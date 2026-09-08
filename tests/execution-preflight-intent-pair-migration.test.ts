@@ -7,6 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '041_execution_preflight_intent_pairs.sql';
+const migrationHeadName = '043_execution_intent_causal_lineage.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const wsolMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = 'a'.repeat(64);
@@ -16,7 +17,8 @@ const expiresAt = '2020-01-01T00:01:00.000Z';
 void test('migration 041 declares the immutable cross-lane pair contract', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
 
-  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationName);
+  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationHeadName);
+  assert.ok(LIVE_EXECUTION_MIGRATION_CATALOG.some((migration) => migration.name === migrationName));
   assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_preflight_intent_pairs/u);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_preflight_intent_pair_memberships/u);
   assert.match(sql, /UNIQUE\s*\(intent_id\)/u);
@@ -35,11 +37,16 @@ void test('PostgreSQL 16 migration 041 creates and guards pristine intent pairs'
 
   await withTemporarySchema(databaseUrl, 'execution_preflight_pair', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), migrationHeadName);
     assert.deepEqual(await migrateDatabase({ pool }), []);
 
     await pool.query(`SET search_path TO ${quoteIdentifier(await currentSchema(pool))}, pg_temp, public`);
     await pool.query(await readFile(migrationUrl, 'utf8'));
+    await pool.query(`INSERT INTO domain_events (
+      event_id,type,mint,source,program,signature,slot,transaction_index,instruction_index,
+      confirmation_status,observed_at,payload_version,payload
+    ) VALUES ('decision-event','PaperStrategySessionUpdated','mint','paper-decision','pumpfun',
+      'signature',1,0,0,'finalized',statement_timestamp(),1,'{}')`);
 
     await inTransaction(pool, async (client) => {
       await insertIntent(client, 'target');

@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import pg from 'pg';
+import { EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS } from '../src/preflight-source/database.js';
 import {
   ExecutionPreflightSourceRepositoryError,
   PostgresExecutionPreflightSourceRepository,
 } from '../src/preflight-source/repository.js';
+import { migrateDatabase } from '../src/storage/database.js';
 import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
+import {
+  mutateWithTriggersDisabled,
+  seedCanonicalV2Source,
+} from './helpers/execution-preflight-v2-source-fixture.js';
 
 void test('exports one exact source from a repeatable-read read-only snapshot', async () => {
   const input = preflightDraftInputs();
@@ -34,6 +42,30 @@ void test('exports one exact source from a repeatable-read read-only snapshot', 
   assert.match(queries[1] ?? '', /decision\.confirmation_status='finalized'/u);
 });
 
+void test('bounds the exported proof expiry by candidate eligibility and retention', async () => {
+  const input = preflightDraftInputs();
+  const rows = rowsFrom(input.source);
+  const candidateExpiryMs = input.source.capturedAtMs + 10_000;
+  rows[0] = Object.freeze({ ...rows[0],
+    candidate_eligible_until_ms: String(candidateExpiryMs),
+    candidate_purge_after_ms: String(candidateExpiryMs + 1_000),
+  });
+  let index = 0;
+  const repository = new PostgresExecutionPreflightSourceRepository({ connect: async () => ({
+    query: async (sql) => {
+      if (sql.startsWith('BEGIN') || sql === 'COMMIT') return { rows: [], rowCount: null };
+      const row = rows[index++];
+      if (row === undefined) throw new Error('unexpected query');
+      return { rows: [row], rowCount: 1 };
+    },
+    release() {},
+  }) });
+  const exported = await repository.export({
+    preparationRunId: input.source.lineage.preparationRunId,
+  });
+  assert.equal(exported.expiresAtMs, candidateExpiryMs);
+});
+
 void test('rolls back a contradictory snapshot and returns one redacted error', async () => {
   const input = preflightDraftInputs();
   const rows = rowsFrom(input.source);
@@ -56,6 +88,121 @@ void test('rolls back a contradictory snapshot and returns one redacted error', 
     && error.code === 'EXECUTION_PREFLIGHT_SOURCE_READ_FAILED'
     && !error.message.includes('secret'));
   assert.equal(queries.at(-1), 'ROLLBACK');
+});
+
+void test('exports and rejects altered H2h v2 lineage on PostgreSQL 16', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: H2h v2 PostgreSQL 16 integration skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await seedCanonicalV2Source(pool);
+    const schema = (await pool.query<{ schema: string }>(
+      'SELECT current_schema() AS schema',
+    )).rows[0]?.schema;
+    if (schema === undefined) throw new TypeError();
+    const role = `h2h_v2_reader_${randomUUID().replaceAll('-', '')}`;
+    await provisionRestrictedSourceRole(pool, role, schema);
+    const restrictedPool = new pg.Pool({ connectionString: databaseUrl,
+      options: `-c search_path="${schema}"`, max: 2 });
+    const observations: string[] = [];
+    try {
+      const restrictedCheck = await restrictedPool.connect();
+      try {
+        await restrictedCheck.query(`SET ROLE "${role}"`);
+        await restrictedCheck.query(`SELECT run_id
+          FROM execution_preflight_intent_preparation_runs WHERE run_id=$1`, [fixture.runId]);
+        await assert.rejects(restrictedCheck.query(`UPDATE trading_candidates SET state='REVOKED'
+          WHERE candidate_id=$1`, [fixture.candidateId]), (error: unknown) =>
+          typeof error === 'object' && error !== null && 'code' in error && error.code === '42501');
+      } finally { restrictedCheck.release(); }
+      const repository = new PostgresExecutionPreflightSourceRepository({
+        connect: async () => {
+          const client = await restrictedPool.connect();
+          await client.query(`SET ROLE "${role}"`);
+          return {
+            query: async (text: string, values?: readonly unknown[]) => {
+              const result = values === undefined
+                ? await client.query(text)
+                : await client.query(text, [...values]);
+              if (text === 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY') {
+                const settings = await client.query<{
+                  transaction_isolation: string;
+                  transaction_read_only: string;
+                  server_version_num: string;
+                  current_role: string;
+                }>(`SELECT current_setting('transaction_isolation') AS transaction_isolation,
+                  current_setting('transaction_read_only') AS transaction_read_only,
+                  current_setting('server_version_num') AS server_version_num,
+                  current_user AS current_role`);
+                const row = settings.rows[0];
+                if (row !== undefined) observations.push(row.transaction_isolation,
+                  row.transaction_read_only, row.server_version_num, row.current_role);
+              }
+              return result;
+            },
+            release: () => { client.release(); },
+          };
+        },
+      });
+      const request = Object.freeze({ preparationRunId: fixture.runId });
+      const exported = await repository.export(request);
+      assert.equal(exported.schemaVersion, 'execution-preflight-draft-source.v2');
+      assert.equal(exported.lineage.preparationRunId, fixture.runId);
+      assert.equal(exported.target.intent.id, fixture.targetIntentId);
+      assert.equal(exported.simulation.intentId, fixture.simulationIntentId);
+      assert.deepEqual(observations.slice(0, 2), ['repeatable read', 'on']);
+      assert.equal(observations[3], role);
+      const serverVersion = Number(observations[2]);
+      assert.equal(Number.isSafeInteger(serverVersion)
+        && serverVersion >= 160_000 && serverVersion < 170_000, true);
+
+      const mutations: readonly Readonly<{
+        apply: string;
+        restore: string;
+        value: string;
+        restoreValue?: string | Date;
+      }>[] = [
+        Object.freeze({
+          apply: `UPDATE trading_candidates SET confirmation_status='orphaned'
+            WHERE candidate_id=$1`,
+          restore: `UPDATE trading_candidates SET confirmation_status='finalized'
+            WHERE candidate_id=$1`,
+          value: fixture.candidateId,
+        }),
+        Object.freeze({
+          apply: `UPDATE execution_preflight_intent_preparation_runs
+            SET artifact_fingerprint=repeat('f',64) WHERE run_id=$1`,
+          restore: `UPDATE execution_preflight_intent_preparation_runs
+            SET artifact_fingerprint=$2 WHERE run_id=$1`,
+          value: fixture.runId,
+          restoreValue: fixture.artifactFingerprint,
+        }),
+        Object.freeze({
+          apply: `UPDATE execution_preflight_intent_pairs
+            SET expires_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second'
+            WHERE pair_id=$1`,
+          restore: `UPDATE execution_preflight_intent_pairs SET expires_at=$2 WHERE pair_id=$1`,
+          value: fixture.pairId,
+          restoreValue: new Date(fixture.expiresAtMs),
+        }),
+      ];
+      for (const mutation of mutations) {
+        await mutateWithTriggersDisabled(pool, mutation.apply, [mutation.value]);
+        await assert.rejects(repository.export(request), ExecutionPreflightSourceRepositoryError);
+        await mutateWithTriggersDisabled(pool, mutation.restore,
+          mutation.restoreValue === undefined
+            ? [mutation.value]
+            : [mutation.value, mutation.restoreValue]);
+        assert.equal((await repository.export(request)).lineage.preparationRunId, fixture.runId);
+      }
+    } finally {
+      await restrictedPool.end();
+      await pool.query(`DROP OWNED BY "${role}"`);
+      await pool.query(`DROP ROLE "${role}"`);
+    }
+  });
 });
 
 function rowsFrom(source: ReturnType<typeof preflightDraftInputs>['source']):
@@ -90,6 +237,8 @@ Readonly<Record<string, unknown>>[] {
       candidate_id: source.lineage.candidateId,
       candidate_evidence_fingerprint: source.lineage.candidateEvidenceFingerprint,
       candidate_confirmation_status: source.lineage.candidateConfirmationStatus,
+      candidate_eligible_until_ms: String(source.expiresAtMs),
+      candidate_purge_after_ms: String(source.expiresAtMs),
       generation_id: source.generation.generationId,
     }),
     Object.freeze({ database_now_ms: String(source.capturedAtMs) }),
@@ -173,3 +322,42 @@ Readonly<Record<string, unknown>>[] {
 }
 function bigintText(value: unknown): string | null { return typeof value === 'bigint' ? String(value) : null; }
 function nullableText(value: number | null): string | null { return value === null ? null : String(value); }
+
+
+async function provisionRestrictedSourceRole(
+  pool: InstanceType<typeof pg.Pool>,
+  role: string,
+  schema: string,
+): Promise<void> {
+  if (!/^[a-z0-9_]+$/u.test(role) || !/^[a-z0-9_]+$/u.test(schema)) throw new TypeError();
+  await pool.query(`CREATE ROLE "${role}" NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB
+    NOCREATEROLE NOREPLICATION NOBYPASSRLS`);
+  await pool.query(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
+  for (const table of [
+    'execution_wallet_generations', 'execution_wallet_snapshots',
+    'execution_provider_usage_snapshots', 'execution_simulation_artifacts',
+  ]) await pool.query(`GRANT SELECT ON TABLE "${schema}"."${table}" TO "${role}"`);
+  for (const [table, columns] of Object.entries(EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS)) {
+    await pool.query(`GRANT SELECT (${columns.map((column) => `"${column}"`).join(',')})
+      ON TABLE "${schema}"."${table}" TO "${role}"`);
+  }
+}
+
+async function withTemporarySchema(
+  databaseUrl: string,
+  run: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+): Promise<void> {
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const schema = `h2h_v2_${randomUUID().replaceAll('-', '')}`;
+  await admin.query(`CREATE SCHEMA "${schema}"`);
+  const pool = new pg.Pool({ connectionString: databaseUrl,
+    options: `-c search_path="${schema}"` });
+  try {
+    await migrateDatabase({ pool });
+    await run(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await admin.end();
+  }
+}

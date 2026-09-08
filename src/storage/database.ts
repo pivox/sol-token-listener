@@ -156,6 +156,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperTrades: number;
   readonly paperPositions: number;
   readonly executionIntentsExpiredPreSubmission: number;
+  readonly executionPreflightPreparationRuns: number;
   readonly executionPreflightIntentPairMemberships: number;
   readonly executionPreflightIntentPairs: number;
   readonly executionSubmissionEvents: number;
@@ -798,6 +799,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          JOIN eligible target ON target.id=pair.target_intent_id
          JOIN eligible simulation ON simulation.id=pair.simulation_intent_id
          WHERE pair.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_preflight_intent_preparation_runs run
+             WHERE run.pair_id=pair.pair_id
+               AND (run.state NOT IN ('PREPARED','FAILED')
+                 OR run.purge_after IS NULL
+                 OR run.purge_after > $1::TIMESTAMPTZ)
+           )
        )
        SELECT eligible.id
        FROM eligible
@@ -824,6 +832,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const executionPreflightPairIds = executionPreflightPairCohort.rows.map(
       ({ pair_id }) => pair_id,
+    );
+    const executionPreflightPreparationRuns = await client.query(
+      `DELETE FROM execution_preflight_intent_preparation_runs run
+       WHERE run.pair_id=ANY($1::TEXT[])
+         AND run.state IN ('PREPARED','FAILED')
+         AND run.purge_after <= $2::TIMESTAMPTZ`,
+      [executionPreflightPairIds, executionIntentCutoff],
     );
     const executionSimulationArtifacts = await client.query(
       `DELETE FROM execution_simulation_artifacts artifact
@@ -1183,6 +1198,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
       executionIntentsExpiredPreSubmission,
+      executionPreflightPreparationRuns:
+        executionPreflightPreparationRuns.rowCount ?? 0,
       executionPreflightIntentPairMemberships:
         executionPreflightIntentPairMemberships.rowCount ?? 0,
       executionPreflightIntentPairs: executionPreflightIntentPairs.rowCount ?? 0,

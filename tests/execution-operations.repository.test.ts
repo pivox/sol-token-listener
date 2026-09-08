@@ -4,6 +4,7 @@ import test from 'node:test';
 import pg from 'pg';
 import {
   createExecutionArmamentRequestV2,
+  createExecutionArmamentRequestV3,
   createOperatorAuthorization,
   createOperatorAuthorizationV2,
 } from '../src/domain/execution-operations.js';
@@ -16,7 +17,10 @@ import {
   EXECUTION_SAFETY_GATE_IDS,
 } from '../src/domain/execution-safety-qualification.js';
 import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
-import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
+import {
+  createExecutionIntentDraft,
+  type ExecutionIntentDraftV1,
+} from '../src/domain/execution-intent.js';
 import { createExecutionPreflightIntentPairDraft } from '../src/domain/execution-preflight-intent-pair.js';
 import { createExecutionSimulationArtifactDraft } from '../src/domain/execution-simulation.js';
 import { migrateDatabase } from '../src/storage/database.js';
@@ -31,9 +35,15 @@ import {
 } from '../src/storage/execution-operations.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import {
+  mutateWithTriggersDisabled,
+  seedCanonicalV2Source,
+} from './helpers/execution-preflight-v2-source-fixture.js';
+import { PostgresExecutionPreflightSourceRepository } from '../src/preflight-source/repository.js';
 
-const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const publicKey = '11111111111111111111111111111111';
+const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const hash = '1'.repeat(64);
 
 void test('reads the exact unleased BUY intent used as a canary target', async (context) => {
@@ -42,7 +52,8 @@ void test('reads the exact unleased BUY intent used as a canary target', async (
   await withTemporarySchema(databaseUrl, async (pool) => {
     await migrateDatabase({ pool });
     const intents = new PostgresExecutionIntentRepository(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
+    await insertExecutionDecisionEvent(pool, 'decision:canary-target', publicKey);
     const created = await intents.create(createExecutionIntentDraft({
       strategyId: 'canary-target', strategyVersion: 1,
       positionId: 'position:canary-target', logicalCommandId: 'command:canary-target',
@@ -77,7 +88,7 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
       generationId, payloadVersion: 1, walletPublicKey: publicKey,
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
-    const snapshotNowMs = Date.now();
+    const snapshotNowMs = await currentDatabaseTimeMs(pool);
     const walletSnapshot = await risk.appendWalletSnapshot(createExecutionWalletSnapshot({
       generationId, providerId: 'primary', stateRevision: 0n, slot: 10n,
       blockTimeMs: snapshotNowMs - 100, observedAtMs: snapshotNowMs - 50, commitment: 'finalized',
@@ -91,7 +102,7 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
     });
     await risk.appendProviderUsage(providerSnapshot);
     const simulation = await seedSuccessfulSimulation(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
     const template = safetyQualification(nowMs, simulation);
     const qualification = qualificationWithCanarySnapshots(template, walletSnapshot, providerSnapshot);
     const armQueries: string[] = [];
@@ -110,6 +121,7 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
       qualificationId: qualification.qualificationId, authorization: resumeAuthorization,
       operatorId: 'operator-primary', occurredAtMs: nowMs,
     });
+    await insertExecutionDecisionEvent(pool, 'decision:canary-target', publicKey);
     const target = await intents.create(createExecutionIntentDraft({
       strategyId: 'canary-target', strategyVersion: 1,
       positionId: 'position:canary-target', logicalCommandId: 'command:canary-target',
@@ -196,6 +208,191 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
     }]);
   });
 });
+
+void test('arms a paired target only from the exact fresh H2h V2 source using wire V3',
+  async (context) => {
+    const databaseUrl = testDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = await seedCanonicalV2Source(pool);
+      const source = await new PostgresExecutionPreflightSourceRepository(pool).export({
+        preparationRunId: fixture.runId,
+      });
+      await pool.query(`INSERT INTO execution_wallet_risk_state (
+        generation_id,reconciled_capital_lamports,reserved_exposure_raw,
+        conservative_drawdown_raw
+      ) VALUES ($1,0,0,0)`, [source.generation.generationId]);
+      const armQueries: string[] = [];
+      let pauseFinalLineage = false;
+      let signalFinalLineage: (() => void) | undefined;
+      let releaseFinalLineage: (() => void) | undefined;
+      const finalLineageReached = new Promise<void>((resolve) => { signalFinalLineage = resolve; });
+      const finalLineageReleased = new Promise<void>((resolve) => { releaseFinalLineage = resolve; });
+      const repository = new PostgresExecutionOperationsRepository(
+        recordingDatabaseSource(pool, armQueries, async (query) => {
+          if (pauseFinalLineage && query.includes('AS lineage_current')) {
+            pauseFinalLineage = false;
+            signalFinalLineage?.();
+            await finalLineageReleased;
+          }
+        }),
+      );
+      const nowMs = await currentDatabaseTimeMs(pool);
+      const qualification = qualificationWithCanarySnapshots(
+        safetyQualification(nowMs, source.simulation, hash, Object.freeze({
+          generationId: source.generation.generationId,
+          walletPublicKey: source.generation.walletPublicKey,
+          genesisHash: source.generation.genesisHash,
+          providerId: source.providerSnapshot.providerId,
+        })),
+        source.walletSnapshot,
+        source.providerSnapshot,
+      );
+      await repository.persistQualification(qualification);
+      const resumeAuthorization = createOperatorAuthorization({
+        payloadVersion: 1, generationId: qualification.generationId,
+        action: 'RESUME', phase: null,
+        contextFingerprint: qualification.qualificationFingerprint,
+        nonceHash: 'a'.repeat(64), operatorId: 'operator-primary',
+        issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+      });
+      await repository.recordAuthorization(resumeAuthorization);
+      await repository.resume({
+        payloadVersion: 1, commandId: 'command:paired-v3-resume',
+        generationId: qualification.generationId,
+        qualificationId: qualification.qualificationId,
+        authorization: resumeAuthorization, operatorId: 'operator-primary',
+        occurredAtMs: nowMs,
+      });
+      const legacyRequest = createCanaryRequest({
+        qualification,
+        target: source.target.intent,
+        walletSnapshot: source.walletSnapshot,
+        providerSnapshot: source.providerSnapshot,
+        nowMs,
+        evidenceExpiresAtMs: source.expiresAtMs,
+        armamentExpiresAtMs: source.expiresAtMs,
+      });
+      const {
+        armamentRequestFingerprint: _legacyFingerprint,
+        evidenceId: _legacyEvidenceId,
+        evidenceFingerprint: _legacyEvidenceFingerprint,
+        payloadVersion: _legacyVersion,
+        ...requestFields
+      } = legacyRequest;
+      const request = createExecutionArmamentRequestV3(Object.freeze({
+        ...requestFields,
+        payloadVersion: 3,
+        lineageProof: Object.freeze({
+          preparationRunId: source.lineage.preparationRunId,
+          preparationRunFingerprint: source.lineage.preparationRunFingerprint,
+          pairId: source.lineage.pairId,
+          pairFingerprint: source.lineage.pairFingerprint,
+          targetAssessmentId: source.lineage.targetAssessmentId,
+          targetAssessmentFingerprint: source.lineage.targetAssessmentFingerprint,
+          simulationArtifactId: source.lineage.simulationArtifactId,
+          simulationArtifactFingerprint: source.lineage.simulationArtifactFingerprint,
+          preparationManifestFingerprint: source.lineage.preparationManifestFingerprint,
+          candidateId: source.lineage.candidateId,
+          candidateEvidenceFingerprint: source.lineage.candidateEvidenceFingerprint,
+          proofFingerprint: source.proofFingerprint,
+          sourceCapturedAtMs: source.capturedAtMs,
+          sourceExpiresAtMs: source.expiresAtMs,
+        }),
+      }));
+      const authorization = createOperatorAuthorizationV2({
+        payloadVersion: 2, generationId: qualification.generationId,
+        action: 'ARM', phase: 'CANARY',
+        contextFingerprint: request.armamentRequestFingerprint,
+        nonceHash: 'b'.repeat(64), operatorId: 'operator-primary',
+        issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+      });
+
+      const candidateRetention = (await pool.query<{
+        eligible_until: string;
+        created_at: string;
+        purge_after: string;
+      }>(`SELECT eligible_until::TEXT,created_at::TEXT,purge_after::TEXT
+        FROM trading_candidates WHERE candidate_id=$1`, [source.lineage.candidateId])).rows[0];
+      assert.ok(candidateRetention !== undefined);
+      await mutateWithTriggersDisabled(pool,
+        `UPDATE trading_candidates SET eligible_until=statement_timestamp()-INTERVAL '1 second'
+          WHERE candidate_id=$1`, [source.lineage.candidateId]);
+      await assert.rejects(repository.armCanary(Object.freeze({
+        request, authorization, preflightSource: source,
+      })), isRepositoryError('CONFLICT'));
+      await assertNoCanaryArmSideEffects(pool);
+      await mutateWithTriggersDisabled(pool,
+        `UPDATE trading_candidates SET eligible_until=$2 WHERE candidate_id=$1`,
+        [source.lineage.candidateId, candidateRetention.eligible_until]);
+
+      await mutateWithTriggersDisabled(pool,
+        `UPDATE trading_candidates SET
+          created_at=statement_timestamp()-INTERVAL '5 hours',
+          purge_after=statement_timestamp()-INTERVAL '1 hour'
+          WHERE candidate_id=$1`, [source.lineage.candidateId]);
+      await assert.rejects(repository.armCanary(Object.freeze({
+        request, authorization, preflightSource: source,
+      })), isRepositoryError('CONFLICT'));
+      await assertNoCanaryArmSideEffects(pool);
+      await mutateWithTriggersDisabled(pool,
+        `UPDATE trading_candidates SET created_at=$2,purge_after=$3 WHERE candidate_id=$1`,
+        [source.lineage.candidateId, candidateRetention.created_at, candidateRetention.purge_after]);
+
+      await mutateWithTriggersDisabled(pool,
+        `UPDATE execution_preflight_intent_pairs SET pair_fingerprint=repeat('f',64)
+          WHERE pair_id=$1`, [fixture.pairId]);
+      await assert.rejects(repository.armCanary(Object.freeze({
+        request, authorization, preflightSource: source,
+      })), isRepositoryError('CONFLICT'));
+      await assertNoCanaryArmSideEffects(pool);
+      await mutateWithTriggersDisabled(pool,
+        `UPDATE execution_preflight_intent_pairs SET pair_fingerprint=$2 WHERE pair_id=$1`,
+        [fixture.pairId, source.lineage.pairFingerprint]);
+
+      armQueries.length = 0;
+      pauseFinalLineage = true;
+      const armamentPromise = repository.armCanary(Object.freeze({
+        request, authorization, preflightSource: source,
+      }));
+      await finalLineageReached;
+      try {
+        await assertCandidateMutationBlocked(pool, source.lineage.candidateId);
+      } finally {
+        releaseFinalLineage?.();
+      }
+      const armament = await armamentPromise;
+      assert.equal(armament.payloadVersion, 2);
+      assert.equal(armament.armamentRequestFingerprint, request.armamentRequestFingerprint);
+      assert.equal((await pool.query<{ live_reserved: boolean }>(
+        'SELECT live_reserved FROM execution_intents WHERE id=$1',
+        [fixture.targetIntentId],
+      )).rows[0]?.live_reserved, true);
+      const pairLockIndex = armQueries.findIndex((query) =>
+        query.includes('FROM execution_preflight_intent_pairs WHERE pair_id=$1 FOR UPDATE'));
+      const targetLockIndex = armQueries.findIndex((query) =>
+        query.includes('FROM execution_intents WHERE id=$1 FOR UPDATE'));
+      const runLockIndex = armQueries.findIndex((query) =>
+        query.includes('FROM execution_preflight_intent_preparation_runs WHERE run_id=$1 FOR UPDATE'));
+      const proofLockIndex = armQueries.findIndex((query) =>
+        query.includes('FROM execution_dry_run_assessments assessment'));
+      const causalLockIndex = armQueries.findIndex((query) =>
+        query.includes('FOR UPDATE OF candidate,report,decision,source,candidate_event,'));
+      const finalLineageIndex = armQueries.findIndex((query) => query.includes('AS lineage_current'));
+      const promotionIndex = armQueries.findIndex((query) =>
+        /UPDATE execution_intents(?: AS intent)?\s+SET\s+live_reserved\s*=\s*TRUE/iu.test(query));
+      assert.ok(pairLockIndex >= 0);
+      assert.ok(pairLockIndex < targetLockIndex);
+      assert.ok(targetLockIndex < runLockIndex);
+      assert.ok(runLockIndex < proofLockIndex);
+      assert.match(armQueries[proofLockIndex] ?? '',
+        /FOR UPDATE OF assessment,artifact,attempt,simulation,candidate,generation/iu);
+      assert.ok(proofLockIndex < causalLockIndex);
+      assert.ok(causalLockIndex < finalLineageIndex);
+      assert.ok(finalLineageIndex < promotionIndex);
+    });
+  });
 
 void test('serializes concurrent divergent V2 canary requests to one admitted armament', async (context) => {
   const databaseUrl = testDatabaseUrl(context);
@@ -340,7 +537,7 @@ void test('rejects an already live-reserved canary target before admission', asy
   });
 });
 
-void test('H2c refuses the SIMULATION lane while legacy unpaired targets remain supported',
+void test('legacy H2c V2 refuses every paired lane while unpaired targets remain supported',
   async (context) => {
     const databaseUrl = testDatabaseUrl(context);
     if (databaseUrl === null) return;
@@ -351,6 +548,7 @@ void test('H2c refuses the SIMULATION lane while legacy unpaired targets remain 
       const canonicalTarget = createExecutionIntentDraft({
         strategyId: 'creation-entry-v1', strategyVersion: 1,
         positionId: 'position:paired-canary-target',
+        candidateId: `candidate_${'6'.repeat(64)}`,
         logicalCommandId: `paper_open_${commandHash}`,
         mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
         quoteMint: 'So11111111111111111111111111111111111111112',
@@ -361,6 +559,7 @@ void test('H2c refuses the SIMULATION lane while legacy unpaired targets remain 
         requestedAtMs: fixture.nowMs - 1_000, expiresAtMs: fixture.nowMs + 120_000,
       });
       const pair = createExecutionPreflightIntentPairDraft(canonicalTarget);
+      await seedCurrentCausalLineage(pool, canonicalTarget);
       const pairClient = await pool.connect();
       try {
         await pairClient.query('BEGIN');
@@ -376,6 +575,18 @@ void test('H2c refuses the SIMULATION lane while legacy unpaired targets remain 
       const simulationTarget = Object.freeze({
         ...pair.simulationIntent,
         stateRevision: 0n,
+      });
+      const pairedTarget = Object.freeze({ ...canonicalTarget, stateRevision: 0n });
+      const pairedTargetRequest = createCanaryRequest({
+        qualification: fixture.qualification, target: pairedTarget,
+        walletSnapshot: fixture.walletSnapshot, providerSnapshot: fixture.providerSnapshot,
+        nowMs: fixture.nowMs,
+      });
+      const pairedTargetAuthorization = createOperatorAuthorizationV2({
+        payloadVersion: 2, generationId, action: 'ARM', phase: 'CANARY',
+        contextFingerprint: pairedTargetRequest.armamentRequestFingerprint,
+        nonceHash: '7'.repeat(64), operatorId: 'operator-primary',
+        issuedAtMs: fixture.nowMs, expiresAtMs: fixture.nowMs + 60_000,
       });
       const request = createCanaryRequest({
         qualification: fixture.qualification,
@@ -395,6 +606,9 @@ void test('H2c refuses the SIMULATION lane while legacy unpaired targets remain 
         recordingDatabaseSource(pool, queries),
       );
 
+      await assert.rejects(guardedRepository.armCanary(Object.freeze({
+        request: pairedTargetRequest, authorization: pairedTargetAuthorization,
+      })), isRepositoryError('CONFLICT'));
       await assert.rejects(guardedRepository.armCanary(Object.freeze({ request, authorization })),
         isRepositoryError('CONFLICT'));
       assert.equal(queries.some((query) => /UPDATE execution_intents(?: AS intent)?\s+SET\s+live_reserved\s*=\s*TRUE/iu.test(query)), false);
@@ -548,7 +762,7 @@ void test('qualification, resume and inert armament replay durably without live 
       generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
     const qualification = safetyQualification(nowMs, simulation);
     assert.deepEqual(await repository.persistQualification(qualification), qualification);
     assert.deepEqual(await repository.persistQualification(qualification), qualification);
@@ -636,7 +850,7 @@ void test('armament fails closed while stopped and a hard stop cannot be downgra
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
     const qualification = safetyQualification(nowMs, simulation);
     await repository.persistQualification(qualification);
     const authorization = createOperatorAuthorization({
@@ -669,7 +883,7 @@ void test('preflight rejects absent or mismatched #51-D Mainnet simulation evide
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
     const valid = safetyQualification(nowMs, simulation);
     const gates = valid.gates.map((gate) => gate.gateId === 'MAINNET_PREFLIGHT_SIMULATED'
       ? { ...gate, evidenceFingerprint: 'f'.repeat(64) }
@@ -705,7 +919,7 @@ void test('identical concurrent preflights replay after the generation lock', as
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const qualification = safetyQualification(Date.now(), simulation);
+    const qualification = safetyQualification(await currentDatabaseTimeMs(pool), simulation);
     const results = await Promise.all([
       repository.persistQualification(qualification),
       repository.persistQualification(qualification),
@@ -726,7 +940,7 @@ void test('identical concurrent operator authorizations replay exactly once', as
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
     const authorization = createOperatorAuthorization({
       payloadVersion: 1, generationId, action: 'RESUME', phase: null,
       contextFingerprint: hash, nonceHash: 'e'.repeat(64),
@@ -786,7 +1000,7 @@ void test('V1 ARM authorization remains forbidden while risk is unknown', async 
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const qualification = safetyQualification(Date.now(), simulation);
+    const qualification = safetyQualification(await currentDatabaseTimeMs(pool), simulation);
     await repository.persistQualification(qualification);
     const resumeAuthorization = createOperatorAuthorization({
       payloadVersion: 1, generationId, action: 'RESUME', phase: null,
@@ -808,7 +1022,8 @@ void test('V1 ARM authorization remains forbidden while risk is unknown', async 
       payloadVersion: 1, generationId, action: 'ARM', phase: 'CANARY',
       contextFingerprint: qualification.qualificationFingerprint,
       nonceHash: '8'.repeat(64), operatorId: 'operator-primary',
-      issuedAtMs: Date.now(), expiresAtMs: Date.now() + 60_000,
+      issuedAtMs: qualification.qualifiedAtMs,
+      expiresAtMs: qualification.qualifiedAtMs + 60_000,
     });
     await assert.rejects(repository.recordAuthorization(legacyAuthorization),
       isRepositoryError('CONFLICT'));
@@ -831,7 +1046,7 @@ void test('latest migration refuses the obsolete V1 arm path after a resume', as
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
-    const nowMs = Date.now();
+    const nowMs = await currentDatabaseTimeMs(pool);
     const qualification = safetyQualification(nowMs, simulation);
     await repository.persistQualification(qualification);
     const resumeAuthorization = createOperatorAuthorization({
@@ -863,6 +1078,13 @@ function safetyQualification(
   nowMs: number,
   simulation: Awaited<ReturnType<typeof seedSuccessfulSimulation>>,
   buildHash = hash,
+  identity: Readonly<{
+    generationId: string;
+    walletPublicKey: string;
+    genesisHash: string;
+    providerId: string;
+  }> = Object.freeze({ generationId, walletPublicKey: publicKey,
+    genesisHash: publicKey, providerId: 'primary' }),
 ) {
   const evidenceTypes = [
     'CI_RUN', 'MIGRATION_TEST', 'ARCHITECTURE_TEST', 'DRY_RUN_TEST',
@@ -873,8 +1095,9 @@ function safetyQualification(
   return createSafetyQualification({
     payloadVersion: 1, evaluatorVersion: 1, phase: 'CANARY',
     buildHash, configurationFingerprint: simulation.configurationFingerprint,
-    strategyFingerprint: '3'.repeat(64), generationId, walletPublicKey: publicKey,
-    cluster: 'mainnet-beta', genesisHash: publicKey, providerId: 'primary',
+    strategyFingerprint: '3'.repeat(64), generationId: identity.generationId,
+    walletPublicKey: identity.walletPublicKey,
+    cluster: 'mainnet-beta', genesisHash: identity.genesisHash, providerId: identity.providerId,
     qualifiedAtMs: nowMs, expiresAtMs: nowMs + 300_000,
     gates: EXECUTION_SAFETY_GATE_IDS.map((gateId, index) => ({
       payloadVersion: 1, gateId, status: 'PASSED', evidenceType: evidenceTypes[index],
@@ -887,9 +1110,9 @@ function safetyQualification(
           buildHash,
           configurationFingerprint: simulation.configurationFingerprint,
           strategyFingerprint: '3'.repeat(64),
-          walletPublicKey: publicKey,
-          genesisHash: publicKey,
-          providerId: 'primary',
+          walletPublicKey: identity.walletPublicKey,
+          genesisHash: identity.genesisHash,
+          providerId: identity.providerId,
         })
         : index.toString(16).repeat(64),
       observedAtMs: gateId === 'MAINNET_PREFLIGHT_SIMULATED'
@@ -954,8 +1177,10 @@ function canaryPolicy() {
 }
 
 async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
-  const nowMs = Date.now();
+  const nowMs = await currentDatabaseTimeMs(pool);
   const intents = new PostgresExecutionIntentRepository(pool);
+  const decisionEventId = `event-${randomUUID()}`;
+  await insertExecutionDecisionEvent(pool, decisionEventId, publicKey);
   const created = await intents.create(createExecutionIntentDraft({
     strategyId: 'simulation-strategy', strategyVersion: 1,
     positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
@@ -963,7 +1188,7 @@ async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
     quoteMint: 'So11111111111111111111111111111111111111112',
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
     quoteAmountRaw: 1_000n, baseAmountRaw: null, minimumAmountOutRaw: 850n,
-    decisionEventId: `event-${randomUUID()}`, decisionFingerprint: hash,
+    decisionEventId, decisionFingerprint: hash,
     requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
   }));
   const claimed = await intents.claim({
@@ -1012,7 +1237,7 @@ async function prepareCanaryArmament(pool: InstanceType<typeof pg.Pool>) {
     generationId, payloadVersion: 1, walletPublicKey: publicKey,
     cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
   });
-  const snapshotNowMs = Date.now();
+  const snapshotNowMs = await currentDatabaseTimeMs(pool);
   const walletSnapshot = createExecutionWalletSnapshot({
     generationId, providerId: 'primary', stateRevision: 0n, slot: 10n,
     blockTimeMs: snapshotNowMs - 100, observedAtMs: snapshotNowMs - 50, commitment: 'finalized',
@@ -1025,7 +1250,7 @@ async function prepareCanaryArmament(pool: InstanceType<typeof pg.Pool>) {
     expiresAtMs: snapshotNowMs + 300_000, provenance: 'OPERATOR_REPORT',
   });
   const simulation = await seedSuccessfulSimulation(pool);
-  const nowMs = Date.now();
+  const nowMs = await currentDatabaseTimeMs(pool);
   const qualification = qualificationWithCanarySnapshots(
     safetyQualification(nowMs, simulation), walletSnapshot, providerSnapshot,
   );
@@ -1042,6 +1267,7 @@ async function prepareCanaryArmament(pool: InstanceType<typeof pg.Pool>) {
     qualificationId: qualification.qualificationId, authorization: resumeAuthorization,
     operatorId: 'operator-primary', occurredAtMs: nowMs,
   });
+  await insertExecutionDecisionEvent(pool, 'decision:canary-target', publicKey);
   const target = await intents.create(createExecutionIntentDraft({
     strategyId: 'canary-target', strategyVersion: 1,
     positionId: 'position:canary-target', logicalCommandId: 'command:canary-target',
@@ -1075,13 +1301,15 @@ function createCanaryRequest(input: Readonly<{
   nowMs: number;
   operatorReason?: string;
   decisionFingerprint?: string;
+  evidenceExpiresAtMs?: number;
   armamentExpiresAtMs?: number;
 }>): ReturnType<typeof createExecutionArmamentRequestV2> {
   if (input.target.quoteAmountRaw === null) throw new Error('Canary target must have quote input.');
   return createExecutionArmamentRequestV2({
     payloadVersion: 2, qualification: input.qualification, targetIntentId: input.target.id,
     policy: canaryPolicy(), walletSnapshot: input.walletSnapshot, providerSnapshot: input.providerSnapshot,
-    allEndpointsUnavailable: false, capturedAtMs: input.nowMs, expiresAtMs: input.nowMs + 120_000,
+    allEndpointsUnavailable: false, capturedAtMs: input.nowMs,
+    expiresAtMs: input.evidenceExpiresAtMs ?? input.nowMs + 120_000,
     target: {
       intentId: input.target.id, stateRevision: input.target.stateRevision,
       strategyId: input.target.strategyId, strategyVersion: input.target.strategyVersion,
@@ -1113,8 +1341,97 @@ async function assertNoCanaryArmSideEffects(pool: InstanceType<typeof pg.Pool>):
   }]);
 }
 
+async function seedCurrentCausalLineage(
+  pool: InstanceType<typeof pg.Pool>,
+  intent: ExecutionIntentDraftV1,
+): Promise<void> {
+  if (intent.candidateId === null) throw new TypeError('Candidate lineage is missing.');
+  const reportId = `qreport_${'3'.repeat(64)}`;
+  const qualificationEventId = `evt_${'4'.repeat(64)}`;
+  const candidateEventId = `evt_${'5'.repeat(64)}`;
+  const rawEventId = `raw_lineage_${intent.candidateId.slice(-16)}`;
+  const signature = `lineage-${intent.candidateId}`;
+  const candidatePayload = Object.freeze({ id: intent.candidateId,
+    qualificationReportId: reportId, mint: intent.mint });
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+    created_signature,created_slot,created_transaction_index,created_instruction_index,
+    detected_at,updated_at
+  ) VALUES ($1,'pumpfun','pumpfun','creator','SPL_TOKEN','[]','OBSERVING',
+    $2,1,0,0,date_trunc('milliseconds',statement_timestamp()),
+    date_trunc('milliseconds',statement_timestamp())) ON CONFLICT (mint) DO NOTHING`,
+  [intent.mint, signature]);
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    confirmation_status,observed_at,payload_version,payload,processing_status
+  ) VALUES ($1,'pumpfun','pumpfun',$2,$3,1,0,0,'finalized',
+    date_trunc('milliseconds',statement_timestamp()),1,'{}','processed')`,
+  [rawEventId, intent.mint, signature]);
+  for (const event of [
+    [qualificationEventId, 'QualificationUpdated', 'qualification', Object.freeze({})],
+    [candidateEventId, 'TradingCandidateUpdated', 'paper-decision', Object.freeze({ candidate: candidatePayload })],
+    [intent.decisionEventId, 'PaperStrategySessionUpdated', 'paper-decision', Object.freeze({
+      session: Object.freeze({ candidateId: intent.candidateId, qualificationReportId: reportId,
+        positionId: intent.positionId, mint: intent.mint }),
+    })],
+  ] as const) {
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,confirmation_status,observed_at,payload_version,payload
+    ) VALUES ($1,$2,$3,$4,$5,'pumpfun',$6,1,0,0,'finalized',
+      date_trunc('milliseconds',statement_timestamp()),1,$7)`, [
+      event[0], rawEventId, event[1], intent.mint, event[2], signature,
+      JSON.stringify(event[3]),
+    ]);
+  }
+  await pool.query(`WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+  ) INSERT INTO qualification_reports (
+    report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+    profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+    preparation_score,social_score,onchain_score,total_score,as_of_slot,
+    as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+    purge_after,payload_version,payload
+  ) SELECT $1,$2,$3,$4,$3,'profile',1,repeat('6',64),repeat('7',64),'QUALIFIED',
+    15,25,60,100,1,0,0,'finalized',operation.at,operation.at+INTERVAL '4 hours',1,'{}'
+    FROM operation`, [reportId, intent.mint, qualificationEventId, rawEventId]);
+  await pool.query(`WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+  ) INSERT INTO trading_candidates (
+    candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+    strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+    quote_decimals,quote_token_program,reason_codes,eligible_until,created_at,
+    purge_after,payload_version,payload
+  ) SELECT $1,$2,$3,$4,$5,$6,$7,repeat('7',64),'finalized','ELIGIBLE',$8,9,
+    'SPL_TOKEN','["QUALIFIED_ENTRY"]',operation.at+INTERVAL '3 minutes',operation.at,
+    operation.at+INTERVAL '4 hours',1,$9 FROM operation`, [intent.candidateId, intent.mint,
+      reportId, qualificationEventId, candidateEventId, intent.strategyId,
+      intent.strategyVersion, intent.quoteMint, JSON.stringify(candidatePayload)]);
+  await pool.query(`INSERT INTO paper_positions (
+    position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+    strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+    round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,payload_version,
+    payload,opened_at,strategy_session_id,qualification_report_id,candidate_id
+  ) VALUES ($1,$2,$3,9,'SPL_TOKEN',$4,$5,'PAPER_HOLDING',1,1,1,0,$6,$7,$8,1,
+    '{}',date_trunc('milliseconds',statement_timestamp()),'paper-session',$9,$10)`, [
+      intent.positionId, intent.mint, intent.quoteMint, intent.strategyId, intent.strategyVersion,
+      `paper_trade_${'8'.repeat(64)}`, `paper_open_command_${'9'.repeat(64)}`,
+      qualificationEventId, reportId, intent.candidateId,
+    ]);
+}
+
 function isRepositoryError(code: string): (error: unknown) => boolean {
   return (error) => error instanceof ExecutionOperationsRepositoryError && error.code === code;
+}
+
+async function currentDatabaseTimeMs(pool: InstanceType<typeof pg.Pool>): Promise<number> {
+  const result = await pool.query<{ readonly database_now_ms: string }>(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS database_now_ms`);
+  const row = result.rows[0];
+  assert.ok(row !== undefined);
+  const nowMs = Number(row.database_now_ms);
+  assert.equal(Number.isSafeInteger(nowMs), true);
+  return nowMs;
 }
 
 function testDatabaseUrl(context: Readonly<{ skip(message?: string): void }>): string | null {
@@ -1127,6 +1444,7 @@ function testDatabaseUrl(context: Readonly<{ skip(message?: string): void }>): s
 function recordingDatabaseSource(
   pool: InstanceType<typeof pg.Pool>,
   queries: string[],
+  afterQuery?: (text: string) => Promise<void>,
 ): Readonly<{ connect(): Promise<Readonly<{
   query(text: string, values?: readonly unknown[]): Promise<Readonly<{
     rows: readonly Readonly<Record<string, unknown>>[];
@@ -1141,6 +1459,7 @@ function recordingDatabaseSource(
         query: async (text: string, values?: readonly unknown[]) => {
           queries.push(text);
           const result = await client.query(text, values as unknown[] | undefined);
+          await afterQuery?.(text);
           return Object.freeze({
             rows: result.rows as readonly Readonly<Record<string, unknown>>[],
             rowCount: result.rowCount,
@@ -1150,6 +1469,27 @@ function recordingDatabaseSource(
       });
     },
   });
+}
+
+async function assertCandidateMutationBlocked(
+  pool: InstanceType<typeof pg.Pool>,
+  candidateId: string,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL session_replication_role=replica');
+    await client.query("SET LOCAL lock_timeout='100ms'");
+    await assert.rejects(
+      client.query(`UPDATE trading_candidates SET state='REVOKED' WHERE candidate_id=$1`, [candidateId]),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'code' in error && error.code === '55P03',
+    );
+    await client.query('ROLLBACK');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* preserve assertion failure */ }
+    throw error;
+  } finally { client.release(); }
 }
 
 async function withTemporarySchema(

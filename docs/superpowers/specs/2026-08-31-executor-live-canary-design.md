@@ -1,10 +1,10 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.3.1
+**Version de spécification :** 1.4.0
 
-**Version de la spécification parente :** 1.12.1
+**Version de la spécification parente :** 1.13.0
 
-**Date :** 2026-08-31
+**Date :** 2026-09-08
 
 **Statut :** APPROUVÉE
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.4.0 — 2026-09-08 :** constate H2k-b disponible mais inerte par défaut :
+  le runner one-shot prépare une paire exacte, H2h v2 reconstruit sa preuve
+  causale à partir du seul `preparationRunId` et H2c exige le wire V3 avant
+  toute promotion. Aucun wallet, armement, byte signé ou envoi n'est ajouté et
+  le canary reste `CANARY_NOT_STARTED`.
 - **1.3.1 — 2026-09-06 :** constate H2k-a disponible derrière
   `EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false`. La migration 041 lie une
   cible target pristine à un probe de simulation économiquement identique,

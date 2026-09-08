@@ -10,7 +10,6 @@ import {
   type ExecutionPreflightPreparationPool,
 } from '../src/storage/execution-preflight-preparation.repository.js';
 import { migrateDatabase } from '../src/storage/database.js';
-import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const NOW_MS = 1_789_000_000_000;
 const DEADLINE_MS = NOW_MS + 45_000;
@@ -18,6 +17,10 @@ const LEASE_EXPIRES_AT_MS = NOW_MS + 30_000;
 const LEASE_TOKEN = '00000000-0000-4000-8000-000000000001';
 const IDENTITY = createExecutionPreflightPreparationIdentity(LEASE_TOKEN);
 const RUN_ID = IDENTITY.runId;
+const TARGET_ID = `execution_intent_${'1'.repeat(64)}`;
+const SIMULATION_ID = `execution_intent_${'2'.repeat(64)}`;
+const CAUSAL_CANDIDATE_ID = `candidate_${'a'.repeat(64)}`;
+const CAUSAL_REPORT_ID = `qreport_${'b'.repeat(64)}`;
 
 void test('starts one database-watermarked preparation under a global selector fence', async () => {
   const client = new ScriptedClient([
@@ -59,6 +62,9 @@ void test('selects only the first exact post-watermark pair without SKIP LOCKED'
     result([pairRow()], 1),
     result([parentLockRow()], 1),
     result([pairRow()], 1),
+    result([lineageLockRow(TARGET_ID), lineageLockRow(SIMULATION_ID)], 2),
+    result([{ lineage_current: true }], 1),
+    result([{ lineage_current: true }], 1),
     result([claimRow({ state: 'PREPARING', stateRevision: 1n, pairId: 'pair-1' })], 1),
     result([], null),
   ]);
@@ -70,8 +76,8 @@ void test('selects only the first exact post-watermark pair without SKIP LOCKED'
   const selected = await repository.selectFirstPair(claim);
 
   assert.equal(selected?.pairId, 'pair-1');
-  assert.equal(selected?.targetIntentId, 'target-1');
-  assert.equal(selected?.simulationIntentId, 'probe-1');
+  assert.equal(selected?.targetIntentId, TARGET_ID);
+  assert.equal(selected?.simulationIntentId, SIMULATION_ID);
   const selectionSql = client.calls[2]?.text ?? '';
   assert.match(selectionSql, /pair\.created_at > preparation\.watermark_at/u);
   assert.match(selectionSql, /ORDER BY pair\.created_at,pair\.pair_id/u);
@@ -82,7 +88,37 @@ void test('selects only the first exact post-watermark pair without SKIP LOCKED'
   assert.doesNotMatch(client.calls[3]?.text ?? '', /execution_dry_run_assessments/u);
   assert.match(client.calls[4]?.text ?? '', /NOT EXISTS \(SELECT 1 FROM execution_dry_run_assessments/u);
   assert.doesNotMatch(client.calls[4]?.text ?? '', /FOR UPDATE/u);
-  assert.match(client.calls[5]?.text ?? '', /WHERE preparation\.run_id=\$1/u);
+  const causalLockSql = client.calls[5]?.text ?? '';
+  assert.match(causalLockSql, /ORDER BY intent\.id/u);
+  assert.match(causalLockSql, /FOR UPDATE OF intent,candidate,report,decision,source,candidate_event/u);
+  assert.deepEqual(client.calls[5]?.values, [[TARGET_ID, SIMULATION_ID]]);
+  assert.deepEqual(client.calls[6]?.values, [TARGET_ID]);
+  assert.deepEqual(client.calls[7]?.values, [SIMULATION_ID]);
+  assert.match(client.calls[8]?.text ?? '', /WHERE preparation\.run_id=\$1/u);
+});
+
+void test('terminalizes the exact selected run when either causal lineage is invalid', async () => {
+  const claim = preparationClaim();
+  const client = new LineageSelectionClient();
+  const repository = new ExecutionPreflightPreparationPostgresRepository(
+    new ScriptedPool(client),
+    () => LEASE_TOKEN,
+  );
+
+  await assert.rejects(
+    repository.selectFirstPair(claim),
+    (error: unknown) => error instanceof ExecutionPreflightPreparationRepositoryError
+      && error.code === 'PREFLIGHT_PAIR_LINEAGE_INVALID',
+  );
+
+  const lineageCalls = client.calls.filter((call) => call.text.includes('AS lineage_current'));
+  assert.equal(lineageCalls.length, 1);
+  assert.deepEqual(lineageCalls[0]?.values, [TARGET_ID]);
+  const failure = client.calls.find((call) => call.text
+    .includes("failure_code='PREFLIGHT_PAIR_LINEAGE_INVALID'"));
+  assert.notEqual(failure, undefined);
+  assert.deepEqual(failure?.values?.slice(-1), ['pair-1']);
+  assert.equal(client.calls.some((call) => call.text.includes("SET state='PREPARING'")), false);
 });
 
 void test('returns idle without selecting a replacement and rejects hostile options', async () => {
@@ -365,15 +401,23 @@ void test('marks the fully evidenced exact pair prepared with a closed frozen ma
     artifactFingerprint: 'd'.repeat(64),
   });
   const manifestFingerprint = 'e'.repeat(64);
-  const client = new ScriptedClient([result([{
-    ...preparationRowFromClaim(preparing),
-    state: 'PREPARED',
-    state_revision: '4',
-    manifest_fingerprint: manifestFingerprint,
-    updated_at_ms: String(NOW_MS + 2),
-    completed_at_ms: String(NOW_MS + 2),
-    purge_after_ms: String(NOW_MS + 2 + 14_400_000),
-  }], 1)]);
+  const client = new ScriptedClient([
+    result([], null),
+    result([lockedPreparationPairRow('PREPARING')], 1),
+    result([lineageLockRow(TARGET_ID), lineageLockRow(SIMULATION_ID)], 2),
+    result([{ lineage_current: true }], 1),
+    result([{ lineage_current: true }], 1),
+    result([{
+      ...preparationRowFromClaim(preparing),
+      state: 'PREPARED',
+      state_revision: '4',
+      manifest_fingerprint: manifestFingerprint,
+      updated_at_ms: String(NOW_MS + 2),
+      completed_at_ms: String(NOW_MS + 2),
+      purge_after_ms: String(NOW_MS + 2 + 14_400_000),
+    }], 1),
+    result([], null),
+  ]);
   const repository = new ExecutionPreflightPreparationPostgresRepository(
     new ScriptedPool(client),
     () => LEASE_TOKEN,
@@ -387,7 +431,12 @@ void test('marks the fully evidenced exact pair prepared with a closed frozen ma
   assert.equal(prepared.state, 'PREPARED');
   assert.equal(prepared.stateRevision, 4n);
   assert.equal(prepared.manifestFingerprint, manifestFingerprint);
-  const sql = client.calls[0]?.text ?? '';
+  assert.equal(client.calls[0]?.text, 'BEGIN');
+  assert.match(client.calls[1]?.text ?? '', /FOR UPDATE OF preparation,pair,target,simulation/u);
+  assert.match(client.calls[2]?.text ?? '', /FOR UPDATE OF intent,candidate,report/u);
+  assert.deepEqual(client.calls[3]?.values, [TARGET_ID]);
+  assert.deepEqual(client.calls[4]?.values, [SIMULATION_ID]);
+  const sql = client.calls[5]?.text ?? '';
   assert.match(sql, /FOR UPDATE OF preparation,pair,target,simulation/u);
   assert.match(sql, /preparation\.assessment_id IS NOT NULL/u);
   assert.match(sql, /preparation\.artifact_id IS NOT NULL/u);
@@ -406,6 +455,33 @@ void test('marks the fully evidenced exact pair prepared with a closed frozen ma
       && error.code === 'INVALID_INPUT',
   );
   assert.equal(never.connections, 0);
+});
+
+void test('terminalizes the same preparing run when causal lineage drifts before PREPARED', async () => {
+  const preparing = preparingClaim({
+    stateRevision: 3n,
+    assessmentId: `execution_dry_run_assessment_${'a'.repeat(64)}`,
+    assessmentFingerprint: 'b'.repeat(64),
+    artifactId: `execution_simulation_artifact_${'c'.repeat(64)}`,
+    artifactFingerprint: 'd'.repeat(64),
+  });
+  const client = new LineageMarkPreparedClient(preparing);
+  const repository = new ExecutionPreflightPreparationPostgresRepository(
+    new ScriptedPool(client),
+    () => LEASE_TOKEN,
+  );
+
+  await assert.rejects(
+    repository.markPrepared(preparing, Object.freeze({ manifestFingerprint: 'e'.repeat(64) })),
+    (error: unknown) => error instanceof ExecutionPreflightPreparationRepositoryError
+      && error.code === 'PREFLIGHT_PAIR_LINEAGE_INVALID',
+  );
+
+  assert.equal(client.calls.filter((call) => call.text.includes('AS lineage_current')).length, 1);
+  assert.notEqual(client.calls.find((call) => call.text.includes("SET state='FAILED'")
+    && call.text.includes("failure_code='PREFLIGHT_PAIR_LINEAGE_INVALID'")), undefined);
+  assert.equal(client.calls.some((call) => call.text.includes("SET state='PREPARED'")), false);
+  assert.equal(client.calls.at(-1)?.text, 'COMMIT');
 });
 
 void test('PostgreSQL selects and crash-resumes the same exact pair', async (context) => {
@@ -713,8 +789,8 @@ function pairRow(): Readonly<Record<string, unknown>> {
   return {
     pair_id: 'pair-1',
     pair_fingerprint: 'b'.repeat(64),
-    target_intent_id: 'target-1',
-    simulation_intent_id: 'probe-1',
+    target_intent_id: TARGET_ID,
+    simulation_intent_id: SIMULATION_ID,
     decision_event_id: 'decision-1',
     decision_fingerprint: 'c'.repeat(64),
     pair_created_at_ms: String(NOW_MS + 1),
@@ -723,7 +799,22 @@ function pairRow(): Readonly<Record<string, unknown>> {
 }
 
 function parentLockRow(): Readonly<Record<string, unknown>> {
-  return { target_intent_id: 'target-1', simulation_intent_id: 'probe-1' };
+  return { target_intent_id: TARGET_ID, simulation_intent_id: SIMULATION_ID };
+}
+
+function lockedPreparationPairRow(
+  state: 'PREPARING' | 'PREPARED',
+): Readonly<Record<string, unknown>> {
+  return {
+    preparation_state: state,
+    pair_id: 'pair-1',
+    target_intent_id: TARGET_ID,
+    simulation_intent_id: SIMULATION_ID,
+  };
+}
+
+function lineageLockRow(intentId: string): Readonly<Record<string, unknown>> {
+  return { intent_id: intentId };
 }
 
 function preparationRow(): Readonly<Record<string, unknown>> {
@@ -751,6 +842,63 @@ class ScriptedClient {
     return next;
   }
   public release(): void {}
+}
+
+class LineageSelectionClient extends ScriptedClient {
+  public constructor() { super([]); }
+  public override async query(text: string, values?: readonly unknown[]): Promise<QueryResult> {
+    this.calls.push(values === undefined ? { text } : { text, values });
+    if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return result([], null);
+    if (text.includes('AS operation_at_ms') && text.includes('FOR UPDATE')) {
+      return result([{ ...claimRow(), operation_at_ms: String(NOW_MS) }], 1);
+    }
+    if (text.includes('ORDER BY pair.created_at,pair.pair_id')) return result([pairRow()], 1);
+    if (text.includes('FOR UPDATE OF target,simulation')) return result([parentLockRow()], 1);
+    if (text.includes('NOT EXISTS (SELECT 1 FROM execution_dry_run_assessments')) {
+      return result([pairRow()], 1);
+    }
+    if (text.includes('JOIN trading_candidates AS candidate')
+      && text.includes('FOR UPDATE OF intent')) {
+      return result([lineageLockRow(TARGET_ID), lineageLockRow(SIMULATION_ID)], 2);
+    }
+    if (text.includes('AS lineage_current')) return result([{ lineage_current: false }], 1);
+    if (text.includes("failure_code='PREFLIGHT_PAIR_LINEAGE_INVALID'")) {
+      return result([{ run_id: RUN_ID }], 1);
+    }
+    if (text.includes("SET state='PREPARING'")) {
+      return result([claimRow({ state: 'PREPARING', stateRevision: 1n, pairId: 'pair-1' })], 1);
+    }
+    throw new Error('Unexpected query.');
+  }
+}
+
+class LineageMarkPreparedClient extends ScriptedClient {
+  public constructor(private readonly preparing: ClaimedExecutionPreflightPreparation) { super([]); }
+  public override async query(text: string, values?: readonly unknown[]): Promise<QueryResult> {
+    this.calls.push(values === undefined ? { text } : { text, values });
+    if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return result([], null);
+    if (text.includes('JOIN trading_candidates AS candidate')
+      && text.includes('FOR UPDATE OF intent')) {
+      return result([lineageLockRow(TARGET_ID), lineageLockRow(SIMULATION_ID)], 2);
+    }
+    if (text.includes('AS lineage_current')) return result([{ lineage_current: false }], 1);
+    if (text.includes("failure_code='PREFLIGHT_PAIR_LINEAGE_INVALID'")) {
+      return result([{
+        ...preparationRowFromClaim(this.preparing),
+        state: 'FAILED',
+        state_revision: '4',
+        failure_code: 'PREFLIGHT_PAIR_LINEAGE_INVALID',
+        manifest_fingerprint: null,
+        updated_at_ms: String(NOW_MS + 2),
+        completed_at_ms: String(NOW_MS + 2),
+        purge_after_ms: String(NOW_MS + 2 + 14_400_000),
+      }], 1);
+    }
+    if (text.includes('FROM execution_preflight_intent_preparation_runs AS preparation')
+      && text.includes('FOR UPDATE')) return result([lockedPreparationPairRow('PREPARING')], 1);
+    if (text.includes("SET state='PREPARED'")) return result([], 0);
+    throw new Error('Unexpected query.');
+  }
 }
 
 class ScriptedPool implements ExecutionPreflightPreparationPool {
@@ -791,6 +939,7 @@ async function insertPairWithParents(
   const expiresAtMs = requestedAtMs + 60_000;
   try {
     await client.query('BEGIN');
+    await insertCausalLineage(client, requestedAtMs, expiresAtMs);
     await insertIntent(client, targetId, 'TARGET', requestedAtMs, expiresAtMs);
     await insertIntent(client, simulationId, 'SIMULATION', requestedAtMs, expiresAtMs);
     await client.query(`INSERT INTO execution_preflight_intent_pairs (
@@ -824,23 +973,96 @@ async function insertIntent(
   const command = lane === 'TARGET'
     ? `paper_open_${suffix}`
     : `execution_preflight_probe_${suffix}`;
-  await insertExecutionDecisionEvent(
-    client,
-    'decision-event',
-    '11111111111111111111111111111111',
-  );
   await client.query(`INSERT INTO execution_intents (
-    id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+    id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,candidate_id,
     logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
     quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
     decision_event_id,decision_fingerprint,requested_at,expires_at,status
-  ) VALUES ($1,1,$2,'creation-entry-v1',1,'position',$2,
+  ) VALUES ($1,1,$2,'creation-entry-v1',1,'position',$5,$2,
     '11111111111111111111111111111111','BUY','PUMP_FUN_ONLY',
     'So11111111111111111111111111111111111111112','SPL_TOKEN',9,500000,NULL,1,
     'decision-event',repeat('d',64),
     TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
     TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'),'PENDING')`, [
-    id, command, requestedAtMs, expiresAtMs,
+    id, command, requestedAtMs, expiresAtMs, CAUSAL_CANDIDATE_ID,
+  ]);
+}
+
+async function insertCausalLineage(
+  client: Queryable,
+  createdAtMs: number,
+  expiresAtMs: number,
+): Promise<void> {
+  const mint = '11111111111111111111111111111111';
+  const createdAt = new Date(createdAtMs);
+  const expiresAt = new Date(expiresAtMs);
+  await client.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+    created_signature,created_slot,created_transaction_index,created_instruction_index,
+    detected_at,updated_at
+  ) VALUES ($1,'pumpfun','pumpfun','creator','SPL_TOKEN','[]','OBSERVING',
+    'signature-preparation-lineage',1,0,0,$2,$2)
+  ON CONFLICT (mint) DO NOTHING`, [mint, createdAt]);
+  await client.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    confirmation_status,observed_at,payload_version,payload,processing_status
+  ) VALUES ('raw-preparation-lineage','pumpfun','pumpfun',$1,
+    'signature-preparation-lineage',1,0,0,'finalized',$2,1,'{}','processed')
+  ON CONFLICT (event_id) DO NOTHING`, [mint, createdAt]);
+  for (const event of [
+    ['qualification-event', 'QualificationUpdated', 'qualification', Object.freeze({})],
+    ['candidate-event', 'TradingCandidateUpdated', 'paper-decision', Object.freeze({})],
+    ['decision-event', 'PaperStrategySessionUpdated', 'paper-decision', Object.freeze({
+      session: Object.freeze({
+        candidateId: CAUSAL_CANDIDATE_ID,
+        qualificationReportId: CAUSAL_REPORT_ID,
+        positionId: 'position',
+        mint,
+      }),
+    })],
+  ] as const) {
+    await client.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,confirmation_status,observed_at,payload_version,payload
+    ) VALUES ($1,'raw-preparation-lineage',$2,$3,$4,'pumpfun',
+      'signature-preparation-lineage',1,0,0,'finalized',$5,1,$6)
+    ON CONFLICT (event_id) DO NOTHING`, [
+      event[0], event[1], mint, event[2], createdAt, JSON.stringify(event[3]),
+    ]);
+  }
+  await client.query(`INSERT INTO qualification_reports (
+    report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+    profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+    preparation_score,social_score,onchain_score,total_score,as_of_slot,
+    as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+    purge_after,payload_version,payload
+  ) VALUES ($3,$1,'qualification-event','raw-preparation-lineage',
+    'qualification-event','profile',1,repeat('7',64),repeat('8',64),'QUALIFIED',
+    15,25,60,100,1,0,0,'finalized',$2,$2::TIMESTAMPTZ+INTERVAL '4 hours',1,'{}')
+  ON CONFLICT (report_id) DO NOTHING`, [mint, createdAt, CAUSAL_REPORT_ID]);
+  await client.query(`INSERT INTO trading_candidates (
+    candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+    strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+    quote_decimals,quote_token_program,reason_codes,eligible_until,created_at,
+    purge_after,payload_version,payload
+  ) VALUES ($5,$1,$6,'qualification-event','candidate-event',
+    'creation-entry-v1',1,repeat('9',64),'finalized','ELIGIBLE',
+    'So11111111111111111111111111111111111111112',9,'SPL_TOKEN',
+    '["QUALIFIED_ENTRY"]',$3,$2,$2::TIMESTAMPTZ+INTERVAL '4 hours',1,$4)
+  ON CONFLICT (candidate_id) DO NOTHING`, [mint, createdAt, expiresAt, JSON.stringify({
+    id: CAUSAL_CANDIDATE_ID, qualificationReportId: CAUSAL_REPORT_ID, mint,
+  }), CAUSAL_CANDIDATE_ID, CAUSAL_REPORT_ID]);
+  await client.query(`INSERT INTO paper_positions (
+    position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+    strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+    round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,payload_version,
+    payload,opened_at,strategy_session_id,qualification_report_id,candidate_id
+  ) VALUES ('position',$1,'So11111111111111111111111111111111111111112',9,
+    'SPL_TOKEN','creation-entry-v1',1,'PAPER_HOLDING',1,1,1,0,
+    'paper_trade_lineage','paper_open_command_lineage','qualification-event',1,'{}',$2,
+    'paper-session-lineage',$3,$4)
+  ON CONFLICT (position_id) DO NOTHING`, [
+    mint, createdAt, CAUSAL_REPORT_ID, CAUSAL_CANDIDATE_ID,
   ]);
 }
 

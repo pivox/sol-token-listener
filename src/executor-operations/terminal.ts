@@ -31,7 +31,7 @@ export interface AuthorizeOperatorActionV1Input {
 export interface AuthorizeOperatorCanaryArmInput {
   readonly terminal: OperatorTerminal;
   readonly nonceSource: () => string;
-  readonly payloadVersion: 2;
+  readonly payloadVersion: 2 | 3;
   readonly generationId: string;
   readonly walletPublicKey: string;
   readonly action: 'ARM';
@@ -57,6 +57,11 @@ export interface AuthorizeOperatorCanaryArmInput {
   readonly runtimeMaxFeePayerLamportDebit: bigint;
   readonly runtimeMaxRpcCallsPerAttempt: number;
   readonly runtimeLeaseMs: number;
+  readonly preparationRunId?: string;
+  readonly pairId?: string;
+  readonly pairFingerprint?: string;
+  readonly preparationManifestFingerprint?: string;
+  readonly proofFingerprint?: string;
 }
 
 export class ExecutionOperatorTerminalError extends Error {
@@ -136,15 +141,24 @@ export async function authorizeCanaryArmament(
       || !Number.isSafeInteger(input.runtimeMaxRpcCallsPerAttempt)
       || input.runtimeMaxRpcCallsPerAttempt < 12 || input.runtimeMaxRpcCallsPerAttempt > 16
       || !Number.isSafeInteger(input.runtimeLeaseMs) || input.runtimeLeaseMs < 3_000
-      || input.runtimeLeaseMs > 120_000) throw invalid();
+      || input.runtimeLeaseMs > 120_000
+      || (input.payloadVersion === 2 && [input.preparationRunId, input.pairId,
+        input.pairFingerprint, input.preparationManifestFingerprint,
+        input.proofFingerprint].some((value) => value !== undefined))
+      || (input.payloadVersion === 3 && (!/^execution_preflight_preparation_[0-9a-f]{64}$/u
+        .test(input.preparationRunId ?? '')
+        || !/^execution_preflight_intent_pair_[0-9a-f]{64}$/u.test(input.pairId ?? '')
+        || !/^[0-9a-f]{64}$/u.test(input.pairFingerprint ?? '')
+        || !/^[0-9a-f]{64}$/u.test(input.preparationManifestFingerprint ?? '')
+        || !/^[0-9a-f]{64}$/u.test(input.proofFingerprint ?? '')))) throw invalid();
     const phrase = [
-    'CONFIRM', 'ARM', 'V2', 'CANARY', input.walletPublicKey, input.targetIntentId,
+    'CONFIRM', 'ARM', `V${input.payloadVersion}`, 'CANARY', input.walletPublicKey, input.targetIntentId,
     input.targetMint, input.targetQuoteMint, input.targetQuoteAmountRaw.toString(),
     input.maximumCapitalLamports.toString(), String(input.maximumHoldingMs), String(input.expiresAtMs),
     input.contextFingerprint, nonce,
     ].join(' ');
     const details = [
-    'ARM_DETAILS', 'V2', `policyFingerprint=${input.policyFingerprint}`,
+    'ARM_DETAILS', `V${input.payloadVersion}`, `policyFingerprint=${input.policyFingerprint}`,
     `walletSnapshotFingerprint=${input.walletSnapshotFingerprint}`,
     `providerSnapshotFingerprint=${input.providerSnapshotFingerprint}`,
     `runtimeQuoteMaxAgeMs=${input.runtimeQuoteMaxAgeMs}`,
@@ -155,11 +169,18 @@ export async function authorizeCanaryArmament(
     `runtimeMaxFeePayerLamportDebit=${input.runtimeMaxFeePayerLamportDebit.toString()}`,
     `runtimeMaxRpcCallsPerAttempt=${input.runtimeMaxRpcCallsPerAttempt}`,
     `runtimeLeaseMs=${input.runtimeLeaseMs}`,
+    ...(input.payloadVersion === 3 ? [
+      `preparationRunId=${input.preparationRunId}`,
+      `pairId=${input.pairId}`,
+      `pairFingerprint=${input.pairFingerprint}`,
+      `preparationManifestFingerprint=${input.preparationManifestFingerprint}`,
+      `proofFingerprint=${input.proofFingerprint}`,
+    ] : []),
     ].join(' ');
     input.terminal.write(`${details}\n${phrase}\n`);
     if (await input.terminal.readLine() !== phrase) throw invalid();
     const nonceHash = createHash('sha256').update(JSON.stringify([
-    'execution-operator-nonce-v2', nonce, input.generationId, input.action,
+    `execution-operator-nonce-v${input.payloadVersion}`, nonce, input.generationId, input.action,
     input.phase, input.contextFingerprint, input.operatorId, input.nowMs,
     ])).digest('hex');
     return createOperatorAuthorizationV2({

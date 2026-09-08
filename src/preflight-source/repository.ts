@@ -55,7 +55,12 @@ export class PostgresExecutionPreflightSourceRepository {
         artifact.artifact_id,artifact.result_fingerprint AS artifact_fingerprint,
         attempt.attempt_number AS simulation_attempt_number,
         target.candidate_id,candidate.evidence_fingerprint AS candidate_evidence_fingerprint,
-        candidate.confirmation_status AS candidate_confirmation_status,generation.generation_id
+        candidate.confirmation_status AS candidate_confirmation_status,
+        trunc(EXTRACT(EPOCH FROM candidate.eligible_until)*1000)::TEXT
+          AS candidate_eligible_until_ms,
+        trunc(EXTRACT(EPOCH FROM candidate.purge_after)*1000)::TEXT
+          AS candidate_purge_after_ms,
+        generation.generation_id
         FROM execution_preflight_intent_preparation_runs preparation
         JOIN execution_preflight_intent_pairs pair ON pair.pair_id=preparation.pair_id
         JOIN execution_preflight_intent_pair_memberships target_membership
@@ -258,6 +263,7 @@ export class PostgresExecutionPreflightSourceRepository {
         observedAtMs: wallet.observedAtMs, expiresAtMs: provider.expiresAtMs,
       }));
       const expiresAtMs = Math.min(lineage.runExpiresAtMs, lineage.pairExpiresAtMs,
+        lineage.candidateEligibleUntilMs, lineage.candidatePurgeAfterMs,
         target.intent.expiresAtMs, provider.expiresAtMs);
       const unsignedSource = Object.freeze({
         schemaVersion: 'execution-preflight-draft-source.v2' as const,
@@ -309,6 +315,8 @@ interface LineageRow {
   readonly artifactFingerprint: string;
   readonly candidateId: string;
   readonly candidateEvidenceFingerprint: string;
+  readonly candidateEligibleUntilMs: number;
+  readonly candidatePurgeAfterMs: number;
   readonly generationId: string;
   readonly manifestFingerprint: string;
 }
@@ -319,7 +327,8 @@ function lineageFrom(row: Readonly<Record<string, unknown>>): LineageRow {
     'pair_id', 'pair_fingerprint', 'target_intent_id', 'simulation_intent_id',
     'pair_expires_at_ms', 'assessment_id', 'assessment_fingerprint', 'artifact_id',
     'artifact_fingerprint', 'simulation_attempt_number', 'candidate_id',
-    'candidate_evidence_fingerprint', 'candidate_confirmation_status', 'generation_id'] as const);
+    'candidate_evidence_fingerprint', 'candidate_confirmation_status',
+    'candidate_eligible_until_ms', 'candidate_purge_after_ms', 'generation_id'] as const);
   if (value.run_state !== 'PREPARED' || value.simulation_attempt_number !== 1
     || value.candidate_confirmation_status !== 'finalized') throw new TypeError();
   return Object.freeze({
@@ -335,6 +344,8 @@ function lineageFrom(row: Readonly<Record<string, unknown>>): LineageRow {
     artifactFingerprint: fingerprintValue(value.artifact_fingerprint),
     candidateId: stringValue(value.candidate_id),
     candidateEvidenceFingerprint: fingerprintValue(value.candidate_evidence_fingerprint),
+    candidateEligibleUntilMs: timestampText(value.candidate_eligible_until_ms),
+    candidatePurgeAfterMs: timestampText(value.candidate_purge_after_ms),
     generationId: stringValue(value.generation_id),
     manifestFingerprint: fingerprintValue(value.manifest_fingerprint),
   });

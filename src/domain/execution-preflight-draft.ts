@@ -9,7 +9,10 @@ import {
   type ExecutionSimulationArtifactV1,
 } from './execution-simulation.js';
 import type { ProviderUsageSnapshotV1 } from './execution-provider-quota.js';
-import { createProviderUsageSnapshot } from './execution-provider-quota.js';
+import {
+  createProviderUsageSnapshot,
+  evaluateProviderQuota,
+} from './execution-provider-quota.js';
 import {
   createExecutionReadinessManifest,
   createExecutionWalletGeneration,
@@ -232,6 +235,17 @@ export function createExecutionPreflightDraft(
     );
     assertPolicyFreshness(walletSnapshot, providerSnapshot, databaseNowMs,
       policy.walletSnapshotMaxAgeMs, policy.providerUsageMaxAgeMs);
+    const providerQuota = evaluateProviderQuota(Object.freeze({
+      policy,
+      previousSnapshot: null,
+      snapshot: providerSnapshot,
+      localUsedSinceMeasurement: 0n,
+      openPositions: walletSnapshot.openPositions.length,
+      consecutiveRateLimits: Object.freeze([]),
+      allEndpointsUnavailable: false,
+      nowMs: databaseNowMs,
+    }));
+    if (providerQuota.state !== 'NORMAL') throw invalid();
     const mainnetSimulationFingerprint = createMainnetSimulationEvidenceFingerprint({
       artifactId: simulation.artifactId,
       resultFingerprint: simulation.resultFingerprint,

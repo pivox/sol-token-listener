@@ -51,6 +51,7 @@ const EXECUTOR_ALLOWED_DYNAMIC_ELEMENT_ACCESSES = new Set([
   'expected[key]',
   'CLAIM_SQL[options.purpose]',
   'intentValues[key]',
+  'claimValues[key]',
 ]);
 const SIMULATION_ONLY_ALLOWED_BARE_MODULES = new Set([
   'pg', 'pino', 'dotenv', 'dotenv/config',
@@ -72,6 +73,14 @@ const SIMULATION_ONLY_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/markets\/pumpswap\/(?:borsh-reader|constants|errors|official-sdk|pool-account-decoder|pumpswap-fee-state|pumpswap-quote\.provider|reserve-math|types|generated\/pumpswap-idl)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/solana\/rpc\/types\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/utils\/json\.(?:js|ts)$/u,
+];
+const PREFLIGHT_PREPARATION_ALLOWED_LOCAL_MODULES = [
+  ...SIMULATION_ONLY_ALLOWED_LOCAL_MODULES,
+  /^(?:dist\/)?src\/executor-preflight-preparation\/(?:main|config|exact-intent-adapter|manifest|service)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/execution-preflight-preparation\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/ports\/execution-preflight-preparation-repository\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/execution-intent-lineage\.repository\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/execution-preflight-preparation\.repository\.(?:js|ts)$/u,
 ];
 const SIMULATION_ONLY_FORBIDDEN_PATH_SEGMENTS = new Set([
   'execution', 'paper', 'listener', 'raydium',
@@ -111,10 +120,10 @@ const OPERATIONS_ALLOWED_NODE_BUILTINS = new Set([
 const OPERATIONS_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor-operations\/(?:config|database|main|service|terminal)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor\/database\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/execution-(?:canary|canary-attestation|fault-policy|intent|operations|provider-quota|reconciliation|risk-policy|safety-(?:attestation|qualification)|wallet-snapshot)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/execution-(?:canary|canary-attestation|fault-policy|intent|operations|preflight-bundle|preflight-draft|provider-quota|readiness|reconciliation|risk-policy|safety-(?:attestation|qualification)|simulation|wallet-snapshot)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor-risk\/admission-service\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-operations-repository\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/storage\/(?:database|execution-intent-expiration|execution-operations\.repository|execution-risk\.repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-intent-expiration|execution-intent-lineage\.repository|execution-operations\.repository|execution-risk\.repository)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/utils\/json\.(?:js|ts)$/u,
 ];
 const OPERATIONS_FORBIDDEN_IDENTIFIERS = new Set([
@@ -268,6 +277,23 @@ export function simulationOnlyExecutorBoundaryViolations(
   sourcePath: string,
   repositoryRoot: string,
 ): readonly string[] {
+  return simulationExecutorBoundaryViolations(sourceText, sourcePath, repositoryRoot, false);
+}
+
+export function preflightPreparationBoundaryViolations(
+  sourceText: string,
+  sourcePath: string,
+  repositoryRoot: string,
+): readonly string[] {
+  return simulationExecutorBoundaryViolations(sourceText, sourcePath, repositoryRoot, true);
+}
+
+function simulationExecutorBoundaryViolations(
+  sourceText: string,
+  sourcePath: string,
+  repositoryRoot: string,
+  preparationProfile: boolean,
+): readonly string[] {
   const sourceFile = ts.createSourceFile(sourcePath, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const violations = [...executionBoundaryViolations(sourceText, sourcePath, repositoryRoot)];
   const normalizedSourcePath = relative(repositoryRoot, sourcePath).replaceAll('\\', '/');
@@ -284,7 +310,9 @@ export function simulationOnlyExecutorBoundaryViolations(
       const targetPath = relative(repositoryRoot, target).replaceAll('\\', '/');
       if (hasSimulationOnlyForbiddenPathSegment(targetPath)) {
         violations.push(`Forbidden simulation-only local module: ${specifier}`);
-      } else if (!SIMULATION_ONLY_ALLOWED_LOCAL_MODULES.some((pattern) => pattern.test(targetPath))) {
+      } else if (!(preparationProfile
+        ? PREFLIGHT_PREPARATION_ALLOWED_LOCAL_MODULES
+        : SIMULATION_ONLY_ALLOWED_LOCAL_MODULES).some((pattern) => pattern.test(targetPath))) {
         violations.push(`Simulation-only local module is outside the allowlist: ${specifier}`);
       }
       continue;
@@ -303,7 +331,8 @@ export function simulationOnlyExecutorBoundaryViolations(
       continue;
     }
     if (!SIMULATION_ONLY_ALLOWED_BARE_MODULES.has(specifier)
-      && !SIMULATION_ONLY_ALLOWED_NODE_BUILTINS.has(specifier)) {
+      && !SIMULATION_ONLY_ALLOWED_NODE_BUILTINS.has(specifier)
+      && !(preparationProfile && specifier === 'node:fs')) {
       violations.push(`Simulation-only module is outside the allowlist: ${specifier}`);
     }
   }

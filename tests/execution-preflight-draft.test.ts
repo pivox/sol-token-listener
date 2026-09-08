@@ -103,3 +103,16 @@ void test('rejects missing or reordered static gates', () => {
       ...input.catalog.gates.slice(2)]),
   })), /Invalid execution preflight draft/u);
 });
+
+void test('refuses to fabricate provider exit capacity when quota blocks a new entry', () => {
+  const input = preflightDraftInputs();
+  const entryBlockedPolicy = Object.freeze({
+    ...input.catalog.policy,
+    providerEntryCostUnits: 995n,
+  });
+
+  assert.throws(() => createExecutionPreflightDraft(input.source, Object.freeze({
+    ...input.catalog,
+    policy: entryBlockedPolicy,
+  })), /Invalid execution preflight draft/u);
+});

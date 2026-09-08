@@ -62,6 +62,46 @@ void test('migration 043 is replayable and enforces both new foreign keys on rea
   }
 });
 
+void test('migration 043 rejects drifted foreign-key columns and options on real PostgreSQL', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent lineage migration drift skipped');
+    return;
+  }
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const schema = `execution_lineage_drift_${randomUUID().replaceAll('-', '')}`;
+  await admin.query(`CREATE SCHEMA "${schema}"`);
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path="${schema}"` });
+  try {
+    await migrateDatabase({ pool });
+    const sql = await readFile(new URL(`../migrations/${migrationName}`, import.meta.url), 'utf8');
+
+    await pool.query(`ALTER TABLE execution_intents
+      DROP CONSTRAINT execution_intents_candidate_id_fkey,
+      ADD CONSTRAINT execution_intents_candidate_id_fkey
+        FOREIGN KEY (mint) REFERENCES trading_candidates(candidate_id)
+        ON DELETE RESTRICT NOT VALID`);
+    await assert.rejects(pool.query(sql), (error: unknown) =>
+      error instanceof Error && 'code' in error && error.code === '55000');
+
+    await pool.query(`ALTER TABLE execution_intents
+      DROP CONSTRAINT execution_intents_candidate_id_fkey,
+      ADD CONSTRAINT execution_intents_candidate_id_fkey
+        FOREIGN KEY (candidate_id) REFERENCES trading_candidates(candidate_id)
+        ON DELETE RESTRICT NOT VALID,
+      DROP CONSTRAINT execution_intents_decision_event_id_fkey,
+      ADD CONSTRAINT execution_intents_decision_event_id_fkey
+        FOREIGN KEY (decision_event_id) REFERENCES domain_events(event_id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED NOT VALID`);
+    await assert.rejects(pool.query(sql), (error: unknown) =>
+      error instanceof Error && 'code' in error && error.code === '55000');
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await admin.end();
+  }
+});
+
 function insertIntent(
   pool: InstanceType<typeof pg.Pool>,
   decisionEventId: string,

@@ -24,7 +24,8 @@ const WORKER_TABLE_AUTHORITY: Readonly<Record<string, TableAuthority>> = Object.
   execution_intents: authority({
     SELECT: [
       'id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
-      'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
+      'position_id', 'candidate_id', 'logical_command_id', 'mint', 'side', 'venue_policy',
+      'quote_mint',
       'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
       'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint',
       'requested_at', 'expires_at', 'status', 'attempt_count', 'state_revision',

@@ -14,6 +14,10 @@ import type {
   ExecutionPreflightPreparationStartOptions,
 } from '../ports/execution-preflight-preparation-repository.js';
 import { getDatabasePool } from './database.js';
+import {
+  assertExecutionIntentLineageCurrentInTransaction,
+  ExecutionIntentLineageRepositoryError,
+} from './execution-intent-lineage.repository.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -559,9 +563,18 @@ implements ExecutionPreflightPreparationRepository {
       requireActive(signal);
       if (claim.preparation.state === 'PREPARING') {
         const exact = await this.readSelectedPair(client, claim.preparation.runId);
+        if (exact === null) failPairConflict();
+        await lockPairParents(client, exact);
+        if (!await lockPairCausalLineage(client, exact)
+          || !await pairLineageIsCurrent(client, exact)) {
+          await terminalizeLineageInvalid(client, claim, exact.pairId, false);
+          await client.query('COMMIT');
+          committed = true;
+          throw repositoryError('PREFLIGHT_PAIR_LINEAGE_INVALID');
+        }
         await client.query('COMMIT');
         committed = true;
-        return exact === null ? failPairConflict() : selection(claim, exact);
+        return selection(claim, exact);
       }
       if (claim.preparation.state !== 'WAITING') throw dataError();
 
@@ -580,18 +593,7 @@ implements ExecutionPreflightPreparationRepository {
         return null;
       }
       const pair = pairFromResult(candidate);
-      const parentLocks = await client.query(`SELECT
-          target.id AS target_intent_id,simulation.id AS simulation_intent_id
-        FROM execution_preflight_intent_pairs AS pair
-        JOIN execution_intents AS target ON target.id=pair.target_intent_id
-        JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
-        WHERE pair.pair_id=$1 AND target.id=$2 AND simulation.id=$3
-        FOR UPDATE OF target,simulation`, [
-        pair.pairId,
-        pair.targetIntentId,
-        pair.simulationIntentId,
-      ]);
-      if (parentLocks.rowCount !== 1 || parentLocks.rows.length !== 1) failPairConflict();
+      await lockPairParents(client, pair);
       const validated = await client.query(`SELECT ${PAIR_PROJECTION}
         FROM execution_preflight_intent_pairs AS pair
         JOIN execution_intents AS target ON target.id=pair.target_intent_id
@@ -650,6 +652,13 @@ implements ExecutionPreflightPreparationRepository {
       }
       const exactPair = pairFromResult(validated);
       if (!sameStoredPair(pair, exactPair)) failPairConflict();
+      if (!await lockPairCausalLineage(client, exactPair)
+        || !await pairLineageIsCurrent(client, exactPair)) {
+        await terminalizeLineageInvalid(client, claim, exactPair.pairId, false);
+        await client.query('COMMIT');
+        committed = true;
+        throw repositoryError('PREFLIGHT_PAIR_LINEAGE_INVALID');
+      }
       const updated = await client.query(`UPDATE execution_preflight_intent_preparation_runs
         AS preparation
         SET state='PREPARING',pair_id=$7,state_revision=preparation.state_revision+1
@@ -790,7 +799,38 @@ implements ExecutionPreflightPreparationRepository {
     const options = markPreparedOptions(optionsValue);
     requireSignal(signal);
     const client = await this.connect(signal);
+    let committed = false;
     try {
+      await client.query('BEGIN');
+      const pairLock = await client.query(`SELECT
+          preparation.state AS preparation_state,
+          pair.pair_id,
+          target.id AS target_intent_id,simulation.id AS simulation_intent_id
+        FROM execution_preflight_intent_preparation_runs AS preparation
+        JOIN execution_preflight_intent_pairs AS pair ON pair.pair_id=preparation.pair_id
+        JOIN execution_intents AS target ON target.id=pair.target_intent_id
+        JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
+        WHERE preparation.run_id=$1 AND preparation.pair_id=$6
+          AND ((preparation.state='PREPARING'
+              AND preparation.state_revision IN ($2::BIGINT,$2::BIGINT+1)
+              AND preparation.lease_owner=$3 AND preparation.lease_token=$4::UUID
+              AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+                +($5::BIGINT*INTERVAL '1 millisecond'))
+            OR (preparation.state='PREPARED'
+              AND preparation.state_revision=$2::BIGINT+1))
+        FOR UPDATE OF preparation,pair,target,simulation`, [
+        ...proofClaimValues(claim), claim.preparation.pairId,
+      ]);
+      const pair = lockedPairForPreparation(pairLock);
+      if (!await lockPairCausalLineage(client, pair)
+        || !await pairLineageIsCurrent(client, pair)) {
+        if (pair.preparationState === 'PREPARING') {
+          await terminalizeLineageInvalid(client, claim, pair.pairId, true);
+          await client.query('COMMIT');
+          committed = true;
+        }
+        throw repositoryError('PREFLIGHT_PAIR_LINEAGE_INVALID');
+      }
       const prepared = await client.query(MARK_PREPARED_SQL, [
         ...proofClaimValues(claim), options.manifestFingerprint,
       ]);
@@ -798,11 +838,15 @@ implements ExecutionPreflightPreparationRepository {
       if (prepared.rowCount !== 1 || prepared.rows.length !== 1) {
         throw repositoryError('PREFLIGHT_PAIR_LINEAGE_INVALID');
       }
-      return preparationFromRow(onlyRow(prepared));
+      const result = preparationFromRow(onlyRow(prepared));
+      await client.query('COMMIT');
+      committed = true;
+      return result;
     } catch (error: unknown) {
+      if (!committed) await rollback(client);
       throw normalizeError(error, signal);
     } finally {
-      client.release();
+      client.release(!committed);
     }
   }
 
@@ -923,6 +967,123 @@ interface StoredPair {
   readonly decisionFingerprint: string;
   readonly pairCreatedAtMs: number;
   readonly pairExpiresAtMs: number;
+}
+
+interface LockedPreparationPair {
+  readonly preparationState: 'PREPARING' | 'PREPARED';
+  readonly pairId: string;
+  readonly targetIntentId: string;
+  readonly simulationIntentId: string;
+}
+
+async function lockPairParents(
+  client: ExecutionPreflightPreparationClient,
+  pair: StoredPair,
+): Promise<void> {
+  const parentLocks = await client.query(`SELECT
+      target.id AS target_intent_id,simulation.id AS simulation_intent_id
+    FROM execution_preflight_intent_pairs AS pair
+    JOIN execution_intents AS target ON target.id=pair.target_intent_id
+    JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
+    WHERE pair.pair_id=$1 AND target.id=$2 AND simulation.id=$3
+    FOR UPDATE OF target,simulation`, [
+    pair.pairId,
+    pair.targetIntentId,
+    pair.simulationIntentId,
+  ]);
+  if (parentLocks.rowCount !== 1 || parentLocks.rows.length !== 1) failPairConflict();
+}
+
+async function pairLineageIsCurrent(
+  client: ExecutionPreflightPreparationClient,
+  pair: Readonly<{ targetIntentId: string; simulationIntentId: string }>,
+): Promise<boolean> {
+  try {
+    await assertExecutionIntentLineageCurrentInTransaction(client, pair.targetIntentId);
+    await assertExecutionIntentLineageCurrentInTransaction(client, pair.simulationIntentId);
+    return true;
+  } catch (error: unknown) {
+    if (error instanceof ExecutionIntentLineageRepositoryError
+      && (error.code === 'LINEAGE_INVALID' || error.code === 'INVALID_INPUT')) return false;
+    throw error;
+  }
+}
+
+async function lockPairCausalLineage(
+  client: ExecutionPreflightPreparationClient,
+  pair: Readonly<{ targetIntentId: string; simulationIntentId: string }>,
+): Promise<boolean> {
+  const intentIds = Object.freeze([
+    pair.targetIntentId,
+    pair.simulationIntentId,
+  ].sort());
+  const locked = await client.query(`SELECT intent.id AS intent_id
+    FROM execution_intents AS intent
+    JOIN trading_candidates AS candidate
+      ON candidate.candidate_id=intent.candidate_id
+    JOIN qualification_reports AS report
+      ON report.report_id=candidate.report_id
+    JOIN domain_events AS decision
+      ON decision.event_id=intent.decision_event_id
+    JOIN domain_events AS source
+      ON source.event_id=candidate.source_event_id
+    JOIN domain_events AS candidate_event
+      ON candidate_event.event_id=candidate.candidate_event_id
+    JOIN domain_events AS qualification
+      ON qualification.event_id=report.qualification_event_id
+    JOIN raw_chain_events AS source_raw
+      ON source_raw.event_id=report.source_raw_event_id
+    JOIN paper_positions AS position
+      ON position.position_id=intent.position_id
+    WHERE intent.id=ANY($1::TEXT[])
+    ORDER BY intent.id
+    FOR UPDATE OF intent,candidate,report,decision,source,candidate_event,
+      qualification,source_raw,position`, [intentIds]);
+  if (locked.rowCount !== 2 || locked.rows.length !== 2) return false;
+  const lockedIds = locked.rows.map((row) => exactRecord(row, ['intent_id'] as const).intent_id);
+  return lockedIds[0] === intentIds[0] && lockedIds[1] === intentIds[1];
+}
+
+async function terminalizeLineageInvalid(
+  client: ExecutionPreflightPreparationClient,
+  claim: ClaimedExecutionPreflightPreparation,
+  pairId: string,
+  allowOneRevisionAdvance: boolean,
+): Promise<void> {
+  const revisionPredicate = allowOneRevisionAdvance
+    ? 'preparation.state_revision IN ($3::BIGINT,$3::BIGINT+1)'
+    : 'preparation.state_revision=$3::BIGINT';
+  const failed = await client.query(`UPDATE execution_preflight_intent_preparation_runs
+    AS preparation
+    SET state='FAILED',pair_id=COALESCE(preparation.pair_id,$7),
+      state_revision=preparation.state_revision+1,
+      failure_code='PREFLIGHT_PAIR_LINEAGE_INVALID'
+    WHERE preparation.run_id=$1 AND preparation.state=$2
+      AND ${revisionPredicate}
+      AND preparation.lease_owner=$4 AND preparation.lease_token=$5::UUID
+      AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+        +($6::BIGINT*INTERVAL '1 millisecond')
+      AND (preparation.pair_id IS NULL OR preparation.pair_id=$7)
+    RETURNING preparation.run_id`, [...claimValues(claim), pairId]);
+  if (failed.rowCount !== 1 || failed.rows.length !== 1) {
+    throw repositoryError('PREPARATION_LEASE_LOST');
+  }
+}
+
+function lockedPairForPreparation(result: QueryResult): LockedPreparationPair {
+  const row = exactRecord(onlyRow(result), [
+    'preparation_state', 'pair_id', 'target_intent_id', 'simulation_intent_id',
+  ] as const);
+  const preparationState = row.preparation_state;
+  if (preparationState !== 'PREPARING' && preparationState !== 'PREPARED') throw dataError();
+  const pair: LockedPreparationPair = Object.freeze({
+    preparationState,
+    pairId: text(row.pair_id),
+    targetIntentId: text(row.target_intent_id),
+    simulationIntentId: text(row.simulation_intent_id),
+  });
+  if (pair.targetIntentId === pair.simulationIntentId) throw dataError();
+  return pair;
 }
 
 function startOptions(value: unknown): ExecutionPreflightPreparationStartOptions {

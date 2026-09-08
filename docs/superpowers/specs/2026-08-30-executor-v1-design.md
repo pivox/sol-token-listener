@@ -1,8 +1,8 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.12.1
+**Version de spécification :** 1.13.0
 
-**Date :** 2026-08-31
+**Date :** 2026-09-08
 
 **Statut :** APPROUVÉE
 
@@ -14,12 +14,18 @@ préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
 hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
 read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
-et autorité PostgreSQL fermée du worker non signant #51-H2j, puis paire
-d'intentions canary non signante #51-H2k-a ; la préparation one-shot
-#51-H2k-b reste à livrer
+et autorité PostgreSQL fermée du worker non signant #51-H2j, paire
+d'intentions canary non signante #51-H2k-a, puis préparation one-shot exacte,
+lignée causale et handoff H2h/H2c versionné #51-H2k-b. Le canary reste
+`CANARY_NOT_STARTED`.
 
 ## Historique des versions
 
+- **1.13.0 — 2026-09-08 :** livre H2k-b derrière un flag faux par défaut :
+  migrations 042–043, sélection one-shot exacte, dry-run de la cible,
+  simulation du probe, manifeste redacted, source H2h v2 par `preparationRunId`
+  et requête H2c wire V3. Aucun wallet, armement, octet signé ou envoi n'est
+  ajouté ; le canary reste `CANARY_NOT_STARTED`.
 - **1.12.1 — 2026-09-06 :** H2k-a est livrée derrière
   `EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false` : la migration 041 lie
   atomiquement la cible target et son probe de simulation, interdit au worker

@@ -388,7 +388,7 @@ TO sol_token_listener_writer;
 
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
@@ -396,7 +396,7 @@ GRANT SELECT (
   purge_after
 ), INSERT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status
 )
@@ -948,7 +948,7 @@ FROM PUBLIC,sol_token_executor_worker;
 
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
@@ -1139,7 +1139,7 @@ ON TABLE migration_history TO sol_token_executor_live_recovery;
 
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
@@ -1147,7 +1147,7 @@ GRANT SELECT (
   purge_after,live_reserved
 ), INSERT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,live_reserved
 ), UPDATE (
@@ -1320,6 +1320,7 @@ GRANT SELECT ON TABLE
   execution_live_positions,
   execution_live_unsigned_simulation_evidence,
   execution_operator_authorizations,
+  execution_preflight_intent_preparation_runs,
   execution_preflight_intent_pair_memberships,
   execution_preflight_intent_pairs,
   execution_provider_rate_limit_events,
@@ -1402,6 +1403,7 @@ GRANT DELETE ON TABLE
   execution_live_positions,
   execution_live_unsigned_simulation_evidence,
   execution_operator_authorizations,
+  execution_preflight_intent_preparation_runs,
   execution_preflight_intent_pair_memberships,
   execution_preflight_intent_pairs,
   execution_pre_signature_locks,
@@ -1718,7 +1720,7 @@ ON TABLE market_pools TO sol_token_executor_live;
 
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
@@ -2097,7 +2099,7 @@ ON TABLE execution_wallet_generations TO sol_token_executor_operations;
 
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,attempt_count,
   state_revision,last_reason_code,terminal_at,reconciliation_completed_at,purge_after,

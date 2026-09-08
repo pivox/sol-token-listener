@@ -343,7 +343,9 @@ function requireActiveSignal(signal: unknown): asserts signal is AbortSignal {
 }
 
 function errorCode(error: unknown): unknown {
-  return typeof error === 'object' && error !== null ? Reflect.get(error, 'code') : undefined;
+  if (typeof error !== 'object' || error === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
 }
 
 function validateDependencies(value: unknown): void {
@@ -374,19 +376,24 @@ function validateDependencies(value: unknown): void {
     if (typeof preparations !== 'object' || preparations === null || isProxy(preparations)) {
       throw serviceError();
     }
-    for (const method of [
-      'startOrResume', 'selectFirstPair', 'expireWaitingWithoutPair', 'bindTargetAssessment',
-      'bindSimulationArtifact', 'markPrepared', 'renew', 'fail', 'read',
-    ] as const) {
-      if (typeof Reflect.get(preparations, method) !== 'function') throw serviceError();
-    }
+    const repository = preparations as Partial<ExecutionPreflightPreparationRepository>;
+    if (typeof repository.startOrResume !== 'function'
+      || typeof repository.selectFirstPair !== 'function'
+      || typeof repository.expireWaitingWithoutPair !== 'function'
+      || typeof repository.bindTargetAssessment !== 'function'
+      || typeof repository.bindSimulationArtifact !== 'function'
+      || typeof repository.markPrepared !== 'function'
+      || typeof repository.renew !== 'function'
+      || typeof repository.fail !== 'function'
+      || typeof repository.read !== 'function') throw serviceError();
     const manifestWriter = dependencies.manifestWriter;
     if (typeof dependencies.createTargetWorker !== 'function'
       || typeof dependencies.createSimulationWorker !== 'function'
       || typeof dependencies.delay !== 'function'
       || typeof manifestWriter !== 'object' || manifestWriter === null
       || isProxy(manifestWriter)
-      || typeof Reflect.get(manifestWriter, 'write') !== 'function') throw serviceError();
+      || typeof (manifestWriter as Partial<ExecutionPreflightIntentPreparationManifestWriter>)
+        .write !== 'function') throw serviceError();
   } catch {
     throw serviceError();
   }

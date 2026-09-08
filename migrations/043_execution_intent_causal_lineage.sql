@@ -4,7 +4,12 @@ ALTER TABLE execution_intents
 DO $execution_intents_causal_lineage_schema$
 DECLARE
   relation_oid OID;
+  candidate_relation_oid OID;
+  event_relation_oid OID;
   candidate_attribute RECORD;
+  decision_attribute_number SMALLINT;
+  candidate_reference_attribute_number SMALLINT;
+  event_reference_attribute_number SMALLINT;
   candidate_fk_count INTEGER;
   decision_fk_count INTEGER;
 BEGIN
@@ -15,7 +20,22 @@ BEGIN
     AND relation.relname='execution_intents'
     AND relation.relkind='r';
 
-  SELECT attribute.atttypid,attribute.attnotnull,default_value.oid AS default_oid
+  SELECT relation.oid INTO candidate_relation_oid
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+  WHERE namespace.nspname=pg_catalog.current_schema()
+    AND relation.relname='trading_candidates'
+    AND relation.relkind='r';
+
+  SELECT relation.oid INTO event_relation_oid
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+  WHERE namespace.nspname=pg_catalog.current_schema()
+    AND relation.relname='domain_events'
+    AND relation.relkind='r';
+
+  SELECT attribute.attnum,attribute.atttypid,attribute.attnotnull,
+    default_value.oid AS default_oid
   INTO candidate_attribute
   FROM pg_catalog.pg_attribute attribute
   LEFT JOIN pg_catalog.pg_attrdef default_value
@@ -26,10 +46,36 @@ BEGIN
     AND attribute.attnum>0
     AND NOT attribute.attisdropped;
 
+  SELECT attribute.attnum INTO decision_attribute_number
+  FROM pg_catalog.pg_attribute attribute
+  WHERE attribute.attrelid=relation_oid
+    AND attribute.attname='decision_event_id'
+    AND attribute.attnum>0
+    AND NOT attribute.attisdropped;
+
+  SELECT attribute.attnum INTO candidate_reference_attribute_number
+  FROM pg_catalog.pg_attribute attribute
+  WHERE attribute.attrelid=candidate_relation_oid
+    AND attribute.attname='candidate_id'
+    AND attribute.attnum>0
+    AND NOT attribute.attisdropped;
+
+  SELECT attribute.attnum INTO event_reference_attribute_number
+  FROM pg_catalog.pg_attribute attribute
+  WHERE attribute.attrelid=event_relation_oid
+    AND attribute.attname='event_id'
+    AND attribute.attnum>0
+    AND NOT attribute.attisdropped;
+
   IF relation_oid IS NULL
+    OR candidate_relation_oid IS NULL
+    OR event_relation_oid IS NULL
     OR candidate_attribute.atttypid IS DISTINCT FROM 'pg_catalog.text'::pg_catalog.regtype::OID
     OR candidate_attribute.attnotnull IS DISTINCT FROM FALSE
-    OR candidate_attribute.default_oid IS NOT NULL THEN
+    OR candidate_attribute.default_oid IS NOT NULL
+    OR decision_attribute_number IS NULL
+    OR candidate_reference_attribute_number IS NULL
+    OR event_reference_attribute_number IS NULL THEN
     RAISE EXCEPTION 'execution_intents causal lineage column has a malformed schema'
       USING ERRCODE='55000';
   END IF;
@@ -65,16 +111,30 @@ BEGIN
   WHERE constraint_value.conrelid=relation_oid
     AND constraint_value.conname='execution_intents_candidate_id_fkey'
     AND constraint_value.contype='f'
-    AND constraint_value.confrelid='trading_candidates'::pg_catalog.regclass
-    AND constraint_value.confdeltype='r';
+    AND constraint_value.confrelid=candidate_relation_oid
+    AND constraint_value.conkey=ARRAY[candidate_attribute.attnum]::SMALLINT[]
+    AND constraint_value.confkey=ARRAY[candidate_reference_attribute_number]::SMALLINT[]
+    AND constraint_value.confupdtype='a'
+    AND constraint_value.confdeltype='r'
+    AND constraint_value.confmatchtype='s'
+    AND constraint_value.condeferrable=FALSE
+    AND constraint_value.condeferred=FALSE
+    AND constraint_value.convalidated=FALSE;
 
   SELECT COUNT(*)::INTEGER INTO decision_fk_count
   FROM pg_catalog.pg_constraint constraint_value
   WHERE constraint_value.conrelid=relation_oid
     AND constraint_value.conname='execution_intents_decision_event_id_fkey'
     AND constraint_value.contype='f'
-    AND constraint_value.confrelid='domain_events'::pg_catalog.regclass
-    AND constraint_value.confdeltype='r';
+    AND constraint_value.confrelid=event_relation_oid
+    AND constraint_value.conkey=ARRAY[decision_attribute_number]::SMALLINT[]
+    AND constraint_value.confkey=ARRAY[event_reference_attribute_number]::SMALLINT[]
+    AND constraint_value.confupdtype='a'
+    AND constraint_value.confdeltype='r'
+    AND constraint_value.confmatchtype='s'
+    AND constraint_value.condeferrable=FALSE
+    AND constraint_value.condeferred=FALSE
+    AND constraint_value.convalidated=FALSE;
 
   IF candidate_fk_count<>1 OR decision_fk_count<>1 THEN
     RAISE EXCEPTION 'execution_intents causal lineage constraints have a malformed schema'

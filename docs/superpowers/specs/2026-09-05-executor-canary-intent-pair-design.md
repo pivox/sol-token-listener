@@ -1,19 +1,27 @@
 # Paire d'intentions canary non signante — conception #51-H2k
 
-**Version de spécification :** 1.2.0
+**Version de spécification :** 1.3.0
 
-**Version de la spécification parente :** 1.12.1
+**Version de la spécification parente :** 1.13.0
 
-**Version de la spécification canary :** 1.3.1
+**Version de la spécification canary :** 1.4.0
 
 **Date :** 2026-09-08
 
-**Statut :** H2k-a LIVRÉE — H2k-b À LIVRER
+**Statut :** H2k-a ET H2k-b LIVRÉES — OFF PAR DÉFAUT — CANARY_NOT_STARTED
 
 **Issue parente :** #51
 
 ## Historique des versions
 
+- **1.3.0 — 2026-09-08 :** constate H2k-b livré mais désactivé par défaut :
+  runner one-shot exact, validation causale TARGET/SIMULATION sous verrous,
+  dry-run et simulation sans signature, migration 042 du run durable, migration
+  043 de lineage causale, manifeste
+  redacted, source H2h v2 et requête H2c wire V3. L'expiration est bornée par
+  le candidat, le quota provider doit être `NORMAL` et aucune capacité wallet,
+  armement, signature ou soumission n'est ajoutée. `CANARY_NOT_STARTED` reste
+  obligatoire.
 - **1.2.0 — 2026-09-08 :** versionne le contrat public de préparation avec
   les liaisons persistantes de l'assessment cible et de l'artefact de
   simulation, puis la terminalisation `PREPARED` liée au fingerprint du
@@ -45,8 +53,9 @@ son flag désactivé :
 
 - **H2k-a**, désormais disponible, crée le contrat de paire, son émission
   atomique et les fences de persistance ;
-- **H2k-b** ajoute la commande one-shot qui évalue la cible et simule seulement
-  le sibling avant de produire le handoff H2h.
+- **H2k-b**, désormais disponible mais OFF par défaut, ajoute la commande
+  one-shot qui évalue la cible et simule seulement le sibling avant de produire
+  le handoff H2h.
 
 Les deux PR restent sans wallet, keypair, signer, armement, bytes signés ou
 transport de soumission. `CANARY_NOT_STARTED` reste obligatoire.
@@ -174,17 +183,18 @@ Le claim non-live `purpose=EXECUTE`, utilisé par `simulation-only`, exclut tout
 intention référencée comme `target_intent_id`. Le sibling reste éligible. Le
 claim `DRY_RUN` reste non consommant et peut évaluer la cible. Les claims live,
 qui exigent déjà `live_reserved=true`, ne reçoivent pas cet anti-join : ils
-doivent pouvoir consommer la cible après le futur armement H2c. H2k-b ajoutera
-des claims exactement ciblés afin de produire un handoff déterministe.
+doivent pouvoir consommer la cible après l'armement H2c. H2k-b fournit des
+claims exactement ciblés afin de produire un handoff déterministe.
 
 Une cible expirée n'est jamais rendue exécutable par la disparition de la
 paire : les predicates temporels existants restent obligatoires. H2c est le
 seul flux qui peut promouvoir la cible vers `live_reserved=true`. La base
 refuse toute promotion du sibling de simulation. Le contrat H2c v1 reste
 compatible avec les intentions historiques non appairées ; son repository
-refuse seulement tout identifiant connu comme sibling. H2k-b introduira un
-handoff H2c v2 qui verrouillera paire et cible dans la même transaction, puis
-exigera explicitement le côté `target_intent_id` avant promotion.
+refuse seulement tout identifiant connu comme sibling. H2k-b introduit une
+requête H2c wire V3 qui verrouille paire et cible dans la même transaction,
+puis exige explicitement le côté `target_intent_id` avant promotion.
+L'armement durable conserve le schéma V2 existant.
 
 L'activation ne rétroforme ni ne backfill les intentions déjà émises. Seules
 les nouvelles décisions OPEN persistées après activation produisent une
@@ -209,8 +219,8 @@ capacité live.
 
 ## 7. Validation H2h v2 dans H2k-b
 
-H2k-a ne modifie pas le contrat H2h v1. H2k-b versionnera la source et le draft
-en v2. H2h relira alors la paire et l'intention parent de l'artefact sous son snapshot
+H2k-a ne modifie pas le contrat H2h v1. H2k-b versionne la source et le draft
+en v2. H2h relit la paire et l'intention parent de l'artefact sous son snapshot
 `REPEATABLE READ READ ONLY`. Il refuse l'export sauf si :
 
 - la cible et le probe correspondent exactement à la paire ;
@@ -230,7 +240,7 @@ Un artefact arbitraire, même réussi, ne peut donc plus satisfaire H2h.
 
 ## 8. Commande H2k-b
 
-La PR suivante ajoutera un processus one-shot sous le rôle H2j. Au démarrage,
+H2k-b fournit un processus one-shot sous le rôle H2j. Au démarrage,
 il capture un watermark `statement_timestamp()` PostgreSQL, attend pendant une
 fenêtre bornée la première paire OPEN admissible créée après ce watermark,
 ordonnée par `(created_at, pair_id)`, puis la verrouille par une lease de
@@ -309,6 +319,12 @@ résiduels, `PUBLIC`, ownership, grant options et schémas homonymes.
 Le flag ne démarre aucun executor et ne contacte aucun RPC supplémentaire.
 Le déploiement normal reste inchangé lorsque le flag est absent ou faux.
 
+`EXECUTOR_PREFLIGHT_PREPARATION_ENABLED=false` est également le défaut du
+runner H2k-b. Sa valeur `true` autorise seulement le run one-shot non signant
+sous le rôle H2j, avec une sortie absolue hors checkout et les limites de temps
+et de quota configurées. Elle n'active ni H2c, ni wallet, ni armement, ni
+soumission.
+
 ## 11. Erreurs de préparation stables
 
 H2k réutilise les codes métier existants pour le cycle de vie des intentions.
@@ -350,9 +366,9 @@ H2k-a prouve :
 - rôles réels PostgreSQL 16 et absence de capacité signante/live ;
 - flag absent : comportement et tests existants inchangés.
 
-H2k-b ajoutera les tests de sélection après watermark, lease exacte,
-crash/reprise, deadline, 429, contrats H2c/H2h v2, finalité causale, manifeste
-redacted et handoff de bout en bout.
+H2k-b prouve la sélection après watermark, la lease exacte, la crash/reprise,
+la deadline, les refus provider, les contrats H2c wire V3/H2h v2, la finalité
+causale, le manifeste redacted et le handoff de bout en bout.
 
 ## 13. Limites explicites
 

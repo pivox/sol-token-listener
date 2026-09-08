@@ -28,6 +28,7 @@ void test('keeps common operations parsing independent of arm-only sidecar and r
   assert.equal(parseExecutionOperationsConfig(commonEnvironment).phase, 'CANARY');
   const arm = parseExecutionCanaryArmConfig(environment());
   assert.equal(arm.canaryEvidencePath, '/tmp/canary-evidence.json');
+  assert.equal(arm.preflightSourcePath, '/tmp/preflight-source.json');
   assert.equal(arm.runtimeLeaseMs, 120_000);
   assert.equal(arm.runtimeMaxFeeLamports, 100_000n);
 });
@@ -50,6 +51,7 @@ void test('rejects missing identities, live enablement and every keypair variabl
   );
   for (const changed of [
     { EXECUTOR_CANARY_EVIDENCE_PATH: 'relative.json' },
+    { EXECUTOR_PREFLIGHT_SOURCE_PATH: 'relative.json' },
     { EXECUTOR_LEASE_MS: '120001' },
     { EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '11' },
   ]) assert.throws(
@@ -92,6 +94,7 @@ function environment(overrides: Readonly<Record<string, string>> = {}) {
     EXECUTOR_OPERATOR_ID: 'operator-primary',
     EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '/tmp/preflight-evidence.json',
     EXECUTOR_CANARY_EVIDENCE_PATH: '/tmp/canary-evidence.json',
+    EXECUTOR_PREFLIGHT_SOURCE_PATH: '/tmp/preflight-source.json',
     EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: 'MCowBQYDK2VwAyEA7Q2ZB8C8QzL4vVfJdGz4g0yP5wVqgYvZx4h7gM9rGgM=',
     EXECUTOR_LEASE_MS: '120000',
     EXECUTOR_QUOTE_MAX_AGE_MS: '3000',

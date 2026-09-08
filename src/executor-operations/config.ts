@@ -29,6 +29,7 @@ export interface ExecutionOperationsConfig {
 
 export interface ExecutionCanaryArmConfig extends ExecutionOperationsConfig {
   readonly canaryEvidencePath: string;
+  readonly preflightSourcePath: string;
   readonly runtimeQuoteMaxAgeMs: number;
   readonly runtimeSlippageBps: bigint;
   readonly runtimeSnapshotMaxSlotLag: number;
@@ -111,6 +112,9 @@ export function parseExecutionCanaryArmConfig(input: unknown): ExecutionCanaryAr
     const canaryEvidencePath = absolutePath(
       environmentValue(input, 'EXECUTOR_CANARY_EVIDENCE_PATH'),
     );
+    const preflightSourcePath = absolutePath(
+      environmentValue(input, 'EXECUTOR_PREFLIGHT_SOURCE_PATH'),
+    );
     const runtimeQuoteMaxAgeMs = decimalInteger(
       environmentValue(input, 'EXECUTOR_QUOTE_MAX_AGE_MS'), 1, 60_000,
     );
@@ -135,7 +139,7 @@ export function parseExecutionCanaryArmConfig(input: unknown): ExecutionCanaryAr
     const runtimeLeaseMs = decimalInteger(
       environmentValue(input, 'EXECUTOR_LEASE_MS'), 3_000, 120_000,
     );
-    return Object.freeze({ ...base, canaryEvidencePath, runtimeQuoteMaxAgeMs,
+    return Object.freeze({ ...base, canaryEvidencePath, preflightSourcePath, runtimeQuoteMaxAgeMs,
       runtimeSlippageBps, runtimeSnapshotMaxSlotLag, runtimeMaxComputeUnits,
       runtimeMaxFeeLamports, runtimeMaxFeePayerLamportDebit,
       runtimeMaxRpcCallsPerAttempt, runtimeLeaseMs });

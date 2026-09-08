@@ -15,8 +15,64 @@ import type {
 } from '../src/ports/execution-operations-repository.js';
 import type { ExecutionActivationArmamentV2 } from '../src/domain/execution-operations.js';
 import { canaryEvidenceInput } from './helpers/execution-canary-fixture.js';
+import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
+import { createExecutionPreflightDraft } from '../src/domain/execution-preflight-draft.js';
+import { createExecutionPreflightBundle } from '../src/domain/execution-preflight-bundle.js';
 
 const NOW_MS = 1_788_134_400_000;
+
+void test('V3 binds a canonical H2h V2 source before the terminal checkpoint and repository',
+  async () => {
+    const { source, catalog } = preflightDraftInputs();
+    const bundle = createExecutionPreflightBundle(createExecutionPreflightDraft(source, catalog));
+    const intent = source.target.intent;
+    let captured: Parameters<ExecutionCanaryArmamentRepository['armCanary']>[0] | null = null;
+    const service = createExecutionOperationsService({
+      repository: repositoryStub({ readQualification: async () => bundle.qualification }),
+      canaryRepository: {
+        readTargetIntent: async () => Object.freeze({
+          intentId: intent.id, side: 'BUY', status: 'PENDING', leaseOwner: null,
+          leaseExpiresAtMs: null, stateRevision: intent.stateRevision,
+          strategyId: intent.strategyId, strategyVersion: intent.strategyVersion,
+          decisionFingerprint: intent.decisionFingerprint, mint: intent.mint,
+          quoteMint: intent.quoteMint, quoteAmountRaw: intent.quoteAmountRaw ?? 0n,
+          expiresAtMs: intent.expiresAtMs,
+        }),
+        armCanary: async (input) => {
+          captured = input;
+          return Object.freeze({ ...input.request, payloadVersion: 2,
+            armamentId: `execution_activation_armament_${'a'.repeat(64)}`,
+            armamentFingerprint: 'a'.repeat(64), state: 'ARMED',
+            authorizationId: `execution_operator_authorization_${'b'.repeat(64)}`,
+            authorizationFingerprint: 'b'.repeat(64),
+            admissionReportId: `execution_risk_admission_${'c'.repeat(64)}`,
+            reservationId: `execution_exposure_reservation_${'d'.repeat(64)}`,
+          }) as ExecutionActivationArmamentV2;
+        },
+      },
+      nonceSource: () => 'abcdef123456',
+    });
+    await service.arm({
+      payloadVersion: 3, evidence: bundle.canary, preflightSource: source,
+      intentId: intent.id, maximumCapitalLamports: intent.quoteAmountRaw ?? 0n,
+      maximumHoldingMs: 300_000, runtimeQuoteMaxAgeMs: 3_000,
+      runtimeSlippageBps: 500n, runtimeSnapshotMaxSlotLag: 8,
+      runtimeMaxComputeUnits: 300_000n, runtimeMaxFeeLamports: 100_000n,
+      runtimeMaxFeePayerLamportDebit: 2_500_000n, runtimeMaxRpcCallsPerAttempt: 12,
+      runtimeLeaseMs: 3_000, operatorId: 'operator-primary',
+      operatorReason: 'Paired Mainnet canary manually approved.', nowMs: source.capturedAtMs + 1,
+      terminal: terminalForV2Confirmation(),
+    });
+    const persisted = captured as unknown as Parameters<
+      ExecutionCanaryArmamentRepository['armCanary']
+    >[0];
+    assert.equal(persisted.request.payloadVersion, 3);
+    if (persisted.request.payloadVersion === 3) {
+      assert.equal(persisted.request.lineageProof.preparationRunId,
+        source.lineage.preparationRunId);
+      assert.equal(persisted.request.lineageProof.proofFingerprint, source.proofFingerprint);
+    }
+  });
 
 
 void test('arms only an exact fresh CANARY target after V2 terminal authorization', async () => {

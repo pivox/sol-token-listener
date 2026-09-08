@@ -7,12 +7,14 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '042_execution_preflight_intent_preparation.sql';
+const migrationHeadName = '043_execution_intent_causal_lineage.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 042 declares the bounded preparation-run authority', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
 
-  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationName);
+  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationHeadName);
+  assert.ok(LIVE_EXECUTION_MIGRATION_CATALOG.some((migration) => migration.name === migrationName));
   assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_preflight_intent_preparation_runs/u);
   assert.match(sql, /UNIQUE\s*\(pair_id\)/u);
   assert.match(sql, /state IN \('WAITING', 'PREPARING', 'PREPARED', 'FAILED'\)/u);
@@ -34,7 +36,7 @@ void test('PostgreSQL 16 migration 042 creates, replays and constrains preparati
 
   await withTemporarySchema(databaseUrl, 'execution_preflight_preparation', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), migrationHeadName);
     assert.deepEqual(await migrateDatabase({ pool }), []);
 
     const inserted = await pool.query(`INSERT INTO execution_preflight_intent_preparation_runs (

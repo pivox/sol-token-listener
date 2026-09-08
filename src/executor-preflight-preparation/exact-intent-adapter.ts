@@ -213,7 +213,9 @@ function simulationDependencies(
 
 function exactClaimRepository(value: unknown): ExactClaimRepository {
   if (typeof value !== 'object' || value === null || isProxy(value)
-    || typeof Reflect.get(value, 'claimExactPreflightIntent') !== 'function') throw invalid();
+    || typeof (value as Partial<ExactClaimRepository>).claimExactPreflightIntent !== 'function') {
+    throw invalid();
+  }
   return value as ExactClaimRepository;
 }
 
