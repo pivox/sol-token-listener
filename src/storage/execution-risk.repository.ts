@@ -1059,18 +1059,33 @@ export async function appendWalletSnapshotInTransaction(
     return existing;
   }
   const latest = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
-    superseded_at
-    FROM execution_wallet_snapshots WHERE generation_id=$1
-    ORDER BY state_revision DESC LIMIT 1`, [draft.generationId]);
+    trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
+    FROM execution_wallet_snapshots
+    WHERE generation_id=$1 AND superseded_at IS NULL
+    ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC LIMIT 1`, [draft.generationId]);
   if (latest.rows.length > 1) throw failure('INVALID_DATA');
   const latestRow = latest.rows.length === 0 ? null : exactRow(latest.rows[0], [
-    'snapshot_id', 'state_revision', 'superseded_at',
+    'snapshot_id', 'state_revision', 'observed_at_ms',
   ] as const);
   const latestRevision = latestRow === null
     ? null : unsignedBigint(parseBigint(latestRow.state_revision));
-  if (latestRow !== null && latestRow.superseded_at !== null) throw failure('INVALID_DATA');
-  if (latestRevision !== null && draft.stateRevision <= latestRevision) throw failure('CONFLICT');
+  const latestObservedAtMs = latestRow === null ? null : textTimestamp(latestRow.observed_at_ms);
+  if (latestRevision !== null && latestObservedAtMs !== null) {
+    if (draft.stateRevision < latestRevision || draft.observedAtMs < latestObservedAtMs) {
+      throw failure('STALE_MEASUREMENT');
+    }
+    // A divergent immutable identity at the same instant stays a conflict;
+    // the exact identity was returned by the replay lookup above.
+    if (draft.observedAtMs === latestObservedAtMs) throw failure('CONFLICT');
+  }
   try {
+    if (latestRow !== null) {
+      const superseded = await client.query(`UPDATE execution_wallet_snapshots SET
+        superseded_at=date_trunc('milliseconds',statement_timestamp()),
+        purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
+        WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latestRow.snapshot_id]);
+      if (superseded.rowCount !== 1) throw failure('CONFLICT');
+    }
     const result = await client.query(`INSERT INTO execution_wallet_snapshots (
       snapshot_id,payload_version,snapshot_fingerprint,generation_id,provider_id,
       state_revision,slot,block_time,observed_at,commitment,wallet_lamports,
@@ -1088,15 +1103,7 @@ export async function appendWalletSnapshotInTransaction(
       $14,$15::NUMERIC,$16::NUMERIC,$17,
       $18,$19::NUMERIC,$20::NUMERIC,$21,$22::NUMERIC)
     RETURNING ${WALLET_SNAPSHOT_PROJECTION}`, walletSnapshotValues(draft));
-    const inserted = decodeWalletSnapshot(singleRow(result));
-    if (latestRow !== null) {
-      const superseded = await client.query(`UPDATE execution_wallet_snapshots SET
-        superseded_at=date_trunc('milliseconds',statement_timestamp()),
-        purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
-        WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latestRow.snapshot_id]);
-      if (superseded.rowCount !== 1) throw failure('CONFLICT');
-    }
-    return inserted;
+    return decodeWalletSnapshot(singleRow(result));
   } catch (error) {
     if (['23503', '23505'].includes(databaseCode(error) ?? '')) throw failure('CONFLICT');
     throw error;

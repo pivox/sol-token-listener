@@ -43,6 +43,7 @@ void test('commits fresh readiness evidence for an unchanged generation and risk
     const refreshed = refreshedCommitInput(first);
     assert.deepEqual(await repository.commit(first), first);
     assert.deepEqual(await repository.commit(refreshed), refreshed);
+    assert.deepEqual(await repository.commit(refreshed), refreshed);
     const walletSnapshots = await pool.query(`SELECT snapshot_id,superseded_at,purge_after,
       EXTRACT(EPOCH FROM (purge_after-superseded_at))::INTEGER AS retention_seconds
       FROM execution_wallet_snapshots ORDER BY observed_at`);
@@ -67,6 +68,18 @@ void test('commits fresh readiness evidence for an unchanged generation and risk
       (SELECT COUNT(*) FROM execution_provider_usage_snapshots WHERE superseded_at IS NULL)::INTEGER
         AS providers`)).rows[0];
     assert.deepEqual(active, { wallets: 1, providers: 1 });
+    const riskState = (await pool.query(`SELECT state_revision::TEXT AS state_revision,
+      reconciled_capital_lamports::TEXT AS reconciled_capital_lamports,
+      reserved_exposure_raw::TEXT AS reserved_exposure_raw,open_positions,
+      conservative_drawdown_raw::TEXT AS conservative_drawdown_raw,
+      consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
+      FROM execution_wallet_risk_state WHERE generation_id=$1`,
+    [first.generation.generationId])).rows[0];
+    assert.deepEqual(riskState, {
+      state_revision: '0', reconciled_capital_lamports: '0', reserved_exposure_raw: '0',
+      open_positions: 0, conservative_drawdown_raw: '0', consecutive_technical_failures: 0,
+      last_technical_failure_reason_code: null, unknown_block: false,
+    });
   });
 });
 
