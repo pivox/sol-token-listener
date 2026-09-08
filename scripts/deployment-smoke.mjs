@@ -79,6 +79,7 @@ const canonicalMigrations = Object.freeze([
   '041_execution_preflight_intent_pairs.sql',
   '042_execution_preflight_intent_preparation.sql',
   '043_execution_intent_causal_lineage.sql',
+  '044_transaction_inbox_launch_priority.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',

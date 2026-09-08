@@ -58,6 +58,34 @@ type Boundary = (typeof BOUNDARIES)[number];
 type ReplayStage = Boundary | 'paper';
 const FULL_REPLAY: readonly ReplayStage[] = Object.freeze([...BOUNDARIES, 'paper']);
 
+void test('claims a late prioritized launch before 2,000 normal rows and decodes its initial buy', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at
+    ) SELECT 'normal-' || value, value, ARRAY['CATCH_UP'], ARRAY[$1], 'confirmed',
+      'PENDING', clock_timestamp()
+      FROM generate_series(1, 2000) value`, [PUMP_PROGRAM_ID]);
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(Object.freeze({
+      signature: fixture.transaction.signature,
+      slot: fixture.transaction.slot,
+      source: 'WEBSOCKET' as const,
+      ingestionHint: 'PUMPFUN_CREATE' as const,
+      programIds: Object.freeze([PUMP_PROGRAM_ID]),
+      confirmationStatus: 'confirmed' as const,
+      observedAtMs: Date.now(),
+    }));
+
+    assert.equal((await repository.claim(Date.now(), 120))?.signature, fixture.transaction.signature);
+    const decoded = decodePumpTransaction(fixture.transaction);
+    assert.equal(decoded.creations.length, 1);
+    assert.equal(decoded.trades.length, 1);
+    assert.equal(decoded.trades[0]?.event.isBuy, true);
+  });
+});
+
 void test('restarts the production PostgreSQL path at every observation boundary', async (context) => {
   await withDatabase(context, async (pool) => {
     const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
@@ -70,6 +98,7 @@ void test('restarts the production PostgreSQL path at every observation boundary
         signature: transaction.signature,
         slot: transaction.slot,
         source: 'WEBSOCKET' as const,
+        ingestionHint: null,
         programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
         confirmationStatus: 'confirmed' as const,
         observedAtMs: Date.now(),
@@ -195,6 +224,7 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
       signature: confirmed.signature,
       slot: confirmed.slot,
       source: 'WEBSOCKET' as const,
+        ingestionHint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
       confirmationStatus: 'confirmed' as const,
       observedAtMs: Date.now(),
@@ -283,6 +313,7 @@ void test('resets missing finality evidence after a restart on fallback before a
       signature: transaction.signature,
       slot: transaction.slot,
       source: 'WEBSOCKET' as const,
+        ingestionHint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
       confirmationStatus: 'confirmed' as const,
       observedAtMs: 1_000,
@@ -331,6 +362,7 @@ void test('exposes a real retryable failed inbox row through persisted API healt
     const repository = new PostgresTransactionInboxRepository(pool);
     await repository.enqueue(Object.freeze({
       signature: 'retryable-health', slot: 1n, source: 'WEBSOCKET' as const,
+        ingestionHint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'confirmed' as const,
       observedAtMs: Date.now(),
     }));
@@ -371,6 +403,7 @@ void test('counts only qualification reports with canonical active lineage in Po
       signature: transaction.signature,
       slot: transaction.slot,
       source: 'WEBSOCKET' as const,
+        ingestionHint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
       confirmationStatus: 'confirmed' as const,
       observedAtMs: Date.now(),

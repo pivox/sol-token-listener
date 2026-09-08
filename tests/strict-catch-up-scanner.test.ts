@@ -527,6 +527,7 @@ void test('merges identical signatures with legacy finality, immutability, progr
   const shared = repository.enqueued[2];
   assert.deepEqual(shared, {
     signature: 'shared', slot: 3n, source: 'CATCH_UP',
+    ingestionHint: null,
     programIds: [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID],
     confirmationStatus: 'finalized', observedAtMs: 9_000,
   });

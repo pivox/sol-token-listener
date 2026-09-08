@@ -96,7 +96,10 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
     await supervisor.start();
     scheduler.fire(0);
     await waitForProvider(supervisor, 'primary');
-    await sessions.at(0).observe(wsNotification('pumpfun'));
+    await assert.rejects(
+      sessions.at(0).observe(wsNotification('pumpswap', 'primary', 'PUMPFUN_CREATE')),
+    );
+    await sessions.at(0).observe(wsNotification('pumpfun', 'primary', 'PUMPFUN_CREATE'));
 
     scheduler.fire(30_000);
     await waitForPhase(health, 'DEGRADED');
@@ -124,6 +127,7 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
 
     await assert.rejects(inbox.enqueue(Object.freeze({
       signature: SHARED_SIGNATURE, slot: 43n, source: 'WEBSOCKET',
+      ingestionHint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'confirmed', observedAtMs: 10_001,
     })), (error: unknown) => error instanceof TransactionInboxConflictError
       && error.conflict === 'identity');
@@ -984,8 +988,9 @@ function http429Source(
 function wsNotification(
   program: 'pumpfun' | 'pumpswap',
   endpointId: RpcProviderId = 'primary',
+  hint: 'NONE' | 'PUMPFUN_CREATE' = 'NONE',
 ): WsProgramNotification {
-  return Object.freeze({ endpointId, program, signature: SHARED_SIGNATURE, slot: 42n });
+  return Object.freeze({ endpointId, program, signature: SHARED_SIGNATURE, slot: 42n, hint });
 }
 
 function establishNativeSession(socket: NativeSetupSocket): void {
@@ -1032,6 +1037,7 @@ async function seedCrashBoundary(
   if (boundary === 'RECOVERING') return snapshot;
   await inbox.enqueue(Object.freeze({
     signature: SHARED_SIGNATURE, slot: 42n, source: 'CATCH_UP',
+      ingestionHint: null,
     programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID]),
     confirmationStatus: 'confirmed', observedAtMs: 10_000,
   }));

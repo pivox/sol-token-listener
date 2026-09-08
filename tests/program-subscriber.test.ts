@@ -345,6 +345,7 @@ function notification(programId: string): TransactionNotification {
     signature,
     slot: 42n,
     source: 'WEBSOCKET',
+      ingestionHint: null,
     programIds: Object.freeze([programId]),
     confirmationStatus: 'processed',
     observedAtMs: 1_720_000_000_000,

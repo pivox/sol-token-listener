@@ -40,6 +40,10 @@ export const TRANSACTION_INBOX_RECOVERY_RESULT_CODES = Object.freeze([
   'RECOVERY_NOT_FOUND',
 ] as const);
 
+export const TRANSACTION_INGESTION_HINTS = Object.freeze([
+  'PUMPFUN_CREATE',
+] as const);
+
 export const TRANSACTION_INGESTION_ERROR_CODES = Object.freeze([
   'RPC_TRANSIENT',
   'TRANSACTION_NOT_AVAILABLE',
@@ -56,6 +60,7 @@ export type TransactionInboxStatus = (typeof TRANSACTION_INBOX_STATUSES)[number]
 export type ListenerRuntimeState = (typeof LISTENER_RUNTIME_STATES)[number];
 export type IngestionComponentState = ListenerRuntimeState;
 export type TransactionDiscoverySource = 'WEBSOCKET' | 'CATCH_UP';
+export type TransactionIngestionHint = (typeof TRANSACTION_INGESTION_HINTS)[number];
 export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
 export type InboxRecoveryResultCode =
   (typeof TRANSACTION_INBOX_RECOVERY_RESULT_CODES)[number];
@@ -117,6 +122,7 @@ export interface TransactionNotification {
   readonly signature: string;
   readonly slot: bigint;
   readonly source: TransactionDiscoverySource;
+  readonly ingestionHint: TransactionIngestionHint | null;
   readonly programIds: readonly string[];
   readonly confirmationStatus: Exclude<ChainConfirmationStatus, 'orphaned'>;
   readonly observedAtMs: number;
@@ -337,10 +343,26 @@ export function assertValidTransactionNotification(
   value: unknown,
 ): asserts value is TransactionNotification {
   const record = frozenRecord(value, 'Transaction notification');
+  assertOnlyRecordFields(record, [
+    'signature',
+    'slot',
+    'source',
+    'ingestionHint',
+    'programIds',
+    'confirmationStatus',
+    'observedAtMs',
+  ], 'Transaction notification');
   assertText(record.signature, 'Transaction notification signature');
   assertSlot(record.slot, 'Transaction notification slot');
   if (record.source !== 'WEBSOCKET' && record.source !== 'CATCH_UP') {
     throw new TypeError('Transaction notification source is invalid.');
+  }
+  if (record.ingestionHint !== null
+    && !TRANSACTION_INGESTION_HINTS.includes(record.ingestionHint as TransactionIngestionHint)) {
+    throw new TypeError('Transaction notification ingestion hint is invalid.');
+  }
+  if (record.source === 'CATCH_UP' && record.ingestionHint !== null) {
+    throw new TypeError('Transaction notification ingestion hint is invalid for catch-up.');
   }
   assertCanonicalProgramIds(record.programIds);
   if (!isObservedConfirmationStatus(record.confirmationStatus)) {

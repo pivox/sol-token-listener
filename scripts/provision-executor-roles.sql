@@ -381,6 +381,15 @@ GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE
   wallet_relationships
 TO sol_token_listener_writer;
 
+GRANT SELECT ON TABLE chain_transaction_inbox_claim_scheduler
+TO sol_token_listener_writer;
+GRANT UPDATE (consecutive_launch_candidate_claims,updated_at)
+ON TABLE chain_transaction_inbox_claim_scheduler
+TO sol_token_listener_writer;
+
+GRANT USAGE ON TYPE chain_transaction_inbox_priority
+TO sol_token_listener_writer;
+
 GRANT USAGE ON SEQUENCE
   api_event_stream_sequence_seq,
   paper_decision_claim_scan_generation_seq

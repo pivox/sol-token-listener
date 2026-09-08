@@ -64,7 +64,7 @@ frontières et l'état non activé.
 `executor:preflight-source:start` reçoit uniquement le
 `EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID` produit par H2k-b, reconstruit et
 vérifie toute la lignée run/pair/candidate/assessment/artifact avant d'écrire
-un fichier owner-only hors Git. Le head de migration est 043.
+un fichier owner-only hors Git. Le head de migration est 044.
 
 #51-H2k-b ajoute la préparation one-shot exacte : sélection d'une seule paire
 target/probe finalisée, dry-run non consommant, simulation du probe, puis run
@@ -159,7 +159,7 @@ sans clé privée, signature, soumission ni live; elle n'appelle ni
   contient aucune clé réelle.
 - H2b est isolé du listener, de H2a et des commandes H2c ; H2c est préparé mais sa présence ne vaut
   ni armement, ni canary, ni transaction exécutée.
-- Les migrations canary vont jusqu'à 043. Le runner H2k-b est one-shot,
+- Les migrations canary vont jusqu'à 044. Le runner H2k-b est one-shot,
   séparé et désactivé par défaut ; sa réussite prépare uniquement une source
   H2h v2.
 - Le paper trading est une projection simulée, initialement limitée à SOL/WSOL

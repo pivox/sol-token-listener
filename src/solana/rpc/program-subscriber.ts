@@ -236,6 +236,7 @@ function snapshotNotification(
     signature,
     slot: BigInt(slot),
     source: 'WEBSOCKET',
+    ingestionHint: null,
     programIds: Object.freeze([programId]),
     confirmationStatus: PROGRAM_SUBSCRIBER_COMMITMENT,
     observedAtMs,

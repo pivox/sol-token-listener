@@ -116,6 +116,115 @@ void test('merges discoveries, rejects identity contradictions, and claims concu
   });
 });
 
+void test('upgrades duplicate creation hints monotonically and claims a late launch before normal backlog', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at
+    ) SELECT 'normal-' || value, value, ARRAY['CATCH_UP'], ARRAY[$1], 'confirmed',
+      'PENDING', clock_timestamp()
+      FROM generate_series(1, 2000) value`, [PUMP_PROGRAM_ID]);
+    await repository.enqueue(notification(
+      'normal-upgraded',
+      2_001n,
+      'CATCH_UP',
+      'confirmed',
+      1_000,
+    ));
+    await repository.enqueue(notification(
+      'normal-upgraded',
+      2_001n,
+      'WEBSOCKET',
+      'confirmed',
+      1_001,
+      'PUMPFUN_CREATE',
+    ));
+    await repository.enqueue(notification(
+      'candidate-first',
+      2_002n,
+      'WEBSOCKET',
+      'confirmed',
+      1_002,
+      'PUMPFUN_CREATE',
+    ));
+    await repository.enqueue(notification(
+      'candidate-first',
+      2_002n,
+      'CATCH_UP',
+      'confirmed',
+      1_003,
+    ));
+
+    assert.equal((await row(pool, 'normal-upgraded')).ingestion_priority, 'LAUNCH_CANDIDATE');
+    assert.equal((await row(pool, 'candidate-first')).ingestion_priority, 'LAUNCH_CANDIDATE');
+    assert.equal((await repository.claim(2_000, 120))?.signature, 'normal-upgraded');
+  });
+});
+
+void test('concurrent normal and creation discoveries converge to launch priority', async (context) => {
+  await withDatabase(context, async (pool) => {
+    if (databaseUrl === undefined) throw new Error('Database URL unexpectedly absent.');
+    const schema = (await pool.query<{ readonly schema: string }>(
+      'SELECT current_schema() AS schema',
+    )).rows[0]?.schema;
+    assert.ok(schema);
+    const contenderPool = new pg.Pool({
+      connectionString: databaseUrl,
+      options: `-c search_path=${schema}`,
+    });
+    try {
+      const first = new PostgresTransactionInboxRepository(pool);
+      const second = new PostgresTransactionInboxRepository(contenderPool);
+      await Promise.all([
+        first.enqueue(notification('parallel-priority', 2_100n, 'CATCH_UP')),
+        second.enqueue(notification(
+          'parallel-priority',
+          2_100n,
+          'WEBSOCKET',
+          'processed',
+          1_001,
+          'PUMPFUN_CREATE',
+        )),
+      ]);
+
+      const stored = await row(pool, 'parallel-priority');
+      assert.equal(stored.ingestion_priority, 'LAUNCH_CANDIDATE');
+      assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    } finally {
+      await contenderPool.end();
+    }
+  });
+});
+
+void test('bounds normal starvation after 32 consecutive launch-candidate claims', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('normal-fairness', 1n, 'CATCH_UP'));
+    for (let index = 1; index <= 33; index += 1) {
+      await repository.enqueue(notification(
+        `launch-${String(index).padStart(2, '0')}`,
+        BigInt(100 + index),
+        'WEBSOCKET',
+        'processed',
+        1_000 + index,
+        'PUMPFUN_CREATE',
+      ));
+    }
+    const terminalFailure: IngestionFailure = Object.freeze({
+      code: 'NORMALIZATION_FAILED', errorName: 'ExpectedTestFailure', retryable: false,
+    });
+    for (let index = 1; index <= 32; index += 1) {
+      const claim = await repository.claim(2_000 + index, 120);
+      assert.equal(claim?.signature, `launch-${String(index).padStart(2, '0')}`);
+      if (claim === null) throw new Error('Expected a launch claim.');
+      await repository.markFailed(claim.signature, claim.leaseToken, terminalFailure);
+    }
+
+    assert.equal((await repository.claim(3_000, 120))?.signature, 'normal-fairness');
+  });
+});
+
 void test('leases expire, renew, and reject stale tokens on every leased mutation', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -1796,9 +1905,21 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
       'PROCESSING', 'lease-' || value, clock_timestamp() + INTERVAL '1 day',
       clock_timestamp()
       FROM generate_series(1, 10000) value`);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, ingestion_priority
+    ) VALUES (
+      'late-launch', 99999, ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
+      'PENDING', clock_timestamp(), 'LAUNCH_CANDIDATE'
+    )`);
     await pool.query('ANALYZE chain_transaction_inbox');
-    const explained = await pool.query(`EXPLAIN (FORMAT JSON)
-      SELECT signature FROM chain_transaction_inbox
+    const version = await pool.query<{ readonly major: string }>(
+      "SELECT current_setting('server_version_num')::INTEGER / 10000 AS major",
+    );
+    assert.equal(version.rows[0]?.major, 16);
+    const explained = await pool.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+      SELECT signature, ingestion_priority FROM chain_transaction_inbox
       WHERE (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
          OR (processing_status = 'FAILED' AND error_retryable = TRUE
              AND retry_exhausted_at IS NULL
@@ -1806,7 +1927,7 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
              AND attempts_in_cycle < retry_max_attempts)
          OR (processing_status = 'PROCESSING' AND lease_expires_at <= clock_timestamp()
              AND attempts_in_cycle < retry_max_attempts)
-      ORDER BY observed_slot, signature
+      ORDER BY ingestion_priority DESC, observed_slot, signature
       FOR UPDATE SKIP LOCKED
       LIMIT 1`);
     const plan = explained.rows[0]?.['QUERY PLAN']?.[0]?.Plan;
@@ -1819,7 +1940,7 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
     assert.equal(nodes.some((node) =>
       node['Index Name'] === 'chain_transaction_inbox_claim_order_idx'), true);
     const claimed = await new PostgresTransactionInboxRepository(pool).claim(Date.now(), 120);
-    assert.equal(claimed?.signature, 'pending-1');
+    assert.equal(claimed?.signature, 'late-launch');
   });
 });
 
@@ -2076,6 +2197,7 @@ function notification(
   source: TransactionNotification['source'] = 'WEBSOCKET',
   confirmationStatus: TransactionNotification['confirmationStatus'] = 'processed',
   observedAtMs = 1_000,
+  ingestionHint: TransactionNotification['ingestionHint'] = null,
 ): TransactionNotification {
   const programIds = source === 'CATCH_UP'
     ? Object.freeze([
@@ -2083,7 +2205,9 @@ function notification(
       'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
     ])
     : Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']);
-  return Object.freeze({ signature, slot, source, programIds, confirmationStatus, observedAtMs });
+  return Object.freeze({
+    signature, slot, source, ingestionHint, programIds, confirmationStatus, observedAtMs,
+  });
 }
 
 function checkpoint(

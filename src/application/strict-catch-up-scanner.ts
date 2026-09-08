@@ -225,6 +225,7 @@ export class StrictCatchUpScanner {
         signature: discovery.signature,
         slot: discovery.slot,
         source: 'CATCH_UP',
+        ingestionHint: null,
         programIds: discovery.programIds,
         confirmationStatus: discovery.confirmationStatus,
         observedAtMs,
