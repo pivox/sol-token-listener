@@ -57,6 +57,15 @@ export type ExecutionPreflightExactClaimOptions =
       readonly purpose: 'EXECUTE';
     }>;
 
+export interface ExecutionPreflightSimulationMutationFence {
+  readonly runId: string;
+  readonly preparationLeaseOwner: string;
+  readonly preparationLeaseToken: string;
+  readonly pairId: string;
+  readonly intentId: string;
+  readonly lane: 'SIMULATION';
+}
+
 export interface ClaimedExecutionIntent {
   readonly intent: ExecutionIntentV1;
   readonly leaseOwner: string;
@@ -120,4 +129,21 @@ export interface ExecutionIntentRepository {
   ): Promise<ExecutionIntentV1>;
   expirePreSubmission(limit: number): Promise<number>;
   read(intentId: string): Promise<ExecutionIntentV1 | null>;
+}
+
+export interface ExecutionPreflightSimulationMutationRepository {
+  transitionExactPreflightSimulation(
+    fence: ExecutionPreflightSimulationMutationFence,
+    claim: ClaimedExecutionIntent,
+    input: ExecutionIntentTransitionInput,
+  ): Promise<ExecutionIntentV1>;
+  beginExactPreflightSimulationAttempt(
+    fence: ExecutionPreflightSimulationMutationFence,
+    claim: ClaimedExecutionIntent,
+  ): Promise<ExecutionBeginAttemptResult>;
+  renewExactPreflightSimulation(
+    fence: ExecutionPreflightSimulationMutationFence,
+    claim: ClaimedExecutionIntent,
+    leaseMs: number,
+  ): Promise<ClaimedExecutionIntent>;
 }

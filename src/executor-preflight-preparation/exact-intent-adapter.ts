@@ -1,15 +1,16 @@
 import { isProxy } from 'node:util/types';
 import type { ClaimedExecutionPreflightPreparation } from '../domain/execution-preflight-preparation.js';
 import type {
+  ClaimedExecutionIntent,
   ExecutionClaimOptions,
   ExecutionIntentRepository,
+  ExecutionPreflightSimulationMutationFence,
+  ExecutionPreflightSimulationMutationRepository,
 } from '../ports/execution-intent-repository.js';
 
 type ExactClaimRepository = Pick<ExecutionIntentRepository, 'claimExactPreflightIntent'>;
-type SimulationIntentRepository = Pick<
-  ExecutionIntentRepository,
-  'claimExactPreflightIntent' | 'transition' | 'beginAttempt' | 'renew'
->;
+type SimulationIntentRepository = Pick<ExecutionIntentRepository, 'claimExactPreflightIntent'>
+  & ExecutionPreflightSimulationMutationRepository;
 
 export interface ExactPreflightTargetIntentAdapterDependencies {
   readonly intents: ExactClaimRepository;
@@ -86,22 +87,43 @@ export function createExactPreflightSimulationIntentAdapter(
   const claim = exactClaim(Object.freeze({ ...dependencies,
     preparationClaim: () => preparationClaim,
   }), 'SIMULATION', 'EXECUTE');
-  const transition = dependencies.intents.transition.bind(dependencies.intents);
-  const beginAttempt = dependencies.intents.beginAttempt.bind(dependencies.intents);
-  const renewIntent = dependencies.intents.renew.bind(dependencies.intents);
+  const mutationFence = (): ExecutionPreflightSimulationMutationFence => {
+    const current = preparationClaimInput(preparationClaim);
+    return Object.freeze({
+      runId: current.preparation.runId,
+      preparationLeaseOwner: current.leaseOwner,
+      preparationLeaseToken: current.leaseToken,
+      pairId: dependencies.pairId,
+      intentId: dependencies.intentId,
+      lane: 'SIMULATION',
+    });
+  };
   return Object.freeze({
     claim,
-    transition,
-    beginAttempt,
+    transition: async (intentClaim, input) => {
+      assertSimulationClaim(intentClaim, dependencies, 'TRANSITION');
+      return dependencies.intents.transitionExactPreflightSimulation(
+        mutationFence(), intentClaim, input,
+      );
+    },
+    beginAttempt: async (intentClaim) => {
+      assertSimulationClaim(intentClaim, dependencies, 'BEGIN_ATTEMPT');
+      return dependencies.intents.beginExactPreflightSimulationAttempt(
+        mutationFence(), intentClaim,
+      );
+    },
     renew: async (intentClaim, leaseMs) => {
       if (leaseMs !== dependencies.leaseMs) throw invalid();
+      assertSimulationClaim(intentClaim, dependencies, 'RENEW');
       const renewedPreparation = preparationClaimInput(await dependencies.renewPreparation(
         preparationClaim,
         dependencies.preparationLeaseMs,
       ));
       assertRenewedPreparation(preparationClaim, renewedPreparation);
       preparationClaim = renewedPreparation;
-      return renewIntent(intentClaim, leaseMs);
+      return dependencies.intents.renewExactPreflightSimulation(
+        mutationFence(), intentClaim, leaseMs,
+      );
     },
     currentPreparationClaim: () => preparationClaim,
   });
@@ -197,10 +219,41 @@ function exactClaimRepository(value: unknown): ExactClaimRepository {
 
 function simulationRepository(value: unknown): SimulationIntentRepository {
   const repository = exactClaimRepository(value) as Partial<SimulationIntentRepository>;
-  if (typeof repository.transition !== 'function'
-    || typeof repository.beginAttempt !== 'function'
-    || typeof repository.renew !== 'function') throw invalid();
+  if (typeof repository.transitionExactPreflightSimulation !== 'function'
+    || typeof repository.beginExactPreflightSimulationAttempt !== 'function'
+    || typeof repository.renewExactPreflightSimulation !== 'function') throw invalid();
   return repository as SimulationIntentRepository;
+}
+
+function assertSimulationClaim(
+  value: unknown,
+  dependencies: Pick<ExactPreflightSimulationIntentAdapterDependencies,
+  'intentId' | 'ownerId'>,
+  operation: 'TRANSITION' | 'BEGIN_ATTEMPT' | 'RENEW',
+): asserts value is ClaimedExecutionIntent {
+  if (typeof value !== 'object' || value === null || isProxy(value) || !Object.isFrozen(value)) {
+    throw invalid();
+  }
+  const claimRecord = value as Readonly<Record<string, unknown>>;
+  const intent = claimRecord.intent;
+  if (typeof intent !== 'object' || intent === null || isProxy(intent) || !Object.isFrozen(intent)) {
+    throw invalid();
+  }
+  const intentRecord = intent as Readonly<Record<string, unknown>>;
+  const intentId = intentRecord.id;
+  const owner = claimRecord.leaseOwner;
+  const status = intentRecord.status;
+  const attemptCount = intentRecord.attemptCount;
+  const stateRevision = intentRecord.stateRevision;
+  if (intentId !== dependencies.intentId || owner !== dependencies.ownerId) throw invalid();
+  const validState = operation === 'TRANSITION'
+    ? status === 'PENDING' && attemptCount === 0 && stateRevision === 0n
+    : operation === 'BEGIN_ATTEMPT'
+      ? status === 'PROCESSING'
+        && (attemptCount === 0 || attemptCount === 1)
+        && stateRevision === 1n
+      : status === 'PROCESSING' && attemptCount === 1 && stateRevision === 1n;
+  if (!validState) throw invalid();
 }
 
 function preparationClaimInput(value: unknown): ClaimedExecutionPreflightPreparation {

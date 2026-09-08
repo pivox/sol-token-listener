@@ -19,6 +19,8 @@ import type {
   ExecutionClaimOptions,
   ExecutionClaimPurpose,
   ExecutionPreflightExactClaimOptions,
+  ExecutionPreflightSimulationMutationFence,
+  ExecutionPreflightSimulationMutationRepository,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
   ExecutionIntentTransitionInput,
@@ -111,6 +113,14 @@ type ExactPreflightClaimOptions =
       readonly lane: 'SIMULATION';
       readonly purpose: 'EXECUTE';
     }>;
+type SimulationMutationFence = Readonly<{
+  readonly runId: string;
+  readonly preparationLeaseOwner: string;
+  readonly preparationLeaseToken: string;
+  readonly pairId: string;
+  readonly intentId: string;
+  readonly lane: 'SIMULATION';
+}>;
 
 type ActualCreateResult = Awaited<ReturnType<ExecutionIntentRepository['create']>>;
 type ActualClaimOptions = Parameters<ExecutionIntentRepository['claim']>[0];
@@ -132,6 +142,30 @@ type ExactSurfaceAssertions = AssertAll<{
       options: ExactPreflightClaimOptions,
       signal?: AbortSignal,
     ) => Promise<ClaimedExecutionIntent | null>>>;
+  simulationFence: Expect<Equal<
+  ExecutionPreflightSimulationMutationFence,
+  SimulationMutationFence
+  >>;
+  simulationMutations: Expect<Equal<
+  keyof ExecutionPreflightSimulationMutationRepository,
+  'transitionExactPreflightSimulation' | 'beginExactPreflightSimulationAttempt'
+  | 'renewExactPreflightSimulation'
+  >>
+    & Expect<Equal<
+    ExecutionPreflightSimulationMutationRepository['transitionExactPreflightSimulation'],
+    (fence: SimulationMutationFence, claim: ClaimedExecutionIntent,
+      input: ExecutionIntentTransitionInput) => Promise<ExecutionIntentV1>
+    >>
+    & Expect<Equal<
+    ExecutionPreflightSimulationMutationRepository['beginExactPreflightSimulationAttempt'],
+    (fence: SimulationMutationFence,
+      claim: ClaimedExecutionIntent) => Promise<ExecutionBeginAttemptResult>
+    >>
+    & Expect<Equal<
+    ExecutionPreflightSimulationMutationRepository['renewExactPreflightSimulation'],
+    (fence: SimulationMutationFence, claim: ClaimedExecutionIntent,
+      leaseMs: number) => Promise<ClaimedExecutionIntent>
+    >>;
   beginAttempt: Expect<Equal<ExecutionIntentRepository['beginAttempt'], (claim: ClaimedExecutionIntent) => Promise<ExecutionBeginAttemptResult>>>
     & Expect<Equal<ExecutionBeginAttemptResult, AttemptResult>>;
   begunAttempt: Expect<Equal<keyof ExecutionBeginAttemptResult, 'claim' | 'attempt'>>
@@ -216,13 +250,13 @@ void test('execution intent repository is an allowlisted domain-only persistence
   const source = await readFile(sourceUrl, 'utf8');
   const sourceFile = ts.createSourceFile(sourcePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 
-  assert.equal(sourceFile.statements.length, 10);
+  assert.equal(sourceFile.statements.length, 12);
   const [firstStatement, ...declarations] = sourceFile.statements;
   assert.ok(firstStatement !== undefined && ts.isImportDeclaration(firstStatement));
   const domainImport = firstStatement !== undefined && ts.isImportDeclaration(firstStatement)
     ? firstStatement
     : undefined;
-  assert.equal(declarations.length, 9);
+  assert.equal(declarations.length, 11);
   assert.ok(declarations.every(isExportedPortDeclaration));
   assert.ok(domainImport?.importClause?.isTypeOnly);
   assert.ok(domainImport?.moduleSpecifier !== undefined && ts.isStringLiteral(domainImport.moduleSpecifier));
@@ -254,6 +288,8 @@ void test('execution intent repository is an allowlisted domain-only persistence
       'ExecutionIntentTransitionEvidenceV1',
       'ExecutionIntentTransitionInput',
       'ExecutionPreflightExactClaimOptions',
+      'ExecutionPreflightSimulationMutationFence',
+      'ExecutionPreflightSimulationMutationRepository',
     ],
   );
   assert.deepEqual(executionBoundaryViolations(source, sourcePath, fileURLToPath(new URL('../', import.meta.url))), []);

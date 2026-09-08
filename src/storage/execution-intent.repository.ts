@@ -17,6 +17,7 @@ import type {
   ExecutionClaimOptions,
   ExecutionClaimPurpose,
   ExecutionPreflightExactClaimOptions,
+  ExecutionPreflightSimulationMutationFence,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
   ExecutionIntentTransitionInput,
@@ -104,6 +105,9 @@ const LIVE_BUY_CLAIM_OPTION_KEYS = Object.freeze([
 const PREFLIGHT_EXACT_CLAIM_OPTION_KEYS = Object.freeze([
   'runId', 'preparationLeaseOwner', 'preparationLeaseToken', 'pairId',
   'intentId', 'lane', 'purpose', 'ownerId', 'leaseMs',
+] as const);
+const PREFLIGHT_SIMULATION_FENCE_KEYS = Object.freeze([
+  'runId', 'preparationLeaseOwner', 'preparationLeaseToken', 'pairId', 'intentId', 'lane',
 ] as const);
 const CLAIM_KEYS = Object.freeze([
   'intent', 'leaseOwner', 'leaseToken', 'leaseExpiresAtMs',
@@ -351,7 +355,16 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const options = preflightExactClaimOptions(optionsValue);
       if (signal?.aborted === true) throw operationAbortedError();
       const leaseToken = randomUUID();
-      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', async (client) => {
+      return this.transaction(async (client) => {
+        const locked = await client.query(
+          exactPreflightIntentLockSql(),
+          exactPreflightLockValues(options),
+        );
+        if (locked.rowCount === 0 && locked.rows.length === 0) return null;
+        if (locked.rowCount !== 1 || locked.rows.length !== 1) throw dataError();
+        const lockRow = exactRecord(requiredRow(locked.rows), ['id'], 'INVALID_DATA');
+        if (lockRow.id !== options.intentId) throw dataError();
+        if (signal?.aborted === true) throw operationAbortedError();
         const claimed = await client.query(
           exactPreflightIntentClaimSql(),
           exactPreflightClaimValues(options, leaseToken),
@@ -367,15 +380,31 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
           || claim.leaseExpiresAtMs - claimAtMs !== options.leaseMs
           || claim.intent.expiresAtMs <= claim.leaseExpiresAtMs) throw dataError();
         return claim;
-      });
+      }, signal, 'READ_COMMITTED');
     });
   }
 
   public async beginAttempt(claimValue: ClaimedExecutionIntent): Promise<ExecutionBeginAttemptResult> {
+    return this.beginAttemptUnderFence(claimValue);
+  }
+
+  public async beginExactPreflightSimulationAttempt(
+    fenceValue: ExecutionPreflightSimulationMutationFence,
+    claimValue: ClaimedExecutionIntent,
+  ): Promise<ExecutionBeginAttemptResult> {
+    return this.beginAttemptUnderFence(claimValue, fenceValue);
+  }
+
+  private async beginAttemptUnderFence(
+    claimValue: ClaimedExecutionIntent,
+    fenceValue?: ExecutionPreflightSimulationMutationFence,
+  ): Promise<ExecutionBeginAttemptResult> {
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
+      const fence = fenceValue === undefined ? null : preflightSimulationFence(fenceValue, claim);
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
       return this.transaction(async (client) => {
+        if (fence !== null) await lockExactSimulationMutationFence(client, fence, claim, 0);
         const locked = await lockClaimedIntent(client, claim);
         const ledger = await lockAttemptLedger(client, locked);
         if (ledger.latest?.status === 'STARTED') {
@@ -499,10 +528,30 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     claimValue: ClaimedExecutionIntent,
     leaseMsValue: number,
   ): Promise<ClaimedExecutionIntent> {
+    return this.renewUnderFence(claimValue, leaseMsValue);
+  }
+
+  public async renewExactPreflightSimulation(
+    fenceValue: ExecutionPreflightSimulationMutationFence,
+    claimValue: ClaimedExecutionIntent,
+    leaseMsValue: number,
+  ): Promise<ClaimedExecutionIntent> {
+    return this.renewUnderFence(claimValue, leaseMsValue, fenceValue);
+  }
+
+  private async renewUnderFence(
+    claimValue: ClaimedExecutionIntent,
+    leaseMsValue: number,
+    fenceValue?: ExecutionPreflightSimulationMutationFence,
+  ): Promise<ClaimedExecutionIntent> {
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
+      const fence = fenceValue === undefined ? null : preflightSimulationFence(fenceValue, claim);
       const leaseMs = positiveInteger(leaseMsValue, MAX_LEASE_MS, 'INVALID_INPUT');
       return this.transaction(async (client) => {
+        if (fence !== null) {
+          await lockExactSimulationMutationFence(client, fence, claim, leaseMs);
+        }
         await lockClaimedIntent(client, claim);
         const renewed = await client.query(
           `WITH operation AS MATERIALIZED (
@@ -561,10 +610,28 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     claimValue: ClaimedExecutionIntent,
     inputValue: ExecutionIntentTransitionInput,
   ): Promise<ExecutionIntentV1> {
+    return this.transitionUnderFence(claimValue, inputValue);
+  }
+
+  public async transitionExactPreflightSimulation(
+    fenceValue: ExecutionPreflightSimulationMutationFence,
+    claimValue: ClaimedExecutionIntent,
+    inputValue: ExecutionIntentTransitionInput,
+  ): Promise<ExecutionIntentV1> {
+    return this.transitionUnderFence(claimValue, inputValue, fenceValue);
+  }
+
+  private async transitionUnderFence(
+    claimValue: ClaimedExecutionIntent,
+    inputValue: ExecutionIntentTransitionInput,
+    fenceValue?: ExecutionPreflightSimulationMutationFence,
+  ): Promise<ExecutionIntentV1> {
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
+      const fence = fenceValue === undefined ? null : preflightSimulationFence(fenceValue, claim);
       const input = transitionInput(inputValue, claim);
       return this.transaction(async (client) => {
+        if (fence !== null) await lockExactSimulationMutationFence(client, fence, claim, 0);
         if (claim.intent.side === 'SELL'
           && claim.intent.status === 'UNKNOWN_REQUIRES_RECONCILIATION'
           && input.nextStatus === 'RETRY_READY') {
@@ -902,6 +969,48 @@ function exactPreflightIntentClaimSql(): string {
     candidate.dry_run_assessment_count,candidate.simulation_artifact_count`;
 }
 
+function exactPreflightIntentLockSql(): string {
+  return `WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+  )
+  SELECT intent.id
+  FROM execution_preflight_intent_preparation_runs AS preparation
+  JOIN execution_preflight_intent_pairs AS pair
+    ON pair.pair_id=preparation.pair_id AND pair.pair_id=$4
+  JOIN execution_preflight_intent_pair_memberships AS membership
+    ON membership.pair_id=pair.pair_id AND membership.intent_id=$6
+      AND membership.lane=$5
+  JOIN execution_intents AS intent
+    ON intent.id=membership.intent_id AND intent.id=$6
+  CROSS JOIN operation
+  WHERE preparation.run_id=$1
+    AND preparation.state='PREPARING'
+    AND preparation.lease_owner=$2
+    AND preparation.lease_token=$3::UUID
+    AND preparation.pair_id=$4
+    AND preparation.lease_expires_at>operation.at
+    AND preparation.lease_expires_at>=operation.at
+      +($7::BIGINT*INTERVAL '1 millisecond')
+    AND preparation.deadline_at>operation.at+INTERVAL '5 seconds'
+    AND preparation.deadline_at>=operation.at
+      +(($7::BIGINT+5000)*INTERVAL '1 millisecond')
+    AND (($5='TARGET' AND $8='DRY_RUN' AND pair.target_intent_id=intent.id
+        AND intent.status='PENDING' AND intent.attempt_count=0
+        AND intent.state_revision=0 AND intent.last_reason_code IS NULL)
+      OR ($5='SIMULATION' AND $8='EXECUTE' AND pair.simulation_intent_id=intent.id
+        AND ((intent.status='PENDING' AND intent.attempt_count=0
+            AND intent.state_revision=0 AND intent.last_reason_code IS NULL)
+          OR (intent.status='PROCESSING' AND intent.attempt_count=1
+            AND intent.state_revision=1 AND intent.last_reason_code='EXECUTION_STARTED'))))
+    AND (intent.lease_expires_at IS NULL OR intent.lease_expires_at<=operation.at)
+    AND intent.terminal_at IS NULL
+    AND intent.reconciliation_completed_at IS NULL
+    AND intent.purge_after IS NULL
+    AND intent.live_reserved=FALSE
+    AND intent.expires_at>operation.at+($7::BIGINT*INTERVAL '1 millisecond')
+  FOR UPDATE OF preparation,pair,intent`;
+}
+
 function liveExecuteBuyClaimSql(): string {
   return `WITH operation AS MATERIALIZED (
     SELECT date_trunc('milliseconds', statement_timestamp()) AS at
@@ -1066,6 +1175,57 @@ function transitionUpdateSql(terminal: boolean): string {
     AND intent.state_revision < 9223372036854775807
     AND intent.lease_expires_at > statement_timestamp()
   RETURNING ${INTENT_PROJECTION}`;
+}
+
+async function lockExactSimulationMutationFence(
+  client: ExecutionIntentClient,
+  fence: ExecutionPreflightSimulationMutationFence,
+  claim: ClaimedExecutionIntent,
+  requiredLeaseMs: number,
+): Promise<void> {
+  const result = await client.query(
+    `WITH operation AS MATERIALIZED (
+       SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+     )
+     SELECT intent.id
+     FROM execution_preflight_intent_preparation_runs AS preparation
+     JOIN execution_preflight_intent_pairs AS pair
+       ON pair.pair_id=preparation.pair_id AND pair.pair_id=$4
+     JOIN execution_preflight_intent_pair_memberships AS membership
+       ON membership.pair_id=pair.pair_id AND membership.intent_id=$5
+         AND membership.lane='SIMULATION'
+     JOIN execution_intents AS intent
+       ON intent.id=membership.intent_id AND intent.id=$5
+     CROSS JOIN operation
+     WHERE preparation.run_id=$1
+       AND preparation.state='PREPARING'
+       AND preparation.lease_owner=$2
+       AND preparation.lease_token=$3::UUID
+       AND preparation.pair_id=$4
+       AND preparation.lease_expires_at>operation.at
+       AND preparation.lease_expires_at>=operation.at
+         +($10::BIGINT*INTERVAL '1 millisecond')
+       AND preparation.deadline_at>operation.at+INTERVAL '5 seconds'
+       AND preparation.deadline_at>=operation.at
+         +(($10::BIGINT+5000)*INTERVAL '1 millisecond')
+       AND pair.simulation_intent_id=intent.id
+       AND intent.lease_owner=$6
+       AND intent.lease_token=$7::UUID
+       AND intent.lease_expires_at>operation.at
+       AND intent.status=$8
+       AND intent.state_revision=$9::BIGINT
+       AND intent.live_reserved=FALSE
+     FOR UPDATE OF preparation,pair,intent`,
+    [
+      fence.runId, fence.preparationLeaseOwner, fence.preparationLeaseToken,
+      fence.pairId, fence.intentId, claim.leaseOwner, claim.leaseToken,
+      claim.intent.status, claim.intent.stateRevision.toString(), requiredLeaseMs,
+    ],
+  );
+  if (result.rowCount === 0 && result.rows.length === 0) throw leaseLostError();
+  if (result.rowCount !== 1 || result.rows.length !== 1) throw dataError();
+  const row = exactRecord(requiredRow(result.rows), ['id'], 'INVALID_DATA');
+  if (row.id !== fence.intentId) throw dataError();
 }
 
 async function lockClaimedIntent(
@@ -1235,6 +1395,47 @@ function exactPreflightClaimValues(
     leaseToken,
     options.purpose,
   ];
+}
+
+function exactPreflightLockValues(
+  options: ExecutionPreflightExactClaimOptions,
+): readonly unknown[] {
+  return [
+    options.runId,
+    options.preparationLeaseOwner,
+    options.preparationLeaseToken,
+    options.pairId,
+    options.lane,
+    options.intentId,
+    options.leaseMs,
+    options.purpose,
+  ];
+}
+
+function preflightSimulationFence(
+  value: unknown,
+  claim: ClaimedExecutionIntent,
+): ExecutionPreflightSimulationMutationFence {
+  const row = exactRecord(value, PREFLIGHT_SIMULATION_FENCE_KEYS, 'INVALID_INPUT');
+  const runId = patternedText(
+    row.runId,
+    /^execution_preflight_preparation_[0-9a-f]{64}$/u,
+  );
+  const preparationLeaseOwner = patternedText(
+    row.preparationLeaseOwner,
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u,
+  );
+  const preparationLeaseToken = uuid(row.preparationLeaseToken, 'INVALID_INPUT');
+  const pairId = patternedText(
+    row.pairId,
+    /^execution_preflight_intent_pair_[0-9a-f]{64}$/u,
+  );
+  const intentId = patternedText(row.intentId, /^execution_intent_[0-9a-f]{64}$/u);
+  if (row.lane !== 'SIMULATION' || intentId !== claim.intent.id) throw inputError();
+  return Object.freeze({
+    runId, preparationLeaseOwner, preparationLeaseToken, pairId, intentId,
+    lane: 'SIMULATION',
+  });
 }
 
 function claimedInput(value: unknown): ClaimedExecutionIntent {

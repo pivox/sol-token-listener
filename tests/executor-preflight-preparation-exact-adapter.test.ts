@@ -95,7 +95,9 @@ void test('SIMULATION delegates bound lifecycle methods and renews preparation f
     ownerId: 'simulation-owner',
     leaseMs: 30_000,
   }));
-  const intentClaim = Object.freeze({}) as ClaimedExecutionIntent;
+  const intentClaim = claimedSimulation('PENDING', 0, 0n);
+  const processingClaim = claimedSimulation('PROCESSING', 0, 1n);
+  const begunClaim = claimedSimulation('PROCESSING', 1, 1n);
   const transition = Object.freeze({}) as ExecutionIntentTransitionInput;
 
   assert.deepEqual(Object.keys(adapter), [
@@ -105,11 +107,12 @@ void test('SIMULATION delegates bound lifecycle methods and renews preparation f
     ownerId: 'simulation-owner', leaseMs: 30_000, purpose: 'EXECUTE',
   }), SIGNAL);
   await adapter.transition(intentClaim, transition);
-  await adapter.beginAttempt(intentClaim);
-  await adapter.renew(intentClaim, 30_000);
+  await adapter.beginAttempt(processingClaim);
+  await adapter.renew(begunClaim, 30_000);
 
   assert.deepEqual(calls, [
-    'claim-exact', 'transition', 'begin-attempt', 'renew-preparation', 'renew-intent',
+    'claim-exact', 'transition-exact', 'begin-attempt-exact',
+    'renew-preparation', 'renew-intent-exact',
   ]);
   assert.equal(adapter.currentPreparationClaim(), renewed);
   await adapter.claim(Object.freeze({
@@ -118,6 +121,39 @@ void test('SIMULATION delegates bound lifecycle methods and renews preparation f
   assert.equal(repository.exactClaims[1]?.preparationLeaseOwner, 'prep-owner-1');
   assert.equal(repository.exactClaims[1]?.preparationLeaseToken, uuid(1));
 });
+
+void test('SIMULATION rejects another intent, owner, or lifecycle state before mutation',
+  async () => {
+    const calls: string[] = [];
+    const repository = new IntentRepositoryProbe(calls);
+    const adapter = createExactPreflightSimulationIntentAdapter(Object.freeze({
+      intents: repository,
+      preparationClaim: claimedPreparation('prep-owner', uuid(1), 0n),
+      renewPreparation: async (claim: ClaimedExecutionPreflightPreparation) => claim,
+      preparationLeaseMs: 40_000,
+      pairId: PAIR_ID,
+      intentId: SIMULATION_ID,
+      ownerId: 'simulation-owner',
+      leaseMs: 30_000,
+    }));
+    const transition = Object.freeze({}) as ExecutionIntentTransitionInput;
+    await assert.rejects(
+      adapter.transition(
+        claimedSimulation('PENDING', 0, 0n, 'simulation-owner', TARGET_ID),
+        transition,
+      ),
+      TypeError,
+    );
+    await assert.rejects(
+      adapter.beginAttempt(claimedSimulation('PROCESSING', 0, 1n, 'other-owner')),
+      TypeError,
+    );
+    await assert.rejects(
+      adapter.renew(claimedSimulation('PENDING', 0, 0n), 30_000),
+      TypeError,
+    );
+    assert.deepEqual(calls, []);
+  });
 
 void test('SIMULATION does not renew the intent when preparation renewal fails', async () => {
   const calls: string[] = [];
@@ -136,7 +172,7 @@ void test('SIMULATION does not renew the intent when preparation renewal fails',
   }));
 
   await assert.rejects(
-    adapter.renew(Object.freeze({}) as ClaimedExecutionIntent, 30_000),
+    adapter.renew(claimedSimulation('PROCESSING', 1, 1n), 30_000),
     (error: unknown) => error === failure,
   );
   assert.deepEqual(calls, ['renew-preparation']);
@@ -184,6 +220,32 @@ class IntentRepositoryProbe implements Pick<ExecutionIntentRepository,
     this.calls.push('renew-intent');
     return claim;
   }
+
+  public async transitionExactPreflightSimulation(
+    _fence: unknown,
+    _claim: ClaimedExecutionIntent,
+    _input: ExecutionIntentTransitionInput,
+  ): Promise<never> {
+    this.calls.push('transition-exact');
+    return undefined as never;
+  }
+
+  public async beginExactPreflightSimulationAttempt(
+    _fence: unknown,
+    _claim: ClaimedExecutionIntent,
+  ): Promise<ExecutionBeginAttemptResult> {
+    this.calls.push('begin-attempt-exact');
+    return undefined as never;
+  }
+
+  public async renewExactPreflightSimulation(
+    _fence: unknown,
+    claim: ClaimedExecutionIntent,
+    _leaseMs: number,
+  ): Promise<ClaimedExecutionIntent> {
+    this.calls.push('renew-intent-exact');
+    return claim;
+  }
 }
 
 function repositoryReceiver<Value extends IntentRepositoryProbe>(value: Value): Value {
@@ -225,4 +287,50 @@ function claimedPreparation(
 
 function uuid(index: number): string {
   return `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+}
+
+function claimedSimulation(
+  status: 'PENDING' | 'PROCESSING',
+  attemptCount: number,
+  stateRevision: bigint,
+  owner = 'simulation-owner',
+  intentId = SIMULATION_ID,
+): ClaimedExecutionIntent {
+  const now = 1_800_000_000_000;
+  return Object.freeze({
+    intent: Object.freeze({
+      id: intentId,
+      payloadVersion: 1,
+      logicalOrderKey: `execution_preflight_probe_${HASH}`,
+      strategyId: 'creation-entry-v1',
+      strategyVersion: 1,
+      positionId: 'position:exact-preflight',
+      logicalCommandId: `execution_preflight_probe_${HASH}`,
+      mint: '11111111111111111111111111111111',
+      side: 'BUY',
+      venuePolicy: 'PUMP_FUN_ONLY',
+      quoteMint: 'So11111111111111111111111111111111111111112',
+      quoteTokenProgram: 'SPL_TOKEN',
+      quoteDecimals: 9,
+      quoteAmountRaw: 1n,
+      baseAmountRaw: null,
+      minimumAmountOutRaw: 1n,
+      decisionEventId: 'decision:exact-preflight',
+      decisionFingerprint: HASH,
+      requestedAtMs: now,
+      expiresAtMs: now + 60_000,
+      status,
+      attemptCount,
+      stateRevision,
+      lastReasonCode: status === 'PENDING' ? null : 'EXECUTION_STARTED',
+      terminalAtMs: null,
+      reconciliationCompletedAtMs: null,
+      purgeAfterMs: null,
+      createdAtMs: now,
+      updatedAtMs: now,
+    }),
+    leaseOwner: owner,
+    leaseToken: uuid(2),
+    leaseExpiresAtMs: now + 30_000,
+  });
 }
