@@ -1,8 +1,14 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.0 — 2026-09-08
+**Version :** 1.17.1 — 2026-09-08
 
-La version 1.17.0 constate H2k-b disponible mais désactivé par défaut : son
+La version 1.17.1 constate que H2e accepte strictement le contrat historique
+`usage` et le contrat courant
+`creditCycle + credits + requests + dataTransfer` ; dans ce dernier,
+`creditCycle` est l'autorité du cycle. Ce complément documentaire ne change
+aucune procédure ni frontière de sécurité.
+
+H2k-b reste disponible mais désactivé par défaut : son
 runner one-shot prépare une paire target/probe exacte et H2h v2 l'exporte par
 `preparationRunId`. Le head de migration est 043. Aucune clé n'est chargée,
 aucune transaction n'est signée, armée ou soumise par H2k-b, et le canary
