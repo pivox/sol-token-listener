@@ -1,6 +1,6 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.12
+**Version de spécification :** 1.0.13
 
 **Version de la spécification parente :** 1.11.13
 
@@ -13,6 +13,11 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.13 — 2026-09-08 :** impose `READ COMMITTED` à la transaction H2d afin
+  que la validation de l'état risque, exécutée après une attente sur le mutex
+  `51005`, observe le commit du writer même si la session ou le rôle utilise
+  par défaut `REPEATABLE READ`.
 
 - **1.0.12 — 2026-09-08 :** aligne la validation de l'état risque sur
   l'autorité PostgreSQL fermée : le mutex transactionnel de génération `51005`
@@ -272,8 +277,8 @@ armement, lock pré-signature, bytes signés, preuve de soumission ou contrôle
 opérateur. Listener, API, opérations, H2a et H2b ne gagnent aucune autorité H2d.
 
 Le rôle ne reçoit aucun privilège `UPDATE` sur
-`execution_wallet_risk_state`. La validation de l'état initial est un `SELECT`
-ordinaire exécuté après le mutex transactionnel de génération
+`execution_wallet_risk_state`. La transaction H2d force `READ COMMITTED`, puis
+la validation de l'état initial est un `SELECT` ordinaire exécuté après le mutex transactionnel de génération
 `pg_advisory_xact_lock(hashtextextended(generation_id, 51005))`. Ce même mutex
 précède tous les writers applicatifs de l'état risque. Un verrou de ligne
 `FOR UPDATE` serait à la fois redondant et inexécutable avec cette autorité
@@ -310,10 +315,14 @@ Une exécution utilise une transaction unique après la collecte réseau :
 8. commit ;
 9. rendu du manifeste depuis les objets commités.
 
-Le verrou de l'étape 1 est le mutex advisory transactionnel `51005`. Il
+La transaction démarre explicitement en `READ COMMITTED`. Le verrou de l'étape
+1 est le mutex advisory transactionnel `51005`. Il
 sérialise les exécutions H2d concurrentes et les writers applicatifs du même
 `generation_id` jusqu'au commit ou rollback, sans accorder de droit de
-mutation à readiness. Un writer SQL administratif qui contourne volontairement
+mutation à readiness. Le niveau d'isolation explicite garantit qu'après une
+attente, la lecture de l'état risque voit le commit du writer précédent, sans
+dépendre du défaut configuré sur la session ou le rôle. Un writer SQL
+administratif qui contourne volontairement
 ce mutex est hors du contrat applicatif et reste une dérive opérateur.
 
 Un crash avant commit ne laisse aucune projection partielle. Un replay exact

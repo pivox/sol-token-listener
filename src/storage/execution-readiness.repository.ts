@@ -58,7 +58,7 @@ export class PostgresExecutionReadinessRepository implements ExecutionReadinessR
     let commitStarted = false;
     let released = false;
     try {
-      await client.query('BEGIN');
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       transactionStarted = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
         [input.generation.generationId]);

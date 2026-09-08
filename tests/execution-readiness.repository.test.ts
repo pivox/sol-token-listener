@@ -53,6 +53,72 @@ void test('serializes concurrent replays of the same readiness commit', async (c
   });
 });
 
+void test('reads risk state after a blocked generation writer under repeatable read',
+  async (context) => {
+    const url = databaseUrl(context);
+    if (url === null) return;
+    await withSchema(url, async (pool, schema) => {
+      const input = commitInput();
+      await pool.query(`INSERT INTO execution_wallet_generations (
+        generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation
+      ) VALUES ($1,1,$2,$3,$4,$5)`, [input.generation.generationId,
+        input.generation.walletPublicKey, input.generation.cluster,
+        input.generation.genesisHash, input.generation.generation]);
+      await pool.query(`INSERT INTO execution_wallet_risk_state (
+        generation_id,reconciled_capital_lamports,reserved_exposure_raw,
+        conservative_drawdown_raw
+      ) VALUES ($1,0,0,0)`, [input.generation.generationId]);
+      const writer = await pool.connect();
+      const repeatablePool = new pg.Pool({ connectionString: url,
+        options: `-c search_path=${schema}`, max: 1 });
+      let generationLockDispatchedResolve: (() => void) | undefined;
+      const generationLockDispatched = new Promise<void>((resolve) => {
+        generationLockDispatchedResolve = resolve;
+      });
+      const repeatableSource: ExecutionRiskPool = { async connect() {
+        const client = await repeatablePool.connect();
+        await client.query(`SET SESSION CHARACTERISTICS AS TRANSACTION
+          ISOLATION LEVEL REPEATABLE READ`);
+        return {
+          query: (text, values) => {
+            const pending = client.query(text, values === undefined ? undefined : [...values]);
+            if (text.includes('hashtextextended($1, 51005)')) {
+              generationLockDispatchedResolve?.();
+            }
+            return pending;
+          },
+          release: (evict = false) => { client.release(evict); },
+        };
+      } };
+      let writerTransaction = false;
+      try {
+        await writer.query('BEGIN');
+        writerTransaction = true;
+        await writer.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+          [input.generation.generationId]);
+        const commit = new PostgresExecutionReadinessRepository(repeatableSource).commit(input);
+        await generationLockDispatched;
+        await writer.query(`UPDATE execution_wallet_risk_state
+          SET state_revision=1 WHERE generation_id=$1`, [input.generation.generationId]);
+        await writer.query('COMMIT');
+        writerTransaction = false;
+        await assert.rejects(commit,
+          (error: unknown) => error instanceof ExecutionReadinessRepositoryError
+            && error.code === 'CONFLICT');
+        const state = (await pool.query(`SELECT state_revision::TEXT AS revision,
+          (SELECT COUNT(*) FROM execution_wallet_snapshots)::INTEGER AS wallet_snapshots,
+          (SELECT COUNT(*) FROM execution_provider_usage_snapshots)::INTEGER AS provider_snapshots
+          FROM execution_wallet_risk_state WHERE generation_id=$1`,
+        [input.generation.generationId])).rows[0];
+        assert.deepEqual(state, { revision: '1', wallet_snapshots: 0, provider_snapshots: 0 });
+      } finally {
+        if (writerTransaction) await writer.query('ROLLBACK');
+        writer.release();
+        await repeatablePool.end();
+      }
+    });
+  });
+
 void test('rolls back every readiness projection when the provider insert fails', async (context) => {
   const url = databaseUrl(context);
   if (url === null) return;
@@ -194,7 +260,7 @@ function databaseUrl(context: Readonly<{ skip(message?: string): void }>): strin
 
 async function withSchema(
   databaseUrlValue: string,
-  callback: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+  callback: (pool: InstanceType<typeof pg.Pool>, schema: string) => Promise<void>,
 ): Promise<void> {
   const schema = `execution_readiness_${randomUUID().replaceAll('-', '')}`;
   const admin = new pg.Pool({ connectionString: databaseUrlValue });
@@ -204,7 +270,7 @@ async function withSchema(
   try {
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await migrateDatabase({ pool });
-    await callback(pool);
+    await callback(pool, schema);
   } finally {
     try {
       await pool.end();

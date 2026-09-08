@@ -4,7 +4,7 @@
 
 **Goal:** Rendre le commit H2d exécutable par son rôle PostgreSQL dédié sans lui accorder de privilège `UPDATE`, tout en conservant la sérialisation et l'atomicité du bootstrap.
 
-**Architecture:** Le mutex advisory transactionnel `hashtextextended(generationId, 51005)` reste l'unique verrou causal de génération et précède la validation de l'état risque. Le `SELECT ... FOR UPDATE` redondant est remplacé par un `SELECT` ordinaire. Les tests couvrent le repository réellement utilisé par readiness, le login PostgreSQL fermé et deux commits concurrents du même bootstrap.
+**Architecture:** Le mutex advisory transactionnel `hashtextextended(generationId, 51005)` reste l'unique verrou causal de génération et précède la validation de l'état risque. La transaction force `READ COMMITTED` afin qu'une lecture post-attente voie le dernier commit, même sous un défaut de session `REPEATABLE READ`. Le `SELECT ... FOR UPDATE` redondant est remplacé par un `SELECT` ordinaire. Les tests couvrent le repository réellement utilisé par readiness, le login PostgreSQL fermé, deux commits concurrents du même bootstrap et l'attente d'un writer sous isolation restrictive.
 
 **Tech Stack:** TypeScript strict ESM, Node.js 22, PostgreSQL 16, `pg`, `node:test` via `tsx`.
 
@@ -16,8 +16,8 @@
 - `tests/executor-readiness-database.test.ts` : preuve PostgreSQL 16 de verrouillage, commit et refus de mutation avec le rôle dédié.
 - `tests/execution-readiness.repository.test.ts` : preuve de sérialisation et rejeu concurrent du même bootstrap.
 - `src/storage/execution-readiness.repository.ts` : validation de l'état initial sous mutex generation, sans row lock.
-- `docs/superpowers/specs/2026-09-05-executor-readiness-bootstrap-design.md` : contrat H2d version 1.0.12.
-- `docs/operations/executor-live-canary.md` : procédure opérateur version 1.17.2.
+- `docs/superpowers/specs/2026-09-05-executor-readiness-bootstrap-design.md` : contrat H2d version 1.0.13.
+- `docs/operations/executor-live-canary.md` : procédure opérateur version 1.17.3.
 
 ### Task 1: Reproduire l'incompatibilité d'autorité
 
@@ -62,7 +62,7 @@ Expected: FAIL sur la présence actuelle de `FOR UPDATE` dans le repository read
 
 - [ ] **Step 1: Appliquer le changement minimal**
 
-Remplacer uniquement :
+Forcer la transaction en `READ COMMITTED` puis remplacer :
 
 ```sql
 FROM execution_wallet_risk_state WHERE generation_id=$1 FOR UPDATE
@@ -73,6 +73,9 @@ par :
 ```sql
 FROM execution_wallet_risk_state WHERE generation_id=$1
 ```
+
+Le niveau d'isolation explicite ne doit pas dépendre du défaut du rôle ou de la
+session PostgreSQL.
 
 - [ ] **Step 2: Vérifier GREEN**
 
@@ -92,6 +95,13 @@ Exécuter deux `commit(input)` concurrents sur le même repository et le même i
 - [ ] **Step 2: Vérifier le test ciblé**
 
 Run: `TEST_DATABASE_URL=<postgres16-admin-url> npx tsx --test tests/execution-readiness.repository.test.ts`
+
+- [ ] **Step 3: Prouver la fraîcheur après attente sous `REPEATABLE READ`**
+
+Maintenir le mutex `51005` dans une transaction writer, démarrer H2d depuis une
+session dont le défaut est `REPEATABLE READ`, commiter une révision concurrente,
+puis vérifier que H2d la voit après l'attente et retourne `CONFLICT` sans écrire
+de snapshot.
 
 Expected: PASS avec les deux promesses résolues sur le même commit canonique.
 

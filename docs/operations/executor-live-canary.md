@@ -1,6 +1,11 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.2 — 2026-09-08
+**Version :** 1.17.3 — 2026-09-08
+
+La version 1.17.3 force la transaction H2d en `READ COMMITTED`. Une exécution
+qui attend le mutex de génération observe ainsi le dernier état risque commité,
+même si le rôle ou la session PostgreSQL utilise par défaut `REPEATABLE READ`.
+Le rôle readiness ne reçoit toujours aucun privilège `UPDATE`.
 
 La version 1.17.2 corrige le prérequis PostgreSQL H2d observé sur le terrain :
 la validation de l'état risque s'appuie sur le mutex transactionnel de
