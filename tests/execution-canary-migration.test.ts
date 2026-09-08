@@ -13,7 +13,7 @@ import {
 } from '../src/storage/execution-live.repository.js';
 
 const migrationName = '039_execution_canary_operator_binding.sql';
-const latestMigrationName = '041_execution_preflight_intent_pairs.sql';
+const latestMigrationName = '043_execution_intent_causal_lineage.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 039 defines V2 armament bindings and pre-signature locks', async () => {
@@ -666,7 +666,7 @@ function defaultCanaryTargetSeed(): CanaryTargetSeed {
   return Object.freeze({
     id: `execution_intent_${'d'.repeat(64)}`, payloadVersion: 1 as const,
     logicalOrderKey: 'order', strategyId: 'strategy', strategyVersion: 1,
-    positionId: 'position', logicalCommandId: 'command',
+    positionId: 'position', candidateId: null, logicalCommandId: 'command',
     mint: '11111111111111111111111111111111', side: 'BUY' as const,
     venuePolicy: 'PUMP_FUN_ONLY' as const,
     quoteMint: 'So11111111111111111111111111111111111111112',

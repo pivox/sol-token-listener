@@ -15,6 +15,7 @@ import {
   EXECUTOR_INTEGRATION_PAYER,
   startScriptedPumpFunBuyRpc,
 } from './helpers/executor-simulation-rpc.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -79,7 +80,7 @@ void test('compiled executor records once, remains non-consuming and exits clean
   await migrateDatabase({ pool: schemaPool });
 
   const repository = new PostgresExecutionIntentRepository(schemaPool);
-  const created = await createIntent(repository, 'first');
+  const created = await createIntent(schemaPool, repository, 'first');
   const before = await parentState(schemaPool, created.intent.id);
   const applicationName = `executor-idle-${randomUUID()}`;
   const executorUrl = databaseUrlForSchema(databaseUrl, schema, applicationName, databaseRole);
@@ -92,7 +93,7 @@ void test('compiled executor records once, remains non-consuming and exits clean
     [idlePid],
   );
   assert.equal(terminated.rows[0]?.terminated, true);
-  const continued = await createIntent(repository, 'continued');
+  const continued = await createIntent(schemaPool, repository, 'continued');
   await waitForAssessment(schemaPool, continued.intent.id, 1, first);
   assert.equal(first.exitCode, null, childOutput(first));
   assert.deepEqual(await stopExecutorChild(first), { code: 0, signal: null }, childOutput(first));
@@ -150,7 +151,7 @@ void test('compiled simulation-only executor records one unsigned Pump.fun BUY w
   await migrateDatabase({ pool: schemaPool });
 
   const repository = new PostgresExecutionIntentRepository(schemaPool);
-  const created = await createSimulationIntent(repository);
+  const created = await createSimulationIntent(schemaPool, repository);
   const executorUrl = databaseUrlForSchema(
     databaseUrl,
     schema,
@@ -274,7 +275,7 @@ void test('compiled non-signing executors run under the isolated worker login', 
     }]);
 
     const repository = new PostgresExecutionIntentRepository(isolated);
-    const dryRunIntent = await createIntent(repository, `worker-${suffix}`);
+    const dryRunIntent = await createIntent(isolated, repository, `worker-${suffix}`);
     const dryRun = startExecutor(context, children, workerUrl.href, false);
     await waitForAssessment(isolated, dryRunIntent.intent.id, 1, dryRun);
     assert.deepEqual(
@@ -284,7 +285,7 @@ void test('compiled non-signing executors run under the isolated worker login', 
     );
 
     rpc = await startScriptedPumpFunBuyRpc();
-    const simulationIntent = await createSimulationIntent(repository);
+    const simulationIntent = await createSimulationIntent(isolated, repository);
     const simulation = startSimulationExecutor(
       context, children, workerUrl.href, rpc.url, false,
     );
@@ -643,11 +644,12 @@ async function delay(durationMs: number): Promise<void> {
 }
 
 async function createIntent(
+  pool: InstanceType<typeof pg.Pool>,
   repository: PostgresExecutionIntentRepository,
   suffix: string,
 ) {
   const now = Date.now();
-  return repository.create(createExecutionIntentDraft({
+  const draft = createExecutionIntentDraft({
     strategyId: 'executor-main-integration', strategyVersion: 1,
     positionId: `position-${suffix}`, logicalCommandId: `command-${suffix}`,
     mint: '11111111111111111111111111111111', side: 'BUY',
@@ -657,12 +659,17 @@ async function createIntent(
     quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
     decisionEventId: `event-${suffix}`, decisionFingerprint: 'a'.repeat(64),
     requestedAtMs: now, expiresAtMs: now + 60_000,
-  }));
+  });
+  await insertExecutionDecisionEvent(pool, draft.decisionEventId, draft.mint);
+  return repository.create(draft);
 }
 
-async function createSimulationIntent(repository: PostgresExecutionIntentRepository) {
+async function createSimulationIntent(
+  pool: InstanceType<typeof pg.Pool>,
+  repository: PostgresExecutionIntentRepository,
+) {
   const now = Date.now();
-  return repository.create(createExecutionIntentDraft({
+  const draft = createExecutionIntentDraft({
     strategyId: 'executor-simulation-main-integration',
     strategyVersion: 1,
     positionId: 'position-simulation-buy',
@@ -680,7 +687,9 @@ async function createSimulationIntent(repository: PostgresExecutionIntentReposit
     decisionFingerprint: 'b'.repeat(64),
     requestedAtMs: now,
     expiresAtMs: now + 120_000,
-  }));
+  });
+  await insertExecutionDecisionEvent(pool, draft.decisionEventId, draft.mint);
+  return repository.create(draft);
 }
 
 async function waitForIdleBackend(

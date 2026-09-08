@@ -51,17 +51,29 @@ PostgreSQL. #51-H2a compose séparément la finalité read-only, et #51-H2b
 compose le runtime signable désarmé. H2b ne possède que quatre lanes, dans cet
 ordre : recover SELL, execute SELL, recover BUY, execute BUY. H2a conserve
 finalité, confirmation, réconciliation et deadline. #51-H2c livre maintenant
-les gates, l'armement exact et le lock durable pré-signature dans l'état
-`READY_FOR_EXTERNAL_PREFLIGHT`; aucun canary n'a démarré. Les seuls modes du listener restent
+les gates, la requête d'armement wire V3 et le lock durable pré-signature dans
+l'état `READY_FOR_EXTERNAL_PREFLIGHT`. La requête V3 est validée puis persistée
+comme un armement V2 ; aucun canary n'a démarré. Les seuls modes du listener restent
 `observe` et `paper` ; le processus H2b est un exécutable séparé. Le
 [runbook canary #51-G](docs/operations/executor-live-canary.md) décrit les
 frontières et l'état non activé.
 
-#51-H2h exporte désormais, dans une transaction PostgreSQL
-`REPEATABLE READ READ ONLY`, la source persistée exacte requise par H2g. La
-commande séparée `executor:preflight-source:start` exige les identités
-génération/intention/simulation explicites, écrit un fichier owner-only hors
-Git et ne possède ni RPC, clé, signature, armement ou soumission.
+#51-H2h exporte désormais la source
+`execution-preflight-draft-source.v2` dans une transaction PostgreSQL
+`REPEATABLE READ READ ONLY`. La commande séparée
+`executor:preflight-source:start` reçoit uniquement le
+`EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID` produit par H2k-b, reconstruit et
+vérifie toute la lignée run/pair/candidate/assessment/artifact avant d'écrire
+un fichier owner-only hors Git. Le head de migration est 043.
+
+#51-H2k-b ajoute la préparation one-shot exacte : sélection d'une seule paire
+target/probe finalisée, dry-run non consommant, simulation du probe, puis run
+`PREPARED` et manifeste `PREFLIGHT_INTENT_PREPARED` destinés à H2h v2. Le
+runner `executor:preflight-preparation:start` n'est jamais démarré
+automatiquement et reste désactivé par défaut avec
+`EXECUTOR_PREFLIGHT_PREPARATION_ENABLED=false`. Cette chaîne ne charge aucune
+clé, ne signe, n'arme et ne soumet rien ; l'état reste
+`CANARY_NOT_STARTED`.
 
 ### Bootstrap de readiness non signant (#51-H2d)
 
@@ -147,6 +159,9 @@ sans clé privée, signature, soumission ni live; elle n'appelle ni
   contient aucune clé réelle.
 - H2b est isolé du listener, de H2a et des commandes H2c ; H2c est préparé mais sa présence ne vaut
   ni armement, ni canary, ni transaction exécutée.
+- Les migrations canary vont jusqu'à 043. Le runner H2k-b est one-shot,
+  séparé et désactivé par défaut ; sa réussite prépare uniquement une source
+  H2h v2.
 - Le paper trading est une projection simulée, initialement limitée à SOL/WSOL
   par allowlist; il ne démontre ni profit ni sellabilité.
 - Aucune promesse de première position, même slot, sortie ou profit.

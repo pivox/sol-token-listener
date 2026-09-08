@@ -166,9 +166,13 @@ void test('documents H2d-H2k external evidence without starting a canary',
     packageJson.scripts?.['executor:preflight-source:start'],
     'node dist/src/preflight-source/main.js',
   );
+  assert.equal(
+    packageJson.scripts?.['executor:preflight-preparation:start'],
+    'node dist/src/executor-preflight-preparation/main.js',
+  );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.12.1',
+    '**Version de spécification :** 1.13.0',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -179,9 +183,10 @@ void test('documents H2d-H2k external evidence without starting a canary',
       + "#51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations\n"
       + 'hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL\n'
       + 'read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i\n'
-      + 'et autorité PostgreSQL fermée du worker non signant #51-H2j, puis paire\n'
-      + "d'intentions canary non signante #51-H2k-a ; la préparation one-shot\n"
-      + '#51-H2k-b reste à livrer',
+      + 'et autorité PostgreSQL fermée du worker non signant #51-H2j, paire\n'
+      + "d'intentions canary non signante #51-H2k-a, puis préparation one-shot exacte,\n"
+      + 'lignée causale et handoff H2h/H2c versionné #51-H2k-b. Le canary reste\n'
+      + '`CANARY_NOT_STARTED`.',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
@@ -196,22 +201,32 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.3.1',
+    '**Version de spécification :** 1.4.0',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.12.1',
+    '**Version de la spécification parente :** 1.13.0',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
     canaryIntentPairSpecification,
-    '**Version de spécification :** 1.1.2',
+    '**Version de spécification :** 1.3.0',
     'canary intent pair specification version',
   );
   assertContainsExactlyOnce(
     canaryIntentPairSpecification,
-    '**Statut :** H2k-a LIVRÉE — H2k-b À LIVRER',
+    '**Version de la spécification parente :** 1.13.0',
+    'canary intent pair parent specification version',
+  );
+  assertContainsExactlyOnce(
+    canaryIntentPairSpecification,
+    '**Version de la spécification canary :** 1.4.0',
+    'canary intent pair canary specification version',
+  );
+  assertContainsExactlyOnce(
+    canaryIntentPairSpecification,
+    '**Statut :** H2k-a ET H2k-b LIVRÉES — OFF PAR DÉFAUT — CANARY_NOT_STARTED',
     'canary intent pair specification status',
   );
   assertContainsExactlyOnce(
@@ -276,17 +291,17 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.16.0 — 2026-09-06',
+    '**Version :** 1.17.0 — 2026-09-08',
     'runbook version',
   );
   assertContainsExactlyOnce(
     pumpFunArchitecture,
-    '**Version :** 1.0.0 — 2026-09-06',
+    '**Version :** 1.1.0 — 2026-09-08',
     'Pump.fun architecture version',
   );
   assertContainsExactlyOnce(
     systemOverview,
-    '<meta name="doc-version" content="1.0.0">',
+    '<meta name="doc-version" content="1.1.0">',
     'system overview version',
   );
   for (const document of [
@@ -298,14 +313,19 @@ void test('documents H2d-H2k external evidence without starting a canary',
     systemOverview,
   ]) {
     assert.match(document, /H2k-a[\s\S]*(?:disponible|livr(?:e|é|ée))/iu);
-    assert.match(document, /H2k-b[\s\S]*(?:reste|prochaine|à livrer)/iu);
+    assert.match(document, /H2k-b[\s\S]*(?:disponible|livr(?:e|é|ée))/iu);
     assert.match(document,
       /EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED[\s\S]*(?:false|désactivé)/iu);
     assert.match(document,
-      /migration 041[\s\S]*(?:target|cible)[\s\S]*(?:probe|simulation)/iu);
+      /migrations?[\s\S]{0,80}\b041\b[\s\S]*(?:target|cible)[\s\S]*(?:probe|simulation)/iu);
     assert.match(document,
       /(?:expire|expiration)[\s\S]*(?:purge|rétention)[\s\S]*(?:quatre heures|4 h)/iu);
     assert.match(document, /CANARY_NOT_STARTED/iu);
+  }
+  for (const document of [canaryIntentPairSpecification, pumpFunArchitecture, runbook, systemOverview]) {
+    assert.match(document,
+      /EXECUTOR_PREFLIGHT_PREPARATION_ENABLED[\s\S]*(?:false|désactivé)/iu);
+    assert.match(document, /migration\s+042[\s\S]*migration\s+043/iu);
   }
   assertContainsExactlyOnce(
     readinessSpecification,
@@ -460,8 +480,10 @@ void test('documents H2d-H2k external evidence without starting a canary',
   assert.equal((deploymentSmoke.match(/'039_execution_canary_operator_binding\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'040_execution_worker_live_partition\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'041_execution_preflight_intent_pairs\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'042_execution_preflight_intent_preparation\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'043_execution_intent_causal_lineage\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n {2}'042_execution_preflight_intent_preparation\.sql',\n {2}'043_execution_intent_causal_lineage\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );

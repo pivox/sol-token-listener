@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createExecutionArmament,
   createExecutionArmamentRequestV2,
+  createExecutionArmamentRequestV3,
   createExecutionArmamentV2,
   createOperatorAuthorization,
   createOperatorAuthorizationV2,
@@ -238,6 +239,53 @@ void test('creates an exact short-lived V2 operator authorization for the V2 req
   }).authorizationFingerprint);
   assert.throws(() => createOperatorAuthorizationV2({ ...authorization, payloadVersion: 2, rawNonce: 'forbidden' }),
     ExecutionOperationsValidationError);
+});
+
+void test('creates a frozen V3 request whose fingerprint binds the complete H2h lineage proof', () => {
+  const evidence = canaryEvidenceInput();
+  const lineageProof = Object.freeze({
+    preparationRunId: `execution_preflight_preparation_${'1'.repeat(64)}`,
+    preparationRunFingerprint: '2'.repeat(64),
+    pairId: `execution_preflight_intent_pair_${'3'.repeat(64)}`,
+    pairFingerprint: '4'.repeat(64),
+    targetAssessmentId: `execution_dry_run_assessment_${'5'.repeat(64)}`,
+    targetAssessmentFingerprint: '6'.repeat(64),
+    simulationArtifactId: `execution_simulation_artifact_${'7'.repeat(64)}`,
+    simulationArtifactFingerprint: '8'.repeat(64),
+    preparationManifestFingerprint: '9'.repeat(64),
+    candidateId: `candidate_${'a'.repeat(64)}`,
+    candidateEvidenceFingerprint: 'b'.repeat(64),
+    proofFingerprint: 'c'.repeat(64),
+    sourceCapturedAtMs: CANARY_NOW_MS,
+    sourceExpiresAtMs: CANARY_NOW_MS + 300_000,
+  });
+  const input = {
+    ...evidence, payloadVersion: 3 as const, lineageProof, target: {
+      intentId: evidence.targetIntentId, stateRevision: 0n, strategyId: 'live-canary',
+      strategyVersion: 1, decisionFingerprint: '8'.repeat(64),
+      mint: '11111111111111111111111111111111',
+      quoteMint: 'So11111111111111111111111111111111111111112', quoteAmountRaw: 500_000n,
+    }, maximumBuys: 1 as const, maximumCapitalLamports: 500_000n,
+    maximumExposureBps: 500n as const, maximumOpenPositions: 1 as const,
+    maximumHoldingMs: 300_000, runtimeQuoteMaxAgeMs: 30_000,
+    runtimeSlippageBps: 500n, runtimeSnapshotMaxSlotLag: 50,
+    runtimeMaxComputeUnits: 1_400_000n, runtimeMaxFeeLamports: 10_000n,
+    runtimeMaxFeePayerLamportDebit: 20_000n, runtimeMaxRpcCallsPerAttempt: 12,
+    runtimeLeaseMs: 120_000, armedAtMs: CANARY_NOW_MS + 1,
+    armamentExpiresAtMs: CANARY_NOW_MS + 299_999,
+    operatorId: 'operator-primary', operatorReason: 'Exact paired Mainnet canary approval.',
+  };
+  const request = createExecutionArmamentRequestV3(input);
+  assert.equal(request.payloadVersion, 3);
+  assert.equal(Object.isFrozen(request), true);
+  assert.equal(Object.isFrozen(request.lineageProof), true);
+  assert.notEqual(request.armamentRequestFingerprint,
+    createExecutionArmamentRequestV3({ ...input, lineageProof: Object.freeze({
+      ...lineageProof, pairFingerprint: 'd'.repeat(64),
+    }) }).armamentRequestFingerprint);
+  assert.throws(() => createExecutionArmamentRequestV3({ ...input,
+    lineageProof: { ...lineageProof, proofFingerprint: 'x'.repeat(64) },
+  }), ExecutionOperationsValidationError);
 });
 
 function armamentInput(overrides: Readonly<Record<string, unknown>> = {}) {

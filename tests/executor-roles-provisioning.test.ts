@@ -28,6 +28,7 @@ import {
   ExecutionOperationsDatabaseError,
 } from '../src/executor-operations/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const repositoryUrl = new URL('../src/storage/execution-operations.repository.ts', import.meta.url);
@@ -89,9 +90,18 @@ void test('executor role provisioning is explicit, passwordless and least-privil
   assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_worker/iu);
   assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_live/iu);
   assert.doesNotMatch(sql, /GRANT[^;]*execution_preflight_intent_pairs[^;]*TO sol_token_executor_(?:readiness|live|live_recovery)/iu);
-  assert.doesNotMatch(sql, /GRANT[^;]*execution_preflight_intent_pair[^;]*TO (?:sol_token_operator_reader|sol_token_public_api)/iu);
-  assert.match(sql, /GRANT SELECT ON TABLE[\s\S]*execution_preflight_intent_pair_memberships,[\s\S]*execution_preflight_intent_pairs[\s\S]*TO sol_token_retention_worker/iu);
-  assert.match(sql, /GRANT DELETE ON TABLE[\s\S]*execution_preflight_intent_pair_memberships,[\s\S]*execution_preflight_intent_pairs[\s\S]*TO sol_token_retention_worker/iu);
+  const forbiddenReaderTableGrant = /GRANT\s+(?:(?:ALL(?:\s+PRIVILEGES)?)|(?:(?:SELECT|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)(?:\s*,\s*(?:SELECT|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER))*))\s+ON\s+TABLE\s+(?=[^;]*\bexecution_preflight_intent_(?:pairs|pair_memberships|preparation_runs)\b)[^;]*\bTO\s+(?:sol_token_operator_reader|sol_token_public_api|PUBLIC)\b/iu;
+  assert.match(
+    'GRANT SELECT ON TABLE execution_preflight_intent_pairs TO sol_token_operator_reader;',
+    forbiddenReaderTableGrant,
+  );
+  assert.doesNotMatch(
+    'GRANT SELECT (pair_id) ON TABLE execution_preflight_intent_pairs TO sol_token_operator_reader;',
+    forbiddenReaderTableGrant,
+  );
+  assert.doesNotMatch(executable, forbiddenReaderTableGrant);
+  assert.match(sql, /GRANT SELECT ON TABLE[\s\S]*execution_preflight_intent_preparation_runs,[\s\S]*execution_preflight_intent_pair_memberships,[\s\S]*execution_preflight_intent_pairs[\s\S]*TO sol_token_retention_worker/iu);
+  assert.match(sql, /GRANT DELETE ON TABLE[\s\S]*execution_preflight_intent_preparation_runs,[\s\S]*execution_preflight_intent_pair_memberships,[\s\S]*execution_preflight_intent_pairs[\s\S]*TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT UPDATE \(status,completed_at,reason_code\)\s+ON TABLE execution_attempts TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT INSERT \([^)]+\)\s+ON TABLE execution_intent_transitions TO sol_token_retention_worker/iu);
   assert.doesNotMatch(sql,
@@ -637,6 +647,7 @@ void test('provisioned retention role runs the complete purge without reading si
     await isolated.query(`INSERT INTO execution_wallet_generations (
       generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation
     ) VALUES ($1,1,$2,'mainnet-beta',$2,1)`, [operationsGenerationId, publicKey]);
+    await insertExecutionDecisionEvent(isolated, 'decision:live-role', publicKey);
     const created = await new PostgresExecutionIntentRepository(isolated).create(
       createExecutionIntentDraft({
         strategyId: 'live-role-test', strategyVersion: 1,

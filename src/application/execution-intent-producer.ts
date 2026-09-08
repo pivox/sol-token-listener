@@ -252,6 +252,7 @@ export function deriveExecutionIntent(
       strategyId,
       strategyVersion,
       positionId,
+      candidateId,
       logicalCommandId,
       mint,
       side: requestedAction === 'OPEN' ? 'BUY' : 'SELL',

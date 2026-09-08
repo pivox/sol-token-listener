@@ -12,6 +12,7 @@ import {
   runExecutionOperationsCommand,
 } from '../src/executor-operations/main.js';
 import type { ExecutionOperationsService } from '../src/executor-operations/service.js';
+import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
 
 void test('status emits one bounded versioned redacted JSON document', async () => {
   const output = await runExecutionOperationsCommand(['status'], environment(), {
@@ -120,7 +121,9 @@ void test('preflight accepts only a trusted signed qualification bound to runtim
 void test('live:arm requires an exact target command, a signed sidecar, and emits only redacted non-live status', async () => {
   const keyPair = generateKeyPairSync('ed25519');
   const publicKeyBase64 = keyPair.publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
-  const intentId = `execution_intent_${'e'.repeat(64)}`;
+  const preflightSource = preflightDraftInputs().source;
+  const sourceJson = canonicalStringifyJson(preflightSource);
+  const intentId = preflightSource.target.intent.id;
   const sidecarInput = canaryEvidenceInput({
     targetIntentId: intentId,
     walletSnapshot: { generationId: `execution_wallet_generation_${'a'.repeat(64)}` },
@@ -139,8 +142,8 @@ void test('live:arm requires an exact target command, a signed sidecar, and emit
   ], environment({ EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: publicKeyBase64 }), {
     service: serviceStub({
       arm: async (command) => {
-        assert.equal(command.payloadVersion, 2);
-        if (command.payloadVersion === 2) {
+        assert.equal(command.payloadVersion, 3);
+        if (command.payloadVersion === 3) {
           assert.equal(command.intentId, intentId);
           assert.equal(command.maximumCapitalLamports, 500_000n);
           assert.equal(command.runtimeLeaseMs, 120_000);
@@ -153,12 +156,12 @@ void test('live:arm requires an exact target command, a signed sidecar, and emit
       },
     }),
     terminal: { isTTY: true, write() {}, readLine: async () => 'not used by stub' },
-    readTextFile: async () => envelope,
+    readTextFile: async (path) => path.endsWith('preflight-source.json') ? sourceJson : envelope,
     now: () => 1_788_134_400_001,
   });
   const result = JSON.parse(output) as Record<string, unknown>;
   assert.equal(receivedArm, true);
-  assert.equal(result.payloadVersion, 2);
+  assert.equal(result.payloadVersion, 3);
   assert.equal(result.canaryStatus, 'CANARY_NOT_STARTED');
   assert.equal(result.liveCapabilityPresent, false);
   assert.equal(output.includes('postgresql://'), false);
@@ -176,7 +179,8 @@ void test('live:arm requires an exact target command, a signed sidecar, and emit
         reservationId: `execution_exposure_reservation_${'c'.repeat(64)}` }) as never;
     } }),
     terminal: { isTTY: true, write() {}, readLine: async () => '' },
-    readTextFile: async () => paddedEnvelope, now: () => 1_788_134_400_001,
+    readTextFile: async (path) => path.endsWith('preflight-source.json') ? sourceJson : paddedEnvelope,
+    now: () => 1_788_134_400_001,
   });
   assert.equal(Buffer.byteLength(paddedEnvelope, 'utf8'), 140_000);
   assert.equal(paddedReachedService, true);
@@ -189,7 +193,8 @@ void test('live:arm requires an exact target command, a signed sidecar, and emit
     EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: publicKeyBase64,
   }), {
     service: serviceStub({}), terminal: { isTTY: false, write() {}, readLine: async () => '' },
-    readTextFile: async () => envelope, now: () => 1_788_134_400_001,
+    readTextFile: async (path) => path.endsWith('preflight-source.json') ? sourceJson : envelope,
+    now: () => 1_788_134_400_001,
   }), (error) => error instanceof ExecutionOperationsCliError);
 
   let oversizedReachedService = false;
@@ -211,7 +216,8 @@ void test('live:arm requires an exact target command, a signed sidecar, and emit
   ], environment({ EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: bad.publicKey }), {
     service: serviceStub({ arm: async () => { throw new Error('must not arm'); } }),
     terminal: { isTTY: false, write() {}, readLine: async () => '' },
-    readTextFile: async () => envelope, now: () => 1_788_134_400_001,
+    readTextFile: async (path) => path.endsWith('preflight-source.json') ? sourceJson : envelope,
+    now: () => 1_788_134_400_001,
   }), ExecutionOperationsCliError);
 });
 
@@ -239,6 +245,7 @@ function environment(overrides: Readonly<Record<string, string>> = {}) {
     EXECUTOR_OPERATOR_ID: 'operator-primary',
     EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '/tmp/preflight-evidence.json',
     EXECUTOR_CANARY_EVIDENCE_PATH: '/tmp/canary-evidence.json',
+    EXECUTOR_PREFLIGHT_SOURCE_PATH: '/tmp/preflight-source.json',
     EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: 'MCowBQYDK2VwAyEA7Q2ZB8C8QzL4vVfJdGz4g0yP5wVqgYvZx4h7gM9rGgM=',
     EXECUTOR_LEASE_MS: '120000', EXECUTOR_QUOTE_MAX_AGE_MS: '3000',
     EXECUTOR_SLIPPAGE_BPS: '500', EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: '8',

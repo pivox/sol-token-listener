@@ -37,6 +37,17 @@ const ARMAMENT_REQUEST_V2_KEYS = Object.freeze([
   'runtimeMaxComputeUnits', 'runtimeMaxFeeLamports', 'runtimeMaxFeePayerLamportDebit',
   'runtimeMaxRpcCallsPerAttempt', 'runtimeLeaseMs', 'armedAtMs', 'armamentExpiresAtMs', 'operatorId', 'operatorReason',
 ] as const);
+const ARMAMENT_REQUEST_V3_KEYS = Object.freeze([
+  ...ARMAMENT_REQUEST_V2_KEYS.slice(0, 9), 'lineageProof',
+  ...ARMAMENT_REQUEST_V2_KEYS.slice(9),
+] as const);
+const LINEAGE_PROOF_V3_KEYS = Object.freeze([
+  'preparationRunId', 'preparationRunFingerprint', 'pairId', 'pairFingerprint',
+  'targetAssessmentId', 'targetAssessmentFingerprint', 'simulationArtifactId',
+  'simulationArtifactFingerprint', 'preparationManifestFingerprint', 'candidateId',
+  'candidateEvidenceFingerprint', 'proofFingerprint', 'sourceCapturedAtMs',
+  'sourceExpiresAtMs',
+] as const);
 const ARMAMENT_V2_KEYS = Object.freeze([
   'payloadVersion', 'request', 'authorizationId', 'authorizationFingerprint', 'admissionReportId', 'reservationId',
 ] as const);
@@ -111,6 +122,30 @@ export interface ExecutionArmamentRequestV2 extends Omit<ExecutionCanaryEvidence
   readonly armamentExpiresAtMs: number;
   readonly operatorId: string;
   readonly operatorReason: string;
+}
+
+export interface ExecutionPreflightLineageProofV3 {
+  readonly preparationRunId: string;
+  readonly preparationRunFingerprint: string;
+  readonly pairId: string;
+  readonly pairFingerprint: string;
+  readonly targetAssessmentId: string;
+  readonly targetAssessmentFingerprint: string;
+  readonly simulationArtifactId: string;
+  readonly simulationArtifactFingerprint: string;
+  readonly preparationManifestFingerprint: string;
+  readonly candidateId: string;
+  readonly candidateEvidenceFingerprint: string;
+  readonly proofFingerprint: string;
+  readonly sourceCapturedAtMs: number;
+  readonly sourceExpiresAtMs: number;
+}
+
+export interface ExecutionArmamentRequestV3 extends
+  Omit<ExecutionArmamentRequestV2, 'payloadVersion' | 'armamentRequestFingerprint'> {
+  readonly payloadVersion: 3;
+  readonly armamentRequestFingerprint: string;
+  readonly lineageProof: ExecutionPreflightLineageProofV3;
 }
 
 export interface ExecutionActivationArmamentV2 extends ExecutionArmamentRequestV2 {
@@ -357,6 +392,27 @@ export function createExecutionArmamentRequestV2(input: unknown): ExecutionArmam
   } catch { throw invalid(); }
 }
 
+export function createExecutionArmamentRequestV3(input: unknown): ExecutionArmamentRequestV3 {
+  try {
+    const record = exactRecord(input, ARMAMENT_REQUEST_V3_KEYS);
+    if (record.payloadVersion !== 3) throw invalid();
+    const { lineageProof: lineageProofInput, ...legacyRecord } = record;
+    const legacy = createExecutionArmamentRequestV2({
+      ...legacyRecord,
+      payloadVersion: 2,
+    });
+    const lineageProof = lineageProofV3From(lineageProofInput);
+    if (lineageProof.sourceCapturedAtMs > legacy.armedAtMs
+      || lineageProof.sourceExpiresAtMs < legacy.armamentExpiresAtMs) throw invalid();
+    const armamentRequestFingerprint = hashLengthPrefixed([
+      'execution-armament-request-v3', legacy.armamentRequestFingerprint,
+      ...LINEAGE_PROOF_V3_KEYS.map((key) => lineageProof[key]),
+    ]);
+    return Object.freeze({ ...legacy, payloadVersion: 3, armamentRequestFingerprint,
+      lineageProof });
+  } catch { throw invalid(); }
+}
+
 export function createExecutionArmamentV2(input: unknown): ExecutionActivationArmamentV2 {
   try {
     const record = exactRecord(input, ARMAMENT_V2_KEYS);
@@ -431,17 +487,55 @@ function targetFrom(value: unknown): ExecutionCanaryTargetV2 {
   });
 }
 
-function requestFrom(value: unknown): ExecutionArmamentRequestV2 {
+function lineageProofV3From(value: unknown): ExecutionPreflightLineageProofV3 {
+  const record = exactRecord(value, LINEAGE_PROOF_V3_KEYS);
+  const sourceCapturedAtMs = timestamp(record.sourceCapturedAtMs);
+  const sourceExpiresAtMs = timestamp(record.sourceExpiresAtMs);
+  if (sourceExpiresAtMs <= sourceCapturedAtMs) throw invalid();
+  return Object.freeze({
+    preparationRunId: patternedText(record.preparationRunId,
+      /^execution_preflight_preparation_[0-9a-f]{64}$/u, 96),
+    preparationRunFingerprint: fingerprint(record.preparationRunFingerprint),
+    pairId: patternedText(record.pairId,
+      /^execution_preflight_intent_pair_[0-9a-f]{64}$/u, 128),
+    pairFingerprint: fingerprint(record.pairFingerprint),
+    targetAssessmentId: patternedText(record.targetAssessmentId,
+      /^execution_dry_run_assessment_[0-9a-f]{64}$/u, 128),
+    targetAssessmentFingerprint: fingerprint(record.targetAssessmentFingerprint),
+    simulationArtifactId: patternedText(record.simulationArtifactId,
+      /^execution_simulation_artifact_[0-9a-f]{64}$/u, 128),
+    simulationArtifactFingerprint: fingerprint(record.simulationArtifactFingerprint),
+    preparationManifestFingerprint: fingerprint(record.preparationManifestFingerprint),
+    candidateId: patternedText(record.candidateId, /^candidate_[0-9a-f]{64}$/u, 128),
+    candidateEvidenceFingerprint: fingerprint(record.candidateEvidenceFingerprint),
+    proofFingerprint: fingerprint(record.proofFingerprint),
+    sourceCapturedAtMs,
+    sourceExpiresAtMs,
+  });
+}
+
+function requestFrom(value: unknown): ExecutionArmamentRequestV2 | ExecutionArmamentRequestV3 {
   if (!isPlainObject(value) || !Object.isFrozen(value)) throw invalid();
-  const record = exactRecord(value, [
+  const keys = (value as Readonly<{ payloadVersion?: unknown }>).payloadVersion === 3
+    ? [...[
+      'payloadVersion', 'evidenceId', 'evidenceFingerprint', 'qualification', 'targetIntentId', 'policy', 'walletSnapshot',
+      'providerSnapshot', 'allEndpointsUnavailable', 'capturedAtMs', 'expiresAtMs', 'armamentRequestFingerprint',
+    ], 'lineageProof', ...[
+      'target', 'maximumBuys', 'maximumCapitalLamports', 'maximumExposureBps', 'maximumOpenPositions',
+      'maximumHoldingMs', 'runtimeQuoteMaxAgeMs', 'runtimeSlippageBps', 'runtimeSnapshotMaxSlotLag',
+      'runtimeMaxComputeUnits', 'runtimeMaxFeeLamports', 'runtimeMaxFeePayerLamportDebit',
+      'runtimeMaxRpcCallsPerAttempt', 'runtimeLeaseMs', 'armedAtMs', 'armamentExpiresAtMs', 'operatorId', 'operatorReason',
+    ]] as const
+    : [
     'payloadVersion', 'evidenceId', 'evidenceFingerprint', 'qualification', 'targetIntentId', 'policy', 'walletSnapshot',
     'providerSnapshot', 'allEndpointsUnavailable', 'capturedAtMs', 'expiresAtMs', 'armamentRequestFingerprint',
     'target', 'maximumBuys', 'maximumCapitalLamports', 'maximumExposureBps', 'maximumOpenPositions',
     'maximumHoldingMs', 'runtimeQuoteMaxAgeMs', 'runtimeSlippageBps', 'runtimeSnapshotMaxSlotLag',
     'runtimeMaxComputeUnits', 'runtimeMaxFeeLamports', 'runtimeMaxFeePayerLamportDebit',
     'runtimeMaxRpcCallsPerAttempt', 'runtimeLeaseMs', 'armedAtMs', 'armamentExpiresAtMs', 'operatorId', 'operatorReason',
-  ] as const);
-  const candidate = createExecutionArmamentRequestV2({
+  ] as const;
+  const record = exactRecord(value, keys);
+  const common = {
     payloadVersion: record.payloadVersion, qualification: record.qualification, targetIntentId: record.targetIntentId,
     policy: record.policy, walletSnapshot: record.walletSnapshot, providerSnapshot: record.providerSnapshot,
     allEndpointsUnavailable: record.allEndpointsUnavailable, capturedAtMs: record.capturedAtMs,
@@ -453,7 +547,11 @@ function requestFrom(value: unknown): ExecutionArmamentRequestV2 {
     runtimeMaxFeeLamports: record.runtimeMaxFeeLamports, runtimeMaxFeePayerLamportDebit: record.runtimeMaxFeePayerLamportDebit,
     runtimeMaxRpcCallsPerAttempt: record.runtimeMaxRpcCallsPerAttempt, runtimeLeaseMs: record.runtimeLeaseMs,
     armedAtMs: record.armedAtMs, armamentExpiresAtMs: record.armamentExpiresAtMs, operatorId: record.operatorId, operatorReason: record.operatorReason,
-  });
+  };
+  const candidate = record.payloadVersion === 3
+    ? createExecutionArmamentRequestV3({ ...common, payloadVersion: 3,
+      lineageProof: record.lineageProof })
+    : createExecutionArmamentRequestV2(common);
   if (record.evidenceId !== candidate.evidenceId || record.evidenceFingerprint !== candidate.evidenceFingerprint
     || record.armamentRequestFingerprint !== candidate.armamentRequestFingerprint) throw invalid();
   return candidate;

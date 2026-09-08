@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
-import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
+import {
+  createExecutionIntentDraft,
+  type ExecutionIntentDraftV1,
+} from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
 import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const wallet = '11111111111111111111111111111111';
@@ -99,8 +103,7 @@ void test('purges expired terminal SELL evidence without a reservation', async (
       generationId, payloadVersion: 1, walletPublicKey: wallet,
       cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
     });
-    const intent = await new PostgresExecutionIntentRepository(pool)
-      .create(intentDraft('sell-retention', nowMs));
+    const intent = await createIntent(pool, intentDraft('sell-retention', nowMs));
     await pool.query(`INSERT INTO execution_attempts (
       intent_id,attempt_number,status,effective_venue,provider_id,started_at,completed_at,reason_code
     ) VALUES ($1,1,'COMPLETED','PUMP_FUN','rpc-primary',
@@ -129,8 +132,7 @@ void test('retains a complete SELL evidence cohort while one member is still liv
       generationId, payloadVersion: 1, walletPublicKey: wallet,
       cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
     });
-    const intent = await new PostgresExecutionIntentRepository(pool)
-      .create(intentDraft('sell-retention-live-member', nowMs));
+    const intent = await createIntent(pool, intentDraft('sell-retention-live-member', nowMs));
     await pool.query(`INSERT INTO execution_attempts (
       intent_id,attempt_number,status,effective_venue,provider_id,started_at,completed_at,reason_code
     ) VALUES ($1,1,'COMPLETED','PUMP_FUN','rpc-primary',
@@ -233,8 +235,7 @@ void test('a tombstone collision rolls back the complete executor risk cohort', 
       generationId, payloadVersion: 1, walletPublicKey: wallet,
       cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
     });
-    const intent = await new PostgresExecutionIntentRepository(pool)
-      .create(intentDraft('collision', nowMs));
+    const intent = await createIntent(pool, intentDraft('collision', nowMs));
     await insertReport(pool, intent.intent.id, '6', 'REJECTED', nowMs);
     await repository.recordRateLimit(rateLimit('7', nowMs - 14_400_000));
     await pool.query(`INSERT INTO execution_risk_tombstones (
@@ -266,9 +267,8 @@ void test('tombstones precede child-first deletion while UNKNOWN_HELD survives',
       generationId, payloadVersion: 1, walletPublicKey: wallet,
       cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
     });
-    const intentRepository = new PostgresExecutionIntentRepository(pool);
-    const terminalIntent = await intentRepository.create(intentDraft('terminal', nowMs));
-    const heldIntent = await intentRepository.create(intentDraft('held', nowMs));
+    const terminalIntent = await createIntent(pool, intentDraft('terminal', nowMs));
+    const heldIntent = await createIntent(pool, intentDraft('held', nowMs));
     await insertReport(pool, terminalIntent.intent.id, '4', 'ADMITTED', nowMs);
     await insertReport(pool, heldIntent.intent.id, '5', 'ADMITTED', nowMs);
     await insertReservation(pool, terminalIntent.intent.id, '4', 'RELEASED', nowMs);
@@ -364,6 +364,14 @@ function intentDraft(seed: string, nowMs: number) {
     decisionEventId: `decision:${seed}`, decisionFingerprint: 'a'.repeat(64),
     requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
   });
+}
+
+async function createIntent(
+  pool: InstanceType<typeof pg.Pool>,
+  draft: ExecutionIntentDraftV1,
+) {
+  await insertExecutionDecisionEvent(pool, draft.decisionEventId, draft.mint);
+  return new PostgresExecutionIntentRepository(pool).create(draft);
 }
 
 async function insertReport(

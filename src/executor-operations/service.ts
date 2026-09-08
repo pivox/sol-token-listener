@@ -1,10 +1,15 @@
 import {
   createExecutionArmament,
   createExecutionArmamentRequestV2,
+  createExecutionArmamentRequestV3,
   type ExecutionActivationArmamentV1,
   type ExecutionActivationArmamentV2,
   type ExecutionCanaryTargetV2,
 } from '../domain/execution-operations.js';
+import {
+  createExecutionPreflightDraftSource,
+  type ExecutionPreflightDraftSourceV2,
+} from '../domain/execution-preflight-draft.js';
 import type { ExecutionCanaryEvidenceV1 } from '../domain/execution-canary.js';
 import type { ExecutionSafetyQualificationV1 } from '../domain/execution-safety-qualification.js';
 import type {
@@ -66,6 +71,11 @@ interface ArmCanaryCommandV2 {
   readonly terminal: OperatorTerminal;
 }
 
+interface ArmCanaryCommandV3 extends Omit<ArmCanaryCommandV2, 'payloadVersion'> {
+  readonly payloadVersion: 3;
+  readonly preflightSource: ExecutionPreflightDraftSourceV2;
+}
+
 export interface ExecutionOperationsService {
   readonly preflight: (
     qualification: ExecutionSafetyQualificationV1,
@@ -75,7 +85,7 @@ export interface ExecutionOperationsService {
     command: ExecutionControlCommandV1,
     mode: 'ENTRY_STOP' | 'HARD_STOP',
   ) => Promise<ExecutionOperationsStatusV1>;
-  readonly arm: (command: ArmCommandV1 | ArmCanaryCommandV2) => Promise<
+  readonly arm: (command: ArmCommandV1 | ArmCanaryCommandV2 | ArmCanaryCommandV3) => Promise<
     ExecutionActivationArmamentV1 | ExecutionActivationArmamentV2
   >;
   readonly resume: (command: ResumeCommandV1) => Promise<ExecutionOperationsStatusV1>;
@@ -90,8 +100,8 @@ export function createExecutionOperationsService(
     status: (generationId: string) => dependencies.repository.readStatus(generationId),
     stop: (command: ExecutionControlCommandV1, mode: 'ENTRY_STOP' | 'HARD_STOP') =>
       dependencies.repository.setStop(command, mode),
-    arm: async (command: ArmCommandV1 | ArmCanaryCommandV2) => {
-      if (command.payloadVersion === 2) {
+    arm: async (command: ArmCommandV1 | ArmCanaryCommandV2 | ArmCanaryCommandV3) => {
+      if (command.payloadVersion === 2 || command.payloadVersion === 3) {
         const canaryRepository = dependencies.canaryRepository;
         if (canaryRepository === undefined) throw new Error('CANARY_ARMAMENT_REPOSITORY_UNAVAILABLE');
         const qualification = await dependencies.repository.readQualification(
@@ -117,12 +127,15 @@ export function createExecutionOperationsService(
         const effectiveExpiryMs = effectiveCanaryExpiryMs(qualification.expiresAtMs, target.expiresAtMs,
           command.evidence.expiresAtMs, command.evidence.providerSnapshot.expiresAtMs,
           command.evidence.providerSnapshot.measuredAtMs + command.evidence.policy.providerUsageMaxAgeMs,
-          command.evidence.walletSnapshot.observedAtMs + command.evidence.policy.walletSnapshotMaxAgeMs);
+          command.evidence.walletSnapshot.observedAtMs + command.evidence.policy.walletSnapshotMaxAgeMs,
+          command.payloadVersion === 3 ? command.preflightSource.expiresAtMs
+            : Number.MAX_SAFE_INTEGER);
         if (effectiveExpiryMs < command.nowMs + 2 * command.runtimeLeaseMs) {
           throw new Error('CANARY_ARMAMENT_EXPIRED');
         }
-        const request = createExecutionArmamentRequestV2({
-          payloadVersion: 2, qualification, targetIntentId: command.evidence.targetIntentId,
+        const requestInput = {
+          payloadVersion: command.payloadVersion, qualification,
+          targetIntentId: command.evidence.targetIntentId,
           policy: command.evidence.policy, walletSnapshot: command.evidence.walletSnapshot,
           providerSnapshot: command.evidence.providerSnapshot,
           allEndpointsUnavailable: command.evidence.allEndpointsUnavailable,
@@ -138,9 +151,15 @@ export function createExecutionOperationsService(
           runtimeLeaseMs: command.runtimeLeaseMs, armedAtMs: command.nowMs,
           armamentExpiresAtMs: effectiveExpiryMs, operatorId: command.operatorId,
           operatorReason: command.operatorReason,
-        });
+        };
+        const request = command.payloadVersion === 3
+          ? createExecutionArmamentRequestV3({ ...requestInput, payloadVersion: 3,
+            lineageProof: lineageProofFromSource(command.preflightSource, command.evidence,
+              target, command.nowMs) })
+          : createExecutionArmamentRequestV2(requestInput);
         const authorization = await authorizeCanaryArmament({
-          terminal: command.terminal, nonceSource: dependencies.nonceSource, payloadVersion: 2,
+          terminal: command.terminal, nonceSource: dependencies.nonceSource,
+          payloadVersion: command.payloadVersion,
           generationId: qualification.generationId, walletPublicKey: qualification.walletPublicKey,
           action: 'ARM', phase: 'CANARY', contextFingerprint: request.armamentRequestFingerprint,
           operatorId: command.operatorId, nowMs: command.nowMs, targetIntentId: request.target.intentId,
@@ -159,7 +178,19 @@ export function createExecutionOperationsService(
           runtimeMaxFeePayerLamportDebit: request.runtimeMaxFeePayerLamportDebit,
           runtimeMaxRpcCallsPerAttempt: request.runtimeMaxRpcCallsPerAttempt,
           runtimeLeaseMs: request.runtimeLeaseMs,
+          ...(request.payloadVersion === 3 ? {
+            preparationRunId: request.lineageProof.preparationRunId,
+            pairId: request.lineageProof.pairId,
+            pairFingerprint: request.lineageProof.pairFingerprint,
+            preparationManifestFingerprint: request.lineageProof.preparationManifestFingerprint,
+            proofFingerprint: request.lineageProof.proofFingerprint,
+          } : {}),
         });
+        if (request.payloadVersion === 3) {
+          if (command.payloadVersion !== 3) throw new Error('CANARY_ARMAMENT_INPUT_INVALID');
+          return canaryRepository.armCanary(Object.freeze({ request, authorization,
+            preflightSource: command.preflightSource }));
+        }
         return canaryRepository.armCanary(Object.freeze({ request, authorization }));
       }
       const qualification = await dependencies.repository.readQualification(command.qualificationId);
@@ -216,6 +247,52 @@ export function createExecutionOperationsService(
         occurredAtMs: command.nowMs,
       });
     },
+  });
+}
+
+function lineageProofFromSource(
+  input: ExecutionPreflightDraftSourceV2,
+  evidence: ExecutionCanaryEvidenceV1,
+  target: ExecutionCanaryTargetIntentV1,
+  nowMs: number,
+): Readonly<{
+  preparationRunId: string; preparationRunFingerprint: string; pairId: string;
+  pairFingerprint: string; targetAssessmentId: string; targetAssessmentFingerprint: string;
+  simulationArtifactId: string; simulationArtifactFingerprint: string;
+  preparationManifestFingerprint: string; candidateId: string;
+  candidateEvidenceFingerprint: string; proofFingerprint: string;
+  sourceCapturedAtMs: number; sourceExpiresAtMs: number;
+}> {
+  const source = createExecutionPreflightDraftSource(input);
+  if (source.schemaVersion !== 'execution-preflight-draft-source.v2'
+    || source.target.intent.id !== target.intentId
+    || source.target.intent.stateRevision !== target.stateRevision
+    || source.target.intent.decisionFingerprint !== target.decisionFingerprint
+    || source.target.intent.mint !== target.mint
+    || source.target.intent.quoteMint !== target.quoteMint
+    || source.target.intent.quoteAmountRaw !== target.quoteAmountRaw
+    || source.generation.generationId !== evidence.qualification.generationId
+    || source.generation.walletPublicKey !== evidence.qualification.walletPublicKey
+    || source.generation.genesisHash !== evidence.qualification.genesisHash
+    || source.walletSnapshot.snapshotFingerprint !== evidence.walletSnapshot.snapshotFingerprint
+    || source.providerSnapshot.snapshotFingerprint !== evidence.providerSnapshot.snapshotFingerprint
+    || source.providerSnapshot.providerId !== evidence.qualification.providerId
+    || source.capturedAtMs > nowMs || source.expiresAtMs <= nowMs) {
+    throw new Error('CANARY_ARMAMENT_INPUT_INVALID');
+  }
+  return Object.freeze({
+    preparationRunId: source.lineage.preparationRunId,
+    preparationRunFingerprint: source.lineage.preparationRunFingerprint,
+    pairId: source.lineage.pairId, pairFingerprint: source.lineage.pairFingerprint,
+    targetAssessmentId: source.lineage.targetAssessmentId,
+    targetAssessmentFingerprint: source.lineage.targetAssessmentFingerprint,
+    simulationArtifactId: source.lineage.simulationArtifactId,
+    simulationArtifactFingerprint: source.lineage.simulationArtifactFingerprint,
+    preparationManifestFingerprint: source.lineage.preparationManifestFingerprint,
+    candidateId: source.lineage.candidateId,
+    candidateEvidenceFingerprint: source.lineage.candidateEvidenceFingerprint,
+    proofFingerprint: source.proofFingerprint, sourceCapturedAtMs: source.capturedAtMs,
+    sourceExpiresAtMs: source.expiresAtMs,
   });
 }
 

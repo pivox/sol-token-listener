@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.0.0 — 2026-09-06
+**Version :** 1.1.0 — 2026-09-08
 
 ## Périmètre produit
 
@@ -523,10 +523,13 @@ quota/sizing/retry, #51-F pour le preflight et l'armement manuel, puis #51-G
 pour une éventuelle signature/soumission sous gates compensatoires sont tous
 obligatoires avant une transaction réelle. #51-D n'ajoute aucun mode live.
 
-#51-H2h relie désormais ces preuves au draft sans coupler le listener au live :
-un processus one-shot séparé lit les identités persistées explicites sous le
-rôle `sol_token_operator_reader`, dans une transaction `REPEATABLE READ READ
-ONLY`, puis produit hors Git la source canonique de H2g. Cette frontière ne
+#51-H2h relie désormais ces preuves au draft sans coupler le listener au live.
+Un processus one-shot séparé reçoit uniquement un
+`EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID` sous le rôle
+`sol_token_operator_reader`, dans une transaction `REPEATABLE READ READ ONLY`.
+Il reconstruit la lignée exacte run/pair/candidate/assessment/artifact, vérifie
+ses fingerprints, sa finalité et ses échéances, puis produit hors Git la source
+canonique `execution-preflight-draft-source.v2` de H2g. Cette frontière ne
 charge aucun secret Solana et ne peut ni louer une intention, ni armer, signer
 ou soumettre.
 
@@ -586,7 +589,7 @@ explicitement le flag, la configuration exige simultanément le mode `paper`,
 Token 9 décimales et `PAPER_MINIMUM_CONFIRMATION=finalized`. Cette activation
 ne démarre aucun executor et n'ajoute aucun appel RPC.
 
-La migration 041 porte le head canonique et ajoute une paire append-only entre
+La migration 041 ajoute une paire append-only entre
 la cible `TARGET` BUY `paper_open_…`, issue du flux paper normal, et un probe
 `SIMULATION` BUY `execution_preflight_probe_…`. Les deux intentions sont
 créées dans la même transaction, partagent exactement leur décision et leur
@@ -604,10 +607,28 @@ journalise la transition. La purge de la paire attend à la fois
 réconcilié, soit quatre heures après sa terminalisation, avant de supprimer
 enfants, memberships, paire et parents dans l'ordre des FK.
 
-H2k-a ne sélectionne pas encore une paire exacte, ne lance pas le dry-run ou
-la simulation, et ne produit aucun manifeste H2h. Cette orchestration one-shot
-est la prochaine PR H2k-b. Aucun wallet, keypair, signer, armement, byte signé
-ou transport de soumission n'est ajouté ; l'état reste
+La migration 042 ajoute le run durable H2k-b et son cycle
+`WAITING -> PREPARING -> PREPARED|FAILED`. La migration 043, head canonique,
+attache l'intention à son `candidate_id` et verrouille sa lignée causale
+finalisée jusqu'aux événements et preuves brutes. Les migrations sont
+forward-only et rejouables sur une base vide.
+
+### Préparation one-shot exacte (#51-H2k-b)
+
+H2k-b sélectionne une seule paire target/probe admissible dans une fenêtre
+bornée, conserve la cible pristine, exécute le dry-run non consommant puis la
+simulation du probe, termine le run en `PREPARED` et publie un manifeste
+`PREFLIGHT_INTENT_PREPARED` owner-only. H2h v2
+réutilise ensuite uniquement le `preparationRunId` pour reconstruire et
+vérifier la photographie causale complète.
+
+Le runner séparé est désactivé par défaut avec
+`EXECUTOR_PREFLIGHT_PREPARATION_ENABLED=false` et n'est importé par aucun
+bootstrap actif. Son activation exige une commande one-shot explicite et un
+fichier de sortie absolu hors du checkout. H2k-b ne charge aucune clé ou
+keypair, ne signe, n'arme et ne soumet aucune transaction. H2c transporte une
+requête d'armement wire V3, convertie en armement persisté V2 seulement dans
+la frontière opérations ; H2k-b ne l'appelle pas. L'état demeure
 `CANARY_NOT_STARTED`.
 
 ## Persistance, reprise et rétention

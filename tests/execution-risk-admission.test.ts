@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
-import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
+import {
+  createExecutionIntentDraft,
+  type ExecutionIntentDraftV1,
+} from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
 import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
 import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
@@ -14,6 +17,7 @@ import {
   ExecutionRiskRepositoryError,
   PostgresExecutionRiskRepository,
 } from '../src/storage/execution-risk.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const NOW_MS = Date.now();
 const WSOL = 'So11111111111111111111111111111111111111112';
@@ -392,7 +396,13 @@ type Fixture = Awaited<ReturnType<typeof createFixture>>;
 async function createFixture(pool: InstanceType<typeof pg.Pool>) {
   await migrateDatabase({ pool });
   const riskRepository = new PostgresExecutionRiskRepository(pool);
-  const intentRepository = new PostgresExecutionIntentRepository(pool);
+  const durableIntentRepository = new PostgresExecutionIntentRepository(pool);
+  const intentRepository = Object.freeze({
+    create: async (draft: ExecutionIntentDraftV1) => {
+      await insertExecutionDecisionEvent(pool, draft.decisionEventId, draft.mint);
+      return durableIntentRepository.create(draft);
+    },
+  });
   const generation = await riskRepository.registerWalletGeneration({
     generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
     payloadVersion: 1,

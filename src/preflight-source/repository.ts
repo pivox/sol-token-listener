@@ -1,7 +1,9 @@
 import { isProxy } from 'node:util/types';
 import { assertExecutionIntent } from '../domain/execution-intent.js';
-import type { ExecutionPreflightDraftSourceV1 } from '../domain/execution-preflight-draft.js';
-import { createExecutionPreflightDraftSource } from '../domain/execution-preflight-draft.js';
+import type { ExecutionPreflightDraftSourceV1,
+  ExecutionPreflightDraftSourceV2 } from '../domain/execution-preflight-draft.js';
+import { createExecutionPreflightDraftSource,
+  createExecutionPreflightDraftSourceProofFingerprint } from '../domain/execution-preflight-draft.js';
 import { createProviderUsageSnapshot } from '../domain/execution-provider-quota.js';
 import { createExecutionReadinessManifest,
   createExecutionWalletGeneration } from '../domain/execution-readiness.js';
@@ -18,10 +20,8 @@ interface DatabaseClient {
 }
 interface DatabaseSource { connect(): Promise<DatabaseClient>; }
 
-export interface ExecutionPreflightSourceRequestV1 {
-  readonly generationId: string;
-  readonly targetIntentId: string;
-  readonly simulationArtifactId: string;
+export interface ExecutionPreflightSourceRequestV2 {
+  readonly preparationRunId: string;
 }
 
 export class ExecutionPreflightSourceRepositoryError extends Error {
@@ -36,8 +36,8 @@ export class PostgresExecutionPreflightSourceRepository {
   readonly #source: DatabaseSource;
   public constructor(source: DatabaseSource) { this.#source = source; }
 
-  public async export(request: ExecutionPreflightSourceRequestV1):
-  Promise<ExecutionPreflightDraftSourceV1> {
+  public async export(request: ExecutionPreflightSourceRequestV2):
+  Promise<ExecutionPreflightDraftSourceV2> {
     let client: DatabaseClient | undefined;
     let began = false;
     try {
@@ -45,12 +45,138 @@ export class PostgresExecutionPreflightSourceRepository {
       client = await this.#source.connect();
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
       began = true;
+      const lineage = lineageFrom(single(await client.query(`SELECT
+        preparation.run_id,preparation.run_fingerprint,preparation.state AS run_state,
+        preparation.manifest_fingerprint,pair.pair_id,pair.pair_fingerprint,
+        trunc(EXTRACT(EPOCH FROM preparation.deadline_at)*1000)::TEXT AS run_expires_at_ms,
+        pair.target_intent_id,pair.simulation_intent_id,
+        trunc(EXTRACT(EPOCH FROM pair.expires_at)*1000)::TEXT AS pair_expires_at_ms,
+        assessment.assessment_id,assessment.result_fingerprint AS assessment_fingerprint,
+        artifact.artifact_id,artifact.result_fingerprint AS artifact_fingerprint,
+        attempt.attempt_number AS simulation_attempt_number,
+        target.candidate_id,candidate.evidence_fingerprint AS candidate_evidence_fingerprint,
+        candidate.confirmation_status AS candidate_confirmation_status,
+        trunc(EXTRACT(EPOCH FROM candidate.eligible_until)*1000)::TEXT
+          AS candidate_eligible_until_ms,
+        trunc(EXTRACT(EPOCH FROM candidate.purge_after)*1000)::TEXT
+          AS candidate_purge_after_ms,
+        generation.generation_id
+        FROM execution_preflight_intent_preparation_runs preparation
+        JOIN execution_preflight_intent_pairs pair ON pair.pair_id=preparation.pair_id
+        JOIN execution_preflight_intent_pair_memberships target_membership
+          ON target_membership.pair_id=pair.pair_id
+          AND target_membership.intent_id=pair.target_intent_id
+          AND target_membership.lane='TARGET'
+        JOIN execution_preflight_intent_pair_memberships simulation_membership
+          ON simulation_membership.pair_id=pair.pair_id
+          AND simulation_membership.intent_id=pair.simulation_intent_id
+          AND simulation_membership.lane='SIMULATION'
+        JOIN execution_intents target ON target.id=pair.target_intent_id
+        JOIN execution_intents simulation_intent ON simulation_intent.id=pair.simulation_intent_id
+        JOIN execution_dry_run_assessments assessment
+          ON assessment.assessment_id=preparation.assessment_id
+          AND assessment.intent_id=target.id
+          AND assessment.result_fingerprint=preparation.assessment_fingerprint
+        JOIN execution_simulation_artifacts artifact
+          ON artifact.artifact_id=preparation.artifact_id
+          AND artifact.intent_id=simulation_intent.id
+          AND artifact.result_fingerprint=preparation.artifact_fingerprint
+        JOIN execution_attempts attempt ON attempt.intent_id=simulation_intent.id
+          AND attempt.attempt_number=artifact.attempt_number
+          AND attempt.status='COMPLETED'
+        JOIN trading_candidates candidate ON candidate.candidate_id=target.candidate_id
+          AND candidate.candidate_id=simulation_intent.candidate_id
+        JOIN qualification_reports report ON report.report_id=candidate.report_id
+        JOIN domain_events decision ON decision.event_id=target.decision_event_id
+        JOIN domain_events source_event ON source_event.event_id=candidate.source_event_id
+        JOIN domain_events candidate_event
+          ON candidate_event.event_id=candidate.candidate_event_id
+        JOIN domain_events qualification_event
+          ON qualification_event.event_id=report.qualification_event_id
+        JOIN raw_chain_events source_raw ON source_raw.event_id=report.source_raw_event_id
+        JOIN paper_positions position ON position.position_id=target.position_id
+        JOIN execution_wallet_generations generation
+          ON generation.wallet_public_key=artifact.executor_public_key
+          AND generation.genesis_hash=artifact.expected_genesis_hash
+          AND generation.retired_at IS NULL
+        WHERE preparation.run_id=$1 AND preparation.state='PREPARED'
+          AND preparation.completed_at IS NOT NULL
+          AND preparation.failure_code IS NULL
+          AND preparation.manifest_fingerprint IS NOT NULL
+          AND preparation.deadline_at>statement_timestamp()
+          AND preparation.purge_after>statement_timestamp()
+          AND pair.expires_at>statement_timestamp()
+          AND candidate.confirmation_status='finalized'
+          AND candidate.state='ELIGIBLE' AND candidate.superseded_at IS NULL
+          AND candidate.eligible_until>statement_timestamp()
+          AND candidate.purge_after>statement_timestamp()
+          AND decision.type='PaperStrategySessionUpdated'
+          AND decision.source='paper-decision'
+          AND decision.mint=target.mint
+          AND decision.confirmation_status='finalized'
+          AND decision.raw_event_id=report.source_raw_event_id
+          AND decision.payload #>> '{session,candidateId}'=candidate.candidate_id
+          AND decision.payload #>> '{session,qualificationReportId}'=report.report_id
+          AND decision.payload #>> '{session,positionId}'=target.position_id
+          AND decision.payload #>> '{session,mint}'=target.mint
+          AND candidate.mint=target.mint
+          AND candidate.strategy_id=target.strategy_id
+          AND candidate.strategy_version=target.strategy_version
+          AND candidate.payload #>> '{id}'=candidate.candidate_id
+          AND candidate.payload #>> '{qualificationReportId}'=report.report_id
+          AND candidate.payload #>> '{mint}'=target.mint
+          AND report.mint=target.mint
+          AND report.confirmation_status='finalized'
+          AND report.superseded_at IS NULL
+          AND source_event.event_id=report.source_event_id
+          AND source_event.raw_event_id=report.source_raw_event_id
+          AND source_event.mint=target.mint
+          AND source_event.confirmation_status='finalized'
+          AND candidate_event.raw_event_id=report.source_raw_event_id
+          AND candidate_event.type='TradingCandidateUpdated'
+          AND candidate_event.source='paper-decision'
+          AND candidate_event.mint=target.mint
+          AND candidate_event.confirmation_status='finalized'
+          AND qualification_event.raw_event_id=report.source_raw_event_id
+          AND qualification_event.type='QualificationUpdated'
+          AND qualification_event.mint=target.mint
+          AND qualification_event.confirmation_status='finalized'
+          AND source_raw.mint=target.mint
+          AND source_raw.confirmation_status='finalized'
+          AND source_raw.processing_status='processed'
+          AND position.mint=target.mint
+          AND position.candidate_id=candidate.candidate_id
+          AND position.qualification_report_id=report.report_id
+          AND position.trigger_event_id=report.qualification_event_id
+          AND target.status='PENDING' AND target.attempt_count=0
+          AND target.state_revision=0 AND target.lease_owner IS NULL
+          AND target.lease_expires_at IS NULL
+          AND target.live_reserved=FALSE
+          AND simulation_intent.status='SUCCEEDED'
+          AND simulation_intent.attempt_count=1
+          AND simulation_intent.reconciliation_completed_at IS NOT NULL
+          AND simulation_intent.purge_after>statement_timestamp()
+          AND target.strategy_id=simulation_intent.strategy_id
+          AND target.strategy_version=simulation_intent.strategy_version
+          AND target.position_id=simulation_intent.position_id
+          AND target.mint=simulation_intent.mint
+          AND target.side=simulation_intent.side
+          AND target.venue_policy=simulation_intent.venue_policy
+          AND target.quote_mint=simulation_intent.quote_mint
+          AND target.quote_token_program=simulation_intent.quote_token_program
+          AND target.quote_decimals=simulation_intent.quote_decimals
+          AND target.quote_amount_raw IS NOT DISTINCT FROM simulation_intent.quote_amount_raw
+          AND target.base_amount_raw IS NOT DISTINCT FROM simulation_intent.base_amount_raw
+          AND target.minimum_amount_out_raw=simulation_intent.minimum_amount_out_raw
+          AND target.decision_event_id=simulation_intent.decision_event_id
+          AND target.decision_fingerprint=simulation_intent.decision_fingerprint`,
+      [request.preparationRunId])));
       const databaseNowMs = timestampText(field(single(await client.query(`SELECT
         trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS database_now_ms`)),
       'database_now_ms'));
       const generation = generationFrom(single(await client.query(`SELECT generation_id,
         payload_version,wallet_public_key,cluster,genesis_hash,generation,retired_at
-        FROM execution_wallet_generations WHERE generation_id=$1`, [request.generationId])));
+        FROM execution_wallet_generations WHERE generation_id=$1`, [lineage.generationId])));
       const wallet = walletFrom(single(await client.query(`SELECT snapshot_id,payload_version,
         snapshot_fingerprint,generation_id,provider_id,state_revision::TEXT AS state_revision,
         slot::TEXT AS slot,
@@ -66,7 +192,7 @@ export class PostgresExecutionPreflightSourceRepository {
           AS position_2_conservative_liquidation_lamports,position_2_reconciliation_status,
         realized_net_pnl_raw::TEXT AS realized_net_pnl_raw,superseded_at
         FROM execution_wallet_snapshots
-        WHERE generation_id=$1 AND superseded_at IS NULL`, [request.generationId])));
+        WHERE generation_id=$1 AND superseded_at IS NULL`, [lineage.generationId])));
       const provider = providerFrom(single(await client.query(`SELECT snapshot_id,payload_version,
         snapshot_fingerprint,provider_id,plan_id,billing_period_id,
         trunc(EXTRACT(EPOCH FROM billing_period_started_at)*1000)::TEXT
@@ -79,7 +205,7 @@ export class PostgresExecutionPreflightSourceRepository {
         provenance,superseded_at FROM execution_provider_usage_snapshots
         WHERE provider_id=$1 AND superseded_at IS NULL`, [wallet.providerId])));
       const target = targetFrom(single(await client.query(`SELECT id,payload_version,
-        logical_order_key,strategy_id,strategy_version,position_id,logical_command_id,mint,side,
+        logical_order_key,strategy_id,strategy_version,position_id,candidate_id,logical_command_id,mint,side,
         venue_policy,quote_mint,quote_token_program,quote_decimals,
         quote_amount_raw::TEXT AS quote_amount_raw,base_amount_raw::TEXT AS base_amount_raw,
         minimum_amount_out_raw::TEXT AS minimum_amount_out_raw,decision_event_id,
@@ -98,7 +224,7 @@ export class PostgresExecutionPreflightSourceRepository {
           trunc(EXTRACT(EPOCH FROM purge_after)*1000)::TEXT END AS purge_after_ms,
         trunc(EXTRACT(EPOCH FROM created_at)*1000)::TEXT AS created_at_ms,
         trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS updated_at_ms
-        FROM execution_intents WHERE id=$1`, [request.targetIntentId])));
+        FROM execution_intents WHERE id=$1`, [lineage.targetIntentId])));
       const simulation = simulationFrom(single(await client.query(`SELECT artifact_id,
         payload_version,specification_version,evaluator_version,intent_id,attempt_number,
         intent_state_revision::TEXT AS intent_state_revision,strategy_id,strategy_version,
@@ -120,7 +246,12 @@ export class PostgresExecutionPreflightSourceRepository {
         terminal_reason_code,logs_fingerprint,logs_line_count,result_fingerprint,
         trunc(EXTRACT(EPOCH FROM recorded_at)*1000)::TEXT AS recorded_at_ms
         FROM execution_simulation_artifacts WHERE artifact_id=$1`,
-      [request.simulationArtifactId])));
+      [lineage.artifactId])));
+      if (target.intent.id !== lineage.targetIntentId
+        || target.intent.candidateId !== lineage.candidateId
+        || simulation.intentId !== lineage.simulationIntentId
+        || simulation.artifactId !== lineage.artifactId
+        || simulation.resultFingerprint !== lineage.artifactFingerprint) throw new TypeError();
       const readiness = createExecutionReadinessManifest(Object.freeze({
         generationId: generation.generationId, walletPublicKey: generation.walletPublicKey,
         cluster: generation.cluster, providerId: provider.providerId,
@@ -131,10 +262,32 @@ export class PostgresExecutionPreflightSourceRepository {
         walletLamports: wallet.walletLamports, tokenBalanceCount: wallet.tokenBalanceCount,
         observedAtMs: wallet.observedAtMs, expiresAtMs: provider.expiresAtMs,
       }));
-      const source = createExecutionPreflightDraftSource(Object.freeze({
-        schemaVersion: 'execution-preflight-draft-source.v1', readiness, generation,
-        walletSnapshot: wallet, providerSnapshot: provider, target, simulation, databaseNowMs,
+      const expiresAtMs = Math.min(lineage.runExpiresAtMs, lineage.pairExpiresAtMs,
+        lineage.candidateEligibleUntilMs, lineage.candidatePurgeAfterMs,
+        target.intent.expiresAtMs, provider.expiresAtMs);
+      const unsignedSource = Object.freeze({
+        schemaVersion: 'execution-preflight-draft-source.v2' as const,
+        lineage: Object.freeze({
+          preparationRunId: lineage.runId,
+          preparationRunFingerprint: lineage.runFingerprint,
+          pairId: lineage.pairId,
+          pairFingerprint: lineage.pairFingerprint,
+          targetAssessmentId: lineage.assessmentId,
+          targetAssessmentFingerprint: lineage.assessmentFingerprint,
+          simulationAttemptNumber: 1 as const,
+          simulationArtifactId: lineage.artifactId,
+          simulationArtifactFingerprint: lineage.artifactFingerprint,
+          preparationManifestFingerprint: lineage.manifestFingerprint,
+          candidateId: lineage.candidateId,
+          candidateEvidenceFingerprint: lineage.candidateEvidenceFingerprint,
+          candidateConfirmationStatus: 'finalized' as const,
+        }), readiness, generation, walletSnapshot: wallet, providerSnapshot: provider,
+        target, simulation, capturedAtMs: databaseNowMs, expiresAtMs,
+      });
+      const source = createExecutionPreflightDraftSource(Object.freeze({ ...unsignedSource,
+        proofFingerprint: createExecutionPreflightDraftSourceProofFingerprint(unsignedSource),
       }));
+      if (source.schemaVersion !== 'execution-preflight-draft-source.v2') throw new TypeError();
       await client.query('COMMIT');
       began = false;
       return source;
@@ -145,6 +298,57 @@ export class PostgresExecutionPreflightSourceRepository {
       throw new ExecutionPreflightSourceRepositoryError();
     } finally { client?.release(); }
   }
+}
+
+interface LineageRow {
+  readonly runId: string;
+  readonly runFingerprint: string;
+  readonly pairId: string;
+  readonly pairFingerprint: string;
+  readonly targetIntentId: string;
+  readonly simulationIntentId: string;
+  readonly pairExpiresAtMs: number;
+  readonly runExpiresAtMs: number;
+  readonly assessmentId: string;
+  readonly assessmentFingerprint: string;
+  readonly artifactId: string;
+  readonly artifactFingerprint: string;
+  readonly candidateId: string;
+  readonly candidateEvidenceFingerprint: string;
+  readonly candidateEligibleUntilMs: number;
+  readonly candidatePurgeAfterMs: number;
+  readonly generationId: string;
+  readonly manifestFingerprint: string;
+}
+
+function lineageFrom(row: Readonly<Record<string, unknown>>): LineageRow {
+  const value = exact(row, ['run_id', 'run_fingerprint', 'run_state', 'manifest_fingerprint',
+    'run_expires_at_ms',
+    'pair_id', 'pair_fingerprint', 'target_intent_id', 'simulation_intent_id',
+    'pair_expires_at_ms', 'assessment_id', 'assessment_fingerprint', 'artifact_id',
+    'artifact_fingerprint', 'simulation_attempt_number', 'candidate_id',
+    'candidate_evidence_fingerprint', 'candidate_confirmation_status',
+    'candidate_eligible_until_ms', 'candidate_purge_after_ms', 'generation_id'] as const);
+  if (value.run_state !== 'PREPARED' || value.simulation_attempt_number !== 1
+    || value.candidate_confirmation_status !== 'finalized') throw new TypeError();
+  return Object.freeze({
+    runId: stringValue(value.run_id), runFingerprint: fingerprintValue(value.run_fingerprint),
+    pairId: stringValue(value.pair_id), pairFingerprint: fingerprintValue(value.pair_fingerprint),
+    runExpiresAtMs: timestampText(value.run_expires_at_ms),
+    targetIntentId: stringValue(value.target_intent_id),
+    simulationIntentId: stringValue(value.simulation_intent_id),
+    pairExpiresAtMs: timestampText(value.pair_expires_at_ms),
+    assessmentId: stringValue(value.assessment_id),
+    assessmentFingerprint: fingerprintValue(value.assessment_fingerprint),
+    artifactId: stringValue(value.artifact_id),
+    artifactFingerprint: fingerprintValue(value.artifact_fingerprint),
+    candidateId: stringValue(value.candidate_id),
+    candidateEvidenceFingerprint: fingerprintValue(value.candidate_evidence_fingerprint),
+    candidateEligibleUntilMs: timestampText(value.candidate_eligible_until_ms),
+    candidatePurgeAfterMs: timestampText(value.candidate_purge_after_ms),
+    generationId: stringValue(value.generation_id),
+    manifestFingerprint: fingerprintValue(value.manifest_fingerprint),
+  });
 }
 
 function generationFrom(row: Readonly<Record<string, unknown>>):
@@ -238,7 +442,7 @@ ExecutionPreflightDraftSourceV1['providerSnapshot'] {
 function targetFrom(row: Readonly<Record<string, unknown>>):
 ExecutionPreflightDraftSourceV1['target'] {
   const keys = ['id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
-    'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
+    'position_id', 'candidate_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
     'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
     'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint', 'requested_at_ms',
     'expires_at_ms', 'status', 'attempt_count', 'state_revision', 'lease_owner',
@@ -249,6 +453,7 @@ ExecutionPreflightDraftSourceV1['target'] {
   const intent = Object.freeze({ id: stringValue(value.id), payloadVersion: numberValue(value.payload_version),
     logicalOrderKey: stringValue(value.logical_order_key), strategyId: stringValue(value.strategy_id),
     strategyVersion: numberValue(value.strategy_version), positionId: stringValue(value.position_id),
+    candidateId: stringValue(value.candidate_id),
     logicalCommandId: stringValue(value.logical_command_id), mint: stringValue(value.mint),
     side: stringValue(value.side), venuePolicy: stringValue(value.venue_policy),
     quoteMint: stringValue(value.quote_mint), quoteTokenProgram: stringValue(value.quote_token_program),
@@ -321,14 +526,10 @@ ExecutionPreflightDraftSourceV1['simulation'] {
   return simulation;
 }
 
-function validateRequest(value: ExecutionPreflightSourceRequestV1): void {
-  const request = exact(value, ['generationId', 'targetIntentId', 'simulationArtifactId'] as const);
-  if (typeof request.generationId !== 'string'
-    || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(request.generationId)
-    || typeof request.targetIntentId !== 'string'
-    || !/^execution_intent_[0-9a-f]{64}$/u.test(request.targetIntentId)
-    || typeof request.simulationArtifactId !== 'string'
-    || !/^execution_simulation_artifact_[0-9a-f]{64}$/u.test(request.simulationArtifactId)) {
+function validateRequest(value: ExecutionPreflightSourceRequestV2): void {
+  const request = exact(value, ['preparationRunId'] as const);
+  if (typeof request.preparationRunId !== 'string'
+    || !/^execution_preflight_preparation_[0-9a-f]{64}$/u.test(request.preparationRunId)) {
     throw new TypeError();
   }
 }
@@ -358,6 +559,11 @@ Readonly<Record<K[number], unknown>> {
 }
 function field(row: Readonly<Record<string, unknown>>, key: string): unknown { return row[key]; }
 function stringValue(value: unknown): string { if (typeof value !== 'string') throw new TypeError(); return value; }
+function fingerprintValue(value: unknown): string {
+  const parsed = stringValue(value);
+  if (!/^[0-9a-f]{64}$/u.test(parsed)) throw new TypeError();
+  return parsed;
+}
 function nullableString(value: unknown): string | null { return value === null ? null : stringValue(value); }
 function providerProvenance(value: unknown): 'AUTHORITATIVE_PROBE' | 'OPERATOR_REPORT' {
   if (value !== 'AUTHORITATIVE_PROBE' && value !== 'OPERATOR_REPORT') throw new TypeError();

@@ -12,6 +12,8 @@ import {
 import { createExecutionPreflightIntentPairInTransaction } from
   '../src/storage/execution-preflight-intent-pair.repository.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { seedCanonicalV2Source } from './helpers/execution-preflight-v2-source-fixture.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 
@@ -125,6 +127,7 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
       isolated = new pg.Pool({ connectionString: isolatedUrl.href });
       await migrateDatabase({ pool: isolated });
+      const canonicalSource = await seedCanonicalV2Source(isolated);
       const provisioningSql = await readFile(scriptUrl, 'utf8');
       const publicParameterProbe = await isolated.connect();
       try {
@@ -231,18 +234,45 @@ void test('PostgreSQL 16 listener login can write business projections but no li
         decisionEventId: `decision-${suffix}`, decisionFingerprint: 'd'.repeat(64),
         requestedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
       }));
+      await insertExecutionDecisionEvent(listener, intentDraft.decisionEventId, intentDraft.mint);
       assert.equal((await intentRepository.create(intentDraft)).kind, 'CREATED');
       assert.equal((await intentRepository.create(intentDraft)).kind, 'REPLAYED');
+      const pairedDecisionEventId = `decision-pair-${suffix}`;
+      const lineage = (await listener.query<{
+        readonly position_id: string;
+        readonly qualification_event_id: string;
+        readonly report_id: string;
+        readonly source_raw_event_id: string;
+      }>(`SELECT position.position_id,report.qualification_event_id,report.report_id,
+          report.source_raw_event_id
+        FROM trading_candidates candidate
+        JOIN qualification_reports report ON report.report_id=candidate.report_id
+        JOIN paper_positions position ON position.candidate_id=candidate.candidate_id
+        WHERE candidate.candidate_id=$1`, [canonicalSource.candidateId])).rows[0];
+      assert.ok(lineage !== undefined);
+      const pairedPositionId = lineage.position_id;
+      await listener.query(`INSERT INTO domain_events (
+        event_id,raw_event_id,type,mint,source,program,signature,slot,
+        transaction_index,instruction_index,inner_instruction_index,
+        confirmation_status,observed_at,payload_version,payload
+      ) VALUES ($1,$2,'PaperStrategySessionUpdated',$3,'paper-decision','pumpfun',$1,1,
+        0,0,NULL,'finalized',$4,1,$5::JSONB)`, [
+        pairedDecisionEventId, lineage.source_raw_event_id, intentDraft.mint, new Date(nowMs),
+        JSON.stringify({ session: { candidateId: canonicalSource.candidateId,
+          qualificationReportId: lineage.report_id, positionId: pairedPositionId,
+          mint: intentDraft.mint } }),
+      ]);
       const pairedTarget = createExecutionIntentDraft(Object.freeze({
         strategyId: 'creation-entry-v1', strategyVersion: 1,
-        positionId: `position-pair-${suffix}`,
+        positionId: pairedPositionId,
+        candidateId: canonicalSource.candidateId,
         logicalCommandId: `paper_open_${'a'.repeat(64)}`,
         mint: '11111111111111111111111111111111', side: 'BUY',
         venuePolicy: 'PUMP_FUN_ONLY',
         quoteMint: 'So11111111111111111111111111111111111111112',
         quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
         quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
-        decisionEventId: `decision-pair-${suffix}`,
+        decisionEventId: pairedDecisionEventId,
         decisionFingerprint: 'e'.repeat(64),
         requestedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
       }));

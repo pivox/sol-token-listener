@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
 import { verifySignedExecutionCanaryEvidence } from '../domain/execution-canary-attestation.js';
+import { createExecutionPreflightDraftSource } from '../domain/execution-preflight-draft.js';
+import { canonicalStringifyJson, parseJson } from '../utils/json.js';
 import { parseExecutionCanaryArmConfig, parseExecutionOperationsConfig } from './config.js';
 import { openExecutionOperationsDatabase } from './database.js';
 import {
@@ -95,9 +97,16 @@ export async function runExecutionOperationsCommand(
           armConfig.evidencePublicKeyBase64,
         );
         if (arm.intentId !== evidence.targetIntentId) throw invalid();
+        const sourceEncoded = await dependencies.readTextFile(armConfig.preflightSourcePath);
+        if (Buffer.byteLength(sourceEncoded, 'utf8') > MAX_CANARY_EVIDENCE_ENVELOPE_BYTES) throw invalid();
+        const decodedSource = parseJson(sourceEncoded);
+        if (canonicalStringifyJson(decodedSource) !== sourceEncoded) throw invalid();
+        const preflightSource = createExecutionPreflightDraftSource(deepFreeze(decodedSource));
+        if (preflightSource.schemaVersion !== 'execution-preflight-draft-source.v2'
+          || preflightSource.target.intent.id !== arm.intentId) throw invalid();
         assertQualificationBinding(evidence.qualification, armConfig, nowMs);
         const armament = await dependencies.service.arm({
-          payloadVersion: 2, evidence, intentId: arm.intentId,
+          payloadVersion: 3, evidence, preflightSource, intentId: arm.intentId,
           maximumCapitalLamports: arm.maximumCapitalLamports,
           maximumHoldingMs: arm.maximumHoldingMs,
           runtimeQuoteMaxAgeMs: armConfig.runtimeQuoteMaxAgeMs,
@@ -115,7 +124,7 @@ export async function runExecutionOperationsCommand(
         });
         if (armament.payloadVersion !== 2) throw invalid();
         return JSON.stringify({
-          payloadVersion: 2, command: 'arm', armamentId: armament.armamentId,
+          payloadVersion: 3, command: 'arm', armamentId: armament.armamentId,
           admissionReportId: armament.admissionReportId, reservationId: armament.reservationId,
           state: armament.state, phase: 'CANARY', expiresAtMs: armament.armamentExpiresAtMs,
           canaryStatus: 'CANARY_NOT_STARTED',
@@ -280,6 +289,12 @@ function statusJson(command: string, status: Awaited<ReturnType<
 
 function invalid(): ExecutionOperationsCliError {
   return new ExecutionOperationsCliError();
+}
+
+function deepFreeze(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  for (const nested of Object.values(value)) deepFreeze(nested);
+  return Object.freeze(value);
 }
 
 const entrypoint = process.argv[1];

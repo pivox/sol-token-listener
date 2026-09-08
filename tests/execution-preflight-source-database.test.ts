@@ -7,6 +7,7 @@ import {
   createExecutionPreflightSourceDatabase,
   EXECUTION_PREFLIGHT_SOURCE_AUTHORITY_SQL,
   EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS,
+  EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS,
   EXECUTION_PREFLIGHT_SOURCE_TABLES,
   ExecutionPreflightSourceDatabaseError,
 } from '../src/preflight-source/database.js';
@@ -14,6 +15,16 @@ import { migrateDatabase } from '../src/storage/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 void test('pins and validates the operator reader role on every checkout', async () => {
+  for (const table of [
+    'execution_preflight_intent_preparation_runs', 'execution_preflight_intent_pairs',
+    'execution_preflight_intent_pair_memberships', 'execution_dry_run_assessments',
+    'execution_attempts', 'trading_candidates', 'qualification_reports',
+    'domain_events', 'raw_chain_events', 'paper_positions',
+  ]) assert.ok(Object.hasOwn(EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS, table));
+  for (const column of ['candidate_id', 'live_reserved']) {
+    assert.ok(EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS.includes(column as never));
+  }
+  assert.equal(EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS.includes('lease_token' as never), false);
   const queries: string[] = [];
   const releases: boolean[] = [];
   const database = createExecutionPreflightSourceDatabase({ connect: async () => ({
@@ -109,6 +120,9 @@ void test('PostgreSQL 16 operator login has exact source-only authority', async 
       await client.query('SELECT version FROM migration_history LIMIT 1');
       for (const statement of [
         'SELECT lease_token FROM execution_intents LIMIT 1',
+        'SELECT lease_token FROM execution_preflight_intent_preparation_runs LIMIT 1',
+        'SELECT payload FROM raw_chain_events LIMIT 1',
+        'SELECT reason_codes FROM trading_candidates LIMIT 1',
         'SELECT signed_transaction_bytes FROM execution_signed_transactions LIMIT 1',
         'INSERT INTO execution_control_state DEFAULT VALUES',
         'DELETE FROM execution_wallet_snapshots WHERE FALSE',
@@ -176,10 +190,11 @@ function validAuthority(): Readonly<Record<string, unknown>> {
     table_privileges: JSON.stringify(EXECUTION_PREFLIGHT_SOURCE_TABLES.map(
       (table) => ['sol_token_operator_reader', 'public', table, 'SELECT'],
     )),
-    intent_columns: JSON.stringify(EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS.map(
-      (column) => ['sol_token_operator_reader', 'public', column, 'SELECT'],
-    )),
-    schema_usage: true, schema_create: false, migration_041_present: true,
+    source_columns: JSON.stringify(Object.entries(EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS)
+      .flatMap(([table, columns]) => columns.map(
+        (column) => ['sol_token_operator_reader', 'public', table, column, 'SELECT'],
+      )).sort((left, right) => left.join('\0').localeCompare(right.join('\0')))),
+    schema_usage: true, schema_create: false, migration_043_present: true,
     executable_security_definer_count: '0', role_can_set_replication: false,
     session_can_set_replication: false });
 }

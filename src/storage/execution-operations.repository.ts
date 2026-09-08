@@ -3,6 +3,7 @@ import type pg from 'pg';
 import {
   createExecutionArmament,
   createExecutionArmamentRequestV2,
+  createExecutionArmamentRequestV3,
   createExecutionArmamentV2,
   createOperatorAuthorization,
   createOperatorAuthorizationV2,
@@ -10,6 +11,7 @@ import {
   type ExecutionActivationArmamentV1,
   type ExecutionActivationArmamentV2,
   type ExecutionArmamentRequestV2,
+  type ExecutionArmamentRequestV3,
   type ExecutionOperatorAuthorizationV1,
   type ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
@@ -41,6 +43,14 @@ import {
   appendWalletSnapshotInTransaction,
   ExecutionRiskRepositoryError,
 } from './execution-risk.repository.js';
+import {
+  assertExecutionIntentLineageCurrentInTransaction,
+  ExecutionIntentLineageRepositoryError,
+} from './execution-intent-lineage.repository.js';
+import {
+  createExecutionPreflightDraftSource,
+  type ExecutionPreflightDraftSourceV2,
+} from '../domain/execution-preflight-draft.js';
 
 interface QueryResult {
   readonly rows: readonly Readonly<Record<string, unknown>>[];
@@ -414,8 +424,15 @@ export class PostgresExecutionOperationsRepository implements
   public async armCanary(input: Readonly<{
     request: ExecutionArmamentRequestV2;
     authorization: ExecutionOperatorAuthorizationV2;
+    preflightSource?: never;
+  }> | Readonly<{
+    request: ExecutionArmamentRequestV3;
+    authorization: ExecutionOperatorAuthorizationV2;
+    preflightSource: ExecutionPreflightDraftSourceV2;
   }>): Promise<ExecutionActivationArmamentV2> {
     const request = canaryRequestFrom(input.request);
+    const preflightSource = preflightSourceForRequest(request,
+      'preflightSource' in input ? input.preflightSource : undefined);
     const authorization = canaryAuthorizationFrom(input.authorization);
     if (authorization.generationId !== request.qualification.generationId
       || authorization.action !== 'ARM' || authorization.phase !== 'CANARY'
@@ -426,14 +443,32 @@ export class PostgresExecutionOperationsRepository implements
         hashtextextended('execution-live-sell-presence:v1', 51008))`);
       await lockGeneration(client, request.qualification.generationId);
       const nowMs = await databaseNowMs(client);
+      let target: LockedCanaryTarget | null = null;
+      if (request.payloadVersion === 3) {
+        const pair = await lockAndAssertPairedPreflightPair(
+          client, request, preflightSource, nowMs,
+        );
+        target = await lockedCanaryTarget(client, request.target.intentId, pair.pairId, null);
+        await lockAndAssertPairedPreflightEvidence(client, request, pair, nowMs);
+      }
       const replay = await findCanaryReplay(client, request, authorization);
-      if (replay?.kind === 'REPLAY') return replay;
+      if (replay?.kind === 'REPLAY') {
+        if (target !== null) {
+          if (!target.liveReserved) throw failure('CONFLICT');
+          await assertCurrentCanaryLineage(client, request.target.intentId);
+        }
+        return replay;
+      }
       if (replay?.kind === 'STALE') {
         await terminalizeActiveArmament(client, request.qualification.generationId, 'EXPIRED', true);
         return replay;
       }
-      const target = await lockedCanaryTarget(client, request.target.intentId);
+      target ??= await lockedCanaryTarget(client, request.target.intentId, null, false);
+      if (target.liveReserved) throw failure('CONFLICT');
       assertCanaryRequestTarget(request, target, nowMs);
+      if (request.payloadVersion === 3) {
+        await assertCurrentCanaryLineage(client, request.target.intentId);
+      }
       await promoteCanaryTarget(client, target.intent.id);
       await ensureControlState(client, request.qualification.generationId);
       const control = await lockedControlState(client, request.qualification.generationId);
@@ -526,15 +561,61 @@ export class PostgresExecutionOperationsRepository implements
   }
 }
 
+function preflightSourceForRequest(
+  request: CanaryArmamentRequest,
+  input: ExecutionPreflightDraftSourceV2 | undefined,
+): ExecutionPreflightDraftSourceV2 | null {
+  if (request.payloadVersion === 2) {
+    if (input !== undefined) throw failure('CONFLICT');
+    return null;
+  }
+  if (input === undefined) throw failure('CONFLICT');
+  try {
+    const source = createExecutionPreflightDraftSource(input);
+    if (source.schemaVersion !== 'execution-preflight-draft-source.v2'
+      || source.proofFingerprint !== request.lineageProof.proofFingerprint
+      || source.lineage.preparationRunId !== request.lineageProof.preparationRunId
+      || source.lineage.preparationRunFingerprint !== request.lineageProof.preparationRunFingerprint
+      || source.lineage.pairId !== request.lineageProof.pairId
+      || source.lineage.pairFingerprint !== request.lineageProof.pairFingerprint
+      || source.lineage.targetAssessmentId !== request.lineageProof.targetAssessmentId
+      || source.lineage.targetAssessmentFingerprint !== request.lineageProof.targetAssessmentFingerprint
+      || source.lineage.simulationArtifactId !== request.lineageProof.simulationArtifactId
+      || source.lineage.simulationArtifactFingerprint !== request.lineageProof.simulationArtifactFingerprint
+      || source.lineage.preparationManifestFingerprint
+        !== request.lineageProof.preparationManifestFingerprint
+      || source.lineage.candidateId !== request.lineageProof.candidateId
+      || source.lineage.candidateEvidenceFingerprint
+        !== request.lineageProof.candidateEvidenceFingerprint
+      || source.capturedAtMs !== request.lineageProof.sourceCapturedAtMs
+      || source.expiresAtMs !== request.lineageProof.sourceExpiresAtMs
+      || source.target.intent.id !== request.target.intentId
+      || source.generation.generationId !== request.qualification.generationId
+      || source.walletSnapshot.snapshotFingerprint !== request.walletSnapshot.snapshotFingerprint
+      || source.providerSnapshot.snapshotFingerprint !== request.providerSnapshot.snapshotFingerprint) {
+      throw new TypeError();
+    }
+    return source;
+  } catch { throw failure('CONFLICT'); }
+}
+
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
 interface LockedCanaryTarget {
   readonly intent: ExecutionIntentV1;
+  readonly liveReserved: boolean;
 }
 
-function canaryRequestFrom(input: ExecutionArmamentRequestV2): ExecutionArmamentRequestV2 {
+interface LockedPairedPreflight {
+  readonly pairId: string;
+  readonly simulationIntentId: string;
+}
+
+type CanaryArmamentRequest = ExecutionArmamentRequestV2 | ExecutionArmamentRequestV3;
+
+function canaryRequestFrom(input: CanaryArmamentRequest): CanaryArmamentRequest {
   try {
-    const canonical = createExecutionArmamentRequestV2({
+    const common = {
       payloadVersion: input.payloadVersion,
       qualification: input.qualification,
       targetIntentId: input.targetIntentId,
@@ -562,7 +643,11 @@ function canaryRequestFrom(input: ExecutionArmamentRequestV2): ExecutionArmament
       armamentExpiresAtMs: input.armamentExpiresAtMs,
       operatorId: input.operatorId,
       operatorReason: input.operatorReason,
-    });
+    };
+    const canonical = input.payloadVersion === 3
+      ? createExecutionArmamentRequestV3({ ...common, payloadVersion: 3,
+        lineageProof: input.lineageProof })
+      : createExecutionArmamentRequestV2(common);
     if (!Object.isFrozen(input)
       || input.evidenceId !== canonical.evidenceId
       || input.evidenceFingerprint !== canonical.evidenceFingerprint
@@ -610,7 +695,7 @@ async function databaseNowMs(client: DatabaseClient): Promise<number> {
 
 async function findCanaryReplay(
   client: DatabaseClient,
-  request: ExecutionArmamentRequestV2,
+  request: CanaryArmamentRequest,
   authorization: ExecutionOperatorAuthorizationV2,
 ): Promise<Readonly<{ kind: 'REPLAY'; armament: ExecutionActivationArmamentV2 }>
   | Readonly<{ kind: 'STALE' }> | null> {
@@ -649,9 +734,157 @@ async function findCanaryReplay(
   return Object.freeze({ kind: 'REPLAY' as const, armament: canonical });
 }
 
+async function lockAndAssertPairedPreflightPair(
+  client: DatabaseClient,
+  request: ExecutionArmamentRequestV3,
+  source: ExecutionPreflightDraftSourceV2 | null,
+  nowMs: number,
+): Promise<LockedPairedPreflight> {
+  if (source?.proofFingerprint !== request.lineageProof.proofFingerprint) {
+    throw failure('CONFLICT');
+  }
+  const proof = request.lineageProof;
+  const pair = exactRow(singleRow(await client.query(`SELECT pair_fingerprint,target_intent_id,
+    simulation_intent_id,decision_fingerprint,
+    trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms,
+    expires_at > statement_timestamp() AS fresh
+    FROM execution_preflight_intent_pairs WHERE pair_id=$1 FOR UPDATE`, [proof.pairId])), [
+    'pair_fingerprint', 'target_intent_id', 'simulation_intent_id', 'decision_fingerprint',
+    'expires_at_ms', 'fresh',
+  ] as const);
+  if (pair.pair_fingerprint !== proof.pairFingerprint
+    || pair.target_intent_id !== request.target.intentId
+    || pair.decision_fingerprint !== request.target.decisionFingerprint
+    || typeof pair.simulation_intent_id !== 'string' || pair.fresh !== true
+    || timestampText(pair.expires_at_ms) < proof.sourceExpiresAtMs
+    || proof.sourceCapturedAtMs > nowMs || proof.sourceExpiresAtMs <= nowMs) {
+    throw failure('CONFLICT');
+  }
+  return Object.freeze({ pairId: proof.pairId, simulationIntentId: pair.simulation_intent_id });
+}
+
+async function lockAndAssertPairedPreflightEvidence(
+  client: DatabaseClient,
+  request: ExecutionArmamentRequestV3,
+  pair: LockedPairedPreflight,
+  nowMs: number,
+): Promise<void> {
+  const proof = request.lineageProof;
+  const run = exactRow(singleRow(await client.query(`SELECT run_fingerprint,state,pair_id,
+    assessment_id,assessment_fingerprint,artifact_id,artifact_fingerprint,manifest_fingerprint,
+    trunc(EXTRACT(EPOCH FROM deadline_at)*1000)::TEXT AS deadline_at_ms,
+    deadline_at > statement_timestamp() AS deadline_fresh,
+    purge_after > statement_timestamp() AS retained
+    FROM execution_preflight_intent_preparation_runs WHERE run_id=$1 FOR UPDATE`,
+  [proof.preparationRunId])), [
+    'run_fingerprint', 'state', 'pair_id', 'assessment_id', 'assessment_fingerprint',
+    'artifact_id', 'artifact_fingerprint', 'manifest_fingerprint', 'deadline_at_ms',
+    'deadline_fresh', 'retained',
+  ] as const);
+  if (run.run_fingerprint !== proof.preparationRunFingerprint || run.state !== 'PREPARED'
+    || run.pair_id !== proof.pairId || run.assessment_id !== proof.targetAssessmentId
+    || run.assessment_fingerprint !== proof.targetAssessmentFingerprint
+    || run.artifact_id !== proof.simulationArtifactId
+    || run.artifact_fingerprint !== proof.simulationArtifactFingerprint
+    || run.manifest_fingerprint !== proof.preparationManifestFingerprint
+    || run.deadline_fresh !== true || run.retained !== true
+    || timestampText(run.deadline_at_ms) < proof.sourceExpiresAtMs) throw failure('CONFLICT');
+
+  const evidence = exactRow(singleRow(await client.query(`SELECT
+    assessment.intent_id AS assessment_intent_id,
+    assessment.result_fingerprint AS assessment_fingerprint,
+    assessment.evaluator_version AS assessment_evaluator_version,
+    artifact.intent_id AS artifact_intent_id,artifact.attempt_number,
+    artifact.result_fingerprint AS artifact_fingerprint,artifact.result_kind,
+    artifact.provider_id,artifact.executor_public_key,artifact.expected_genesis_hash,
+    artifact.observed_genesis_hash,
+    trunc(EXTRACT(EPOCH FROM artifact.recorded_at)*1000)::TEXT AS artifact_recorded_at_ms,
+    simulation.status AS simulation_status,simulation.attempt_count AS simulation_attempt_count,
+    simulation.live_reserved AS simulation_live_reserved,
+    candidate.candidate_id,candidate.evidence_fingerprint AS candidate_evidence_fingerprint,
+    candidate.confirmation_status,candidate.state AS candidate_state,
+    candidate.superseded_at IS NULL AS candidate_current,
+    trunc(EXTRACT(EPOCH FROM candidate.eligible_until)*1000)::TEXT AS candidate_eligible_until_ms,
+    candidate.eligible_until > statement_timestamp() AS candidate_eligible,
+    trunc(EXTRACT(EPOCH FROM candidate.purge_after)*1000)::TEXT AS candidate_purge_after_ms,
+    candidate.purge_after > statement_timestamp() AS candidate_retained,
+    generation.generation_id,generation.retired_at IS NULL AS generation_current
+    FROM execution_dry_run_assessments assessment
+    JOIN execution_simulation_artifacts artifact ON artifact.artifact_id=$2
+    JOIN execution_attempts attempt ON attempt.intent_id=artifact.intent_id
+      AND attempt.attempt_number=artifact.attempt_number AND attempt.status='COMPLETED'
+    JOIN execution_intents simulation ON simulation.id=artifact.intent_id
+    JOIN trading_candidates candidate ON candidate.candidate_id=$3
+      AND candidate.candidate_id=simulation.candidate_id
+    JOIN execution_wallet_generations generation ON generation.generation_id=$4
+    WHERE assessment.assessment_id=$1
+    FOR UPDATE OF assessment,artifact,attempt,simulation,candidate,generation`, [proof.targetAssessmentId,
+      proof.simulationArtifactId, proof.candidateId, request.qualification.generationId])), [
+    'assessment_intent_id', 'assessment_fingerprint', 'assessment_evaluator_version',
+    'artifact_intent_id', 'attempt_number', 'artifact_fingerprint', 'result_kind', 'provider_id',
+    'executor_public_key', 'expected_genesis_hash', 'observed_genesis_hash',
+    'artifact_recorded_at_ms', 'simulation_status', 'simulation_attempt_count',
+    'simulation_live_reserved', 'candidate_id', 'candidate_evidence_fingerprint',
+    'confirmation_status', 'candidate_state', 'candidate_current', 'candidate_eligible_until_ms',
+    'candidate_eligible', 'candidate_purge_after_ms', 'candidate_retained', 'generation_id',
+    'generation_current',
+  ] as const);
+  const artifactRecordedAtMs = timestampText(evidence.artifact_recorded_at_ms);
+  const candidateEligibleUntilMs = timestampText(evidence.candidate_eligible_until_ms);
+  const candidatePurgeAfterMs = timestampText(evidence.candidate_purge_after_ms);
+  if (evidence.assessment_intent_id !== request.target.intentId
+    || evidence.assessment_fingerprint !== proof.targetAssessmentFingerprint
+    || evidence.assessment_evaluator_version !== 1
+    || evidence.artifact_intent_id !== pair.simulationIntentId
+    || evidence.attempt_number !== 1
+    || evidence.artifact_fingerprint !== proof.simulationArtifactFingerprint
+    || evidence.result_kind !== 'SUCCESS' || evidence.provider_id !== request.qualification.providerId
+    || evidence.executor_public_key !== request.qualification.walletPublicKey
+    || evidence.expected_genesis_hash !== request.qualification.genesisHash
+    || evidence.observed_genesis_hash !== request.qualification.genesisHash
+    || artifactRecordedAtMs > nowMs || artifactRecordedAtMs + 30_000 < nowMs
+    || evidence.simulation_status !== 'SUCCEEDED' || evidence.simulation_attempt_count !== 1
+    || evidence.simulation_live_reserved !== false || evidence.candidate_id !== proof.candidateId
+    || evidence.candidate_evidence_fingerprint !== proof.candidateEvidenceFingerprint
+    || evidence.confirmation_status !== 'finalized' || evidence.candidate_state !== 'ELIGIBLE'
+    || evidence.candidate_current !== true || evidence.candidate_eligible !== true
+    || candidateEligibleUntilMs < proof.sourceExpiresAtMs || evidence.candidate_retained !== true
+    || candidatePurgeAfterMs < proof.sourceExpiresAtMs
+    || evidence.generation_id !== request.qualification.generationId
+    || evidence.generation_current !== true) throw failure('CONFLICT');
+  const lineageLocks = await client.query(`SELECT candidate.candidate_id
+    FROM execution_intents AS intent
+    JOIN trading_candidates AS candidate ON candidate.candidate_id=intent.candidate_id
+    JOIN qualification_reports AS report ON report.report_id=candidate.report_id
+    JOIN domain_events AS decision ON decision.event_id=intent.decision_event_id
+    JOIN domain_events AS source ON source.event_id=candidate.source_event_id
+    JOIN domain_events AS candidate_event ON candidate_event.event_id=candidate.candidate_event_id
+    JOIN domain_events AS qualification ON qualification.event_id=report.qualification_event_id
+    JOIN raw_chain_events AS source_raw ON source_raw.event_id=report.source_raw_event_id
+    JOIN paper_positions AS position ON position.position_id=intent.position_id
+    WHERE intent.id=$1
+    FOR UPDATE OF candidate,report,decision,source,candidate_event,qualification,source_raw,position`,
+  [request.target.intentId]);
+  if (lineageLocks.rowCount !== 1 || lineageLocks.rows.length !== 1) throw failure('CONFLICT');
+}
+
+async function assertCurrentCanaryLineage(
+  client: DatabaseClient,
+  intentId: string,
+): Promise<void> {
+  try {
+    await assertExecutionIntentLineageCurrentInTransaction(client, intentId);
+  } catch (error) {
+    if (error instanceof ExecutionIntentLineageRepositoryError) throw failure('CONFLICT');
+    throw error;
+  }
+}
+
 async function lockedCanaryTarget(
   client: DatabaseClient,
   intentId: string,
+  expectedPairId: string | null,
+  expectedLiveReserved: boolean | null,
 ): Promise<LockedCanaryTarget> {
   const row = exactRow(singleRow(await client.query(`SELECT id,payload_version,logical_order_key,
     strategy_id,strategy_version,position_id,logical_command_id,mint,side,venue_policy,
@@ -684,7 +917,7 @@ async function lockedCanaryTarget(
     'purge_after_ms', 'created_at_ms', 'updated_at_ms', 'lease_owner', 'lease_token',
     'lease_expires_at_ms', 'live_reserved',
   ] as const);
-  const pairMembership = await client.query(`SELECT lane
+  const pairMembership = await client.query(`SELECT pair_id,lane
     FROM execution_preflight_intent_pair_memberships
     WHERE intent_id=$1`, [intentId]);
   if (pairMembership.rows.length > 1 || pairMembership.rowCount !== pairMembership.rows.length) {
@@ -692,9 +925,11 @@ async function lockedCanaryTarget(
   }
   const [membership] = pairMembership.rows;
   if (membership !== undefined) {
-    const exactMembership = exactRow(membership, ['lane'] as const);
-    if (exactMembership.lane === 'SIMULATION') throw failure('CONFLICT');
-    if (exactMembership.lane !== 'TARGET') throw failure('INVALID_DATA');
+    const exactMembership = exactRow(membership, ['pair_id', 'lane'] as const);
+    if (expectedPairId === null || exactMembership.pair_id !== expectedPairId
+      || exactMembership.lane !== 'TARGET') throw failure('CONFLICT');
+  } else if (expectedPairId !== null) {
+    throw failure('CONFLICT');
   }
   try {
     const draft = createExecutionIntentDraft({
@@ -721,7 +956,10 @@ async function lockedCanaryTarget(
       || row.attempt_count !== 0 || row.last_reason_code !== null
       || row.terminal_at_ms !== null || row.reconciliation_completed_at_ms !== null
       || row.purge_after_ms !== null || row.lease_owner !== null || row.lease_token !== null
-      || row.lease_expires_at_ms !== null || row.live_reserved !== false) throw new TypeError();
+      || row.lease_expires_at_ms !== null || typeof row.live_reserved !== 'boolean'
+      || (expectedLiveReserved !== null && row.live_reserved !== expectedLiveReserved)) {
+      throw new TypeError();
+    }
     const intent = Object.freeze({
       ...draft,
       status: 'PENDING' as const,
@@ -734,7 +972,7 @@ async function lockedCanaryTarget(
       createdAtMs: timestampText(row.created_at_ms),
       updatedAtMs: timestampText(row.updated_at_ms),
     });
-    return Object.freeze({ intent });
+    return Object.freeze({ intent, liveReserved: row.live_reserved });
   } catch {
     throw failure('CONFLICT');
   }
@@ -751,7 +989,7 @@ async function promoteCanaryTarget(
 }
 
 function assertCanaryRequestTarget(
-  request: ExecutionArmamentRequestV2,
+  request: CanaryArmamentRequest,
   target: LockedCanaryTarget,
   nowMs: number,
 ): void {
@@ -778,7 +1016,7 @@ function assertCanaryRequestTarget(
 }
 
 function assertCanaryQualification(
-  request: ExecutionArmamentRequestV2,
+  request: CanaryArmamentRequest,
   qualification: ExecutionSafetyQualificationV1,
   nowMs: number,
 ): void {
@@ -805,7 +1043,7 @@ function assertCanaryQualification(
 
 async function assertCanarySnapshotsCurrent(
   client: DatabaseClient,
-  request: ExecutionArmamentRequestV2,
+  request: CanaryArmamentRequest,
   walletSnapshot: ExecutionArmamentRequestV2['walletSnapshot'],
   providerSnapshot: ExecutionArmamentRequestV2['providerSnapshot'],
   nowMs: number,

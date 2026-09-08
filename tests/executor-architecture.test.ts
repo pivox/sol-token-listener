@@ -8,6 +8,7 @@ import {
   executorBoundaryViolations,
   literalRuntimeModuleSpecifiers,
   operationsFoundationBoundaryViolations,
+  preflightPreparationBoundaryViolations,
   riskFoundationBoundaryViolations,
   simulationOnlyExecutorBoundaryViolations,
 } from './helpers/execution-boundary.js';
@@ -715,6 +716,10 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
     EXECUTOR_RPC_TIMEOUT_MS: '5000',
     EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '8',
     LIVE_TRADING_ENABLED: 'false',
+    EXECUTOR_PREFLIGHT_PREPARATION_ENABLED: 'false',
+    EXECUTOR_PREFLIGHT_PREPARATION_SELECTION_WINDOW_MS: '120000',
+    EXECUTOR_PREFLIGHT_PREPARATION_LEASE_MS: '60000',
+    EXECUTOR_PREFLIGHT_PREPARATION_OUTPUT_PATH: '',
   });
   assert.equal((environment.match(/^DATABASE_URL=postgresql:\/\//gmu) ?? []).length, 1);
   assert.match(environment, /mode executor[^\n]*dry-run[\s\S]*?sans RPC Solana ni wallet/iu);
@@ -843,6 +848,30 @@ void test('listener, API, dry-run and operations graphs cannot reach executor-li
     );
   }
 });
+
+void test('source and compiled H2k-b preparation graphs cannot reach signing or live execution',
+  async () => {
+    for (const entry of [
+      'src/executor-preflight-preparation/main.ts',
+      'dist/src/executor-preflight-preparation/main.js',
+    ]) {
+      const graph = await readGraph(resolve(repositoryRoot, entry));
+      assert.ok(graph.size >= 12, `${entry} graph unexpectedly small`);
+      const forbiddenPaths = [...graph.keys()].filter((path) => (
+        /\/executor-(?:live|operations)(?:\/|$)/u.test(path)
+        || /(?:keypair|transaction-signer|submission-gateway)/u.test(path)
+      ));
+      assert.deepEqual(forbiddenPaths, [], entry);
+      const violations: string[] = [];
+      for (const [path, source] of graph) {
+        violations.push(...preflightPreparationBoundaryViolations(source, path, repositoryRoot));
+        assert.doesNotMatch(source,
+          /\b(?:Keypair|sendRawTransaction|sendTransaction|signTransaction|signMessage)\b/u,
+          `signing/submission capability in ${relative(repositoryRoot, path)}`);
+      }
+      assert.deepEqual(violations, [], `unsafe H2k-b graph from ${entry}`);
+    }
+  });
 
 async function readGraph(entry: string): Promise<ReadonlyMap<string, string>> {
   const graph = new Map<string, string>();

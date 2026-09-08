@@ -9,8 +9,13 @@ void test('exports canonical source plus a redacted non-live manifest', () => {
   const exported = createExecutionPreflightSourceExport(input.source);
   assert.deepEqual(parseJson(exported.sourceJson), input.source);
   assert.equal(exported.manifest.state, 'PREFLIGHT_SOURCE_EXPORTED');
+  assert.equal(exported.manifest.schemaVersion, 'execution-preflight-source-export.v2');
   assert.equal(exported.manifest.targetIntentId, input.source.target.intent.id);
   assert.equal(exported.manifest.simulationArtifactId, input.source.simulation.artifactId);
+  assert.equal('preparationRunId' in exported.manifest
+    && exported.manifest.preparationRunId, input.source.lineage.preparationRunId);
+  assert.equal('proofFingerprint' in exported.manifest
+    && exported.manifest.proofFingerprint, input.source.proofFingerprint);
   assert.equal(exported.manifest.liveCapabilityPresent, false);
   assert.equal(JSON.stringify(exported.manifest).includes('secret'), false);
 });

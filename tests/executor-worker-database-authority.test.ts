@@ -5,6 +5,7 @@ import test from 'node:test';
 import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const WORKER_ROLE = 'sol_token_executor_worker';
@@ -24,7 +25,8 @@ const WORKER_TABLE_AUTHORITY: Readonly<Record<string, TableAuthority>> = Object.
   execution_intents: authority({
     SELECT: [
       'id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
-      'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
+      'position_id', 'candidate_id', 'logical_command_id', 'mint', 'side', 'venue_policy',
+      'quote_mint',
       'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
       'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint',
       'requested_at', 'expires_at', 'status', 'attempt_count', 'state_revision',
@@ -1281,6 +1283,9 @@ async function assertRevokedWorkerSessionPartition(
 async function insertPartitionIntent(
   admin: InstanceType<typeof pg.Pool>, id: string, suffix: string, liveReserved: boolean,
 ): Promise<void> {
+  await insertExecutionDecisionEvent(
+    admin, `decision-${suffix}`, '11111111111111111111111111111111',
+  );
   await admin.query(`INSERT INTO execution_intents (
     id,logical_order_key,strategy_id,strategy_version,position_id,logical_command_id,mint,side,
     venue_policy,quote_mint,quote_token_program,quote_decimals,quote_amount_raw,

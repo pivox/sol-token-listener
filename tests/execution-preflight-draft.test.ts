@@ -4,6 +4,7 @@ import { createExecutionPreflightBundle } from '../src/domain/execution-prefligh
 import {
   createExecutionPreflightDraft,
   createExecutionPreflightDraftSource,
+  createExecutionPreflightDraftSourceProofFingerprint,
 } from '../src/domain/execution-preflight-draft.js';
 import { NOW_MS } from './helpers/execution-canary-fixture.js';
 import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
@@ -21,11 +22,50 @@ void test('builds an H2f draft from exact persisted identities and eight static 
   assert.notEqual(input.source.simulation.intentId, input.source.target.intent.id);
 });
 
-void test('reconstructs the standalone H2h source before a gate catalog exists', () => {
+void test('reconstructs the preparation-bound H2h v2 source before a gate catalog exists', () => {
   const input = preflightDraftInputs();
   assert.deepEqual(createExecutionPreflightDraftSource(input.source), input.source);
   assert.throws(() => createExecutionPreflightDraftSource(Object.freeze({ ...input.source,
     readiness: Object.freeze({ ...input.source.readiness, walletLamports: '999' }),
+  })), /Invalid execution preflight draft/u);
+});
+
+void test('keeps v1 readable but never authorizes its unproved target', () => {
+  const input = preflightDraftInputs();
+  const legacyIntent = Object.freeze(Object.fromEntries(Object.entries(input.source.target.intent)
+    .filter(([key]) => key !== 'candidateId')));
+  const legacy = Object.freeze({
+    schemaVersion: 'execution-preflight-draft-source.v1' as const,
+    readiness: input.source.readiness,
+    generation: input.source.generation,
+    walletSnapshot: input.source.walletSnapshot,
+    providerSnapshot: input.source.providerSnapshot,
+    target: Object.freeze({ ...input.source.target, intent: legacyIntent }),
+    simulation: input.source.simulation,
+    databaseNowMs: input.source.capturedAtMs,
+  });
+  assert.equal(createExecutionPreflightDraftSource(legacy).schemaVersion,
+    'execution-preflight-draft-source.v1');
+  assert.throws(() => createExecutionPreflightDraft(legacy, input.catalog),
+    /Invalid execution preflight draft/u);
+});
+
+void test('rejects forged v2 lineage and proof fingerprints', () => {
+  const input = preflightDraftInputs();
+  assert.throws(() => createExecutionPreflightDraftSource(Object.freeze({ ...input.source,
+    lineage: Object.freeze({ ...input.source.lineage,
+      candidateConfirmationStatus: 'orphaned' }),
+  })), /Invalid execution preflight draft/u);
+  assert.throws(() => createExecutionPreflightDraftSource(Object.freeze({ ...input.source,
+    proofFingerprint: 'f'.repeat(64),
+  })), /Invalid execution preflight draft/u);
+  const { proofFingerprint: _proofFingerprint, ...unsigned } = input.source;
+  void _proofFingerprint;
+  const forgedRun = Object.freeze({ ...unsigned, lineage: Object.freeze({
+    ...unsigned.lineage, preparationRunFingerprint: 'f'.repeat(64),
+  }) });
+  assert.throws(() => createExecutionPreflightDraftSource(Object.freeze({ ...forgedRun,
+    proofFingerprint: createExecutionPreflightDraftSourceProofFingerprint(forgedRun),
   })), /Invalid execution preflight draft/u);
 });
 
@@ -61,5 +101,18 @@ void test('rejects missing or reordered static gates', () => {
   assert.throws(() => createExecutionPreflightDraft(input.source, Object.freeze({
     ...input.catalog, gates: Object.freeze([input.catalog.gates[1], input.catalog.gates[0],
       ...input.catalog.gates.slice(2)]),
+  })), /Invalid execution preflight draft/u);
+});
+
+void test('refuses to fabricate provider exit capacity when quota blocks a new entry', () => {
+  const input = preflightDraftInputs();
+  const entryBlockedPolicy = Object.freeze({
+    ...input.catalog.policy,
+    providerEntryCostUnits: 995n,
+  });
+
+  assert.throws(() => createExecutionPreflightDraft(input.source, Object.freeze({
+    ...input.catalog,
+    policy: entryBlockedPolicy,
   })), /Invalid execution preflight draft/u);
 });

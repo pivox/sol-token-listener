@@ -22,6 +22,8 @@
     "executor:preflight-draft:start": "node dist/src/preflight-draft/main.js",
     "executor:preflight-source:dev": "tsx src/preflight-source/main.ts",
     "executor:preflight-source:start": "node dist/src/preflight-source/main.js",
+    "executor:preflight-preparation:dev": "tsx src/executor-preflight-preparation/main.ts",
+    "executor:preflight-preparation:start": "node dist/src/executor-preflight-preparation/main.js",
     "executor:live:recovery:dev": "tsx src/executor-live-recovery/main.ts",
     "executor:live:recovery:start": "node dist/src/executor-live-recovery/main.js",
     "executor:live:dev": "tsx src/executor-live/main.ts",

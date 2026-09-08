@@ -2,12 +2,14 @@ import type {
   ExecutionActivationArmamentV1,
   ExecutionActivationArmamentV2,
   ExecutionArmamentRequestV2,
+  ExecutionArmamentRequestV3,
   ExecutionControlState,
   ExecutionOperatorAuthorizationV1,
   ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
 import type { ExecutionSafetyQualificationV1 } from '../domain/execution-safety-qualification.js';
 import type { ExecutionIntentSide, ExecutionIntentStatus } from '../domain/execution-intent.js';
+import type { ExecutionPreflightDraftSourceV2 } from '../domain/execution-preflight-draft.js';
 
 export interface ExecutionControlCommandV1 {
   readonly payloadVersion: 1;
@@ -72,6 +74,11 @@ export interface ExecutionCanaryArmamentRepository {
   armCanary(input: Readonly<{
     request: ExecutionArmamentRequestV2;
     authorization: ExecutionOperatorAuthorizationV2;
+    preflightSource?: never;
+  }> | Readonly<{
+    request: ExecutionArmamentRequestV3;
+    authorization: ExecutionOperatorAuthorizationV2;
+    preflightSource: ExecutionPreflightDraftSourceV2;
   }>): Promise<ExecutionActivationArmamentV2>;
 }
 

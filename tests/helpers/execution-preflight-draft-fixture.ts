@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   createExecutionReadinessManifest,
   createExecutionWalletGeneration,
@@ -8,15 +9,16 @@ import {
   createExecutionSimulationArtifactDraft,
 } from '../../src/domain/execution-simulation.js';
 import type {
-  ExecutionPreflightDraftSourceV1,
+  ExecutionPreflightDraftSourceV2,
   ExecutionPreflightGateCatalogV1,
 } from '../../src/domain/execution-preflight-draft.js';
+import { createExecutionPreflightDraftSourceProofFingerprint } from '../../src/domain/execution-preflight-draft.js';
 import { canaryEvidenceInput, NOW_MS, WSOL_MINT } from './execution-canary-fixture.js';
 
 const STATIC_INDEXES = [0, 1, 2, 3, 4, 5, 6, 8] as const;
 
 export function preflightDraftInputs(): Readonly<{
-  source: ExecutionPreflightDraftSourceV1;
+  source: ExecutionPreflightDraftSourceV2;
   catalog: ExecutionPreflightGateCatalogV1;
 }> {
   const generation = createExecutionWalletGeneration(Object.freeze({
@@ -42,7 +44,8 @@ export function preflightDraftInputs(): Readonly<{
   }));
   const intentDraft = createExecutionIntentDraft(Object.freeze({
     strategyId: 'creation-entry-v1', strategyVersion: 1,
-    positionId: 'paper-position-1', logicalCommandId: 'first-canary-entry',
+    positionId: 'paper-position-1', candidateId: `candidate_${'a'.repeat(64)}`,
+    logicalCommandId: 'first-canary-entry',
     mint: '11111111111111111111111111111111', side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
     quoteMint: WSOL_MINT, quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
     quoteAmountRaw: 10_000n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
@@ -53,6 +56,7 @@ export function preflightDraftInputs(): Readonly<{
     attemptCount: 0, stateRevision: 0n, lastReasonCode: null, terminalAtMs: null,
     reconciliationCompletedAtMs: null, purgeAfterMs: null,
     createdAtMs: NOW_MS - 2_000, updatedAtMs: NOW_MS - 2_000 });
+  if (intent.candidateId === null) throw new TypeError();
   const simulation = createExecutionSimulationArtifact(
     createExecutionSimulationArtifactDraft(Object.freeze({
       intentId: base.targetIntentId, attemptNumber: 1, intentStateRevision: 2n,
@@ -74,17 +78,42 @@ export function preflightDraftInputs(): Readonly<{
     })),
     NOW_MS - 1_000,
   );
-  return Object.freeze({
-    source: Object.freeze({
-      schemaVersion: 'execution-preflight-draft-source.v1', readiness,
+  const preparationRunId = `execution_preflight_preparation_${'5'.repeat(64)}`;
+  const preparationRunFingerprint = createHash('sha256').update(JSON.stringify(Object.freeze({
+    payloadVersion: 1, runId: preparationRunId,
+  })), 'utf8').digest('hex');
+  const unsignedSource = Object.freeze({
+      schemaVersion: 'execution-preflight-draft-source.v2' as const,
+      lineage: Object.freeze({
+        preparationRunId,
+        preparationRunFingerprint,
+        pairId: `execution_preflight_intent_pair_${'7'.repeat(64)}`,
+        pairFingerprint: '8'.repeat(64),
+        targetAssessmentId: `execution_dry_run_assessment_${'9'.repeat(64)}`,
+        targetAssessmentFingerprint: 'a'.repeat(64),
+        simulationAttemptNumber: 1 as const,
+        simulationArtifactId: simulation.artifactId,
+        simulationArtifactFingerprint: simulation.resultFingerprint,
+        preparationManifestFingerprint: 'b'.repeat(64),
+        candidateId: intent.candidateId,
+        candidateEvidenceFingerprint: 'c'.repeat(64),
+        candidateConfirmationStatus: 'finalized' as const,
+      }),
+      readiness,
       generation: Object.freeze({ generationId: generation.generationId,
         walletPublicKey: generation.walletPublicKey, cluster: 'mainnet-beta',
         genesisHash: generation.genesisHash, generation: 1 }),
       walletSnapshot: wallet, providerSnapshot: provider,
       target: Object.freeze({ intent, leaseOwner: null, leaseToken: null, leaseExpiresAtMs: null }),
       simulation,
-      databaseNowMs: NOW_MS,
-    }),
+      capturedAtMs: NOW_MS,
+      expiresAtMs: NOW_MS + 60_000,
+  });
+  const source = Object.freeze({ ...unsignedSource,
+    proofFingerprint: createExecutionPreflightDraftSourceProofFingerprint(unsignedSource),
+  });
+  return Object.freeze({
+    source,
     catalog: Object.freeze({
       schemaVersion: 'execution-preflight-gate-catalog.v1',
       strategyFingerprint: q.strategyFingerprint,

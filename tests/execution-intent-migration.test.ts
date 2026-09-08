@@ -5,6 +5,7 @@ import test from 'node:test';
 import pg from 'pg';
 import { assertExecutionIntent, createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '031_execution_intents.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -220,7 +221,7 @@ void test('execution intent migration applies and replays on an isolated schema'
 
   await withTemporarySchema(databaseUrl, 'execution_intents', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '041_execution_preflight_intent_pairs.sql');
+    assert.equal(applied.at(-1), '043_execution_intent_causal_lineage.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const schemaState = await pool.query(`SELECT current_schema() AS schema,
@@ -751,6 +752,7 @@ function migrationReasonForStatus(status: string): string | null {
 
 async function insertIntent(pool: InstanceType<typeof pg.Pool>, row: IntentRow): Promise<void> {
   const value = row.draft;
+  await insertExecutionDecisionEvent(pool, value.decisionEventId, value.mint);
   await pool.query(`INSERT INTO execution_intents (
     id, payload_version, logical_order_key, strategy_id, strategy_version, position_id,
     logical_command_id, mint, side, venue_policy, quote_mint, quote_token_program,
@@ -867,7 +869,7 @@ async function readIntentRow(
 ): Promise<Record<string, unknown> | undefined> {
   const result = await pool.query<Record<string, unknown>>(`SELECT
     id, payload_version, logical_order_key, strategy_id, strategy_version, position_id,
-    logical_command_id, mint, side, venue_policy, quote_mint, quote_token_program,
+    candidate_id, logical_command_id, mint, side, venue_policy, quote_mint, quote_token_program,
     quote_decimals, quote_amount_raw::TEXT AS quote_amount_raw,
     base_amount_raw::TEXT AS base_amount_raw,
     minimum_amount_out_raw::TEXT AS minimum_amount_out_raw,
@@ -890,6 +892,7 @@ function intentFromRow(row: Record<string, unknown> | undefined): object {
     id: text(row.id), payloadVersion: integer(row.payload_version),
     logicalOrderKey: text(row.logical_order_key), strategyId: text(row.strategy_id),
     strategyVersion: integer(row.strategy_version), positionId: text(row.position_id),
+    candidateId: row.candidate_id === null ? null : text(row.candidate_id),
     logicalCommandId: text(row.logical_command_id), mint: text(row.mint), side: text(row.side),
     venuePolicy: text(row.venue_policy), quoteMint: text(row.quote_mint),
     quoteTokenProgram: text(row.quote_token_program), quoteDecimals: integer(row.quote_decimals),
@@ -941,6 +944,7 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
       'lease_owner', 'lease_token', 'lease_expires_at', 'last_reason_code', 'terminal_at',
       'reconciliation_completed_at', 'created_at', 'updated_at', 'purge_after',
       'live_reserved',
+      'candidate_id',
     ].map((column_name) => ({ table_name, column_name }))),
   ]);
   const foreignKeys = await pool.query(`SELECT source_table.relname AS source, target_table.relname AS target,

@@ -40,9 +40,7 @@ void test('closes PostgreSQL successfully before publishing any source', async (
     close: async () => { calls.push('close'); },
   });
   const manifest = await runExecutionPreflightSourceCommand(database,
-    { generationId: source.generation.generationId,
-      targetIntentId: source.target.intent.id,
-      simulationArtifactId: source.simulation.artifactId }, '/outside/source.json',
+    { preparationRunId: source.lineage.preparationRunId }, '/outside/source.json',
     async () => { calls.push('publish'); });
   assert.deepEqual(calls, ['export', 'evict', 'close', 'publish']);
   assert.equal(JSON.parse(manifest).state, 'PREFLIGHT_SOURCE_EXPORTED');
@@ -50,9 +48,7 @@ void test('closes PostgreSQL successfully before publishing any source', async (
   let publications = 0;
   await assert.rejects(runExecutionPreflightSourceCommand(Object.freeze({ ...database,
     close: async () => { throw new Error('close failed'); },
-  }), { generationId: source.generation.generationId,
-    targetIntentId: source.target.intent.id,
-    simulationArtifactId: source.simulation.artifactId }, '/outside/source.json',
+  }), { preparationRunId: source.lineage.preparationRunId }, '/outside/source.json',
   async () => { publications += 1; }));
   assert.equal(publications, 0);
 });

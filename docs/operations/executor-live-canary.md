@@ -1,19 +1,20 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.16.0 — 2026-09-06
+**Version :** 1.17.0 — 2026-09-08
 
-La version 1.16.0 constate H2k-a disponible : la paire target/probe est durable,
-ses claims et sa promotion live sont séparés et le head de migration est 041.
-Le flag reste désactivé et H2k-b reste à livrer. La version 1.15.1 fixait la
-commande canonique du provisioning H2j et son contrôle post-exécution. Le
-canary reste non démarré.
+La version 1.17.0 constate H2k-b disponible mais désactivé par défaut : son
+runner one-shot prépare une paire target/probe exacte et H2h v2 l'exporte par
+`preparationRunId`. Le head de migration est 043. Aucune clé n'est chargée,
+aucune transaction n'est signée, armée ou soumise par H2k-b, et le canary
+reste non démarré.
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
 signature ni soumission. #51-H2b publie séparément
-`executor:live:dev` et `executor:live:start`. #51-H2c ajoute les gates, un
-armement V2 lié à une intention BUY exacte, le lock durable avant signature et
-sa récupération fail-closed. #51-H2d ajoute le bootstrap non signant des
+`executor:live:dev` et `executor:live:start`. #51-H2c ajoute les gates, une
+requête d'armement wire V3 liée à une intention BUY exacte, sa persistance en
+armement V2, le lock durable avant signature et sa récupération fail-closed.
+#51-H2d ajoute le bootstrap non signant des
 snapshots wallet/provider. #51-H2e produit l'attestation de quota Helius
 consommée par H2d. #51-H2f valide et signe hors ligne les deux enveloppes H2c
 dans un paquet atomique. #51-H2g assemble son draft depuis deux artefacts
@@ -21,9 +22,10 @@ canoniques protégés, sans accès DB ou réseau. #51-H2h exporte sa source depu
 une photographie PostgreSQL read-only. #51-H2i ferme l'autorité PostgreSQL du
 listener paper qui produit l'intention canary normale. #51-H2j ferme celle du
 worker commun aux modes `dry-run` et `simulation-only`. #51-H2k-a ajoute la
-paire durable entre la cible canary et son probe de simulation sans les
-exécuter. H2k-b ajoutera la préparation one-shot exacte. Ces livraisons
-préparent un preflight externe sans armer ni démarrer un canary.
+paire durable entre la cible canary et son probe de simulation. #51-H2k-b
+ajoute sa sélection et sa préparation one-shot exactes, mais le runner n'est
+jamais démarré automatiquement. Ces livraisons préparent un preflight externe
+sans armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -38,9 +40,7 @@ uniquement de `sol_token_operator_reader` :
 
 ```dotenv
 DATABASE_URL=postgresql://...
-EXECUTOR_PREFLIGHT_GENERATION_ID=execution_wallet_generation_...
-EXECUTOR_PREFLIGHT_TARGET_INTENT_ID=execution_intent_...
-EXECUTOR_PREFLIGHT_SIMULATION_ARTIFACT_ID=execution_simulation_artifact_...
+EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID=execution_preflight_preparation_<sha256>
 EXECUTOR_PREFLIGHT_SOURCE_PATH=/chemin/hors-git/execution-preflight-source.json
 ```
 
@@ -53,12 +53,14 @@ DOTENV_CONFIG_PATH=/chemin/hors-git/preflight-source.env \
   npm run executor:preflight-source:start
 ```
 
-La commande ne sélectionne jamais « le dernier » objet : les trois identités
-sont obligatoires. Elle lit génération, snapshots, intention BUY `PENDING`
-non louée et simulation `SUCCESS` dans une photographie unique, reconstruit
-leurs fingerprints et publie exclusivement un nouveau fichier `0600`. Elle
-refuse tout nom de variable RPC, wallet, keypair, mode live ou armement. Son
-succès signifie seulement `PREFLIGHT_SOURCE_EXPORTED` et
+La commande ne sélectionne jamais « le dernier » objet : seul le run H2k-b
+exact est accepté. Elle reconstruit dans une photographie unique la lignée
+run/pair/candidate/assessment/artifact, la génération, les snapshots,
+l'intention BUY `PENDING` non louée et la simulation `SUCCESS`. Elle vérifie
+leurs fingerprints, leur finalité et leurs échéances, puis publie exclusivement
+un nouveau fichier `0600` au schéma `execution-preflight-draft-source.v2`.
+Elle refuse tout nom de variable RPC, wallet, keypair, mode live ou armement.
+Son succès signifie seulement `PREFLIGHT_SOURCE_EXPORTED` et
 `CANARY_NOT_STARTED`.
 
 ## Assemblage offline H2g
@@ -269,8 +271,9 @@ EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false
 La valeur `true` n'est acceptée qu'avec `EXECUTION_MODE=paper`,
 `EXECUTION_INTENT_EMISSION_ENABLED=true`, l'allowlist quote limitée à WSOL/SPL
 Token 9 décimales et `PAPER_MINIMUM_CONFIRMATION=finalized`. Avant toute
-activation, appliquer la migration 041, rejouer le provisioning des rôles et
-redémarrer le listener H2i. L'activation ne lance ni le worker H2j, ni H2h, ni
+activation, appliquer les migrations jusqu'au head 043, rejouer le
+provisioning des rôles et redémarrer le listener H2i. L'activation ne lance ni
+le worker H2j, ni H2h, ni
 un runtime live, et ne provoque aucun appel RPC supplémentaire.
 
 Pour chaque nouvel OPEN admissible, une transaction atomique persiste :
@@ -294,12 +297,42 @@ terminal et réconcilié, soit quatre heures après sa terminalisation. Elle
 supprime ensuite enfants, memberships, paire et parents dans l'ordre des FK et
 conserve les tombstones anti-rejeu.
 
-H2k-a ne choisit pas la prochaine paire, n'exécute pas ses deux lanes et ne
-produit pas de manifeste pour H2h. La commande one-shot, la sélection exacte et
-le handoff H2h v2 appartiennent à la prochaine PR H2k-b. Jusqu'à sa livraison,
-conserver le flag à `false`. H2k-a n'ajoute aucun wallet, keypair, signer,
-armement, byte signé ou transport de soumission ; le constat reste
-`CANARY_NOT_STARTED`.
+La migration 042 ajoute les runs persistés H2k-b et la migration 043, head
+canonique, ajoute la lignée `candidate_id` finalisée de l'intention. H2k-a
+n'ajoute aucun wallet, keypair, signer, armement, byte signé ou transport de
+soumission ; le constat reste `CANARY_NOT_STARTED`.
+
+## Préparer exactement une paire avec H2k-b
+
+Le runner H2k-b est une commande one-shot séparée et désactivée par défaut.
+Il ne faut jamais ajouter de sélecteur pair, target, simulation, mint ou SQL :
+la commande choisit elle-même une unique paire éligible dans sa fenêtre
+persistée, exécute le dry-run non consommant de la cible puis la simulation du
+probe, et termine en `PREPARED` ou `FAILED`.
+
+Étendre un environnement `simulation-only` H2j dédié, owner-only et hors Git,
+avec les seules variables H2k-b suivantes :
+
+```dotenv
+EXECUTOR_PREFLIGHT_PREPARATION_ENABLED=true
+EXECUTOR_PREFLIGHT_PREPARATION_SELECTION_WINDOW_MS=120000
+EXECUTOR_PREFLIGHT_PREPARATION_LEASE_MS=60000
+EXECUTOR_PREFLIGHT_PREPARATION_OUTPUT_PATH=/chemin/hors-git/execution-preflight-preparation.json
+```
+
+Puis lancer explicitement :
+
+```bash
+npm run build:backend
+DOTENV_CONFIG_PATH=/chemin/hors-git/preflight-preparation.env \
+  npm run executor:preflight-preparation:start
+```
+
+Le fichier de sortie est créé exclusivement en `0600`. Le résumé terminal
+redacted fournit le `runId`; ce seul identifiant est transmis à H2h v2. Le
+runner n'est importé par aucun bootstrap, ne charge aucune clé, ne signe,
+n'arme et ne soumet rien. L'exemple suivi conserve le flag à `false` et l'état
+reste `CANARY_NOT_STARTED`.
 
 ## Produire la preuve Helius H2e
 
@@ -436,13 +469,13 @@ un armement ou un verdict de sécurité économique.
 2. Démarrer le listener sans keypair en `EXECUTION_MODE=paper` avec
    `EXECUTION_INTENT_EMISSION_ENABLED=true`. Cette émission temporaire utilise
    le producteur normal ; ne jamais fabriquer une cible par SQL.
-3. Sélectionner une seule intention BUY `PENDING`, WSOL, non louée, dont la
-   décision et la révision sont connues. Noter son `intentId`, son mint et son
-   montant entier. Arrêter le listener ou remettre l'émission à `false`, puis
-   vérifier qu'aucune nouvelle intention n'apparaît.
-4. Produire la simulation Mainnet non signée exacte avec #51-D, puis exécuter
-   H2h avec les identités explicites de la génération, de la cible canary et de
-   cet artefact. Auditer le manifeste redacted et conserver la source `0600`.
+3. Arrêter le listener ou remettre l'émission à `false`, puis lancer une fois
+   H2k-b. Vérifier son run `PREPARED`, auditer le manifeste
+   `PREFLIGHT_INTENT_PREPARED` et la paire sélectionnée, puis conserver son
+   `runId`; ne jamais fabriquer ni sélectionner la cible par SQL.
+4. Exécuter H2h v2 avec ce seul `preparationRunId`. Auditer son manifeste
+   redacted et conserver la source `execution-preflight-draft-source.v2` en
+   `0600`.
 5. Construire le catalogue réel des huit gates statiques, exécuter H2g avec la
    source H2h, puis auditer le draft canonique obtenu. H2g ne déclare aucune
    preuve à la place de l'opérateur.
@@ -476,11 +509,12 @@ un armement ou un verdict de sécurité économique.
    ```
 
    `live:arm` exige un TTY et fait afficher la cible complète, les limites, les
-   fingerprints et un nonce. La réservation d'exposition et l'armement V2 sont
-   atomiques ; tout écart laisse zéro capacité live.
+   fingerprints et un nonce. Sa requête wire porte `payloadVersion: 3`; après
+   validation, la réservation d'exposition et l'armement persisté V2 sont
+   atomiques. Tout écart laisse zéro capacité live.
 10. Seulement après inspection humaine de l'armement, démarrer H2a avec son
    environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
-   migration 041, génération, genesis, les huit limites runtime exactes et
+   migration 043, génération, genesis, les huit limites runtime exactes et
    absence d'état incohérent avant de charger le signer. Il ne doit traiter
    que la cible armée, y compris après redémarrage sur un artefact persisté.
 11. Surveiller continuellement les sorties structurées H2a/H2b et les commandes

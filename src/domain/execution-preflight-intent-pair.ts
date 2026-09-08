@@ -16,6 +16,7 @@ const TARGET_DRAFT_KEYS = Object.freeze([
   'strategyId',
   'strategyVersion',
   'positionId',
+  'candidateId',
   'logicalCommandId',
   'mint',
   'side',
@@ -66,6 +67,7 @@ export function createExecutionPreflightIntentPairDraft(
       strategyId: target.strategyId,
       strategyVersion: target.strategyVersion,
       positionId: target.positionId,
+      candidateId: target.candidateId,
       logicalCommandId,
       mint: target.mint,
       side: target.side,
@@ -136,6 +138,7 @@ function assertSupportedTarget(target: ExecutionIntentDraftV1): void {
   if (
     target.strategyId !== 'creation-entry-v1'
     || target.strategyVersion !== 1
+    || target.candidateId === null
     || !/^paper_open_[a-f0-9]{64}$/u.test(target.logicalCommandId)
     || target.logicalOrderKey !== target.logicalCommandId
     || target.side !== 'BUY'

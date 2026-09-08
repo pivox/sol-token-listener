@@ -41,6 +41,7 @@ import {
 import { PostgresExecutionOperationsRepository } from '../src/storage/execution-operations.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const signingKeypair = Keypair.fromSeed(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
@@ -620,6 +621,11 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
   const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
+  await insertExecutionDecisionEvent(
+    pool,
+    `maximum-holding:${entry.position.positionId}`,
+    entry.position.mint,
+  );
   const exit = await live.createDeadlineExitIntent({
     positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });
@@ -934,13 +940,15 @@ async function createBuyFixture(
     operatorId: 'operator-primary', occurredAtMs: nowMs + 1,
   });
   const intents = new PostgresExecutionIntentRepository(pool);
+  const decisionEventId = `decision:${randomUUID()}`;
+  await insertExecutionDecisionEvent(pool, decisionEventId, walletPublicKey);
   const created = await intents.create(createExecutionIntentDraft({
     strategyId: 'revocation-contract-test', strategyVersion: 1,
     positionId: `position:${randomUUID()}`, logicalCommandId: `command:${randomUUID()}`,
     mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
     baseAmountRaw: null, minimumAmountOutRaw: 90n,
-    decisionEventId: `decision:${randomUUID()}`, decisionFingerprint: fingerprint,
+    decisionEventId, decisionFingerprint: fingerprint,
     requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
   }));
   const policy = createExecutionRiskPolicy({
@@ -1161,13 +1169,15 @@ async function makePositionDue(
 async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
   const nowMs = Date.now();
   const intents = new PostgresExecutionIntentRepository(pool);
+  const decisionEventId = `event-${randomUUID()}`;
+  await insertExecutionDecisionEvent(pool, decisionEventId, walletPublicKey);
   const created = await intents.create(createExecutionIntentDraft({
     strategyId: 'simulation-strategy', strategyVersion: 1,
     positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
     mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
     baseAmountRaw: null, minimumAmountOutRaw: 850n,
-    decisionEventId: `event-${randomUUID()}`, decisionFingerprint: fingerprint,
+    decisionEventId, decisionFingerprint: fingerprint,
     requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
   }));
   const claimed = await intents.claim({
