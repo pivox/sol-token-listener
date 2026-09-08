@@ -291,7 +291,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.17.0 — 2026-09-08',
+    '**Version :** 1.17.1 — 2026-09-08',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -339,7 +339,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de spécification :** 1.0.6',
+    '**Version de spécification :** 1.1.0',
     'provider evidence specification version',
   );
   assertContainsExactlyOnce(

@@ -8,15 +8,31 @@ import {
 const INPUT_KEYS = Object.freeze([
   'providerId', 'projectId', 'response', 'measuredAtMs', 'ttlMs',
 ] as const);
-const RESPONSE_KEYS = Object.freeze([
+const LEGACY_RESPONSE_KEYS = Object.freeze([
   'creditsRemaining', 'creditsUsed', 'prepaidCreditsRemaining',
   'prepaidCreditsUsed', 'subscriptionDetails', 'usage',
+] as const);
+const CURRENT_RESPONSE_KEYS = Object.freeze([
+  'creditCycle', 'credits', 'creditsRemaining', 'creditsUsed', 'dataTransfer',
+  'prepaidCreditsRemaining', 'prepaidCreditsUsed', 'requests', 'subscriptionDetails',
 ] as const);
 const SUBSCRIPTION_KEYS = Object.freeze(['billingCycle', 'creditsLimit', 'plan'] as const);
 const BILLING_CYCLE_KEYS = Object.freeze(['start', 'end'] as const);
 const USAGE_KEYS = Object.freeze([
   'api', 'archival', 'das', 'grpc', 'grpcGeyser', 'photon', 'rpc', 'stream',
   'webhook', 'websocket',
+] as const);
+const CREDIT_KEYS = Object.freeze([
+  'rpc', 'enhancedApi', 'walletApi', 'das', 'webhooks', 'laserstreamGrpc',
+  'laserstreamWebsocket', 'preConfirmations', 'preprocessedTransactions',
+  'archival', 'photon', 'other',
+] as const);
+const REQUEST_KEYS = Object.freeze([
+  'rpc', 'enhancedApi', 'walletApi', 'das', 'webhooks', 'preConfirmations',
+  'preprocessedTransactions', 'archival', 'photon', 'other',
+] as const);
+const DATA_TRANSFER_KEYS = Object.freeze([
+  'laserstreamGrpc', 'laserstreamWebsocket',
 ] as const);
 const DATE_MAX_MS = 8_640_000_000_000_000;
 
@@ -52,19 +68,20 @@ export function createHeliusProviderUsage(input: unknown): HeliusProviderUsageV1
     const row = exactRecord(input, INPUT_KEYS);
     const providerId = identifier(row.providerId, 64);
     const projectId = uuid(row.projectId);
-    const response = exactRecord(row.response, RESPONSE_KEYS);
+    const response = exactHeliusResponse(row.response);
     const creditsRemaining = counter(response.creditsRemaining);
     const creditsUsed = counter(response.creditsUsed);
     const prepaidCreditsRemaining = counter(response.prepaidCreditsRemaining);
     const prepaidCreditsUsed = counter(response.prepaidCreditsUsed);
     const subscription = exactRecord(response.subscriptionDetails, SUBSCRIPTION_KEYS);
-    const cycle = exactRecord(subscription.billingCycle, BILLING_CYCLE_KEYS);
+    const cycle = response.variant === 'legacy'
+      ? exactCycle(subscription.billingCycle)
+      : exactCurrentCycle(response.creditCycle, subscription.billingCycle);
     const startedAtMs = date(cycle.start);
     const endsAtMs = date(cycle.end);
     const creditsLimit = counter(subscription.creditsLimit);
     const planId = identifier(subscription.plan, 128);
-    const usage = exactRecord(response.usage, USAGE_KEYS);
-    for (const key of USAGE_KEYS) counter(usage[key]);
+    validateBreakdown(response);
     const measuredAtMs = timestamp(row.measuredAtMs);
     const ttlMs = integer(row.ttlMs, 30_000, 300_000);
     if (endsAtMs <= startedAtMs || measuredAtMs < startedAtMs || measuredAtMs >= endsAtMs
@@ -88,6 +105,62 @@ export function createHeliusProviderUsage(input: unknown): HeliusProviderUsageV1
   } catch {
     throw invalid();
   }
+}
+
+type LegacyHeliusResponse = Readonly<Record<(typeof LEGACY_RESPONSE_KEYS)[number], unknown>> & {
+  readonly variant: 'legacy';
+};
+
+type CurrentHeliusResponse = Readonly<Record<(typeof CURRENT_RESPONSE_KEYS)[number], unknown>> & {
+  readonly variant: 'current';
+};
+
+function exactHeliusResponse(value: unknown): LegacyHeliusResponse | CurrentHeliusResponse {
+  const keys = exactOwnKeys(value);
+  if (sameKeys(keys, LEGACY_RESPONSE_KEYS)) {
+    return Object.assign(exactRecord(value, LEGACY_RESPONSE_KEYS), { variant: 'legacy' as const });
+  }
+  if (sameKeys(keys, CURRENT_RESPONSE_KEYS)) {
+    return Object.assign(exactRecord(value, CURRENT_RESPONSE_KEYS), { variant: 'current' as const });
+  }
+  throw invalid();
+}
+
+function exactCurrentCycle(
+  creditCycle: unknown,
+  informationalBillingCycle: unknown,
+): Readonly<Record<(typeof BILLING_CYCLE_KEYS)[number], unknown>> {
+  if (informationalBillingCycle !== null) validateCycle(informationalBillingCycle);
+  return exactCycle(creditCycle);
+}
+
+function exactCycle(
+  value: unknown,
+): Readonly<Record<(typeof BILLING_CYCLE_KEYS)[number], unknown>> {
+  const cycle = exactRecord(value, BILLING_CYCLE_KEYS);
+  const startedAtMs = date(cycle.start);
+  const endsAtMs = date(cycle.end);
+  if (endsAtMs <= startedAtMs) throw invalid();
+  return cycle;
+}
+
+function validateCycle(value: unknown): void {
+  exactCycle(value);
+}
+
+function validateBreakdown(response: LegacyHeliusResponse | CurrentHeliusResponse): void {
+  if (response.variant === 'legacy') {
+    validateCounters(response.usage, USAGE_KEYS);
+    return;
+  }
+  validateCounters(response.credits, CREDIT_KEYS);
+  validateCounters(response.requests, REQUEST_KEYS);
+  validateCounters(response.dataTransfer, DATA_TRANSFER_KEYS);
+}
+
+function validateCounters(value: unknown, keys: readonly string[]): void {
+  const counters = exactRecord(value, keys);
+  for (const counterValue of Object.values(counters)) counter(counterValue);
 }
 
 export function createHeliusProviderEvidenceManifest(
@@ -119,12 +192,7 @@ function exactRecord<const Keys extends readonly string[]>(
   value: unknown,
   keys: Keys,
 ): Readonly<Record<Keys[number], unknown>> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
-    throw invalid();
-  }
-  const prototype = Reflect.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw invalid();
-  const own = Reflect.ownKeys(value);
+  const own = exactOwnKeys(value);
   if (own.length !== keys.length
     || own.some((key) => typeof key !== 'string' || !keys.includes(key))) throw invalid();
   const result = Object.create(null) as Record<string, unknown>;
@@ -134,6 +202,20 @@ function exactRecord<const Keys extends readonly string[]>(
     result[key] = descriptor.value;
   }
   return result as Readonly<Record<Keys[number], unknown>>;
+}
+
+function exactOwnKeys(value: unknown): readonly PropertyKey[] {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
+    throw invalid();
+  }
+  const prototype = Reflect.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw invalid();
+  return Reflect.ownKeys(value);
+}
+
+function sameKeys(actual: readonly PropertyKey[], expected: readonly string[]): boolean {
+  return actual.length === expected.length
+    && actual.every((key) => typeof key === 'string' && expected.includes(key));
 }
 
 function counter(value: unknown): bigint {
