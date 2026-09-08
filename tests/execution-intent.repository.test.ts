@@ -751,9 +751,10 @@ void test('claims only the exact TARGET dry-run intent under its preparation fen
     assert.match(text, /preparation\.deadline_at>operation\.at\+INTERVAL '5 seconds'/u);
     assert.match(text, /membership\.lane=\$5/u);
     assert.match(text, /pair\.target_intent_id=intent\.id/u);
-    assert.match(text, /NOT EXISTS \([\s\S]*execution_dry_run_assessments/u);
-    assert.match(text, /NOT EXISTS \([\s\S]*execution_attempts/u);
-    assert.match(text, /intent\.status='PENDING'/u);
+    assert.match(text, /proof\.dry_run_assessment_count=0/u);
+    assert.match(text, /ledger\.stored_attempt_count=0/u);
+    assert.match(text, /intent\.lease_expires_at IS NULL[\s\S]*intent\.lease_expires_at<=operation\.at/u);
+    assert.match(text, /\$5='TARGET'[\s\S]*intent\.status='PENDING'/u);
     assert.match(text, /intent\.state_revision=0/u);
     assert.match(text, /intent\.live_reserved=FALSE/u);
     assert.match(text, /intent\.id=\$6/u);
@@ -763,6 +764,14 @@ void test('claims only the exact TARGET dry-run intent under its preparation fen
       lease_owner: values?.[6],
       lease_token: values?.[8],
       claim_at_ms: String(NOW_MS),
+      previous_lease_owner: null,
+      previous_lease_token: null,
+      previous_lease_expires_at_ms: null,
+      previous_live_reserved: false,
+      stored_attempt_count: 0,
+      started_attempt_one_count: 0,
+      dry_run_assessment_count: 0,
+      simulation_artifact_count: 0,
     }], 1);
   }]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -793,6 +802,117 @@ void test('claims only the exact TARGET dry-run intent under its preparation fen
     claimed?.leaseToken,
   ]);
 });
+
+void test('reclaims the exact SIMULATION lane only from attempt one STARTED after lease expiry',
+  async () => {
+    const draft = executionDraft('exact-preflight-simulation-recovery');
+    const previousLeaseToken = '00000000-0000-4000-8000-000000000005';
+    const client = new ScriptedClient([(text, values) => {
+      assert.match(text, /\$5='SIMULATION'[\s\S]*intent\.status='PROCESSING'/u);
+      assert.match(text, /intent\.attempt_count=1/u);
+      assert.match(text, /intent\.state_revision=1/u);
+      assert.match(text, /ledger\.stored_attempt_count=1/u);
+      assert.match(text, /ledger\.started_attempt_one_count=1/u);
+      assert.match(text, /proof\.simulation_artifact_count=0/u);
+      return result([{
+        ...claimRow(draft, 'PROCESSING', 1),
+        state_revision: '1',
+        lease_owner: values?.[6],
+        lease_token: values?.[8],
+        claim_at_ms: String(NOW_MS),
+        previous_lease_owner: 'expired-simulation-worker',
+        previous_lease_token: previousLeaseToken,
+        previous_lease_expires_at_ms: String(NOW_MS),
+        previous_live_reserved: false,
+        stored_attempt_count: 1,
+        started_attempt_one_count: 1,
+        dry_run_assessment_count: 0,
+        simulation_artifact_count: 0,
+      }], 1);
+    }]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    const claimed = await repository.claimExactPreflightIntent(Object.freeze({
+      runId: `execution_preflight_preparation_${'1'.repeat(64)}`,
+      preparationLeaseOwner: 'preparation-worker',
+      preparationLeaseToken: '00000000-0000-4000-8000-000000000003',
+      pairId: `execution_preflight_intent_pair_${'2'.repeat(64)}`,
+      lane: 'SIMULATION', purpose: 'EXECUTE', intentId: draft.id,
+      ownerId: 'simulation-recovery-worker', leaseMs: 30_000,
+    }));
+
+    assert.equal(claimed?.intent.status, 'PROCESSING');
+    assert.equal(claimed?.intent.attemptCount, 1);
+    assert.equal(claimed?.intent.stateRevision, 1n);
+  });
+
+void test('exact lane postconditions reject fresh prior leases, incompatible state and evidence',
+  async () => {
+    const draft = executionDraft('exact-preflight-postconditions');
+    const baseRow = {
+      ...claimRow(draft, 'PENDING'),
+      claim_at_ms: String(NOW_MS),
+      previous_lease_owner: null,
+      previous_lease_token: null,
+      previous_lease_expires_at_ms: null,
+      previous_live_reserved: false,
+      stored_attempt_count: 0,
+      started_attempt_one_count: 0,
+      dry_run_assessment_count: 0,
+      simulation_artifact_count: 0,
+    };
+    const cases = [
+      {
+        lane: 'TARGET', purpose: 'DRY_RUN', row: {
+          ...baseRow,
+          previous_lease_owner: 'still-active-worker',
+          previous_lease_token: '00000000-0000-4000-8000-000000000005',
+          previous_lease_expires_at_ms: String(NOW_MS + 1),
+        },
+      },
+      {
+        lane: 'TARGET', purpose: 'DRY_RUN',
+        row: { ...baseRow, dry_run_assessment_count: 1 },
+      },
+      {
+        lane: 'SIMULATION', purpose: 'EXECUTE',
+        row: { ...baseRow, status: 'PROCESSING', attempt_count: 2, state_revision: '2',
+          last_reason_code: 'EXECUTION_STARTED', stored_attempt_count: 2 },
+      },
+      {
+        lane: 'SIMULATION', purpose: 'EXECUTE',
+        row: { ...baseRow, simulation_artifact_count: 1 },
+      },
+      {
+        lane: 'SIMULATION', purpose: 'EXECUTE',
+        row: { ...baseRow, dry_run_assessment_count: 1 },
+      },
+      {
+        lane: 'SIMULATION', purpose: 'EXECUTE',
+        row: { ...baseRow, previous_live_reserved: true },
+      },
+    ] as const;
+    for (const [index, testCase] of cases.entries()) {
+      const client = new ScriptedClient([(_text, values) => result([{
+        ...testCase.row,
+        lease_owner: values?.[6],
+        lease_token: values?.[8],
+      }], 1)]);
+      const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+      const commonOptions = {
+        runId: `execution_preflight_preparation_${'1'.repeat(64)}`,
+        preparationLeaseOwner: 'preparation-worker',
+        preparationLeaseToken: '00000000-0000-4000-8000-000000000003',
+        pairId: `execution_preflight_intent_pair_${'2'.repeat(64)}`,
+        intentId: draft.id, ownerId: 'exact-postcondition-worker', leaseMs: 30_000,
+      } as const;
+      const options = testCase.lane === 'TARGET'
+        ? Object.freeze({ ...commonOptions, lane: 'TARGET', purpose: 'DRY_RUN' } as const)
+        : Object.freeze({ ...commonOptions, lane: 'SIMULATION', purpose: 'EXECUTE' } as const);
+      await expectCode(repository.claimExactPreflightIntent(options), 'INVALID_DATA');
+      assert.equal(client.calls.length, 1, `case ${index} must be rejected after one claim query`);
+    }
+  });
 
 void test('exact preflight claim rejects cross-lane purposes before touching PostgreSQL', async () => {
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(new ScriptedClient([])));
@@ -2539,6 +2659,19 @@ void test('PostgreSQL exact preparation claims lease only their bound TARGET and
         assert.equal(targetClaim?.intent.id, target.id);
         assert.deepEqual((await firstPool.query(`SELECT lease_owner FROM execution_intents
           WHERE id=$1`, [pair.simulationIntent.id])).rows, [{ lease_owner: null }]);
+        assert.equal(await second.claimExactPreflightIntent(Object.freeze({
+          ...common, intentId: target.id, lane: 'TARGET', purpose: 'DRY_RUN',
+          ownerId: 'fresh-target-loser',
+        })), null);
+        await firstPool.query(`UPDATE execution_intents
+          SET lease_expires_at=date_trunc('milliseconds',statement_timestamp())
+          WHERE id=$1`, [target.id]);
+        const reclaimedTarget = await second.claimExactPreflightIntent(Object.freeze({
+          ...common, intentId: target.id, lane: 'TARGET', purpose: 'DRY_RUN',
+          ownerId: 'exact-target-recovery-worker',
+        }));
+        assert.equal(reclaimedTarget?.intent.id, target.id);
+        assert.notEqual(reclaimedTarget?.leaseToken, targetClaim?.leaseToken);
 
         const simulationClaim = await second.claimExactPreflightIntent(Object.freeze({
           ...common, intentId: pair.simulationIntent.id, lane: 'SIMULATION', purpose: 'EXECUTE',
@@ -2551,6 +2684,29 @@ void test('PostgreSQL exact preparation claims lease only their bound TARGET and
           ...common, intentId: pair.simulationIntent.id, lane: 'SIMULATION', purpose: 'EXECUTE',
           ownerId: 'losing-worker',
         })), null);
+        const processingSimulation = await second.transition(
+          required(simulationClaim),
+          transitionInput(required(simulationClaim), 'PROCESSING'),
+        );
+        const activeSimulation = Object.freeze({
+          ...required(simulationClaim), intent: processingSimulation,
+        });
+        const startedAttempt = await second.beginAttempt(activeSimulation);
+        await firstPool.query(`UPDATE execution_intents
+          SET lease_expires_at=date_trunc('milliseconds',statement_timestamp())
+          WHERE id=$1`, [pair.simulationIntent.id]);
+        const reclaimedSimulation = required(await first.claimExactPreflightIntent(Object.freeze({
+          ...common, intentId: pair.simulationIntent.id,
+          lane: 'SIMULATION', purpose: 'EXECUTE', ownerId: 'simulation-recovery-worker',
+        })));
+        assert.equal(reclaimedSimulation.intent.status, 'PROCESSING');
+        assert.equal(reclaimedSimulation.intent.attemptCount, 1);
+        assert.equal(reclaimedSimulation.intent.stateRevision, 1n);
+        assert.notEqual(reclaimedSimulation.leaseToken, simulationClaim?.leaseToken);
+        assert.deepEqual(
+          (await first.beginAttempt(reclaimedSimulation)).attempt,
+          startedAttempt.attempt,
+        );
       });
   });
 

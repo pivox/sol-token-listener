@@ -130,6 +130,12 @@ const INTENT_ROW_KEYS = Object.freeze([
   'lease_expires_at_ms',
 ] as const);
 const CLAIM_ROW_KEYS = Object.freeze([...INTENT_ROW_KEYS, 'claim_at_ms'] as const);
+const EXACT_PREFLIGHT_CLAIM_ROW_KEYS = Object.freeze([
+  ...CLAIM_ROW_KEYS,
+  'previous_lease_owner', 'previous_lease_token', 'previous_lease_expires_at_ms',
+  'previous_live_reserved', 'stored_attempt_count', 'started_attempt_one_count',
+  'dry_run_assessment_count', 'simulation_artifact_count',
+] as const);
 const ATTEMPT_ROW_KEYS = Object.freeze([
   'attempt_number', 'status', 'effective_venue', 'provider_id', 'started_at_ms', 'completed_at_ms',
   'reason_code',
@@ -352,16 +358,11 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         );
         if (claimed.rowCount === 0 && claimed.rows.length === 0) return null;
         if (claimed.rowCount !== 1 || claimed.rows.length !== 1) throw dataError();
-        const { claim, claimAtMs } = claimFromRow(requiredRow(claimed.rows));
-        if (claim.intent.id !== options.intentId
-          || claim.intent.status !== 'PENDING'
-          || claim.intent.attemptCount !== 0
-          || claim.intent.stateRevision !== 0n
-          || claim.intent.lastReasonCode !== null
-          || claim.intent.terminalAtMs !== null
-          || claim.intent.reconciliationCompletedAtMs !== null
-          || claim.intent.purgeAfterMs !== null
-          || claim.leaseOwner !== options.ownerId
+        const { claim, claimAtMs } = exactPreflightClaimFromRow(
+          requiredRow(claimed.rows),
+          options,
+        );
+        if (claim.intent.id !== options.intentId || claim.leaseOwner !== options.ownerId
           || claim.leaseToken !== leaseToken
           || claim.leaseExpiresAtMs - claimAtMs !== options.leaseMs
           || claim.intent.expiresAtMs <= claim.leaseExpiresAtMs) throw dataError();
@@ -830,7 +831,15 @@ function exactPreflightIntentClaimSql(): string {
       AND preparation.deadline_at>=operation.at
         +(($8::BIGINT+5000)*INTERVAL '1 millisecond')
   ), candidate AS MATERIALIZED (
-    SELECT intent.id
+    SELECT intent.id,
+      intent.lease_owner AS previous_lease_owner,
+      intent.lease_token::TEXT AS previous_lease_token,
+      CASE WHEN intent.lease_expires_at IS NULL THEN NULL
+        ELSE trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+        END AS previous_lease_expires_at_ms,
+      intent.live_reserved AS previous_live_reserved,
+      ledger.stored_attempt_count,ledger.started_attempt_one_count,
+      proof.dry_run_assessment_count,proof.simulation_artifact_count
     FROM preparation
     JOIN execution_preflight_intent_pairs AS pair
       ON pair.pair_id=preparation.pair_id AND pair.pair_id=$4
@@ -840,29 +849,44 @@ function exactPreflightIntentClaimSql(): string {
     JOIN execution_intents AS intent
       ON intent.id=membership.intent_id AND intent.id=$6
     CROSS JOIN operation
+    CROSS JOIN LATERAL (
+      SELECT COUNT(*)::INTEGER AS stored_attempt_count,
+        COUNT(*) FILTER (WHERE attempt.attempt_number=1
+          AND attempt.status='STARTED')::INTEGER AS started_attempt_one_count
+      FROM execution_attempts AS attempt
+      WHERE attempt.intent_id=intent.id
+    ) AS ledger
+    CROSS JOIN LATERAL (
+      SELECT
+        (SELECT COUNT(*)::INTEGER FROM execution_dry_run_assessments AS assessment
+          WHERE assessment.intent_id=intent.id) AS dry_run_assessment_count,
+        (SELECT COUNT(*)::INTEGER FROM execution_simulation_artifacts AS artifact
+          WHERE artifact.intent_id=intent.id) AS simulation_artifact_count
+    ) AS proof
     WHERE (($5='TARGET' AND $10='DRY_RUN' AND pair.target_intent_id=intent.id)
         OR ($5='SIMULATION' AND $10='EXECUTE'
           AND pair.simulation_intent_id=intent.id))
-      AND intent.status='PENDING'
-      AND intent.attempt_count=0 AND intent.state_revision=0
-      AND intent.lease_owner IS NULL AND intent.lease_token IS NULL
-      AND intent.lease_expires_at IS NULL AND intent.last_reason_code IS NULL
+      AND (intent.lease_expires_at IS NULL OR intent.lease_expires_at<=operation.at)
+      AND (($5='TARGET'
+          AND intent.status='PENDING' AND intent.attempt_count=0
+          AND intent.state_revision=0 AND intent.last_reason_code IS NULL
+          AND ledger.stored_attempt_count=0 AND ledger.started_attempt_one_count=0)
+        OR ($5='SIMULATION' AND (
+          (intent.status='PENDING' AND intent.attempt_count=0
+            AND intent.state_revision=0 AND intent.last_reason_code IS NULL
+            AND ledger.stored_attempt_count=0 AND ledger.started_attempt_one_count=0)
+          OR (intent.status='PROCESSING' AND intent.attempt_count=1
+            AND intent.state_revision=1 AND intent.last_reason_code='EXECUTION_STARTED'
+            AND ledger.stored_attempt_count=1 AND ledger.started_attempt_one_count=1)
+        )))
       AND intent.terminal_at IS NULL
       AND intent.reconciliation_completed_at IS NULL
       AND intent.purge_after IS NULL AND intent.live_reserved=FALSE
       AND intent.expires_at>operation.at
         +($8::BIGINT*INTERVAL '1 millisecond')
-      AND NOT EXISTS (
-        SELECT 1 FROM execution_attempts AS attempt
-        WHERE attempt.intent_id=intent.id
-      )
-      AND (($5='TARGET' AND NOT EXISTS (
-          SELECT 1 FROM execution_dry_run_assessments AS assessment
-          WHERE assessment.intent_id=intent.id AND assessment.evaluator_version=1
-        )) OR ($5='SIMULATION' AND NOT EXISTS (
-          SELECT 1 FROM execution_simulation_artifacts AS artifact
-          WHERE artifact.intent_id=intent.id
-        )))
+      AND (($5='TARGET' AND proof.dry_run_assessment_count=0)
+        OR ($5='SIMULATION' AND proof.dry_run_assessment_count=0
+          AND proof.simulation_artifact_count=0))
     FOR UPDATE OF intent
   )
   UPDATE execution_intents AS intent
@@ -871,7 +895,11 @@ function exactPreflightIntentClaimSql(): string {
       updated_at=operation.at
   FROM candidate CROSS JOIN operation
   WHERE intent.id=candidate.id AND intent.id=$6
-  RETURNING ${CLAIM_PROJECTION}`;
+  RETURNING ${CLAIM_PROJECTION},
+    candidate.previous_lease_owner,candidate.previous_lease_token,
+    candidate.previous_lease_expires_at_ms,candidate.previous_live_reserved,
+    candidate.stored_attempt_count,candidate.started_attempt_one_count,
+    candidate.dry_run_assessment_count,candidate.simulation_artifact_count`;
 }
 
 function liveExecuteBuyClaimSql(): string {
@@ -1420,6 +1448,79 @@ function claimFromRow(value: unknown): Readonly<{
     claim: Object.freeze({ intent, ...lease }),
     claimAtMs: timestampFromDatabase(row.claim_at_ms),
   });
+}
+
+function exactPreflightClaimFromRow(
+  value: unknown,
+  options: ExecutionPreflightExactClaimOptions,
+): Readonly<{ readonly claim: ClaimedExecutionIntent; readonly claimAtMs: number }> {
+  const row = exactRecord(value, EXACT_PREFLIGHT_CLAIM_ROW_KEYS, 'INVALID_DATA');
+  const claimValues: Record<string, unknown> = {};
+  for (const key of CLAIM_ROW_KEYS) claimValues[key] = row[key];
+  const parsed = claimFromRow(claimValues);
+  const previousLeaseOwner = row.previous_lease_owner === null
+    ? null
+    : boundedText(row.previous_lease_owner, 'INVALID_DATA');
+  const previousLeaseToken = row.previous_lease_token === null
+    ? null
+    : uuid(row.previous_lease_token, 'INVALID_DATA');
+  const previousLeaseExpiresAtMs = nullableTimestampFromDatabase(
+    row.previous_lease_expires_at_ms,
+  );
+  const previousLeaseAbsent = previousLeaseOwner === null
+    && previousLeaseToken === null
+    && previousLeaseExpiresAtMs === null;
+  const previousLeaseExpired = previousLeaseOwner !== null
+    && previousLeaseToken !== null
+    && previousLeaseExpiresAtMs !== null
+    && previousLeaseExpiresAtMs <= parsed.claimAtMs;
+  const storedAttemptCount = nonNegativeInteger(row.stored_attempt_count, 'INVALID_DATA');
+  const startedAttemptOneCount = boundedInteger(
+    row.started_attempt_one_count,
+    0,
+    1,
+    'INVALID_DATA',
+  );
+  const dryRunAssessmentCount = nonNegativeInteger(
+    row.dry_run_assessment_count,
+    'INVALID_DATA',
+  );
+  const simulationArtifactCount = nonNegativeInteger(
+    row.simulation_artifact_count,
+    'INVALID_DATA',
+  );
+  const intent = parsed.claim.intent;
+  if ((!previousLeaseAbsent && !previousLeaseExpired)
+    || row.previous_live_reserved !== false
+    || intent.terminalAtMs !== null
+    || intent.reconciliationCompletedAtMs !== null
+    || intent.purgeAfterMs !== null) throw dataError();
+  if (options.lane === 'TARGET') {
+    if (intent.status !== 'PENDING'
+      || intent.attemptCount !== 0
+      || intent.stateRevision !== 0n
+      || intent.lastReasonCode !== null
+      || storedAttemptCount !== 0
+      || startedAttemptOneCount !== 0
+      || dryRunAssessmentCount !== 0) throw dataError();
+    return parsed;
+  }
+  const pristine = intent.status === 'PENDING'
+    && intent.attemptCount === 0
+    && intent.stateRevision === 0n
+    && intent.lastReasonCode === null
+    && storedAttemptCount === 0
+    && startedAttemptOneCount === 0;
+  const resumable = intent.status === 'PROCESSING'
+    && intent.attemptCount === 1
+    && intent.stateRevision === 1n
+    && intent.lastReasonCode === 'EXECUTION_STARTED'
+    && storedAttemptCount === 1
+    && startedAttemptOneCount === 1;
+  if ((!pristine && !resumable)
+    || dryRunAssessmentCount !== 0
+    || simulationArtifactCount !== 0) throw dataError();
+  return parsed;
 }
 
 type AttemptStatus = 'STARTED' | 'COMPLETED' | 'ABANDONED';
