@@ -122,6 +122,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '040_execution_worker_live_partition.sql',
       '041_execution_preflight_intent_pairs.sql',
       '042_execution_preflight_intent_preparation.sql',
+      '043_execution_intent_causal_lineage.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);
