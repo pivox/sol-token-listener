@@ -80,15 +80,23 @@ void test('requires the five-second H2d commit margin after output persistence',
 
 function validResponse(): Readonly<Record<string, unknown>> {
   return Object.freeze({
-    creditsRemaining: 487_500, creditsUsed: 12_500,
-    prepaidCreditsRemaining: 50_000, prepaidCreditsUsed: 0,
-    subscriptionDetails: Object.freeze({
-      billingCycle: Object.freeze({ start: '2026-09-01', end: '2026-10-01' }),
-      creditsLimit: 500_000, plan: 'business',
+    creditCycle: Object.freeze({ start: '2026-09-01', end: '2026-10-01' }),
+    credits: Object.freeze({
+      rpc: 1, enhancedApi: 2, walletApi: 3, das: 4, webhooks: 5,
+      laserstreamGrpc: 6, laserstreamWebsocket: 7, preConfirmations: 8,
+      preprocessedTransactions: 9, archival: 10, photon: 11, other: 12,
     }),
-    usage: Object.freeze({
-      api: 1_200, archival: 0, das: 5_000, grpc: 300, grpcGeyser: 0,
-      photon: 0, rpc: 4_500, stream: 100, webhook: 800, websocket: 600,
+    creditsRemaining: 487_500, creditsUsed: 12_500,
+    dataTransfer: Object.freeze({ laserstreamGrpc: 13, laserstreamWebsocket: 14 }),
+    prepaidCreditsRemaining: 50_000, prepaidCreditsUsed: 0,
+    requests: Object.freeze({
+      rpc: 15, enhancedApi: 16, walletApi: 17, das: 18, webhooks: 19,
+      preConfirmations: 20, preprocessedTransactions: 21, archival: 22,
+      photon: 23, other: 24,
+    }),
+    subscriptionDetails: Object.freeze({
+      billingCycle: null,
+      creditsLimit: 500_000, plan: 'business',
     }),
   });
 }
