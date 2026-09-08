@@ -94,6 +94,7 @@ void test('execution dry-run migration applies, upgrades 031, and replays safely
         '037_execution_live_orchestration.sql',
         '038_execution_live_rpc_budget.sql',
         '039_execution_canary_operator_binding.sql',
+        '040_execution_worker_live_partition.sql',
         latestMigrationName,
       ]);
       assert.equal((await upgradePool.query('SELECT id FROM execution_intents WHERE id = $1', [parent.id])).rowCount, 1);
