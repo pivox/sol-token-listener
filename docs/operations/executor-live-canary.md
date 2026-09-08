@@ -1,6 +1,12 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.5 — 2026-09-08
+**Version :** 1.17.6 — 2026-09-09
+
+La version 1.17.6 permet de rafraîchir H2d pour la même génération wallet tant
+que l'état de risque n'a pas changé. Chaque observation reste immuable, la
+nouvelle doit être strictement plus récente, un seul snapshot reste actif et
+le précédent devient purgeable après quatre heures. Ce refresh ne modifie pas
+l'état de risque et n'ajoute aucun privilège au rôle readiness.
 
 La version 1.17.5 priorise durablement les créations Pump.fun signalées par le
 `CreateEvent` officiel, avec une tranche d'équité après 32 claims prioritaires.
