@@ -12,6 +12,7 @@ export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
 export type PaperStrategyId = 'validated-external-buys' | 'creation-entry-v1';
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
 export type ListenerCatchUpPolicy = 'live-edge' | 'strict';
+export type ListenerIngestionScope = 'launchpad-only' | 'launchpad-and-market';
 
 export interface AppConfig {
   readonly cluster: string;
@@ -52,6 +53,7 @@ export interface AppConfig {
   readonly qualificationMinimumScore: number | null;
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
+  readonly listenerIngestionScope: ListenerIngestionScope;
   readonly expectedGenesisHash: string | null;
   readonly listenerWorkerLeaseSeconds: number;
   readonly listenerCatchUpPolicy: ListenerCatchUpPolicy;
@@ -259,6 +261,12 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
     listenerEnabled,
+    listenerIngestionScope: parseClosedLiteral(
+      environment.LISTENER_INGESTION_SCOPE,
+      'launchpad-and-market',
+      'LISTENER_INGESTION_SCOPE',
+      ['launchpad-only', 'launchpad-and-market'],
+    ),
     expectedGenesisHash,
     listenerWorkerLeaseSeconds: parseInteger(
       environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,

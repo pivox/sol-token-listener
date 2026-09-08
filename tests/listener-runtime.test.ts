@@ -32,6 +32,47 @@ void test('starts the supervisor before every consumer and exposes honest frozen
   assert.ok(Object.isFrozen(runtime.pipelineState()));
 });
 
+void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime health', async () => {
+  const deps = dependencies([]);
+  let supervisorState: 'RUNNING' | 'STARTING' = 'RUNNING';
+  deps.supervisor.state = () => supervisorState;
+  const runtime = new SolanaListenerRuntime(deps, {
+    shutdownTimeoutMs: 100,
+    marketIngestionEnabled: false,
+  });
+
+  assert.deepEqual(runtime.pipelineState(), {
+    httpAvailable: true,
+    pumpfun: 'STOPPED',
+    pumpswap: 'IDLE',
+    qualification: 'STOPPED',
+    paperDecision: 'STOPPED',
+    social: 'STOPPED',
+  });
+
+  await runtime.start();
+
+  assert.deepEqual(runtime.pipelineState(), {
+    httpAvailable: true,
+    pumpfun: 'RUNNING',
+    pumpswap: 'IDLE',
+    qualification: 'RUNNING',
+    paperDecision: 'RUNNING',
+    social: 'RUNNING',
+  });
+
+  supervisorState = 'STARTING';
+  assert.equal(runtime.state(), 'DEGRADED');
+  assert.deepEqual(runtime.pipelineState(), {
+    httpAvailable: true,
+    pumpfun: 'DEGRADED',
+    pumpswap: 'IDLE',
+    qualification: 'DEGRADED',
+    paperDecision: 'RUNNING',
+    social: 'RUNNING',
+  });
+});
+
 void test('chain health requires the supervisor, inbox worker, reconciler, and heartbeat only', async () => {
   const calls: string[] = [];
   const deps = dependencies(calls);
@@ -391,6 +432,13 @@ void test('validates shutdown bounds and returns STOPPED projections before star
   });
   assert.throws(
     () => new SolanaListenerRuntime(dependencies([]), { shutdownTimeoutMs: 0 }),
+    TypeError,
+  );
+  assert.throws(
+    () => new SolanaListenerRuntime(dependencies([]), {
+      shutdownTimeoutMs: 100,
+      marketIngestionEnabled: 'false' as never,
+    }),
     TypeError,
   );
 });

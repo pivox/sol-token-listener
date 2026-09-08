@@ -13,6 +13,7 @@ import type {
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
 import type { CatchUpSource } from '../ports/catch-up-source.js';
+import type { ListenerIngestionProgram } from '../ports/listener-ingestion-program.js';
 import type { StrictCatchUpRepository } from '../ports/strict-catch-up-repository.js';
 import {
   MAX_CATCH_UP_PAGE_SIZE,
@@ -36,6 +37,7 @@ export interface StrictCatchUpScannerOptions {
   readonly pageSize: number;
   readonly maxPages: number;
   readonly now?: () => number;
+  readonly programs?: readonly ListenerIngestionProgram[];
 }
 
 export interface StrictCatchUpBoundaries {
@@ -140,9 +142,9 @@ class StrictCatchUpWindowSignal extends Error {
   }
 }
 
-const PROGRAMS: readonly CatchUpDiscoveryProgram[] = Object.freeze([
-  Object.freeze({ key: 'launchpad', id: PUMP_PROGRAM_ID }),
-  Object.freeze({ key: 'market', id: PUMPSWAP_PROGRAM_ID }),
+const DEFAULT_PROGRAMS: readonly ListenerIngestionProgram[] = Object.freeze([
+  Object.freeze({ key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID }),
+  Object.freeze({ key: 'market', family: 'pumpswap', id: PUMPSWAP_PROGRAM_ID }),
 ]);
 
 export class StrictCatchUpScanner {
@@ -150,6 +152,7 @@ export class StrictCatchUpScanner {
   private readonly pageSize: number;
   private readonly maxPages: number;
   private readonly now: () => number;
+  private readonly programs: readonly ListenerIngestionProgram[];
 
   public constructor(
     private readonly source: StrictCatchUpSource,
@@ -157,7 +160,7 @@ export class StrictCatchUpScanner {
     options: StrictCatchUpScannerOptions,
   ) {
     this.providerId = snapshotProviderId(source);
-    const { pageSize, maxPages, now } = snapshotOptions(options);
+    const { pageSize, maxPages, now, programs } = snapshotOptions(options);
     if (!positiveBound(pageSize, MAX_CATCH_UP_PAGE_SIZE)
       || !positiveBound(maxPages, MAX_STRICT_CATCH_UP_PAGES)
       || (now !== undefined && typeof now !== 'function')) {
@@ -166,23 +169,26 @@ export class StrictCatchUpScanner {
     this.pageSize = pageSize;
     this.maxPages = maxPages;
     this.now = now === undefined ? Date.now : now as () => number;
+    this.programs = snapshotPrograms(programs ?? DEFAULT_PROGRAMS);
   }
 
   public async scan(signal: AbortSignal): Promise<StrictCatchUpScanResult> {
     assertNotAborted(signal);
     const observedAtMs = this.readNow();
-    const launchpad = await this.awaited(
-      signal,
-      () => this.readCheckpoint('launchpad', signal),
-    );
-    const market = await this.awaited(
-      signal,
-      () => this.readCheckpoint('market', signal),
-    );
-    const boundaries: StrictCatchUpBoundaries = Object.freeze({ launchpad, market });
+    const checkpoints: {
+      launchpad: ProcessingCheckpoint | null;
+      market: ProcessingCheckpoint | null;
+    } = { launchpad: null, market: null };
+    for (const program of this.programs) {
+      checkpoints[program.key] = await this.awaited(
+        signal,
+        () => this.readCheckpoint(program.key, signal),
+      );
+    }
+    const boundaries: StrictCatchUpBoundaries = Object.freeze({ ...checkpoints });
     const scans: StrictProgramScan[] = [];
 
-    for (const program of PROGRAMS) {
+    for (const program of this.programs) {
       const expected = boundaries[program.key];
       try {
         scans.push(await this.awaited(
@@ -528,6 +534,7 @@ function snapshotOptions(options: unknown): {
   readonly pageSize: unknown;
   readonly maxPages: unknown;
   readonly now: unknown;
+  readonly programs: unknown;
 } {
   try {
     if (typeof options !== 'object' || options === null || isProxy(options) || Array.isArray(options)) {
@@ -536,20 +543,79 @@ function snapshotOptions(options: unknown): {
     const prototype: object | null = Object.getPrototypeOf(options) as object | null;
     if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
     const keys = Reflect.ownKeys(options);
-    if (keys.length < 2 || keys.length > 3
+    if (keys.length < 2 || keys.length > 4
       || !keys.includes('pageSize')
       || !keys.includes('maxPages')
-      || keys.some((key) => key !== 'pageSize' && key !== 'maxPages' && key !== 'now')) {
+      || keys.some((key) => key !== 'pageSize'
+        && key !== 'maxPages'
+        && key !== 'now'
+        && key !== 'programs')) {
       throw new TypeError();
     }
     return Object.freeze({
       pageSize: ownData(options, 'pageSize'),
       maxPages: ownData(options, 'maxPages'),
       now: keys.includes('now') ? ownData(options, 'now') : undefined,
+      programs: keys.includes('programs') ? ownData(options, 'programs') : undefined,
     });
   } catch {
     throw new TypeError('Strict catch-up scanner bounds are invalid.');
   }
+}
+
+function snapshotPrograms(value: unknown): readonly ListenerIngestionProgram[] {
+  if (isProxy(value) || !Array.isArray(value)) {
+    throw new TypeError('Strict catch-up scanner programs are invalid.');
+  }
+  const lengthField = Object.getOwnPropertyDescriptor(value, 'length');
+  const length = lengthField !== undefined && 'value' in lengthField
+    ? lengthField.value as unknown
+    : undefined;
+  if (length !== 1 && length !== 2) {
+    throw new TypeError('Strict catch-up scanner programs are invalid.');
+  }
+  const arrayKeys = Reflect.ownKeys(value);
+  if (arrayKeys.length !== length + 1
+    || !arrayKeys.includes('length')
+    || Array.from({ length }, (_, index) => String(index))
+      .some((key) => !arrayKeys.includes(key))) {
+    throw new TypeError('Strict catch-up scanner programs are invalid.');
+  }
+  const expected = [
+    Object.freeze({ key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID }),
+    Object.freeze({ key: 'market', family: 'pumpswap', id: PUMPSWAP_PROGRAM_ID }),
+  ] as const;
+  const result: ListenerIngestionProgram[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const canonical = expected[index];
+    const entryField = Object.getOwnPropertyDescriptor(value, String(index));
+    const entry: unknown = entryField !== undefined
+      && entryField.enumerable
+      && 'value' in entryField
+      ? entryField.value as unknown
+      : undefined;
+    if (canonical === undefined
+      || typeof entry !== 'object'
+      || entry === null
+      || isProxy(entry)
+      || Array.isArray(entry)) {
+      throw new TypeError('Strict catch-up scanner programs are invalid.');
+    }
+    const prototype: object | null = Object.getPrototypeOf(entry) as object | null;
+    const keys = Reflect.ownKeys(entry);
+    if ((prototype !== Object.prototype && prototype !== null)
+      || keys.length !== 3
+      || !keys.includes('key')
+      || !keys.includes('family')
+      || !keys.includes('id')
+      || ownData(entry, 'key') !== canonical.key
+      || ownData(entry, 'family') !== canonical.family
+      || ownData(entry, 'id') !== canonical.id) {
+      throw new TypeError('Strict catch-up scanner programs are invalid.');
+    }
+    result.push(canonical);
+  }
+  return Object.freeze(result);
 }
 
 function snapshotProviderId(source: unknown): RpcProviderId {

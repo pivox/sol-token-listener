@@ -32,4 +32,3 @@ defaut.
   uniquement avec CI verte et aucun thread bloquant.
 - Rejouer H2i sur une base PostgreSQL propre, sans wallet, et mesurer le SLA
   creation vers paire sans revendiquer #49.
-

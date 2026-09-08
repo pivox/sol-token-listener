@@ -67,6 +67,7 @@ export interface ListenerRuntimeDependencies {
 
 export interface ListenerRuntimeOptions {
   readonly shutdownTimeoutMs: number;
+  readonly marketIngestionEnabled?: boolean;
 }
 
 type ActiveRuntimeResource =
@@ -92,6 +93,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   private closePromise: Promise<void> | null = null;
   private readonly activeResources = new Set<ActiveRuntimeResource>();
   private readonly closingResources = new Map<ActiveRuntimeResource, Promise<void>>();
+  private readonly marketIngestionEnabled: boolean;
   private started = false;
   private permanentlyClosed = false;
 
@@ -104,6 +106,11 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       || options.shutdownTimeoutMs > 120_000) {
       throw new TypeError('Listener shutdown timeout is invalid.');
     }
+    if (options.marketIngestionEnabled !== undefined
+      && typeof options.marketIngestionEnabled !== 'boolean') {
+      throw new TypeError('Listener market ingestion state is invalid.');
+    }
+    this.marketIngestionEnabled = options.marketIngestionEnabled ?? true;
   }
 
   public start(): Promise<void> {
@@ -150,7 +157,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       return Object.freeze({
         httpAvailable: true,
         pumpfun: 'STOPPED',
-        pumpswap: 'STOPPED',
+        pumpswap: this.marketPipelineState('STOPPED'),
         qualification: 'STOPPED',
         paperDecision: 'STOPPED',
         social: 'STOPPED',
@@ -160,7 +167,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       return Object.freeze({
         httpAvailable: true,
         pumpfun: 'DEGRADED',
-        pumpswap: 'DEGRADED',
+        pumpswap: this.marketPipelineState('DEGRADED'),
         qualification: 'DEGRADED',
         paperDecision: 'DEGRADED',
         social: 'DEGRADED',
@@ -182,11 +189,17 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     return Object.freeze({
       httpAvailable: true,
       pumpfun: chain,
-      pumpswap: chain,
+      pumpswap: this.marketPipelineState(chain),
       qualification: chain,
       paperDecision,
       social,
     });
+  }
+
+  private marketPipelineState(
+    activeState: ApiProjectionPipelineState['pumpswap'],
+  ): ApiProjectionPipelineState['pumpswap'] {
+    return this.marketIngestionEnabled ? activeState : 'IDLE';
   }
 
   private async performStart(): Promise<void> {

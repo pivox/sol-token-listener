@@ -73,4 +73,3 @@ retention auditee.
 - build, check, lint, tests, documentation, smoke et CI verts ;
 - reprobe Mainnet court sans PumpSwap global, sans wallet et sans aucune
   revendication de validation paper Mainnet.
-

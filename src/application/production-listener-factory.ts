@@ -49,6 +49,7 @@ import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.rep
 import { PostgresWalletGraphRepository } from '../storage/wallet-graph.repository.js';
 import { FinalityReconciler } from './finality-reconciler.js';
 import { LaunchParticipantAnalyticsService } from './launch-participant-analytics.service.js';
+import { listenerIngestionPrograms } from './listener-ingestion-programs.js';
 import { LaunchpadObservationService } from './launchpad-observation.service.js';
 import { MarketObservationService } from './market-observation.service.js';
 import { ObservedTransactionPipeline } from './observed-transaction-pipeline.js';
@@ -114,6 +115,7 @@ export function createProductionListenerRuntime(
   );
   if (expectedGenesisHash === null) throw new SolanaGenesisHashError();
   const providers = createRpcProviderCatalog(config);
+  const ingestionPrograms = listenerIngestionPrograms(config.listenerIngestionScope);
   const databasePool = pool ?? getDatabasePool();
   const rpc = new SolanaRpcClient(config, {
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
@@ -155,6 +157,7 @@ export function createProductionListenerRuntime(
         {
           pageSize: config.listenerCatchUpPageSize,
           maxPages: config.listenerCatchUpMaxPages,
+          programs: ingestionPrograms,
         },
       );
       return [providerId, new StrictCatchUpCoordinator(scanner)] as const;
@@ -176,7 +179,12 @@ export function createProductionListenerRuntime(
         }
         return source.verifyGenesis(signal);
       },
-      openSession: openWsProgramSession,
+      openSession: (endpoint, observe, signal): ReturnType<typeof openWsProgramSession> => openWsProgramSession(
+        endpoint,
+        observe,
+        signal,
+        { programs: ingestionPrograms },
+      ),
       runStrictScan: (providerId, signal): ReturnType<StrictCatchUpCoordinator['run']> => {
         const coordinator = strictCoordinators.get(providerId);
         if (coordinator === undefined) {
@@ -392,7 +400,10 @@ export function createProductionListenerRuntime(
     socialWorker: socialWorkerComponent,
     reconciler,
     heartbeat,
-  }, { shutdownTimeoutMs: config.listenerShutdownTimeoutMs });
+  }, {
+    shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    marketIngestionEnabled: config.listenerIngestionScope === 'launchpad-and-market',
+  });
 }
 
 export function catchUpGapLogContext(

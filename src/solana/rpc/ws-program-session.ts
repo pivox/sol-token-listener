@@ -2,6 +2,7 @@ import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../../markets/pumpswap/constants.js';
 import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
+import type { ListenerIngestionProgram } from '../../ports/listener-ingestion-program.js';
 import type { RpcProviderId } from './rpc-provider-catalog.js';
 
 export const WS_PROGRAM_SESSION_SETUP_TIMEOUT_MS = 10_000;
@@ -82,6 +83,7 @@ export interface WsProgramSessionScheduler {
 export interface WsProgramSessionDependencies {
   readonly createWebSocket?: WsProgramSessionWebSocketFactory;
   readonly scheduler?: WsProgramSessionScheduler;
+  readonly programs?: readonly ListenerIngestionProgram[];
 }
 
 interface ProgramDefinition {
@@ -91,12 +93,12 @@ interface ProgramDefinition {
   readonly unsubscribeRequestId: 3 | 4;
 }
 
-const PROGRAMS: readonly ProgramDefinition[] = Object.freeze([
+const DEFAULT_PROGRAMS: readonly ListenerIngestionProgram[] = Object.freeze([
   Object.freeze({
-    family: 'pumpfun', address: PUMP_PROGRAM_ID, subscribeRequestId: 1, unsubscribeRequestId: 3,
+    key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID,
   }),
   Object.freeze({
-    family: 'pumpswap', address: PUMPSWAP_PROGRAM_ID, subscribeRequestId: 2, unsubscribeRequestId: 4,
+    key: 'market', family: 'pumpswap', id: PUMPSWAP_PROGRAM_ID,
   }),
 ]);
 
@@ -119,6 +121,12 @@ export function openWsProgramSession(
   signal: AbortSignal,
   dependencies: WsProgramSessionDependencies = {},
 ): Promise<WsProgramSession> {
+  let programs: readonly ProgramDefinition[];
+  try {
+    programs = snapshotPrograms(dependencies.programs ?? DEFAULT_PROGRAMS);
+  } catch {
+    return Promise.reject(new WsProgramSessionError('PROTOCOL_INVALID'));
+  }
   const createWebSocket = dependencies.createWebSocket
     ?? ((url: string): WsProgramSessionWebSocket => new WebSocket(url));
   const scheduler = dependencies.scheduler ?? defaultScheduler;
@@ -131,7 +139,7 @@ export function openWsProgramSession(
 
   return new Promise((resolve, reject) => {
     const requests = new Map<number, ProgramDefinition>(
-      PROGRAMS.map((program) => [program.subscribeRequestId, program]),
+      programs.map((program) => [program.subscribeRequestId, program]),
     );
     const subscriptions = new Map<number, WsProgramFamily>();
     let setupSettled = false;
@@ -291,7 +299,7 @@ export function openWsProgramSession(
         return closePromise;
       }
       let sendFailed = false;
-      for (const program of PROGRAMS) {
+      for (const program of programs) {
         const subscription = [...subscriptions.entries()]
           .find(([, family]) => family === program.family)?.[0];
         if (subscription === undefined) continue;
@@ -327,7 +335,7 @@ export function openWsProgramSession(
     const onAbort = (): void => { failSetup('ABORTED'); };
 
     const onOpen = (): void => {
-      for (const program of PROGRAMS) {
+      for (const program of programs) {
         try {
           socket.send(JSON.stringify({
             jsonrpc: '2.0',
@@ -486,6 +494,67 @@ export function openWsProgramSession(
     );
     if (signal.aborted) onAbort();
   });
+}
+
+function snapshotPrograms(value: unknown): readonly ProgramDefinition[] {
+  if (isProxy(value) || !Array.isArray(value)) {
+    throw new TypeError();
+  }
+  const lengthField = Object.getOwnPropertyDescriptor(value, 'length');
+  const length = lengthField !== undefined && 'value' in lengthField
+    ? lengthField.value as unknown
+    : undefined;
+  if (length !== 1 && length !== 2) throw new TypeError();
+  const arrayKeys = Reflect.ownKeys(value);
+  if (arrayKeys.length !== length + 1
+    || !arrayKeys.includes('length')
+    || Array.from({ length }, (_, index) => String(index))
+      .some((key) => !arrayKeys.includes(key))) throw new TypeError();
+  const expected = [
+    Object.freeze({
+      key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID,
+      subscribeRequestId: 1, unsubscribeRequestId: 3,
+    }),
+    Object.freeze({
+      key: 'market', family: 'pumpswap', id: PUMPSWAP_PROGRAM_ID,
+      subscribeRequestId: 2, unsubscribeRequestId: 4,
+    }),
+  ] as const;
+  const result: ProgramDefinition[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const canonical = expected[index];
+    const entryField = Object.getOwnPropertyDescriptor(value, String(index));
+    const entry: unknown = entryField !== undefined
+      && entryField.enumerable
+      && 'value' in entryField
+      ? entryField.value as unknown
+      : undefined;
+    if (canonical === undefined
+      || typeof entry !== 'object'
+      || entry === null
+      || isProxy(entry)
+      || Array.isArray(entry)) throw new TypeError();
+    const prototype: object | null = Object.getPrototypeOf(entry) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
+    const keys = Reflect.ownKeys(entry);
+    if (keys.length !== 3
+      || !keys.includes('key')
+      || !keys.includes('family')
+      || !keys.includes('id')) throw new TypeError();
+    const key = ownField(entry, 'key');
+    const family = ownField(entry, 'family');
+    const id = ownField(entry, 'id');
+    if (!key.found || key.value !== canonical.key
+      || !family.found || family.value !== canonical.family
+      || !id.found || id.value !== canonical.id) throw new TypeError();
+    result.push(Object.freeze({
+      family: canonical.family,
+      address: canonical.id,
+      subscribeRequestId: canonical.subscribeRequestId,
+      unsubscribeRequestId: canonical.unsubscribeRequestId,
+    }));
+  }
+  return Object.freeze(result);
 }
 
 function parsePayload(event: unknown): unknown {
