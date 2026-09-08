@@ -292,7 +292,8 @@ fermée ; il est donc interdit dans le repository readiness.
 
 Chaque checkout force `SET ROLE sol_token_executor_readiness`,
 `search_path=pg_catalog,public` et `session_replication_role=origin`, puis
-revalide PostgreSQL 16, le membership exact, la migration 039 et l'allowlist
+revalide PostgreSQL 16, le membership exact, la migration 045 qui porte
+l'invariant de refresh wallet, et l'allowlist
 effective complète.
 
 L'allowlist de colonnes est comparée tuple par tuple (`grantee`, `table`,
@@ -314,9 +315,9 @@ Une exécution utilise une transaction unique après la collecte réseau :
 2. validation ou insertion de la génération ;
 3. vérification qu'aucune génération du même wallet ne porte une position
    `OPEN`, `EXIT_PENDING` ou `UNKNOWN` ;
-4. validation ou insertion du snapshot wallet ; une collecte différente à la
-   même révision de risque est acceptée seulement si `observed_at` est
-   strictement supérieur au snapshot actif ;
+4. validation ou insertion du snapshot wallet ; toute collecte d'identité
+   différente est acceptée seulement si sa révision ne régresse pas et si son
+   `observed_at` est strictement supérieur au snapshot actif ;
 5. verrou provider ;
 6. validation/supersession puis insertion du snapshot provider ;
 7. contrôle de fraîcheur sur l'horloge PostgreSQL ;
@@ -339,8 +340,9 @@ snapshots canoniques et ne modifie jamais les anciennes preuves. La contrainte
 d'unicité porte sur le seul snapshot actif d'une génération, pas sur le couple
 `generation_id/state_revision` : plusieurs observations peuvent donc prouver
 le même état de risque sans prétendre à une rotation ou à une mutation du
-risque. Un snapshot d'une révision inférieure, ou non strictement plus récent à
-révision égale, est refusé. Les snapshots
+risque. Toute régression de révision ou de temps est refusée ; deux identités
+divergentes au même instant sont également refusées. Le replay exact est
+résolu par son identifiant avant ces gardes. Les snapshots
 superseded et devenus inutiles suivent la rétention existante de quatre heures.
 Les générations actives et les preuves référencées par un état non terminal ne
 sont jamais purgées.

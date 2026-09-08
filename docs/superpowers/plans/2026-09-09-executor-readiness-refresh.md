@@ -14,6 +14,7 @@
 
 - `migrations/045_execution_wallet_snapshot_refresh.sql` : évolution rejouable de l'unicité des snapshots wallet.
 - `src/storage/execution-risk.repository.ts` : ordre total, garde de fraîcheur et supersession atomique.
+- `src/executor-readiness/database.ts` : refus précoce de tout schéma antérieur à 045.
 - `tests/execution-risk.repository.test.ts` : comportement RED/GREEN du primitive partagé.
 - `tests/execution-readiness.repository.test.ts` : deux bootstraps frais à risque inchangé.
 - `tests/execution-wallet-snapshot-refresh-migration.test.ts` : base vide, upgrade 044→045, replay et catalogue.
@@ -43,6 +44,7 @@
 ### Task 4: Aligner la tête de migration et la documentation
 
 - [ ] Ajouter 045 avec son SHA-256 au catalogue live, puis remplacer uniquement les assertions de tête 044 par 045 ; conserver 044 dans tous les inventaires historiques ordonnés.
+- [ ] Faire vérifier explicitement la présence de 045 par l'autorité H2d et adapter son test fermé, afin qu'un binaire neuf refuse un schéma 044 avant toute écriture.
 - [ ] Vérifier les versions 1.0.14 et 1.17.6, sans promesse de trade ni changement d'autorité.
 - [ ] Exécuter `npm run build:backend`, `npm run check:backend`, `npm run lint:backend`, les tests de migration et `npm run docs:check`.
 

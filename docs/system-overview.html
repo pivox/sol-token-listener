@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="doc-version" content="1.1.0">
+  <meta name="doc-version" content="1.1.1">
   <meta name="description" content="Architecture, sécurité et exploitation du listener durable Pump.fun, PumpSwap et de l'executor de preuve sans signature.">
   <title>sol-token-listener — Vue complète du système</title>
   <link rel="stylesheet" href="assets/vendor/bootstrap/bootstrap.min.css">
@@ -55,7 +55,7 @@
 
   <header class="hero text-white py-5">
     <div class="container py-4">
-      <p class="eyebrow text-info mb-2">Documentation système hors ligne · version 1.1.0 · 8 septembre 2026</p>
+      <p class="eyebrow text-info mb-2">Documentation système hors ligne · version 1.1.1 · 9 septembre 2026</p>
       <div class="row align-items-end g-4">
         <div class="col-lg-8">
           <h1 class="display-4 fw-bold">sol-token-listener</h1>
@@ -261,7 +261,7 @@
             <div class="row g-3 mt-1">
               <div class="col-lg-4"><h4 class="h6">Émission atomique</h4><p class="small mb-0"><code>EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false</code> reste le défaut. La migration 041 crée ensemble la cible <code>TARGET</code>, le probe <code>SIMULATION</code> et leur paire append-only.</p></div>
               <div class="col-lg-4"><h4 class="h6">Préparation exacte</h4><p class="small mb-0">La migration 042 persiste le run H2k-b. Le runner one-shot, désactivé avec <code>EXECUTOR_PREFLIGHT_PREPARATION_ENABLED=false</code>, sélectionne une paire, exécute le dry-run de la cible et la simulation du probe, puis termine le run en <code>PREPARED</code> et publie le manifeste <code>PREFLIGHT_INTENT_PREPARED</code>.</p></div>
-              <div class="col-lg-4"><h4 class="h6">Lignée H2h v2</h4><p class="small mb-0">La migration 044 est le head : <code>candidate_id</code> ferme la lignée causale finalisée et l’inbox priorise les indices <code>CreateEvent</code> sans leur donner d’autorité métier. H2h v2 reçoit uniquement le <code>preparationRunId</code> et vérifie run, pair, assessment, artifact, fingerprints et échéances.</p></div>
+              <div class="col-lg-4"><h4 class="h6">Lignée H2h v2</h4><p class="small mb-0">La migration 045 est le head ; la migration 043 ferme la lignée causale avec <code>candidate_id</code> et la migration 044 priorise les indices <code>CreateEvent</code> sans leur donner d’autorité métier. H2h v2 reçoit uniquement le <code>preparationRunId</code> et vérifie run, pair, assessment, artifact, fingerprints et échéances.</p></div>
             </div>
             <div class="alert alert-warning small mt-3 mb-0"><strong>Barrière :</strong> H2k-b ne charge aucune clé, ne signe, n'arme et ne soumet rien. H2c transporte une requête wire V3, persistée en armement V2 uniquement par la frontière opérations ; <code>CANARY_NOT_STARTED</code>.</div>
           </div></div>
