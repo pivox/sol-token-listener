@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.0 — 2026-09-08
+**Version :** 1.1.1 — 2026-09-08
 
 ## Périmètre produit
 
@@ -62,6 +62,27 @@ health RPC -> baseline bornée -> WebSocket -> catch-up de fermeture
 Il ne compose ni wallet, ni exécution live, ni envoi de transaction. `observe`
 et `paper` restent les seuls modes.
 Raydium CPMM reste un adaptateur secondaire non composé dans ce bootstrap.
+
+Le scope fermé `LISTENER_INGESTION_SCOPE` pilote la liste canonique de
+programmes injectée à la fois dans le WebSocket et dans le catch-up :
+
+- `launchpad-and-market`, valeur par défaut compatible, conserve l'ingestion
+  globale Pump.fun et PumpSwap ;
+- `launchpad-only` conserve Pump.fun et exclut l'ingestion globale PumpSwap.
+
+Pump.fun reste toujours actif et un scope vide ou inconnu est refusé. H2i doit
+sélectionner explicitement `launchpad-only` afin de mesurer le délai de
+création vers paire sans le firehose global PumpSwap. La transaction Pump.fun
+peut encore fournir la migration et sa preuve `create_pool` PumpSwap dans la
+même portée CPI ; les swaps exclusivement PumpSwap post-migration ne sont en
+revanche pas suivis dans ce scope. L'API publie alors
+`pipeline.pumpswap=IDLE`, ce qui décrit une exclusion configurée et non une
+dégradation. Les preuves market déjà persistées restent intactes et
+redeviennent pertinentes lorsque `launchpad-and-market` est réactivé.
+
+Ce réglage réduit uniquement l'ingestion passive. Il n'ajoute ni droit
+PostgreSQL, ni wallet, ni clé, ni armement, ni signature, ni simulation ou
+soumission, et ne modifie aucun invariant d'exécution.
 
 Le worker social durable prend ses propres leases et enrichit passivement les
 snapshots de métadonnées. Un transport HTTP partagé et borné valide chaque
@@ -650,8 +671,10 @@ le travail réclamable.
 
 Le WebSocket est le chemin nominal. Le catch-up initial est borné par
 `LISTENER_CATCH_UP_MAX_PAGES * LISTENER_CATCH_UP_PAGE_SIZE` pour chacun des
-programmes Pump.fun et PumpSwap, soit 20 × 100 signatures par programme par
-défaut. Une panne retryable est replanifiée avec un délai exponentiel de 500 ms
+programmes du scope. Avec `launchpad-and-market`, il couvre Pump.fun et
+PumpSwap, soit 20 × 100 signatures par programme par défaut. Avec
+`launchpad-only`, il ne lit, ne checkpoint et ne résout aucune preuve du
+programme market. Une panne retryable est replanifiée avec un délai exponentiel de 500 ms
 plafonné à 60 s, sans plafond du nombre de tentatives. Les variables
 `RPC_RETRY_MAX_ATTEMPTS` et `RPC_RETRY_BASE_DELAY_MS` sont parsées et validées
 pour compatibilité, mais ne pilotent pas encore ce scheduler durable. Les lots
@@ -720,6 +743,12 @@ enrichissement. `pipeline.paperDecision` et `paperDecisionJobs` exposent
 séparément pending, leased, retryable, exhausted, dernier succès et dernier
 code d'erreur stable : une panne d'un worker ne renomme pas les pipelines chain
 Pump.fun/PumpSwap.
+
+Dans le scope `launchpad-only`, `pipeline.pumpswap=IDLE` reste stable tant que
+PumpSwap est volontairement hors ingestion ; cette valeur ne devient ni
+`RUNNING` ni `DEGRADED` en raison d'une ancienne preuve market. Dans le scope
+compatible par défaut `launchpad-and-market`, les règles de santé PumpSwap
+existantes restent inchangées.
 
 `pipeline.qualification` reflète l’état du worker inbox qui exécute l’étape
 synchrone (`IDLE | RUNNING | DEGRADED | STOPPED`). `qualification.currentCount`

@@ -56,6 +56,61 @@ void test('aborts before the scan without calling the clock, repository, or sour
   assert.deepEqual(events, []);
 });
 
+void test('scans only the configured launchpad program without touching market state', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 12)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 13)]],
+  });
+  const repository = new FakeRepository({
+    market: checkpoint('market', 'existing-market', 10),
+  });
+
+  const result = await scanner(source, repository, {
+    programs: Object.freeze([Object.freeze({
+      key: 'launchpad',
+      family: 'pumpfun',
+      id: PUMP_PROGRAM_ID,
+    })]),
+  }).scan(NEVER_ABORTED);
+
+  assert.deepEqual(repository.eventsSeen, [
+    'read:launchpad',
+    'enqueue:launch',
+    'cas:launchpad',
+  ]);
+  assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
+  assert.deepEqual(result.boundaries, { launchpad: null, market: null });
+  assert.equal(result.discoveredCount, 1);
+  assert.equal(result.enqueuedCount, 1);
+});
+
+void test('rejects accessor-backed ingestion programs without invoking them', () => {
+  let getterCalls = 0;
+  const programs = Object.defineProperty([], '0', {
+    enumerable: true,
+    get: () => {
+      getterCalls += 1;
+      return { key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID };
+    },
+  });
+  Object.defineProperty(programs, 'length', { value: 1 });
+
+  assert.throws(() => scanner(new FakeSource({}), new FakeRepository(), {
+    programs,
+  }), /programs are invalid/u);
+  assert.equal(getterCalls, 0);
+
+  const revoked = Proxy.revocable([], {});
+  revoked.revoke();
+  assert.throws(() => scanner(new FakeSource({}), new FakeRepository(), {
+    programs: revoked.proxy,
+  }), (error: unknown) => {
+    assert.ok(error instanceof TypeError);
+    assert.equal(error.message, 'Strict catch-up scanner programs are invalid.');
+    return true;
+  });
+});
+
 void test('aborts after the launchpad checkpoint settles without reading the market checkpoint', async () => {
   const checkpointRead = deferred<undefined>();
   const controller = new AbortController();
@@ -708,12 +763,18 @@ function scanner(
     readonly pageSize?: number;
     readonly maxPages?: number;
     readonly now?: () => number;
+    readonly programs?: readonly Readonly<{
+      readonly key: ProcessingCheckpointKey;
+      readonly family: 'pumpfun' | 'pumpswap';
+      readonly id: string;
+    }>[];
   } = {},
 ): StrictCatchUpScanner {
   return new StrictCatchUpScanner(source, repository, {
     pageSize: overrides.pageSize ?? 2,
     maxPages: overrides.maxPages ?? 3,
     now: overrides.now ?? (() => 9_000),
+    ...(overrides.programs === undefined ? {} : { programs: overrides.programs }),
   });
 }
 

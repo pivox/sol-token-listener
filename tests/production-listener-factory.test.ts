@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
+import {
+  ALL_INGESTION_PROGRAMS,
+  LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
+  listenerIngestionPrograms,
+} from '../src/application/listener-ingestion-programs.js';
 import { FinalityReconciler } from '../src/application/finality-reconciler.js';
 import { PromotedProviderSelector } from '../src/application/promoted-provider-selector.js';
 import type {
@@ -30,6 +35,17 @@ import {
 } from '../src/application/production-listener-factory.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+void test('selects one frozen canonical ingestion program list and rejects unknown scopes', () => {
+  assert.equal(listenerIngestionPrograms('launchpad-only'), LAUNCHPAD_ONLY_INGESTION_PROGRAMS);
+  assert.equal(listenerIngestionPrograms('launchpad-and-market'), ALL_INGESTION_PROGRAMS);
+  assert.ok(Object.isFrozen(LAUNCHPAD_ONLY_INGESTION_PROGRAMS));
+  assert.ok(Object.isFrozen(ALL_INGESTION_PROGRAMS));
+  assert.throws(
+    () => listenerIngestionPrograms('unknown'),
+    /ingestion scope is invalid/u,
+  );
+});
 
 void test('builds a redacted structured live-edge gap warning', () => {
   const gap = createCatchUpGap(
@@ -66,6 +82,27 @@ void test('composes the passive production listener without opening resources', 
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    qualification: 'STOPPED',
+    paperDecision: 'STOPPED',
+    social: 'STOPPED',
+  });
+});
+
+void test('composes launchpad-only ingestion with PumpSwap explicitly idle', () => {
+  const runtime = createProductionListenerRuntime(
+    parseConfig({
+      SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+      SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+      SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
+      LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    }),
+    inertPool as unknown as ReturnType<typeof getDatabasePool>,
+  );
+
+  assert.deepEqual(runtime.pipelineState(), {
+    httpAvailable: true,
+    pumpfun: 'STOPPED',
+    pumpswap: 'IDLE',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
     social: 'STOPPED',
@@ -925,7 +962,11 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /verifyProviderGenesis:/u);
   assert.match(source, /source\.verifyGenesis\(signal\)/u);
   assert.match(source, /runStrictScan:/u);
-  assert.match(source, /openSession:\s*openWsProgramSession/u);
+  assert.match(
+    source,
+    /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{ programs: ingestionPrograms \}/u,
+  );
+  assert.match(source, /new StrictCatchUpScanner\([\s\S]*?programs:\s*ingestionPrograms/u);
 }
 
 function hasSchedulerWaiterState(scheduler: ManualScheduler): boolean {

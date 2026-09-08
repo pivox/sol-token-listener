@@ -1,6 +1,14 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.3 — 2026-09-08
+**Version :** 1.17.4 — 2026-09-08
+
+La version 1.17.4 impose `LISTENER_INGESTION_SCOPE=launchpad-only` pour le
+probe H2i. La valeur par défaut compatible reste `launchpad-and-market` pour
+les déploiements existants. Le scope H2i conserve Pump.fun, exclut le flux
+global PumpSwap des chemins WebSocket et catch-up et publie
+`pipeline.pumpswap=IDLE`. Cette valeur est un état volontaire, pas une panne.
+Le changement ne donne aucun droit, wallet, armement, capacité de signature ou
+de soumission et laisse `CANARY_NOT_STARTED` inchangé.
 
 La version 1.17.3 force la transaction H2d en `READ COMMITTED`. Une exécution
 qui attend le mutex de génération observe ainsi le dernier état risque commité,
@@ -129,7 +137,8 @@ Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
 - listener H2i : login `NOINHERIT` membre uniquement de
   `sol_token_listener_writer`, connexion avec
   `options=-c role=sol_token_listener_writer`,
-  `POSTGRES_AUTO_MIGRATE=false` et aucun keypair ;
+  `POSTGRES_AUTO_MIGRATE=false`,
+  `LISTENER_INGESTION_SCOPE=launchpad-only` et aucun keypair ;
 
 - worker H2j : login `NOINHERIT` membre uniquement de
   `sol_token_executor_worker`, connexion avec
@@ -216,6 +225,20 @@ insérer une intention, mais ne peut ni modifier une intention existante, ni
 lire ou écrire génération wallet, risque live, contrôle, armement, lock,
 transaction signée, soumission ou réconciliation. Arrêter le listener, ou
 remettre `EXECUTION_INTENT_EMISSION_ENABLED=false`, avant le preflight H2c.
+
+Son environnement doit contenir explicitement :
+
+```dotenv
+LISTENER_INGESTION_SCOPE=launchpad-only
+```
+
+Ne pas omettre cette ligne : le défaut `launchpad-and-market` préserve la
+compatibilité générale et réactiverait donc le flux global PumpSwap. En
+`launchpad-only`, Pump.fun reste observé et une migration Pump.fun peut encore
+apporter sa preuve PumpSwap dans la même transaction ; le suivi global des
+swaps PumpSwap est volontairement inactif et l'API doit exposer
+`pipeline.pumpswap=IDLE`. Aucune preuve market antérieure ne doit dégrader cet
+état. Ce scope ne change aucune gate H2c et n'autorise aucune action réelle.
 
 ## Exécuter H2j sans autorité live
 
@@ -484,8 +507,10 @@ un armement ou un verdict de sécurité économique.
 1. Exécuter H2d, auditer son manifeste et transmettre ses identités exactes au
    producteur externe de qualification et de sidecar H2c.
 2. Démarrer le listener sans keypair en `EXECUTION_MODE=paper` avec
-   `EXECUTION_INTENT_EMISSION_ENABLED=true`. Cette émission temporaire utilise
-   le producteur normal ; ne jamais fabriquer une cible par SQL.
+   `EXECUTION_INTENT_EMISSION_ENABLED=true` et
+   `LISTENER_INGESTION_SCOPE=launchpad-only`. Cette émission temporaire utilise
+   le producteur normal ; ne jamais fabriquer une cible par SQL. Vérifier que
+   l'API expose `pipeline.pumpswap=IDLE` avant de poursuivre.
 3. Arrêter le listener ou remettre l'émission à `false`, puis lancer une fois
    H2k-b. Vérifier son run `PREPARED`, auditer le manifeste
    `PREFLIGHT_INTENT_PREPARED` et la paire sélectionnée, puis conserver son

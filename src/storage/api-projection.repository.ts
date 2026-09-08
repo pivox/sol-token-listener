@@ -467,11 +467,14 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     let pipeline = DEGRADED_PIPELINE_STATE;
     try {
       pipeline = pipelineState(this.pipeline);
+      const activeCheckpointKeys = pipeline.pumpswap === 'IDLE'
+        ? ['launchpad']
+        : ['launchpad', 'market'];
       const database = await this.database.query('SELECT 1 AS available');
       const checkpoints = await this.database.query(
         `SELECT checkpoint_key, slot FROM processing_checkpoints
-         WHERE checkpoint_key = ANY($1)`,
-        [['launchpad', 'market']],
+         WHERE checkpoint_key = ANY($1::text[])`,
+        [activeCheckpointKeys],
       );
       const healthSnapshot = await this.database.query(
         `SELECT
@@ -498,6 +501,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
             EXISTS (
               SELECT 1 FROM listener_strict_catch_up_failures
               WHERE resolved_at IS NULL
+                AND checkpoint_key = ANY($2::text[])
               LIMIT 1
             ) AS has_unresolved
          FROM (VALUES ($1::text)) AS health_anchor(service_key)
@@ -505,7 +509,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
            ON heartbeat.service_key = health_anchor.service_key
          LEFT JOIN listener_websocket_health AS websocket
            ON websocket.service_key = health_anchor.service_key`,
-        [LISTENER_SERVICE_KEY],
+        [LISTENER_SERVICE_KEY, activeCheckpointKeys],
       );
       const healthSnapshotRow = healthSnapshot.rows[0];
       if (healthSnapshotRow === undefined) throw invalid();

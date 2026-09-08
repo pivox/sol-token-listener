@@ -634,6 +634,7 @@ void test('le modèle d’environnement publie les valeurs API sûres exactes', 
 void test('le listener durable est activé avec des bornes sûres par défaut', () => {
   const config = parseConfig(base);
   assert.equal(config.listenerEnabled, true);
+  assert.equal(config.listenerIngestionScope, 'launchpad-and-market');
   assert.equal(config.expectedGenesisHash, base.SOLANA_EXPECTED_GENESIS_HASH);
   assert.equal(config.listenerCatchUpPolicy, 'live-edge');
   assert.equal(config.listenerWorkerLeaseSeconds, 120);
@@ -644,6 +645,31 @@ void test('le listener durable est activé avec des bornes sûres par défaut', 
   assert.equal(config.rpcRetryMaxAttempts, 5);
   assert.equal(config.rpcRetryBaseDelayMs, 500);
   assert.equal(config.reconcileSeconds, 15);
+});
+
+void test('le scope d\'ingestion du listener accepte ses deux valeurs canoniques', () => {
+  for (const listenerIngestionScope of ['launchpad-only', 'launchpad-and-market'] as const) {
+    assert.equal(
+      parseConfig({ ...base, LISTENER_INGESTION_SCOPE: listenerIngestionScope }).listenerIngestionScope,
+      listenerIngestionScope,
+    );
+  }
+});
+
+void test('le scope d\'ingestion du listener refuse espaces, casse et valeurs inconnues', () => {
+  for (const value of [
+    ' launchpad-only',
+    'launchpad-only ',
+    'LAUNCHPAD-ONLY',
+    'Launchpad-And-Market',
+    'market-only',
+    'all',
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...base, LISTENER_INGESTION_SCOPE: value }),
+      /LISTENER_INGESTION_SCOPE/u,
+    );
+  }
 });
 
 void test('le listener désactivé accepte un hash genesis absent et publie null', () => {
@@ -747,6 +773,7 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
   for (const line of [
     'SOLANA_EXPECTED_GENESIS_HASH=',
     'LISTENER_ENABLED=true',
+    'LISTENER_INGESTION_SCOPE=launchpad-and-market',
     'LISTENER_CATCH_UP_POLICY=live-edge',
     'LISTENER_WORKER_LEASE_SECONDS=120',
     'LISTENER_CATCH_UP_MAX_PAGES=20',
@@ -953,7 +980,7 @@ void test('durable WebSocket health documentation is versioned and exposes the e
   ]);
 
   assert.match(design, /^Version: 1\.0\.5$/mu);
-  assert.match(umbrella, /^Version: 1\.4\.2$/mu);
+  assert.match(umbrella, /^Version: 1\.4\.3$/mu);
   assert.match(umbrella, /durable-websocket-health-design\.md` version\s+1\.0\.5/isu);
   assert.match(plan, /design v1\.0\.5/iu);
 

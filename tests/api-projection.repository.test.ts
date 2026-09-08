@@ -1768,7 +1768,7 @@ void test('pins the generic heartbeat projection to the canonical listener servi
     heartbeatQuery?.text ?? '',
     /LEFT JOIN listener_heartbeats AS heartbeat[\s\S]*heartbeat\.service_key = health_anchor\.service_key/u,
   );
-  assert.deepEqual(heartbeatQuery?.values, ['transaction-listener']);
+  assert.deepEqual(heartbeatQuery?.values, ['transaction-listener', ['launchpad', 'market']]);
 });
 
 void test('reads canonical runtime, WebSocket, and strict-failure health from one anchored snapshot', async () => {
@@ -1787,7 +1787,7 @@ void test('reads canonical runtime, WebSocket, and strict-failure health from on
   assert.match(snapshotQuery?.text ?? '', /LEFT JOIN listener_heartbeats AS heartbeat[\s\S]*heartbeat\.service_key = health_anchor\.service_key/u);
   assert.match(snapshotQuery?.text ?? '', /LEFT JOIN listener_websocket_health AS websocket[\s\S]*websocket\.service_key = health_anchor\.service_key/u);
   assert.match(snapshotQuery?.text ?? '', /EXISTS \([\s\S]*listener_strict_catch_up_failures[\s\S]*resolved_at IS NULL[\s\S]*LIMIT 1/u);
-  assert.deepEqual(snapshotQuery?.values, ['transaction-listener']);
+  assert.deepEqual(snapshotQuery?.values, ['transaction-listener', ['launchpad', 'market']]);
 });
 
 void test('evaluates heartbeat freshness after the causal health snapshot is read', async () => {
@@ -1860,7 +1860,7 @@ void test('projects the canonical WebSocket snapshot through exact frozen redact
     /ownerGeneration|revision|sessionGeneration|rpc_url|secret-signature|wss?:\/\//iu,
   );
   const websocketQuery = database.calls.find((call) => call.text.includes('listener_websocket_health'));
-  assert.deepEqual(websocketQuery?.values, ['transaction-listener']);
+  assert.deepEqual(websocketQuery?.values, ['transaction-listener', ['launchpad', 'market']]);
   assert.doesNotMatch(websocketQuery?.text ?? '', /SELECT\s+\*/iu);
 });
 
@@ -2152,6 +2152,38 @@ class HealthQueryable implements Queryable {
   }
 }
 
+class ScopeAwareHealthQueryable implements Queryable {
+  public readonly calls: Call[] = [];
+
+  public constructor(private readonly unresolvedFailureKeys: ReadonlySet<string>) {}
+
+  public async query(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<{ readonly rows: readonly Record<string, unknown>[] }> {
+    this.calls.push({ text, values });
+    if (text.includes('SELECT 1 AS available')) return { rows: [{ available: 1 }] };
+    if (text.includes('processing_checkpoints')) {
+      const activeKeys = stringArray(values?.[0]);
+      return { rows: activeKeys.map((checkpointKey, index) => ({
+        checkpoint_key: checkpointKey, slot: String(60 - index),
+      })) };
+    }
+    if (isJoinedHealthSnapshotQuery(text)) {
+      const activeKeys = stringArray(values?.[1]);
+      return { rows: [joinedHealthSnapshotRow(
+        healthyHeartbeatRow(), websocketRow(),
+        activeKeys.some((key) => this.unresolvedFailureKeys.has(key)),
+      )] };
+    }
+    return { rows: [] };
+  }
+}
+
+function stringArray(value: unknown): readonly string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : [];
+}
+
 function healthyHealthDatabase(
   websocket?: Readonly<Record<string, unknown>>,
   unresolvedStrictFailure = false,
@@ -2164,6 +2196,46 @@ function healthyRepository(database: Queryable): PostgresApiProjectionRepository
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
     qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
+}
+
+void test('scopes strict catch-up health and checkpoints to active ingestion keys', async () => {
+  const launchpadOnlyPipeline: ApiProjectionPipelineState = {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+  };
+  const marketOnlyFailure = new ScopeAwareHealthQueryable(new Set(['market']));
+  const launchpadOnlyHealth = await new PostgresApiProjectionRepository(
+    marketOnlyFailure, () => openedAt, launchpadOnlyPipeline,
+  ).getHealth();
+
+  assert.equal(launchpadOnlyHealth.status, 'OK');
+  assert.deepEqual(launchpadOnlyHealth.checkpoints, { launchpad: '60', market: null });
+  const launchpadCheckpointQuery = marketOnlyFailure.calls.find((call) =>
+    call.text.includes('processing_checkpoints'));
+  const launchpadSnapshotQuery = marketOnlyFailure.calls.find(isJoinedHealthSnapshotCall);
+  assert.deepEqual(launchpadCheckpointQuery?.values, [['launchpad']]);
+  assert.deepEqual(launchpadSnapshotQuery?.values, ['transaction-listener', ['launchpad']]);
+  assert.match(launchpadSnapshotQuery?.text ?? '', /checkpoint_key = ANY\(\$2::text\[\]\)/u);
+
+  const launchpadFailure = new ScopeAwareHealthQueryable(new Set(['launchpad']));
+  const launchpadFailureHealth = await new PostgresApiProjectionRepository(
+    launchpadFailure, () => openedAt, launchpadOnlyPipeline,
+  ).getHealth();
+  assert.equal(launchpadFailureHealth.status, 'DEGRADED');
+
+  const fullScopeMarketFailure = new ScopeAwareHealthQueryable(new Set(['market']));
+  const fullScopeHealth = await healthyRepository(fullScopeMarketFailure).getHealth();
+  assert.equal(fullScopeHealth.status, 'DEGRADED');
+  assert.deepEqual(fullScopeHealth.checkpoints, { launchpad: '60', market: '59' });
+  const fullScopeSnapshotQuery = fullScopeMarketFailure.calls.find(isJoinedHealthSnapshotCall);
+  assert.deepEqual(
+    fullScopeSnapshotQuery?.values,
+    ['transaction-listener', ['launchpad', 'market']],
+  );
+});
+
+function isJoinedHealthSnapshotCall(call: Call): boolean {
+  return isJoinedHealthSnapshotQuery(call.text);
 }
 
 async function healthResponseFromRouter(

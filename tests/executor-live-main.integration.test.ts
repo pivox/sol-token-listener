@@ -291,14 +291,20 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.17.3 — 2026-09-08',
+    '**Version :** 1.17.4 — 2026-09-08',
     'runbook version',
   );
   assertContainsExactlyOnce(
     pumpFunArchitecture,
-    '**Version :** 1.1.0 — 2026-09-08',
+    '**Version :** 1.1.1 — 2026-09-08',
     'Pump.fun architecture version',
   );
+  for (const document of [pumpFunArchitecture, runbook]) {
+    assert.match(document, /LISTENER_INGESTION_SCOPE/iu);
+    assert.match(document, /launchpad-only/iu);
+    assert.match(document, /launchpad-and-market/iu);
+    assert.match(document, /pipeline\.pumpswap[^\n]*`?IDLE`?/iu);
+  }
   assertContainsExactlyOnce(
     systemOverview,
     '<meta name="doc-version" content="1.1.0">',

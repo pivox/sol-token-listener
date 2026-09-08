@@ -3,8 +3,13 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.4.2
+Version: 1.4.3
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.4.3 introduit le scope d'ingestion ferme defini par la specification
+`2026-09-08-listener-ingestion-scope-design.md`. Une liste canonique unique
+pilote les abonnements WebSocket et le strict catch-up ; H2i peut exclure le
+flux global PumpSwap sans masquer cette desactivation dans la sante publique.
 
 Revision 1.4.2 accepte le frame texte d'un `MessageEvent` WebSocket natif Node
 22 lorsque `data` est exposé par le getter intégré hérité. La frontière appelle

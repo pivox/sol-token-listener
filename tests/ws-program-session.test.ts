@@ -52,6 +52,91 @@ void test('opens only after both confirmed subscriptions acknowledge and forward
   assert.equal(scheduler.pendingCount, 0);
 });
 
+void test('subscribes and unsubscribes only the configured launchpad program', async () => {
+  const socket = new FakeWebSocket();
+  const scheduler = new ManualScheduler();
+  const signature = '1'.repeat(64);
+  const frames: unknown[] = [];
+  const opening = openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); },
+    new AbortController().signal,
+    {
+      createWebSocket: () => socket,
+      scheduler,
+      programs: Object.freeze([Object.freeze({
+        key: 'launchpad',
+        family: 'pumpfun',
+        id: PUMP_PROGRAM_ID,
+      })]),
+    },
+  );
+
+  socket.open();
+  assert.deepEqual(socket.sent.map(parseJson), [{
+    jsonrpc: '2.0', id: 1, method: 'logsSubscribe',
+    params: [{ mentions: [PUMP_PROGRAM_ID] }, { commitment: 'confirmed' }],
+  }]);
+  socket.message({ jsonrpc: '2.0', id: 1, result: 101 });
+  const session = await opening;
+  socket.message(notification(101, 41, signature));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(frames, [{
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature,
+    slot: 41n,
+  }]);
+
+  const closing = session.close(new AbortController().signal);
+  assert.deepEqual(socket.sent.slice(1).map(parseJson), [{
+    jsonrpc: '2.0', id: 3, method: 'logsUnsubscribe', params: [101],
+  }]);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  await closing;
+  assert.equal(socket.closeCalls, 1);
+});
+
+void test('rejects accessor-backed ingestion programs before opening a socket', async () => {
+  let getterCalls = 0;
+  let socketCalls = 0;
+  const programs = Object.defineProperty([], '0', {
+    enumerable: true,
+    get: () => {
+      getterCalls += 1;
+      return { key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID };
+    },
+  });
+  Object.defineProperty(programs, 'length', { value: 1 });
+
+  await assert.rejects(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async () => undefined,
+    new AbortController().signal,
+    {
+      createWebSocket: () => { socketCalls += 1; return new FakeWebSocket(); },
+      programs,
+    },
+  ), (error: unknown) => {
+    assertStableError(error, 'PROTOCOL_INVALID');
+    return true;
+  });
+  assert.equal(getterCalls, 0);
+  assert.equal(socketCalls, 0);
+
+  const revoked = Proxy.revocable([], {});
+  revoked.revoke();
+  await assert.rejects(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async () => undefined,
+    new AbortController().signal,
+    { programs: revoked.proxy },
+  ), (error: unknown) => {
+    assertStableError(error, 'PROTOCOL_INVALID');
+    return true;
+  });
+});
+
 void test('accepts native Node MessageEvent frames with inherited data accessors', async () => {
   const socket = new FakeWebSocket();
   const scheduler = new ManualScheduler();
