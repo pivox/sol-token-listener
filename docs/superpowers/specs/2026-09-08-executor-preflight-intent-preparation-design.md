@@ -1,6 +1,6 @@
 # Préparation déterministe d'une intention de préflight — H2k-b
 
-Version : 1.0.0  
+Version : 1.0.1  
 Statut : validé pour implémentation  
 Date : 2026-09-08
 
@@ -42,14 +42,16 @@ démarrent jamais implicitement.
 `execution_preflight_intent_preparation_runs` est la source d'autorité du run.
 Elle conserve une identité de run, `payload_version=1`, le watermark DB, la
 deadline absolue, la paire figée, l'état `WAITING`, `PREPARING`, `PREPARED` ou
-`FAILED`, une lease dédiée, les identifiants de l'assessment et de l'artefact,
+`FAILED`, une révision monotone, une lease dédiée active dès `WAITING`, les
+identifiants de l'assessment et de l'artefact,
 le code d'échec, les dates de fin et `purge_after`.
 
 Les contraintes imposent :
 
 - une paire au plus par run et un run au plus par paire ;
+- un seul run `WAITING` ou `PREPARING` à la fois ;
 - paire absente uniquement en `WAITING` ;
-- lease complète et non expirée uniquement en `PREPARING` ;
+- lease complète et non expirée en `WAITING` et `PREPARING` ;
 - preuves complètes uniquement en `PREPARED` ;
 - reason code et date de fin obligatoires en `FAILED` ;
 - horodatages milliseconde, finis, ordonnés et rétention exacte de quatre
@@ -177,3 +179,9 @@ RPC.
 - aucun wallet, armement, signer ou transport de soumission accessible.
 
 Deux cycles de revue maximum sont autorisés pour cette PR.
+
+## Historique
+
+- 1.0.1 — précise l'unicité du run actif, la lease dès le watermark et la
+  révision monotone nécessaire aux reprises CAS.
+- 1.0.0 — conception H2k-b initiale.
