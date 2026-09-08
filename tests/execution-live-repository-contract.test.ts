@@ -36,6 +36,7 @@ const h1ProductionModules = Object.freeze([
       '../domain/execution-intent.js',
       '../ports/execution-intent-repository.js',
       './database.js',
+      './execution-intent-expiration.js',
     ]),
   }),
   Object.freeze({

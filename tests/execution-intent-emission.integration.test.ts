@@ -24,6 +24,67 @@ const EMISSION: ExecutionIntentEmissionConfig = Object.freeze({
   quoteMintAllowlist: Object.freeze([WSOL]),
   wsolMint: WSOL,
   maximumQuoteAgeMs: 5_000,
+  preflightPairEmissionEnabled: false,
+});
+const PAIRED_EMISSION: ExecutionIntentEmissionConfig = Object.freeze({
+  ...EMISSION,
+  preflightPairEmissionEnabled: true,
+});
+
+void test('paired emission creates a target and simulation sibling only for finalized OPEN', async () => {
+  const fixture = emissionFixture(Date.now(), 'finalized');
+  const client = new RecordingEmissionClient(fixture.position);
+
+  await emitExecutionIntentInTransaction(client, fixture.result, PAIRED_EMISSION);
+
+  assert.equal(client.intentInserts.length, 2);
+  assert.equal(client.pairInserts.length, 1);
+  const [target, sibling] = client.intentInserts;
+  assert.ok(target);
+  assert.ok(sibling);
+  assert.equal(target[8], 'BUY');
+  assert.equal(sibling[8], 'BUY');
+  assert.notEqual(target[0], sibling[0]);
+  for (const index of [3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]) {
+    assert.equal(sibling[index], target[index], `economic field ${index}`);
+  }
+  const pair = client.pairInserts[0];
+  assert.ok(pair);
+  assert.equal(pair[3], target[0]);
+  assert.equal(pair[4], sibling[0]);
+});
+
+void test('paired emission refuses non-finalized OPEN before writing an intent', async () => {
+  const fixture = emissionFixture(Date.now(), 'confirmed');
+  const client = new RecordingEmissionClient(fixture.position);
+
+  await assert.rejects(
+    emitExecutionIntentInTransaction(client, fixture.result, PAIRED_EMISSION),
+    /finalized/u,
+  );
+  assert.equal(client.intentInserts.length, 0);
+  assert.equal(client.pairInserts.length, 0);
+});
+
+void test('paired emission preserves one canonical SELL and never creates a pair for CLOSE', async () => {
+  const fixture = closeEmissionFixture(Date.now(), 'finalized');
+  const client = new RecordingEmissionClient(fixture.position);
+
+  await emitExecutionIntentInTransaction(client, fixture.result, PAIRED_EMISSION);
+
+  assert.equal(client.intentInserts.length, 1);
+  assert.equal(client.intentInserts[0]?.[8], 'SELL');
+  assert.equal(client.pairInserts.length, 0);
+});
+
+void test('paired emission never retro-forms a pair around a replayed legacy target', async () => {
+  const fixture = emissionFixture(Date.now(), 'finalized');
+  const client = new RecordingEmissionClient(fixture.position, true);
+
+  await emitExecutionIntentInTransaction(client, fixture.result, PAIRED_EMISSION);
+
+  assert.equal(client.intentInserts.length, 1);
+  assert.equal(client.pairInserts.length, 0);
 });
 
 void test('paper decision and neutral intent share rollback, commit, and replay boundaries', async (context) => {
@@ -107,7 +168,10 @@ void test('orphaned paper session evidence cannot emit an execution intent', asy
   });
 });
 
-function emissionFixture(nowMs: number): Readonly<{
+function emissionFixture(
+  nowMs: number,
+  confirmationStatus: 'confirmed' | 'finalized' = 'confirmed',
+): Readonly<{
   readonly result: PaperDecisionResult;
   readonly position: PaperPosition;
 }> {
@@ -125,7 +189,7 @@ function emissionFixture(nowMs: number): Readonly<{
     program: 'pumpfun',
     signature: 'qualification-signature',
     cursor,
-    confirmationStatus: 'confirmed',
+    confirmationStatus,
     blockchainTimeMs: nowMs - 2_000,
     observedAtMs: nowMs - 2_000,
     payloadVersion: 1,
@@ -194,7 +258,7 @@ function emissionFixture(nowMs: number): Readonly<{
     countedTradeIds: Object.freeze([]),
     countedBuyerWallets: Object.freeze([]),
     lastCountedCursor: null,
-    minimumConfirmation: 'confirmed',
+    minimumConfirmation: confirmationStatus,
     lastQuote: buyQuote,
     lastError: null,
     pendingExitReason: null,
@@ -229,7 +293,7 @@ function emissionFixture(nowMs: number): Readonly<{
     purgeAfterMs: null,
     payloadVersion: 1,
   });
-  const sessionEvent = sessionEventFor(session);
+  const sessionEvent = sessionEventFor(session, confirmationStatus);
   const candidateEvent: DomainEvent = Object.freeze({
     ...qualificationEvent,
     id: `evt_${'2'.repeat(64)}`,
@@ -252,9 +316,68 @@ function emissionFixture(nowMs: number): Readonly<{
   });
 }
 
+function closeEmissionFixture(
+  nowMs: number,
+  confirmationStatus: 'confirmed' | 'finalized',
+): ReturnType<typeof emissionFixture> {
+  const open = emissionFixture(nowMs, confirmationStatus);
+  const externalBuyTarget = 3;
+  const session = createCreationEntrySession({
+    candidate: open.result.candidate,
+    state: 'PAPER_CLOSED',
+    reasonCode: 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+    positionId: open.position.id,
+    entryCursor: open.result.candidate.asOf.cursor,
+    externalBuyTarget,
+    externalBuyCount: externalBuyTarget,
+    externalMinimumBuyAmountRaw: 1n,
+    countedTradeIds: Object.freeze(['trade-1', 'trade-2', 'trade-3']),
+    countedBuyerWallets: Object.freeze(['wallet-1', 'wallet-2', 'wallet-3']),
+    lastCountedCursor: null,
+    minimumConfirmation: confirmationStatus,
+    lastQuote: open.result.candidate.reverseSellQuote,
+    lastError: null,
+    pendingExitReason: 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+    pendingExitTriggerAtMs: null,
+    createdAtMs: nowMs - 2_000,
+    updatedAtMs: nowMs,
+    purgeAfterMs: nowMs + 14_400_000,
+  });
+  const position: PaperPosition = Object.freeze({
+    ...open.position,
+    status: 'PAPER_CLOSED',
+    remainingBaseRaw: 0n,
+    quoteProceedsRaw: 800n,
+    grossPnlQuoteRaw: -200n,
+    netPnlQuoteRaw: -205n,
+    exitTradeId: `paper_trade_${'7'.repeat(64)}`,
+    closeCommandHash: `paper_close_command_${'5'.repeat(64)}`,
+    strategySessionId: session.id,
+    closeEventId: `evt_${'2'.repeat(64)}`,
+    closedAtMs: nowMs,
+    purgeAfterMs: nowMs + 14_400_000,
+  });
+  const sessionEvent = sessionEventFor(session, confirmationStatus, true);
+  return Object.freeze({
+    position,
+    result: Object.freeze({
+      ...open.result,
+      session,
+      sessionEvent,
+      requestedAction: 'CLOSE' as const,
+    }),
+  });
+}
+
 function sessionEventFor(
   session: NonNullable<PaperDecisionResult['session']>,
+  confirmationStatus: 'confirmed' | 'finalized',
+  close = false,
 ): DomainEvent {
+  const cursor = close
+    ? Object.freeze({ ...session.entryCursor, slot: session.entryCursor.slot + 1n })
+    : session.entryCursor;
+  const signature = close ? 'close-signature' : 'open-signature';
   const qualifier = `${session.id}:${createHash('sha256')
     .update(canonicalStringifyJson(session))
     .digest('hex')}`;
@@ -264,22 +387,94 @@ function sessionEventFor(
       mint: session.mint,
       source: 'paper-decision',
       program: 'pumpfun',
-      signature: 'open-signature',
-      cursor: session.entryCursor,
+      signature,
+      cursor,
       qualifier,
     }),
     type: 'PaperStrategySessionUpdated',
     mint: session.mint,
     source: 'paper-decision',
     program: 'pumpfun',
-    signature: 'open-signature',
-    cursor: session.entryCursor,
-    confirmationStatus: 'confirmed',
+    signature,
+    cursor,
+    confirmationStatus,
     blockchainTimeMs: session.updatedAtMs,
     observedAtMs: session.updatedAtMs,
     payloadVersion: 1,
     payload: Object.freeze({ session }),
   });
+}
+
+class RecordingEmissionClient {
+  public readonly intentInserts: readonly unknown[][] = [];
+  public readonly pairInserts: readonly unknown[][] = [];
+
+  public constructor(
+    private readonly position: PaperPosition,
+    private readonly replayTarget = false,
+  ) {}
+
+  public release(): void {}
+
+  public async query(
+    text: string,
+    values: readonly unknown[] = [],
+  ): Promise<{ readonly rows: readonly Readonly<Record<string, unknown>>[]; readonly rowCount: number }> {
+    if (text.includes('pg_advisory_xact_lock')) {
+      return { rows: [{}], rowCount: 1 };
+    }
+    if (text.includes('FROM paper_positions')) {
+      return { rows: [{ payload: toJsonValue(this.position) }], rowCount: 1 };
+    }
+    if (text.includes('INSERT INTO execution_intents AS intent')) {
+      (this.intentInserts as unknown[][]).push([...values]);
+      if (this.replayTarget && this.intentInserts.length === 1) {
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [intentRowFromInsert(values)], rowCount: 1 };
+    }
+    if (text.includes('FROM execution_intent_tombstones')) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (text.includes('FROM execution_intents AS intent')) {
+      const target = this.intentInserts[0];
+      if (target === undefined) throw new Error('Target insert was not recorded.');
+      return { rows: [intentRowFromInsert(target)], rowCount: 1 };
+    }
+    if (text.includes('INSERT INTO execution_preflight_intent_pairs AS pair')) {
+      (this.pairInserts as unknown[][]).push([...values]);
+      return { rows: [pairRowFromInsert(values)], rowCount: 1 };
+    }
+    if (text.includes('FROM execution_preflight_intent_pairs AS pair')) {
+      return { rows: [], rowCount: 0 };
+    }
+    throw new Error('Unexpected emission query.');
+  }
+}
+
+function intentRowFromInsert(values: readonly unknown[]): Readonly<Record<string, unknown>> {
+  return {
+    id: values[0], payload_version: values[1], logical_order_key: values[2],
+    strategy_id: values[3], strategy_version: values[4], position_id: values[5],
+    logical_command_id: values[6], mint: values[7], side: values[8], venue_policy: values[9],
+    quote_mint: values[10], quote_token_program: values[11], quote_decimals: values[12],
+    quote_amount_raw: values[13], base_amount_raw: values[14], minimum_amount_out_raw: values[15],
+    decision_event_id: values[16], decision_fingerprint: values[17],
+    requested_at_ms: values[18], expires_at_ms: values[19], status: 'PENDING',
+    attempt_count: 0, state_revision: '0', last_reason_code: null, terminal_at_ms: null,
+    reconciliation_completed_at_ms: null, purge_after_ms: null,
+    created_at_ms: values[18], updated_at_ms: values[18], lease_owner: null,
+    lease_token: null, lease_expires_at_ms: null,
+  };
+}
+
+function pairRowFromInsert(values: readonly unknown[]): Readonly<Record<string, unknown>> {
+  return {
+    pair_id: values[0], payload_version: values[1], pair_fingerprint: values[2],
+    target_intent_id: values[3], simulation_intent_id: values[4],
+    decision_event_id: values[5], decision_fingerprint: values[6],
+    expires_at_ms: String(values[7]),
+  };
 }
 
 async function seedPosition(

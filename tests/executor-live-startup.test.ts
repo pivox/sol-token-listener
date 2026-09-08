@@ -18,9 +18,9 @@ const PUBLIC_KEY = '11111111111111111111111111111111';
 const FINGERPRINT = 'b'.repeat(64);
 
 void test('pins the existing migration catalogue and rejects a changed migration hash', async () => {
-  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 40);
+  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 41);
   assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.at(-1)?.name,
-    '040_execution_worker_live_partition.sql');
+    '041_execution_preflight_intent_pairs.sql');
   await validateLiveExecutorMigrationFiles();
 
   const directory = await mkdtemp(join(tmpdir(), 'executor-live-migrations-'));
@@ -50,7 +50,7 @@ void test('validates role, exact authority, migrations and live bindings without
     assert.deepEqual(evidence, {
       payloadVersion: 1,
       role: 'sol_token_executor_live',
-      migrationHead: '040_execution_worker_live_partition.sql',
+      migrationHead: '041_execution_preflight_intent_pairs.sql',
       generationId: GENERATION_ID,
       providerId: 'primary',
       phase: 'CANARY',
@@ -276,6 +276,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_live_unsigned_simulation_evidence',
     'execution_pre_signature_locks',
     'execution_pre_submission_revocations',
+    'execution_preflight_intent_pair_memberships',
     'execution_provider_rate_limit_events',
     'execution_provider_usage_counters',
     'execution_provider_usage_snapshots',

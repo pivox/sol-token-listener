@@ -405,6 +405,18 @@ ON TABLE execution_intents TO sol_token_listener_writer;
 GRANT SELECT (intent_id,logical_order_key,decision_fingerprint)
 ON TABLE execution_intent_tombstones TO sol_token_listener_writer;
 
+GRANT SELECT (
+  pair_id,payload_version,pair_fingerprint,target_intent_id,simulation_intent_id,
+  decision_event_id,decision_fingerprint,expires_at
+), INSERT (
+  pair_id,payload_version,pair_fingerprint,target_intent_id,simulation_intent_id,
+  decision_event_id,decision_fingerprint,expires_at
+)
+ON TABLE execution_preflight_intent_pairs TO sol_token_listener_writer;
+
+GRANT INSERT (pair_id,intent_id,lane)
+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_listener_writer;
+
 -- Dry-run and simulation-only share this non-signing authority boundary.
 -- Rebuild it from zero on every replay so stale grants cannot expose wallet,
 -- signing, submission, or reconciliation state.
@@ -977,6 +989,9 @@ GRANT SELECT (intent_id), INSERT (
 )
 ON TABLE execution_intent_transitions TO sol_token_executor_worker;
 
+GRANT SELECT (intent_id,lane)
+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_worker;
+
 GRANT SELECT (
   artifact_id,payload_version,specification_version,evaluator_version,intent_id,
   attempt_number,intent_state_revision,strategy_id,strategy_version,decision_fingerprint,
@@ -1305,6 +1320,8 @@ GRANT SELECT ON TABLE
   execution_live_positions,
   execution_live_unsigned_simulation_evidence,
   execution_operator_authorizations,
+  execution_preflight_intent_pair_memberships,
+  execution_preflight_intent_pairs,
   execution_provider_rate_limit_events,
   execution_provider_usage_counters,
   execution_provider_usage_snapshots,
@@ -1385,6 +1402,8 @@ GRANT DELETE ON TABLE
   execution_live_positions,
   execution_live_unsigned_simulation_evidence,
   execution_operator_authorizations,
+  execution_preflight_intent_pair_memberships,
+  execution_preflight_intent_pairs,
   execution_pre_signature_locks,
   execution_provider_rate_limit_events,
   execution_provider_usage_counters,
@@ -1437,6 +1456,21 @@ TO sol_token_retention_worker;
 GRANT INSERT ON TABLE
   execution_risk_tombstones,
   execution_intent_tombstones
+TO sol_token_retention_worker;
+
+GRANT UPDATE (
+  status,last_reason_code,terminal_at,reconciliation_completed_at,purge_after,
+  lease_owner,lease_token,lease_expires_at,updated_at,state_revision
+)
+ON TABLE execution_intents TO sol_token_retention_worker;
+GRANT UPDATE (status,completed_at,reason_code)
+ON TABLE execution_attempts TO sol_token_retention_worker;
+GRANT INSERT (
+  intent_id,previous_status,next_status,reason_code,human_message,
+  activation_phase,attempt_number,evidence,occurred_at
+)
+ON TABLE execution_intent_transitions TO sol_token_retention_worker;
+GRANT USAGE ON SEQUENCE execution_intent_transitions_sequence_seq
 TO sol_token_retention_worker;
 
 GRANT UPDATE (state,terminal_at,purge_after,updated_at,verdict,failure_code,
@@ -1695,6 +1729,9 @@ GRANT SELECT (
   lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
 )
 ON TABLE execution_intents TO sol_token_executor_live;
+
+GRANT SELECT (intent_id,lane)
+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_live;
 
 GRANT SELECT (intent_id), INSERT (
   intent_id,previous_status,next_status,reason_code,human_message,
@@ -2069,6 +2106,9 @@ GRANT SELECT (
   live_reserved
 )
 ON TABLE execution_intents TO sol_token_executor_operations;
+
+GRANT SELECT (intent_id,lane)
+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_operations;
 
 GRANT SELECT (
   generation_id,state_revision,reconciled_capital_lamports,reserved_exposure_raw,

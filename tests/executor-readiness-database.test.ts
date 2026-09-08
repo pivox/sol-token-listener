@@ -40,7 +40,7 @@ void test('evicts every authority drift with a redacted error', async () => {
   for (const changed of [
     { column_privileges: driftedPrivileges() }, { schema_create: true },
     { session_direct_authority_count: '1' }, { effective_table_privilege_count: '1' },
-    { migration_040_present: false }, { readiness_membership: false },
+    { migration_041_present: false }, { readiness_membership: false },
     { membership_count: '2' }, { session_inherit: true },
     { server_version_number: 170_000 },
   ]) {
@@ -131,6 +131,8 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
       await client.query('SELECT version FROM migration_history LIMIT 1');
       for (const statement of [
         'SELECT id FROM execution_intents LIMIT 1',
+        'SELECT pair_id FROM execution_preflight_intent_pairs LIMIT 1',
+        'SELECT intent_id FROM execution_preflight_intent_pair_memberships LIMIT 1',
         'SELECT armament_id FROM execution_activation_armaments LIMIT 1',
         'SELECT signed_transaction_bytes FROM execution_signed_transactions LIMIT 1',
         'INSERT INTO execution_control_state DEFAULT VALUES',
@@ -185,7 +187,7 @@ function validAuthority(): Readonly<Record<string, unknown>> {
     session_direct_authority_count: '0', effective_table_privilege_count: '0',
     column_privileges: JSON.stringify(EXECUTION_READINESS_COLUMN_PRIVILEGES),
     schema_usage: true,
-    schema_create: false, migration_040_present: true,
+    schema_create: false, migration_041_present: true,
     executable_security_definer_count: '0', role_can_set_replication: false,
     session_can_set_replication: false });
 }

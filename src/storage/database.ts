@@ -3,12 +3,15 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import type { PoolClient } from 'pg';
+import { expireExecutionIntentsPreSubmissionInTransaction } from
+  './execution-intent-expiration.js';
 
 type PgPool = InstanceType<typeof pg.Pool>;
 let sharedPool: PgPool | null = null;
 const migrationAdvisoryLockId = 7_347_662_125;
 const PAPER_MVP_RETENTION_FENCE_SQL =
   "SELECT pg_advisory_xact_lock(hashtextextended('paper-mvp-owner-fence:v1', 0))";
+const EXECUTION_INTENT_EXPIRATION_BATCH_SIZE = 1_000;
 
 export function getDatabasePool(
   databaseUrl = process.env.DATABASE_URL,
@@ -152,6 +155,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperDecisionJobs: number;
   readonly paperTrades: number;
   readonly paperPositions: number;
+  readonly executionIntentsExpiredPreSubmission: number;
+  readonly executionPreflightIntentPairMemberships: number;
+  readonly executionPreflightIntentPairs: number;
   readonly executionSubmissionEvents: number;
   readonly executionSignedSimulationEvidence: number;
   readonly executionLiveUnsignedSimulationEvidence: number;
@@ -207,6 +213,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       "SELECT pg_advisory_xact_lock(hashtextextended('foundation-retention-fence:v1', 0))",
     );
     await client.query(PAPER_MVP_RETENTION_FENCE_SQL);
+    const executionIntentsExpiredPreSubmission =
+      await expireExecutionIntentsPreSubmissionInTransaction(
+        client,
+        EXECUTION_INTENT_EXPIRATION_BATCH_SIZE,
+      );
     const socialEvidence = await client.query(
       `DELETE FROM social_verification_evidence evidence
        USING social_evidence_collections collection
@@ -754,9 +765,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const executionRiskTombstones = (reportTombstones.rowCount ?? 0)
       + (reservationTombstones.rowCount ?? 0);
     const executionIntentCohort = await client.query<{ readonly id: string }>(
-      `SELECT intent.id
-       FROM execution_intents intent
-       WHERE intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
+      `WITH eligible AS MATERIALIZED (
+         SELECT intent.id
+         FROM execution_intents intent
+         WHERE intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
          AND intent.terminal_at IS NOT NULL
          AND intent.reconciliation_completed_at IS NOT NULL
          AND intent.purge_after <= $1::TIMESTAMPTZ
@@ -776,20 +788,38 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            SELECT 1 FROM execution_fault_ledger fault
            WHERE fault.intent_id=intent.id
          )
-       ORDER BY intent.id`,
+       ), complete_pairs AS MATERIALIZED (
+         SELECT pair.pair_id
+         FROM execution_preflight_intent_pairs pair
+         JOIN eligible target ON target.id=pair.target_intent_id
+         JOIN eligible simulation ON simulation.id=pair.simulation_intent_id
+         WHERE pair.purge_after <= $1::TIMESTAMPTZ
+       )
+       SELECT eligible.id
+       FROM eligible
+       WHERE NOT EXISTS (
+           SELECT 1 FROM execution_preflight_intent_pair_memberships membership
+           WHERE membership.intent_id=eligible.id
+         ) OR EXISTS (
+           SELECT 1 FROM execution_preflight_intent_pair_memberships membership
+           JOIN complete_pairs pair ON pair.pair_id=membership.pair_id
+           WHERE membership.intent_id=eligible.id
+         )
+       ORDER BY eligible.id`,
       [executionIntentCutoff],
     );
     const executionIntentIds = executionIntentCohort.rows.map(({ id }) => id);
-    await client.query(
-      `INSERT INTO execution_intent_tombstones (
-         intent_id,payload_version,logical_order_key,decision_fingerprint,retired_at
-       )
-       SELECT intent.id,intent.payload_version,intent.logical_order_key,
-         intent.decision_fingerprint,$2::TIMESTAMPTZ
-       FROM execution_intents intent
-       WHERE intent.id = ANY($1::TEXT[])
-       ORDER BY intent.id`,
+    const executionPreflightPairCohort = await client.query<{ readonly pair_id: string }>(
+      `SELECT pair.pair_id
+       FROM execution_preflight_intent_pairs pair
+       WHERE pair.target_intent_id=ANY($1::TEXT[])
+         AND pair.simulation_intent_id=ANY($1::TEXT[])
+         AND pair.purge_after <= $2::TIMESTAMPTZ
+       ORDER BY pair.pair_id`,
       [executionIntentIds, executionIntentCutoff],
+    );
+    const executionPreflightPairIds = executionPreflightPairCohort.rows.map(
+      ({ pair_id }) => pair_id,
     );
     const executionSimulationArtifacts = await client.query(
       `DELETE FROM execution_simulation_artifacts artifact
@@ -810,6 +840,28 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `DELETE FROM execution_attempts attempt
        WHERE attempt.intent_id = ANY($1::TEXT[])`,
       [executionIntentIds],
+    );
+    const executionPreflightIntentPairMemberships = await client.query(
+      `DELETE FROM execution_preflight_intent_pair_memberships membership
+       WHERE membership.pair_id=ANY($1::TEXT[])`,
+      [executionPreflightPairIds],
+    );
+    const executionPreflightIntentPairs = await client.query(
+      `DELETE FROM execution_preflight_intent_pairs pair
+       WHERE pair.pair_id=ANY($1::TEXT[])
+         AND pair.purge_after <= $2::TIMESTAMPTZ`,
+      [executionPreflightPairIds, executionIntentCutoff],
+    );
+    await client.query(
+      `INSERT INTO execution_intent_tombstones (
+         intent_id,payload_version,logical_order_key,decision_fingerprint,retired_at
+       )
+       SELECT intent.id,intent.payload_version,intent.logical_order_key,
+         intent.decision_fingerprint,$2::TIMESTAMPTZ
+       FROM execution_intents intent
+       WHERE intent.id = ANY($1::TEXT[])
+       ORDER BY intent.id`,
+      [executionIntentIds, executionIntentCutoff],
     );
     const executionIntents = await client.query(
       `DELETE FROM execution_intents intent
@@ -1126,6 +1178,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperDecisionJobs: paperDecisionJobs.rowCount ?? 0,
       paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
+      executionIntentsExpiredPreSubmission,
+      executionPreflightIntentPairMemberships:
+        executionPreflightIntentPairMemberships.rowCount ?? 0,
+      executionPreflightIntentPairs: executionPreflightIntentPairs.rowCount ?? 0,
       executionSubmissionEvents: executionSubmissionEvents.rowCount ?? 0,
       executionSignedSimulationEvidence: executionSignedSimulationEvidence.rowCount ?? 0,
       executionLiveUnsignedSimulationEvidence:

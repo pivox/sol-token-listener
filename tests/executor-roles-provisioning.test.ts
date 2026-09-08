@@ -85,6 +85,15 @@ void test('executor role provisioning is explicit, passwordless and least-privil
   assert.match(sql, /GRANT SELECT \([\s\S]*?\), INSERT \([\s\S]*?\)\s+ON TABLE execution_safety_qualifications TO sol_token_executor_operations/iu);
   assert.match(sql, /INSERT \(generation_id\), UPDATE \(state,state_revision,last_event_id,updated_at\)\s+ON TABLE execution_control_state TO sol_token_executor_operations/iu);
   assert.match(sql, /ON TABLE execution_activation_armaments TO sol_token_executor_operations/iu);
+  assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_operations/iu);
+  assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_worker/iu);
+  assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_live/iu);
+  assert.doesNotMatch(sql, /GRANT[^;]*execution_preflight_intent_pairs[^;]*TO sol_token_executor_(?:readiness|live|live_recovery)/iu);
+  assert.doesNotMatch(sql, /GRANT[^;]*execution_preflight_intent_pair[^;]*TO (?:sol_token_operator_reader|sol_token_public_api)/iu);
+  assert.match(sql, /GRANT SELECT ON TABLE[\s\S]*execution_preflight_intent_pair_memberships,[\s\S]*execution_preflight_intent_pairs[\s\S]*TO sol_token_retention_worker/iu);
+  assert.match(sql, /GRANT DELETE ON TABLE[\s\S]*execution_preflight_intent_pair_memberships,[\s\S]*execution_preflight_intent_pairs[\s\S]*TO sol_token_retention_worker/iu);
+  assert.match(sql, /GRANT UPDATE \(status,completed_at,reason_code\)\s+ON TABLE execution_attempts TO sol_token_retention_worker/iu);
+  assert.match(sql, /GRANT INSERT \([^)]+\)\s+ON TABLE execution_intent_transitions TO sol_token_retention_worker/iu);
   assert.doesNotMatch(sql,
     /execution_pre_signature_locks TO sol_token_executor_operations/iu);
   assert.doesNotMatch(sql,
@@ -722,6 +731,8 @@ void test('provisioned retention role runs the complete purge without reading si
       });
       const status = await operationsRepository.readStatus(operationsGenerationId);
       assert.equal(status.controlState, 'ENTRY_STOP');
+      assert.deepEqual((await operationsClient.query(`SELECT intent_id,lane
+        FROM execution_preflight_intent_pair_memberships WHERE FALSE`)).rows, []);
       const stopped = await operationsRepository.setStop({
         payloadVersion: 1,
         commandId: 'command:postgresql-16-operator-hard-stop',
@@ -732,6 +743,7 @@ void test('provisioned retention role runs the complete purge without reading si
       assert.equal(stopped.controlState, 'HARD_STOP');
       for (const forbidden of [
         'SELECT signed_transaction_bytes FROM execution_signed_transactions',
+        'SELECT pair_id FROM execution_preflight_intent_pairs',
         'SELECT unsigned_transaction_bytes FROM execution_pre_signature_locks',
         'UPDATE execution_intents SET status=status WHERE FALSE',
         `UPDATE execution_activation_armaments

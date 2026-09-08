@@ -684,6 +684,18 @@ async function lockedCanaryTarget(
     'purge_after_ms', 'created_at_ms', 'updated_at_ms', 'lease_owner', 'lease_token',
     'lease_expires_at_ms', 'live_reserved',
   ] as const);
+  const pairMembership = await client.query(`SELECT lane
+    FROM execution_preflight_intent_pair_memberships
+    WHERE intent_id=$1`, [intentId]);
+  if (pairMembership.rows.length > 1 || pairMembership.rowCount !== pairMembership.rows.length) {
+    throw failure('INVALID_DATA');
+  }
+  const [membership] = pairMembership.rows;
+  if (membership !== undefined) {
+    const exactMembership = exactRow(membership, ['lane'] as const);
+    if (exactMembership.lane === 'SIMULATION') throw failure('CONFLICT');
+    if (exactMembership.lane !== 'TARGET') throw failure('INVALID_DATA');
+  }
   try {
     const draft = createExecutionIntentDraft({
       strategyId: row.strategy_id,

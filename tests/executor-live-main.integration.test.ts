@@ -84,10 +84,19 @@ const simulationDatabaseAuthoritySpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-05-executor-simulation-database-authority-design.md',
   import.meta.url,
 );
+const canaryIntentPairSpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-05-executor-canary-intent-pair-design.md',
+  import.meta.url,
+);
+const pumpFunArchitectureUrl = new URL(
+  '../docs/architecture/pumpfun-v1.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
+const systemOverviewUrl = new URL('../docs/system-overview.html', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('documents H2d-H2j external evidence without starting a canary',
+void test('documents H2d-H2k external evidence without starting a canary',
   async () => {
   const [
     packageText,
@@ -103,7 +112,10 @@ void test('documents H2d-H2j external evidence without starting a canary',
     preflightDraftSpecification,
     preflightSourceSpecification,
     simulationDatabaseAuthoritySpecification,
+    canaryIntentPairSpecification,
+    pumpFunArchitecture,
     runbook,
+    systemOverview,
     deploymentSmoke,
   ] =
     await Promise.all([
@@ -120,7 +132,10 @@ void test('documents H2d-H2j external evidence without starting a canary',
       readFile(preflightDraftSpecificationUrl, 'utf8'),
       readFile(preflightSourceSpecificationUrl, 'utf8'),
       readFile(simulationDatabaseAuthoritySpecificationUrl, 'utf8'),
+      readFile(canaryIntentPairSpecificationUrl, 'utf8'),
+      readFile(pumpFunArchitectureUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
+      readFile(systemOverviewUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
   const packageJson = JSON.parse(packageText) as {
@@ -153,7 +168,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.20',
+    '**Version de spécification :** 1.12.1',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -164,7 +179,9 @@ void test('documents H2d-H2j external evidence without starting a canary',
       + "#51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations\n"
       + 'hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL\n'
       + 'read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i\n'
-      + 'et autorité PostgreSQL fermée du worker non signant #51-H2j',
+      + 'et autorité PostgreSQL fermée du worker non signant #51-H2j, puis paire\n'
+      + "d'intentions canary non signante #51-H2k-a ; la préparation one-shot\n"
+      + '#51-H2k-b reste à livrer',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
@@ -179,13 +196,23 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.18',
+    '**Version de spécification :** 1.3.1',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.20',
+    '**Version de la spécification parente :** 1.12.1',
     'live parent specification version',
+  );
+  assertContainsExactlyOnce(
+    canaryIntentPairSpecification,
+    '**Version de spécification :** 1.1.2',
+    'canary intent pair specification version',
+  );
+  assertContainsExactlyOnce(
+    canaryIntentPairSpecification,
+    '**Statut :** H2k-a LIVRÉE — H2k-b À LIVRER',
+    'canary intent pair specification status',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
@@ -249,9 +276,37 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.15.1 — 2026-09-05',
+    '**Version :** 1.16.0 — 2026-09-06',
     'runbook version',
   );
+  assertContainsExactlyOnce(
+    pumpFunArchitecture,
+    '**Version :** 1.0.0 — 2026-09-06',
+    'Pump.fun architecture version',
+  );
+  assertContainsExactlyOnce(
+    systemOverview,
+    '<meta name="doc-version" content="1.0.0">',
+    'system overview version',
+  );
+  for (const document of [
+    parentSpecification,
+    liveSpecification,
+    canaryIntentPairSpecification,
+    pumpFunArchitecture,
+    runbook,
+    systemOverview,
+  ]) {
+    assert.match(document, /H2k-a[\s\S]*(?:disponible|livr(?:e|é|ée))/iu);
+    assert.match(document, /H2k-b[\s\S]*(?:reste|prochaine|à livrer)/iu);
+    assert.match(document,
+      /EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED[\s\S]*(?:false|désactivé)/iu);
+    assert.match(document,
+      /migration 041[\s\S]*(?:target|cible)[\s\S]*(?:probe|simulation)/iu);
+    assert.match(document,
+      /(?:expire|expiration)[\s\S]*(?:purge|rétention)[\s\S]*(?:quatre heures|4 h)/iu);
+    assert.match(document, /CANARY_NOT_STARTED/iu);
+  }
   assertContainsExactlyOnce(
     readinessSpecification,
     '**Version de spécification :** 1.0.11',
@@ -404,8 +459,9 @@ void test('documents H2d-H2j external evidence without starting a canary',
   assert.equal((deploymentSmoke.match(/'038_execution_live_rpc_budget\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'039_execution_canary_operator_binding\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'040_execution_worker_live_partition\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'041_execution_preflight_intent_pairs\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );

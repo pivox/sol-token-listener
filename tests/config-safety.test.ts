@@ -7,6 +7,7 @@ import { loadQualificationProfile } from '../src/qualification/qualification-pro
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 import bs58 from 'bs58';
 
+const DEFAULT_WSOL_FOR_TEST = 'So11111111111111111111111111111111111111112';
 const base = {
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
@@ -277,6 +278,60 @@ void test('execution intent emission is disabled by default and restricted to pa
   }), /EXECUTION_INTENT_EMISSION_ENABLED.*paper/u);
 });
 
+void test('execution preflight pair emission is closed by default and requires finalized paper intent emission', () => {
+  assert.equal(parseConfig(base).executionPreflightPairEmissionEnabled, false);
+
+  const enabled = parseConfig({
+    ...base,
+    EXECUTION_MODE: 'paper',
+    EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+    EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED: 'true',
+    PAPER_MINIMUM_CONFIRMATION: 'finalized',
+  });
+  assert.equal(enabled.executionPreflightPairEmissionEnabled, true);
+
+  for (const environment of [
+    {
+      EXECUTION_MODE: 'observe',
+      EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+      EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED: 'true',
+      PAPER_MINIMUM_CONFIRMATION: 'finalized',
+    },
+    {
+      EXECUTION_MODE: 'paper',
+      EXECUTION_INTENT_EMISSION_ENABLED: 'false',
+      EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED: 'true',
+      PAPER_MINIMUM_CONFIRMATION: 'finalized',
+    },
+    {
+      EXECUTION_MODE: 'paper',
+      EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+      EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED: 'true',
+      PAPER_MINIMUM_CONFIRMATION: 'confirmed',
+    },
+    {
+      EXECUTION_MODE: 'paper',
+      EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+      EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED: 'true',
+      PAPER_MINIMUM_CONFIRMATION: 'finalized',
+      PAPER_QUOTE_MINT_ALLOWLIST: `${DEFAULT_WSOL_FOR_TEST},11111111111111111111111111111111`,
+    },
+    {
+      EXECUTION_MODE: 'paper',
+      EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+      EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED: 'true',
+      PAPER_MINIMUM_CONFIRMATION: 'finalized',
+      WSOL_MINT: '11111111111111111111111111111111',
+      PAPER_QUOTE_MINT_ALLOWLIST: '11111111111111111111111111111111',
+    },
+  ] as const) {
+    assert.throws(
+      () => parseConfig({ ...base, ...environment }),
+      /EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED|EXECUTION_INTENT_EMISSION_ENABLED/u,
+    );
+  }
+});
+
 void test('la stratégie paper end-to-end est strictement désactivée par défaut', () => {
   const config = parseConfig(base);
   assert.deepEqual({
@@ -472,6 +527,7 @@ void test('le modèle d’environnement publie la stratégie paper inactive et s
     'CREATION_ENTRY_MAX_SLOT_LAG=32', 'EXTERNAL_UNIQUE_BUYERS_TARGET=10',
     'EXTERNAL_MIN_BUY_AMOUNT_RAW=', 'CREATION_TAKE_PROFIT_MULTIPLIER_BPS=20000',
     'CREATION_MANUAL_KILL_SWITCH=false',
+    'EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
 });
 

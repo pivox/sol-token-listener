@@ -5,7 +5,12 @@ import test from 'node:test';
 import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
-import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
+import {
+  createExecutionIntentInTransaction,
+  PostgresExecutionIntentRepository,
+} from '../src/storage/execution-intent.repository.js';
+import { createExecutionPreflightIntentPairInTransaction } from
+  '../src/storage/execution-preflight-intent-pair.repository.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
@@ -70,7 +75,14 @@ void test('listener provisioning rebuilds one closed non-live database authority
   }
   assert.match(sql, /GRANT USAGE ON SEQUENCE\s+api_event_stream_sequence_seq,\s+paper_decision_claim_scan_generation_seq\s+TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT \([^)]+\), INSERT \([^)]+\)\s+ON TABLE execution_intents TO sol_token_listener_writer/iu);
+  const intentGrant = /GRANT SELECT \(([^)]+)\), INSERT \([^)]+\)\s+ON TABLE execution_intents TO sol_token_listener_writer/iu
+    .exec(sql)?.[1] ?? '';
+  assert.doesNotMatch(intentGrant, /\blive_reserved\b/iu);
   assert.match(sql, /GRANT SELECT \([^)]+\)\s+ON TABLE execution_intent_tombstones TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT SELECT \([^)]+\), INSERT \([^)]+\)\s+ON TABLE execution_preflight_intent_pairs TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT INSERT \(pair_id,intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_listener_writer/iu);
+  assert.doesNotMatch(sql,
+    /GRANT[^;]*\b(?:UPDATE|DELETE)\b[^;]*execution_preflight_intent_pair[^;]*TO sol_token_listener_writer/iu);
   for (const table of FORBIDDEN_EXECUTION_TABLES) {
     assert.doesNotMatch(sql, new RegExp(`GRANT[^;]*\\b${table}\\b[^;]*TO sol_token_listener_writer`, 'iu'));
   }
@@ -221,6 +233,40 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       }));
       assert.equal((await intentRepository.create(intentDraft)).kind, 'CREATED');
       assert.equal((await intentRepository.create(intentDraft)).kind, 'REPLAYED');
+      const pairedTarget = createExecutionIntentDraft(Object.freeze({
+        strategyId: 'creation-entry-v1', strategyVersion: 1,
+        positionId: `position-pair-${suffix}`,
+        logicalCommandId: `paper_open_${'a'.repeat(64)}`,
+        mint: '11111111111111111111111111111111', side: 'BUY',
+        venuePolicy: 'PUMP_FUN_ONLY',
+        quoteMint: 'So11111111111111111111111111111111111111112',
+        quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+        quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+        decisionEventId: `decision-pair-${suffix}`,
+        decisionFingerprint: 'e'.repeat(64),
+        requestedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+      }));
+      const pairClient = await listener.connect();
+      let pairCommitted = false;
+      let pairResult:
+        Awaited<ReturnType<typeof createExecutionPreflightIntentPairInTransaction>> | undefined;
+      try {
+        await pairClient.query('BEGIN');
+        assert.equal((await createExecutionIntentInTransaction(pairClient, pairedTarget)).kind,
+          'CREATED');
+        pairResult = await createExecutionPreflightIntentPairInTransaction(pairClient, pairedTarget);
+        await pairClient.query('COMMIT');
+        pairCommitted = true;
+      } finally {
+        if (!pairCommitted) await pairClient.query('ROLLBACK');
+        pairClient.release();
+      }
+      assert.ok(pairResult !== undefined);
+      assert.equal(pairResult.kind, 'CREATED');
+      assert.deepEqual((await isolated.query(`SELECT lane FROM
+        execution_preflight_intent_pair_memberships WHERE pair_id=$1 ORDER BY lane`, [
+        pairResult.pair.pairId,
+      ])).rows, [{ lane: 'SIMULATION' }, { lane: 'TARGET' }]);
       const executionRelations = await listener.query<{
         readonly relation_name: string;
         readonly table_allowed: boolean;
@@ -238,7 +284,9 @@ void test('PostgreSQL 16 listener login can write business projections but no li
         && executionRelations.rowCount >= FORBIDDEN_EXECUTION_TABLES.length + 2);
       for (const row of executionRelations.rows) {
         if (row.relation_name === 'execution_intents'
-          || row.relation_name === 'execution_intent_tombstones') {
+          || row.relation_name === 'execution_intent_tombstones'
+          || row.relation_name === 'execution_preflight_intent_pairs'
+          || row.relation_name === 'execution_preflight_intent_pair_memberships') {
           assert.equal(row.table_allowed, false, row.relation_name);
           assert.equal(row.column_allowed, true, row.relation_name);
         } else {
@@ -267,6 +315,9 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       )).rows[0]?.allowed, true);
       assert.equal((await listener.query<{ readonly allowed: boolean }>(
         `SELECT has_column_privilege(current_user,'execution_intents','status','UPDATE') AS allowed`,
+      )).rows[0]?.allowed, false);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_column_privilege(current_user,'execution_intents','live_reserved','SELECT') AS allowed`,
       )).rows[0]?.allowed, false);
       const privateTypeOid = (await isolated.query<{ readonly oid: string }>(
         `SELECT format('%s',type.oid) AS oid FROM pg_type type

@@ -258,6 +258,7 @@ export function createProductionListenerRuntime(
       quoteMintAllowlist: config.paperQuoteMintAllowlist,
       wsolMint: config.wsolMint,
       maximumQuoteAgeMs: config.paperQuoteMaxAgeMs,
+      preflightPairEmissionEnabled: config.executionPreflightPairEmissionEnabled,
     }) : null,
   }, qualificationProfile);
   const qualificationEngine = new QualificationEngine(qualificationProfile);

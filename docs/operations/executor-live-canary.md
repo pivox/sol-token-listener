@@ -1,12 +1,12 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.15.1 — 2026-09-05
+**Version :** 1.16.0 — 2026-09-06
 
-La version 1.15.1 fixe la commande canonique du provisioning H2j et son contrôle
-post-exécution. La version 1.15.0 fermait le replay après renommage du rôle
-worker. La version 1.14.0 finalisait les corrections P1/P2/P3 de la partition RLS.
-La version 1.13.0 avait ajouté cette partition et porté le head de migration à
-040. Le canary reste non démarré.
+La version 1.16.0 constate H2k-a disponible : la paire target/probe est durable,
+ses claims et sa promotion live sont séparés et le head de migration est 041.
+Le flag reste désactivé et H2k-b reste à livrer. La version 1.15.1 fixait la
+commande canonique du provisioning H2j et son contrôle post-exécution. Le
+canary reste non démarré.
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -20,7 +20,9 @@ dans un paquet atomique. #51-H2g assemble son draft depuis deux artefacts
 canoniques protégés, sans accès DB ou réseau. #51-H2h exporte sa source depuis
 une photographie PostgreSQL read-only. #51-H2i ferme l'autorité PostgreSQL du
 listener paper qui produit l'intention canary normale. #51-H2j ferme celle du
-worker commun aux modes `dry-run` et `simulation-only`. Ces livraisons
+worker commun aux modes `dry-run` et `simulation-only`. #51-H2k-a ajoute la
+paire durable entre la cible canary et son probe de simulation sans les
+exécuter. H2k-b ajoutera la préparation one-shot exacte. Ces livraisons
 préparent un preflight externe sans armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
@@ -127,7 +129,7 @@ Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
 - H2b : login membre uniquement de `sol_token_executor_live`, keypair externe
   `0400` ou `0600`, `EXECUTOR_MODE=live` et activation explicite.
 
-Après la migration 040, l'administrateur rejoue
+Après les migrations 040 et 041, l'administrateur rejoue
 `scripts/provision-executor-roles.sql`. Chaque login doit être `NOINHERIT`, ne
 recevoir qu'un seul rôle de groupe avec `ADMIN FALSE, INHERIT FALSE, SET TRUE`,
 et ne posséder aucun objet. Les processus forcent `SET ROLE`,
@@ -255,6 +257,49 @@ et le rôle canonique reçoit les cinq policies finales. Les guards enfants sont
 `BYPASSRLS` constituent une limite de confiance intentionnelle réservée à
 l'administration. Le déni de service pré-promotion reste possible, sans
 capacité de signature ni de soumission.
+
+## Activer l'émission H2k-a uniquement après déploiement contrôlé
+
+H2k-a est disponible après merge, mais sa configuration sûre reste :
+
+```dotenv
+EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false
+```
+
+La valeur `true` n'est acceptée qu'avec `EXECUTION_MODE=paper`,
+`EXECUTION_INTENT_EMISSION_ENABLED=true`, l'allowlist quote limitée à WSOL/SPL
+Token 9 décimales et `PAPER_MINIMUM_CONFIRMATION=finalized`. Avant toute
+activation, appliquer la migration 041, rejouer le provisioning des rôles et
+redémarrer le listener H2i. L'activation ne lance ni le worker H2j, ni H2h, ni
+un runtime live, et ne provoque aucun appel RPC supplémentaire.
+
+Pour chaque nouvel OPEN admissible, une transaction atomique persiste :
+
+1. la cible `TARGET`, BUY `paper_open_…`, qui reste `PENDING`, tentative zéro,
+   sans lease et `live_reserved=false` ;
+2. le probe `SIMULATION`, BUY `execution_preflight_probe_…`, économiquement et
+   causalement identique mais doté d'une identité distincte ;
+3. la paire append-only et ses deux memberships uniques.
+
+Le claim générique `EXECUTE` de `simulation-only` exclut la cible et peut
+consommer seulement le probe. Le `dry-run` reste non consommant. Un trigger
+PostgreSQL interdit de promouvoir le probe vers `live_reserved=true`, et le
+repository opérations refuse aussi ce probe comme cible H2c. Les intentions
+historiques non appairées restent compatibles.
+
+À expiration, le job de rétention fait passer par lots les intentions encore
+pré-signature vers `EXPIRED`, avec transition persistée. La purge de la paire
+attend `expires_at + 4 hours` ainsi que le `purge_after` de chaque parent
+terminal et réconcilié, soit quatre heures après sa terminalisation. Elle
+supprime ensuite enfants, memberships, paire et parents dans l'ordre des FK et
+conserve les tombstones anti-rejeu.
+
+H2k-a ne choisit pas la prochaine paire, n'exécute pas ses deux lanes et ne
+produit pas de manifeste pour H2h. La commande one-shot, la sélection exacte et
+le handoff H2h v2 appartiennent à la prochaine PR H2k-b. Jusqu'à sa livraison,
+conserver le flag à `false`. H2k-a n'ajoute aucun wallet, keypair, signer,
+armement, byte signé ou transport de soumission ; le constat reste
+`CANARY_NOT_STARTED`.
 
 ## Produire la preuve Helius H2e
 
@@ -435,7 +480,7 @@ un armement ou un verdict de sécurité économique.
    atomiques ; tout écart laisse zéro capacité live.
 10. Seulement après inspection humaine de l'armement, démarrer H2a avec son
    environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
-   migration 040, génération, genesis, les huit limites runtime exactes et
+   migration 041, génération, genesis, les huit limites runtime exactes et
    absence d'état incohérent avant de charger le signer. Il ne doit traiter
    que la cible armée, y compris après redémarrage sur un artefact persisté.
 11. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
@@ -624,8 +669,12 @@ La transaction de purge prend d'abord le verrou advisory
 cohortes à la fois, sans `SELECT ... FOR UPDATE` et sans droit de mise à jour
 sur les états live/risk. Les seuls `UPDATE` accordés au rôle sont les colonnes
 que la rétention remet effectivement à zéro ou terminalise dans
-`paper_mvp_runs`, `listener_websocket_health`, `chain_transaction_inbox` et
-`api_event_stream_state`.
+`execution_intents`, `execution_attempts`, `paper_mvp_runs`,
+`listener_websocket_health`, `chain_transaction_inbox` et
+`api_event_stream_state`. Pour H2k-a, elle expire d'abord les intentions
+pré-signature échues, puis ne purge une paire que lorsque target et probe sont
+tous deux terminaux, réconciliés, sans lease et arrivés au terme de leur fenêtre
+de quatre heures.
 
 La purge supprime après quatre heures, par cohorte et dans l'ordre enfant
 d'abord, uniquement :

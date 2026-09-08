@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.18
+**Version de spécification :** 1.3.1
 
-**Version de la spécification parente :** 1.11.20
+**Version de la spécification parente :** 1.12.1
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,15 @@
 
 ## Historique des versions
 
+- **1.3.1 — 2026-09-06 :** constate H2k-a disponible derrière
+  `EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false`. La migration 041 lie une
+  cible target pristine à un probe de simulation économiquement identique,
+  sépare leurs claims et interdit au probe la promotion live. L'expiration et
+  la purge coordonnée attendent quatre heures ; H2k-b reste à livrer et l'état
+  demeure `CANARY_NOT_STARTED`.
+- **1.3.0 — 2026-09-05 :** spécifie H2k : la cible canary pristine est liée
+  atomiquement à un sibling distinct utilisé par la simulation non signée,
+  avant une préparation one-shot sans capacité live.
 - **1.2.18 — 2026-09-05 :** rend canonique l'exécution hermétique du
   provisioning H2j et son contrôle post-exécution 5/5 mono-OID.
 - **1.2.17 — 2026-09-05 :** ferme le replay H2j d'un rôle renommé par

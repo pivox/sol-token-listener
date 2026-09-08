@@ -134,6 +134,9 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '7' }], rowCount: 1 };
       }
+      if (text.includes('AS expired_count FROM updated')) {
+        return { rows: [{ expired_count: 0 }], rowCount: 1 };
+      }
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -160,6 +163,9 @@ void test('la purge retire les projections participants expirées avant leurs é
       }
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '0' }], rowCount: 1 };
+      }
+      if (text.includes('AS expired_count FROM updated')) {
+        return { rows: [{ expired_count: 0 }], rowCount: 1 };
       }
       if (text.includes('DELETE FROM creator_profiles')) return { rows: [], rowCount: 1 };
       if (text.includes('DELETE FROM observed_wallet_positions')) return { rows: [], rowCount: 2 };
@@ -295,6 +301,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '038_execution_live_rpc_budget.sql',
       '039_execution_canary_operator_binding.sql',
       '040_execution_worker_live_partition.sql',
+      '041_execution_preflight_intent_pairs.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
