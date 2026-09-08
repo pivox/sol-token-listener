@@ -89,8 +89,10 @@ void test('rejects proxied native frames and inherited application getters witho
     const native = new MessageEvent('message', {
       data: JSON.stringify({ jsonrpc: '2.0', id: 1, result: 101 }),
     });
+    const revoked = Proxy.revocable(native, {});
+    revoked.revoke();
 
-    for (const frame of [inherited, new Proxy(native, {})]) {
+    for (const frame of [inherited, new Proxy(native, {}), revoked.proxy]) {
       const socket = new FakeWebSocket();
       const scheduler = new ManualScheduler();
       const opening = openWsProgramSession(

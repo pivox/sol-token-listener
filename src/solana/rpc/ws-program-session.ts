@@ -500,7 +500,7 @@ function parsePayload(event: unknown): unknown {
 }
 
 function frameData(event: unknown): unknown {
-  if (typeof event !== 'object' || event === null || Array.isArray(event) || isProxy(event)) {
+  if (typeof event !== 'object' || event === null || isProxy(event) || Array.isArray(event)) {
     return undefined;
   }
   const own = ownField(event, 'data');
