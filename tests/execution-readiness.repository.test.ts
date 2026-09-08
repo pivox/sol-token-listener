@@ -71,21 +71,22 @@ void test('reads risk state after a blocked generation writer under repeatable r
       const writer = await pool.connect();
       const repeatablePool = new pg.Pool({ connectionString: url,
         options: `-c search_path=${schema}`, max: 1 });
-      let generationLockDispatchedResolve: (() => void) | undefined;
-      const generationLockDispatched = new Promise<void>((resolve) => {
-        generationLockDispatchedResolve = resolve;
+      let readinessBackendPidResolve: ((processId: number) => void) | undefined;
+      const readinessBackendPid = new Promise<number>((resolve) => {
+        readinessBackendPidResolve = resolve;
       });
       const repeatableSource: ExecutionRiskPool = { async connect() {
         const client = await repeatablePool.connect();
         await client.query(`SET SESSION CHARACTERISTICS AS TRANSACTION
           ISOLATION LEVEL REPEATABLE READ`);
+        const processId = (await client.query<{ readonly pid: number }>(
+          'SELECT pg_backend_pid() AS pid',
+        )).rows[0]?.pid;
+        if (processId === undefined) assert.fail('Readiness backend PID is unavailable.');
+        readinessBackendPidResolve?.(processId);
         return {
           query: (text, values) => {
-            const pending = client.query(text, values === undefined ? undefined : [...values]);
-            if (text.includes('hashtextextended($1, 51005)')) {
-              generationLockDispatchedResolve?.();
-            }
-            return pending;
+            return client.query(text, values === undefined ? undefined : [...values]);
           },
           release: (evict = false) => { client.release(evict); },
         };
@@ -97,7 +98,7 @@ void test('reads risk state after a blocked generation writer under repeatable r
         await writer.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
           [input.generation.generationId]);
         const commit = new PostgresExecutionReadinessRepository(repeatableSource).commit(input);
-        await generationLockDispatched;
+        await waitForLock(pool, await readinessBackendPid);
         await writer.query(`UPDATE execution_wallet_risk_state
           SET state_revision=1 WHERE generation_id=$1`, [input.generation.generationId]);
         await writer.query('COMMIT');
@@ -256,6 +257,20 @@ function databaseUrl(context: Readonly<{ skip(message?: string): void }>): strin
   if (value !== undefined && value.trim().length > 0) return value;
   context.skip('TEST_DATABASE_URL absent: readiness repository integration skipped');
   return null;
+}
+
+async function waitForLock(
+  admin: InstanceType<typeof pg.Pool>, processId: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const row = (await admin.query<{ readonly wait_event_type: string | null }>(
+      'SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [processId],
+    )).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+  }
+  assert.fail('Readiness did not wait for the generation advisory lock.');
 }
 
 async function withSchema(
