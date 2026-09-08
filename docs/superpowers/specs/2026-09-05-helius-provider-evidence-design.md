@@ -128,7 +128,8 @@ La variante historique contient :
 La variante observée le 8 septembre 2026 contient les mêmes quatre compteurs
 globaux et `subscriptionDetails`, avec :
 
-- `subscriptionDetails.billingCycle=null` ;
+- `subscriptionDetails.billingCycle` comme cycle informatif valide ou `null`
+  pour un plan sans facturation ;
 - `creditCycle.start|end` comme bornes calendaires effectives ;
 - `credits` avec exactement `rpc`, `enhancedApi`, `walletApi`, `das`,
   `webhooks`, `laserstreamGrpc`, `laserstreamWebsocket`, `preConfirmations`,
@@ -138,6 +139,9 @@ globaux et `subscriptionDetails`, avec :
   `photon` et `other` ;
 - `dataTransfer` avec exactement `laserstreamGrpc` et
   `laserstreamWebsocket`.
+
+`creditCycle` est toujours la période autoritative de la variante courante,
+même lorsque le cycle informatif de facturation est présent et différent.
 
 Tous les compteurs doivent être des entiers JSON sûrs et positifs ou nuls.
 Les champs inconnus sont refusés afin qu'une dérive du contrat soit visible.
