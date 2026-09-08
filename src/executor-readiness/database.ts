@@ -133,8 +133,9 @@ export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
     AS column_privileges,
   has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
   has_schema_privilege(current_user,'public','CREATE') AS schema_create,
-  EXISTS(SELECT 1 FROM migration_history WHERE version='041_execution_preflight_intent_pairs.sql')
-    AS migration_041_present,
+  EXISTS(SELECT 1 FROM migration_history
+    WHERE version='042_execution_preflight_intent_preparation.sql')
+    AS migration_042_present,
   (SELECT COUNT(*)::TEXT FROM pg_proc routine
     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
     WHERE namespace.nspname NOT IN ('pg_catalog','information_schema')
@@ -225,7 +226,7 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
     && sameKeys(row, [
       'column_privileges', 'current_role', 'effective_table_privilege_count',
       'executable_security_definer_count', 'membership_admin', 'membership_count',
-      'membership_inherit', 'membership_set', 'migration_041_present',
+      'membership_inherit', 'membership_set', 'migration_042_present',
       'readiness_membership', 'role_bypass_rls', 'role_can_set_replication',
       'role_createdb', 'role_createrole', 'role_inherit', 'role_login',
       'role_parent_count', 'role_replication', 'role_super', 'schema_create',
@@ -254,7 +255,7 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
     && row.effective_table_privilege_count === '0'
     && validColumnPrivileges(row.column_privileges)
     && row.schema_usage === true && row.schema_create === false
-    && row.migration_041_present === true
+    && row.migration_042_present === true
     && row.executable_security_definer_count === '0'
     && row.role_can_set_replication === false && row.session_can_set_replication === false;
 }

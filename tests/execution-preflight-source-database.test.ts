@@ -179,7 +179,7 @@ function validAuthority(): Readonly<Record<string, unknown>> {
     intent_columns: JSON.stringify(EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS.map(
       (column) => ['sol_token_operator_reader', 'public', column, 'SELECT'],
     )),
-    schema_usage: true, schema_create: false, migration_041_present: true,
+    schema_usage: true, schema_create: false, migration_042_present: true,
     executable_security_definer_count: '0', role_can_set_replication: false,
     session_can_set_replication: false });
 }

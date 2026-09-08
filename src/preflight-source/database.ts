@@ -137,8 +137,9 @@ export const EXECUTION_PREFLIGHT_SOURCE_AUTHORITY_SQL = `SELECT
       AND privilege.table_name='execution_intents') AS intent_columns,
   has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
   has_schema_privilege(current_user,'public','CREATE') AS schema_create,
-  EXISTS(SELECT 1 FROM migration_history WHERE version='041_execution_preflight_intent_pairs.sql')
-    AS migration_041_present,
+  EXISTS(SELECT 1 FROM migration_history
+    WHERE version='042_execution_preflight_intent_preparation.sql')
+    AS migration_042_present,
   (SELECT COUNT(*)::TEXT FROM pg_proc routine
     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
     WHERE namespace.nspname NOT IN ('pg_catalog','information_schema') AND routine.prosecdef
@@ -218,7 +219,7 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
   return row !== undefined && sameKeys(row, [
     'creatable_schema_count', 'current_role', 'executable_security_definer_count', 'intent_columns',
     'membership_admin', 'membership_count', 'membership_inherit', 'membership_set',
-    'migration_041_present', 'mutation_privilege_count', 'reader_membership',
+    'migration_042_present', 'mutation_privilege_count', 'reader_membership',
     'role_bypass_rls', 'role_can_set_replication', 'role_createdb', 'role_createrole',
     'role_database_create', 'role_inherit', 'role_login', 'role_owned_object_count',
     'role_parameter_authority_count', 'role_parent_count', 'role_replication', 'role_super',
@@ -255,7 +256,7 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
     && validPrivileges(row.intent_columns, EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS.map(
       (column) => [EXECUTION_PREFLIGHT_SOURCE_ROLE, 'public', column, 'SELECT'] as const))
     && row.schema_usage === true && row.schema_create === false
-    && row.migration_041_present === true && row.executable_security_definer_count === '0'
+    && row.migration_042_present === true && row.executable_security_definer_count === '0'
     && row.role_can_set_replication === false && row.session_can_set_replication === false;
 }
 function sameKeys(value: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean {

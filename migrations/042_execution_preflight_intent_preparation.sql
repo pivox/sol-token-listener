@@ -300,6 +300,8 @@ CREATE TRIGGER execution_preflight_intent_preparation_run_guard
 BEFORE INSERT OR UPDATE ON execution_preflight_intent_preparation_runs
 FOR EACH ROW EXECUTE FUNCTION guard_execution_preflight_intent_preparation_run();
 
+REVOKE ALL ON FUNCTION guard_execution_preflight_intent_preparation_run() FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION guard_execution_preflight_intent_preparation_run_delete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -322,3 +324,5 @@ ON execution_preflight_intent_preparation_runs;
 CREATE TRIGGER execution_preflight_intent_preparation_run_delete_guard
 BEFORE DELETE ON execution_preflight_intent_preparation_runs
 FOR EACH ROW EXECUTE FUNCTION guard_execution_preflight_intent_preparation_run_delete();
+
+REVOKE ALL ON FUNCTION guard_execution_preflight_intent_preparation_run_delete() FROM PUBLIC;

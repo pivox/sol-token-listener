@@ -460,8 +460,9 @@ void test('documents H2d-H2k external evidence without starting a canary',
   assert.equal((deploymentSmoke.match(/'039_execution_canary_operator_binding\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'040_execution_worker_live_partition\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'041_execution_preflight_intent_pairs\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'042_execution_preflight_intent_preparation\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n {2}'042_execution_preflight_intent_preparation\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );

@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '032_execution_dry_run_assessments.sql';
 const simulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '041_execution_preflight_intent_pairs.sql';
+const latestMigrationName = '042_execution_preflight_intent_preparation.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
