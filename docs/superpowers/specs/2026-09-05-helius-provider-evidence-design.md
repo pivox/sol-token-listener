@@ -1,10 +1,10 @@
 # Preuve de quota Helius pour le préflight externe — conception #51-H2e
 
-**Version de spécification :** 1.0.6
+**Version de spécification :** 1.1.0
 
 **Version de la spécification parente :** 1.11.13
 
-**Date :** 2026-09-05
+**Date :** 2026-09-08
 
 **Statut :** APPROUVÉE — producteur externe non transactionnel
 
@@ -13,6 +13,11 @@
 **Dépendance :** #51-H2d fusionnée par la PR #80 (`e854c26`)
 
 ## Historique des versions
+
+- **1.1.0 — 2026-09-08 :** accepte de façon fail-closed les deux contrats
+  Admin API observés : le contrat historique `usage` et le contrat courant
+  `creditCycle + credits + requests + dataTransfer`. Les deux formes sont
+  normalisées vers le même snapshot canonique sans exposer les quotas bruts.
 
 - **1.0.6 — 2026-09-05 :** référence H2g comme validateur offline de la
   liaison du snapshot provider exporté vers la qualification.
@@ -104,9 +109,12 @@ L'origine réseau est fixée dans le code à
 La clé API est envoyée dans l'en-tête `X-Api-Key`, jamais dans l'URL ou les
 logs. Le projet doit correspondre à cette clé ; Helius refuse le désaccord.
 
-## 5. Contrat Helius et conversion entière
+## 5. Contrats Helius et conversion entière
 
-La réponse acceptée contient exactement les champs utiles documentés :
+Le producteur reconnaît exactement deux variantes complètes. Il refuse les
+formes hybrides, les clés inconnues et les objets partiels.
+
+La variante historique contient :
 
 - `creditsRemaining` ;
 - `creditsUsed` ;
@@ -116,6 +124,20 @@ La réponse acceptée contient exactement les champs utiles documentés :
 - `subscriptionDetails.creditsLimit` ;
 - `subscriptionDetails.billingCycle.start|end` ;
 - la ventilation `usage` connue.
+
+La variante observée le 8 septembre 2026 contient les mêmes quatre compteurs
+globaux et `subscriptionDetails`, avec :
+
+- `subscriptionDetails.billingCycle=null` ;
+- `creditCycle.start|end` comme bornes calendaires effectives ;
+- `credits` avec exactement `rpc`, `enhancedApi`, `walletApi`, `das`,
+  `webhooks`, `laserstreamGrpc`, `laserstreamWebsocket`, `preConfirmations`,
+  `preprocessedTransactions`, `archival`, `photon` et `other` ;
+- `requests` avec exactement `rpc`, `enhancedApi`, `walletApi`, `das`,
+  `webhooks`, `preConfirmations`, `preprocessedTransactions`, `archival`,
+  `photon` et `other` ;
+- `dataTransfer` avec exactement `laserstreamGrpc` et
+  `laserstreamWebsocket`.
 
 Tous les compteurs doivent être des entiers JSON sûrs et positifs ou nuls.
 Les champs inconnus sont refusés afin qu'une dérive du contrat soit visible.
@@ -128,7 +150,7 @@ limitUnits = creditsUsed + creditsRemaining + prepaidCreditsRemaining
 
 Cette formule représente l'enveloppe totale actuellement consommée ou encore
 disponible, y compris les crédits prépayés. Elle ne mélange pas les compteurs
-de requêtes par produit avec les unités de crédit.
+de requêtes, de crédits par produit ou de transfert avec les unités globales.
 
 Le `billingPeriodId` lie le fournisseur, le fingerprint du projet et les deux
 bornes UTC du cycle. Le projet UUID n'est pas écrit dans le manifeste stdout.
