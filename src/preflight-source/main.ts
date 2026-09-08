@@ -8,8 +8,8 @@ import { parseExecutionPreflightSourceConfig } from './config.js';
 import {
   openExecutionPreflightSourceDatabase,
 } from './database.js';
-import type { ExecutionPreflightDraftSourceV1 } from '../domain/execution-preflight-draft.js';
-import type { ExecutionPreflightSourceRequestV1 } from './repository.js';
+import type { ExecutionPreflightDraftSourceV2 } from '../domain/execution-preflight-draft.js';
+import type { ExecutionPreflightSourceRequestV2 } from './repository.js';
 import { createExecutionPreflightSourceExport } from './service.js';
 
 export async function writeAtomicPreflightSource(
@@ -58,13 +58,13 @@ export async function assertExternalPreflightSourcePath(
 export async function runExecutionPreflightSourceCommand(
   database: Readonly<{
     repository: Readonly<{
-      export: (request: ExecutionPreflightSourceRequestV1) =>
-      Promise<ExecutionPreflightDraftSourceV1>;
+      export: (request: ExecutionPreflightSourceRequestV2) =>
+      Promise<ExecutionPreflightDraftSourceV2>;
     }>;
     evict: () => void;
     close: () => Promise<void>;
   }>,
-  request: ExecutionPreflightSourceRequestV1,
+  request: ExecutionPreflightSourceRequestV2,
   outputPath: string,
   publish: (path: string, content: string) => Promise<void> = writeAtomicPreflightSource,
   assertReadyToPublish: () => void = () => undefined,
@@ -89,8 +89,7 @@ export async function main(): Promise<void> {
   const database = openExecutionPreflightSourceDatabase({ databaseUrl: config.databaseUrl,
     statementTimeoutMs: 10_000, onIdleError: () => { idleState.failed = true; } });
   const manifest = await runExecutionPreflightSourceCommand(database,
-    { generationId: config.generationId, targetIntentId: config.targetIntentId,
-      simulationArtifactId: config.simulationArtifactId }, config.outputPath,
+    { preparationRunId: config.preparationRunId }, config.outputPath,
     writeAtomicPreflightSource, () => { if (idleState.failed) throw new TypeError(); });
   process.stdout.write(`${manifest}\n`);
 }

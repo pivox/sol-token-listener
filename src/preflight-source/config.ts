@@ -1,13 +1,11 @@
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path';
 import { isProxy } from 'node:util/types';
 
-const FORBIDDEN_KEY = /(?:SOLANA_(?:HTTP|WS)_RPC_URL|HELIUS_|PRIVATE_KEY|SECRET_KEY|KEYPAIR|MNEMONIC|RECOVERY_PHRASE|WALLET|PUBLIC_KEY|LIVE_TRADING_ENABLED|EXECUTOR_MODE|ARMAMENT)/u;
+const FORBIDDEN_KEY = /(?:SOLANA_(?:HTTP|WS)_RPC_URL|HELIUS_|PRIVATE_KEY|SECRET_KEY|KEYPAIR|MNEMONIC|RECOVERY_PHRASE|WALLET|PUBLIC_KEY|LIVE_TRADING_ENABLED|EXECUTOR_MODE|ARMAMENT|EXECUTOR_PREFLIGHT_(?:GENERATION_ID|TARGET_INTENT_ID|SIMULATION_ARTIFACT_ID))/u;
 
 export interface ExecutionPreflightSourceConfig {
   readonly databaseUrl: string;
-  readonly generationId: string;
-  readonly targetIntentId: string;
-  readonly simulationArtifactId: string;
+  readonly preparationRunId: string;
   readonly outputPath: string;
 }
 
@@ -27,18 +25,11 @@ export function parseExecutionPreflightSourceConfig(
     if (!isEnvironment(input)) throw invalid();
     for (const key of Object.keys(input)) if (FORBIDDEN_KEY.test(key)) throw invalid();
     const databaseUrl = postgresUrl(value(input, 'DATABASE_URL'));
-    const generationId = patterned(value(input, 'EXECUTOR_PREFLIGHT_GENERATION_ID'),
-      /^execution_wallet_generation_[0-9a-f]{64}$/u, 96);
-    const targetIntentId = patterned(value(input, 'EXECUTOR_PREFLIGHT_TARGET_INTENT_ID'),
-      /^execution_intent_[0-9a-f]{64}$/u, 81);
-    const simulationArtifactId = patterned(
-      value(input, 'EXECUTOR_PREFLIGHT_SIMULATION_ARTIFACT_ID'),
-      /^execution_simulation_artifact_[0-9a-f]{64}$/u, 94,
-    );
+    const preparationRunId = patterned(value(input, 'EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID'),
+      /^execution_preflight_preparation_[0-9a-f]{64}$/u, 128);
     const outputPath = absolutePath(value(input, 'EXECUTOR_PREFLIGHT_SOURCE_PATH'));
     if (isWithin(resolve(applicationRoot), outputPath)) throw invalid();
-    return Object.freeze({ databaseUrl, generationId, targetIntentId,
-      simulationArtifactId, outputPath });
+    return Object.freeze({ databaseUrl, preparationRunId, outputPath });
   } catch { throw invalid(); }
 }
 

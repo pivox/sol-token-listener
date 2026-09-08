@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
   assertExecutionIntent,
@@ -26,10 +27,22 @@ import {
   createExecutionPreflightBundle,
   type ExecutionPreflightBundleDraftV1,
 } from './execution-preflight-bundle.js';
+import { canonicalStringifyJson } from '../utils/json.js';
 
-const SOURCE_KEYS = Object.freeze([
+const SOURCE_V1_KEYS = Object.freeze([
   'schemaVersion', 'readiness', 'generation', 'walletSnapshot', 'providerSnapshot', 'target',
   'simulation', 'databaseNowMs',
+] as const);
+const SOURCE_V2_KEYS = Object.freeze([
+  'schemaVersion', 'lineage', 'readiness', 'generation', 'walletSnapshot', 'providerSnapshot',
+  'target', 'simulation', 'capturedAtMs', 'expiresAtMs', 'proofFingerprint',
+] as const);
+const SOURCE_V2_UNSIGNED_KEYS = Object.freeze(SOURCE_V2_KEYS.slice(0, -1));
+const LINEAGE_KEYS = Object.freeze([
+  'preparationRunId', 'preparationRunFingerprint', 'pairId', 'pairFingerprint',
+  'targetAssessmentId', 'targetAssessmentFingerprint', 'simulationAttemptNumber',
+  'simulationArtifactId', 'simulationArtifactFingerprint', 'preparationManifestFingerprint',
+  'candidateId', 'candidateEvidenceFingerprint', 'candidateConfirmationStatus',
 ] as const);
 const CATALOG_KEYS = Object.freeze([
   'schemaVersion', 'strategyFingerprint', 'policy', 'gates',
@@ -101,6 +114,40 @@ export interface ExecutionPreflightDraftSourceV1 {
   readonly databaseNowMs: number;
 }
 
+export interface ExecutionPreflightDraftSourceLineageV2 {
+  readonly preparationRunId: string;
+  readonly preparationRunFingerprint: string;
+  readonly pairId: string;
+  readonly pairFingerprint: string;
+  readonly targetAssessmentId: string;
+  readonly targetAssessmentFingerprint: string;
+  readonly simulationAttemptNumber: 1;
+  readonly simulationArtifactId: string;
+  readonly simulationArtifactFingerprint: string;
+  readonly preparationManifestFingerprint: string;
+  readonly candidateId: string;
+  readonly candidateEvidenceFingerprint: string;
+  readonly candidateConfirmationStatus: 'finalized';
+}
+
+export interface ExecutionPreflightDraftSourceV2 {
+  readonly schemaVersion: 'execution-preflight-draft-source.v2';
+  readonly lineage: ExecutionPreflightDraftSourceLineageV2;
+  readonly readiness: ExecutionReadinessManifestV1;
+  readonly generation: ExecutionPreflightDraftSourceV1['generation'];
+  readonly walletSnapshot: ExecutionWalletSnapshotV1;
+  readonly providerSnapshot: ProviderUsageSnapshotV1;
+  readonly target: ExecutionPreflightTargetV1;
+  readonly simulation: ExecutionSimulationArtifactV1;
+  readonly capturedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly proofFingerprint: string;
+}
+
+export type ExecutionPreflightDraftSource =
+  | ExecutionPreflightDraftSourceV1
+  | ExecutionPreflightDraftSourceV2;
+
 export interface ExecutionPreflightGateCatalogV1 {
   readonly schemaVersion: 'execution-preflight-gate-catalog.v1';
   readonly strategyFingerprint: string;
@@ -118,12 +165,15 @@ export class ExecutionPreflightDraftValidationError extends TypeError {
 
 export function createExecutionPreflightDraftSource(
   sourceInput: unknown,
-): ExecutionPreflightDraftSourceV1 {
+): ExecutionPreflightDraftSource {
   try {
-    const source = exactRecord(sourceInput, SOURCE_KEYS);
+    if (schemaVersionOf(sourceInput) === 'execution-preflight-draft-source.v2') {
+      return sourceV2From(sourceInput);
+    }
+    const source = exactRecord(sourceInput, SOURCE_V1_KEYS);
     if (source.schemaVersion !== 'execution-preflight-draft-source.v1') throw invalid();
     const generation = exactRecord(source.generation, GENERATION_KEYS);
-    const targetIntent = targetFrom(source.target);
+    const targetIntent = targetFromV1(source.target);
     const simulation = simulationFrom(source.simulation);
     const walletSnapshot = walletFrom(source.walletSnapshot);
     const providerSnapshot = providerFrom(source.providerSnapshot);
@@ -163,6 +213,7 @@ export function createExecutionPreflightDraft(
 ): ExecutionPreflightBundleDraftV1 {
   try {
     const source = createExecutionPreflightDraftSource(sourceInput);
+    if (source.schemaVersion !== 'execution-preflight-draft-source.v2') throw invalid();
     const catalog = exactRecord(catalogInput, CATALOG_KEYS);
     if (catalog.schemaVersion !== 'execution-preflight-gate-catalog.v1') throw invalid();
     const generation = source.generation;
@@ -170,7 +221,7 @@ export function createExecutionPreflightDraft(
     const simulation = simulationFrom(source.simulation);
     const walletSnapshot = source.walletSnapshot;
     const providerSnapshot = source.providerSnapshot;
-    const databaseNowMs = source.databaseNowMs;
+    const databaseNowMs = source.capturedAtMs;
     const policy = createExecutionRiskPolicy(catalog.policy);
     const strategyFingerprint = fingerprint(catalog.strategyFingerprint);
     const qualificationExpiresAtMs = databaseNowMs + QUALIFICATION_TTL_MS;
@@ -226,6 +277,7 @@ export function createExecutionPreflightDraft(
       providerSnapshot.measuredAtMs + policy.providerUsageMaxAgeMs,
       walletSnapshot.observedAtMs + policy.walletSnapshotMaxAgeMs,
       target.expiresAtMs,
+      source.expiresAtMs,
     );
     if (expiresAtMs < databaseNowMs + MINIMUM_MARGIN_MS) throw invalid();
     const draft = Object.freeze({
@@ -252,6 +304,110 @@ export function createExecutionPreflightDraft(
   }
 }
 
+export function createExecutionPreflightDraftSourceProofFingerprint(
+  sourceInput: Omit<ExecutionPreflightDraftSourceV2, 'proofFingerprint'>,
+): string {
+  try {
+    const source = exactRecord(sourceInput, SOURCE_V2_UNSIGNED_KEYS);
+    if (source.schemaVersion !== 'execution-preflight-draft-source.v2') throw invalid();
+    return createHash('sha256').update(canonicalStringifyJson(source), 'utf8').digest('hex');
+  } catch { throw invalid(); }
+}
+
+function sourceV2From(sourceInput: unknown): ExecutionPreflightDraftSourceV2 {
+  const source = exactRecord(sourceInput, SOURCE_V2_KEYS);
+  if (source.schemaVersion !== 'execution-preflight-draft-source.v2') throw invalid();
+  const lineage = lineageFrom(source.lineage);
+  const generation = exactRecord(source.generation, GENERATION_KEYS);
+  const targetIntent = targetFrom(source.target);
+  const simulation = simulationFrom(source.simulation);
+  const walletSnapshot = walletFrom(source.walletSnapshot);
+  const providerSnapshot = providerFrom(source.providerSnapshot);
+  const capturedAtMs = timestamp(source.capturedAtMs);
+  const expiresAtMs = timestamp(source.expiresAtMs);
+  const readiness = readinessFrom(source.readiness);
+  const reconstructedGeneration = createExecutionWalletGeneration(Object.freeze({
+    walletPublicKey: generation.walletPublicKey,
+    cluster: generation.cluster,
+    genesisHash: generation.genesisHash,
+    generation: generation.generation,
+  }));
+  if (reconstructedGeneration.generationId !== generation.generationId) throw invalid();
+  assertSourceBindings(reconstructedGeneration, targetIntent, simulation, walletSnapshot,
+    providerSnapshot, readiness, capturedAtMs);
+  if (expiresAtMs < capturedAtMs + MINIMUM_MARGIN_MS
+    || expiresAtMs > targetIntent.expiresAtMs
+    || expiresAtMs > providerSnapshot.expiresAtMs
+    || expiresAtMs > readiness.expiresAtMs
+    || lineage.simulationArtifactId !== simulation.artifactId
+    || lineage.simulationArtifactFingerprint !== simulation.resultFingerprint
+    || targetIntent.candidateId !== lineage.candidateId) throw invalid();
+  const unsigned = Object.freeze({
+    schemaVersion: 'execution-preflight-draft-source.v2' as const,
+    lineage,
+    readiness,
+    generation: Object.freeze({
+      generationId: reconstructedGeneration.generationId,
+      walletPublicKey: reconstructedGeneration.walletPublicKey,
+      cluster: 'mainnet-beta' as const,
+      genesisHash: reconstructedGeneration.genesisHash,
+      generation: reconstructedGeneration.generation,
+    }),
+    walletSnapshot,
+    providerSnapshot,
+    target: Object.freeze({ intent: targetIntent, leaseOwner: null,
+      leaseToken: null, leaseExpiresAtMs: null }),
+    simulation,
+    capturedAtMs,
+    expiresAtMs,
+  });
+  const proofFingerprint = fingerprint(source.proofFingerprint);
+  if (proofFingerprint !== createExecutionPreflightDraftSourceProofFingerprint(unsigned)) {
+    throw invalid();
+  }
+  return Object.freeze({ ...unsigned, proofFingerprint });
+}
+
+function lineageFrom(value: unknown): ExecutionPreflightDraftSourceLineageV2 {
+  const row = exactRecord(value, LINEAGE_KEYS);
+  if (row.simulationAttemptNumber !== 1 || row.candidateConfirmationStatus !== 'finalized') {
+    throw invalid();
+  }
+  const preparationRunId = patterned(row.preparationRunId,
+    /^execution_preflight_preparation_[0-9a-f]{64}$/u, 96);
+  const preparationRunFingerprint = fingerprint(row.preparationRunFingerprint);
+  if (preparationRunFingerprint !== createHash('sha256').update(JSON.stringify(Object.freeze({
+    payloadVersion: 1,
+    runId: preparationRunId,
+  })), 'utf8').digest('hex')) throw invalid();
+  return Object.freeze({
+    preparationRunId,
+    preparationRunFingerprint,
+    pairId: patterned(row.pairId, /^execution_preflight_intent_pair_[0-9a-f]{64}$/u, 128),
+    pairFingerprint: fingerprint(row.pairFingerprint),
+    targetAssessmentId: patterned(row.targetAssessmentId,
+      /^execution_dry_run_assessment_[0-9a-f]{64}$/u, 128),
+    targetAssessmentFingerprint: fingerprint(row.targetAssessmentFingerprint),
+    simulationAttemptNumber: 1,
+    simulationArtifactId: patterned(row.simulationArtifactId,
+      /^execution_simulation_artifact_[0-9a-f]{64}$/u, 128),
+    simulationArtifactFingerprint: fingerprint(row.simulationArtifactFingerprint),
+    preparationManifestFingerprint: fingerprint(row.preparationManifestFingerprint),
+    candidateId: patterned(row.candidateId, /^candidate_[0-9a-f]{64}$/u, 128),
+    candidateEvidenceFingerprint: fingerprint(row.candidateEvidenceFingerprint),
+    candidateConfirmationStatus: 'finalized',
+  });
+}
+
+function schemaVersionOf(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
+    throw invalid();
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'schemaVersion');
+  if (!descriptor?.enumerable || !('value' in descriptor)) throw invalid();
+  return descriptor.value;
+}
+
 function targetFrom(value: unknown): ExecutionIntentV1 {
   const row = exactRecord(value, TARGET_KEYS);
   if (row.leaseOwner !== null || row.leaseToken !== null || row.leaseExpiresAtMs !== null) {
@@ -264,6 +420,34 @@ function targetFrom(value: unknown): ExecutionIntentV1 {
     || intent.quoteDecimals !== 9 || intent.baseAmountRaw !== null
     || intent.quoteAmountRaw === null || intent.quoteAmountRaw === 0n) throw invalid();
   return intent;
+}
+
+function targetFromV1(value: unknown): ExecutionIntentV1 {
+  const row = exactRecord(value, TARGET_KEYS);
+  if (row.leaseOwner !== null || row.leaseToken !== null || row.leaseExpiresAtMs !== null) {
+    throw invalid();
+  }
+  const intent = withLegacyCandidateId(row.intent);
+  return targetFrom(Object.freeze({ intent, leaseOwner: null, leaseToken: null,
+    leaseExpiresAtMs: null }));
+}
+
+function withLegacyCandidateId(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
+    throw invalid();
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'candidateId')) return value;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) throw invalid();
+  const result: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') throw invalid();
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) throw invalid();
+    result[key] = descriptor.value;
+  }
+  result.candidateId = null;
+  return Object.freeze(result);
 }
 
 function readinessFrom(value: unknown): ExecutionReadinessManifestV1 {

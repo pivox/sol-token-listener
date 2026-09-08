@@ -5,9 +5,10 @@ import test from 'node:test';
 import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '042_execution_preflight_intent_preparation.sql';
+const latestMigrationName = '043_execution_intent_causal_lineage.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -119,6 +120,8 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '038_execution_live_rpc_budget.sql',
       '039_execution_canary_operator_binding.sql',
       '040_execution_worker_live_partition.sql',
+      '041_execution_preflight_intent_pairs.sql',
+      '042_execution_preflight_intent_preparation.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);
@@ -268,6 +271,7 @@ function parentDraft(logicalCommandId: string): Parent {
 }
 
 async function insertParentAndAttempt(pool: InstanceType<typeof pg.Pool>, parent: Parent): Promise<void> {
+  await insertExecutionDecisionEvent(pool, parent.decisionEventId, parent.mint);
   await pool.query(`INSERT INTO execution_intents (
     id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
     logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,quote_decimals,

@@ -371,6 +371,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            WHERE session.candidate_id = candidate.candidate_id
          )
          AND NOT EXISTS (
+           SELECT 1 FROM execution_intents intent
+           WHERE intent.candidate_id = candidate.candidate_id
+         )
+         AND NOT EXISTS (
            SELECT 1 FROM paper_mvp_runs run
            WHERE run.state='RUNNING'
              AND run.strategy_id=candidate.strategy_id

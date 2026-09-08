@@ -275,6 +275,7 @@ function claimValue(nowMs: number, side: 'BUY' | 'SELL'): ClaimedExecutionIntent
       strategyId: 'strategy',
       strategyVersion: 1,
       positionId: 'position',
+      candidateId: null,
       logicalCommandId: 'command',
       mint: wallet,
       side,

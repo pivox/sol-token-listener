@@ -48,7 +48,7 @@ void test('derives one frozen deterministic canary target and simulation sibling
   assert.equal(Object.isFrozen(first.simulationIntent), true);
 
   for (const key of [
-    'strategyId', 'strategyVersion', 'positionId', 'mint', 'side', 'venuePolicy',
+    'strategyId', 'strategyVersion', 'positionId', 'candidateId', 'mint', 'side', 'venuePolicy',
     'quoteMint', 'quoteTokenProgram', 'quoteDecimals', 'quoteAmountRaw',
     'baseAmountRaw', 'minimumAmountOutRaw', 'decisionEventId', 'decisionFingerprint',
     'requestedAtMs', 'expiresAtMs',
@@ -120,6 +120,7 @@ function targetInput(): Readonly<Record<string, unknown>> {
     strategyId: 'creation-entry-v1',
     strategyVersion: 1,
     positionId: 'paper-position-1',
+    candidateId: `candidate_${'c'.repeat(64)}`,
     logicalCommandId: `paper_open_${'1'.repeat(64)}`,
     mint: '11111111111111111111111111111111',
     side: 'BUY',

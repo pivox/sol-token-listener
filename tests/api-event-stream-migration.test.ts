@@ -303,6 +303,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '040_execution_worker_live_partition.sql',
       '041_execution_preflight_intent_pairs.sql',
       '042_execution_preflight_intent_preparation.sql',
+      '043_execution_intent_causal_lineage.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

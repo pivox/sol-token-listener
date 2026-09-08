@@ -89,7 +89,7 @@ const INTERNAL_ERRORS = new WeakSet<ExecutionIntentRepositoryError>();
 
 const DRAFT_KEYS = Object.freeze([
   'id', 'payloadVersion', 'logicalOrderKey', 'strategyId', 'strategyVersion',
-  'positionId', 'logicalCommandId', 'mint', 'side', 'venuePolicy', 'quoteMint',
+  'positionId', 'candidateId', 'logicalCommandId', 'mint', 'side', 'venuePolicy', 'quoteMint',
   'quoteTokenProgram', 'quoteDecimals', 'quoteAmountRaw', 'baseAmountRaw',
   'minimumAmountOutRaw', 'decisionEventId', 'decisionFingerprint',
   'requestedAtMs', 'expiresAtMs',
@@ -126,6 +126,7 @@ const FINISH_ATTEMPT_KEYS = Object.freeze([
 const INTENT_ROW_KEYS = Object.freeze([
   'id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
   'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
+  'candidate_id',
   'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
   'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint',
   'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'state_revision', 'last_reason_code',
@@ -157,6 +158,7 @@ const INTENT_PROJECTION = `
   intent.strategy_id,
   intent.strategy_version,
   intent.position_id,
+  intent.candidate_id,
   intent.logical_command_id,
   intent.mint,
   intent.side,
@@ -242,14 +244,14 @@ export async function createExecutionIntentInTransaction(
   const inserted = await client.query(
     `INSERT INTO execution_intents AS intent (
        id,payload_version,logical_order_key,strategy_id,strategy_version,
-       position_id,logical_command_id,mint,side,venue_policy,quote_mint,
+       position_id,candidate_id,logical_command_id,mint,side,venue_policy,quote_mint,
        quote_token_program,quote_decimals,quote_amount_raw,base_amount_raw,
        minimum_amount_out_raw,decision_event_id,decision_fingerprint,
        requested_at,expires_at,status
      ) VALUES (
-       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-       TIMESTAMPTZ 'epoch' + ($19::BIGINT * INTERVAL '1 millisecond'),
+       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
        TIMESTAMPTZ 'epoch' + ($20::BIGINT * INTERVAL '1 millisecond'),
+       TIMESTAMPTZ 'epoch' + ($21::BIGINT * INTERVAL '1 millisecond'),
        'PENDING'
      )
      ON CONFLICT DO NOTHING
@@ -1263,7 +1265,7 @@ async function lockClaimedIntent(
 function draftValues(draft: ExecutionIntentDraftV1): readonly unknown[] {
   return [
     draft.id, draft.payloadVersion, draft.logicalOrderKey, draft.strategyId,
-    draft.strategyVersion, draft.positionId, draft.logicalCommandId, draft.mint,
+    draft.strategyVersion, draft.positionId, draft.candidateId, draft.logicalCommandId, draft.mint,
     draft.side, draft.venuePolicy, draft.quoteMint, draft.quoteTokenProgram,
     draft.quoteDecimals, draft.quoteAmountRaw?.toString() ?? null,
     draft.baseAmountRaw?.toString() ?? null, draft.minimumAmountOutRaw.toString(),
@@ -1281,6 +1283,7 @@ function draftInput(value: unknown): ExecutionIntentDraftV1 {
     strategyId: row.strategyId,
     strategyVersion: row.strategyVersion,
     positionId: row.positionId,
+    candidateId: row.candidateId,
     logicalCommandId: row.logicalCommandId,
     mint: row.mint,
     side: row.side,
@@ -1532,6 +1535,9 @@ function intentFromRow(value: unknown): ExecutionIntentV1 {
     strategyId: boundedText(row.strategy_id, 'INVALID_DATA'),
     strategyVersion: positiveInteger(row.strategy_version, INT32_MAX, 'INVALID_DATA'),
     positionId: boundedText(row.position_id, 'INVALID_DATA'),
+    candidateId: row.candidate_id === null
+      ? null
+      : candidateId(row.candidate_id, 'INVALID_DATA'),
     logicalCommandId: boundedText(row.logical_command_id, 'INVALID_DATA'),
     mint: boundedText(row.mint, 'INVALID_DATA'),
     side: side(row.side),
@@ -1979,6 +1985,16 @@ function phase(value: unknown): 'NONE' | 'CANARY' | 'MICRO_LIVE' | 'PILOT' {
 
 function fingerprint(value: unknown): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) throw dataError();
+  return value;
+}
+
+function candidateId(
+  value: unknown,
+  code: 'INVALID_INPUT' | 'INVALID_DATA',
+): string {
+  if (typeof value !== 'string' || !/^candidate_[0-9a-f]{64}$/u.test(value)) {
+    throw repositoryError(code);
+  }
   return value;
 }
 

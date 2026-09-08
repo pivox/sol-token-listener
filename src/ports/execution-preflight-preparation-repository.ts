@@ -35,6 +35,10 @@ export interface ExecutionPreflightPreparationRepository {
     claim: ClaimedExecutionPreflightPreparation,
     signal?: AbortSignal,
   ): Promise<ExecutionPreflightPairSelectionV1 | null>;
+  expireWaitingWithoutPair(
+    claim: ClaimedExecutionPreflightPreparation,
+    signal?: AbortSignal,
+  ): Promise<ExecutionPreflightPreparationV1 | null>;
   bindTargetAssessment(
     claim: ClaimedExecutionPreflightPreparation,
     signal?: AbortSignal,

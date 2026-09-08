@@ -20,6 +20,7 @@ void test('creates an immutable pair through the caller transaction client', asy
   const target = targetDraft();
   const pair = createExecutionPreflightIntentPairDraft(target);
   const client = new ScriptedClient([
+    lineage(true),
     result([intentRow(pair.simulationIntent)], 1),
     result([], 0),
     result([pairRow(pair)], 1),
@@ -29,8 +30,8 @@ void test('creates an immutable pair through the caller transaction client', asy
 
   assert.equal(outcome.kind, 'CREATED');
   assert.deepEqual(outcome.pair, pair);
-  assert.equal(client.calls.length, 3);
-  const insert = required(client.calls[2]);
+  assert.equal(client.calls.length, 4);
+  const insert = required(client.calls[3]);
   assert.match(insert.text, /^INSERT INTO execution_preflight_intent_pairs/mu);
   assert.match(insert.text, /ON CONFLICT DO NOTHING/u);
   assert.deepEqual(insert.values, [
@@ -49,6 +50,7 @@ void test('refuses to pair a newly created target with any pre-existing sibling'
   const target = targetDraft();
   const pair = createExecutionPreflightIntentPairDraft(target);
   const client = new ScriptedClient([
+    lineage(true),
     result([], 0),
     result([], 0),
     result([intentRow(pair.simulationIntent)], 1),
@@ -61,7 +63,7 @@ void test('refuses to pair a newly created target with any pre-existing sibling'
     (error: unknown) => error instanceof ExecutionPreflightIntentPairRepositoryError
       && error.code === 'PAIR_DUPLICATE',
   );
-  assert.equal(client.calls.length, 3);
+  assert.equal(client.calls.length, 4);
 });
 
 void test('rejects collisions and contradictory database results with a fixed typed error', async () => {
@@ -69,15 +71,18 @@ void test('rejects collisions and contradictory database results with a fixed ty
   const pair = createExecutionPreflightIntentPairDraft(target);
   const cases = [
     new ScriptedClient([
+      lineage(true),
       result([intentRow(pair.simulationIntent)], 1), result([], 0),
       result([], 0), result([], 0),
     ]),
     new ScriptedClient([
+      lineage(true),
       result([intentRow(pair.simulationIntent)], 1), result([], 0),
       result([], 0),
       result([{ ...pairRow(pair), pair_fingerprint: 'b'.repeat(64) }], 1),
     ]),
     new ScriptedClient([
+      lineage(true),
       result([intentRow(pair.simulationIntent)], 1), result([], 0),
       result([pairRow(pair)], 0),
     ]),
@@ -92,6 +97,16 @@ void test('rejects collisions and contradictory database results with a fixed ty
         && error.message === 'Execution preflight intent pair persistence failed.',
     );
   }
+});
+
+void test('refuses a target whose causal lineage is no longer current', async () => {
+  const client = new ScriptedClient([lineage(false)]);
+  await assert.rejects(
+    createExecutionPreflightIntentPairInTransaction(client, targetDraft()),
+    (error: unknown) => error instanceof ExecutionPreflightIntentPairRepositoryError
+      && error.code === 'PAIR_LINEAGE_INVALID',
+  );
+  assert.equal(client.calls.length, 1);
 });
 
 void test('rejects hostile target drafts before issuing any query', async () => {
@@ -118,8 +133,8 @@ void test('rejects hostile target drafts before issuing any query', async () => 
 void test('replay lookup never retro-forms an absent pair and validates an existing one', async () => {
   const target = targetDraft();
   const pair = createExecutionPreflightIntentPairDraft(target);
-  const absentClient = new ScriptedClient([result([], 0)]);
-  const existingClient = new ScriptedClient([result([pairRow(pair)], 1)]);
+  const absentClient = new ScriptedClient([lineage(true), result([], 0)]);
+  const existingClient = new ScriptedClient([lineage(true), result([pairRow(pair)], 1)]);
 
   assert.equal(
     await replayExecutionPreflightIntentPairInTransaction(absentClient, target),
@@ -130,8 +145,8 @@ void test('replay lookup never retro-forms an absent pair and validates an exist
     'REPLAYED',
   );
   for (const client of [absentClient, existingClient]) {
-    assert.equal(client.calls.length, 1);
-    assert.match(required(client.calls[0]).text, /^SELECT/mu);
+    assert.equal(client.calls.length, 2);
+    assert.match(required(client.calls[1]).text, /^SELECT/mu);
   }
 });
 
@@ -140,6 +155,7 @@ function targetDraft() {
     strategyId: 'creation-entry-v1',
     strategyVersion: 1,
     positionId: 'paper-position-1',
+    candidateId: `candidate_${'c'.repeat(64)}`,
     logicalCommandId: `paper_open_${'1'.repeat(64)}`,
     mint: '11111111111111111111111111111111',
     side: 'BUY',
@@ -179,6 +195,7 @@ function intentRow(
     id: intent.id, payload_version: 1, logical_order_key: intent.logicalOrderKey,
     strategy_id: intent.strategyId, strategy_version: intent.strategyVersion,
     position_id: intent.positionId, logical_command_id: intent.logicalCommandId,
+    candidate_id: intent.candidateId,
     mint: intent.mint, side: intent.side, venue_policy: intent.venuePolicy,
     quote_mint: intent.quoteMint, quote_token_program: intent.quoteTokenProgram,
     quote_decimals: intent.quoteDecimals, quote_amount_raw: intent.quoteAmountRaw?.toString() ?? null,
@@ -221,6 +238,10 @@ function result(
   rowCount: number | null,
 ): QueryResult {
   return { rows, rowCount };
+}
+
+function lineage(current: boolean): QueryResult {
+  return result([{ lineage_current: current }], 1);
 }
 
 function required<T>(value: T | undefined): T {

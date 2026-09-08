@@ -82,6 +82,7 @@ export interface ExecutionIntentDraftV1 {
   readonly strategyId: string;
   readonly strategyVersion: number;
   readonly positionId: string;
+  readonly candidateId: string | null;
   readonly logicalCommandId: string;
   readonly mint: string;
   readonly side: ExecutionIntentSide;
@@ -129,6 +130,7 @@ const DRAFT_INPUT_KEYS = Object.freeze([
   'strategyId',
   'strategyVersion',
   'positionId',
+  'candidateId',
   'logicalCommandId',
   'mint',
   'side',
@@ -144,6 +146,10 @@ const DRAFT_INPUT_KEYS = Object.freeze([
   'requestedAtMs',
   'expiresAtMs',
 ] as const);
+
+const LEGACY_DRAFT_INPUT_KEYS = Object.freeze(
+  DRAFT_INPUT_KEYS.filter((key) => key !== 'candidateId'),
+);
 
 const DRAFT_KEYS = Object.freeze([
   'id',
@@ -306,8 +312,14 @@ export function assertExecutionAttemptStatusReason(
 }
 
 function draftInputFrom(value: unknown): Omit<ExecutionIntentDraftV1, 'id' | 'payloadVersion' | 'logicalOrderKey'> {
-  const record = ownEnumerableDataRecord(value, DRAFT_INPUT_KEYS);
-  return immutableFieldsFrom(record);
+  const record = ownEnumerableDataRecord(value, undefined);
+  const keys = Object.keys(record);
+  if (!sameKeySet(keys, DRAFT_INPUT_KEYS) && !sameKeySet(keys, LEGACY_DRAFT_INPUT_KEYS)) {
+    throw invalid();
+  }
+  return immutableFieldsFrom(Object.hasOwn(record, 'candidateId')
+    ? record
+    : Object.freeze({ ...record, candidateId: null }));
 }
 
 function draftFrom(value: unknown, requireFrozen: boolean): ExecutionIntentDraftV1 {
@@ -375,6 +387,7 @@ function immutableFieldsFrom(
   const strategyId = textFrom(record.strategyId);
   const strategyVersion = positiveIntegerFrom(record.strategyVersion);
   const positionId = textFrom(record.positionId);
+  const candidateId = nullableCandidateIdFrom(record.candidateId);
   const logicalCommandId = textFrom(record.logicalCommandId);
   const mint = mintFrom(record.mint);
   const side = sideFrom(record.side);
@@ -399,6 +412,7 @@ function immutableFieldsFrom(
     strategyId,
     strategyVersion,
     positionId,
+    candidateId,
     logicalCommandId,
     mint,
     side,
@@ -494,6 +508,10 @@ function pick(
   return result;
 }
 
+function sameKeySet(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((key) => expected.includes(key));
+}
+
 function isFrozenObject(value: unknown): boolean {
   return typeof value === 'object' && value !== null && !isProxy(value) && Object.isFrozen(value);
 }
@@ -513,6 +531,12 @@ function mintFrom(value: unknown): string {
 
 function fingerprintFrom(value: unknown): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) throw invalid();
+  return value;
+}
+
+function nullableCandidateIdFrom(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^candidate_[0-9a-f]{64}$/u.test(value)) throw invalid();
   return value;
 }
 

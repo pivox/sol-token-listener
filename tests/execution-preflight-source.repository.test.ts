@@ -21,13 +21,17 @@ void test('exports one exact source from a repeatable-read read-only snapshot', 
     },
     release() {},
   }) });
-  const exported = await repository.export({ generationId: input.source.generation.generationId,
-    targetIntentId: input.source.target.intent.id,
-    simulationArtifactId: input.source.simulation.artifactId });
+  const exported = await repository.export({
+    preparationRunId: input.source.lineage.preparationRunId,
+  });
   assert.deepEqual(exported, input.source);
   assert.equal(queries[0], 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
   assert.equal(queries.at(-1), 'COMMIT');
-  assert.equal(index, 6);
+  assert.equal(index, 7);
+  assert.match(queries[1] ?? '', /target\.candidate_id/u);
+  assert.match(queries[1] ?? '', /candidate\.confirmation_status='finalized'/u);
+  assert.match(queries[1] ?? '', /source_raw\.confirmation_status='finalized'/u);
+  assert.match(queries[1] ?? '', /decision\.confirmation_status='finalized'/u);
 });
 
 void test('rolls back a contradictory snapshot and returns one redacted error', async () => {
@@ -45,9 +49,9 @@ void test('rolls back a contradictory snapshot and returns one redacted error', 
     },
     release() {},
   }) });
-  await assert.rejects(repository.export({ generationId: input.source.generation.generationId,
-    targetIntentId: input.source.target.intent.id,
-    simulationArtifactId: input.source.simulation.artifactId }), (error: unknown) =>
+  await assert.rejects(repository.export({
+    preparationRunId: input.source.lineage.preparationRunId,
+  }), (error: unknown) =>
     error instanceof ExecutionPreflightSourceRepositoryError
     && error.code === 'EXECUTION_PREFLIGHT_SOURCE_READ_FAILED'
     && !error.message.includes('secret'));
@@ -67,7 +71,28 @@ Readonly<Record<string, unknown>>[] {
     return item[key as keyof typeof item] ?? null;
   };
   return [
-    Object.freeze({ database_now_ms: String(source.databaseNowMs) }),
+    Object.freeze({
+      run_id: source.lineage.preparationRunId,
+      run_fingerprint: source.lineage.preparationRunFingerprint,
+      run_state: 'PREPARED',
+      manifest_fingerprint: source.lineage.preparationManifestFingerprint,
+      run_expires_at_ms: String(source.expiresAtMs),
+      pair_id: source.lineage.pairId,
+      pair_fingerprint: source.lineage.pairFingerprint,
+      target_intent_id: source.target.intent.id,
+      simulation_intent_id: source.simulation.intentId,
+      pair_expires_at_ms: String(source.expiresAtMs),
+      assessment_id: source.lineage.targetAssessmentId,
+      assessment_fingerprint: source.lineage.targetAssessmentFingerprint,
+      artifact_id: source.simulation.artifactId,
+      artifact_fingerprint: source.simulation.resultFingerprint,
+      simulation_attempt_number: 1,
+      candidate_id: source.lineage.candidateId,
+      candidate_evidence_fingerprint: source.lineage.candidateEvidenceFingerprint,
+      candidate_confirmation_status: source.lineage.candidateConfirmationStatus,
+      generation_id: source.generation.generationId,
+    }),
+    Object.freeze({ database_now_ms: String(source.capturedAtMs) }),
     Object.freeze({ generation_id: generation.generationId, payload_version: 1,
       wallet_public_key: generation.walletPublicKey, cluster: generation.cluster,
       genesis_hash: generation.genesisHash, generation: generation.generation, retired_at: null }),
@@ -99,6 +124,7 @@ Readonly<Record<string, unknown>>[] {
     Object.freeze({ id: intent.id, payload_version: intent.payloadVersion,
       logical_order_key: intent.logicalOrderKey, strategy_id: intent.strategyId,
       strategy_version: intent.strategyVersion, position_id: intent.positionId,
+      candidate_id: intent.candidateId,
       logical_command_id: intent.logicalCommandId, mint: intent.mint, side: intent.side,
       venue_policy: intent.venuePolicy, quote_mint: intent.quoteMint,
       quote_token_program: intent.quoteTokenProgram, quote_decimals: intent.quoteDecimals,

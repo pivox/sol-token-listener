@@ -6,6 +6,7 @@ import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '034_execution_risk_reconciliation.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -58,7 +59,7 @@ void test('migration 034 applies on an empty schema and replays cleanly', async 
   await withTemporarySchema(databaseUrl, 'execution_risk_apply', async (pool) => {
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '042_execution_preflight_intent_preparation.sql');
+    assert.equal(applied.at(-1), '043_execution_intent_causal_lineage.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const tables = await pool.query<{ readonly table_name: string }>(`
@@ -120,6 +121,11 @@ void test('migration 034 requires complete immutable reconciliation expectations
   await withTemporarySchema(databaseUrl, 'execution_attempt_expectations', async (pool) => {
     await migrateDatabase({ pool });
     const nowMs = Date.now();
+    await insertExecutionDecisionEvent(
+      pool,
+      'decision:expectation',
+      '11111111111111111111111111111111',
+    );
     const created = await new PostgresExecutionIntentRepository(pool).create(
       createExecutionIntentDraft({
         strategyId: 'expectation-test', strategyVersion: 1,

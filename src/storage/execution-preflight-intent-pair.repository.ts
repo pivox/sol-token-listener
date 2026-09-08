@@ -7,6 +7,10 @@ import {
   createExecutionIntentInTransaction,
   ExecutionIntentRepositoryError,
 } from './execution-intent.repository.js';
+import {
+  assertExecutionIntentLineageCurrentInTransaction,
+  ExecutionIntentLineageRepositoryError,
+} from './execution-intent-lineage.repository.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -21,6 +25,7 @@ export interface ExecutionPreflightIntentPairTransactionClient {
 
 export type ExecutionPreflightIntentPairRepositoryErrorCode =
   | 'PAIR_DUPLICATE'
+  | 'PAIR_LINEAGE_INVALID'
   | 'DATABASE_FAILURE';
 
 export class ExecutionPreflightIntentPairRepositoryError extends Error {
@@ -52,6 +57,7 @@ export async function createExecutionPreflightIntentPairInTransaction(
 }>> {
   const draft = createExecutionPreflightIntentPairDraft(targetDraft);
   try {
+    await assertExecutionIntentLineageCurrentInTransaction(client, draft.targetIntentId);
     const sibling = await createExecutionIntentInTransaction(client, draft.simulationIntent);
     if (sibling.kind !== 'CREATED') throw duplicateError();
     const inserted = await client.query(
@@ -78,6 +84,7 @@ export async function createExecutionPreflightIntentPairInTransaction(
     return Object.freeze({ kind: 'REPLAYED', pair: draft });
   } catch (error: unknown) {
     if (error instanceof ExecutionPreflightIntentPairRepositoryError) throw error;
+    if (error instanceof ExecutionIntentLineageRepositoryError) throw lineageError();
     if (error instanceof ExecutionIntentRepositoryError && error.code === 'INTENT_DUPLICATE') {
       throw duplicateError();
     }
@@ -91,6 +98,7 @@ export async function replayExecutionPreflightIntentPairInTransaction(
 ): Promise<'ABSENT' | 'REPLAYED'> {
   const draft = createExecutionPreflightIntentPairDraft(targetDraft);
   try {
+    await assertExecutionIntentLineageCurrentInTransaction(client, draft.targetIntentId);
     const conflict = await selectPair(client, draft);
     if (conflict.rowCount === 0 && conflict.rows.length === 0) return 'ABSENT';
     if (conflict.rowCount !== 1 || conflict.rows.length !== 1
@@ -98,6 +106,7 @@ export async function replayExecutionPreflightIntentPairInTransaction(
     return 'REPLAYED';
   } catch (error: unknown) {
     if (error instanceof ExecutionPreflightIntentPairRepositoryError) throw error;
+    if (error instanceof ExecutionIntentLineageRepositoryError) throw lineageError();
     throw new ExecutionPreflightIntentPairRepositoryError('DATABASE_FAILURE', { cause: error });
   }
 }
@@ -144,4 +153,8 @@ function samePair(draft: ExecutionPreflightIntentPairDraftV1, row: Row | undefin
 
 function duplicateError(): ExecutionPreflightIntentPairRepositoryError {
   return new ExecutionPreflightIntentPairRepositoryError('PAIR_DUPLICATE');
+}
+
+function lineageError(): ExecutionPreflightIntentPairRepositoryError {
+  return new ExecutionPreflightIntentPairRepositoryError('PAIR_LINEAGE_INVALID');
 }

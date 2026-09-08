@@ -59,6 +59,7 @@ void test('derives an inert PUMP_FUN_ONLY BUY from the canonical open command', 
   assert.equal(intent.venuePolicy, 'PUMP_FUN_ONLY');
   assert.equal(intent.logicalCommandId, input.session?.openCommandId);
   assert.equal(intent.positionId, input.position?.id);
+  assert.equal(intent.candidateId, input.candidate.id);
   assert.equal(intent.quoteMint, WSOL);
   assert.equal(intent.quoteTokenProgram, 'SPL_TOKEN');
   assert.equal(intent.quoteDecimals, 9);

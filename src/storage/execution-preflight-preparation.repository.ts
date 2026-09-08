@@ -673,6 +673,78 @@ implements ExecutionPreflightPreparationRepository {
     }
   }
 
+  public async expireWaitingWithoutPair(
+    claimValue: ClaimedExecutionPreflightPreparation,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<ExecutionPreflightPreparationV1 | null> {
+    const claim = claimedInput(claimValue);
+    if (claim.preparation.state !== 'WAITING' || claim.preparation.pairId !== null) {
+      throw inputError();
+    }
+    requireSignal(signal);
+    const client = await this.connect(signal);
+    let committed = false;
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(`WITH operation AS MATERIALIZED (
+          SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+        )
+        SELECT ${CLAIM_PROJECTION},
+          trunc(EXTRACT(EPOCH FROM operation.at)*1000)::TEXT AS operation_at_ms
+        FROM execution_preflight_intent_preparation_runs AS preparation
+        CROSS JOIN operation
+        WHERE preparation.run_id=$1 AND preparation.state=$2
+          AND preparation.state_revision=$3::BIGINT
+          AND preparation.lease_owner=$4 AND preparation.lease_token=$5::UUID
+          AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+            +($6::BIGINT*INTERVAL '1 millisecond')
+          AND preparation.pair_id IS NULL
+        FOR UPDATE`, claimValues(claim));
+      if (locked.rowCount !== 1 || locked.rows.length !== 1) {
+        throw repositoryError('PREPARATION_LEASE_LOST');
+      }
+      const lockedRow = onlyRow(locked);
+      const operationAtMs = timestamp(lockedRow.operation_at_ms);
+      const current = claimFromRowWithoutExtra(lockedRow);
+      if (current.preparation.runId !== claim.preparation.runId
+        || current.preparation.stateRevision !== claim.preparation.stateRevision
+        || current.leaseOwner !== claim.leaseOwner
+        || current.leaseToken !== claim.leaseToken
+        || current.leaseExpiresAtMs !== claim.leaseExpiresAtMs) throw dataError();
+      requireActive(signal);
+      if (operationAtMs + HANDOFF_RESERVE_MS < current.preparation.deadlineAtMs) {
+        await client.query('COMMIT');
+        committed = true;
+        return null;
+      }
+      const failed = await client.query(`UPDATE execution_preflight_intent_preparation_runs
+        AS preparation
+        SET state='FAILED',state_revision=preparation.state_revision+1,
+          failure_code='PREFLIGHT_PAIR_NOT_FOUND'
+        WHERE preparation.run_id=$1 AND preparation.state=$2
+          AND preparation.state_revision=$3::BIGINT
+          AND preparation.lease_owner=$4 AND preparation.lease_token=$5::UUID
+          AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+            +($6::BIGINT*INTERVAL '1 millisecond')
+          AND preparation.pair_id IS NULL
+          AND preparation.deadline_at<=statement_timestamp()+INTERVAL '5 seconds'
+        RETURNING ${PREPARATION_PROJECTION}`, claimValues(claim));
+      if (failed.rowCount !== 1 || failed.rows.length !== 1) {
+        throw repositoryError('PREPARATION_LEASE_LOST');
+      }
+      const terminal = preparationFromRow(onlyRow(failed));
+      await client.query('COMMIT');
+      committed = true;
+      requireActive(signal);
+      return terminal;
+    } catch (error: unknown) {
+      if (!committed) await rollback(client);
+      throw normalizeError(error, signal);
+    } finally {
+      client.release(!committed);
+    }
+  }
+
   public async bindTargetAssessment(
     claimValue: ClaimedExecutionPreflightPreparation,
     signal: AbortSignal = new AbortController().signal,

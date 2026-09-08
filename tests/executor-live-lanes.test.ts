@@ -196,6 +196,7 @@ function claimFor(
       strategyId: 'strategy',
       strategyVersion: 1,
       positionId: 'position',
+      candidateId: null,
       logicalCommandId: 'logical',
       mint: '11111111111111111111111111111111',
       side,

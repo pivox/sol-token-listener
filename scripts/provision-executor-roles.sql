@@ -2511,14 +2511,44 @@ GRANT SELECT ON TABLE
 TO sol_token_operator_reader;
 
 GRANT SELECT (
-  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,candidate_id,
   logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,attempt_count,
-  state_revision,lease_owner,lease_expires_at,last_reason_code,terminal_at,
+  state_revision,lease_owner,lease_expires_at,live_reserved,last_reason_code,terminal_at,
   reconciliation_completed_at,created_at,updated_at,purge_after
 )
 ON TABLE execution_intents TO sol_token_operator_reader;
+
+GRANT SELECT (confirmation_status,event_id,mint,payload,raw_event_id,source,type)
+ON TABLE domain_events TO sol_token_operator_reader;
+GRANT SELECT (attempt_number,intent_id,status)
+ON TABLE execution_attempts TO sol_token_operator_reader;
+GRANT SELECT (assessment_id,intent_id,result_fingerprint)
+ON TABLE execution_dry_run_assessments TO sol_token_operator_reader;
+GRANT SELECT (intent_id,lane,pair_id)
+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_operator_reader;
+GRANT SELECT (expires_at,pair_fingerprint,pair_id,simulation_intent_id,target_intent_id)
+ON TABLE execution_preflight_intent_pairs TO sol_token_operator_reader;
+GRANT SELECT (
+  artifact_fingerprint,artifact_id,assessment_fingerprint,assessment_id,completed_at,
+  deadline_at,failure_code,manifest_fingerprint,pair_id,purge_after,run_fingerprint,run_id,state
+)
+ON TABLE execution_preflight_intent_preparation_runs TO sol_token_operator_reader;
+GRANT SELECT (candidate_id,mint,position_id,qualification_report_id,trigger_event_id)
+ON TABLE paper_positions TO sol_token_operator_reader;
+GRANT SELECT (
+  confirmation_status,mint,qualification_event_id,report_id,source_event_id,
+  source_raw_event_id,superseded_at
+)
+ON TABLE qualification_reports TO sol_token_operator_reader;
+GRANT SELECT (confirmation_status,event_id,mint,processing_status)
+ON TABLE raw_chain_events TO sol_token_operator_reader;
+GRANT SELECT (
+  candidate_event_id,candidate_id,confirmation_status,eligible_until,evidence_fingerprint,mint,
+  payload,purge_after,report_id,source_event_id,state,strategy_id,strategy_version,superseded_at
+)
+ON TABLE trading_candidates TO sol_token_operator_reader;
 
 REVOKE ALL ON TABLE
   execution_safety_qualifications,

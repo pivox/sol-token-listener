@@ -17,18 +17,58 @@ export const EXECUTION_PREFLIGHT_SOURCE_TABLES = Object.freeze([
   'execution_wallet_risk_state', 'execution_wallet_snapshots', 'migration_history',
 ] as const);
 export const EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS = Object.freeze([
-  'attempt_count', 'base_amount_raw', 'created_at', 'decision_event_id',
+  'attempt_count', 'base_amount_raw', 'candidate_id', 'created_at', 'decision_event_id',
   'decision_fingerprint', 'expires_at', 'id', 'last_reason_code', 'lease_expires_at',
-  'lease_owner', 'logical_command_id', 'logical_order_key', 'minimum_amount_out_raw',
+  'lease_owner', 'live_reserved', 'logical_command_id', 'logical_order_key',
+  'minimum_amount_out_raw',
   'mint', 'payload_version', 'position_id', 'purge_after', 'quote_amount_raw',
   'quote_decimals', 'quote_mint', 'quote_token_program', 'reconciliation_completed_at',
   'requested_at', 'side', 'state_revision', 'status', 'strategy_id', 'strategy_version',
   'terminal_at', 'updated_at', 'venue_policy',
 ] as const);
 
+export const EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS = Object.freeze({
+  domain_events: Object.freeze([
+    'confirmation_status', 'event_id', 'mint', 'payload', 'raw_event_id', 'source', 'type',
+  ]),
+  execution_attempts: Object.freeze(['attempt_number', 'intent_id', 'status']),
+  execution_dry_run_assessments: Object.freeze([
+    'assessment_id', 'intent_id', 'result_fingerprint',
+  ]),
+  execution_intents: EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS,
+  execution_preflight_intent_pair_memberships: Object.freeze(['intent_id', 'lane', 'pair_id']),
+  execution_preflight_intent_pairs: Object.freeze([
+    'expires_at', 'pair_fingerprint', 'pair_id', 'simulation_intent_id', 'target_intent_id',
+  ]),
+  execution_preflight_intent_preparation_runs: Object.freeze([
+    'artifact_fingerprint', 'artifact_id', 'assessment_fingerprint', 'assessment_id',
+    'completed_at', 'deadline_at', 'failure_code', 'manifest_fingerprint', 'pair_id',
+    'purge_after', 'run_fingerprint', 'run_id', 'state',
+  ]),
+  paper_positions: Object.freeze([
+    'candidate_id', 'mint', 'position_id', 'qualification_report_id', 'trigger_event_id',
+  ]),
+  qualification_reports: Object.freeze([
+    'confirmation_status', 'mint', 'qualification_event_id', 'report_id', 'source_event_id',
+    'source_raw_event_id', 'superseded_at',
+  ]),
+  raw_chain_events: Object.freeze([
+    'confirmation_status', 'event_id', 'mint', 'processing_status',
+  ]),
+  trading_candidates: Object.freeze([
+    'candidate_event_id', 'candidate_id', 'confirmation_status', 'eligible_until',
+    'evidence_fingerprint', 'mint', 'payload', 'purge_after', 'report_id', 'source_event_id',
+    'state', 'strategy_id', 'strategy_version', 'superseded_at',
+  ]),
+} as const);
+
 const tableSql = EXECUTION_PREFLIGHT_SOURCE_TABLES.map((value) => `'${value}'`).join(',');
-const intentColumnSql = EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS
-  .map((value) => `'${value}'`).join(',');
+const restrictedEntries = Object.entries(EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS);
+const restrictedTableSql = restrictedEntries.map(([table]) => `'${table}'`).join(',');
+const restrictedColumnScopeSql = restrictedEntries.map(([table, columns]) =>
+  `(privilege.table_name='${table}' AND privilege.column_name IN (${columns.map(
+    (column) => `'${column}'`,
+  ).join(',')}))`).join(' OR ');
 
 export const EXECUTION_PREFLIGHT_SOURCE_AUTHORITY_SQL = `SELECT
   current_setting('server_version_num')::INTEGER AS server_version_number,
@@ -116,9 +156,8 @@ export const EXECUTION_PREFLIGHT_SOURCE_AUTHORITY_SQL = `SELECT
       AND privilege.table_schema NOT IN ('pg_catalog','information_schema')
       AND (privilege.privilege_type<>'SELECT'
         OR privilege.table_schema<>'public'
-        OR privilege.table_name NOT IN (${tableSql},'execution_intents')
-        OR (privilege.table_name='execution_intents'
-          AND privilege.column_name NOT IN (${intentColumnSql}))))
+        OR (privilege.table_name NOT IN (${tableSql})
+          AND NOT (${restrictedColumnScopeSql}))))
     AS unexpected_column_privilege_count,
   (SELECT COALESCE(jsonb_agg(jsonb_build_array(privilege.grantee,privilege.table_schema,
       privilege.table_name,privilege.privilege_type)
@@ -129,17 +168,17 @@ export const EXECUTION_PREFLIGHT_SOURCE_AUTHORITY_SQL = `SELECT
       AND privilege.table_schema NOT IN ('pg_catalog','information_schema'))
     AS table_privileges,
   (SELECT COALESCE(jsonb_agg(jsonb_build_array(privilege.grantee,privilege.table_schema,
-      privilege.column_name,privilege.privilege_type)
-      ORDER BY privilege.grantee,privilege.table_schema,privilege.column_name,
-        privilege.privilege_type),'[]'::jsonb)::TEXT
+      privilege.table_name,privilege.column_name,privilege.privilege_type)
+      ORDER BY privilege.grantee,privilege.table_schema,privilege.table_name,
+        privilege.column_name,privilege.privilege_type),'[]'::jsonb)::TEXT
     FROM information_schema.column_privileges privilege
     WHERE privilege.grantee IN (current_user,'PUBLIC') AND privilege.table_schema='public'
-      AND privilege.table_name='execution_intents') AS intent_columns,
+      AND privilege.table_name IN (${restrictedTableSql})) AS source_columns,
   has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
   has_schema_privilege(current_user,'public','CREATE') AS schema_create,
   EXISTS(SELECT 1 FROM migration_history
-    WHERE version='042_execution_preflight_intent_preparation.sql')
-    AS migration_042_present,
+    WHERE version='043_execution_intent_causal_lineage.sql')
+    AS migration_043_present,
   (SELECT COUNT(*)::TEXT FROM pg_proc routine
     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
     WHERE namespace.nspname NOT IN ('pg_catalog','information_schema') AND routine.prosecdef
@@ -217,13 +256,13 @@ export function createExecutionPreflightSourceDatabase(
 
 function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boolean {
   return row !== undefined && sameKeys(row, [
-    'creatable_schema_count', 'current_role', 'executable_security_definer_count', 'intent_columns',
+    'creatable_schema_count', 'current_role', 'executable_security_definer_count',
     'membership_admin', 'membership_count', 'membership_inherit', 'membership_set',
-    'migration_042_present', 'mutation_privilege_count', 'reader_membership',
+    'migration_043_present', 'mutation_privilege_count', 'reader_membership',
     'role_bypass_rls', 'role_can_set_replication', 'role_createdb', 'role_createrole',
     'role_database_create', 'role_inherit', 'role_login', 'role_owned_object_count',
     'role_parameter_authority_count', 'role_parent_count', 'role_replication', 'role_super',
-    'schema_create', 'schema_usage', 'search_path', 'server_version_number',
+    'schema_create', 'schema_usage', 'search_path', 'server_version_number', 'source_columns',
     'session_bypass_rls', 'session_can_set_replication', 'session_createdb',
     'session_createrole', 'session_direct_authority_count', 'session_inherit',
     'session_login', 'session_replication', 'session_replication_role', 'session_role',
@@ -253,10 +292,12 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
     && row.mutation_privilege_count === '0' && row.unexpected_column_privilege_count === '0'
     && validPrivileges(row.table_privileges, EXECUTION_PREFLIGHT_SOURCE_TABLES.map(
       (table) => [EXECUTION_PREFLIGHT_SOURCE_ROLE, 'public', table, 'SELECT'] as const))
-    && validPrivileges(row.intent_columns, EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS.map(
-      (column) => [EXECUTION_PREFLIGHT_SOURCE_ROLE, 'public', column, 'SELECT'] as const))
+    && validPrivileges(row.source_columns, restrictedEntries.flatMap(([table, columns]) =>
+      columns.map((column) => [
+        EXECUTION_PREFLIGHT_SOURCE_ROLE, 'public', table, column, 'SELECT',
+      ] as const)))
     && row.schema_usage === true && row.schema_create === false
-    && row.migration_042_present === true && row.executable_security_definer_count === '0'
+    && row.migration_043_present === true && row.executable_security_definer_count === '0'
     && row.role_can_set_replication === false && row.session_can_set_replication === false;
 }
 function sameKeys(value: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean {

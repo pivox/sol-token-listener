@@ -41,10 +41,19 @@ void test('creates one frozen deterministic BUY intent using bigint amounts', ()
   assert.equal(first.id, second.id);
   assert.equal(first.id, 'execution_intent_a8328e3681bbe158a8b06cd586cb02bbb187ef88d121bdefce05818b743e7b44');
   assert.equal(first.logicalOrderKey, 'paper_open_abc');
+  assert.equal(first.candidateId, `candidate_${'c'.repeat(64)}`);
   assert.equal(first.payloadVersion, 1);
   assert.equal(first.quoteAmountRaw, 500_000n);
   assert.equal(first.baseAmountRaw, null);
   assert.equal(Object.isFrozen(first), true);
+});
+
+void test('normalizes legacy V1 drafts without candidate lineage to an explicit null', () => {
+  const legacy = validInput();
+  delete legacy.candidateId;
+  const intent = createExecutionIntentDraft(legacy);
+  assert.equal(intent.candidateId, null);
+  assert.equal(Object.hasOwn(intent, 'candidateId'), true);
 });
 
 void test('uses length-prefixed identity fields that cannot collide through concatenation', () => {
@@ -399,6 +408,7 @@ function validInput(
     strategyId: 'creation-entry-v1',
     strategyVersion: 1,
     positionId: 'paper-position-1',
+    candidateId: `candidate_${'c'.repeat(64)}`,
     logicalCommandId: 'paper_open_abc',
     mint: '11111111111111111111111111111111',
     side: 'BUY',

@@ -10,6 +10,7 @@ import {
   type ExecutionPreflightPreparationPool,
 } from '../src/storage/execution-preflight-preparation.repository.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const NOW_MS = 1_789_000_000_000;
 const DEADLINE_MS = NOW_MS + 45_000;
@@ -113,6 +114,93 @@ void test('returns idle without selecting a replacement and rejects hostile opti
   );
   assert.equal(never.connections, 0);
 });
+
+void test('expires only the exact unpaired WAITING run at the DB handoff deadline', async () => {
+  const waiting = preparationClaim();
+  const beforeDeadlineClient = new ScriptedClient([
+    result([], null),
+    result([{ ...claimRow(), operation_at_ms: String(NOW_MS) }], 1),
+    result([], null),
+  ]);
+  const beforeDeadline = new ExecutionPreflightPreparationPostgresRepository(
+    new ScriptedPool(beforeDeadlineClient),
+    () => LEASE_TOKEN,
+  );
+
+  assert.equal(await beforeDeadline.expireWaitingWithoutPair(waiting), null);
+  assert.equal(beforeDeadlineClient.calls[0]?.text, 'BEGIN');
+  assert.match(beforeDeadlineClient.calls[1]?.text ?? '', /FOR UPDATE/u);
+  assert.match(beforeDeadlineClient.calls[1]?.text ?? '', /preparation\.pair_id IS NULL/u);
+  assert.match(beforeDeadlineClient.calls[1]?.text ?? '', /lease_expires_at=TIMESTAMPTZ 'epoch'/u);
+  assert.doesNotMatch(beforeDeadlineClient.calls[1]?.text ?? '', /lease_expires_at>statement_timestamp/u);
+  assert.equal(beforeDeadlineClient.calls[2]?.text, 'COMMIT');
+
+  const expiredLease = Object.freeze({
+    ...waiting,
+    leaseExpiresAtMs: DEADLINE_MS - 5_000,
+  });
+  const deadlineClient = new ScriptedClient([
+    result([], null),
+    result([{
+      ...claimRow(),
+      lease_expires_at_ms: String(expiredLease.leaseExpiresAtMs),
+      operation_at_ms: String(DEADLINE_MS - 5_000),
+    }], 1),
+    result([{
+      ...preparationRow(),
+      state: 'FAILED',
+      state_revision: '1',
+      failure_code: 'PREFLIGHT_PAIR_NOT_FOUND',
+      updated_at_ms: String(DEADLINE_MS - 5_000),
+      completed_at_ms: String(DEADLINE_MS - 5_000),
+      purge_after_ms: String(DEADLINE_MS - 5_000 + 14_400_000),
+    }], 1),
+    result([], null),
+  ]);
+  const atDeadline = new ExecutionPreflightPreparationPostgresRepository(
+    new ScriptedPool(deadlineClient),
+    () => LEASE_TOKEN,
+  );
+
+  const failed = await atDeadline.expireWaitingWithoutPair(expiredLease);
+
+  assert.equal(failed?.state, 'FAILED');
+  assert.equal(failed?.failureCode, 'PREFLIGHT_PAIR_NOT_FOUND');
+  assert.match(deadlineClient.calls[2]?.text ?? '', /SET state='FAILED'/u);
+  assert.match(deadlineClient.calls[2]?.text ?? '', /failure_code='PREFLIGHT_PAIR_NOT_FOUND'/u);
+  assert.match(deadlineClient.calls[2]?.text ?? '', /state_revision=preparation\.state_revision\+1/u);
+  assert.doesNotMatch(deadlineClient.calls[2]?.text ?? '', /lease_expires_at>statement_timestamp/u);
+  assert.equal(deadlineClient.calls[3]?.text, 'COMMIT');
+});
+
+void test('PostgreSQL expires the same WAITING run after its lease at the handoff deadline',
+  { timeout: 20_000 }, async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: waiting expiry integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'preflight_waiting_expiry', async (pool) => {
+      await migrateDatabase({ pool });
+      const repository = new ExecutionPreflightPreparationPostgresRepository(pool);
+      const started = await repository.startOrResume(Object.freeze({
+        ownerId: 'waiting-expiry-integration',
+        selectionWindowMs: 10_001,
+        leaseMs: 5_001,
+      }));
+      await new Promise<void>((resolve) => { setTimeout(resolve, 5_100); });
+
+      const terminal = await repository.expireWaitingWithoutPair(started);
+
+      assert.equal(terminal?.runId, started.preparation.runId);
+      assert.equal(terminal?.pairId, null);
+      assert.equal(terminal?.state, 'FAILED');
+      assert.equal(terminal?.failureCode, 'PREFLIGHT_PAIR_NOT_FOUND');
+      const stored = await repository.read(started.preparation.runId);
+      assert.equal(stored?.state, 'FAILED');
+      assert.equal(stored?.failureCode, 'PREFLIGHT_PAIR_NOT_FOUND');
+    });
+  });
 
 void test('locks the first chronological pair before validating it and never substitutes another', async () => {
   const claim = preparationClaim();
@@ -736,6 +824,11 @@ async function insertIntent(
   const command = lane === 'TARGET'
     ? `paper_open_${suffix}`
     : `execution_preflight_probe_${suffix}`;
+  await insertExecutionDecisionEvent(
+    client,
+    'decision-event',
+    '11111111111111111111111111111111',
+  );
   await client.query(`INSERT INTO execution_intents (
     id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
     logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,

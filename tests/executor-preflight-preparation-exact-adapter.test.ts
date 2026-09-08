@@ -305,6 +305,7 @@ function claimedSimulation(
       strategyId: 'creation-entry-v1',
       strategyVersion: 1,
       positionId: 'position:exact-preflight',
+      candidateId: `candidate_${'c'.repeat(64)}`,
       logicalCommandId: `execution_preflight_probe_${HASH}`,
       mint: '11111111111111111111111111111111',
       side: 'BUY',

@@ -134,7 +134,7 @@ export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
   has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
   has_schema_privilege(current_user,'public','CREATE') AS schema_create,
   EXISTS(SELECT 1 FROM migration_history
-    WHERE version='042_execution_preflight_intent_preparation.sql')
+    WHERE version='043_execution_intent_causal_lineage.sql')
     AS migration_042_present,
   (SELECT COUNT(*)::TEXT FROM pg_proc routine
     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace

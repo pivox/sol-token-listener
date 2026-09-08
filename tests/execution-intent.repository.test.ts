@@ -56,6 +56,7 @@ void test('create uses database timestamps and replays only an exactly matching 
   const insert = client.calls.find((call) => call.text.includes('INSERT INTO execution_intents'));
   assert.ok(insert);
   const insertedColumns = required(/execution_intents AS intent \(([\s\S]*?)\) VALUES/u.exec(insert.text)?.[1]);
+  assert.match(insertedColumns, /candidate_id/u);
   assert.doesNotMatch(insertedColumns, /created_at|updated_at/u);
   assert.equal(insert.values?.some((value) => value instanceof Date), false);
   const conflictRead = client.calls.find((call) =>
@@ -1737,6 +1738,7 @@ void test('a purged logical order cannot be recreated with fresh evidence and ti
   }
   await withTemporarySchema(databaseUrl, 'execution_intent_post_purge_replay', async (pool) => {
     await migrateDatabase({ pool });
+    await seedDefaultExecutionDecisionEvent(pool);
     const repository = new PostgresExecutionIntentRepository(pool);
     const now = await databaseNowMs(pool);
     const live = executionDraft('post-purge-replay', {
@@ -1767,7 +1769,6 @@ void test('a purged logical order cannot be recreated with fresh evidence and ti
     assert.equal((await purgeExpiredFoundationData(pool)).executionIntents, 1);
     const freshNow = await databaseNowMs(pool);
     const replay = executionDraft('post-purge-replay', {
-      decisionEventId: 'event-post-purge-replay-fresh',
       decisionFingerprint: 'b'.repeat(64),
       requestedAtMs: freshNow,
       expiresAtMs: freshNow + 60_000,
@@ -1796,6 +1797,7 @@ void test('create racing a locked purge fails closed on the committed tombstone'
     secondPool,
   ) => {
     await migrateDatabase({ pool: firstPool });
+    await seedDefaultExecutionDecisionEvent(firstPool);
     const original = executionDraft('concurrent-post-purge');
     await firstPool.query(`INSERT INTO execution_intents (
       id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
@@ -1837,7 +1839,6 @@ void test('create racing a locked purge fails closed on the committed tombstone'
       await waitForDatabaseQuery(secondPool, '%DELETE FROM execution_intents intent%');
       const now = await databaseNowMs(secondPool);
       const fresh = executionDraft('concurrent-post-purge', {
-        decisionEventId: 'event-concurrent-post-purge-fresh',
         decisionFingerprint: 'c'.repeat(64), requestedAtMs: now, expiresAtMs: now + 60_000,
       });
       replay = new PostgresExecutionIntentRepository(secondPool).create(fresh);
@@ -1873,6 +1874,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     secondPool,
   ) => {
     await migrateDatabase({ pool: firstPool });
+    await seedDefaultExecutionDecisionEvent(firstPool);
     const first = new PostgresExecutionIntentRepository(firstPool);
     const second = new PostgresExecutionIntentRepository(secondPool);
     const now = await databaseNowMs(firstPool);
@@ -2125,6 +2127,7 @@ void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SE
       secondPool,
     ) => {
       await migrateDatabase({ pool: firstPool });
+      await seedDefaultExecutionDecisionEvent(firstPool);
       const first = new PostgresExecutionIntentRepository(firstPool);
       const buySession = await secondPool.connect();
       await buySession.query(
@@ -2208,6 +2211,7 @@ void test('LIVE_RECOVER BUY waits for an uncommitted SELL creation and observes 
       secondPool,
     ) => {
       await migrateDatabase({ pool: firstPool });
+      await seedDefaultExecutionDecisionEvent(firstPool);
       const first = new PostgresExecutionIntentRepository(firstPool);
       const second = new PostgresExecutionIntentRepository(secondPool);
       const now = await databaseNowMs(firstPool);
@@ -2286,6 +2290,7 @@ void test('LIVE_RECOVER BUY waits for an uncommitted signed SELL persistence bou
       secondPool,
     ) => {
       await migrateDatabase({ pool: firstPool });
+      await seedDefaultExecutionDecisionEvent(firstPool);
       const first = new PostgresExecutionIntentRepository(firstPool);
       const second = new PostgresExecutionIntentRepository(secondPool);
       const now = await databaseNowMs(firstPool);
@@ -2350,6 +2355,7 @@ void test('concurrent LIVE_RECOVER BUY claims elect one winner without deadlock'
     secondPool,
   ) => {
     await migrateDatabase({ pool: firstPool });
+    await seedDefaultExecutionDecisionEvent(firstPool);
     const first = new PostgresExecutionIntentRepository(firstPool);
     const second = new PostgresExecutionIntentRepository(secondPool);
     const now = await databaseNowMs(firstPool);
@@ -2386,6 +2392,7 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
 
   await withTemporarySchema(databaseUrl, 'execution_intent_repository', async (firstPool, secondPool) => {
     await migrateDatabase({ pool: firstPool });
+    await seedDefaultExecutionDecisionEvent(firstPool);
     const first = new PostgresExecutionIntentRepository(firstPool);
     const second = new PostgresExecutionIntentRepository(secondPool);
     const now = await databaseNowMs(firstPool);
@@ -2551,12 +2558,14 @@ void test('generic EXECUTE and DRY_RUN claims skip both lanes of an older prefli
     await withTemporarySchema(databaseUrl, 'execution_paired_target_claim',
       async (firstPool, secondPool) => {
         await migrateDatabase({ pool: firstPool });
+        await seedDefaultExecutionDecisionEvent(firstPool);
         const first = new PostgresExecutionIntentRepository(firstPool);
         const second = new PostgresExecutionIntentRepository(secondPool);
         const nowMs = await databaseNowMs(firstPool);
         const target = createExecutionIntentDraft({
           strategyId: 'creation-entry-v1', strategyVersion: 1,
           positionId: 'position:paired-claim-target',
+          candidateId: `candidate_${'1'.repeat(64)}`,
           logicalCommandId: `paper_open_${'4'.repeat(64)}`,
           mint: '11111111111111111111111111111111', side: 'BUY',
           venuePolicy: 'PUMP_FUN_ONLY',
@@ -2567,6 +2576,7 @@ void test('generic EXECUTE and DRY_RUN claims skip both lanes of an older prefli
           decisionFingerprint: 'a'.repeat(64),
           requestedAtMs: nowMs - 60_000, expiresAtMs: nowMs + 120_000,
         });
+        await seedCurrentExecutionLineage(firstPool, target);
         const pair = createExecutionPreflightIntentPairDraft(target);
         const pairClient = await firstPool.connect();
         try {
@@ -2623,12 +2633,14 @@ void test('PostgreSQL exact preparation claims lease only their bound TARGET and
     await withTemporarySchema(databaseUrl, 'execution_exact_preflight_claim',
       async (firstPool, secondPool) => {
         await migrateDatabase({ pool: firstPool });
+        await seedDefaultExecutionDecisionEvent(firstPool);
         const first = new PostgresExecutionIntentRepository(firstPool);
         const second = new PostgresExecutionIntentRepository(secondPool);
         const nowMs = await databaseNowMs(firstPool);
         const target = createExecutionIntentDraft({
           strategyId: 'creation-entry-v1', strategyVersion: 1,
           positionId: 'position:exact-preflight-claim',
+          candidateId: `candidate_${'2'.repeat(64)}`,
           logicalCommandId: `paper_open_${'5'.repeat(64)}`,
           mint: '11111111111111111111111111111111', side: 'BUY',
           venuePolicy: 'PUMP_FUN_ONLY',
@@ -2639,6 +2651,7 @@ void test('PostgreSQL exact preparation claims lease only their bound TARGET and
           decisionFingerprint: 'a'.repeat(64),
           requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 180_000,
         });
+        await seedCurrentExecutionLineage(firstPool, target);
         const pair = createExecutionPreflightIntentPairDraft(target);
         const client = await firstPool.connect();
         try {
@@ -2813,6 +2826,7 @@ void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attem
 
   await withTemporarySchema(databaseUrl, 'execution_intent_hardening', async (pool) => {
     await migrateDatabase({ pool });
+    await seedDefaultExecutionDecisionEvent(pool);
     const repository = new PostgresExecutionIntentRepository(pool);
     const now = await databaseNowMs(pool);
 
@@ -2906,6 +2920,7 @@ void test('real PostgreSQL replays one STARTED attempt under a reclaimed fresh f
 
   await withTemporarySchema(databaseUrl, 'execution_attempt_reclaim', async (firstPool, secondPool) => {
     await migrateDatabase({ pool: firstPool });
+    await seedDefaultExecutionDecisionEvent(firstPool);
     const first = new PostgresExecutionIntentRepository(firstPool);
     const second = new PostgresExecutionIntentRepository(secondPool);
     const now = await databaseNowMs(firstPool);
@@ -2951,6 +2966,7 @@ void test('real PostgreSQL covers reclaim and pre-submission expiry near databas
 
   await withTemporarySchema(databaseUrl, 'execution_intent_boundaries', async (firstPool, secondPool) => {
     await migrateDatabase({ pool: firstPool });
+    await seedDefaultExecutionDecisionEvent(firstPool);
     const first = new PostgresExecutionIntentRepository(firstPool);
     const second = new PostgresExecutionIntentRepository(secondPool);
     const now = await databaseNowMs(firstPool);
@@ -3050,10 +3066,11 @@ function executionDraft(
   return createExecutionIntentDraft({
     strategyId: 'execution-intent-repository', strategyVersion: 1,
     positionId: `position-${logicalCommandId}`, logicalCommandId,
+    candidateId: null,
     mint: '11111111111111111111111111111111', side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
     quoteMint: 'So11111111111111111111111111111111111111112', quoteTokenProgram: 'SPL_TOKEN',
     quoteDecimals: 9, quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
-    decisionEventId: `event-${logicalCommandId}`, decisionFingerprint: 'a'.repeat(64),
+    decisionEventId: 'event-execution-intent-repository', decisionFingerprint: 'a'.repeat(64),
     requestedAtMs: NOW_MS - 1_000, expiresAtMs: NOW_MS + 60_000,
     ...overrides,
   });
@@ -3142,6 +3159,113 @@ async function seedLiveExecuteBuyTarget(
   }
 }
 
+async function seedDefaultExecutionDecisionEvent(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<void> {
+  await pool.query(`INSERT INTO domain_events (
+    event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,inner_instruction_index,confirmation_status,blockchain_time,
+    observed_at,payload_version,payload
+  ) VALUES (
+    'event-execution-intent-repository',NULL,'PaperStrategySessionUpdated',
+    '11111111111111111111111111111111','test','test','test',0,0,0,NULL,
+    'finalized',NULL,date_trunc('milliseconds',statement_timestamp()),1,'{}'
+  ) ON CONFLICT (event_id) DO NOTHING`);
+}
+
+async function seedCurrentExecutionLineage(
+  pool: InstanceType<typeof pg.Pool>,
+  intent: ExecutionIntentDraftV1,
+): Promise<void> {
+  if (intent.candidateId === null) throw new TypeError('Candidate lineage is missing.');
+  const reportId = `qreport_${'3'.repeat(64)}`;
+  const qualificationEventId = `evt_${'4'.repeat(64)}`;
+  const candidateEventId = `evt_${'5'.repeat(64)}`;
+  const rawEventId = `raw_lineage_${intent.candidateId.slice(-16)}`;
+  const candidatePayload = {
+    id: intent.candidateId,
+    mint: intent.mint,
+    qualificationReportId: reportId,
+  };
+  const decisionPayload = {
+    session: {
+      candidateId: intent.candidateId,
+      qualificationReportId: reportId,
+      positionId: intent.positionId,
+      mint: intent.mint,
+    },
+  };
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+    created_signature,created_slot,created_transaction_index,created_instruction_index,
+    created_inner_instruction_index,detected_at,updated_at
+  ) VALUES ($1,'pumpfun','pumpfun','creator','SPL_TOKEN','[]','OBSERVING',
+    'lineage-signature',1,0,0,NULL,date_trunc('milliseconds',statement_timestamp()),
+    date_trunc('milliseconds',statement_timestamp())) ON CONFLICT (mint) DO NOTHING`, [intent.mint]);
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status,observed_at,payload_version,payload,
+    processing_status
+  ) VALUES ($1,'test','pumpfun',$2,$3,1,0,0,NULL,'finalized',
+    date_trunc('milliseconds',statement_timestamp()),1,'{}','processed')`, [
+    rawEventId, intent.mint, `lineage-${intent.candidateId}`,
+  ]);
+  for (const event of [
+    [qualificationEventId, 'QualificationUpdated', 'qualification', {}],
+    [candidateEventId, 'TradingCandidateUpdated', 'paper-decision', { candidate: candidatePayload }],
+    [intent.decisionEventId, 'PaperStrategySessionUpdated', 'paper-decision', decisionPayload],
+  ] as const) {
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,inner_instruction_index,confirmation_status,observed_at,payload_version,payload
+    ) VALUES ($1,$2,$3,$4,$5,'pumpfun',$6,1,0,0,NULL,'finalized',
+      date_trunc('milliseconds',statement_timestamp()),1,$7)`, [
+      event[0], rawEventId, event[1], intent.mint, event[2],
+      `lineage-${intent.candidateId}`, JSON.stringify(event[3]),
+    ]);
+  }
+  await pool.query(`WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+  ) INSERT INTO qualification_reports (
+    report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+    profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+    preparation_score,social_score,onchain_score,total_score,as_of_slot,
+    as_of_transaction_index,as_of_instruction_index,as_of_inner_instruction_index,
+    confirmation_status,evaluated_at,purge_after,payload_version,payload
+  ) SELECT $1,$2,$3,$4,$3,'profile',1,$5,$6,'QUALIFIED',15,25,60,100,1,0,0,NULL,
+    'finalized',operation.at,operation.at+INTERVAL '4 hours',1,'{}' FROM operation`, [
+    reportId, intent.mint, qualificationEventId, rawEventId, '6'.repeat(64), '7'.repeat(64),
+  ]);
+  await pool.query(`WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+  ) INSERT INTO trading_candidates (
+    candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+    strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+    quote_decimals,quote_token_program,reason_codes,eligible_until,created_at,
+    purge_after,payload_version,payload
+  ) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'finalized','ELIGIBLE',$9,9,'SPL_TOKEN',
+    '["QUALIFIED_ENTRY"]',operation.at+INTERVAL '3 minutes',operation.at,
+    operation.at+INTERVAL '4 hours',1,$10 FROM operation`, [
+    intent.candidateId, intent.mint, reportId, qualificationEventId, candidateEventId,
+    intent.strategyId, intent.strategyVersion, '7'.repeat(64), intent.quoteMint,
+    JSON.stringify(candidatePayload),
+  ]);
+  await pool.query(`INSERT INTO paper_positions (
+    position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+    strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+    quote_proceeds_raw,gross_pnl_quote_raw,net_pnl_quote_raw,round_trip_loss_bps,
+    entry_trade_id,exit_trade_id,open_command_hash,close_command_hash,trigger_event_id,
+    payload_version,payload,opened_at,closed_at,purge_after,strategy_session_id,
+    qualification_report_id,candidate_id
+  ) VALUES ($1,$2,$3,9,'SPL_TOKEN',$4,$5,'PAPER_HOLDING',1,1,1,NULL,NULL,NULL,
+    0,$6,NULL,$7,NULL,$8,1,'{}',date_trunc('milliseconds',statement_timestamp()),
+    NULL,NULL,'paper-session',$9,$10)`, [
+    intent.positionId, intent.mint, intent.quoteMint, intent.strategyId, intent.strategyVersion,
+    `paper_trade_${'8'.repeat(64)}`, `paper_open_command_${'9'.repeat(64)}`,
+    qualificationEventId, reportId, intent.candidateId,
+  ]);
+}
+
 async function reserveLiveIntents(
   pool: InstanceType<typeof pg.Pool>,
   intentIds: readonly string[],
@@ -3165,6 +3289,7 @@ function intentRow(
     strategy_id: draft.strategyId,
     strategy_version: draft.strategyVersion,
     position_id: draft.positionId,
+    candidate_id: draft.candidateId,
     logical_command_id: draft.logicalCommandId,
     mint: draft.mint,
     side: draft.side,
