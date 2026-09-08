@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
+import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
+import { createExecutionWalletGeneration } from '../src/domain/execution-readiness.js';
+import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import {
   createExecutionReadinessBootstrapDatabase,
   createExecutionReadinessDatabase,
@@ -11,6 +14,8 @@ import {
   ExecutionReadinessDatabaseError,
 } from '../src/executor-readiness/database.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { PostgresExecutionReadinessRepository } from
+  '../src/storage/execution-readiness.repository.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 void test('pins and validates the readiness role on every checkout', async () => {
@@ -126,9 +131,14 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
     const activePool = new pg.Pool({ connectionString: url.href, max: 1 });
     loginPool = activePool;
     const database = createExecutionReadinessDatabase(activePool);
+    const repository = new PostgresExecutionReadinessRepository(database.pool);
+    await repository.commit(readinessCommitInput());
     const client = await database.pool.connect();
     try {
       await client.query('SELECT version FROM migration_history LIMIT 1');
+      await assert.rejects(client.query(`UPDATE execution_wallet_risk_state
+        SET payload_version=1 WHERE generation_id=$1`, [readinessCommitInput().generation.generationId]),
+      permissionDenied);
       for (const statement of [
         'SELECT id FROM execution_intents LIMIT 1',
         'SELECT pair_id FROM execution_preflight_intent_pairs LIMIT 1',
@@ -205,4 +215,40 @@ function result(row: Readonly<Record<string, unknown>>) {
 
 function permissionDenied(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === '42501';
+}
+
+function readinessCommitInput() {
+  const nowMs = Date.now();
+  const generation = createExecutionWalletGeneration(Object.freeze({
+    walletPublicKey: '2LvenbX1TdhX8EbxGBmcZYiXuZFN4utA8QZY1UgGXwmZ',
+    cluster: 'mainnet-beta' as const,
+    genesisHash: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+    generation: 1,
+  }));
+  const walletSnapshot = createExecutionWalletSnapshot(Object.freeze({
+    generationId: generation.generationId,
+    providerId: 'primary',
+    stateRevision: 0n,
+    slot: 401_000_000n,
+    blockTimeMs: nowMs - 1_000,
+    observedAtMs: nowMs,
+    commitment: 'finalized' as const,
+    walletLamports: 1n,
+    tokenBalanceCount: 0,
+    openPositions: Object.freeze([]),
+    realizedNetPnlRaw: 0n,
+  }));
+  const providerSnapshot = createProviderUsageSnapshot(Object.freeze({
+    providerId: 'primary',
+    planId: 'paid-mainnet',
+    billingPeriodId: '2026-09',
+    billingPeriodStartedAtMs: nowMs - 86_400_000,
+    billingPeriodEndsAtMs: nowMs + 86_400_000,
+    limitUnits: 1_000_000n,
+    usedUnits: 1n,
+    measuredAtMs: nowMs,
+    expiresAtMs: nowMs + 300_000,
+    provenance: 'OPERATOR_REPORT' as const,
+  }));
+  return Object.freeze({ generation, walletSnapshot, providerSnapshot });
 }

@@ -34,6 +34,25 @@ void test('commits generation and both snapshots atomically and replays exactly'
   });
 });
 
+void test('serializes concurrent replays of the same readiness commit', async (context) => {
+  const url = databaseUrl(context);
+  if (url === null) return;
+  await withSchema(url, async (pool) => {
+    const input = commitInput();
+    const first = new PostgresExecutionReadinessRepository(pool);
+    const second = new PostgresExecutionReadinessRepository(pool);
+    assert.deepEqual(await Promise.all([first.commit(input), second.commit(input)]), [input, input]);
+    const counts = (await pool.query(`SELECT
+      (SELECT COUNT(*) FROM execution_wallet_generations)::INTEGER AS generations,
+      (SELECT COUNT(*) FROM execution_wallet_risk_state)::INTEGER AS risk_states,
+      (SELECT COUNT(*) FROM execution_wallet_snapshots)::INTEGER AS wallet_snapshots,
+      (SELECT COUNT(*) FROM execution_provider_usage_snapshots)::INTEGER AS provider_snapshots`))
+      .rows[0];
+    assert.deepEqual(counts, { generations: 1, risk_states: 1,
+      wallet_snapshots: 1, provider_snapshots: 1 });
+  });
+});
+
 void test('rolls back every readiness projection when the provider insert fails', async (context) => {
   const url = databaseUrl(context);
   if (url === null) return;
