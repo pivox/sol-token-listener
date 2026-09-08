@@ -1,6 +1,6 @@
 # Plan d'implémentation H2k-b — préparation d'intention de préflight
 
-Spec : `docs/superpowers/specs/2026-09-08-executor-preflight-intent-preparation-design.md` v1.1.0
+Spec : `docs/superpowers/specs/2026-09-08-executor-preflight-intent-preparation-design.md` v1.2.0
 
 ## Contraintes permanentes
 
@@ -77,10 +77,15 @@ Fichiers prévus :
 - contrats H2c concernés dans `src/execution-operations/`
 - tests source/draft/opérations
 
-TDD : ajouter les contrats v2 sans modifier le sens des archives v1. Prouver le
+TDD : ajouter le source H2h v2 et le wire contract H2c `payloadVersion=3` sans
+modifier le sens des archives v1/v2. Prouver le
 snapshot `REPEATABLE READ READ ONLY`, la lignée exacte, la cible pristine,
 l'unique tentative du sibling, l'artefact frais, la finalité causale et la
 marge de cinq secondes. Une cible appairée doit être refusée par H2c v1.
+
+Avant l'export, migration 043 ajoute `candidate_id` aux intentions, les FK
+causales `NOT VALID`, un backfill strictement non ambigu et un validateur
+transactionnel reconsulté par H2k-b, H2h et H2c.
 
 ## Lot 6 — Rôles, déploiement, rétention et documentation
 
@@ -94,7 +99,7 @@ Fichiers prévus :
 
 TDD : reconstruire les rôles sur PostgreSQL 16, vérifier les droits colonnes et
 fonctions exacts, l'absence de capacité live/signante, la rétention ordonnée et
-le head 042. Mettre à jour tous les contrats de déploiement épinglés.
+le head 043. Mettre à jour tous les contrats de déploiement épinglés.
 
 ## Vérification et livraison
 

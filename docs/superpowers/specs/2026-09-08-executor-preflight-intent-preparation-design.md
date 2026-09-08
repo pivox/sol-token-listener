@@ -1,6 +1,6 @@
 # Préparation déterministe d'une intention de préflight — H2k-b
 
-Version : 1.1.0
+Version : 1.2.0
 Statut : validé pour implémentation  
 Date : 2026-09-08
 
@@ -96,23 +96,36 @@ uniquement les codes stables :
 
 Les messages restent constants et redacted.
 
-## 5. Orchestrateur one-shot H2j
+## 5. Orchestrateur one-shot H2k-b
 
 Le processus suit exactement ce flux :
 
 ```text
-watermark PostgreSQL
+watermark PostgreSQL et deadline absolue
   -> première paire exacte après watermark
   -> dry-run exact de TARGET, non consommant
   -> simulation exacte de SIMULATION
-  -> snapshot H2h v2 en lecture seule
   -> manifeste redacted atomique
+  -> état PREPARED avec fingerprint du manifeste
   -> arrêt
 ```
 
 Sa configuration accepte uniquement des durées bornées, un owner technique et
 un chemin de sortie absolu hors dépôt. Elle n'accepte ni mint, ni identifiant de
 paire/intention, ni SQL libre, ni URL RPC en argument ad hoc, ni option live.
+
+Le polling ne change jamais le watermark et renouvelle la lease avant toute
+opération réseau. Si aucune paire n'existe à la deadline, le même run passe en
+`FAILED/PREFLIGHT_PAIR_NOT_FOUND` : aucun nouveau run n'est créé pour contourner
+la fenêtre. Après reprise, un assessment ou artefact déjà lié est relu et n'est
+jamais réexécuté.
+
+Le manifeste est déterministe à partir des horodatages PostgreSQL : `createdAt`
+vient du run, `preparedAt` est le `updated_at` produit par la liaison de
+l'artefact, `expiresAt` est le minimum entre deadline et expiration de paire,
+et `purgeAfter=preparedAt+4h`. Il est publié avant `markPrepared`. Une panne
+entre ces deux opérations rejoue uniquement un fichier canonique byte-exact,
+puis termine le même run par CAS ; une sortie différente est refusée.
 
 ## 6. Validation H2h v2 et handoff H2c
 
@@ -134,6 +147,36 @@ L'export est refusé sauf si :
 Les contrats historiques v1 restent lisibles mais ne peuvent pas autoriser une
 cible appairée. H2c adopte un contrat versionné qui exige la preuve H2h v2 et
 verrouille paire plus cible avant toute future promotion `live_reserved`.
+
+Le wire contract H2c correspondant utilise `payloadVersion=3`. La désignation
+produit « H2c v2 » décrit l'étape fonctionnelle ; `payloadVersion=2` reste
+historique et est explicitement limité aux cibles non appairées.
+
+### 6.1 Lignée causale attestée — migration 043
+
+`execution_intents.candidate_id` est nullable pour préserver les archives mais
+obligatoire pour toute nouvelle paire de préflight. La migration ajoute des FK
+`NOT VALID` vers `trading_candidates(candidate_id)` et de
+`execution_intents.decision_event_id` vers `domain_events(event_id)`. Le
+backfill n'atteste que les chaînes historiques uniques et cohérentes ; une ligne
+ambiguë reste `NULL` et ne peut pas entrer dans H2k-b.
+
+La validation transactionnelle suit exclusivement :
+
+```text
+execution_intent.candidate_id
+  -> trading_candidate.report_id/source_event_id/candidate_event_id
+  -> qualification_report.raw_event_id
+  -> domain_event.raw_event_id
+  -> raw_chain_event finalisé et non orphaned
+```
+
+Le `decision_event_id` doit référencer l'événement de session attendu, de même
+mint, dont le payload confirme les mêmes candidate et report. Le candidat, le
+rapport et les événements ne doivent pas être superseded. Cette chaîne est
+revalidée à la sélection H2k-b, à l'export H2h et immédiatement avant toute
+promotion H2c ; une FK seule n'est jamais considérée comme une preuve de
+fraîcheur.
 
 ## 7. Manifeste
 
@@ -170,7 +213,7 @@ RPC.
 
 ## 9. Acceptation
 
-- migrations 001–042 sur base vide, upgrade 041→042 et rejeu idempotent ;
+- migrations 001–043 sur base vide, upgrades 041→042→043 et rejeu idempotent ;
 - concurrence : la seconde paire n'est jamais substituée à la première ;
 - crash/reprise : même run, même paire, lease authentifiée ;
 - workers génériques incapables de prendre TARGET ou SIMULATION ;
@@ -186,6 +229,8 @@ Deux cycles de revue maximum sont autorisés pour cette PR.
 
 ## Historique
 
+- 1.2.0 — fixe le polling et la reprise one-shot, les horodatages déterministes
+  du manifeste, la lignée causale migration 043 et le wire contract H2c v3.
 - 1.1.0 — ferme les résultats de reprise, lease, assessment et simulation par
   des reason codes de préparation distincts.
 - 1.0.1 — précise l'unicité du run actif, la lease dès le watermark et la
