@@ -34,6 +34,92 @@ void test('commits generation and both snapshots atomically and replays exactly'
   });
 });
 
+void test('serializes concurrent replays of the same readiness commit', async (context) => {
+  const url = databaseUrl(context);
+  if (url === null) return;
+  await withSchema(url, async (pool) => {
+    const input = commitInput();
+    const first = new PostgresExecutionReadinessRepository(pool);
+    const second = new PostgresExecutionReadinessRepository(pool);
+    assert.deepEqual(await Promise.all([first.commit(input), second.commit(input)]), [input, input]);
+    const counts = (await pool.query(`SELECT
+      (SELECT COUNT(*) FROM execution_wallet_generations)::INTEGER AS generations,
+      (SELECT COUNT(*) FROM execution_wallet_risk_state)::INTEGER AS risk_states,
+      (SELECT COUNT(*) FROM execution_wallet_snapshots)::INTEGER AS wallet_snapshots,
+      (SELECT COUNT(*) FROM execution_provider_usage_snapshots)::INTEGER AS provider_snapshots`))
+      .rows[0];
+    assert.deepEqual(counts, { generations: 1, risk_states: 1,
+      wallet_snapshots: 1, provider_snapshots: 1 });
+  });
+});
+
+void test('reads risk state after a blocked generation writer under repeatable read',
+  async (context) => {
+    const url = databaseUrl(context);
+    if (url === null) return;
+    await withSchema(url, async (pool, schema) => {
+      const input = commitInput();
+      await pool.query(`INSERT INTO execution_wallet_generations (
+        generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation
+      ) VALUES ($1,1,$2,$3,$4,$5)`, [input.generation.generationId,
+        input.generation.walletPublicKey, input.generation.cluster,
+        input.generation.genesisHash, input.generation.generation]);
+      await pool.query(`INSERT INTO execution_wallet_risk_state (
+        generation_id,reconciled_capital_lamports,reserved_exposure_raw,
+        conservative_drawdown_raw
+      ) VALUES ($1,0,0,0)`, [input.generation.generationId]);
+      const writer = await pool.connect();
+      const repeatablePool = new pg.Pool({ connectionString: url,
+        options: `-c search_path=${schema}`, max: 1 });
+      let readinessBackendPidResolve: ((processId: number) => void) | undefined;
+      const readinessBackendPid = new Promise<number>((resolve) => {
+        readinessBackendPidResolve = resolve;
+      });
+      const repeatableSource: ExecutionRiskPool = { async connect() {
+        const client = await repeatablePool.connect();
+        await client.query(`SET SESSION CHARACTERISTICS AS TRANSACTION
+          ISOLATION LEVEL REPEATABLE READ`);
+        const processId = (await client.query<{ readonly pid: number }>(
+          'SELECT pg_backend_pid() AS pid',
+        )).rows[0]?.pid;
+        if (processId === undefined) assert.fail('Readiness backend PID is unavailable.');
+        readinessBackendPidResolve?.(processId);
+        return {
+          query: (text, values) => {
+            return client.query(text, values === undefined ? undefined : [...values]);
+          },
+          release: (evict = false) => { client.release(evict); },
+        };
+      } };
+      let writerTransaction = false;
+      try {
+        await writer.query('BEGIN');
+        writerTransaction = true;
+        await writer.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+          [input.generation.generationId]);
+        const commit = new PostgresExecutionReadinessRepository(repeatableSource).commit(input);
+        await waitForLock(pool, await readinessBackendPid);
+        await writer.query(`UPDATE execution_wallet_risk_state
+          SET state_revision=1 WHERE generation_id=$1`, [input.generation.generationId]);
+        await writer.query('COMMIT');
+        writerTransaction = false;
+        await assert.rejects(commit,
+          (error: unknown) => error instanceof ExecutionReadinessRepositoryError
+            && error.code === 'CONFLICT');
+        const state = (await pool.query(`SELECT state_revision::TEXT AS revision,
+          (SELECT COUNT(*) FROM execution_wallet_snapshots)::INTEGER AS wallet_snapshots,
+          (SELECT COUNT(*) FROM execution_provider_usage_snapshots)::INTEGER AS provider_snapshots
+          FROM execution_wallet_risk_state WHERE generation_id=$1`,
+        [input.generation.generationId])).rows[0];
+        assert.deepEqual(state, { revision: '1', wallet_snapshots: 0, provider_snapshots: 0 });
+      } finally {
+        if (writerTransaction) await writer.query('ROLLBACK');
+        writer.release();
+        await repeatablePool.end();
+      }
+    });
+  });
+
 void test('rolls back every readiness projection when the provider insert fails', async (context) => {
   const url = databaseUrl(context);
   if (url === null) return;
@@ -173,9 +259,23 @@ function databaseUrl(context: Readonly<{ skip(message?: string): void }>): strin
   return null;
 }
 
+async function waitForLock(
+  admin: InstanceType<typeof pg.Pool>, processId: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const row = (await admin.query<{ readonly wait_event_type: string | null }>(
+      'SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [processId],
+    )).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+  }
+  assert.fail('Readiness did not wait for the generation advisory lock.');
+}
+
 async function withSchema(
   databaseUrlValue: string,
-  callback: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+  callback: (pool: InstanceType<typeof pg.Pool>, schema: string) => Promise<void>,
 ): Promise<void> {
   const schema = `execution_readiness_${randomUUID().replaceAll('-', '')}`;
   const admin = new pg.Pool({ connectionString: databaseUrlValue });
@@ -185,7 +285,7 @@ async function withSchema(
   try {
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await migrateDatabase({ pool });
-    await callback(pool);
+    await callback(pool, schema);
   } finally {
     try {
       await pool.end();

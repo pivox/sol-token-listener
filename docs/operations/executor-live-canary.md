@@ -1,8 +1,19 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.1 — 2026-09-08
+**Version :** 1.17.3 — 2026-09-08
 
-La version 1.17.1 constate que H2e accepte strictement le contrat historique
+La version 1.17.3 force la transaction H2d en `READ COMMITTED`. Une exécution
+qui attend le mutex de génération observe ainsi le dernier état risque commité,
+même si le rôle ou la session PostgreSQL utilise par défaut `REPEATABLE READ`.
+Le rôle readiness ne reçoit toujours aucun privilège `UPDATE`.
+
+La version 1.17.2 corrige le prérequis PostgreSQL H2d observé sur le terrain :
+la validation de l'état risque s'appuie sur le mutex transactionnel de
+génération déjà commun aux writers et n'utilise plus un verrou de ligne qui
+exigerait un privilège `UPDATE`. Le rôle readiness conserve donc zéro capacité
+de mise à jour sur cet état.
+
+La version 1.17.1 constatait que H2e accepte strictement le contrat historique
 `usage` et le contrat courant
 `creditCycle + credits + requests + dataTransfer` ; dans ce dernier,
 `creditCycle` est l'autorité du cycle. Ce complément documentaire ne change

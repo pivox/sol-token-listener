@@ -32,6 +32,10 @@ import { insertExecutionDecisionEvent } from './helpers/execution-decision-event
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const repositoryUrl = new URL('../src/storage/execution-operations.repository.ts', import.meta.url);
+const readinessRepositoryUrl = new URL(
+  '../src/storage/execution-readiness.repository.ts',
+  import.meta.url,
+);
 const riskRepositoryUrl = new URL('../src/storage/execution-risk.repository.ts', import.meta.url);
 const liveStartupUrl = new URL('../src/executor-live/startup-validator.ts', import.meta.url);
 const packageUrl = new URL('../package.json', import.meta.url);
@@ -52,6 +56,7 @@ void test('executor role provisioning is one explicit transaction', async () => 
 void test('executor role provisioning is explicit, passwordless and least-privilege', async () => {
   const sql = await readFile(scriptUrl, 'utf8');
   const repository = await readFile(repositoryUrl, 'utf8');
+  const readinessRepository = await readFile(readinessRepositoryUrl, 'utf8');
   const riskRepository = await readFile(riskRepositoryUrl, 'utf8');
   const executable = sql.replace(/--[^\r\n]*/gu, ' ');
   for (const role of [
@@ -125,6 +130,11 @@ void test('executor role provisioning is explicit, passwordless and least-privil
       `${readOnlyTable} must remain usable with SELECT-only privileges`,
     );
   }
+  assert.doesNotMatch(
+    readinessRepository,
+    /FROM\s+execution_wallet_risk_state[^;`]*FOR UPDATE/iu,
+    'readiness must serialize risk validation with its advisory lock, not UPDATE authority',
+  );
   for (const statement of [...riskRepository.matchAll(/`([^`]*FOR UPDATE[^`]*)`/gs)]
     .map((match) => match[1] ?? '')) {
     for (const [table, alias] of [

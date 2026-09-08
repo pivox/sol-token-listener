@@ -58,7 +58,7 @@ export class PostgresExecutionReadinessRepository implements ExecutionReadinessR
     let commitStarted = false;
     let released = false;
     try {
-      await client.query('BEGIN');
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       transactionStarted = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
         [input.generation.generationId]);
@@ -156,7 +156,7 @@ async function validateInitialRiskState(
     reserved_exposure_raw::TEXT AS reserved_exposure_raw,open_positions,
     conservative_drawdown_raw::TEXT AS conservative_drawdown_raw,
     consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
-    FROM execution_wallet_risk_state WHERE generation_id=$1 FOR UPDATE`, [generationId]);
+    FROM execution_wallet_risk_state WHERE generation_id=$1`, [generationId]);
   const row = result.rows.length === 1 ? result.rows[0] : undefined;
   if (row?.state_revision !== '0'
     || row.reconciled_capital_lamports !== '0' || row.reserved_exposure_raw !== '0'
