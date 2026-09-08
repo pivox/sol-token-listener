@@ -6,7 +6,9 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
+  stat,
   symlink,
   writeFile,
 } from 'node:fs/promises';
@@ -83,7 +85,7 @@ void test('rejects mutable, extended, malformed and temporally incoherent manife
   );
 });
 
-void test('writes one canonical owner-only manifest without overwriting files or following symlinks',
+void test('replays one crash-visible byte-exact manifest without overwriting its inode',
   async (context) => {
     const root = await temporaryDirectory(context, 'preflight-preparation-manifest-');
     const writer = createExecutionPreflightIntentPreparationManifestWriter();
@@ -99,7 +101,16 @@ void test('writes one canonical owner-only manifest without overwriting files or
     assert.deepEqual(JSON.parse(stored), manifest);
     assert.equal(stored.endsWith('\n'), false);
 
-    await assert.rejects(writer.write(output, validInput()), isRedactedManifestError);
+    const published = await stat(output);
+    assert.deepEqual(await writer.write(output, validInput()), manifest);
+    assert.equal((await stat(output)).ino, published.ino);
+    assert.equal(await readFile(output, 'utf8'), stored);
+
+    await assert.rejects(
+      writer.write(output, validInput({ assessmentFingerprint: 'b'.repeat(64) })),
+      isRedactedManifestError,
+    );
+    assert.equal((await stat(output)).ino, published.ino);
     assert.equal(await readFile(output, 'utf8'), stored);
 
     const protectedPath = join(root, 'protected.json');
@@ -109,6 +120,47 @@ void test('writes one canonical owner-only manifest without overwriting files or
     await assert.rejects(writer.write(symlinkPath, validInput()), isRedactedManifestError);
     assert.equal(await readFile(protectedPath, 'utf8'), 'protected');
     assert.deepEqual((await readdir(root)).filter((name) => name.includes('.tmp')), []);
+  });
+
+void test('fails closed when the authenticated parent is substituted before publication',
+  async (context) => {
+    const root = await temporaryDirectory(context, 'preflight-preparation-parent-swap-');
+    const parent = join(root, 'parent');
+    const movedParent = join(root, 'authenticated-parent');
+    await mkdir(parent);
+    const output = join(parent, 'manifest.json');
+    let substituted = false;
+    const writer = createExecutionPreflightIntentPreparationManifestWriter({
+      beforeFileSystemOperation: async (operation) => {
+        if (operation !== 'PUBLISH_OUTPUT' || substituted) return;
+        substituted = true;
+        await rename(parent, movedParent);
+        await mkdir(parent);
+      },
+    });
+
+    await assert.rejects(writer.write(output, validInput()), isRedactedManifestError);
+    assert.equal(substituted, true);
+    assert.deepEqual(await readdir(parent), []);
+    assert.equal((await readdir(movedParent)).some((name) => name === 'manifest.json'), false);
+  });
+
+void test('does not unlink a concurrent destination replacement during rollback',
+  async (context) => {
+    const root = await temporaryDirectory(context, 'preflight-preparation-output-swap-');
+    const output = join(root, 'manifest.json');
+    const replacement = 'concurrent replacement';
+    const writer = createExecutionPreflightIntentPreparationManifestWriter({
+      synchronizeDirectory: async () => {
+        await rm(output);
+        await writeFile(output, replacement, { mode: 0o600 });
+        throw new Error('durability failure');
+      },
+    });
+
+    await assert.rejects(writer.write(output, validInput()), isRedactedManifestError);
+    assert.equal(await readFile(output, 'utf8'), replacement);
+    assert.equal((await lstat(output)).mode & 0o777, 0o600);
   });
 
 void test('requires an absolute path, an existing parent and a location outside every Git checkout',
