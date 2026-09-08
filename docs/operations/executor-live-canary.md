@@ -1,6 +1,20 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.4 — 2026-09-08
+**Version :** 1.17.5 — 2026-09-08
+
+La version 1.17.5 priorise durablement les créations Pump.fun signalées par le
+`CreateEvent` officiel, avec une tranche d'équité après 32 claims prioritaires.
+L'indice ne remplace jamais le décodage RPC, ne persiste aucun log WebSocket et
+n'ajoute aucune capacité wallet, armement, signature ou soumission.
+
+Le backlog par classe se mesure sans lire de payload ni de logs :
+
+```sql
+SELECT ingestion_priority, processing_status, count(*)::BIGINT AS count
+FROM chain_transaction_inbox
+GROUP BY ingestion_priority, processing_status
+ORDER BY ingestion_priority DESC, processing_status;
+```
 
 La version 1.17.4 impose `LISTENER_INGESTION_SCOPE=launchpad-only` pour le
 probe H2i. La valeur par défaut compatible reste `launchpad-and-market` pour
@@ -29,7 +43,7 @@ aucune procédure ni frontière de sécurité.
 
 H2k-b reste disponible mais désactivé par défaut : son
 runner one-shot prépare une paire target/probe exacte et H2h v2 l'exporte par
-`preparationRunId`. Le head de migration est 043. Aucune clé n'est chargée,
+`preparationRunId`. Le head de migration est 044. Aucune clé n'est chargée,
 aucune transaction n'est signée, armée ou soumise par H2k-b, et le canary
 reste non démarré.
 

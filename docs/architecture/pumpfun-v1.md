@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.1 — 2026-09-08
+**Version :** 1.1.2 — 2026-09-08
 
 ## Périmètre produit
 
@@ -660,6 +660,14 @@ la frontière opérations ; H2k-b ne l'appelle pas. L'état demeure
 checkpoints sont indépendants de la source.
 
 L'inbox durable déduplique les notifications WebSocket et le rattrapage HTTP.
+
+Depuis la version 1.1.2, le WebSocket Pump.fun peut joindre l'indice éphémère
+fermé `PUMPFUN_CREATE` lorsque les logs bornés contiennent le discriminator
+officiel de `CreateEvent`. L'inbox le traduit en priorité durable
+`LAUNCH_CANDIDATE`; un doublon ne peut jamais la redescendre. Le claim sert
+jusqu'à 32 créations prioritaires avant de réserver une tranche à une ligne
+`NORMAL` éligible. Les logs WebSocket ne sont pas persistés et le décodeur de
+la transaction RPC complète reste la seule autorité métier.
 Sur une base vide, le scanner prend uniquement la page la plus récente de
 chaque programme comme baseline, conformément au périmètre sans historique.
 Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.

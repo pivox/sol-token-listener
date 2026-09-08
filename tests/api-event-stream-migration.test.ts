@@ -304,6 +304,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '041_execution_preflight_intent_pairs.sql',
       '042_execution_preflight_intent_preparation.sql',
       '043_execution_intent_causal_lineage.sql',
+      '044_transaction_inbox_launch_priority.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

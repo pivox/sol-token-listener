@@ -9,7 +9,7 @@ import { insertExecutionDecisionEvent } from './helpers/execution-decision-event
 
 const migrationName = '032_execution_dry_run_assessments.sql';
 const simulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '043_execution_intent_causal_lineage.sql';
+const latestMigrationName = '044_transaction_inbox_launch_priority.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);

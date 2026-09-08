@@ -64,6 +64,7 @@ interface InboxPool extends Queryable {
 
 interface InboxIdentityRow extends QueryResultRow {
   readonly observed_slot: unknown;
+  readonly ingestion_priority: unknown;
   readonly discovery_sources: unknown;
   readonly program_ids: unknown;
   readonly target_confirmation_status: unknown;
@@ -87,7 +88,10 @@ interface TerminalReplayReceiptRow extends QueryResultRow {
 const SERVICE_KEY = 'transaction-listener';
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM = 100;
+export const MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS = 32;
 const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
+
+type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE';
 
 export interface TransactionInboxRetryPolicy {
   readonly maxAttempts: number;
@@ -141,13 +145,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   public async enqueue(value: TransactionNotification): Promise<void> {
     return this.safely(async () => {
       assertValidTransactionNotification(value);
+      const ingestionPriority = priorityFromHint(value.ingestionHint);
       await this.transaction(async (client) => {
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
           [value.signature],
         );
         const existing = await client.query(
-          `SELECT observed_slot, discovery_sources, program_ids, target_confirmation_status,
+          `SELECT observed_slot, ingestion_priority, discovery_sources, program_ids, target_confirmation_status,
              processing_status, normalized_transaction, immutable_fingerprint, processed_at,
              missing_finality_polls,
              last_missing_finality_provider_id, finality_evidence_version
@@ -171,8 +176,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           const inserted = await client.query(
             `INSERT INTO chain_transaction_inbox (
               signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-              processing_status, observed_at, retry_max_attempts, retry_base_delay_ms
-            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,$5,'PENDING',$6,$7,$8)`,
+              processing_status, observed_at, retry_max_attempts, retry_base_delay_ms,
+              ingestion_priority
+            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,$5,'PENDING',$6,$7,$8,$9)`,
             [
               value.signature,
               value.slot.toString(),
@@ -182,6 +188,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               dateFromMs(value.observedAtMs),
               this.retryPolicy.maxAttempts,
               this.retryPolicy.baseDelayMs,
+              ingestionPriority,
             ],
           );
           requireOne(inserted.rowCount);
@@ -206,9 +213,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           assertTerminalReceiptMatchesInbox(receipt, row);
           const updated = await client.query(
             `UPDATE chain_transaction_inbox SET
-               discovery_sources=$2,program_ids=$3,updated_at=GREATEST(updated_at,$4)
+               discovery_sources=$2,program_ids=$3,
+               ingestion_priority = GREATEST(
+                 ingestion_priority,$5::chain_transaction_inbox_priority
+               ),
+               updated_at=GREATEST(updated_at,$4)
              WHERE signature=$1`,[
-              value.signature,sources,programs,dateFromMs(value.observedAtMs),
+              value.signature,sources,programs,dateFromMs(value.observedAtMs),ingestionPriority,
             ],
           );
           requireOne(updated.rowCount);
@@ -236,9 +247,20 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              missing_finality_polls = 0,
              last_missing_finality_provider_id = NULL,
              finality_evidence_version = finality_evidence_version + 1,
+             ingestion_priority = GREATEST(
+               ingestion_priority,$7::chain_transaction_inbox_priority
+             ),
              updated_at = GREATEST(updated_at, $6)
            WHERE signature = $1`,
-          [value.signature, sources, programs, next, shouldReplay, dateFromMs(value.observedAtMs)],
+          [
+            value.signature,
+            sources,
+            programs,
+            next,
+            shouldReplay,
+            dateFromMs(value.observedAtMs),
+            ingestionPriority,
+          ],
         );
         requireOne(updated.rowCount);
       });
@@ -293,8 +315,43 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE inbox.signature = exhausted.signature`,
           [now, MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM],
         );
-        const selected = await client.query(
-          `SELECT signature
+        const scheduler = await client.query(
+          `SELECT consecutive_launch_candidate_claims
+           FROM chain_transaction_inbox_claim_scheduler
+           WHERE scheduler_key = 'global'
+           FOR UPDATE`,
+        );
+        if (scheduler.rowCount !== 1 || scheduler.rows.length !== 1) {
+          throw new TypeError('Transaction inbox claim scheduler is invalid.');
+        }
+        const launchCandidateStreak = safeCount(
+          scheduler.rows[0]?.consecutive_launch_candidate_claims,
+          'consecutive launch candidate claims',
+        );
+        if (launchCandidateStreak > MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS) {
+          throw new TypeError('Transaction inbox claim scheduler is invalid.');
+        }
+        let selected = launchCandidateStreak === MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS
+          ? await client.query(
+            `SELECT signature, ingestion_priority
+             FROM chain_transaction_inbox
+             WHERE ingestion_priority = 'NORMAL'
+               AND (
+                 (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
+                 OR (processing_status = 'FAILED' AND error_retryable = TRUE
+                     AND retry_exhausted_at IS NULL AND next_attempt_at <= $1
+                     AND attempts_in_cycle < retry_max_attempts)
+                 OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1
+                     AND attempts_in_cycle < retry_max_attempts)
+               )
+             ORDER BY observed_slot, signature
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1`,
+            [now],
+          )
+          : { rows: [], rowCount: 0 };
+        if (selected.rows.length === 0) selected = await client.query(
+          `SELECT signature, ingestion_priority
            FROM chain_transaction_inbox
            WHERE (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
               OR (processing_status = 'FAILED' AND error_retryable = TRUE
@@ -302,13 +359,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                   AND attempts_in_cycle < retry_max_attempts)
               OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1
                   AND attempts_in_cycle < retry_max_attempts)
-           ORDER BY observed_slot, signature
+           ORDER BY ingestion_priority DESC, observed_slot, signature
            FOR UPDATE SKIP LOCKED
            LIMIT 1`,
           [now],
         );
-        const signature = optionalText(selected.rows[0]?.signature, 'claim signature');
+        const selectedRow = selected.rows[0];
+        const signature = optionalText(selectedRow?.signature, 'claim signature');
         if (signature === null) return null;
+        const ingestionPriority = storedInboxPriority(selectedRow?.ingestion_priority);
         const token = randomUUID();
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
@@ -323,6 +382,18 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [now, token, expires, signature],
         );
         requireOne(updated.rowCount);
+        const schedulerUpdated = await client.query(
+          `UPDATE chain_transaction_inbox_claim_scheduler SET
+             consecutive_launch_candidate_claims = CASE
+               WHEN $1::chain_transaction_inbox_priority = 'LAUNCH_CANDIDATE'
+                 THEN LEAST(consecutive_launch_candidate_claims + 1, $2)
+               ELSE 0
+             END,
+             updated_at = GREATEST(updated_at, $3)
+           WHERE scheduler_key = 'global'`,
+          [ingestionPriority, MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS, now],
+        );
+        requireOne(schedulerUpdated.rowCount);
         return claimFromRow(requiredRow(updated.rows[0]));
       });
     });
@@ -1562,6 +1633,19 @@ function inboxStatus(value: unknown): 'PENDING' | 'PROCESSING' | 'PROCESSED' | '
   if (value !== 'PENDING' && value !== 'PROCESSING'
     && value !== 'PROCESSED' && value !== 'FAILED') {
     throw new TypeError('Stored inbox status is invalid.');
+  }
+  return value;
+}
+
+function priorityFromHint(
+  hint: TransactionNotification['ingestionHint'],
+): TransactionInboxPriority {
+  return hint === 'PUMPFUN_CREATE' ? 'LAUNCH_CANDIDATE' : 'NORMAL';
+}
+
+function storedInboxPriority(value: unknown): TransactionInboxPriority {
+  if (value !== 'NORMAL' && value !== 'LAUNCH_CANDIDATE') {
+    throw new TypeError('Stored inbox priority is invalid.');
   }
   return value;
 }

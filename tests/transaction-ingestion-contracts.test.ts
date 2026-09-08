@@ -17,6 +17,7 @@ import {
   MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES,
   MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH,
   TRANSACTION_INBOX_STATUSES,
+  TRANSACTION_INGESTION_HINTS,
   assertValidClaimedTransaction,
   assertValidCatchUpGap,
   assertValidFinalityCandidate,
@@ -121,6 +122,8 @@ void test('publishes exact frozen ingestion status constants', () => {
     'RECOVERY_NOT_FOUND',
   ]);
   assert.ok(Object.isFrozen(TRANSACTION_INBOX_RECOVERY_RESULT_CODES));
+  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['PUMPFUN_CREATE']);
+  assert.ok(Object.isFrozen(TRANSACTION_INGESTION_HINTS));
 });
 
 void test('accepts canonical frozen ingestion contracts with bigint slots and integer milliseconds', () => {
@@ -128,6 +131,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     signature: 'signature',
     slot: 42n,
     source: 'WEBSOCKET',
+    ingestionHint: 'PUMPFUN_CREATE',
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'confirmed',
     observedAtMs,
@@ -577,6 +581,7 @@ void test('rejects mutable contracts, number slots and non-integer millisecond t
     signature: 'signature',
     slot: 42n,
     source: 'CATCH_UP' as const,
+    ingestionHint: null,
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'finalized' as const,
     observedAtMs,
@@ -762,6 +767,7 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
       signature: 'signature',
       slot: 42n,
       source: 'POLLING',
+      ingestionHint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID]),
       confirmationStatus: 'confirmed',
       observedAtMs,
@@ -770,7 +776,7 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
   );
   const notification = Object.freeze({
     signature: 'signature', slot: 42n, source: 'CATCH_UP' as const,
-    confirmationStatus: 'confirmed' as const, observedAtMs,
+    ingestionHint: null, confirmationStatus: 'confirmed' as const, observedAtMs,
   });
   for (const programIds of [
     [],
@@ -808,6 +814,35 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
       code: 'RECOVERY_UNKNOWN', signature: 'signature',
     })); },
     /code/u,
+  );
+});
+
+void test('enforces the closed source-compatible ingestion hint without extra fields', () => {
+  const canonical = Object.freeze({
+    signature: 'signature',
+    slot: 42n,
+    source: 'WEBSOCKET' as const,
+    ingestionHint: 'PUMPFUN_CREATE' as const,
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
+    confirmationStatus: 'confirmed' as const,
+    observedAtMs,
+  });
+  assert.doesNotThrow(() => { assertValidTransactionNotification(canonical); });
+  assert.throws(
+    () => { assertValidTransactionNotification(Object.freeze({ ...canonical, ingestionHint: 'UNKNOWN' })); },
+    /ingestion hint/u,
+  );
+  assert.throws(
+    () => { assertValidTransactionNotification(Object.freeze({
+      ...canonical, source: 'CATCH_UP', ingestionHint: 'PUMPFUN_CREATE',
+    })); },
+    /ingestion hint/u,
+  );
+  assert.throws(
+    () => { assertValidTransactionNotification(Object.freeze({
+      ...canonical, logs: Object.freeze(['private websocket log']),
+    })); },
+    /fields/u,
   );
 });
 

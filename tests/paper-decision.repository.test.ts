@@ -1223,7 +1223,7 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
     await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
     const inbox=new PostgresTransactionInboxRepository(pool);
     await inbox.enqueue(Object.freeze({
-      signature:'signature',slot:10n,source:'WEBSOCKET' as const,
+      signature:'signature',slot:10n,source:'WEBSOCKET' as const,ingestionHint:null,
       programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
       confirmationStatus:'finalized' as const,observedAtMs:1_000,
     }));
@@ -1269,7 +1269,7 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
     const [manualKillClaim]=await Promise.all([
       decisions.claim({nowMs:3_000,leaseMs:10_000}),
       inbox.enqueue(Object.freeze({
-        signature:'signature',slot:10n,source:'CATCH_UP' as const,
+        signature:'signature',slot:10n,source:'CATCH_UP' as const,ingestionHint:null,
         programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
         confirmationStatus:'finalized' as const,observedAtMs:3_000,
       })),
@@ -1295,7 +1295,7 @@ void test('orphan retraction survives terminal inbox retention and a paper-worke
     await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
     const inbox=new PostgresTransactionInboxRepository(pool);
     await inbox.enqueue(Object.freeze({
-      signature:'signature',slot:10n,source:'WEBSOCKET' as const,
+      signature:'signature',slot:10n,source:'WEBSOCKET' as const,ingestionHint:null,
       programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
       confirmationStatus:'confirmed' as const,observedAtMs:2_100,
     }));
@@ -1349,7 +1349,7 @@ void test('orphan retraction survives terminal inbox retention and a paper-worke
       FROM chain_transaction_finality_replay_receipts WHERE signature='signature'`))
       .rows[0]?.confirmation_status,'orphaned');
     await assert.rejects(inbox.enqueue(Object.freeze({
-      signature:'signature',slot:10n,source:'CATCH_UP' as const,
+      signature:'signature',slot:10n,source:'CATCH_UP' as const,ingestionHint:null,
       programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
       confirmationStatus:'confirmed' as const,observedAtMs:3_000,
     })),TransactionInboxConflictError);
@@ -1495,7 +1495,7 @@ void test('the paper inbox SHARE lock serializes enqueueRevision until paper com
     await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
     const replayableInbox=new PostgresTransactionInboxRepository(pool);
     await replayableInbox.enqueue(Object.freeze({
-      signature:'signature',slot:10n,source:'WEBSOCKET' as const,
+      signature:'signature',slot:10n,source:'WEBSOCKET' as const,ingestionHint:null,
       programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
       confirmationStatus:'confirmed' as const,observedAtMs:QUALIFICATION_EVALUATED_AT_MS,
     }));

@@ -781,6 +781,7 @@ const notification: TransactionNotification = Object.freeze({
   signature: 'secret-signature-never-forwarded',
   slot: 42n,
   source: 'WEBSOCKET',
+      ingestionHint: null,
   programIds: Object.freeze(['11111111111111111111111111111111']),
   confirmationStatus: 'processed',
   observedAtMs: 1_000,

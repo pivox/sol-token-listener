@@ -72,6 +72,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
     /REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT SELECT ON TABLE chain_transaction_inbox_claim_scheduler\s+TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT UPDATE \(consecutive_launch_candidate_claims,updated_at\)\s+ON TABLE chain_transaction_inbox_claim_scheduler\s+TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT USAGE ON TYPE chain_transaction_inbox_priority\s+TO sol_token_listener_writer/iu);
   for (const table of BUSINESS_TABLES) {
     assert.match(sql, new RegExp(`GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE[\\s\\S]*?\\b${table}\\b[\\s\\S]*?TO sol_token_listener_writer`, 'iu'));
   }
@@ -192,6 +195,35 @@ void test('PostgreSQL 16 listener login can write business projections but no li
           current_user,current_database(),'CREATE'
         ) AS allowed`,
       )).rows[0]?.allowed, false);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_type_privilege(
+          current_user,'chain_transaction_inbox_priority','USAGE'
+        ) AS allowed`,
+      )).rows[0]?.allowed, true);
+      assert.deepEqual((await listener.query<{ readonly priority: string }>(
+        `SELECT 'LAUNCH_CANDIDATE'::chain_transaction_inbox_priority::TEXT AS priority`,
+      )).rows, [{ priority: 'LAUNCH_CANDIDATE' }]);
+      assert.equal((await listener.query(
+        `UPDATE chain_transaction_inbox_claim_scheduler
+         SET consecutive_launch_candidate_claims=consecutive_launch_candidate_claims
+         WHERE scheduler_key='global'`,
+      )).rowCount, 1);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_table_privilege(
+          current_user,'chain_transaction_inbox_claim_scheduler','INSERT'
+        ) AS allowed`,
+      )).rows[0]?.allowed, false);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_table_privilege(
+          current_user,'chain_transaction_inbox_claim_scheduler','DELETE'
+        ) AS allowed`,
+      )).rows[0]?.allowed, false);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_column_privilege(
+          current_user,'chain_transaction_inbox_claim_scheduler',
+          'consecutive_launch_candidate_claims','UPDATE'
+        ) AS allowed`,
+      )).rows[0]?.allowed, true);
       assert.deepEqual((await listener.query<{
         readonly usage_allowed: boolean;
         readonly update_allowed: boolean;

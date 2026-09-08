@@ -7,6 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '043_execution_intent_causal_lineage.sql';
+const migrationHeadName = '044_transaction_inbox_launch_priority.sql';
 
 void test('migration 043 adds nullable lineage identity and non-blocking foreign keys', async () => {
   const sql = await readFile(new URL(`../migrations/${migrationName}`, import.meta.url), 'utf8');
@@ -18,7 +19,8 @@ void test('migration 043 adds nullable lineage identity and non-blocking foreign
   assert.match(sql, /report\.superseded_at IS NULL/u);
   assert.match(sql, /HAVING COUNT\(\*\)=1/u);
   assert.doesNotMatch(sql, /VALIDATE CONSTRAINT/u);
-  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationName);
+  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationHeadName);
+  assert.ok(LIVE_EXECUTION_MIGRATION_CATALOG.some((entry) => entry.name === migrationName));
 });
 
 void test('retention preserves a candidate while an execution intent still references it', async () => {
@@ -38,7 +40,7 @@ void test('migration 043 is replayable and enforces both new foreign keys on rea
   const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path="${schema}"` });
   try {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), migrationHeadName);
     const sql = await readFile(new URL(`../migrations/${migrationName}`, import.meta.url), 'utf8');
     await pool.query(sql);
     const columns = await pool.query(`SELECT is_nullable FROM information_schema.columns

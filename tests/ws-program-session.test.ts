@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { PUMP_EVENTS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import {
   WsProgramSessionError,
@@ -43,6 +44,7 @@ void test('opens only after both confirmed subscriptions acknowledge and forward
     program: 'pumpswap',
     signature,
     slot: 41n,
+    hint: 'NONE',
   }]);
 
   socket.message({ jsonrpc: '2.0', id: 1, result: 101 });
@@ -86,6 +88,7 @@ void test('subscribes and unsubscribes only the configured launchpad program', a
     program: 'pumpfun',
     signature,
     slot: 41n,
+    hint: 'NONE',
   }]);
 
   const closing = session.close(new AbortController().signal);
@@ -95,6 +98,44 @@ void test('subscribes and unsubscribes only the configured launchpad program', a
   socket.message({ jsonrpc: '2.0', id: 3, result: true });
   await closing;
   assert.equal(socket.closeCalls, 1);
+});
+
+void test('derives only the closed Pump.fun create hint from the official event discriminator', async () => {
+  const socket = new FakeWebSocket();
+  const scheduler = new ManualScheduler();
+  const frames: unknown[] = [];
+  const session = await acknowledge(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); },
+    new AbortController().signal,
+    { createWebSocket: () => socket, scheduler },
+  ), socket);
+  const encodedCreateEvent = Buffer.concat([
+    Buffer.from(PUMP_EVENTS.CreateEvent.discriminator),
+    Buffer.from([0, 1, 2, 3]),
+  ]).toString('base64');
+
+  socket.message(notification(
+    101,
+    42,
+    '1'.repeat(64),
+    null,
+    [`Program data: ${encodedCreateEvent}`],
+  ));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+  assert.deepEqual(frames, [Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: '1'.repeat(64),
+    slot: 42n,
+    hint: 'PUMPFUN_CREATE',
+  })]);
+  assert.equal(Object.hasOwn(frames[0] as object, 'logs'), false);
+  const closing = session.close(new AbortController().signal);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  socket.message({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
 });
 
 void test('rejects accessor-backed ingestion programs before opening a socket', async () => {
@@ -736,6 +777,7 @@ function notification(
   slot: number,
   signature: string,
   err: unknown = null,
+  logs: unknown = ['private raw logs'],
 ): unknown {
   return {
     jsonrpc: '2.0',
@@ -744,7 +786,7 @@ function notification(
       subscription,
       result: {
         context: { slot },
-        value: { signature, err, logs: ['private raw logs'] },
+        value: { signature, err, logs },
       },
     },
   };

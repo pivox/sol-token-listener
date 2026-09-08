@@ -6,7 +6,7 @@ import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '035_execution_preflight_operations.sql';
-const latestMigrationName = '043_execution_intent_causal_lineage.sql';
+const latestMigrationName = '044_transaction_inbox_launch_priority.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const tableNames = Object.freeze([
   'execution_safety_qualifications',

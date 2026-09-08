@@ -875,15 +875,18 @@ export class WebSocketFailoverSupervisor {
     }
     let preliminary: TransactionNotification;
     try {
-      const payload = exactOwnData(value, ['endpointId', 'program', 'signature', 'slot']);
+      const payload = exactOwnData(value, ['endpointId', 'program', 'signature', 'slot', 'hint']);
       const programId = programIdFrom(payload.program);
       if (payload.endpointId !== providerId
         || programId === null
+        || (payload.hint !== 'NONE' && payload.hint !== 'PUMPFUN_CREATE')
+        || (payload.program !== 'pumpfun' && payload.hint === 'PUMPFUN_CREATE')
         || !isCanonicalWebSocketSignature(payload.signature)) throw new TypeError();
       preliminary = Object.freeze({
         signature: payload.signature,
         slot: payload.slot as bigint,
         source: 'WEBSOCKET',
+        ingestionHint: payload.hint === 'PUMPFUN_CREATE' ? 'PUMPFUN_CREATE' : null,
         programIds: Object.freeze([programId]),
         confirmationStatus: 'confirmed',
         observedAtMs: 0,

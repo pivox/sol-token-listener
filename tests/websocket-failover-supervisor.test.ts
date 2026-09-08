@@ -264,6 +264,7 @@ void test('unrecoverable fences notifications and closes a live incumbent before
   await incumbentObserve(Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'NONE',
     signature: '1'.repeat(64),
     slot: 47n,
   }));
@@ -696,6 +697,7 @@ void test('periodic frontier rearms only after successful settlement and never f
   await observe(Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'NONE',
     signature: '1'.repeat(64),
     slot: 50n,
   }));
@@ -957,6 +959,7 @@ void test('stale incumbent completion cannot degrade a replacement promoted afte
   await incumbentObserve(Object.freeze({
     endpointId: 'primary',
     program: 'pumpswap',
+    hint: 'NONE',
     signature: '1'.repeat(64),
     slot: 51n,
   }));
@@ -1420,6 +1423,7 @@ void test('dual ACK forwards a partial notification and promotion follows strict
   await fixture.observe?.(Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'PUMPFUN_CREATE',
     signature: '1'.repeat(64),
     slot: 41n,
   }));
@@ -1430,6 +1434,7 @@ void test('dual ACK forwards a partial notification and promotion follows strict
       signature: '1'.repeat(64),
       slot: 41n,
       source: 'WEBSOCKET',
+      ingestionHint: 'PUMPFUN_CREATE',
       programIds: [PUMP_PROGRAM_ID],
       confirmationStatus: 'confirmed',
       observedAtMs: 1_000,
@@ -1502,6 +1507,7 @@ void test('promoted incumbent keeps forwarding valid websocket notifications', a
   await observe(Object.freeze({
     endpointId: 'primary',
     program: 'pumpswap',
+    hint: 'NONE',
     signature: '1'.repeat(64),
     slot: 43n,
   }));
@@ -1511,6 +1517,7 @@ void test('promoted incumbent keeps forwarding valid websocket notifications', a
       signature: '1'.repeat(64),
       slot: 43n,
       source: 'WEBSOCKET',
+      ingestionHint: null,
       programIds: [PUMPSWAP_PROGRAM_ID],
       confirmationStatus: 'confirmed',
       observedAtMs: 1_000,
@@ -1632,6 +1639,7 @@ void test('queued degradation persistence failure clears and stops the promoted 
   await observe(Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'NONE',
     signature: '4'.repeat(64),
     slot: 44n,
   }));
@@ -1803,6 +1811,7 @@ void test('hostile notification payloads are rejected without traps, clock, or o
   const proxy = new Proxy(Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'NONE',
     signature: '5'.repeat(64),
     slot: 45n,
   }), {
@@ -1823,12 +1832,14 @@ void test('hostile notification payloads are rejected without traps, clock, or o
   const invalidSignature = Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'NONE',
     signature: hostile,
     slot: 45n,
   });
   const invalidSlot = Object.freeze({
     endpointId: 'primary',
     program: 'pumpfun',
+    hint: 'NONE',
     signature: '5'.repeat(64),
     slot: 45,
   });
@@ -1938,6 +1949,7 @@ void test('opened session rejects own completion then without invoking it or ret
     await observe(Object.freeze({
       endpointId: 'primary',
       program: 'pumpfun',
+    hint: 'NONE',
       signature: '1'.repeat(64),
       slot: 46n,
     }));
