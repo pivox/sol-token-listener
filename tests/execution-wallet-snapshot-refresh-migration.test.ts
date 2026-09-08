@@ -22,6 +22,10 @@ void test('migration 045 replaces historical wallet revision uniqueness with one
 
   assert.match(sql, /HAVING COUNT\(\*\) > 1/u);
   assert.match(sql, /RAISE EXCEPTION 'execution wallet snapshot migration requires at most one current snapshot per generation'/u);
+  assert.match(sql, /COUNT\(\*\) FILTER \(WHERE superseded_at IS NULL\)[\s\S]*AS current_count/u);
+  assert.match(sql, /MAX\(state_revision\) OVER \(PARTITION BY generation_id\) AS maximum_state_revision/u);
+  assert.match(sql, /MAX\(observed_at\) OVER \(PARTITION BY generation_id\) AS maximum_observed_at/u);
+  assert.match(sql, /requires exactly one current snapshot matching historical frontier per generation/u);
   assert.match(sql, /ALTER TABLE execution_wallet_snapshots\s+DROP CONSTRAINT IF EXISTS execution_wallet_snapshots_generation_revision_unique/u);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS execution_wallet_snapshots_current_generation_unique\s+ON execution_wallet_snapshots \(generation_id\)\s+WHERE superseded_at IS NULL/u);
   assert.match(sql, /CREATE INDEX IF NOT EXISTS execution_wallet_snapshots_generation_refresh_order_idx\s+ON execution_wallet_snapshots \(generation_id,state_revision DESC,observed_at DESC,snapshot_id DESC\)/u);
@@ -84,6 +88,66 @@ void test('migration 045 refuses legacy multi-current drift without mutating the
     await assert.rejects(
       () => pool.query(sql),
       /at most one current snapshot per generation/u,
+    );
+    assert.deepEqual(await currentSnapshots(pool), before);
+    assert.equal(await hasConstraint(pool, 'execution_wallet_snapshots_generation_revision_unique'), true);
+  });
+});
+
+void test('migration 045 refuses legacy zero-current drift without mutating the snapshots', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+
+  await withTemporarySchema(databaseUrl, 'execution_wallet_snapshot_refresh_zero_current', async (pool) => {
+    await applyMigrationsThrough(pool, priorMigrationName);
+    const generationId = await insertGeneration(pool, 'b');
+    await insertSnapshot(pool, generationId, 'b', 0, '2026-01-01T00:00:01.000Z');
+    const before = await currentSnapshots(pool);
+
+    await assert.rejects(
+      () => migrateDatabase({ pool }),
+      /exactly one current snapshot matching historical frontier/u,
+    );
+    assert.deepEqual(await currentSnapshots(pool), before);
+    assert.equal(await hasConstraint(pool, 'execution_wallet_snapshots_generation_revision_unique'), true);
+  });
+});
+
+void test('migration 045 refuses a legacy current snapshot behind its historical frontier', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+
+  await withTemporarySchema(databaseUrl, 'execution_wallet_snapshot_refresh_stale_current', async (pool) => {
+    await applyMigrationsThrough(pool, priorMigrationName);
+    const generationId = await insertGeneration(pool, 'c');
+    await insertSnapshot(pool, generationId, 'c', 0, null);
+    await insertSnapshot(pool, generationId, 'd', 1, '2026-01-01T00:00:01.000Z');
+    const before = await currentSnapshots(pool);
+
+    await assert.rejects(
+      () => migrateDatabase({ pool }),
+      /exactly one current snapshot matching historical frontier/u,
+    );
+    assert.deepEqual(await currentSnapshots(pool), before);
+    assert.equal(await hasConstraint(pool, 'execution_wallet_snapshots_generation_revision_unique'), true);
+  });
+});
+
+void test('migration 045 refuses a legacy current snapshot behind the historical observed frontier', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+
+  await withTemporarySchema(databaseUrl, 'execution_wallet_snapshot_refresh_observed_drift', async (pool) => {
+    await applyMigrationsThrough(pool, priorMigrationName);
+    const generationId = await insertGeneration(pool, 'e');
+    await insertSnapshot(pool, generationId, 'e', 0, '2026-01-02T00:00:01.000Z',
+      '2026-01-02T00:00:00.000Z');
+    await insertSnapshot(pool, generationId, 'f', 1, null);
+    const before = await currentSnapshots(pool);
+
+    await assert.rejects(
+      () => migrateDatabase({ pool }),
+      /exactly one current snapshot matching historical frontier/u,
     );
     assert.deepEqual(await currentSnapshots(pool), before);
     assert.equal(await hasConstraint(pool, 'execution_wallet_snapshots_generation_revision_unique'), true);
@@ -180,16 +244,16 @@ async function insertGeneration(pool: InstanceType<typeof pg.Pool>, suffix: stri
 
 async function insertSnapshot(
   pool: InstanceType<typeof pg.Pool>, generationId: string, suffix: string,
-  revision: number, supersededAt: string | null,
+  revision: number, supersededAt: string | null, observedAt = '2026-01-01T00:00:00.000Z',
 ): Promise<void> {
   await pool.query(`INSERT INTO execution_wallet_snapshots (
     snapshot_id,snapshot_fingerprint,generation_id,provider_id,state_revision,slot,observed_at,
     commitment,wallet_lamports,token_balance_count,open_positions,realized_net_pnl_raw,
     superseded_at,purge_after
-  ) VALUES ($1,$2,$3,'provider',$4,$5,'2026-01-01T00:00:00.000Z',
+  ) VALUES ($1,$2,$3,'provider',$4,$5,$7::TIMESTAMPTZ,
     'finalized',1,0,0,0,$6,
     CASE WHEN $6::TIMESTAMPTZ IS NULL THEN NULL ELSE $6::TIMESTAMPTZ + INTERVAL '4 hours' END)`, [
-    snapshotId(suffix), suffix.repeat(64), generationId, revision, revision, supersededAt,
+    snapshotId(suffix), suffix.repeat(64), generationId, revision, revision, supersededAt, observedAt,
   ]);
 }
 

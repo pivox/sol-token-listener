@@ -78,6 +78,32 @@ BEGIN
     RAISE EXCEPTION 'execution wallet snapshot migration requires at most one current snapshot per generation'
       USING ERRCODE = '23514';
   END IF;
+
+  IF EXISTS (
+    WITH snapshots AS (
+      SELECT generation_id,snapshot_id,state_revision,observed_at,superseded_at,
+        COUNT(*) FILTER (WHERE superseded_at IS NULL) OVER (PARTITION BY generation_id)
+          AS current_count,
+        MAX(state_revision) OVER (PARTITION BY generation_id) AS maximum_state_revision,
+        MAX(observed_at) OVER (PARTITION BY generation_id) AS maximum_observed_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY generation_id
+          ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC
+        ) AS historical_frontier
+      FROM execution_wallet_snapshots
+    )
+    SELECT 1
+    FROM snapshots
+    WHERE current_count<>1
+      OR (superseded_at IS NULL AND (
+        state_revision<>maximum_state_revision
+        OR observed_at<>maximum_observed_at
+        OR historical_frontier<>1
+      ))
+  ) THEN
+    RAISE EXCEPTION 'execution wallet snapshot migration requires exactly one current snapshot matching historical frontier per generation'
+      USING ERRCODE = '23514';
+  END IF;
 END;
 $$;
 

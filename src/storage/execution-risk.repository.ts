@@ -1058,25 +1058,54 @@ export async function appendWalletSnapshotInTransaction(
     if (!sameWalletSnapshot(existing, draft)) throw failure('CONFLICT');
     return existing;
   }
-  const latest = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
-    trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
+  const snapshots = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
+    trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms,
+    superseded_at IS NULL AS current
     FROM execution_wallet_snapshots
-    WHERE generation_id=$1 AND superseded_at IS NULL
-    ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC LIMIT 1`, [draft.generationId]);
-  if (latest.rows.length > 1) throw failure('INVALID_DATA');
-  const latestRow = latest.rows.length === 0 ? null : exactRow(latest.rows[0], [
-    'snapshot_id', 'state_revision', 'observed_at_ms',
-  ] as const);
-  const latestRevision = latestRow === null
-    ? null : unsignedBigint(parseBigint(latestRow.state_revision));
-  const latestObservedAtMs = latestRow === null ? null : textTimestamp(latestRow.observed_at_ms);
-  if (latestRevision !== null && latestObservedAtMs !== null) {
-    if (draft.stateRevision < latestRevision || draft.observedAtMs < latestObservedAtMs) {
+    WHERE generation_id=$1
+    ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC
+    FOR UPDATE`, [draft.generationId]);
+  const snapshotRows = snapshots.rows.map((row) => exactRow(row, [
+    'snapshot_id', 'state_revision', 'observed_at_ms', 'current',
+  ] as const));
+  const currentRows = snapshotRows.filter((row) => row.current === true);
+  const historicalFrontier = snapshotRows[0];
+  const current = currentRows[0];
+  let maximumStateRevision: bigint | null = null;
+  let maximumObservedAtMs: number | null = null;
+  for (const row of snapshotRows) {
+    const stateRevision = unsignedBigint(parseBigint(row.state_revision));
+    const observedAtMs = textTimestamp(row.observed_at_ms);
+    if (maximumStateRevision === null || stateRevision > maximumStateRevision) {
+      maximumStateRevision = stateRevision;
+    }
+    if (maximumObservedAtMs === null || observedAtMs > maximumObservedAtMs) {
+      maximumObservedAtMs = observedAtMs;
+    }
+  }
+  const currentStateRevision = current === undefined
+    ? null : unsignedBigint(parseBigint(current.state_revision));
+  const currentObservedAtMs = current === undefined ? null : textTimestamp(current.observed_at_ms);
+  if ((snapshotRows.length > 0 && (
+    currentRows.length !== 1
+    || historicalFrontier === undefined
+    || current === undefined
+    || maximumStateRevision === null
+    || maximumObservedAtMs === null
+    || historicalFrontier.snapshot_id !== current.snapshot_id
+    || currentStateRevision !== maximumStateRevision
+    || currentObservedAtMs !== maximumObservedAtMs
+  ))) {
+    throw failure('INVALID_DATA');
+  }
+  const latestRow = historicalFrontier ?? null;
+  if (maximumStateRevision !== null && maximumObservedAtMs !== null) {
+    if (draft.stateRevision < maximumStateRevision || draft.observedAtMs < maximumObservedAtMs) {
       throw failure('STALE_MEASUREMENT');
     }
     // A divergent immutable identity at the same instant stays a conflict;
     // the exact identity was returned by the replay lookup above.
-    if (draft.observedAtMs === latestObservedAtMs) throw failure('CONFLICT');
+    if (draft.observedAtMs === maximumObservedAtMs) throw failure('CONFLICT');
   }
   try {
     if (latestRow !== null) {
