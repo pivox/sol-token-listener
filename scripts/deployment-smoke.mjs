@@ -99,6 +99,7 @@ const canonicalRetentionCounters = Object.freeze([
   'executionOperatorAuthorizations',
   'executionPreflightIntentPairMemberships',
   'executionPreflightIntentPairs',
+  'executionPreflightPreparationRuns',
   'executionPreSignatureLocks',
   'executionRiskAdmissionReports',
   'executionRiskFaults',

@@ -56,6 +56,8 @@ Il ne peut toujours pas lire `signed_transaction_bytes`.
 - H2c sur PostgreSQL 16 : deux passages séquentiels à 20/20.
 - Base PostgreSQL vide : 43 migrations appliquées jusqu'à
   `043_execution_intent_causal_lineage.sql`; base jetable ensuite supprimée.
+- `npm run deployment:smoke` : succès Docker complet après alignement du
+  compteur canonique `executionPreflightPreparationRuns`; ressources nettoyées.
 - `npm audit --omit=dev` : 15 alertes transitives (7 modérées, 8 hautes) dans
   les SDK Solana/Pump. Les corrections proposées imposent des downgrades
   cassants ; elles restent une dette de sécurité séparée, sans `--force` dans
