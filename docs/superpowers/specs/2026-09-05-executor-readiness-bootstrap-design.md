@@ -1,6 +1,6 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.11
+**Version de spécification :** 1.0.12
 
 **Version de la spécification parente :** 1.11.13
 
@@ -13,6 +13,11 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.12 — 2026-09-08 :** aligne la validation de l'état risque sur
+  l'autorité PostgreSQL fermée : le mutex transactionnel de génération `51005`
+  sérialise la lecture, sans `SELECT ... FOR UPDATE` ni privilège `UPDATE` pour
+  readiness.
 
 - **1.0.11 — 2026-09-05 :** référence H2g comme consommateur offline des
   identités H2d via l'export canonique H2h à venir.
@@ -266,6 +271,14 @@ Il ne peut lire ou modifier aucune intention, qualification, autorisation,
 armement, lock pré-signature, bytes signés, preuve de soumission ou contrôle
 opérateur. Listener, API, opérations, H2a et H2b ne gagnent aucune autorité H2d.
 
+Le rôle ne reçoit aucun privilège `UPDATE` sur
+`execution_wallet_risk_state`. La validation de l'état initial est un `SELECT`
+ordinaire exécuté après le mutex transactionnel de génération
+`pg_advisory_xact_lock(hashtextextended(generation_id, 51005))`. Ce même mutex
+précède tous les writers applicatifs de l'état risque. Un verrou de ligne
+`FOR UPDATE` serait à la fois redondant et inexécutable avec cette autorité
+fermée ; il est donc interdit dans le repository readiness.
+
 Chaque checkout force `SET ROLE sol_token_executor_readiness`,
 `search_path=pg_catalog,public` et `session_replication_role=origin`, puis
 revalide PostgreSQL 16, le membership exact, la migration 039 et l'allowlist
@@ -296,6 +309,12 @@ Une exécution utilise une transaction unique après la collecte réseau :
 7. contrôle de fraîcheur sur l'horloge PostgreSQL ;
 8. commit ;
 9. rendu du manifeste depuis les objets commités.
+
+Le verrou de l'étape 1 est le mutex advisory transactionnel `51005`. Il
+sérialise les exécutions H2d concurrentes et les writers applicatifs du même
+`generation_id` jusqu'au commit ou rollback, sans accorder de droit de
+mutation à readiness. Un writer SQL administratif qui contourne volontairement
+ce mutex est hors du contrat applicatif et reste une dérive opérateur.
 
 Un crash avant commit ne laisse aucune projection partielle. Un replay exact
 retourne les mêmes identifiants. Une collecte différente crée de nouveaux
@@ -340,6 +359,10 @@ est vide. Le processus exige `mainnet-beta`, mais ne reçoit ni
   refusée avant écriture ;
 - commit atomique, replay exact et crash sans état partiel ;
 - rôle PostgreSQL 16 exact et absence d'accès live/signed ;
+- commit H2d réel avec le login readiness dédié, tandis qu'un `UPDATE` de
+  l'état risque, y compris sans changement de valeur, reste refusé ;
+- exécutions concurrentes du même bootstrap sérialisées et rejouées sans
+  projection dupliquée ;
 - graphes source et `dist` sans keypair, signer, construction, simulation,
   `sendTransaction` ou import H2a/H2b ;
 - migration/provisioning depuis base vide et replay ;
