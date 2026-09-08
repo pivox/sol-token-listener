@@ -1,12 +1,12 @@
 # Paire d'intentions canary non signante — conception #51-H2k
 
-**Version de spécification :** 1.1.2
+**Version de spécification :** 1.2.0
 
 **Version de la spécification parente :** 1.12.1
 
 **Version de la spécification canary :** 1.3.1
 
-**Date :** 2026-09-06
+**Date :** 2026-09-08
 
 **Statut :** H2k-a LIVRÉE — H2k-b À LIVRER
 
@@ -14,6 +14,13 @@
 
 ## Historique des versions
 
+- **1.2.0 — 2026-09-08 :** versionne le contrat public de préparation avec
+  les liaisons persistantes de l'assessment cible et de l'artefact de
+  simulation, puis la terminalisation `PREPARED` liée au fingerprint du
+  manifeste. Chaque mutation emploie une CAS exacte et une reprise après
+  commit incertain qui interdit la substitution de preuve. La sélection
+  verrouille désormais la première paire chronologique avant toute gate et
+  échoue fermée si cette paire est invalide, sans essayer la suivante.
 - **1.1.2 — 2026-09-08 :** retire au listener la lecture inutile de
   `execution_intents.live_reserved`; le trigger H2k effectue seul cette lecture
   sous son autorité SQL dédiée.
@@ -263,6 +270,15 @@ horodatages bornés et les constantes :
 
 Il n'expose ni mint, montant, URL, lease token ou secret.
 
+Le repository de préparation est seul autorisé à lier les preuves au run. Son
+API n'accepte aucun identifiant d'assessment ou d'artefact fourni par
+l'appelant : elle dérive sous verrou l'unique assessment evaluator v1 de la
+cible et l'unique artefact `SUCCESS` de la tentative 1 du sibling. Les trois
+mutations `bindTargetAssessment`, `bindSimulationArtifact` et `markPrepared`
+font une CAS sur le run, sa révision et la lease exacte. Un rejeu après commit
+incertain restitue uniquement la preuve déjà liée et identique ; une autre
+preuve, même valide isolément, est un conflit.
+
 ## 9. Autorités PostgreSQL
 
 - le listener H2i reçoit uniquement les colonnes nécessaires pour insérer et
@@ -306,8 +322,12 @@ transitions `ExecutionIntentReasonCode` :
 - `PREFLIGHT_TARGET_NOT_PRISTINE` ;
 - `PREFLIGHT_PROBE_NOT_PRISTINE` ;
 - `PREFLIGHT_TARGET_FENCE_LOST` ;
+- `PREFLIGHT_PREPARATION_LEASE_LOST` ;
 - `PREFLIGHT_PREPARATION_DEADLINE_EXCEEDED` ;
 - `PREFLIGHT_RPC_CAPACITY_UNVERIFIED` ;
+- `PREFLIGHT_ASSESSMENT_INVALID` ;
+- `PREFLIGHT_SIMULATION_FAILED` ;
+- `PREFLIGHT_RECOVERY_CONFLICT` ;
 - `PREFLIGHT_PREPARATION_EXPORT_FAILED`.
 
 Les erreurs publiques restent typées et redacted.

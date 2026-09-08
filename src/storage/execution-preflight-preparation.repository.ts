@@ -8,6 +8,7 @@ import {
   type ExecutionPreflightPreparationV1,
 } from '../domain/execution-preflight-preparation.js';
 import type {
+  ExecutionPreflightMarkPreparedOptions,
   ExecutionPreflightPairSelectionV1,
   ExecutionPreflightPreparationRepository,
   ExecutionPreflightPreparationStartOptions,
@@ -38,6 +39,9 @@ export type ExecutionPreflightPreparationRepositoryErrorCode =
   | 'PREPARATION_BUSY'
   | 'PREPARATION_LEASE_LOST'
   | 'PREFLIGHT_PAIR_CONFLICT'
+  | 'PREFLIGHT_PAIR_LINEAGE_INVALID'
+  | 'PREFLIGHT_ASSESSMENT_INVALID'
+  | 'PREFLIGHT_SIMULATION_FAILED'
   | 'PREFLIGHT_PREPARATION_DEADLINE_EXCEEDED';
 
 export class ExecutionPreflightPreparationRepositoryError extends Error {
@@ -55,6 +59,7 @@ const DATE_MAX_MS = 8_640_000_000_000_000;
 const INT64_MAX = 9_223_372_036_854_775_807n;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const START_KEYS = Object.freeze(['ownerId', 'selectionWindowMs', 'leaseMs'] as const);
+const MARK_PREPARED_KEYS = Object.freeze(['manifestFingerprint'] as const);
 const CLAIM_KEYS = Object.freeze([
   'preparation', 'leaseOwner', 'leaseToken', 'leaseExpiresAtMs',
 ] as const);
@@ -118,6 +123,301 @@ const PAIR_PROJECTION = `
   pair.decision_fingerprint,
   trunc(EXTRACT(EPOCH FROM pair.created_at)*1000)::TEXT AS pair_created_at_ms,
   trunc(EXTRACT(EPOCH FROM pair.expires_at)*1000)::TEXT AS pair_expires_at_ms`;
+
+const BIND_TARGET_ASSESSMENT_SQL = `WITH operation AS MATERIALIZED (
+  SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+), proof AS MATERIALIZED (
+  SELECT preparation.run_id,assessment.assessment_id,assessment.result_fingerprint
+  FROM operation
+  JOIN execution_preflight_intent_preparation_runs AS preparation ON TRUE
+  JOIN execution_preflight_intent_pairs AS pair ON pair.pair_id=preparation.pair_id
+  JOIN execution_intents AS target ON target.id=pair.target_intent_id
+  JOIN execution_preflight_intent_pair_memberships AS member
+    ON member.pair_id=pair.pair_id AND member.intent_id=target.id AND member.lane='TARGET'
+  JOIN execution_dry_run_assessments AS assessment ON assessment.intent_id=target.id
+  WHERE preparation.run_id=$1 AND preparation.state='PREPARING'
+    AND preparation.state_revision IN ($2::BIGINT,$2::BIGINT+1)
+    AND preparation.lease_owner=$3 AND preparation.lease_token=$4::UUID
+    AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+      +($5::BIGINT*INTERVAL '1 millisecond')
+    AND preparation.lease_expires_at>operation.at
+    AND preparation.deadline_at>operation.at+INTERVAL '5 seconds'
+    AND pair.created_at>preparation.watermark_at
+    AND pair.created_at<preparation.deadline_at-INTERVAL '5 seconds'
+    AND pair.expires_at>operation.at+INTERVAL '5 seconds'
+    AND pair.decision_event_id=target.decision_event_id
+    AND pair.decision_fingerprint=target.decision_fingerprint
+    AND ${pristineIntent('target')}
+    AND target.side='BUY' AND target.venue_policy='PUMP_FUN_ONLY'
+    AND assessment.payload_version=1
+    AND assessment.specification_version='1.4.0'
+    AND assessment.evaluator_version=1
+    AND assessment.strategy_id=target.strategy_id
+    AND assessment.strategy_version=target.strategy_version
+    AND assessment.decision_fingerprint=target.decision_fingerprint
+    AND assessment.intent_state_revision=0
+    AND assessment.intent_status='PENDING'
+    AND assessment.outcome='FOUNDATION_VALIDATED'
+    AND assessment.coverage='INTENT_AND_LEASE_ONLY'
+    AND assessment.quote_status='NOT_RUN' AND assessment.build_status='NOT_RUN'
+    AND assessment.simulation_status='NOT_RUN' AND assessment.signature_status='NOT_RUN'
+    AND assessment.submission_status='NOT_RUN'
+    AND assessment.recorded_at>=target.requested_at AND assessment.recorded_at<=operation.at
+  FOR UPDATE OF preparation,pair,target
+), updated AS MATERIALIZED (
+  UPDATE execution_preflight_intent_preparation_runs AS preparation
+  SET assessment_id=proof.assessment_id,
+    assessment_fingerprint=proof.result_fingerprint,
+    state_revision=preparation.state_revision+1
+  FROM proof
+  WHERE preparation.run_id=proof.run_id AND preparation.state_revision=$2::BIGINT
+    AND preparation.assessment_id IS NULL AND preparation.assessment_fingerprint IS NULL
+  RETURNING ${CLAIM_PROJECTION}
+), replayed AS MATERIALIZED (
+  SELECT ${CLAIM_PROJECTION}
+  FROM proof
+  JOIN execution_preflight_intent_preparation_runs AS preparation
+    ON preparation.run_id=proof.run_id
+  WHERE NOT EXISTS (SELECT 1 FROM updated)
+    AND preparation.state_revision IN ($2::BIGINT,$2::BIGINT+1)
+    AND preparation.assessment_id=proof.assessment_id
+    AND preparation.assessment_fingerprint=proof.result_fingerprint
+)
+SELECT * FROM updated
+UNION ALL
+SELECT * FROM replayed`;
+
+const BIND_SIMULATION_ARTIFACT_SQL = `WITH operation AS MATERIALIZED (
+  SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+), proof AS MATERIALIZED (
+  SELECT preparation.run_id,artifact.artifact_id,artifact.result_fingerprint
+  FROM operation
+  JOIN execution_preflight_intent_preparation_runs AS preparation ON TRUE
+  JOIN execution_preflight_intent_pairs AS pair ON pair.pair_id=preparation.pair_id
+  JOIN execution_intents AS target ON target.id=pair.target_intent_id
+  JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
+  JOIN execution_preflight_intent_pair_memberships AS target_member
+    ON target_member.pair_id=pair.pair_id
+      AND target_member.intent_id=target.id AND target_member.lane='TARGET'
+  JOIN execution_preflight_intent_pair_memberships AS simulation_member
+    ON simulation_member.pair_id=pair.pair_id
+      AND simulation_member.intent_id=simulation.id AND simulation_member.lane='SIMULATION'
+  JOIN execution_dry_run_assessments AS assessment
+    ON assessment.assessment_id=preparation.assessment_id
+      AND assessment.result_fingerprint=preparation.assessment_fingerprint
+  JOIN execution_attempts AS attempt
+    ON attempt.intent_id=simulation.id AND attempt.attempt_number=1
+  JOIN execution_simulation_artifacts AS artifact
+    ON artifact.intent_id=simulation.id AND artifact.attempt_number=attempt.attempt_number
+  WHERE preparation.run_id=$1 AND preparation.state='PREPARING'
+    AND preparation.state_revision IN ($2::BIGINT,$2::BIGINT+1)
+    AND preparation.lease_owner=$3 AND preparation.lease_token=$4::UUID
+    AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+      +($5::BIGINT*INTERVAL '1 millisecond')
+    AND preparation.lease_expires_at>operation.at
+    AND preparation.deadline_at>operation.at+INTERVAL '5 seconds'
+    AND preparation.assessment_id IS NOT NULL
+    AND preparation.assessment_fingerprint IS NOT NULL
+    AND pair.created_at>preparation.watermark_at
+    AND pair.created_at<preparation.deadline_at-INTERVAL '5 seconds'
+    AND pair.expires_at>operation.at+INTERVAL '5 seconds'
+    AND pair.decision_event_id=target.decision_event_id
+    AND pair.decision_fingerprint=target.decision_fingerprint
+    AND ${pristineIntent('target')}
+    AND target.side='BUY' AND target.venue_policy='PUMP_FUN_ONLY'
+    AND assessment.intent_id=target.id AND assessment.payload_version=1
+    AND assessment.specification_version='1.4.0' AND assessment.evaluator_version=1
+    AND assessment.strategy_id=target.strategy_id
+    AND assessment.strategy_version=target.strategy_version
+    AND assessment.decision_fingerprint=target.decision_fingerprint
+    AND assessment.intent_state_revision=0 AND assessment.intent_status='PENDING'
+    AND assessment.outcome='FOUNDATION_VALIDATED'
+    AND assessment.coverage='INTENT_AND_LEASE_ONLY'
+    AND assessment.quote_status='NOT_RUN' AND assessment.build_status='NOT_RUN'
+    AND assessment.simulation_status='NOT_RUN' AND assessment.signature_status='NOT_RUN'
+    AND assessment.submission_status='NOT_RUN'
+    AND simulation.status='SUCCEEDED' AND simulation.attempt_count=1
+    AND simulation.last_reason_code='INTENT_SUCCEEDED'
+    AND simulation.lease_owner IS NULL AND simulation.lease_token IS NULL
+    AND simulation.lease_expires_at IS NULL AND simulation.live_reserved=FALSE
+    AND simulation.terminal_at IS NOT NULL
+    AND simulation.reconciliation_completed_at=simulation.terminal_at
+    AND simulation.purge_after=simulation.reconciliation_completed_at+INTERVAL '4 hours'
+    AND target.strategy_id=simulation.strategy_id
+    AND target.strategy_version=simulation.strategy_version
+    AND target.position_id=simulation.position_id AND target.mint=simulation.mint
+    AND target.side=simulation.side AND target.venue_policy=simulation.venue_policy
+    AND target.quote_mint=simulation.quote_mint
+    AND target.quote_token_program=simulation.quote_token_program
+    AND target.quote_decimals=simulation.quote_decimals
+    AND target.quote_amount_raw IS NOT DISTINCT FROM simulation.quote_amount_raw
+    AND target.base_amount_raw IS NOT DISTINCT FROM simulation.base_amount_raw
+    AND target.minimum_amount_out_raw=simulation.minimum_amount_out_raw
+    AND target.decision_event_id=simulation.decision_event_id
+    AND target.decision_fingerprint=simulation.decision_fingerprint
+    AND target.requested_at=simulation.requested_at AND target.expires_at=simulation.expires_at
+    AND attempt.status='COMPLETED' AND attempt.reason_code='ATTEMPT_COMPLETED'
+    AND attempt.completed_at IS NOT NULL AND attempt.purge_after IS NULL
+    AND artifact.payload_version=1 AND artifact.specification_version='1.5.0'
+    AND artifact.evaluator_version=1 AND artifact.attempt_number=1
+    AND artifact.intent_state_revision+2=simulation.state_revision
+    AND artifact.strategy_id=simulation.strategy_id
+    AND artifact.strategy_version=simulation.strategy_version
+    AND artifact.decision_fingerprint=simulation.decision_fingerprint
+    AND artifact.result_kind='SUCCESS' AND artifact.effective_venue='PUMP_FUN'
+    AND artifact.terminal_reason_code='INTENT_SUCCEEDED'
+    AND artifact.amount_in_raw=simulation.quote_amount_raw
+    AND artifact.protected_amount_out_raw>=simulation.minimum_amount_out_raw
+    AND artifact.quote_status='SUCCEEDED' AND artifact.build_status='SUCCEEDED'
+    AND artifact.simulation_status='SUCCEEDED'
+    AND artifact.failure_stage IS NULL AND artifact.failure_code IS NULL
+    AND artifact.recorded_at=attempt.completed_at
+    AND artifact.recorded_at=simulation.terminal_at
+    AND artifact.recorded_at>=operation.at-INTERVAL '30 seconds'
+    AND artifact.recorded_at<=operation.at
+    AND artifact.recorded_at<preparation.deadline_at
+  FOR UPDATE OF preparation,pair,target,simulation
+), updated AS MATERIALIZED (
+  UPDATE execution_preflight_intent_preparation_runs AS preparation
+  SET artifact_id=proof.artifact_id,
+    artifact_fingerprint=proof.result_fingerprint,
+    state_revision=preparation.state_revision+1
+  FROM proof
+  WHERE preparation.run_id=proof.run_id AND preparation.state_revision=$2::BIGINT
+    AND preparation.artifact_id IS NULL AND preparation.artifact_fingerprint IS NULL
+  RETURNING ${CLAIM_PROJECTION}
+), replayed AS MATERIALIZED (
+  SELECT ${CLAIM_PROJECTION}
+  FROM proof
+  JOIN execution_preflight_intent_preparation_runs AS preparation
+    ON preparation.run_id=proof.run_id
+  WHERE NOT EXISTS (SELECT 1 FROM updated)
+    AND preparation.state_revision IN ($2::BIGINT,$2::BIGINT+1)
+    AND preparation.artifact_id=proof.artifact_id
+    AND preparation.artifact_fingerprint=proof.result_fingerprint
+)
+SELECT * FROM updated
+UNION ALL
+SELECT * FROM replayed`;
+
+const MARK_PREPARED_SQL = `WITH operation AS MATERIALIZED (
+  SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+), eligible AS MATERIALIZED (
+  SELECT preparation.run_id
+  FROM operation
+  JOIN execution_preflight_intent_preparation_runs AS preparation ON TRUE
+  JOIN execution_preflight_intent_pairs AS pair ON pair.pair_id=preparation.pair_id
+  JOIN execution_intents AS target ON target.id=pair.target_intent_id
+  JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
+  JOIN execution_preflight_intent_pair_memberships AS target_member
+    ON target_member.pair_id=pair.pair_id
+      AND target_member.intent_id=target.id AND target_member.lane='TARGET'
+  JOIN execution_preflight_intent_pair_memberships AS simulation_member
+    ON simulation_member.pair_id=pair.pair_id
+      AND simulation_member.intent_id=simulation.id AND simulation_member.lane='SIMULATION'
+  JOIN execution_dry_run_assessments AS assessment
+    ON assessment.assessment_id=preparation.assessment_id
+      AND assessment.result_fingerprint=preparation.assessment_fingerprint
+  JOIN execution_attempts AS attempt
+    ON attempt.intent_id=simulation.id AND attempt.attempt_number=1
+  JOIN execution_simulation_artifacts AS artifact
+    ON artifact.artifact_id=preparation.artifact_id
+      AND artifact.result_fingerprint=preparation.artifact_fingerprint
+      AND artifact.intent_id=simulation.id AND artifact.attempt_number=1
+  WHERE preparation.run_id=$1
+    AND preparation.state_revision IN ($2::BIGINT,$2::BIGINT+1)
+    AND preparation.assessment_id IS NOT NULL
+    AND preparation.assessment_fingerprint IS NOT NULL
+    AND preparation.artifact_id IS NOT NULL
+    AND preparation.artifact_fingerprint IS NOT NULL
+    AND pair.decision_event_id=target.decision_event_id
+    AND pair.decision_fingerprint=target.decision_fingerprint
+    AND ${pristineIntent('target')}
+    AND target.side='BUY' AND target.venue_policy='PUMP_FUN_ONLY'
+    AND assessment.intent_id=target.id AND assessment.payload_version=1
+    AND assessment.specification_version='1.4.0' AND assessment.evaluator_version=1
+    AND assessment.strategy_id=target.strategy_id
+    AND assessment.strategy_version=target.strategy_version
+    AND assessment.decision_fingerprint=target.decision_fingerprint
+    AND assessment.intent_state_revision=0 AND assessment.intent_status='PENDING'
+    AND assessment.outcome='FOUNDATION_VALIDATED'
+    AND assessment.coverage='INTENT_AND_LEASE_ONLY'
+    AND assessment.quote_status='NOT_RUN' AND assessment.build_status='NOT_RUN'
+    AND assessment.simulation_status='NOT_RUN' AND assessment.signature_status='NOT_RUN'
+    AND assessment.submission_status='NOT_RUN'
+    AND simulation.status='SUCCEEDED' AND simulation.attempt_count=1
+    AND simulation.last_reason_code='INTENT_SUCCEEDED'
+    AND simulation.lease_owner IS NULL AND simulation.lease_token IS NULL
+    AND simulation.lease_expires_at IS NULL AND simulation.live_reserved=FALSE
+    AND target.strategy_id=simulation.strategy_id
+    AND target.strategy_version=simulation.strategy_version
+    AND target.position_id=simulation.position_id AND target.mint=simulation.mint
+    AND target.side=simulation.side AND target.venue_policy=simulation.venue_policy
+    AND target.quote_mint=simulation.quote_mint
+    AND target.quote_token_program=simulation.quote_token_program
+    AND target.quote_decimals=simulation.quote_decimals
+    AND target.quote_amount_raw IS NOT DISTINCT FROM simulation.quote_amount_raw
+    AND target.base_amount_raw IS NOT DISTINCT FROM simulation.base_amount_raw
+    AND target.minimum_amount_out_raw=simulation.minimum_amount_out_raw
+    AND target.decision_event_id=simulation.decision_event_id
+    AND target.decision_fingerprint=simulation.decision_fingerprint
+    AND target.requested_at=simulation.requested_at AND target.expires_at=simulation.expires_at
+    AND attempt.status='COMPLETED' AND attempt.reason_code='ATTEMPT_COMPLETED'
+    AND artifact.payload_version=1 AND artifact.specification_version='1.5.0'
+    AND artifact.evaluator_version=1 AND artifact.intent_state_revision+2=simulation.state_revision
+    AND artifact.strategy_id=simulation.strategy_id
+    AND artifact.strategy_version=simulation.strategy_version
+    AND artifact.decision_fingerprint=simulation.decision_fingerprint
+    AND artifact.result_kind='SUCCESS' AND artifact.effective_venue='PUMP_FUN'
+    AND artifact.terminal_reason_code='INTENT_SUCCEEDED'
+    AND artifact.amount_in_raw=simulation.quote_amount_raw
+    AND artifact.protected_amount_out_raw>=simulation.minimum_amount_out_raw
+    AND artifact.quote_status='SUCCEEDED' AND artifact.build_status='SUCCEEDED'
+    AND artifact.simulation_status='SUCCEEDED'
+    AND artifact.failure_stage IS NULL AND artifact.failure_code IS NULL
+    AND artifact.recorded_at=attempt.completed_at
+    AND artifact.recorded_at=simulation.terminal_at
+    AND artifact.recorded_at<preparation.deadline_at
+    AND (
+      (preparation.state='PREPARING'
+        AND preparation.state_revision=$2::BIGINT
+        AND preparation.lease_owner=$3 AND preparation.lease_token=$4::UUID
+        AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+          +($5::BIGINT*INTERVAL '1 millisecond')
+        AND preparation.lease_expires_at>operation.at
+        AND preparation.deadline_at>operation.at+INTERVAL '5 seconds'
+        AND pair.expires_at>operation.at+INTERVAL '5 seconds'
+        AND artifact.recorded_at>=operation.at-INTERVAL '30 seconds'
+        AND artifact.recorded_at<=operation.at)
+      OR (preparation.state='PREPARED'
+        AND preparation.state_revision=$2::BIGINT+1
+        AND preparation.manifest_fingerprint=$6
+        AND preparation.completed_at IS NOT NULL
+        AND artifact.recorded_at>=preparation.completed_at-INTERVAL '30 seconds'
+        AND artifact.recorded_at<=preparation.completed_at)
+    )
+  FOR UPDATE OF preparation,pair,target,simulation
+), updated AS MATERIALIZED (
+  UPDATE execution_preflight_intent_preparation_runs AS preparation
+  SET state='PREPARED',manifest_fingerprint=$6,
+    state_revision=preparation.state_revision+1
+  FROM eligible
+  WHERE preparation.run_id=eligible.run_id AND preparation.state='PREPARING'
+    AND preparation.state_revision=$2::BIGINT
+  RETURNING ${PREPARATION_PROJECTION}
+), replayed AS MATERIALIZED (
+  SELECT ${PREPARATION_PROJECTION}
+  FROM eligible
+  JOIN execution_preflight_intent_preparation_runs AS preparation
+    ON preparation.run_id=eligible.run_id
+  WHERE NOT EXISTS (SELECT 1 FROM updated)
+    AND preparation.state='PREPARED'
+    AND preparation.state_revision=$2::BIGINT+1
+    AND preparation.manifest_fingerprint=$6
+)
+SELECT * FROM updated
+UNION ALL
+SELECT * FROM replayed`;
 
 export class ExecutionPreflightPreparationPostgresRepository
 implements ExecutionPreflightPreparationRepository {
@@ -270,21 +570,86 @@ implements ExecutionPreflightPreparationRepository {
         JOIN execution_preflight_intent_pairs AS pair
           ON pair.created_at > preparation.watermark_at
           AND pair.created_at < preparation.deadline_at-INTERVAL '5 seconds'
-        JOIN execution_intents AS target ON target.id=pair.target_intent_id
-        JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
         WHERE preparation.run_id=$1
-          AND pair.expires_at>statement_timestamp()+INTERVAL '5 seconds'
-          AND ${pristineIntent('target')}
-          AND ${pristineIntent('simulation')}
         ORDER BY pair.created_at,pair.pair_id
         LIMIT 1
-        FOR UPDATE OF pair,target,simulation`, [claim.preparation.runId]);
+        FOR UPDATE OF pair`, [claim.preparation.runId]);
       if (candidate.rowCount === 0 && candidate.rows.length === 0) {
         await client.query('COMMIT');
         committed = true;
         return null;
       }
       const pair = pairFromResult(candidate);
+      const parentLocks = await client.query(`SELECT
+          target.id AS target_intent_id,simulation.id AS simulation_intent_id
+        FROM execution_preflight_intent_pairs AS pair
+        JOIN execution_intents AS target ON target.id=pair.target_intent_id
+        JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
+        WHERE pair.pair_id=$1 AND target.id=$2 AND simulation.id=$3
+        FOR UPDATE OF target,simulation`, [
+        pair.pairId,
+        pair.targetIntentId,
+        pair.simulationIntentId,
+      ]);
+      if (parentLocks.rowCount !== 1 || parentLocks.rows.length !== 1) failPairConflict();
+      const validated = await client.query(`SELECT ${PAIR_PROJECTION}
+        FROM execution_preflight_intent_pairs AS pair
+        JOIN execution_intents AS target ON target.id=pair.target_intent_id
+        JOIN execution_intents AS simulation ON simulation.id=pair.simulation_intent_id
+        JOIN execution_preflight_intent_pair_memberships AS target_member
+          ON target_member.pair_id=pair.pair_id
+            AND target_member.intent_id=target.id AND target_member.lane='TARGET'
+        JOIN execution_preflight_intent_pair_memberships AS simulation_member
+          ON simulation_member.pair_id=pair.pair_id
+            AND simulation_member.intent_id=simulation.id
+            AND simulation_member.lane='SIMULATION'
+        WHERE pair.pair_id=$1
+          AND pair.expires_at>statement_timestamp()+INTERVAL '5 seconds'
+          AND pair.decision_event_id=target.decision_event_id
+          AND pair.decision_fingerprint=target.decision_fingerprint
+          AND pair.decision_event_id=simulation.decision_event_id
+          AND pair.decision_fingerprint=simulation.decision_fingerprint
+          AND target.strategy_id=simulation.strategy_id
+          AND target.strategy_version=simulation.strategy_version
+          AND target.position_id=simulation.position_id AND target.mint=simulation.mint
+          AND target.side=simulation.side AND target.venue_policy=simulation.venue_policy
+          AND target.quote_mint=simulation.quote_mint
+          AND target.quote_token_program=simulation.quote_token_program
+          AND target.quote_decimals=simulation.quote_decimals
+          AND target.quote_amount_raw IS NOT DISTINCT FROM simulation.quote_amount_raw
+          AND target.base_amount_raw IS NOT DISTINCT FROM simulation.base_amount_raw
+          AND target.minimum_amount_out_raw=simulation.minimum_amount_out_raw
+          AND target.requested_at=simulation.requested_at
+          AND target.expires_at=simulation.expires_at
+          AND ${pristineIntent('target')}
+          AND ${pristineIntent('simulation')}
+          AND NOT EXISTS (SELECT 1 FROM execution_dry_run_assessments AS evidence
+            WHERE evidence.intent_id IN (target.id,simulation.id))
+          AND NOT EXISTS (SELECT 1 FROM execution_attempts AS evidence
+            WHERE evidence.intent_id IN (target.id,simulation.id))
+          AND NOT EXISTS (SELECT 1 FROM execution_simulation_artifacts AS evidence
+            WHERE evidence.intent_id IN (target.id,simulation.id))
+        `, [pair.pairId]);
+      if (validated.rowCount !== 1 || validated.rows.length !== 1) {
+        const failed = await client.query(`UPDATE execution_preflight_intent_preparation_runs
+          AS preparation
+          SET state='FAILED',state_revision=preparation.state_revision+1,
+            failure_code='PREFLIGHT_PAIR_CONFLICT'
+          WHERE preparation.run_id=$1 AND preparation.state=$2
+            AND preparation.state_revision=$3::BIGINT
+            AND preparation.lease_owner=$4 AND preparation.lease_token=$5::UUID
+            AND preparation.lease_expires_at=TIMESTAMPTZ 'epoch'
+              +($6::BIGINT*INTERVAL '1 millisecond')
+          RETURNING preparation.run_id`, claimValues(claim));
+        if (failed.rowCount !== 1 || failed.rows.length !== 1) {
+          throw repositoryError('PREPARATION_LEASE_LOST');
+        }
+        await client.query('COMMIT');
+        committed = true;
+        throw repositoryError('PREFLIGHT_PAIR_CONFLICT');
+      }
+      const exactPair = pairFromResult(validated);
+      if (!sameStoredPair(pair, exactPair)) failPairConflict();
       const updated = await client.query(`UPDATE execution_preflight_intent_preparation_runs
         AS preparation
         SET state='PREPARING',pair_id=$7,state_revision=preparation.state_revision+1
@@ -305,6 +670,67 @@ implements ExecutionPreflightPreparationRepository {
       throw normalizeError(error, signal);
     } finally {
       client.release(!committed);
+    }
+  }
+
+  public async bindTargetAssessment(
+    claimValue: ClaimedExecutionPreflightPreparation,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<ClaimedExecutionPreflightPreparation> {
+    const claim = preparingClaimInput(claimValue, 'ASSESSMENT');
+    requireSignal(signal);
+    const client = await this.connect(signal);
+    try {
+      const bound = await client.query(BIND_TARGET_ASSESSMENT_SQL, proofClaimValues(claim));
+      requireActive(signal);
+      return onlyClaimOr(bound, 'PREFLIGHT_ASSESSMENT_INVALID');
+    } catch (error: unknown) {
+      throw normalizeError(error, signal);
+    } finally {
+      client.release();
+    }
+  }
+
+  public async bindSimulationArtifact(
+    claimValue: ClaimedExecutionPreflightPreparation,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<ClaimedExecutionPreflightPreparation> {
+    const claim = preparingClaimInput(claimValue, 'SIMULATION');
+    requireSignal(signal);
+    const client = await this.connect(signal);
+    try {
+      const bound = await client.query(BIND_SIMULATION_ARTIFACT_SQL, proofClaimValues(claim));
+      requireActive(signal);
+      return onlyClaimOr(bound, 'PREFLIGHT_SIMULATION_FAILED');
+    } catch (error: unknown) {
+      throw normalizeError(error, signal);
+    } finally {
+      client.release();
+    }
+  }
+
+  public async markPrepared(
+    claimValue: ClaimedExecutionPreflightPreparation,
+    optionsValue: ExecutionPreflightMarkPreparedOptions,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<ExecutionPreflightPreparationV1> {
+    const claim = preparingClaimInput(claimValue, 'MANIFEST');
+    const options = markPreparedOptions(optionsValue);
+    requireSignal(signal);
+    const client = await this.connect(signal);
+    try {
+      const prepared = await client.query(MARK_PREPARED_SQL, [
+        ...proofClaimValues(claim), options.manifestFingerprint,
+      ]);
+      requireActive(signal);
+      if (prepared.rowCount !== 1 || prepared.rows.length !== 1) {
+        throw repositoryError('PREFLIGHT_PAIR_LINEAGE_INVALID');
+      }
+      return preparationFromRow(onlyRow(prepared));
+    } catch (error: unknown) {
+      throw normalizeError(error, signal);
+    } finally {
+      client.release();
     }
   }
 
@@ -446,6 +872,13 @@ function startOptions(value: unknown): ExecutionPreflightPreparationStartOptions
   });
 }
 
+function markPreparedOptions(value: unknown): ExecutionPreflightMarkPreparedOptions {
+  const row = exactFrozenRecord(value, MARK_PREPARED_KEYS);
+  if (typeof row.manifestFingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(row.manifestFingerprint)) throw inputError();
+  return Object.freeze({ manifestFingerprint: row.manifestFingerprint });
+}
+
 function claimedInput(value: unknown): ClaimedExecutionPreflightPreparation {
   const row = exactFrozenRecord(value, CLAIM_KEYS);
   const preparationRow = exactFrozenRecord(row.preparation, PREPARATION_KEYS);
@@ -462,6 +895,23 @@ function claimedInput(value: unknown): ClaimedExecutionPreflightPreparation {
     leaseToken: row.leaseToken,
     leaseExpiresAtMs: row.leaseExpiresAtMs,
   });
+}
+
+function preparingClaimInput(
+  value: unknown,
+  phase: 'ASSESSMENT' | 'SIMULATION' | 'MANIFEST',
+): ClaimedExecutionPreflightPreparation {
+  const claim = claimedInput(value);
+  const preparation = claim.preparation;
+  const hasAssessment = preparation.assessmentId !== null
+    && preparation.assessmentFingerprint !== null;
+  const hasArtifact = preparation.artifactId !== null
+    && preparation.artifactFingerprint !== null;
+  if (preparation.state !== 'PREPARING' || preparation.pairId === null
+    || preparation.manifestFingerprint !== null
+    || (phase !== 'ASSESSMENT' && !hasAssessment)
+    || (phase === 'MANIFEST' && !hasArtifact)) throw inputError();
+  return claim;
 }
 
 function preparationFromDomain(row: Row): ExecutionPreflightPreparationV1 {
@@ -535,7 +985,8 @@ function onlyClaim(result: QueryResult): ClaimedExecutionPreflightPreparation {
 
 function onlyClaimOr(
   result: QueryResult,
-  code: 'INVALID_DATA' | 'PREPARATION_LEASE_LOST' | 'PREFLIGHT_PAIR_CONFLICT',
+  code: 'INVALID_DATA' | 'PREPARATION_LEASE_LOST' | 'PREFLIGHT_PAIR_CONFLICT'
+    | 'PREFLIGHT_ASSESSMENT_INVALID' | 'PREFLIGHT_SIMULATION_FAILED',
 ): ClaimedExecutionPreflightPreparation {
   if (result.rowCount !== 1 || result.rows.length !== 1) {
     throw code === 'INVALID_DATA' ? dataError() : repositoryError(code);
@@ -569,6 +1020,17 @@ function selection(
   return Object.freeze({ preparation, ...pair });
 }
 
+function sameStoredPair(left: StoredPair, right: StoredPair): boolean {
+  return left.pairId === right.pairId
+    && left.pairFingerprint === right.pairFingerprint
+    && left.targetIntentId === right.targetIntentId
+    && left.simulationIntentId === right.simulationIntentId
+    && left.decisionEventId === right.decisionEventId
+    && left.decisionFingerprint === right.decisionFingerprint
+    && left.pairCreatedAtMs === right.pairCreatedAtMs
+    && left.pairExpiresAtMs === right.pairExpiresAtMs;
+}
+
 function pristineIntent(alias: 'target' | 'simulation'): string {
   return `${alias}.status='PENDING'
           AND ${alias}.attempt_count=0 AND ${alias}.state_revision=0
@@ -582,6 +1044,16 @@ function claimValues(claim: ClaimedExecutionPreflightPreparation): readonly unkn
   return [
     claim.preparation.runId,
     claim.preparation.state,
+    claim.preparation.stateRevision.toString(),
+    claim.leaseOwner,
+    claim.leaseToken,
+    claim.leaseExpiresAtMs,
+  ];
+}
+
+function proofClaimValues(claim: ClaimedExecutionPreflightPreparation): readonly unknown[] {
+  return [
+    claim.preparation.runId,
     claim.preparation.stateRevision.toString(),
     claim.leaseOwner,
     claim.leaseToken,

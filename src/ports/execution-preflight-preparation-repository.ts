@@ -22,6 +22,10 @@ export interface ExecutionPreflightPairSelectionV1 {
   readonly pairExpiresAtMs: number;
 }
 
+export interface ExecutionPreflightMarkPreparedOptions {
+  readonly manifestFingerprint: string;
+}
+
 export interface ExecutionPreflightPreparationRepository {
   startOrResume(
     options: ExecutionPreflightPreparationStartOptions,
@@ -31,6 +35,19 @@ export interface ExecutionPreflightPreparationRepository {
     claim: ClaimedExecutionPreflightPreparation,
     signal?: AbortSignal,
   ): Promise<ExecutionPreflightPairSelectionV1 | null>;
+  bindTargetAssessment(
+    claim: ClaimedExecutionPreflightPreparation,
+    signal?: AbortSignal,
+  ): Promise<ClaimedExecutionPreflightPreparation>;
+  bindSimulationArtifact(
+    claim: ClaimedExecutionPreflightPreparation,
+    signal?: AbortSignal,
+  ): Promise<ClaimedExecutionPreflightPreparation>;
+  markPrepared(
+    claim: ClaimedExecutionPreflightPreparation,
+    options: ExecutionPreflightMarkPreparedOptions,
+    signal?: AbortSignal,
+  ): Promise<ExecutionPreflightPreparationV1>;
   renew(
     claim: ClaimedExecutionPreflightPreparation,
     leaseMs: number,
