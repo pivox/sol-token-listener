@@ -162,8 +162,8 @@ export class StrictCatchUpWindowExceededError extends Error {
     const left = WINDOW_FRONTIERS.get(this);
     const right = WINDOW_FRONTIERS.get(other);
     return left !== undefined && right !== undefined
-      && sameCheckpoint(left.launchpad, right.launchpad)
-      && sameCheckpoint(left.market, right.market);
+      && this.checkpointKey === other.checkpointKey
+      && sameCheckpoint(left[this.checkpointKey], right[this.checkpointKey]);
   }
 }
 

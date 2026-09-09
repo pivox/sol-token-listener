@@ -604,7 +604,7 @@ void test('compares private exact window frontiers without enumerating or serial
     launchpad: checkpoint('launchpad', 'launch-secret', 10, 1),
     market: checkpoint('market', 'market-secret', 11, 1),
   });
-  const first = new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier);
+  const first = new StrictCatchUpWindowExceededError('primary', 'market', frontier);
   const equal = new StrictCatchUpWindowExceededError('fallback-1', 'market', frontier);
   const different = new StrictCatchUpWindowExceededError('fallback-2', 'market', Object.freeze({
     ...frontier,
@@ -617,6 +617,50 @@ void test('compares private exact window frontiers without enumerating or serial
     'code', 'stage', 'retryable', 'providerId', 'checkpointKey',
   ]);
   assert.doesNotMatch(JSON.stringify(first), /launch-secret|market-secret/u);
+  assert.equal('toJSON' in first, false);
+});
+
+void test('compares only the failing program frontier while ignoring unrelated checkpoint progress', () => {
+  const frontier = Object.freeze({
+    launchpad: checkpoint('launchpad', 'launch-secret', 10, 1),
+    market: checkpoint('market', 'market-secret', 11, 1),
+  });
+  const failure = new StrictCatchUpWindowExceededError('primary', 'market', frontier);
+  const unrelatedProgress = new StrictCatchUpWindowExceededError('fallback-1', 'market', Object.freeze({
+    launchpad: checkpoint('launchpad', 'new-launch-secret', 15, 2),
+    market: checkpoint('market', 'market-secret', 11, 2),
+  }));
+  assert.equal(failure.sameFrontier(unrelatedProgress), true);
+  assert.equal(unrelatedProgress.sameFrontier(failure), true);
+  assert.equal(failure.sameFrontier(new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier)), false);
+  for (const changedMarket of [
+    checkpoint('market', 'other-secret', 11, 1),
+    checkpoint('market', 'market-secret', 12, 1),
+  ]) {
+    assert.equal(failure.sameFrontier(new StrictCatchUpWindowExceededError('primary', 'market', Object.freeze({
+      ...frontier, market: changedMarket,
+    }))), false);
+  }
+  assert.deepEqual(Object.keys(unrelatedProgress), ['code', 'stage', 'retryable', 'providerId', 'checkpointKey']);
+  assert.doesNotMatch(JSON.stringify(unrelatedProgress), /secret/u);
+  assert.equal('toJSON' in unrelatedProgress, false);
+});
+
+void test('compares null frontiers exactly and still requires the same failing program key', () => {
+  const empty = Object.freeze({ launchpad: null, market: null });
+  for (const key of ['launchpad', 'market'] as const) {
+    const otherKey = key === 'launchpad' ? 'market' : 'launchpad';
+    const failure = new StrictCatchUpWindowExceededError('primary', key, empty);
+    assert.equal(failure.sameFrontier(new StrictCatchUpWindowExceededError('fallback-1', key, Object.freeze({
+      ...empty, [otherKey]: checkpoint(otherKey, 'unrelated-secret', 1),
+    }))), true);
+    assert.equal(failure.sameFrontier(new StrictCatchUpWindowExceededError('primary', otherKey, empty)), false);
+    const nonnull = new StrictCatchUpWindowExceededError('primary', key, Object.freeze({
+      ...empty, [key]: checkpoint(key, 'boundary-secret', 1),
+    }));
+    assert.equal(failure.sameFrontier(nonnull), false);
+    assert.equal(nonnull.sameFrontier(failure), false);
+  }
 });
 
 void test('rejects a proxy window frontier without invoking any hostile trap', () => {
