@@ -22,6 +22,12 @@ import {
   createStrictCatchUpFailure,
   type StrictCatchUpFailure,
 } from '../src/domain/strict-catch-up.js';
+import {
+  advanceStrictCatchUpRun,
+  createStrictCatchUpRun,
+  terminalizeStrictCatchUpRun,
+  type StrictCatchUpRun,
+} from '../src/domain/strict-catch-up-run.js';
 import type { StrictCatchUpRepository } from '../src/ports/strict-catch-up-repository.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
@@ -34,6 +40,27 @@ import {
 } from '../src/storage/transaction-inbox.repository.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+
+interface StrictCatchUpRunRepository extends StrictCatchUpRepository {
+  readActiveStrictCatchUpRun(key: ProcessingCheckpoint['key']): Promise<StrictCatchUpRun | null>;
+  createStrictCatchUpRun(value: StrictCatchUpRun): Promise<StrictCatchUpRun>;
+  advanceStrictCatchUpRun(expected: StrictCatchUpRun, next: StrictCatchUpRun): Promise<void>;
+  completeStrictCatchUpRun(value: {
+    readonly run: StrictCatchUpRun;
+    readonly nextCheckpoint: ProcessingCheckpoint;
+  }): Promise<void>;
+  failStrictCatchUpRun(expected: StrictCatchUpRun, failed: StrictCatchUpRun): Promise<void>;
+  supersedeStaleStrictCatchUpRun(expected: StrictCatchUpRun, atMs: number): Promise<void>;
+}
+
+void test('reads no active strict catch-up run when its key has no row', async () => {
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { throw new Error('transaction access must not occur'); },
+    query: async () => ({ rows: [], rowCount: 0 }),
+  }) as unknown as StrictCatchUpRunRepository;
+
+  assert.equal(await repository.readActiveStrictCatchUpRun('launchpad'), null);
+});
 
 void test('processes a catch-up row at scan time when blockchain time is in the future', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -1383,6 +1410,190 @@ void test('uses exact checkpoint CAS identities and rejects invalid strict check
   );
 });
 
+void test('persists resumable strict catch-up progress and atomically completes its checkpoint', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('launchpad', 40n, 'run-previous', 100_000);
+    const run = createStrictCatchUpRun({
+      checkpointKey: 'launchpad',
+      previous,
+      providerId: 'primary',
+      observedHead: Object.freeze({ slot: 44n, signature: 'run-head' }),
+      beforeSignature: 'run-first-cursor',
+      lastAcceptedSlot: 44n,
+      pagesScanned: 1n,
+      signaturesEnqueued: 2n,
+      revision: 0n,
+      startedAtMs: 100_000,
+      updatedAtMs: 100_001,
+    });
+    const advanced = advanceStrictCatchUpRun(run, {
+      beforeSignature: 'run-next-cursor',
+      lastAcceptedSlot: 42n,
+      pagesScanned: 2n,
+      signaturesEnqueued: 4n,
+      updatedAtMs: 100_002,
+    });
+    const completed = terminalizeStrictCatchUpRun(advanced, {
+      state: 'COMPLETED', terminalReason: null, completedAtMs: 100_003,
+    });
+    const next = checkpoint('launchpad', 44n, 'run-head', 100_003);
+
+    await repository.compareAndSwapCheckpoint(null, previous);
+    assert.deepEqual(await repository.createStrictCatchUpRun(run), run);
+    assert.deepEqual(await repository.readActiveStrictCatchUpRun('launchpad'), run);
+    await repository.advanceStrictCatchUpRun(run, advanced);
+    assert.deepEqual(await repository.readActiveStrictCatchUpRun('launchpad'), advanced);
+    await repository.completeStrictCatchUpRun({ run: advanced, nextCheckpoint: next });
+
+    assert.equal(await repository.readActiveStrictCatchUpRun('launchpad'), null);
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), next);
+    assert.deepEqual(await strictCatchUpRunRow(pool, completed.runId), {
+      state: 'COMPLETED', revision: '2', previous_slot: '40',
+      observed_head_slot: '44', last_accepted_slot: '42', pages_scanned: '2',
+      signatures_enqueued: '4',
+      updated_at_ms: '100003', completed_at_ms: '100003', purge_after_ms: '14500003',
+    });
+  });
+});
+
+void test('rolls back strict completion when the frozen checkpoint boundary is stale', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('launchpad', 60n, 'stale-completion-previous', 200_000);
+    const run = strictCatchUpRun(previous, 'primary', 200_001);
+    await repository.compareAndSwapCheckpoint(null, previous);
+    await repository.createStrictCatchUpRun(run);
+    const concurrent = checkpoint('launchpad', 61n, 'concurrent-checkpoint', 200_002);
+    await repository.compareAndSwapCheckpoint(previous, concurrent);
+
+    await assert.rejects(
+      repository.completeStrictCatchUpRun({
+        run,
+        nextCheckpoint: checkpoint('launchpad', 64n, 'strict-run-head-primary', 200_003),
+      }),
+      (error) => error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint',
+    );
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), concurrent);
+    assert.deepEqual(await repository.readActiveStrictCatchUpRun('launchpad'), run);
+  });
+});
+
+void test('terminalizes failed and stale superseded runs without moving checkpoints', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('market', 70n, 'terminal-previous', 300_000);
+    const failedRun = strictCatchUpRun(previous, 'primary', 300_001);
+    const failed = terminalizeStrictCatchUpRun(failedRun, {
+      state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: 300_002,
+    });
+    await repository.compareAndSwapCheckpoint(null, previous);
+    await repository.createStrictCatchUpRun(failedRun);
+    await repository.failStrictCatchUpRun(failedRun, failed);
+    assert.deepEqual(await repository.readCheckpoint('market'), previous);
+    assert.equal(await repository.readActiveStrictCatchUpRun('market'), null);
+
+    const supersededRun = strictCatchUpRun(previous, 'fallback-1', 300_003);
+    await repository.createStrictCatchUpRun(supersededRun);
+    await assert.rejects(
+      repository.supersedeStaleStrictCatchUpRun(supersededRun, 300_004),
+      TransactionInboxConflictError,
+    );
+    const changed = checkpoint('market', 71n, 'terminal-concurrent', 300_004);
+    await repository.compareAndSwapCheckpoint(previous, changed);
+    await repository.supersedeStaleStrictCatchUpRun(supersededRun, 300_005);
+    await repository.supersedeStaleStrictCatchUpRun(supersededRun, 300_005);
+    assert.deepEqual(await repository.readCheckpoint('market'), changed);
+    assert.equal(await repository.readActiveStrictCatchUpRun('market'), null);
+  });
+});
+
+void test('allows only one concurrent strict run progress writer', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('launchpad', 80n, 'concurrent-run-previous', 400_000);
+    const run = strictCatchUpRun(previous, 'primary', 400_001);
+    const first = advanceStrictCatchUpRun(run, {
+      beforeSignature: 'concurrent-first-cursor', lastAcceptedSlot: 82n,
+      pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 400_002,
+    });
+    const second = advanceStrictCatchUpRun(run, {
+      beforeSignature: 'concurrent-second-cursor', lastAcceptedSlot: 81n,
+      pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 400_003,
+    });
+    await repository.compareAndSwapCheckpoint(null, previous);
+    await repository.createStrictCatchUpRun(run);
+    const outcomes = await Promise.allSettled([
+      repository.advanceStrictCatchUpRun(run, first),
+      repository.advanceStrictCatchUpRun(run, second),
+    ]);
+    assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled').length, 1);
+    assert.equal(outcomes.filter((outcome) => outcome.status === 'rejected'
+      && outcome.reason instanceof TransactionInboxConflictError).length, 1);
+  });
+});
+
+void test('replays only an exact immutable strict run creation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('market', 90n, 'replay-previous', 500_000);
+    const run = strictCatchUpRun(previous, 'primary', 500_001);
+    const alteredSnapshot = Object.freeze({ ...run, updatedAtMs: 500_002 });
+    await repository.compareAndSwapCheckpoint(null, previous);
+    assert.deepEqual(await repository.createStrictCatchUpRun(run), run);
+    assert.deepEqual(await repository.createStrictCatchUpRun(run), run);
+    await assert.rejects(
+      repository.createStrictCatchUpRun(alteredSnapshot),
+      (error) => error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint',
+    );
+  });
+});
+
+void test('rejects mutable strict run inputs before database access', async () => {
+  let accesses = 0;
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => {
+      accesses += 1;
+      throw new Error('database access must not occur');
+    },
+    query: async () => {
+      accesses += 1;
+      throw new Error('database access must not occur');
+    },
+  }) as unknown as StrictCatchUpRunRepository;
+  const run = strictCatchUpRun(checkpoint('launchpad', 100n, 'invalid-run-previous', 600_000), 'primary', 600_001);
+
+  await assert.rejects(repository.createStrictCatchUpRun({ ...run }), TransactionInboxRepositoryError);
+  assert.equal(accesses, 0);
+});
+
+void test('rejects corrupt strict run rows and redacts repository failures', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('launchpad', 110n, 'corrupt-run-previous', 700_000);
+    const run = strictCatchUpRun(previous, 'primary', 700_001);
+    await repository.compareAndSwapCheckpoint(null, previous);
+    await repository.createStrictCatchUpRun(run);
+    await pool.query('ALTER TABLE listener_strict_catch_up_runs DROP CONSTRAINT listener_strict_catch_up_runs_cursor_order_check');
+    await pool.query(
+      'UPDATE listener_strict_catch_up_runs SET before_signature = previous_signature WHERE run_id = $1',
+      [run.runId],
+    );
+    await assert.rejects(repository.readActiveStrictCatchUpRun('launchpad'), TransactionInboxRepositoryError);
+  });
+
+  const secret = 'postgresql://strict-run-secret@db.invalid/listener';
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { throw new Error('not used'); },
+    query: async () => { throw new Error(secret); },
+  }) as unknown as StrictCatchUpRunRepository;
+  await assert.rejects(repository.readActiveStrictCatchUpRun('market'), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assertNoSecretSurface(error, secret);
+    return true;
+  });
+});
+
 void test('rejects non-canonical strict checkpoint signatures before I/O and accepts 128 UTF-8 bytes', async () => {
   const valid = checkpoint('launchpad', 41n, 'strict-signature', 300_000);
   for (const signature of [' leading', 'trailing ', 'a'.repeat(129), 'é'.repeat(65)]) {
@@ -2219,6 +2430,29 @@ function checkpoint(
   return Object.freeze({ key, slot, signature, updatedAtMs });
 }
 
+function strictCatchUpRun(
+  previous: ProcessingCheckpoint,
+  providerId: StrictCatchUpRun['providerId'],
+  updatedAtMs: number,
+): StrictCatchUpRun {
+  return createStrictCatchUpRun({
+    checkpointKey: previous.key,
+    previous,
+    providerId,
+    observedHead: Object.freeze({
+      slot: previous.slot + 4n,
+      signature: `strict-run-head-${providerId}`,
+    }),
+    beforeSignature: `strict-run-first-${providerId}`,
+    lastAcceptedSlot: previous.slot + 4n,
+    pagesScanned: 1n,
+    signaturesEnqueued: 2n,
+    revision: 0n,
+    startedAtMs: updatedAtMs,
+    updatedAtMs,
+  });
+}
+
 function strictFailure(
   checkpointKey: ProcessingCheckpoint['key'],
   previous: ProcessingCheckpoint | null,
@@ -2315,6 +2549,19 @@ async function finalityRowTuple(
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
   return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
+}
+
+async function strictCatchUpRunRow(
+  pool: InstanceType<typeof pg.Pool>,
+  runId: string,
+): Promise<object> {
+  const result = await pool.query(`SELECT state, revision, previous_slot, observed_head_slot,
+    last_accepted_slot, pages_scanned, signatures_enqueued,
+    (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_ms,
+    (EXTRACT(EPOCH FROM completed_at) * 1000)::bigint AS completed_at_ms,
+    (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+    FROM listener_strict_catch_up_runs WHERE run_id = $1`, [runId]);
+  return result.rows[0] as object;
 }
 
 async function insertTerminal(

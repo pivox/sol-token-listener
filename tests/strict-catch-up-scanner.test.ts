@@ -912,6 +912,15 @@ class FakeRepository implements StrictCatchUpRepository {
     if (this.failResolveAt === this.resolveAttempts) throw new Error('resolve-secret');
     this.resolutions.push([key, previous]);
   }
+
+  async readActiveStrictCatchUpRun(): Promise<null> { return null; }
+  async createStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['createStrictCatchUpRun']>[0]) {
+    return value;
+  }
+  async advanceStrictCatchUpRun(): Promise<void> {}
+  async completeStrictCatchUpRun(): Promise<void> {}
+  async failStrictCatchUpRun(): Promise<void> {}
+  async supersedeStaleStrictCatchUpRun(): Promise<void> {}
 }
 
 function scannerFailure(

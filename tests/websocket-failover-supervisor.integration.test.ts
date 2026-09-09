@@ -739,6 +739,27 @@ class AbortBoundaryRepository implements StrictCatchUpRepository {
   ): Promise<void> {
     return this.inner.resolveStrictCatchUpFailures(key, previous);
   }
+  public readActiveStrictCatchUpRun(key: Parameters<StrictCatchUpRepository['readActiveStrictCatchUpRun']>[0]) {
+    return this.inner.readActiveStrictCatchUpRun(key);
+  }
+  public createStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['createStrictCatchUpRun']>[0]) {
+    return this.inner.createStrictCatchUpRun(value);
+  }
+  public advanceStrictCatchUpRun(
+    expected: Parameters<StrictCatchUpRepository['advanceStrictCatchUpRun']>[0],
+    next: Parameters<StrictCatchUpRepository['advanceStrictCatchUpRun']>[1],
+  ) { return this.inner.advanceStrictCatchUpRun(expected, next); }
+  public completeStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['completeStrictCatchUpRun']>[0]) {
+    return this.inner.completeStrictCatchUpRun(value);
+  }
+  public failStrictCatchUpRun(
+    expected: Parameters<StrictCatchUpRepository['failStrictCatchUpRun']>[0],
+    failed: Parameters<StrictCatchUpRepository['failStrictCatchUpRun']>[1],
+  ) { return this.inner.failStrictCatchUpRun(expected, failed); }
+  public supersedeStaleStrictCatchUpRun(
+    expected: Parameters<StrictCatchUpRepository['supersedeStaleStrictCatchUpRun']>[0],
+    atMs: Parameters<StrictCatchUpRepository['supersedeStaleStrictCatchUpRun']>[1],
+  ) { return this.inner.supersedeStaleStrictCatchUpRun(expected, atMs); }
 }
 
 class CasConflictRepository implements StrictCatchUpRepository {
@@ -771,6 +792,27 @@ class CasConflictRepository implements StrictCatchUpRepository {
   ): Promise<void> {
     return this.inner.resolveStrictCatchUpFailures(key, previous);
   }
+  public readActiveStrictCatchUpRun(key: Parameters<StrictCatchUpRepository['readActiveStrictCatchUpRun']>[0]) {
+    return this.inner.readActiveStrictCatchUpRun(key);
+  }
+  public createStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['createStrictCatchUpRun']>[0]) {
+    return this.inner.createStrictCatchUpRun(value);
+  }
+  public advanceStrictCatchUpRun(
+    expected: Parameters<StrictCatchUpRepository['advanceStrictCatchUpRun']>[0],
+    next: Parameters<StrictCatchUpRepository['advanceStrictCatchUpRun']>[1],
+  ) { return this.inner.advanceStrictCatchUpRun(expected, next); }
+  public completeStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['completeStrictCatchUpRun']>[0]) {
+    return this.inner.completeStrictCatchUpRun(value);
+  }
+  public failStrictCatchUpRun(
+    expected: Parameters<StrictCatchUpRepository['failStrictCatchUpRun']>[0],
+    failed: Parameters<StrictCatchUpRepository['failStrictCatchUpRun']>[1],
+  ) { return this.inner.failStrictCatchUpRun(expected, failed); }
+  public supersedeStaleStrictCatchUpRun(
+    expected: Parameters<StrictCatchUpRepository['supersedeStaleStrictCatchUpRun']>[0],
+    atMs: Parameters<StrictCatchUpRepository['supersedeStaleStrictCatchUpRun']>[1],
+  ) { return this.inner.supersedeStaleStrictCatchUpRun(expected, atMs); }
 }
 
 class NativeSetupFactory implements SessionOpener {
