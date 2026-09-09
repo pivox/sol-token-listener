@@ -1567,6 +1567,123 @@ void test('rejects mutable strict run inputs before database access', async () =
   assert.equal(accesses, 0);
 });
 
+void test('snapshots strict completion inputs before its first database await', async () => {
+  const previous = checkpoint('launchpad', 120n, 'snapshot-previous', 800_000);
+  const run = strictCatchUpRun(previous, 'primary', 800_001);
+  const original = checkpoint('launchpad', 124n, 'strict-run-head-primary', 800_002);
+  const replaced = checkpoint('launchpad', 124n, 'strict-run-head-primary', 800_003);
+  let releaseConnect: (() => void) | undefined;
+  let startedConnect: (() => void) | undefined;
+  const connectGate = new Promise<void>((resolve) => { releaseConnect = resolve; });
+  const connectStarted = new Promise<void>((resolve) => { startedConnect = resolve; });
+  let checkpointUpdateValues: readonly unknown[] | undefined;
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => {
+      startedConnect?.();
+      await connectGate;
+      return {
+        query: async (text: string, values?: readonly unknown[]) => {
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [], rowCount: 0 };
+          if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+          if (text.includes('FROM processing_checkpoints')) {
+            return { rows: [{ checkpoint_key: 'launchpad', slot: '120', signature: 'snapshot-previous', updated_at: new Date(800_000) }], rowCount: 1 };
+          }
+          if (text.includes('UPDATE processing_checkpoints')) {
+            checkpointUpdateValues = values;
+            return { rows: [], rowCount: 1 };
+          }
+          if (text.includes('UPDATE listener_strict_catch_up_runs')) return { rows: [], rowCount: 1 };
+          if (text.includes('UPDATE listener_strict_catch_up_failures')) return { rows: [], rowCount: 0 };
+          throw new Error('Unexpected strict completion query.');
+        },
+        release: () => {},
+      };
+    },
+    query: async () => { throw new Error('not used'); },
+  }) as unknown as StrictCatchUpRunRepository;
+  const wrapper: { run: StrictCatchUpRun; nextCheckpoint: ProcessingCheckpoint } = { run, nextCheckpoint: original };
+  const completion = repository.completeStrictCatchUpRun(wrapper);
+  await connectStarted;
+  wrapper.nextCheckpoint = replaced;
+  releaseConnect?.();
+  await completion;
+  assert.equal((checkpointUpdateValues?.[3] as Date).getTime(), original.updatedAtMs);
+});
+
+void test('rejects strict completion accessors and proxies before getters, traps, or database access', async () => {
+  const previous = checkpoint('market', 130n, 'completion-shape-previous', 900_000);
+  const run = strictCatchUpRun(previous, 'primary', 900_001);
+  const next = checkpoint('market', 134n, 'strict-run-head-primary', 900_002);
+  let accesses = 0;
+  let getters = 0;
+  let traps = 0;
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { accesses += 1; throw new Error('database access must not occur'); },
+    query: async () => { accesses += 1; throw new Error('database access must not occur'); },
+  }) as unknown as StrictCatchUpRunRepository;
+  const accessor = Object.defineProperties({}, {
+    run: { enumerable: true, value: run },
+    nextCheckpoint: { enumerable: true, get: () => { getters += 1; return next; } },
+  });
+  const proxy = new Proxy({ run, nextCheckpoint: next }, {
+    get: () => { traps += 1; return next; },
+  });
+
+  await assert.rejects(repository.completeStrictCatchUpRun(accessor as never), TransactionInboxRepositoryError);
+  await assert.rejects(repository.completeStrictCatchUpRun(proxy as never), TransactionInboxRepositoryError);
+  assert.equal(getters, 0);
+  assert.equal(traps, 0);
+  assert.equal(accesses, 0);
+});
+
+void test('rejects skipped and regressed strict progress revisions before database access', async () => {
+  const run = strictCatchUpRun(checkpoint('launchpad', 140n, 'revision-previous', 1_000_000), 'primary', 1_000_001);
+  const successor = advanceStrictCatchUpRun(run, {
+    beforeSignature: 'revision-next-cursor', lastAcceptedSlot: 142n,
+    pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 1_000_002,
+  });
+  const skipped = Object.freeze({ ...successor, revision: 2n });
+  const regressed = Object.freeze({ ...successor, revision: 0n });
+  let accesses = 0;
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { accesses += 1; throw new Error('database access must not occur'); },
+    query: async () => { accesses += 1; throw new Error('database access must not occur'); },
+  }) as unknown as StrictCatchUpRunRepository;
+
+  await assert.rejects(repository.advanceStrictCatchUpRun(run, skipped), TransactionInboxRepositoryError);
+  await assert.rejects(repository.advanceStrictCatchUpRun(run, regressed), TransactionInboxRepositoryError);
+  assert.equal(accesses, 0);
+});
+
+void test('rolls back checkpoint completion and strict failure resolution when terminalization fails', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('launchpad', 150n, 'trigger-previous', 1_100_000);
+    const run = strictCatchUpRun(previous, 'primary', 1_100_001);
+    const failure = strictFailure('launchpad', previous, 'primary', 154n, 1_100_002);
+    await repository.compareAndSwapCheckpoint(null, previous);
+    await repository.createStrictCatchUpRun(run);
+    await repository.recordStrictCatchUpFailure(failure);
+    await pool.query(`CREATE FUNCTION reject_strict_run_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced terminalization failure'; END;
+      $$`);
+    await pool.query(`CREATE TRIGGER reject_strict_run_completion BEFORE UPDATE ON listener_strict_catch_up_runs
+      FOR EACH ROW EXECUTE FUNCTION reject_strict_run_completion()`);
+
+    await assert.rejects(repository.completeStrictCatchUpRun({
+      run,
+      nextCheckpoint: checkpoint('launchpad', 154n, 'strict-run-head-primary', 1_100_003),
+    }), TransactionInboxRepositoryError);
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), previous);
+    assert.deepEqual(await repository.readActiveStrictCatchUpRun('launchpad'), run);
+    const storedFailure = await pool.query(
+      'SELECT resolved_at FROM listener_strict_catch_up_failures WHERE failure_id = $1',
+      [failure.failureId],
+    );
+    assert.equal(storedFailure.rows[0]?.resolved_at, null);
+  });
+});
+
 void test('rejects corrupt strict run rows and redacts repository failures', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;

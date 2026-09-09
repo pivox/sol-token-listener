@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { QueryResultRow } from 'pg';
 import {
   reconcileConfirmationStatus,
@@ -1183,35 +1184,36 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     readonly nextCheckpoint: ProcessingCheckpoint;
   }): Promise<void> {
     return this.safely(async () => {
-      assertActiveStrictCatchUpRun(value.run);
-      assertValidStrictCheckpoint(value.nextCheckpoint);
-      if (value.nextCheckpoint.key !== value.run.checkpointKey
-        || value.nextCheckpoint.slot !== value.run.observedHead.slot
-        || value.nextCheckpoint.signature !== value.run.observedHead.signature
-        || value.nextCheckpoint.updatedAtMs < value.run.updatedAtMs) {
+      const completion = snapshotStrictCatchUpCompletionInput(value);
+      const run = completion.run;
+      const nextCheckpoint = completion.nextCheckpoint;
+      if (nextCheckpoint.key !== run.checkpointKey
+        || nextCheckpoint.slot !== run.observedHead.slot
+        || nextCheckpoint.signature !== run.observedHead.signature
+        || nextCheckpoint.updatedAtMs < run.updatedAtMs) {
         throw new TypeError('Strict catch-up completion is invalid.');
       }
-      const completed = terminalizeStrictCatchUpRun(value.run, {
-        state: 'COMPLETED', terminalReason: null, completedAtMs: value.nextCheckpoint.updatedAtMs,
+      const completed = terminalizeStrictCatchUpRun(run, {
+        state: 'COMPLETED', terminalReason: null, completedAtMs: nextCheckpoint.updatedAtMs,
       });
       await this.transaction(async (client) => {
-        await lockStrictCheckpoint(client, value.run.checkpointKey);
-        const checkpoint = await lockedStrictCheckpoint(client, value.run.checkpointKey);
-        if (!matchesCheckpointBoundary(checkpoint, value.run.previous)) {
+        await lockStrictCheckpoint(client, run.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, run.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, run.previous)) {
           throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
         }
         const checkpointUpdated = await client.query(
           `UPDATE processing_checkpoints SET slot = $2, signature = $3, updated_at = $4
            WHERE checkpoint_key = $1 AND slot = $5 AND signature = $6`,
-          [value.nextCheckpoint.key, value.nextCheckpoint.slot.toString(), value.nextCheckpoint.signature,
-            dateFromMs(value.nextCheckpoint.updatedAtMs), value.run.previous.slot.toString(),
-            value.run.previous.signature],
+          [nextCheckpoint.key, nextCheckpoint.slot.toString(), nextCheckpoint.signature,
+            dateFromMs(nextCheckpoint.updatedAtMs), run.previous.slot.toString(),
+            run.previous.signature],
         );
         if (checkpointUpdated.rowCount !== 1) {
           throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
         }
-        await terminalizeStrictCatchUpRunAt(client, value.run, completed);
-        await resolveStrictCatchUpFailuresAt(client, value.run.checkpointKey, value.run.previous);
+        await terminalizeStrictCatchUpRunAt(client, run, completed);
+        await resolveStrictCatchUpFailuresAt(client, run.checkpointKey, run.previous);
       });
     });
   }
@@ -1686,6 +1688,35 @@ function strictCatchUpRunFromRow(row: StrictCatchUpRunRow): StrictCatchUpRun {
 function assertActiveStrictCatchUpRun(value: unknown): asserts value is StrictCatchUpRun {
   assertValidStrictCatchUpRun(value);
   if (value.state !== 'ACTIVE') throw new TypeError('Strict catch-up run must be active.');
+}
+
+function snapshotStrictCatchUpCompletionInput(value: unknown): Readonly<{
+  run: StrictCatchUpRun;
+  nextCheckpoint: ProcessingCheckpoint;
+}> {
+  if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 2 || !keys.includes('run') || !keys.includes('nextCheckpoint')) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const runDescriptor = Object.getOwnPropertyDescriptor(value, 'run');
+  const nextDescriptor = Object.getOwnPropertyDescriptor(value, 'nextCheckpoint');
+  if (runDescriptor === undefined || nextDescriptor === undefined
+    || !runDescriptor.enumerable || !nextDescriptor.enumerable
+    || !('value' in runDescriptor) || !('value' in nextDescriptor)) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const run: unknown = runDescriptor.value;
+  const nextCheckpoint: unknown = nextDescriptor.value;
+  assertActiveStrictCatchUpRun(run);
+  assertValidStrictCheckpoint(nextCheckpoint);
+  return Object.freeze({ run, nextCheckpoint });
 }
 
 function assertExactStrictCatchUpAdvance(expected: StrictCatchUpRun, next: StrictCatchUpRun): void {
