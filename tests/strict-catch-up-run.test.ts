@@ -128,6 +128,51 @@ void test('accepts exact durable slot, bigint counter, and timestamp bounds', ()
   assert.equal(run.updatedAtMs, MAX_DATE_MS);
 });
 
+void test('permits only the exact initial one-row head cursor and advances beyond it', () => {
+  const initialInput = {
+    ...canonicalInput(),
+    beforeSignature: 'head',
+    lastAcceptedSlot: 20n,
+    signaturesEnqueued: 1n,
+  };
+  const initial = createStrictCatchUpRun(initialInput);
+
+  assert.doesNotThrow(() => { assertValidStrictCatchUpRun(initial); });
+  const advanced = advanceStrictCatchUpRun(initial, {
+    beforeSignature: 'next-tail',
+    lastAcceptedSlot: 20n,
+    pagesScanned: 2n,
+    signaturesEnqueued: 2n,
+    updatedAtMs: 2_001,
+  });
+  assert.equal(advanced.beforeSignature, 'next-tail');
+  assert.equal(advanced.lastAcceptedSlot, 20n);
+  assert.throws(() => advanceStrictCatchUpRun(advanced, {
+    beforeSignature: 'head',
+    lastAcceptedSlot: 20n,
+    pagesScanned: 3n,
+    signaturesEnqueued: 3n,
+    updatedAtMs: 2_002,
+  }), /strict catch-up run/i);
+
+  for (const value of [
+    { ...initialInput, pagesScanned: 2n },
+    { ...initialInput, signaturesEnqueued: 2n },
+    { ...initialInput, revision: 1n },
+    { ...initialInput, lastAcceptedSlot: 19n },
+  ]) {
+    assert.throws(() => createStrictCatchUpRun(value), /strict catch-up run/i);
+  }
+  for (const value of [
+    Object.freeze({ ...initial, pagesScanned: 2n }),
+    Object.freeze({ ...initial, signaturesEnqueued: 2n }),
+    Object.freeze({ ...initial, revision: 1n }),
+    Object.freeze({ ...initial, lastAcceptedSlot: 19n }),
+  ]) {
+    assert.throws(() => { assertValidStrictCatchUpRun(value); }, /strict catch-up run/i);
+  }
+});
+
 void test('rejects malformed creation input and durable bounds', () => {
   const base = canonicalInput();
   const cases: readonly unknown[] = [

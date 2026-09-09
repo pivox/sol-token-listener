@@ -82,13 +82,18 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
     const revision = counterFrom(record.revision);
     const startedAtMs = millisecondsFrom(record.startedAtMs);
     const updatedAtMs = millisecondsFrom(record.updatedAtMs);
+    const initialSingleRowHead = beforeSignature === observedHead.signature
+      && lastAcceptedSlot === observedHead.slot
+      && pagesScanned === 1n
+      && signaturesEnqueued === 1n
+      && revision === 0n;
     if (
       previous.updatedAtMs > startedAtMs
       || updatedAtMs < startedAtMs
       || observedHead.slot < previous.slot
       || lastAcceptedSlot < previous.slot
       || beforeSignature === previous.signature
-      || beforeSignature === observedHead.signature
+      || (beforeSignature === observedHead.signature && !initialSingleRowHead)
       || lastAcceptedSlot > observedHead.slot
     ) throw invalid();
 
@@ -232,15 +237,21 @@ export function assertValidStrictCatchUpRun(
     const observedHead = checkedHead(record.observedHead);
     const beforeSignature = signatureFrom(record.beforeSignature);
     const lastAcceptedSlot = slotFrom(record.lastAcceptedSlot);
-    positiveCounterFrom(record.pagesScanned);
-    counterFrom(record.signaturesEnqueued);
-    counterFrom(record.revision);
+    const pagesScanned = positiveCounterFrom(record.pagesScanned);
+    const signaturesEnqueued = counterFrom(record.signaturesEnqueued);
+    const revision = counterFrom(record.revision);
     const state = stateFrom(record.state);
     const terminalReason = terminalReasonFrom(record.terminalReason);
     const startedAtMs = millisecondsFrom(record.startedAtMs);
     const updatedAtMs = millisecondsFrom(record.updatedAtMs);
     const completedAtMs = nullableMillisecondsFrom(record.completedAtMs);
     const purgeAfterMs = nullableMillisecondsFrom(record.purgeAfterMs);
+    const initialSingleRowHead = state === 'ACTIVE'
+      && beforeSignature === observedHead.signature
+      && lastAcceptedSlot === observedHead.slot
+      && pagesScanned === 1n
+      && signaturesEnqueued === 1n
+      && revision === 0n;
     if (
       typeof record.runId !== 'string'
       || record.runId !== strictCatchUpRunId(checkpointKey, previous, providerId)
@@ -249,7 +260,7 @@ export function assertValidStrictCatchUpRun(
       || observedHead.slot < previous.slot
       || lastAcceptedSlot < previous.slot
       || beforeSignature === previous.signature
-      || beforeSignature === observedHead.signature
+      || (beforeSignature === observedHead.signature && !initialSingleRowHead)
       || lastAcceptedSlot > observedHead.slot
     ) throw invalid();
 
