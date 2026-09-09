@@ -1,5 +1,11 @@
 import { isProxy } from 'node:util/types';
 import {
+  advanceStrictCatchUpRun,
+  assertValidStrictCatchUpRun,
+  createStrictCatchUpRun,
+  terminalizeStrictCatchUpRun,
+} from '../domain/strict-catch-up-run.js';
+import {
   MAX_DATE_MS,
   MAX_STRICT_CATCH_UP_SLOT,
   createStrictCatchUpFailure,
@@ -60,7 +66,46 @@ export type StrictCatchUpScannerStage =
   | 'enqueue'
   | 'checkpoint-cas'
   | 'failure-write'
-  | 'failure-resolve';
+  | 'failure-resolve'
+  | 'run-read'
+  | 'run-create'
+  | 'run-progress'
+  | 'run-complete'
+  | 'run-fail'
+  | 'run-supersede';
+
+export class StrictCatchUpPausedError extends Error {
+  public readonly code = 'CATCH_UP_PAGE_BUDGET_EXHAUSTED' as const;
+  public readonly retryable = true;
+  public readonly stage = 'page-budget' as const;
+
+  public constructor(
+    public readonly providerId: RpcProviderId,
+    public readonly checkpointKey: ProcessingCheckpointKey,
+    public readonly runId: string,
+    public readonly pagesScanned: bigint,
+    public readonly signaturesEnqueued: bigint,
+  ) {
+    super('Strict catch-up paused after its page budget.');
+    Object.defineProperty(this, 'name', { value: 'StrictCatchUpPausedError' });
+    Object.freeze(this);
+  }
+}
+
+export class StrictCatchUpProviderAffinityError extends Error {
+  public readonly retryable = true;
+  public readonly stage = 'provider-affinity' as const;
+
+  public constructor(
+    public readonly pinnedProviderId: RpcProviderId,
+    public readonly currentProviderId: RpcProviderId,
+    public readonly checkpointKey: ProcessingCheckpointKey,
+  ) {
+    super('Strict catch-up requires its pinned provider.');
+    Object.defineProperty(this, 'name', { value: 'StrictCatchUpProviderAffinityError' });
+    Object.freeze(this);
+  }
+}
 
 export class StrictCatchUpScannerError extends Error {
   public readonly retryable = true;
@@ -123,23 +168,9 @@ export class StrictCatchUpWindowExceededError extends Error {
 }
 
 interface StrictProgramScan {
-  readonly program: CatchUpDiscoveryProgram;
-  readonly expected: ProcessingCheckpoint | null;
-  readonly rows: readonly CatchUpSignature[];
-  readonly newest: CatchUpSignature | null;
+  readonly discoveredCount: number;
+  readonly checkpointCasCount: number;
   readonly pageCount: number;
-}
-
-class StrictCatchUpWindowSignal extends Error {
-  public constructor(
-    public readonly checkpointKey: ProcessingCheckpointKey,
-    public readonly previous: ProcessingCheckpoint,
-    public readonly observedHeadSlot: bigint | null,
-  ) {
-    super('Strict catch-up internal window signal.');
-    this.name = 'StrictCatchUpWindowSignal';
-    Object.freeze(this);
-  }
 }
 
 const DEFAULT_PROGRAMS: readonly ListenerIngestionProgram[] = Object.freeze([
@@ -187,94 +218,18 @@ export class StrictCatchUpScanner {
     }
     const boundaries: StrictCatchUpBoundaries = Object.freeze({ ...checkpoints });
     const scans: StrictProgramScan[] = [];
-
+    const discoveries = new Map<string, CatchUpSignature>();
     for (const program of this.programs) {
-      const expected = boundaries[program.key];
-      try {
-        scans.push(await this.awaited(
-          signal,
-          () => this.scanProgram(program, expected, signal),
-        ));
-      } catch (error) {
-        if (isWindowExceeded(error)) {
-          await this.awaited(
-            signal,
-            () => this.recordWindowFailure(error, observedAtMs, signal),
-          );
-          throw new StrictCatchUpWindowExceededError(
-            this.providerId,
-            error.checkpointKey,
-            boundaries,
-          );
-        }
-        throw error;
-      }
-    }
-
-    let merged;
-    try {
-      merged = mergeCatchUpDiscoveries(scans);
-    } catch (error) {
-      const sourceStage = trustedCatchUpSourceErrorStage(error) ?? 'response';
-      const checkpointKey = trustedProgramKey(error) ?? 'market';
-      throw this.failure('source', checkpointKey, sourceStage);
-    }
-
-    for (const discovery of merged) {
-      const notification: TransactionNotification = Object.freeze({
-        signature: discovery.signature,
-        slot: discovery.slot,
-        source: 'CATCH_UP',
-        ingestionHint: null,
-        programIds: discovery.programIds,
-        confirmationStatus: discovery.confirmationStatus,
-        observedAtMs,
-      });
-      await this.awaited(signal, async () => {
-        try {
-          await this.repository.enqueue(notification);
-        } catch {
-          throw this.failure('enqueue', discoveryKey(discovery.programIds));
-        }
-      });
-    }
-
-    let checkpointCasCount = 0;
-    for (const scan of scans) {
-      if (scan.newest === null) {
-        await this.awaited(signal, async () => {
-          try {
-            await this.repository.resolveStrictCatchUpFailures(
-              scan.program.key,
-              scan.expected,
-            );
-          } catch {
-            throw this.failure('failure-resolve', scan.program.key);
-          }
-        });
-        continue;
-      }
-      const next: ProcessingCheckpoint = Object.freeze({
-        key: scan.program.key,
-        slot: scan.newest.slot,
-        signature: scan.newest.signature,
-        updatedAtMs: observedAtMs,
-      });
-      await this.awaited(signal, async () => {
-        try {
-          await this.repository.compareAndSwapCheckpoint(scan.expected, next);
-        } catch {
-          throw this.failure('checkpoint-cas', scan.program.key);
-        }
-      });
-      checkpointCasCount += 1;
+      scans.push(await this.awaited(signal, () => this.scanProgram(
+        program, boundaries, observedAtMs, discoveries, signal,
+      )));
     }
 
     return Object.freeze({
       providerId: this.providerId,
-      discoveredCount: scans.reduce((sum, scan) => sum + scan.rows.length, 0),
-      enqueuedCount: merged.length,
-      checkpointCasCount,
+      discoveredCount: scans.reduce((sum, scan) => sum + scan.discoveredCount, 0),
+      enqueuedCount: scans.reduce((sum, scan) => sum + scan.discoveredCount, 0),
+      checkpointCasCount: scans.reduce((sum, scan) => sum + scan.checkpointCasCount, 0),
       pageCount: scans.reduce((sum, scan) => sum + scan.pageCount, 0),
       boundaries,
     });
@@ -282,22 +237,48 @@ export class StrictCatchUpScanner {
 
   private async scanProgram(
     program: CatchUpDiscoveryProgram,
-    expected: ProcessingCheckpoint | null,
+    boundaries: StrictCatchUpBoundaries,
+    observedAtMs: number,
+    discoveries: Map<string, CatchUpSignature>,
     signal: AbortSignal,
   ): Promise<StrictProgramScan> {
-    const rows: CatchUpSignature[] = [];
+    const expected = boundaries[program.key];
+    let run = expected === null ? null : await this.operation(signal, 'run-read', program.key, async () => {
+      const active = await this.repository.readActiveStrictCatchUpRun(program.key);
+      if (active !== null) {
+        assertValidStrictCatchUpRun(active);
+        if (active.state !== 'ACTIVE' || active.checkpointKey !== program.key) throw new TypeError();
+      }
+      return active;
+    });
+    if (run !== null && !sameCheckpoint(run.previous, expected)) {
+      const stale = run;
+      await this.operation(signal, 'run-supersede', program.key,
+        () => this.repository.supersedeStaleStrictCatchUpRun(stale, observedAtMs));
+      run = null;
+    }
+    if (run !== null && run.providerId !== this.providerId) {
+      throw new StrictCatchUpProviderAffinityError(run.providerId, this.providerId, program.key);
+    }
+    if (run !== null && observedAtMs < run.updatedAtMs) throw this.failure('run-read', program.key);
     const signatures = new Set<string>();
-    const cursors = new Set<string>();
-    let before: string | undefined;
-    let previousSlot: bigint | null = null;
-    let observedHeadSlot: bigint | null = null;
+    if (run !== null) {
+      signatures.add(run.beforeSignature);
+      signatures.add(run.observedHead.signature);
+    }
+    let before = run?.beforeSignature;
+    let previousSlot = run?.lastAcceptedSlot ?? null;
+    let observedHead = run?.observedHead ?? null;
+    let discoveredCount = 0;
 
     for (let pageCount = 1; pageCount <= this.maxPages; pageCount += 1) {
       const page = await this.awaited(
         signal,
         () => this.readPage(program, before, signal),
       );
-      if (pageCount === 1) observedHeadSlot = page[0]?.slot ?? null;
+      const rows: CatchUpSignature[] = [];
+      let boundaryFound = false;
+      let crossedBoundarySlot = false;
       for (const row of page) {
         if (row.slot > MAX_STRICT_CATCH_UP_SLOT
           || row.signature.length === 0
@@ -314,26 +295,127 @@ export class StrictCatchUpScanner {
           throw this.failure('source', program.key, 'pagination');
         }
         signatures.add(row.signature);
-        if (expected !== null
-          && row.signature === expected.signature
-          && row.slot === expected.slot) {
-          return successfulScan(program, expected, rows, pageCount);
+        if (expected !== null && row.signature === expected.signature) {
+          if (row.slot !== expected.slot) throw this.failure('source', program.key, 'response');
+          boundaryFound = true;
+          break;
+        }
+        // An older slot proves the exact boundary is missing; never persist an older cursor.
+        if (expected !== null && row.slot < expected.slot) {
+          crossedBoundarySlot = true;
+          break;
+        }
+        const previous = discoveries.get(row.signature);
+        if (previous !== undefined) {
+          try {
+            const merged = mergeCatchUpDiscoveries([
+              { program, rows: [previous] }, { program, rows: [row] },
+            ]);
+            discoveries.set(row.signature, merged[0] ?? row);
+          } catch {
+            throw this.failure('source', program.key, 'response');
+          }
+        } else {
+          discoveries.set(row.signature, row);
         }
         rows.push(row);
       }
-      if (expected === null) return successfulScan(program, expected, rows, pageCount);
-      if (page.length < this.pageSize) {
-        throw windowExceeded(program.key, expected, observedHeadSlot);
+      observedHead ??= rows[0] ?? null;
+      for (const row of rows) {
+        const notification: TransactionNotification = Object.freeze({
+          signature: row.signature,
+          slot: row.slot,
+          source: 'CATCH_UP',
+          ingestionHint: null,
+          programIds: Object.freeze([program.id]),
+          confirmationStatus: row.confirmationStatus,
+          observedAtMs,
+        });
+        await this.operation(signal, 'enqueue', program.key, () => this.repository.enqueue(notification));
       }
-      const cursor = page.at(-1)?.signature;
-      if (cursor === undefined || cursor === before || cursors.has(cursor)) {
-        throw this.failure('source', program.key, 'pagination');
+      discoveredCount += rows.length;
+
+      const tail = rows.at(-1);
+      if (expected !== null && (!boundaryFound || run !== null)
+        && tail !== undefined && observedHead !== null) {
+        const current = run;
+        const head = observedHead;
+        run = await this.operation(signal, current === null ? 'run-create' : 'run-progress', program.key, async () => {
+          const progress = {
+            beforeSignature: tail.signature, lastAcceptedSlot: tail.slot,
+            pagesScanned: (current?.pagesScanned ?? 0n) + 1n,
+            signaturesEnqueued: (current?.signaturesEnqueued ?? 0n) + BigInt(rows.length),
+            updatedAtMs: observedAtMs,
+          };
+          if (current === null) {
+            return this.repository.createStrictCatchUpRun(createStrictCatchUpRun({
+              ...progress, checkpointKey: program.key, previous: expected,
+              providerId: this.providerId,
+              observedHead: { slot: head.slot, signature: head.signature },
+              revision: 0n, startedAtMs: observedAtMs,
+            }));
+          }
+          const next = advanceStrictCatchUpRun(current, progress);
+          await this.repository.advanceStrictCatchUpRun(current, next);
+          return next;
+        });
+        before = run.beforeSignature;
       }
-      cursors.add(cursor);
-      before = cursor;
+
+      if (expected === null || boundaryFound) {
+        let checkpointCasCount = 0;
+        if (observedHead === null) {
+          await this.operation(signal, 'failure-resolve', program.key,
+            () => this.repository.resolveStrictCatchUpFailures(program.key, expected));
+        } else {
+          const next: ProcessingCheckpoint = Object.freeze({
+            key: program.key, slot: observedHead.slot,
+            signature: observedHead.signature, updatedAtMs: observedAtMs,
+          });
+          const completedRun = run;
+          if (completedRun === null) {
+            await this.operation(signal, 'checkpoint-cas', program.key,
+              () => this.repository.compareAndSwapCheckpoint(expected, next));
+          } else {
+            await this.operation(signal, 'run-complete', program.key,
+              () => this.repository.completeStrictCatchUpRun({ run: completedRun, nextCheckpoint: next }));
+          }
+          checkpointCasCount = 1;
+        }
+        return Object.freeze({ discoveredCount, checkpointCasCount, pageCount });
+      }
+
+      if (page.length < this.pageSize || crossedBoundarySlot) {
+        await this.recordWindowFailure(program.key, expected, observedHead?.slot ?? null, observedAtMs, signal);
+        const failedRun = run;
+        if (failedRun !== null) {
+          await this.operation(signal, 'run-fail', program.key, () => this.repository.failStrictCatchUpRun(
+            failedRun, terminalizeStrictCatchUpRun(failedRun, {
+              state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: observedAtMs,
+            }),
+          ));
+        }
+        throw new StrictCatchUpWindowExceededError(this.providerId, program.key, boundaries);
+      }
     }
-    if (expected === null) throw this.failure('source', program.key, 'pagination');
-    throw windowExceeded(program.key, expected, observedHeadSlot);
+    if (run === null) throw this.failure('source', program.key, 'pagination');
+    throw new StrictCatchUpPausedError(this.providerId, program.key, run.runId,
+      run.pagesScanned, run.signaturesEnqueued);
+  }
+
+  private async operation<T>(
+    signal: AbortSignal,
+    stage: StrictCatchUpScannerStage,
+    key: ProcessingCheckpointKey,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.awaited(signal, async () => {
+      try {
+        return await operation();
+      } catch {
+        throw this.failure(stage, key);
+      }
+    });
   }
 
   private async readPage(
@@ -374,22 +456,24 @@ export class StrictCatchUpScanner {
   }
 
   private async recordWindowFailure(
-    value: StrictCatchUpWindowSignal,
+    checkpointKey: ProcessingCheckpointKey,
+    previous: ProcessingCheckpoint,
+    observedHeadSlot: bigint | null,
     detectedAtMs: number,
     signal: AbortSignal,
   ): Promise<void> {
     await this.awaited(signal, async () => {
       try {
         const failure = createStrictCatchUpFailure({
-          checkpointKey: value.checkpointKey,
-          previous: value.previous,
+          checkpointKey,
+          previous,
           providerId: this.providerId,
-          observedHeadSlot: value.observedHeadSlot,
+          observedHeadSlot,
           detectedAtMs,
         });
         await this.repository.recordStrictCatchUpFailure(failure);
       } catch {
-        throw this.failure('failure-write', value.checkpointKey);
+        throw this.failure('failure-write', checkpointKey);
       }
     });
   }
@@ -462,33 +546,6 @@ function sameCheckpoint(
     : left.key === right.key
       && left.slot === right.slot
       && left.signature === right.signature;
-}
-
-function successfulScan(
-  program: CatchUpDiscoveryProgram,
-  expected: ProcessingCheckpoint | null,
-  rows: CatchUpSignature[],
-  pageCount: number,
-): StrictProgramScan {
-  return Object.freeze({
-    program,
-    expected,
-    rows: Object.freeze(rows),
-    newest: rows[0] ?? null,
-    pageCount,
-  });
-}
-
-function windowExceeded(
-  checkpointKey: ProcessingCheckpointKey,
-  previous: ProcessingCheckpoint,
-  observedHeadSlot: bigint | null,
-): StrictCatchUpWindowSignal {
-  return new StrictCatchUpWindowSignal(checkpointKey, previous, observedHeadSlot);
-}
-
-function isWindowExceeded(value: unknown): value is StrictCatchUpWindowSignal {
-  return value instanceof StrictCatchUpWindowSignal;
 }
 
 function snapshotCheckpoint(
@@ -633,18 +690,6 @@ function snapshotProviderId(source: unknown): RpcProviderId {
   } catch {
     throw new TypeError('Strict catch-up source is invalid.');
   }
-}
-
-function trustedProgramKey(value: unknown): ProcessingCheckpointKey | null {
-  if (trustedCatchUpSourceErrorStage(value) === null) return null;
-  const program = (value as { readonly program: unknown }).program;
-  return program === 'launchpad' || program === 'market' ? program : null;
-}
-
-function discoveryKey(programIds: readonly string[]): ProcessingCheckpointKey {
-  return programIds.includes(PUMPSWAP_PROGRAM_ID) && !programIds.includes(PUMP_PROGRAM_ID)
-    ? 'market'
-    : 'launchpad';
 }
 
 function positiveBound(value: unknown, maximum: number): value is number {
