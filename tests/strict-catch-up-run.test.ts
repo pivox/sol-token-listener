@@ -155,6 +155,25 @@ void test('permits only the exact initial one-row head cursor and advances beyon
     updatedAtMs: 2_002,
   }), /strict catch-up run/i);
 
+  for (const [state, terminalReason] of [
+    ['COMPLETED', null],
+    ['FAILED', 'CATCH_UP_WINDOW_EXCEEDED'],
+    ['SUPERSEDED', 'CHECKPOINT_SUPERSEDED'],
+  ] as const) {
+    const terminal = terminalizeStrictCatchUpRun(initial, {
+      state, terminalReason, completedAtMs: 3_000,
+    });
+    assert.equal(terminal.revision, 1n);
+    assert.equal(terminal.beforeSignature, initial.observedHead.signature);
+    assert.doesNotThrow(() => { assertValidStrictCatchUpRun(terminal); });
+    assert.throws(() => { assertValidStrictCatchUpRun(Object.freeze({
+      ...terminal, revision: 2n,
+    })); }, /strict catch-up run/i);
+  }
+  assert.throws(() => { assertValidStrictCatchUpRun(Object.freeze({
+    ...initial, revision: 1n,
+  })); }, /strict catch-up run/i);
+
   for (const value of [
     { ...initialInput, pagesScanned: 2n },
     { ...initialInput, signaturesEnqueued: 2n },

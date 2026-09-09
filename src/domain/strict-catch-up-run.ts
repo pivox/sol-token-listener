@@ -246,12 +246,12 @@ export function assertValidStrictCatchUpRun(
     const updatedAtMs = millisecondsFrom(record.updatedAtMs);
     const completedAtMs = nullableMillisecondsFrom(record.completedAtMs);
     const purgeAfterMs = nullableMillisecondsFrom(record.purgeAfterMs);
-    const initialSingleRowHead = state === 'ACTIVE'
-      && beforeSignature === observedHead.signature
+    const initialSingleRowHead = beforeSignature === observedHead.signature
       && lastAcceptedSlot === observedHead.slot
       && pagesScanned === 1n
       && signaturesEnqueued === 1n
-      && revision === 0n;
+      && ((state === 'ACTIVE' && revision === 0n)
+        || (state !== 'ACTIVE' && revision === 1n));
     if (
       typeof record.runId !== 'string'
       || record.runId !== strictCatchUpRunId(checkpointKey, previous, providerId)
