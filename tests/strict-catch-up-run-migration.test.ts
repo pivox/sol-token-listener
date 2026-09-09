@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -15,10 +15,12 @@ void test('migration 046 defines the durable strict catch-up run contract withou
   assert.match(sql, /run_id TEXT PRIMARY KEY/u);
   assert.match(sql, /checkpoint_key TEXT NOT NULL/u);
   assert.match(sql, /previous_slot NUMERIC\(78,0\) NOT NULL/u);
+  assert.match(sql, /previous_updated_at TIMESTAMPTZ NOT NULL/u);
   assert.match(sql, /observed_head_slot NUMERIC\(78,0\) NOT NULL/u);
   assert.match(sql, /pages_scanned BIGINT NOT NULL/u);
   assert.match(sql, /listener_strict_catch_up_runs_id_check/u);
   assert.match(sql, /listener_strict_catch_up_runs_lifecycle_check/u);
+  assert.match(sql, /\^\[\[:space:\]\]/u);
   assert.match(sql, /listener_strict_catch_up_runs_active_key_unique/u);
   assert.match(sql, /listener_strict_catch_up_runs_provider_key_idx/u);
   assert.match(sql, /listener_strict_catch_up_runs_terminal_purge_idx/u);
@@ -53,15 +55,36 @@ void test('migration 046 accepts valid active and terminal runs and rejects inva
       purgeAfter: '2026-01-01T04:00:01.000Z',
       updatedAt: '2026-01-01T00:00:01.000Z',
     });
+    assert.deepEqual((await pool.query(`SELECT to_char(previous_updated_at AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS previous_updated_at
+      FROM listener_strict_catch_up_runs WHERE checkpoint_key='launchpad'`)).rows, [
+      { previous_updated_at: '2026-01-01T00:00:00.000Z' },
+    ]);
     for (const values of [
       { runId: 'wrong' },
-      { previousSignature: ' spaced' },
       { observedHeadSlot: '-1' },
       { lastAcceptedSlot: '12' },
       { state: 'FAILED', terminalReason: null, completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z', updatedAt: '2026-01-01T00:00:01.000Z' },
     ] as const) {
       await assert.rejects(() => insertRun(pool, randomUUID(), values), isCheckViolation);
     }
+    for (const values of [
+      { previousSignature: '\tprevious' },
+      { observedHeadSignature: '\thead' },
+      { beforeSignature: '\tbefore' },
+      { beforeSignature: 'previous' },
+      { beforeSignature: 'head' },
+    ] as const) await assert.rejects(() => insertRun(pool, randomUUID(), values), isCheckViolation);
+    await insertRun(pool, 'active_initial', {
+      checkpointKey: 'market', observedHeadSlot: '11', lastAcceptedSlot: '11',
+      beforeSignature: 'head',
+    });
+    await insertRun(pool, 'terminal_initial', {
+      checkpointKey: 'market', state: 'COMPLETED', revision: '1', observedHeadSlot: '11',
+      lastAcceptedSlot: '11', beforeSignature: 'head', terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
   });
 });
 
@@ -110,16 +133,43 @@ void test('migration 046 rejects incompatible pre-existing table and named index
   });
 });
 
+void test('migration 046 rejects altered named checks, unvalidated checks, and a missing primary key on replay', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  const sql = await readFile(migrationUrl, 'utf8');
+
+  for (const [label, mutation] of [
+    ['changed_check', `ALTER TABLE listener_strict_catch_up_runs
+      DROP CONSTRAINT listener_strict_catch_up_runs_key_check,
+      ADD CONSTRAINT listener_strict_catch_up_runs_key_check CHECK (TRUE)`],
+    ['unvalidated_check', `ALTER TABLE listener_strict_catch_up_runs
+      DROP CONSTRAINT listener_strict_catch_up_runs_key_check,
+      ADD CONSTRAINT listener_strict_catch_up_runs_key_check
+      CHECK (checkpoint_key IN ('launchpad', 'market')) NOT VALID`],
+    ['missing_primary_key', 'ALTER TABLE listener_strict_catch_up_runs DROP CONSTRAINT listener_strict_catch_up_runs_pkey'],
+  ] as const) {
+    await withTemporarySchema(databaseUrl, `strict_catch_up_runs_${label}`, async (pool) => {
+      await migrateDatabase({ pool });
+      await pool.query(mutation);
+      await assert.rejects(() => pool.query(sql), /strict catch-up run (table|constraint) definition is incompatible/u);
+    });
+  }
+});
+
 type RunValues = Readonly<Partial<{
   runId: string;
   checkpointKey: 'launchpad' | 'market';
   previousSlot: string;
+  previousUpdatedAt: string;
   previousSignature: string;
   providerId: string;
   observedHeadSlot: string;
   observedHeadSignature: string;
   beforeSignature: string;
   lastAcceptedSlot: string;
+  pagesScanned: string;
+  signaturesEnqueued: string;
+  revision: string;
   state: 'ACTIVE' | 'COMPLETED' | 'FAILED' | 'SUPERSEDED';
   terminalReason: string | null;
   startedAt: string;
@@ -129,17 +179,19 @@ type RunValues = Readonly<Partial<{
 }>>;
 
 async function insertRun(pool: InstanceType<typeof pg.Pool>, suffix: string, values: RunValues = {}): Promise<void> {
-  const runSuffix = suffix.replaceAll(/[^a-f0-9]/gu, 'a').padEnd(64, 'a').slice(0, 64);
+  const runSuffix = createHash('sha256').update(suffix).digest('hex');
   const runId = values.runId ?? `strict_catchup_run_${runSuffix}`;
   await pool.query(`INSERT INTO listener_strict_catch_up_runs (
     run_id,checkpoint_key,previous_slot,previous_signature,provider_id,observed_head_slot,
     observed_head_signature,before_signature,last_accepted_slot,pages_scanned,
-    signatures_enqueued,revision,state,terminal_reason,started_at,updated_at,completed_at,purge_after
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,1,0,$10,$11,$12,$13,$14,$15)`, [
+    signatures_enqueued,revision,state,terminal_reason,previous_updated_at,started_at,updated_at,completed_at,purge_after
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, [
     runId, values.checkpointKey ?? 'launchpad', values.previousSlot ?? '10',
     values.previousSignature ?? 'previous', values.providerId ?? 'primary', values.observedHeadSlot ?? '11',
     values.observedHeadSignature ?? 'head', values.beforeSignature ?? 'before', values.lastAcceptedSlot ?? '10',
-    values.state ?? 'ACTIVE', values.terminalReason ?? null, values.startedAt ?? '2026-01-01T00:00:00.000Z',
+    values.pagesScanned ?? '1', values.signaturesEnqueued ?? '1', values.revision ?? '0',
+    values.state ?? 'ACTIVE', values.terminalReason ?? null,
+    values.previousUpdatedAt ?? '2026-01-01T00:00:00.000Z', values.startedAt ?? '2026-01-01T00:00:00.000Z',
     values.updatedAt ?? '2026-01-01T00:00:00.000Z', values.completedAt ?? null, values.purgeAfter ?? null,
   ]);
 }
