@@ -257,6 +257,21 @@ export class StrictCatchUpScanner {
         () => this.repository.supersedeStaleStrictCatchUpRun(stale, observedAtMs));
       run = null;
     }
+    if (run === null && expected !== null) {
+      run = await this.operation(signal, 'run-read', program.key, async () => {
+        const historical = await this.repository.readStrictCatchUpRun(program.key, expected, this.providerId);
+        if (historical !== null) {
+          assertValidStrictCatchUpRun(historical);
+          if (!sameCheckpoint(historical.previous, expected) || historical.providerId !== this.providerId
+            || historical.checkpointKey !== program.key
+            || (historical.state !== 'ACTIVE' && historical.state !== 'FAILED')) throw new TypeError();
+        }
+        return historical;
+      });
+      if (run?.state === 'FAILED') {
+        throw new StrictCatchUpWindowExceededError(this.providerId, program.key, boundaries);
+      }
+    }
     if (run !== null && run.providerId !== this.providerId) {
       throw new StrictCatchUpProviderAffinityError(run.providerId, this.providerId, program.key);
     }

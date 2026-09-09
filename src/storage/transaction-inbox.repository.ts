@@ -1104,6 +1104,32 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
+  public async readStrictCatchUpRun(
+    key: ProcessingCheckpoint['key'],
+    previous: ProcessingCheckpoint,
+    providerId: StrictCatchUpRun['providerId'],
+  ): Promise<StrictCatchUpRun | null> {
+    return this.safely(async () => {
+      requireCheckpointKey(key);
+      assertValidStrictCheckpoint(previous);
+      requireRpcProviderId(providerId);
+      if (previous.key !== key) throw new TypeError('Checkpoint keys must match.');
+      const result = await this.pool.query(
+        `${strictCatchUpRunSelect()} WHERE checkpoint_key = $1
+         AND previous_slot = $2 AND previous_signature = $3 AND provider_id = $4`,
+        [key, previous.slot.toString(), previous.signature, providerId],
+      );
+      if (result.rows.length === 0 && result.rowCount === 0) return null;
+      if (result.rows.length !== 1 || result.rowCount !== 1) {
+        throw new TypeError('Strict catch-up run query returned an invalid row count.');
+      }
+      const run = strictCatchUpRunFromRow(result.rows[0] as StrictCatchUpRunRow);
+      if (run.checkpointKey !== key || !matchesCheckpointBoundary(run.previous, previous)
+        || run.providerId !== providerId) throw new TypeError('Strict catch-up run identity mismatch.');
+      return run;
+    });
+  }
+
   public async createStrictCatchUpRun(value: StrictCatchUpRun): Promise<StrictCatchUpRun> {
     return this.safely(async () => {
       assertActiveStrictCatchUpRun(value);

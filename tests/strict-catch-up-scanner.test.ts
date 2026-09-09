@@ -68,7 +68,7 @@ void test('persists a full page before budget pause and resumes its frozen head 
     assert.equal((TRANSACTION_INGESTION_ERROR_CODES as readonly string[]).includes(Reflect.get(error, 'code') as string), false);
     return true;
   });
-  assert.deepEqual(events, ['read:launchpad', 'run-read:launchpad',
+  assert.deepEqual(events, ['read:launchpad', 'run-read:launchpad', 'run-history:launchpad',
     `source:${PUMP_PROGRAM_ID}:head`, 'enqueue:head', 'enqueue:cursor', 'run-create:launchpad']);
   assert.equal(repository.runs[0]?.state, 'ACTIVE');
   assert.deepEqual(repository.cas, []);
@@ -180,6 +180,52 @@ void test('records failure before terminalizing a short or empty resumed history
   }
 });
 
+void test('rethrows a persisted exact failed run without rereading history or rewriting evidence', async () => {
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+  const pages = { [PUMP_PROGRAM_ID]: [[sig('last', 11)]] };
+  await assert.rejects(scanner(new FakeSource(pages), repository, {
+    programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED), StrictCatchUpWindowExceededError);
+  assert.equal(repository.runs[0]?.state, 'FAILED');
+  const previousEvents = repository.eventsSeen.length;
+  const source = new FakeSource(pages);
+  await assert.rejects(scanner(source, repository, {
+    programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED), StrictCatchUpWindowExceededError);
+  assert.deepEqual(source.calls, []);
+  assert.deepEqual(repository.eventsSeen.slice(previousEvents), [
+    'read:launchpad', 'run-read:launchpad', 'run-history:launchpad',
+  ]);
+  assert.equal(repository.failures.length, 1);
+  assert.equal(repository.enqueued.length, 1);
+  assert.equal(repository.runs.length, 1);
+});
+
+void test('empty history without a run keeps recording terminal evidence on each pass', async () => {
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+  for (let pass = 0; pass < 2; pass += 1) {
+    const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[]] });
+    await assert.rejects(scanner(source, repository, { programs: LAUNCHPAD_ONLY }).scan(NEVER_ABORTED), StrictCatchUpWindowExceededError);
+    assert.equal(source.calls.length, 1);
+  }
+  assert.deepEqual(repository.runs, []);
+  assert.equal(repository.failures.length, 2);
+});
+
+void test('rejects inconsistent historical terminal states for a still-current exact checkpoint', async () => {
+  for (const state of ['COMPLETED', 'SUPERSEDED'] as const) {
+    const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+    repository.runs.push(terminalizeStrictCatchUpRun(activeRun(), {
+      state, terminalReason: state === 'COMPLETED' ? null : 'CHECKPOINT_SUPERSEDED', completedAtMs: 2_000,
+    }));
+    const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('next', 12)]] });
+    await assert.rejects(scanner(source, repository, { programs: LAUNCHPAD_ONLY }).scan(NEVER_ABORTED),
+      (error: unknown) => scannerFailure(error, 'run-read', 'launchpad'));
+    assert.deepEqual(source.calls, []);
+    assertNoWrites(repository);
+  }
+});
+
 void test('crossing below the checkpoint slot persists only eligible rows and proves missing history', async () => {
   for (const existing of [false, true]) {
     const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
@@ -202,13 +248,13 @@ function activeRun(): StrictCatchUpRun {
 }
 
 void test('cancellation at durable run boundaries starts no subsequent operation', async () => {
-  for (const operation of ['read', 'create', 'progress', 'complete', 'fail', 'supersede']) {
+  for (const operation of ['read', 'history', 'create', 'progress', 'complete', 'fail', 'supersede']) {
     const controller = new AbortController();
     const pending = deferred<undefined>();
     const repository = new FakeRepository({
       launchpad: checkpoint('launchpad', operation === 'supersede' ? 'replacement' : 'boundary', 10),
     });
-    if (operation !== 'create') repository.runs.push(activeRun());
+    if (operation !== 'create' && operation !== 'history') repository.runs.push(activeRun());
     repository.nextRunOperation = { operation, promise: pending.promise };
     const page = operation === 'complete' ? [sig('boundary', 10)]
       : operation === 'fail' ? [] : [sig('next', 12), sig('tail', 11)];
@@ -661,8 +707,8 @@ void test('captures now and both exact checkpoints before the first provider pag
   }).scan(NEVER_ABORTED);
 
   assert.equal(nowCalls, 1);
-  assert.deepEqual(events.slice(0, 5), [
-    'now', 'read:launchpad', 'read:market', 'run-read:launchpad', `source:${PUMP_PROGRAM_ID}:head`,
+  assert.deepEqual(events.slice(0, 6), [
+    'now', 'read:launchpad', 'read:market', 'run-read:launchpad', 'run-history:launchpad', `source:${PUMP_PROGRAM_ID}:head`,
   ]);
   assert.equal(source.providerIdsSeen.every((value) => value === source.providerId), true);
   assert.deepEqual(result.boundaries, {
@@ -1222,8 +1268,18 @@ class FakeRepository implements StrictCatchUpRepository {
     await this.runOperation('read', key);
     return this.runs.find((run) => run.checkpointKey === key && run.state === 'ACTIVE') ?? null;
   }
+  async readStrictCatchUpRun(key: ProcessingCheckpointKey, previous: ProcessingCheckpoint, providerId: RpcProviderId): Promise<StrictCatchUpRun | null> {
+    await this.runOperation('history', key);
+    return this.runs.find((run) => run.checkpointKey === key && run.previous.slot === previous.slot
+      && run.previous.signature === previous.signature && run.providerId === providerId) ?? null;
+  }
   async createStrictCatchUpRun(value: StrictCatchUpRun): Promise<StrictCatchUpRun> {
     await this.runOperation('create', value.checkpointKey);
+    const existing = this.runs.find((run) => run.runId === value.runId);
+    if (existing !== undefined) {
+      assert.deepEqual(existing, value);
+      return existing;
+    }
     assert.equal(this.runs.some((run) => run.checkpointKey === value.checkpointKey && run.state === 'ACTIVE'), false);
     this.runs.push(value);
     return value;

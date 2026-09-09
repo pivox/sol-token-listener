@@ -742,6 +742,9 @@ class AbortBoundaryRepository implements StrictCatchUpRepository {
   public readActiveStrictCatchUpRun(key: Parameters<StrictCatchUpRepository['readActiveStrictCatchUpRun']>[0]) {
     return this.inner.readActiveStrictCatchUpRun(key);
   }
+  public readStrictCatchUpRun(...args: Parameters<StrictCatchUpRepository['readStrictCatchUpRun']>) {
+    return this.inner.readStrictCatchUpRun(...args);
+  }
   public createStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['createStrictCatchUpRun']>[0]) {
     return this.inner.createStrictCatchUpRun(value);
   }
@@ -794,6 +797,9 @@ class CasConflictRepository implements StrictCatchUpRepository {
   }
   public readActiveStrictCatchUpRun(key: Parameters<StrictCatchUpRepository['readActiveStrictCatchUpRun']>[0]) {
     return this.inner.readActiveStrictCatchUpRun(key);
+  }
+  public readStrictCatchUpRun(...args: Parameters<StrictCatchUpRepository['readStrictCatchUpRun']>) {
+    return this.inner.readStrictCatchUpRun(...args);
   }
   public createStrictCatchUpRun(value: Parameters<StrictCatchUpRepository['createStrictCatchUpRun']>[0]) {
     return this.inner.createStrictCatchUpRun(value);

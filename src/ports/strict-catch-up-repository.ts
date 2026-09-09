@@ -19,6 +19,11 @@ export interface StrictCatchUpRepository {
     previous: ProcessingCheckpoint | null,
   ): Promise<void>;
   readActiveStrictCatchUpRun(key: ProcessingCheckpointKey): Promise<StrictCatchUpRun | null>;
+  readStrictCatchUpRun(
+    key: ProcessingCheckpointKey,
+    previous: ProcessingCheckpoint,
+    providerId: StrictCatchUpRun['providerId'],
+  ): Promise<StrictCatchUpRun | null>;
   createStrictCatchUpRun(value: StrictCatchUpRun): Promise<StrictCatchUpRun>;
   advanceStrictCatchUpRun(expected: StrictCatchUpRun, next: StrictCatchUpRun): Promise<void>;
   completeStrictCatchUpRun(value: {
