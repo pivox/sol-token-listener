@@ -1163,6 +1163,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       assertExactStrictCatchUpAdvance(expected, next);
       await this.transaction(async (client) => {
         await lockStrictCheckpoint(client, expected.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, expected.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, expected.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
         const updated = await client.query(
           `UPDATE listener_strict_catch_up_runs SET
              before_signature = $20, last_accepted_slot = $21, pages_scanned = $22,
@@ -1227,6 +1231,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       assertExactStrictCatchUpTerminal(expected, failed, 'FAILED');
       await this.transaction(async (client) => {
         await lockStrictCheckpoint(client, expected.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, expected.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, expected.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
         await terminalizeStrictCatchUpRunAt(client, expected, failed);
       });
     });

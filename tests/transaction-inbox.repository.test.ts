@@ -1508,6 +1508,36 @@ void test('terminalizes failed and stale superseded runs without moving checkpoi
   });
 });
 
+void test('rejects obsolete strict progress and failure after the checkpoint advances first', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
+    const previous = checkpoint('market', 75n, 'checkpoint-first-previous', 350_000);
+    const run = strictCatchUpRun(previous, 'primary', 350_001);
+    const advancedRun = advanceStrictCatchUpRun(run, {
+      beforeSignature: 'checkpoint-first-cursor', lastAcceptedSlot: 77n,
+      pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 350_002,
+    });
+    const failedRun = terminalizeStrictCatchUpRun(run, {
+      state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: 350_003,
+    });
+    const checkpointFirst = checkpoint('market', 76n, 'checkpoint-first-advanced', 350_002);
+    await repository.compareAndSwapCheckpoint(null, previous);
+    await repository.createStrictCatchUpRun(run);
+    await repository.compareAndSwapCheckpoint(previous, checkpointFirst);
+
+    await assert.rejects(repository.advanceStrictCatchUpRun(run, advancedRun), (error) =>
+      error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint');
+    await assert.rejects(repository.failStrictCatchUpRun(run, failedRun), (error) =>
+      error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint');
+    assert.deepEqual(await repository.readActiveStrictCatchUpRun('market'), run);
+    assert.deepEqual(await repository.readCheckpoint('market'), checkpointFirst);
+
+    await repository.supersedeStaleStrictCatchUpRun(run, 350_004);
+    assert.equal((await strictCatchUpRunRow(pool, run.runId) as { state: string }).state, 'SUPERSEDED');
+    assert.deepEqual(await repository.readCheckpoint('market'), checkpointFirst);
+  });
+});
+
 void test('allows only one concurrent strict run progress writer', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool) as unknown as StrictCatchUpRunRepository;
