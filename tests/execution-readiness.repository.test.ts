@@ -34,6 +34,55 @@ void test('commits generation and both snapshots atomically and replays exactly'
   });
 });
 
+void test('commits fresh readiness evidence for an unchanged generation and risk revision', async (context) => {
+  const url = databaseUrl(context);
+  if (url === null) return;
+  await withSchema(url, async (pool) => {
+    const repository = new PostgresExecutionReadinessRepository(pool);
+    const first = commitInput();
+    const refreshed = refreshedCommitInput(first);
+    assert.deepEqual(await repository.commit(first), first);
+    assert.deepEqual(await repository.commit(refreshed), refreshed);
+    assert.deepEqual(await repository.commit(refreshed), refreshed);
+    const walletSnapshots = await pool.query(`SELECT snapshot_id,superseded_at,purge_after,
+      EXTRACT(EPOCH FROM (purge_after-superseded_at))::INTEGER AS retention_seconds
+      FROM execution_wallet_snapshots ORDER BY observed_at`);
+    assert.equal(walletSnapshots.rows.length, 2);
+    assert.equal(walletSnapshots.rows[0]?.snapshot_id, first.walletSnapshot.snapshotId);
+    assert.ok(walletSnapshots.rows[0]?.superseded_at instanceof Date);
+    assert.equal(walletSnapshots.rows[0]?.retention_seconds, 14_400);
+    assert.equal(walletSnapshots.rows[1]?.snapshot_id, refreshed.walletSnapshot.snapshotId);
+    assert.equal(walletSnapshots.rows[1]?.superseded_at, null);
+    const providerSnapshots = await pool.query(`SELECT snapshot_id,superseded_at,purge_after,
+      EXTRACT(EPOCH FROM (purge_after-superseded_at))::INTEGER AS retention_seconds
+      FROM execution_provider_usage_snapshots ORDER BY measured_at`);
+    assert.equal(providerSnapshots.rows.length, 2);
+    assert.equal(providerSnapshots.rows[0]?.snapshot_id, first.providerSnapshot.snapshotId);
+    assert.ok(providerSnapshots.rows[0]?.superseded_at instanceof Date);
+    assert.equal(providerSnapshots.rows[0]?.retention_seconds, 14_400);
+    assert.equal(providerSnapshots.rows[1]?.snapshot_id, refreshed.providerSnapshot.snapshotId);
+    assert.equal(providerSnapshots.rows[1]?.superseded_at, null);
+    const active = (await pool.query(`SELECT
+      (SELECT COUNT(*) FROM execution_wallet_snapshots WHERE superseded_at IS NULL)::INTEGER
+        AS wallets,
+      (SELECT COUNT(*) FROM execution_provider_usage_snapshots WHERE superseded_at IS NULL)::INTEGER
+        AS providers`)).rows[0];
+    assert.deepEqual(active, { wallets: 1, providers: 1 });
+    const riskState = (await pool.query(`SELECT state_revision::TEXT AS state_revision,
+      reconciled_capital_lamports::TEXT AS reconciled_capital_lamports,
+      reserved_exposure_raw::TEXT AS reserved_exposure_raw,open_positions,
+      conservative_drawdown_raw::TEXT AS conservative_drawdown_raw,
+      consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
+      FROM execution_wallet_risk_state WHERE generation_id=$1`,
+    [first.generation.generationId])).rows[0];
+    assert.deepEqual(riskState, {
+      state_revision: '0', reconciled_capital_lamports: '0', reserved_exposure_raw: '0',
+      open_positions: 0, conservative_drawdown_raw: '0', consecutive_technical_failures: 0,
+      last_technical_failure_reason_code: null, unknown_block: false,
+    });
+  });
+});
+
 void test('serializes concurrent replays of the same readiness commit', async (context) => {
   const url = databaseUrl(context);
   if (url === null) return;
@@ -250,6 +299,36 @@ function commitInput() {
     provenance: 'OPERATOR_REPORT' as const,
   }));
   return Object.freeze({ generation, walletSnapshot, providerSnapshot });
+}
+
+function refreshedCommitInput(first: ReturnType<typeof commitInput>) {
+  const walletSnapshot = createExecutionWalletSnapshot(Object.freeze({
+    generationId: first.walletSnapshot.generationId,
+    providerId: first.walletSnapshot.providerId,
+    stateRevision: first.walletSnapshot.stateRevision,
+    slot: first.walletSnapshot.slot + 1n,
+    blockTimeMs: first.walletSnapshot.blockTimeMs === null
+      ? null : first.walletSnapshot.blockTimeMs + 1,
+    observedAtMs: first.walletSnapshot.observedAtMs + 1,
+    commitment: first.walletSnapshot.commitment,
+    walletLamports: first.walletSnapshot.walletLamports,
+    tokenBalanceCount: first.walletSnapshot.tokenBalanceCount,
+    openPositions: first.walletSnapshot.openPositions,
+    realizedNetPnlRaw: first.walletSnapshot.realizedNetPnlRaw,
+  }));
+  const providerSnapshot = createProviderUsageSnapshot(Object.freeze({
+    providerId: first.providerSnapshot.providerId,
+    planId: first.providerSnapshot.planId,
+    billingPeriodId: first.providerSnapshot.billingPeriodId,
+    billingPeriodStartedAtMs: first.providerSnapshot.billingPeriodStartedAtMs,
+    billingPeriodEndsAtMs: first.providerSnapshot.billingPeriodEndsAtMs,
+    limitUnits: first.providerSnapshot.limitUnits,
+    usedUnits: first.providerSnapshot.usedUnits,
+    measuredAtMs: first.providerSnapshot.measuredAtMs + 1,
+    expiresAtMs: first.providerSnapshot.expiresAtMs + 1,
+    provenance: first.providerSnapshot.provenance,
+  }));
+  return Object.freeze({ generation: first.generation, walletSnapshot, providerSnapshot });
 }
 
 function databaseUrl(context: Readonly<{ skip(message?: string): void }>): string | null {

@@ -37,7 +37,7 @@ void test('applies migrations 001-042 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '044_transaction_inbox_launch_priority.sql');
+    assert.equal(applied.at(-1), '045_execution_wallet_snapshot_refresh.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const versions = await pool.query(
       `SELECT payload_version FROM paper_strategy_sessions

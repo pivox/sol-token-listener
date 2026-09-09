@@ -15,7 +15,7 @@ void test('migration 037 defines only the partial live execution lane index', as
     .sort((left, right) => left.localeCompare(right));
 
   assert.equal(migrationNames.includes(migrationName), true);
-  assert.equal(migrationNames.at(-1), '044_transaction_inbox_launch_priority.sql');
+  assert.equal(migrationNames.at(-1), '045_execution_wallet_snapshot_refresh.sql');
   assert.match(sql, /CREATE INDEX IF NOT EXISTS execution_intents_live_claim_idx/u);
   assert.match(sql, /ON execution_intents \(side, requested_at, id\)/u);
   assert.match(sql, /WHERE status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)/u);
@@ -37,7 +37,7 @@ void test('migration 037 applies to an empty PostgreSQL schema and replays clean
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
     assert.equal(applied.includes(migrationName), true);
-    assert.equal(applied.at(-1), '044_transaction_inbox_launch_priority.sql');
+    assert.equal(applied.at(-1), '045_execution_wallet_snapshot_refresh.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
 
     const sql = await readFile(migrationUrl, 'utf8');
