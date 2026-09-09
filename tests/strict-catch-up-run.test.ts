@@ -82,6 +82,30 @@ void test('uses only the versioned checkpoint boundary and provider for run iden
   assert.notEqual(first.runId, changedProvider.runId);
 });
 
+void test('uses the fixed versioned run identity and excludes progress and checkpoint time', () => {
+  const canonical = canonicalInput();
+  const first = createStrictCatchUpRun(canonical);
+  const changedUpdatedAt = createStrictCatchUpRun({
+    ...canonical,
+    previous: Object.freeze({ ...canonical.previous, updatedAtMs: 1_001 }),
+  });
+  const changedKey = createStrictCatchUpRun({
+    ...canonical,
+    checkpointKey: 'market',
+    previous: Object.freeze({ ...canonical.previous, key: 'market' }),
+  });
+  const changedSlot = createStrictCatchUpRun({
+    ...canonical,
+    previous: Object.freeze({ ...canonical.previous, slot: 11n }),
+    lastAcceptedSlot: 12n,
+  });
+
+  assert.equal(first.runId, 'strict_catchup_run_b97a547e598259d192e0f368fbe5b5b55f07da7ac6cd7eb9d8e1f35dc438ff28');
+  assert.equal(first.runId, changedUpdatedAt.runId);
+  assert.notEqual(first.runId, changedKey.runId);
+  assert.notEqual(first.runId, changedSlot.runId);
+});
+
 void test('accepts exact durable slot, bigint counter, and timestamp bounds', () => {
   const run = createStrictCatchUpRun({
     checkpointKey: 'market',
@@ -149,9 +173,16 @@ void test('rejects proxies and accessors without invoking traps', () => {
   const runProxy = new Proxy(canonical, {
     getPrototypeOf: trap, ownKeys: trap, getOwnPropertyDescriptor: trap,
   });
+  let accessorReads = 0;
   const accessor = Object.defineProperty({
     ...canonicalInput(),
-  }, 'providerId', { enumerable: true, get: () => 'primary' });
+  }, 'providerId', {
+    enumerable: true,
+    get: () => {
+      accessorReads += 1;
+      throw new Error('accessor trap must not run');
+    },
+  });
 
   assert.throws(() => createStrictCatchUpRun(proxy), /strict catch-up run/i);
   assert.throws(() => createStrictCatchUpRun({
@@ -163,6 +194,7 @@ void test('rejects proxies and accessors without invoking traps', () => {
     ...canonical, previous: nestedProxy,
   })); }, /strict catch-up run/i);
   assert.equal(traps, 0);
+  assert.equal(accessorReads, 0);
 });
 
 void test('assertion rejects mutable, non-canonical, and malformed runs', () => {
@@ -172,6 +204,8 @@ void test('assertion rejects mutable, non-canonical, and malformed runs', () => 
     Object.freeze({ ...canonical, runId: 'strict_catchup_run_bad' }),
     Object.freeze({ ...canonical, previous: { ...canonical.previous } }),
     Object.freeze({ ...canonical, observedHead: { ...canonical.observedHead } }),
+    Object.freeze({ ...canonical, beforeSignature: canonical.previous.signature }),
+    Object.freeze({ ...canonical, beforeSignature: canonical.observedHead.signature }),
     Object.freeze({ ...canonical, terminalReason: 'CATCH_UP_WINDOW_EXCEEDED' }),
     Object.freeze({ ...canonical, completedAtMs: canonical.updatedAtMs }),
     Object.freeze({ ...canonical, purgeAfterMs: canonical.updatedAtMs + 14_400_000 }),
@@ -238,6 +272,8 @@ void test('rejects cursor and counter regression, no-op cursors, and revision ov
     { ...valid, beforeSignature: current.beforeSignature },
     { ...valid, beforeSignature: current.previous.signature, lastAcceptedSlot: current.previous.slot },
     { ...valid, lastAcceptedSlot: current.previous.slot - 1n },
+    { ...valid, beforeSignature: current.previous.signature },
+    { ...valid, beforeSignature: current.observedHead.signature },
     { ...valid, lastAcceptedSlot: 12n },
     { ...valid, pagesScanned: 1n },
     { ...valid, signaturesEnqueued: 8n },
@@ -252,6 +288,22 @@ void test('rejects cursor and counter regression, no-op cursors, and revision ov
     ...canonicalInput(), revision: MAX_STRICT_CATCH_UP_RUN_COUNTER,
   });
   assert.throws(() => advanceStrictCatchUpRun(maximumRevision, valid), /strict catch-up run/i);
+
+  const sameSlotHead = createStrictCatchUpRun({
+    ...canonicalInput(),
+    observedHead: Object.freeze({ slot: 11n, signature: 'head' }),
+  });
+  assert.throws(() => advanceStrictCatchUpRun(sameSlotHead, {
+    beforeSignature: sameSlotHead.observedHead.signature,
+    lastAcceptedSlot: 11n,
+    pagesScanned: 2n,
+    signaturesEnqueued: sameSlotHead.signaturesEnqueued,
+    updatedAtMs: sameSlotHead.updatedAtMs,
+  }), /strict catch-up run/i);
+  assert.throws(() => { assertValidStrictCatchUpRun(Object.freeze({
+    ...sameSlotHead,
+    beforeSignature: sameSlotHead.observedHead.signature,
+  })); }, /strict catch-up run/i);
 });
 
 void test('terminalizes active runs with exact four-hour retention', () => {

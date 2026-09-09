@@ -87,7 +87,8 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
       || updatedAtMs < startedAtMs
       || observedHead.slot < previous.slot
       || lastAcceptedSlot < previous.slot
-      || (lastAcceptedSlot === previous.slot && beforeSignature === previous.signature)
+      || beforeSignature === previous.signature
+      || beforeSignature === observedHead.signature
       || lastAcceptedSlot > observedHead.slot
     ) throw invalid();
 
@@ -139,9 +140,9 @@ export function advanceStrictCatchUpRun(
     const updatedAtMs = millisecondsFrom(record.updatedAtMs);
     if (
       beforeSignature === current.beforeSignature
+      || beforeSignature === current.previous.signature
+      || beforeSignature === current.observedHead.signature
       || lastAcceptedSlot < current.previous.slot
-      || (lastAcceptedSlot === current.previous.slot
-        && beforeSignature === current.previous.signature)
       || lastAcceptedSlot > current.lastAcceptedSlot
       || pagesScanned <= current.pagesScanned
       || signaturesEnqueued < current.signaturesEnqueued
@@ -247,7 +248,8 @@ export function assertValidStrictCatchUpRun(
       || updatedAtMs < startedAtMs
       || observedHead.slot < previous.slot
       || lastAcceptedSlot < previous.slot
-      || (lastAcceptedSlot === previous.slot && beforeSignature === previous.signature)
+      || beforeSignature === previous.signature
+      || beforeSignature === observedHead.signature
       || lastAcceptedSlot > observedHead.slot
     ) throw invalid();
 
