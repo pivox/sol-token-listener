@@ -145,6 +145,7 @@ export function createProductionListenerRuntime(
       return [providerId, source] as const;
     }),
   );
+  const strictCheckpointKeys = Object.freeze(ingestionPrograms.map(({ key }) => key));
   const strictCoordinators = new Map<RpcProviderId, StrictCatchUpCoordinator>(
     providers.ids.map((providerId) => {
       const source = pinnedCatchUpSources.get(providerId);
@@ -160,9 +161,11 @@ export function createProductionListenerRuntime(
           programs: ingestionPrograms,
         },
       );
-      return [providerId, new StrictCatchUpCoordinator(scanner)] as const;
+      return [providerId, new StrictCatchUpCoordinator(scanner, inbox, strictCheckpointKeys)] as const;
     }),
   );
+  const strictAffinity = strictCoordinators.get('primary');
+  if (strictAffinity === undefined) throw new TypeError('Strict catch-up coordinator is unavailable.');
   const promoted = new PromotedProviderSelector(
     providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId)),
   );
@@ -172,6 +175,7 @@ export function createProductionListenerRuntime(
       health: websocketHealth,
       reporter: websocketReporter,
       promoted,
+      readPinnedProviderId: (signal): Promise<RpcProviderId | null> => strictAffinity.readPinnedProviderId(signal),
       verifyProviderGenesis: (providerId, signal): Promise<void> => {
         const source = pinnedCatchUpSources.get(providerId);
         if (source === undefined) {

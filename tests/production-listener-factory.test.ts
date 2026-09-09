@@ -962,6 +962,9 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /verifyProviderGenesis:/u);
   assert.match(source, /source\.verifyGenesis\(signal\)/u);
   assert.match(source, /runStrictScan:/u);
+  assert.match(source, /readPinnedProviderId:/u);
+  assert.match(source, /new StrictCatchUpCoordinator\(scanner, inbox, strictCheckpointKeys\)/u);
+  assert.match(source, /strictCheckpointKeys\s*=\s*Object\.freeze\(ingestionPrograms\.map/u);
   assert.match(
     source,
     /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{ programs: ingestionPrograms \}/u,

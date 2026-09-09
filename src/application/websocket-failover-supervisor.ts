@@ -2,10 +2,12 @@ import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import {
   StrictCatchUpAbortedError,
+  StrictCatchUpPausedError,
   StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError,
   type StrictCatchUpScanResult,
 } from './strict-catch-up-scanner.js';
+import { StrictCatchUpAffinityReadError } from './strict-catch-up-coordinator.js';
 import { PromotedProviderSelector } from './promoted-provider-selector.js';
 import {
   PersistentWebSocketHealthReporter,
@@ -84,6 +86,7 @@ export interface WebSocketFailoverSupervisorDependencies {
   readonly health: Pick<WebSocketHealthRepository, 'beginOwner'>;
   readonly reporter: PersistentWebSocketHealthReporter;
   readonly promoted: PromotedProviderSelector;
+  readonly readPinnedProviderId: (signal: AbortSignal) => Promise<RpcProviderId | null>;
   readonly verifyProviderGenesis: (
     providerId: RpcProviderId,
     signal: AbortSignal,
@@ -122,6 +125,11 @@ type ProviderAttemptResult =
   | Readonly<{ kind: 'promoted' }>
   | Readonly<{ kind: 'aborted' }>
   | Readonly<{
+      kind: 'paused';
+      recoveryReason: 'RPC_UNAVAILABLE';
+      disconnectReason: WebSocketHealthTransition['disconnectReasonCode'];
+    }>
+  | Readonly<{
       kind: 'window';
       error: StrictCatchUpWindowExceededError;
       recoveryReason: 'CATCH_UP_WINDOW_EXCEEDED';
@@ -153,6 +161,7 @@ interface ValidatedDependencies {
   readonly health: Pick<WebSocketHealthRepository, 'beginOwner'>;
   readonly reporter: ValidatedReporter;
   readonly promoted: ValidatedPromotedSelector;
+  readonly readPinnedProviderId: WebSocketFailoverSupervisorDependencies['readPinnedProviderId'];
   readonly verifyProviderGenesis: WebSocketFailoverSupervisorDependencies['verifyProviderGenesis'];
   readonly openSession: typeof openWsProgramSession;
   readonly runStrictScan: WebSocketFailoverSupervisorDependencies['runStrictScan'];
@@ -366,11 +375,25 @@ export class WebSocketFailoverSupervisor {
     if (this.#isPermanentlyClosed() || this.#unrecoverable) return;
     const ids = this.#providerCycleOrder();
     const windowErrors: StrictCatchUpWindowExceededError[] = [];
+    const attempted = new Set<RpcProviderId>();
+    let pinnedCycle = false;
     let recoveryReason = this.#pendingRecoveryReason;
     let disconnectReason: WebSocketHealthTransition['disconnectReasonCode'] = null;
 
-    for (const providerId of ids) {
+    while (attempted.size < ids.length) {
       if (this.#isPermanentlyClosed()) return;
+      let pinned: RpcProviderId | null;
+      try {
+        pinned = await this.#readRecoveryPin();
+      } catch {
+        recoveryReason = 'RPC_UNAVAILABLE';
+        break;
+      }
+      if (this.#isPermanentlyClosed()) return;
+      pinnedCycle ||= pinned !== null;
+      const providerId = pinned ?? ids.find((id) => !attempted.has(id));
+      if (providerId === undefined || attempted.has(providerId)) break;
+      attempted.add(providerId);
       let result: ProviderAttemptResult;
       try {
         result = await this.#attemptProvider(providerId, recoveryReason);
@@ -383,13 +406,18 @@ export class WebSocketFailoverSupervisor {
       }
       if (result.kind === 'promoted' || result.kind === 'aborted') return;
       recoveryReason = result.recoveryReason;
+      if (result.kind === 'paused') {
+        disconnectReason = result.disconnectReason;
+        break;
+      }
       if (result.kind === 'window') windowErrors.push(result.error);
       else if (result.disconnectReason !== null) disconnectReason = result.disconnectReason;
+      if (pinned !== null) break;
     }
 
     if (this.#isPermanentlyClosed()) return;
     const firstWindowError = windowErrors[0];
-    if (windowErrors.length === ids.length
+    if (!pinnedCycle && windowErrors.length === this.#dependencies.providers.ids.length
       && firstWindowError !== undefined
       && windowErrors.every((error) => firstWindowError.sameFrontier(error))) {
       await this.#becomeUnrecoverable();
@@ -399,6 +427,16 @@ export class WebSocketFailoverSupervisor {
     await this.#persistCycleDegraded(recoveryReason, disconnectReason);
     if (this.#isPermanentlyClosed()) return;
     this.#scheduleCycleRetry();
+  }
+
+  async #readRecoveryPin(): Promise<RpcProviderId | null> {
+    const controller = new AbortController();
+    this.#candidateAbort = controller;
+    try {
+      return await this.#dependencies.readPinnedProviderId(controller.signal);
+    } finally {
+      if (this.#candidateAbort === controller) this.#candidateAbort = null;
+    }
   }
 
   #scheduleCycleRetry(): void {
@@ -561,10 +599,13 @@ export class WebSocketFailoverSupervisor {
       try {
         await this.#dependencies.runStrictScan(providerId, controller.signal);
       } catch (error) {
+        const failure = strictScanFailureFrom(error, candidate);
         const cleaned = await this.#cleanupCandidate(candidate);
-        return this.#isPermanentlyClosed()
-          ? abortedAttempt()
-          : cleaned ? strictScanFailureFrom(error, candidate) : cleanupFailureAttempt();
+        if (this.#isPermanentlyClosed()) return abortedAttempt();
+        if (failure.kind === 'paused') {
+          return Object.freeze({ ...failure, disconnectReason: cleaned ? null : 'CLEANUP_FAILED' });
+        }
+        return cleaned ? failure : cleanupFailureAttempt();
       }
       if (this.#candidate !== candidate || this.#isPermanentlyClosed()) {
         const result = completionAttemptFailure(candidate);
@@ -1106,7 +1147,15 @@ export class WebSocketFailoverSupervisor {
   async #runPeriodicFrontier(record: SessionRecord): Promise<void> {
     const controller = new AbortController();
     this.#periodicAbort = controller;
+    let scanning = false;
     try {
+      const pinned = await this.#dependencies.readPinnedProviderId(controller.signal);
+      if (!this.#canScanPeriodic(record, controller.signal)) {
+        if (this.#periodicAbort === controller) this.#periodicAbort = null;
+        return;
+      }
+      if (pinned !== null && pinned !== record.providerId) throw new StrictCatchUpAffinityReadError();
+      scanning = true;
       await this.#dependencies.runStrictScan(record.providerId, controller.signal);
     } catch (error) {
       if (this.#periodicAbort === controller) this.#periodicAbort = null;
@@ -1114,7 +1163,7 @@ export class WebSocketFailoverSupervisor {
         || controller.signal.aborted
         || this.#incumbent !== record
         || this.#currentState !== 'RUNNING') return;
-      const failure = attemptFailureFrom(error);
+      const failure = scanning ? strictScanFailureFrom(error, record) : attemptFailureFrom(error);
       if (failure.kind === 'aborted' || failure.kind === 'promoted') return;
       const recoveryReason = failure.recoveryReason;
       const pending = this.#activeFailurePromise;
@@ -1122,11 +1171,9 @@ export class WebSocketFailoverSupervisor {
         try { await pending; } catch { /* fixed degradation already handled */ }
         return;
       }
-      const operation = this.#degradeActiveIncumbent(
-        record,
-        'UNEXPECTED_RESTART',
-        recoveryReason,
-      );
+      const operation = !scanning || failure.kind === 'paused'
+        ? this.#pausePeriodicRecovery(record, recoveryReason)
+        : this.#degradeActiveIncumbent(record, 'UNEXPECTED_RESTART', recoveryReason);
       this.#activeFailurePromise = operation;
       try {
         await operation;
@@ -1141,6 +1188,37 @@ export class WebSocketFailoverSupervisor {
       || this.#incumbent !== record
       || this.#currentProviderId !== record.providerId
       || this.#currentState !== 'RUNNING') return;
+  }
+
+  #canScanPeriodic(record: SessionRecord, signal: AbortSignal): boolean {
+    return !this.#permanentlyClosed && !signal.aborted && this.#incumbent === record
+      && this.#currentProviderId === record.providerId && this.#currentState === 'RUNNING';
+  }
+
+  async #pausePeriodicRecovery(
+    record: SessionRecord,
+    recoveryReason: WebSocketRecoveryReasonCode,
+  ): Promise<void> {
+    this.#cancelPeriodicFrontier();
+    this.#clearPromotedRecord(record);
+    if (this.#incumbent === record) this.#incumbent = null;
+    record.controller.abort();
+    let disconnectReason: WebSocketHealthTransition['disconnectReasonCode'] = null;
+    try {
+      await this.#closeSession(record);
+    } catch {
+      disconnectReason = 'CLEANUP_FAILED';
+      if (this.#permanentlyClosed) this.#shutdownResourceFailed = true;
+    }
+    if (this.#isPermanentlyClosed()) return;
+    this.#pendingRecoveryReason = recoveryReason;
+    try {
+      await this.#persistCycleDegraded(recoveryReason, disconnectReason);
+    } finally {
+      if (!this.#isPermanentlyClosed() && this.#loopHandle === null && this.#loopPromise === null) {
+        this.#scheduleCycleRetry();
+      }
+    }
   }
 
   #cancelPeriodicFrontier(): void {
@@ -1256,6 +1334,7 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     'health',
     'reporter',
     'promoted',
+    'readPinnedProviderId',
     'verifyProviderGenesis',
     'openSession',
     'runStrictScan',
@@ -1267,12 +1346,15 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
   const verifyProviderGenesis = dependencies.verifyProviderGenesis;
   const openSession = dependencies.openSession;
   const runStrictScan = dependencies.runStrictScan;
+  const readPinnedProviderId = dependencies.readPinnedProviderId;
   if (!objectValue(providersValue)
     || !objectValue(healthValue)
     || !(reporterValue instanceof PersistentWebSocketHealthReporter)
     || isProxy(reporterValue)
     || !(promotedValue instanceof PromotedProviderSelector)
     || isProxy(promotedValue)
+    || typeof readPinnedProviderId !== 'function'
+    || isProxy(readPinnedProviderId)
     || typeof verifyProviderGenesis !== 'function'
     || isProxy(verifyProviderGenesis)
     || typeof openSession !== 'function'
@@ -1368,6 +1450,23 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
         return Reflect.apply(activeProviderId, promotedValue, []);
       },
     }),
+    readPinnedProviderId(signal: AbortSignal): Promise<RpcProviderId | null> {
+      try {
+        const result: unknown = Reflect.apply(readPinnedProviderId, dependencyReceiver, [signal]);
+        if (!nativePromise(result)) return Promise.reject(new StrictCatchUpAffinityReadError());
+        return Reflect.apply(PROMISE_THEN, result, [
+          (value: unknown): RpcProviderId | null => {
+            if (value !== null && (!isRpcProviderId(value) || !ids.includes(value))) {
+              throw new StrictCatchUpAffinityReadError();
+            }
+            return value;
+          },
+          (): never => { throw new StrictCatchUpAffinityReadError(); },
+        ]);
+      } catch {
+        return Promise.reject(new StrictCatchUpAffinityReadError());
+      }
+    },
     verifyProviderGenesis(providerId: RpcProviderId, signal: AbortSignal): Promise<void> {
       try {
         const result: unknown = Reflect.apply(verifyProviderGenesis, dependencyReceiver, [
@@ -1669,7 +1768,11 @@ function strictScanFailureFrom(
   error: unknown,
   record: SessionRecord,
 ): ProviderAttemptResult {
+  if (typeof error === 'object' && error !== null && isProxy(error)) return attemptFailureFrom(null);
   if (error instanceof StrictCatchUpAbortedError) return nonShutdownAbortFailure(record);
+  if (error instanceof StrictCatchUpPausedError) {
+    return Object.freeze({ kind: 'paused', recoveryReason: 'RPC_UNAVAILABLE', disconnectReason: null });
+  }
   if (error instanceof StrictCatchUpWindowExceededError) {
     return Object.freeze({
       kind: 'window',

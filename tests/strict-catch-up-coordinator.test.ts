@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createStrictCatchUpRun, terminalizeStrictCatchUpRun } from '../src/domain/strict-catch-up-run.js';
 import type { StrictCatchUpScanResult } from '../src/application/strict-catch-up-scanner.js';
 import {
   StrictCatchUpCoordinator,
@@ -8,10 +9,77 @@ import {
 
 const NEVER_ABORTED = new AbortController().signal;
 
+void test('reads configured durable affinity without caching and without starting a scan', async () => {
+  const calls: string[] = [];
+  let pinned = false;
+  const coordinator = new StrictCatchUpCoordinator(new FakeScanner([]), {
+    async readActiveStrictCatchUpRun(key) {
+      calls.push(key);
+      return pinned ? activeRun(key, 'fallback-1') : null;
+    },
+  }, ['launchpad']);
+  assert.deepEqual(calls, []);
+  assert.equal(await coordinator.readPinnedProviderId(), null);
+  pinned = true;
+  assert.equal(await coordinator.readPinnedProviderId(), 'fallback-1');
+  assert.deepEqual(calls, ['launchpad', 'launchpad']);
+});
+
+void test('accepts matching active providers but rejects divergent, malformed, and failed affinity reads safely', async () => {
+  const matching = new StrictCatchUpCoordinator(new FakeScanner([]), {
+    async readActiveStrictCatchUpRun(key) { return activeRun(key, 'fallback-1'); },
+  }, ['launchpad', 'market']);
+  assert.equal(await matching.readPinnedProviderId(), 'fallback-1');
+  for (const read of [
+    async (key: 'launchpad' | 'market') => activeRun(key, key === 'launchpad' ? 'primary' : 'fallback-1'),
+    async () => ({ secret: 'https://signature-secret.invalid' }),
+    async () => terminalizeStrictCatchUpRun(activeRun('launchpad', 'primary'), {
+      state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: 2_000,
+    }),
+    async () => { throw new Error('https://signature-secret.invalid'); },
+  ]) {
+    const coordinator = new StrictCatchUpCoordinator(new FakeScanner([]), {
+      readActiveStrictCatchUpRun: read as never,
+    }, ['launchpad', 'market']);
+    await assert.rejects(coordinator.readPinnedProviderId(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, 'StrictCatchUpAffinityReadError');
+      assert.equal(Reflect.get(error, 'retryable'), true);
+      assert.ok(Object.isFrozen(error));
+      assert.doesNotMatch(JSON.stringify(error), /secret|signature|https/u);
+      return true;
+    });
+  }
+});
+
+function activeRun(key: 'launchpad' | 'market', providerId: 'primary' | 'fallback-1') {
+  return createStrictCatchUpRun({
+    checkpointKey: key, previous: { key, slot: 10n, signature: 'boundary', updatedAtMs: 100 },
+    providerId, observedHead: { slot: 14n, signature: 'head' }, beforeSignature: 'cursor',
+    lastAcceptedSlot: 13n, pagesScanned: 1n, signaturesEnqueued: 2n,
+    revision: 0n, startedAtMs: 1_000, updatedAtMs: 1_000,
+  });
+}
+
+void test('affinity rejects accessor methods and hostile promises without invoking their getters', async () => {
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({}, 'readActiveStrictCatchUpRun', {
+    get() { getterCalls += 1; throw new Error('secret'); },
+  });
+  const hostilePromise = Object.defineProperty(Promise.resolve(null), 'then', {
+    get() { getterCalls += 1; throw new Error('secret'); },
+  });
+  for (const repository of [accessor, { readActiveStrictCatchUpRun: () => hostilePromise }]) {
+    const coordinator = new StrictCatchUpCoordinator(new FakeScanner([]), repository as never, ['launchpad']);
+    await assert.rejects(coordinator.readPinnedProviderId(), { name: 'StrictCatchUpAffinityReadError' });
+  }
+  assert.equal(getterCalls, 0);
+});
+
 void test('coalesces concurrent runs into the exact same promise and scan', async () => {
   const pending = deferred<StrictCatchUpScanResult>();
   const scanner = new FakeScanner([pending.promise]);
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
   const firstController = new AbortController();
   const secondController = new AbortController();
 
@@ -30,7 +98,7 @@ void test('coalesces concurrent runs into the exact same promise and scan', asyn
 void test('shares the original scan error between concurrent callers', async () => {
   const pending = deferred<StrictCatchUpScanResult>();
   const scanner = new FakeScanner([pending.promise]);
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
   const error = new Error('unavailable');
 
   const first = coordinator.run(NEVER_ABORTED);
@@ -49,7 +117,7 @@ void test('starts a new scan after a successful run settles', async () => {
     Promise.resolve(firstResult),
     Promise.resolve(secondResult),
   ]);
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
 
   const first = coordinator.run(NEVER_ABORTED);
   assert.equal(await first, firstResult);
@@ -67,7 +135,7 @@ void test('starts a new scan after a failed run settles', async () => {
     Promise.reject(error),
     Promise.resolve(successfulResult),
   ]);
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
 
   await assert.rejects(coordinator.run(NEVER_ABORTED), (value: unknown) => value === error);
 
@@ -86,7 +154,7 @@ void test('normalizes a scanner thenable without duplicating its scan', async ()
       } as unknown as Promise<StrictCatchUpScanResult>;
     },
   };
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
 
   const first = coordinator.run(NEVER_ABORTED);
   const second = coordinator.run(NEVER_ABORTED);
@@ -106,7 +174,7 @@ void test('rejects and resets after a native scan promise has a hostile then get
     hostileResult,
     Promise.resolve(successfulResult),
   ]);
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
 
   let first: Promise<StrictCatchUpScanResult> | undefined;
   assert.doesNotThrow(() => { first = coordinator.run(NEVER_ABORTED); });
@@ -138,7 +206,7 @@ void test('coalesces a synchronous reentrant run before the scanner returns', as
       return Promise.resolve(scanResult);
     },
   };
-  coordinator = new StrictCatchUpCoordinator(scanner);
+  coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
 
   const first = coordinator.run(NEVER_ABORTED);
 
@@ -162,7 +230,7 @@ void test('converts a synchronous scanner throw into its original rejected error
       return Promise.resolve(successfulResult);
     },
   };
-  const coordinator = new StrictCatchUpCoordinator(scanner);
+  const coordinator = new StrictCatchUpCoordinator(scanner, { async readActiveStrictCatchUpRun() { return null; } }, ['launchpad']);
 
   await assert.rejects(coordinator.run(NEVER_ABORTED), (value: unknown) => value === error);
   assert.equal(await coordinator.run(NEVER_ABORTED), successfulResult);

@@ -5,9 +5,11 @@ import bs58 from 'bs58';
 import { Connection } from '@solana/web3.js';
 import pg from 'pg';
 import { PromotedProviderSelector } from '../src/application/promoted-provider-selector.js';
+import { StrictCatchUpCoordinator } from '../src/application/strict-catch-up-coordinator.js';
 import {
   StrictCatchUpScanner,
   StrictCatchUpScannerError,
+  StrictCatchUpPausedError,
   type StrictCatchUpScanResult,
 } from '../src/application/strict-catch-up-scanner.js';
 import {
@@ -67,6 +69,7 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
     const sessions = new SessionFactory();
     const strictScans: RpcProviderId[] = [];
     const candidateScan = deferred<StrictCatchUpScanResult>();
+    const affinity = new StrictCatchUpCoordinator(strictScanner('primary', inbox), inbox, ['launchpad', 'market']);
     const supervisor = new WebSocketFailoverSupervisor({
       providers: new TestCatalog(['primary', 'fallback-1']),
       health,
@@ -75,6 +78,7 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
         finalityPass('primary'), finalityPass('fallback-1'),
       ]),
       verifyProviderGenesis: async () => undefined,
+      readPinnedProviderId: (signal) => affinity.readPinnedProviderId(signal),
       openSession: sessions.open,
       runStrictScan: async (providerId, signal) => {
         strictScans.push(providerId);
@@ -437,7 +441,7 @@ void test('aborts an active strict scan at concrete source, enqueue, and launchp
       assert.equal(await inboxCount(pool, SHARED_SIGNATURE), boundary === 'page' ? 0 : 1, boundary);
       assert.equal(await inbox.readCheckpoint('launchpad') === null, boundary !== 'launchpad-cas', boundary);
       assert.equal(await inbox.readCheckpoint('market'), null, boundary);
-      assert.equal(source.listCalls, boundary === 'page' ? 1 : 2, boundary);
+      assert.equal(source.listCalls, 1, boundary);
       assert.equal(repository.enqueueCalls, boundary === 'page' ? 0 : 1, boundary);
       assert.deepEqual(repository.checkpointKeys, boundary === 'launchpad-cas' ? ['launchpad'] : [], boundary);
       assert.equal((await health.read()).disconnect?.reasonCode, 'REMOTE_CLOSE', boundary);
@@ -499,6 +503,63 @@ void test('persists native partial-ACK and setup-timeout failures after the real
       await supervisor.close();
     });
   }
+});
+
+void test('restarts a durably paused fallback run and promotes only after its exact final page', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const inbox = new PostgresTransactionInboxRepository(pool);
+    const health = new PostgresWebSocketHealthRepository(pool);
+    const previous = Object.freeze({
+      key: 'launchpad' as const, slot: 41n, signature: MULTI_PAGE_BOUNDARY_SIGNATURE, updatedAtMs: 9_000,
+    });
+    await inbox.compareAndSwapCheckpoint(null, previous);
+    const sourceCalls: [RpcProviderId, string | undefined][] = [];
+    const strict = (providerId: RpcProviderId, signal: AbortSignal) => new StrictCatchUpScanner({
+      providerId,
+      async list(_programId: string, before: string | undefined) {
+        sourceCalls.push([providerId, before]);
+        const rows: [string, bigint][] = before === undefined
+          ? [[MULTI_PAGE_SIGNATURE, 45n], [SHARED_SIGNATURE, 44n]]
+          : before === SHARED_SIGNATURE
+            ? [[STRICT_WINDOW_HEAD_SIGNATURE, 43n], [STRICT_WINDOW_LAUNCHPAD_SIGNATURE, 42n]]
+            : [[MULTI_PAGE_BOUNDARY_SIGNATURE, 41n]];
+        return rows.map(([signature, slot]) => Object.freeze({ signature, slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null }));
+      },
+    }, inbox, {
+      pageSize: 2, maxPages: 1, now: () => 10_000,
+      programs: Object.freeze([Object.freeze({ key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID })]),
+    }).scan(signal);
+    await assert.rejects(strict('fallback-1', new AbortController().signal), StrictCatchUpPausedError);
+    const scheduler = new ManualScheduler();
+    const sessions = new SessionFactory();
+    const first = supervisorFor({ inbox, health, scheduler, sessions, reporter: reporterFor(inbox, health), strict });
+    await first.start();
+    scheduler.fire(0);
+    await waitForPhase(health, 'DEGRADED');
+    assert.equal(first.activeProviderId(), null);
+    assert.equal(sessions.count, 1);
+    assert.equal(sessions.at(0).closeCalls, 1);
+    assert.equal(sessions.at(0).session.endpointId, 'fallback-1');
+    assert.deepEqual(scheduler.pendingDelays(), [500]);
+    assert.equal((await inbox.readActiveStrictCatchUpRun('launchpad'))?.beforeSignature, STRICT_WINDOW_LAUNCHPAD_SIGNATURE);
+    assert.deepEqual(await inbox.readCheckpoint('launchpad'), previous);
+    await first.close();
+
+    const restartScheduler = new ManualScheduler();
+    const restartSessions = new SessionFactory();
+    const restarted = supervisorFor({ inbox, health, scheduler: restartScheduler, sessions: restartSessions,
+      reporter: reporterFor(inbox, health), strict });
+    await restarted.start();
+    restartScheduler.fire(0);
+    await waitForProvider(restarted, 'fallback-1');
+    assert.equal(restartSessions.count, 1);
+    assert.equal(await inbox.readActiveStrictCatchUpRun('launchpad'), null);
+    assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, MULTI_PAGE_SIGNATURE);
+    assert.deepEqual(sourceCalls, [['fallback-1', undefined], ['fallback-1', SHARED_SIGNATURE],
+      ['fallback-1', STRICT_WINDOW_LAUNCHPAD_SIGNATURE]]);
+    assert.equal(await unresolvedStrictFailureCount(pool), 0);
+    await restarted.close();
+  });
 });
 
 void test('recovers a real multi-page strict scan through PostgreSQL before durable promotion', async (context) => {
@@ -563,12 +624,14 @@ function supervisorFor(value: Readonly<{
   providerIds?: readonly RpcProviderId[];
   strict: (providerId: RpcProviderId, signal: AbortSignal) => Promise<StrictCatchUpScanResult>;
 }>): WebSocketFailoverSupervisor {
+  const affinity = new StrictCatchUpCoordinator(strictScanner('primary', value.inbox), value.inbox, ['launchpad', 'market']);
   return new WebSocketFailoverSupervisor({
     providers: new TestCatalog(value.providerIds ?? ['primary', 'fallback-1']),
     health: value.health,
     reporter: value.reporter,
     promoted: new PromotedProviderSelector([finalityPass('primary'), finalityPass('fallback-1')]),
     verifyProviderGenesis: async () => undefined,
+    readPinnedProviderId: (signal) => affinity.readPinnedProviderId(signal),
     openSession: value.sessions.open,
     runStrictScan: value.strict,
   }, {
@@ -959,7 +1022,7 @@ function strictWindowScanner(
       })];
     },
   });
-  return new StrictCatchUpScanner(source, inbox, { pageSize: 1, maxPages: 1, now: () => 10_000 });
+  return new StrictCatchUpScanner(source, inbox, { pageSize: 1, maxPages: 2, now: () => 10_000 });
 }
 
 function multiPageStrictScanner(
