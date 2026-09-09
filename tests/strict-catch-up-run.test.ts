@@ -116,7 +116,8 @@ void test('rejects malformed creation input and durable bounds', () => {
     { ...base, observedHead: Object.freeze({ ...base.observedHead, slot: 9n }) },
     { ...base, beforeSignature: ` ${'x'.repeat(127)}` },
     { ...base, observedHead: Object.freeze({ ...base.observedHead, signature: '' }) },
-    { ...base, lastAcceptedSlot: 10n },
+    { ...base, lastAcceptedSlot: 10n, beforeSignature: base.previous.signature },
+    { ...base, lastAcceptedSlot: 9n },
     { ...base, lastAcceptedSlot: 21n },
     { ...base, pagesScanned: 0n },
     { ...base, pagesScanned: 1 },
@@ -204,6 +205,26 @@ void test('advances active progress with one revision and immutable snapshots', 
   assert.doesNotThrow(() => { assertValidStrictCatchUpRun(advanced); });
 });
 
+void test('accepts a different cursor signature in the previous checkpoint slot', () => {
+  const current = createStrictCatchUpRun(canonicalInput());
+  const created = createStrictCatchUpRun({
+    ...canonicalInput(),
+    beforeSignature: 'same-slot-tail',
+    lastAcceptedSlot: canonicalInput().previous.slot,
+  });
+  const advanced = advanceStrictCatchUpRun(current, {
+    beforeSignature: 'same-slot-tail',
+    lastAcceptedSlot: current.previous.slot,
+    pagesScanned: 2n,
+    signaturesEnqueued: current.signaturesEnqueued,
+    updatedAtMs: current.updatedAtMs,
+  });
+
+  assert.equal(created.lastAcceptedSlot, current.previous.slot);
+  assert.equal(advanced.lastAcceptedSlot, current.previous.slot);
+  assert.equal(advanced.beforeSignature, 'same-slot-tail');
+});
+
 void test('rejects cursor and counter regression, no-op cursors, and revision overflow', () => {
   const current = createStrictCatchUpRun(canonicalInput());
   const valid = {
@@ -215,6 +236,8 @@ void test('rejects cursor and counter regression, no-op cursors, and revision ov
   };
   const cases: readonly unknown[] = [
     { ...valid, beforeSignature: current.beforeSignature },
+    { ...valid, beforeSignature: current.previous.signature, lastAcceptedSlot: current.previous.slot },
+    { ...valid, lastAcceptedSlot: current.previous.slot - 1n },
     { ...valid, lastAcceptedSlot: 12n },
     { ...valid, pagesScanned: 1n },
     { ...valid, signaturesEnqueued: 8n },
@@ -246,7 +269,9 @@ void test('terminalizes active runs with exact four-hour retention', () => {
   for (const terminal of [completed, failed, superseded]) {
     assert.equal(terminal.revision, 1n);
     assert.equal(terminal.updatedAtMs, terminal.completedAtMs);
-    assert.equal(terminal.purgeAfterMs, terminal.completedAtMs! + STRICT_CATCH_UP_RUN_RETENTION_MS);
+    const completedAtMs = terminal.completedAtMs;
+    assert.ok(completedAtMs !== null);
+    assert.equal(terminal.purgeAfterMs, completedAtMs + STRICT_CATCH_UP_RUN_RETENTION_MS);
     assert.ok(Object.isFrozen(terminal));
     assert.doesNotThrow(() => { assertValidStrictCatchUpRun(terminal); });
   }
