@@ -20,7 +20,8 @@ void test('migration 046 defines the durable strict catch-up run contract withou
   assert.match(sql, /pages_scanned BIGINT NOT NULL/u);
   assert.match(sql, /listener_strict_catch_up_runs_id_check/u);
   assert.match(sql, /listener_strict_catch_up_runs_lifecycle_check/u);
-  assert.match(sql, /\^\[\[:space:\]\]/u);
+  assert.match(sql, /CHR\(160\)/u);
+  assert.match(sql, /CHR\(65279\)/u);
   assert.match(sql, /listener_strict_catch_up_runs_active_key_unique/u);
   assert.match(sql, /listener_strict_catch_up_runs_provider_key_idx/u);
   assert.match(sql, /listener_strict_catch_up_runs_terminal_purge_idx/u);
@@ -75,6 +76,22 @@ void test('migration 046 accepts valid active and terminal runs and rejects inva
       { beforeSignature: 'previous' },
       { beforeSignature: 'head' },
     ] as const) await assert.rejects(() => insertRun(pool, randomUUID(), values), isCheckViolation);
+    const terminalRun: RunValues = {
+      checkpointKey: 'market', state: 'COMPLETED', terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    };
+    for (const values of [
+      { previousSignature: '\u00a0previous' }, { previousSignature: 'previous\ufeff' },
+      { observedHeadSignature: '\u00a0head' }, { observedHeadSignature: 'head\ufeff' },
+      { beforeSignature: '\u00a0before' }, { beforeSignature: 'before\ufeff' },
+    ] as const) await assert.rejects(() => insertRun(pool, randomUUID(), { ...terminalRun, ...values }), isCheckViolation);
+    await insertRun(pool, 'internal_whitespace', {
+      checkpointKey: 'market', previousSignature: 'pre vious', observedHeadSignature: 'he ad',
+      beforeSignature: 'be fore', state: 'COMPLETED', terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
     await insertRun(pool, 'active_initial', {
       checkpointKey: 'market', observedHeadSlot: '11', lastAcceptedSlot: '11',
       beforeSignature: 'head',

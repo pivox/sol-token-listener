@@ -71,16 +71,19 @@ CREATE TABLE IF NOT EXISTS listener_strict_catch_up_runs (
   CONSTRAINT listener_strict_catch_up_runs_id_check CHECK (run_id ~ '^strict_catchup_run_[0-9a-f]{64}$'),
   CONSTRAINT listener_strict_catch_up_runs_key_check CHECK (checkpoint_key IN ('launchpad','market')),
   CONSTRAINT listener_strict_catch_up_runs_previous_signature_check CHECK (
-    previous_signature !~ '^[[:space:]]' AND previous_signature !~ '[[:space:]]$'
+    NOT (LEFT(previous_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)]))
+    AND NOT (RIGHT(previous_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)]))
     AND OCTET_LENGTH(previous_signature) BETWEEN 1 AND 128
   ),
   CONSTRAINT listener_strict_catch_up_runs_provider_check CHECK (provider_id IN ('primary','fallback-1','fallback-2','fallback-3')),
   CONSTRAINT listener_strict_catch_up_runs_head_signature_check CHECK (
-    observed_head_signature !~ '^[[:space:]]' AND observed_head_signature !~ '[[:space:]]$'
+    NOT (LEFT(observed_head_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)]))
+    AND NOT (RIGHT(observed_head_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)]))
     AND OCTET_LENGTH(observed_head_signature) BETWEEN 1 AND 128
   ),
   CONSTRAINT listener_strict_catch_up_runs_before_signature_check CHECK (
-    before_signature !~ '^[[:space:]]' AND before_signature !~ '[[:space:]]$'
+    NOT (LEFT(before_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)]))
+    AND NOT (RIGHT(before_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)]))
     AND OCTET_LENGTH(before_signature) BETWEEN 1 AND 128
   ),
   CONSTRAINT listener_strict_catch_up_runs_numeric_bounds_check CHECK (
@@ -135,10 +138,10 @@ BEGIN
     ADD CONSTRAINT listener_strict_catch_up_runs_pkey PRIMARY KEY (run_id),
     ADD CONSTRAINT listener_strict_catch_up_runs_id_check CHECK (run_id ~ '^strict_catchup_run_[0-9a-f]{64}$'),
     ADD CONSTRAINT listener_strict_catch_up_runs_key_check CHECK (checkpoint_key IN ('launchpad','market')),
-    ADD CONSTRAINT listener_strict_catch_up_runs_previous_signature_check CHECK (previous_signature !~ '^[[:space:]]' AND previous_signature !~ '[[:space:]]$' AND OCTET_LENGTH(previous_signature) BETWEEN 1 AND 128),
+    ADD CONSTRAINT listener_strict_catch_up_runs_previous_signature_check CHECK (NOT (LEFT(previous_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)])) AND NOT (RIGHT(previous_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)])) AND OCTET_LENGTH(previous_signature) BETWEEN 1 AND 128),
     ADD CONSTRAINT listener_strict_catch_up_runs_provider_check CHECK (provider_id IN ('primary','fallback-1','fallback-2','fallback-3')),
-    ADD CONSTRAINT listener_strict_catch_up_runs_head_signature_check CHECK (observed_head_signature !~ '^[[:space:]]' AND observed_head_signature !~ '[[:space:]]$' AND OCTET_LENGTH(observed_head_signature) BETWEEN 1 AND 128),
-    ADD CONSTRAINT listener_strict_catch_up_runs_before_signature_check CHECK (before_signature !~ '^[[:space:]]' AND before_signature !~ '[[:space:]]$' AND OCTET_LENGTH(before_signature) BETWEEN 1 AND 128),
+    ADD CONSTRAINT listener_strict_catch_up_runs_head_signature_check CHECK (NOT (LEFT(observed_head_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)])) AND NOT (RIGHT(observed_head_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)])) AND OCTET_LENGTH(observed_head_signature) BETWEEN 1 AND 128),
+    ADD CONSTRAINT listener_strict_catch_up_runs_before_signature_check CHECK (NOT (LEFT(before_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)])) AND NOT (RIGHT(before_signature,1)=ANY(ARRAY[CHR(9),CHR(10),CHR(11),CHR(12),CHR(13),CHR(32),CHR(160),CHR(5760),CHR(8192),CHR(8193),CHR(8194),CHR(8195),CHR(8196),CHR(8197),CHR(8198),CHR(8199),CHR(8200),CHR(8201),CHR(8202),CHR(8232),CHR(8233),CHR(8239),CHR(8287),CHR(12288),CHR(65279)])) AND OCTET_LENGTH(before_signature) BETWEEN 1 AND 128),
     ADD CONSTRAINT listener_strict_catch_up_runs_numeric_bounds_check CHECK (
       previous_slot BETWEEN 0 AND 999999999999999999999999999999999999999999999999999999999999999999999999999999
       AND observed_head_slot BETWEEN 0 AND 999999999999999999999999999999999999999999999999999999999999999999999999999999
