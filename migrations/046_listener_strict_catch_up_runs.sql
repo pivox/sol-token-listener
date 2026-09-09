@@ -1,12 +1,12 @@
 -- Durable, resumable strict catch-up runs. Keep the record free of RPC diagnostics.
 DO $$
-DECLARE run_table_oid OID; run_table_kind "char"; target_index_oid OID; target_index_kind "char";
+DECLARE run_table_oid OID; run_table_kind "char"; run_table_persistence "char"; target_index_oid OID; target_index_kind "char";
 BEGIN
-  SELECT relation.oid,relation.relkind INTO run_table_oid,run_table_kind FROM pg_class relation
+  SELECT relation.oid,relation.relkind,relation.relpersistence INTO run_table_oid,run_table_kind,run_table_persistence FROM pg_class relation
   JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
   WHERE namespace.nspname=CURRENT_SCHEMA() AND relation.relname='listener_strict_catch_up_runs';
   IF run_table_oid IS NOT NULL THEN
-    IF run_table_kind<>'r'
+    IF run_table_kind<>'r' OR run_table_persistence<>'p'
       OR (SELECT COUNT(*) FROM pg_attribute WHERE attrelid=run_table_oid AND attnum>0 AND NOT attisdropped)<>19
       OR EXISTS (
         SELECT 1 FROM (VALUES
@@ -21,7 +21,8 @@ BEGIN
         LEFT JOIN pg_attribute attribute ON attribute.attrelid=run_table_oid AND attribute.attname=expected.column_name
           AND attribute.attnum>0 AND NOT attribute.attisdropped
         WHERE attribute.attnum IS NULL OR format_type(attribute.atttypid,attribute.atttypmod)<>expected.column_type
-          OR attribute.attnotnull<>expected.not_null
+          OR attribute.attnotnull<>expected.not_null OR attribute.attgenerated<>''
+          OR attribute.attidentity<>'' OR attribute.atthasdef
       )
       OR NOT EXISTS (
         SELECT 1 FROM pg_constraint primary_key WHERE primary_key.conrelid=run_table_oid
@@ -131,10 +132,29 @@ CREATE TABLE IF NOT EXISTS listener_strict_catch_up_runs (
 DO $$
 DECLARE actual_constraints TEXT[]; expected_constraints TEXT[];
 BEGIN
-  CREATE TEMP TABLE listener_strict_catch_up_runs_expected (
-    LIKE listener_strict_catch_up_runs INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING STORAGE
+  DROP TABLE IF EXISTS pg_temp.listener_strict_catch_up_runs_expected;
+  CREATE TEMP TABLE pg_temp.listener_strict_catch_up_runs_expected (
+    run_id TEXT NOT NULL,
+    checkpoint_key TEXT NOT NULL,
+    previous_slot NUMERIC(78,0) NOT NULL,
+    previous_signature TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    observed_head_slot NUMERIC(78,0) NOT NULL,
+    observed_head_signature TEXT NOT NULL,
+    before_signature TEXT NOT NULL,
+    last_accepted_slot NUMERIC(78,0) NOT NULL,
+    pages_scanned BIGINT NOT NULL,
+    signatures_enqueued BIGINT NOT NULL,
+    revision BIGINT NOT NULL,
+    state TEXT NOT NULL,
+    terminal_reason TEXT,
+    previous_updated_at TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    purge_after TIMESTAMPTZ
   ) ON COMMIT DROP;
-  ALTER TABLE listener_strict_catch_up_runs_expected
+  ALTER TABLE pg_temp.listener_strict_catch_up_runs_expected
     ADD CONSTRAINT listener_strict_catch_up_runs_pkey PRIMARY KEY (run_id),
     ADD CONSTRAINT listener_strict_catch_up_runs_id_check CHECK (run_id ~ '^strict_catchup_run_[0-9a-f]{64}$'),
     ADD CONSTRAINT listener_strict_catch_up_runs_key_check CHECK (checkpoint_key IN ('launchpad','market')),
@@ -174,6 +194,7 @@ BEGIN
   IF actual_constraints IS DISTINCT FROM expected_constraints THEN
     RAISE EXCEPTION 'strict catch-up run constraint definition is incompatible' USING ERRCODE='23514';
   END IF;
+  DROP TABLE pg_temp.listener_strict_catch_up_runs_expected;
 END;
 $$;
 
@@ -181,11 +202,11 @@ DO $$
 DECLARE run_table_oid OID:='listener_strict_catch_up_runs'::REGCLASS; target_index_oid OID;
 BEGIN
   SELECT relation.oid INTO target_index_oid FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=CURRENT_SCHEMA() AND relation.relname='listener_strict_catch_up_runs_active_key_unique';
-  IF target_index_oid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_index index_info JOIN pg_class index_class ON index_class.oid=index_info.indexrelid JOIN pg_am access_method ON access_method.oid=index_class.relam WHERE index_info.indexrelid=target_index_oid AND index_info.indrelid=run_table_oid AND index_info.indisvalid AND index_info.indisready AND index_info.indisunique AND NOT index_info.indisprimary AND access_method.amname='btree' AND index_info.indnkeyatts=1 AND index_info.indexprs IS NULL AND pg_get_indexdef(index_info.indexrelid,1,TRUE)='checkpoint_key' AND pg_get_expr(index_info.indpred,index_info.indrelid)='(state = ''ACTIVE''::text)') THEN RAISE EXCEPTION 'strict catch-up run target index definition is incompatible' USING ERRCODE='23514'; END IF;
+  IF target_index_oid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_index index_info JOIN pg_class index_class ON index_class.oid=index_info.indexrelid JOIN pg_am access_method ON access_method.oid=index_class.relam WHERE index_info.indexrelid=target_index_oid AND index_info.indrelid=run_table_oid AND index_info.indisvalid AND index_info.indisready AND index_info.indisunique AND NOT index_info.indisprimary AND access_method.amname='btree' AND index_info.indnkeyatts=1 AND index_info.indnatts=index_info.indnkeyatts AND index_info.indexprs IS NULL AND pg_get_indexdef(index_info.indexrelid,1,TRUE)='checkpoint_key' AND pg_get_expr(index_info.indpred,index_info.indrelid)='(state = ''ACTIVE''::text)') THEN RAISE EXCEPTION 'strict catch-up run target index definition is incompatible' USING ERRCODE='23514'; END IF;
   SELECT relation.oid INTO target_index_oid FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=CURRENT_SCHEMA() AND relation.relname='listener_strict_catch_up_runs_provider_key_idx';
-  IF target_index_oid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_index index_info JOIN pg_class index_class ON index_class.oid=index_info.indexrelid JOIN pg_am access_method ON access_method.oid=index_class.relam WHERE index_info.indexrelid=target_index_oid AND index_info.indrelid=run_table_oid AND index_info.indisvalid AND index_info.indisready AND NOT index_info.indisunique AND NOT index_info.indisprimary AND access_method.amname='btree' AND index_info.indnkeyatts=2 AND index_info.indexprs IS NULL AND index_info.indpred IS NULL AND pg_get_indexdef(index_info.indexrelid,1,TRUE)='provider_id' AND pg_get_indexdef(index_info.indexrelid,2,TRUE)='checkpoint_key') THEN RAISE EXCEPTION 'strict catch-up run target index definition is incompatible' USING ERRCODE='23514'; END IF;
+  IF target_index_oid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_index index_info JOIN pg_class index_class ON index_class.oid=index_info.indexrelid JOIN pg_am access_method ON access_method.oid=index_class.relam WHERE index_info.indexrelid=target_index_oid AND index_info.indrelid=run_table_oid AND index_info.indisvalid AND index_info.indisready AND NOT index_info.indisunique AND NOT index_info.indisprimary AND access_method.amname='btree' AND index_info.indnkeyatts=2 AND index_info.indnatts=index_info.indnkeyatts AND index_info.indexprs IS NULL AND index_info.indpred IS NULL AND pg_get_indexdef(index_info.indexrelid,1,TRUE)='provider_id' AND pg_get_indexdef(index_info.indexrelid,2,TRUE)='checkpoint_key') THEN RAISE EXCEPTION 'strict catch-up run target index definition is incompatible' USING ERRCODE='23514'; END IF;
   SELECT relation.oid INTO target_index_oid FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=CURRENT_SCHEMA() AND relation.relname='listener_strict_catch_up_runs_terminal_purge_idx';
-  IF target_index_oid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_index index_info JOIN pg_class index_class ON index_class.oid=index_info.indexrelid JOIN pg_am access_method ON access_method.oid=index_class.relam WHERE index_info.indexrelid=target_index_oid AND index_info.indrelid=run_table_oid AND index_info.indisvalid AND index_info.indisready AND NOT index_info.indisunique AND NOT index_info.indisprimary AND access_method.amname='btree' AND index_info.indnkeyatts=1 AND index_info.indexprs IS NULL AND pg_get_indexdef(index_info.indexrelid,1,TRUE)='purge_after' AND pg_get_expr(index_info.indpred,index_info.indrelid)='(state <> ''ACTIVE''::text)') THEN RAISE EXCEPTION 'strict catch-up run target index definition is incompatible' USING ERRCODE='23514'; END IF;
+  IF target_index_oid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_index index_info JOIN pg_class index_class ON index_class.oid=index_info.indexrelid JOIN pg_am access_method ON access_method.oid=index_class.relam WHERE index_info.indexrelid=target_index_oid AND index_info.indrelid=run_table_oid AND index_info.indisvalid AND index_info.indisready AND NOT index_info.indisunique AND NOT index_info.indisprimary AND access_method.amname='btree' AND index_info.indnkeyatts=1 AND index_info.indnatts=index_info.indnkeyatts AND index_info.indexprs IS NULL AND pg_get_indexdef(index_info.indexrelid,1,TRUE)='purge_after' AND pg_get_expr(index_info.indpred,index_info.indrelid)='(state <> ''ACTIVE''::text)') THEN RAISE EXCEPTION 'strict catch-up run target index definition is incompatible' USING ERRCODE='23514'; END IF;
 END;
 $$;
 
