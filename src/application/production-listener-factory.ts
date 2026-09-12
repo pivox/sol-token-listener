@@ -377,6 +377,7 @@ export function createProductionListenerRuntime(
     Date.now,
     paperRepository,
     qualification,
+    inbox,
   );
 
   const worker = new TransactionInboxWorker(inbox, locator, pipeline, {

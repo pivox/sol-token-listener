@@ -208,6 +208,7 @@ interface HarnessOptions {
   readonly marketActivationCount?: number;
   readonly marketAffectedMints?: readonly string[];
   readonly paperDecisions?: boolean;
+  readonly synchronizer?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -215,7 +216,7 @@ function harness(options: HarnessOptions = {}) {
   const rebuildPolicies: string[] = [];
   const observed: unknown[] = [];
   let clockCalls = 0;
-  const fail = (stage: ObservedPipelineStage, mint?: string): void => {
+  const fail = (stage: ObservedPipelineStage | 'sync_tracked_mint', mint?: string): void => {
     if (
       options.fail === stage
       && (options.failMint === undefined || options.failMint === mint)
@@ -323,6 +324,12 @@ function harness(options: HarnessOptions = {}) {
       fail('paper_decision_enqueue', mint);
     },
   } : null;
+  const synchronizer = options.synchronizer === true ? {
+    syncTrackedMint: async (mint: string) => {
+      order.push(`sync:${mint}`);
+      fail('sync_tracked_mint', mint);
+    },
+  } : null;
   const pipeline = new ObservedTransactionPipeline(
     reader,
     launchpad,
@@ -337,6 +344,7 @@ function harness(options: HarnessOptions = {}) {
     },
     paperDecisions,
     qualification,
+    synchronizer,
   );
   return {
     pipeline,
@@ -348,6 +356,38 @@ function harness(options: HarnessOptions = {}) {
     dependencies: { reader, launchpad, funding, participants, graph, market, qualification },
   };
 }
+
+void test('synchronizes lexical unique launchpad mints before active events reload', async () => {
+  const h = harness({
+    synchronizer: true,
+    launchpadAffectedMints: ['MintB', 'MintA', 'MintB'],
+  });
+
+  await h.pipeline.process(h.tx);
+
+  assert.deepEqual(h.order, [
+    'tracked', 'launchpad', 'sync:MintA', 'sync:MintB', 'reload', 'funding:',
+    'i1:MintA', 'i1:MintB', 'i2:MintA', 'i2:MintB', 'pumpswap',
+    'qualification:MintA', 'qualification:MintB',
+  ]);
+});
+
+void test('attributes tracked-mint synchronization failure and stops later stages', async () => {
+  const h = harness({
+    synchronizer: true,
+    launchpadAffectedMints: ['MintB', 'MintA'],
+    fail: 'sync_tracked_mint',
+    failMint: 'MintB',
+  });
+
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'sync_tracked_mint');
+    assert.equal(error.mint, 'MintB');
+    return true;
+  });
+  assert.deepEqual(h.order, ['tracked', 'launchpad', 'sync:MintA', 'sync:MintB']);
+});
 
 void test('runs strict stages once, collapses duplicates, and rebuilds mints lexically', async () => {
   const duplicate = event('trade-b', 'MintB');
