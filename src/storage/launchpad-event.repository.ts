@@ -26,6 +26,7 @@ import {
   toJsonValue,
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import { FOUNDATION_RETENTION_SHARED_FENCE_SQL } from './foundation-retention-fence.js';
 import { createRepositoryId } from './repositories.js';
 
 interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
@@ -88,6 +89,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       try { client = await this.pool.connect(); } catch { throw new LaunchpadEventRepositoryError('record'); }
       try {
         await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+        await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [batch.signature]);
         const byId = new Map<string, EventRecordOutcome>();
         const ordered = [...batch.events].sort((left, right) =>

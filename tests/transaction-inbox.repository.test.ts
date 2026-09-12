@@ -2601,7 +2601,7 @@ void test('rolls back and releases a checked-out client after a database failure
     && error.message === 'Transaction inbox repository operation failed.'
     && !error.message.includes('secret'));
   assert.deepEqual(queries, ['BEGIN',
-    "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
+    "SELECT pg_advisory_xact_lock_shared(hashtextextended('foundation-retention-fence:v1', 0))",
     'ROLLBACK']);
   assert.equal(released, true);
 });

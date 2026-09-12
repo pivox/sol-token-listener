@@ -50,6 +50,7 @@ import type { TransactionInboxRepository } from '../ports/transaction-inbox-repo
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import { FOUNDATION_RETENTION_SHARED_FENCE_SQL } from './foundation-retention-fence.js';
 
 interface Queryable {
   query(
@@ -179,6 +180,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     return this.safely(async () => {
       assertValidTransactionNotification(value);
       await this.transaction(async (client) => {
+        await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
           [value.signature],
@@ -337,6 +339,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     return this.safely(async () => {
       assertCanonicalMint(mint);
       await this.transaction(async (client) => {
+        await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
         await lockTrackedMint(client, mint);
         await client.query(
           `WITH decision AS MATERIALIZED (
