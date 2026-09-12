@@ -24,6 +24,8 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const executorRoleDatabaseUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
 const CHILD_TERM_TIMEOUT_MS = 2_500;
 const CHILD_KILL_TIMEOUT_MS = 1_000;
+const SIMULATION_CHILD_DATABASE_TIMEOUT_MS = 1_000;
+const SIMULATION_CHILD_SHUTDOWN_GRACE_MS = 2_000;
 
 type TrackedChild = ChildProcess & Readonly<{ captured: string[] }>;
 type ChildExit = Readonly<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -392,8 +394,8 @@ function startSimulationExecutor(
         EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '8',
         EXECUTOR_POLL_MS: '100',
         EXECUTOR_LEASE_MS: '30000',
-        EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '100',
-        EXECUTOR_SHUTDOWN_GRACE_MS: '1100',
+        EXECUTOR_DB_STATEMENT_TIMEOUT_MS: String(SIMULATION_CHILD_DATABASE_TIMEOUT_MS),
+        EXECUTOR_SHUTDOWN_GRACE_MS: String(SIMULATION_CHILD_SHUTDOWN_GRACE_MS),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     }),
