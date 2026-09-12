@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-Specification version: `pumpfun-current-create-v2-decoder.v2`.
+Specification version: `pumpfun-current-create-v2-decoder.v3`.
 
 This change updates only the observe-side Pump.fun decoder. It adds no wallet,
 signing, transaction submission, paper-entry, or live-execution capability.
@@ -63,6 +63,10 @@ The launch projection retains `creator` as the effective fee-routing creator
 for database compatibility and records the requested creator, effective
 creator, creator-fee basis points, and holder-reward flag in immutable launch
 parameters.
+
+The creation mint and bonding curve emitted by `CreateEvent` must exactly match
+the corresponding instruction accounts. A contradiction fails closed with
+`PUMP_EVENT_MISMATCH` before any launch projection can be persisted.
 
 ## Evidence and tests
 

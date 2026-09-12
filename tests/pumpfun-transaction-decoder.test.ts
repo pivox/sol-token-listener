@@ -296,6 +296,10 @@ void test('refuse les contradictions mint, user, sens, quote et programme', () =
       action('create_v2', cursor(2, null, 1), { user: OTHER }),
       eventAt(createEventInstruction(), cursor(2, 0, 2)),
     ],
+    [
+      action('create_v2', cursor(2, null, 1), { bonding_curve: OTHER }),
+      eventAt(createEventInstruction(), cursor(2, 0, 2)),
+    ],
   ];
   for (const instructions of mismatches) {
     assert.throws(
@@ -373,6 +377,7 @@ function action(
 
 function accountValue(name: string): string {
   if (name === 'mint' || name === 'base_mint') return MINT;
+  if (name === 'bonding_curve') return address(5);
   if (name === 'quote_mint') return QUOTE_MINT;
   if (name === 'user') return USER;
   if (name === 'token_program' || name === 'base_token_program') {

@@ -289,6 +289,12 @@ function validateCreation(
 ): DecodedPumpCreation {
   const event = eventCpi.event;
   requireEqual(event.mint, account(action, 'mint'), transaction, 'mint');
+  requireEqual(
+    event.bondingCurve,
+    account(action, 'bonding_curve'),
+    transaction,
+    'bonding_curve',
+  );
   requireEqual(event.name, stringArg(action, 'name'), transaction, 'name');
   requireEqual(event.symbol, stringArg(action, 'symbol'), transaction, 'symbol');
   requireEqual(event.uri, stringArg(action, 'uri'), transaction, 'uri');

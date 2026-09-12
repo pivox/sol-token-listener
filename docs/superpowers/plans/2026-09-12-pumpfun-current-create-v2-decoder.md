@@ -85,3 +85,15 @@
 - [x] Demonstrate RED for an arbitrary effective holder-reward creator.
 - [x] Require the exact Pump `holder-rewards` PDA derived from the mint.
 - [x] Re-run complete verification, publish the correction, and resolve both review threads.
+
+### Task 7: Close the final local bonding-curve evidence gap
+
+**Files:**
+- Modify: `src/launchpads/pumpfun/transaction-decoder.ts`
+- Modify: `tests/pumpfun-transaction-decoder.test.ts`
+- Modify: `docs/architecture/pumpfun-v1.md`
+- Modify: `docs/superpowers/specs/2026-09-12-pumpfun-current-create-v2-decoder-design.md`
+
+- [x] Demonstrate RED for a creation whose instruction and event disagree on the bonding curve.
+- [x] Require the exact instruction/event bonding-curve match before projection.
+- [x] Re-run complete verification and publish without requesting a third review cycle.

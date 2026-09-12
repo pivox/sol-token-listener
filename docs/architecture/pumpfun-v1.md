@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.5 — 2026-09-12
+**Version :** 1.1.6 — 2026-09-12
 
 ## Périmètre produit
 
@@ -317,7 +317,9 @@ frais pour un token holder-reward, mais ce dernier doit être exactement le PDA
 Pump dérivé de `holder-rewards` et du mint. Le taux effectif vient de
 `CreateEvent` : la présence optionnelle de `quote-control` ne prouve pas que le
 taux demandé a été appliqué, car ce compte peut être redondant pour un quote
-mint déjà autorisé par `Global`. Aucun octet final inconnu n’est toléré.
+mint déjà autorisé par `Global`. Le mint et la bonding curve de l’événement
+doivent correspondre exactement aux comptes de l’instruction. Aucun octet final
+inconnu n’est toléré.
 
 Les fixtures mainnet minimisées et versionnées couvrent une création avec
 achat initial, une vente CPI, un achat V2 CPI, une migration V2 avec son
