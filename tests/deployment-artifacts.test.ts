@@ -277,11 +277,12 @@ void test('Compose defines an observe-only, five-service deployment without expo
   }
 });
 
-void test('Compose forwards block hydration and ingestion scope with canonical safe defaults', async () => {
+void test('Compose forwards catch-up policy, block hydration and ingestion scope with safe defaults', async () => {
   const compose = await readArtifact('deploy/compose.yaml');
   const environment = await readArtifact('deploy/env.example');
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
+    ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
     ['LISTENER_BLOCK_HYDRATION_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_MAX_ENTRIES', '64'],
     ['LISTENER_BLOCK_HYDRATION_MAX_BYTES', '67108864'],
