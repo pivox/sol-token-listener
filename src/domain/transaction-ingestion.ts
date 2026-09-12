@@ -139,6 +139,8 @@ export interface ClaimedTransaction {
   readonly attempts: number;
   readonly leaseToken: string;
   readonly leaseExpiresAtMs: number;
+  /** Original durable `chain_transaction_inbox.observed_at`, in milliseconds. */
+  readonly observedAtMs: number;
   readonly normalizedTransaction: DurableNormalizedTransaction | null;
 }
 
@@ -428,6 +430,7 @@ export function assertValidClaimedTransaction(
   assertCount(record.attempts, 'Claimed transaction attempts');
   assertText(record.leaseToken, 'Claimed transaction leaseToken');
   assertMilliseconds(record.leaseExpiresAtMs, 'Claimed transaction leaseExpiresAtMs');
+  assertMilliseconds(record.observedAtMs, 'Claimed transaction observedAtMs');
   if (record.normalizedTransaction !== null) {
     const snapshot = readValidDurableNormalizedTransaction(record.normalizedTransaction);
     if (snapshot.signature !== record.signature) {

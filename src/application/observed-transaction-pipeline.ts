@@ -124,7 +124,6 @@ export class ObservedTransactionPipeline {
     private readonly participants: MintProjectionRebuilder,
     private readonly graph: MintProjectionRebuilder,
     private readonly market: MarketObserver,
-    private readonly clock: () => number = Date.now,
     private readonly paperDecisions: PaperDecisionScheduler | null = null,
     private readonly qualification: MintProjectionRebuilder | null = null,
     private readonly trackedMintInbox: TrackedMintInboxSynchronizer | null = null,
@@ -132,9 +131,10 @@ export class ObservedTransactionPipeline {
 
   public async process(
     transaction: NormalizedTransaction,
+    observedAtMs: number,
   ): Promise<ObservedPipelineResult> {
     const observed = await this.stage('create_observation', null, () =>
-      createSolanaObservedTransaction(transaction, this.clock()));
+      createSolanaObservedTransaction(transaction, observedAtMs));
     const trackedMints = await this.stage('load_tracked_mints', null, async () =>
       boundedMintSet(await this.reader.listTrackedMints()));
     const launchpad = await this.stage('launchpad_observation', null, async () =>

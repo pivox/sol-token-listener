@@ -77,7 +77,24 @@ void test('purges deferred decisions after four hours without recovering or purg
     assert.equal((await repository.claim(Date.now(), 30))?.signature, 'retained-normal');
   });
 });
+
+void test('returns the original inbox observed_at in every PostgreSQL claim', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(Object.freeze({
+      signature: 'durable-observed-at', slot: 1n, source: 'WEBSOCKET', ingestionHint: null,
+      ingestionHintMint: null, programIds: Object.freeze([PUMP_PROGRAM_ID]),
+      confirmationStatus: 'confirmed', observedAtMs: 1_700_000_000_123,
+    }));
+
+    const claim = await repository.claim(1_700_000_900_000, 30);
+
+    assert.ok(claim);
+    assert.equal(claim.observedAtMs, 1_700_000_000_123);
+  });
+});
 const EXTERNAL_BUYER = '8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR';
+const DURABLE_FIXTURE_OBSERVED_AT_MS = Date.now() - 60_000;
 const BOUNDARIES = Object.freeze([
   'launchpad', 'funding', 'i1', 'i2', 'pumpswap', 'qualification',
 ] as const);
@@ -323,7 +340,7 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
     });
 
     const replayOrder: ReplayStage[] = [];
-    await pipeline(pool, null, replayOrder).process(orphaned);
+    await pipeline(pool, null, replayOrder).process(orphaned, DURABLE_FIXTURE_OBSERVED_AT_MS);
     assert.deepEqual(replayOrder, FULL_REPLAY);
     assert.deepEqual(await auditCounts(pool), beforeAudit);
     assert.deepEqual(await currentProjectionCounts(pool), {
@@ -347,11 +364,15 @@ void test('resets missing finality evidence after a restart on fallback before a
       ingestionHintMint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
       confirmationStatus: 'confirmed' as const,
-      observedAtMs: 1_000,
+      observedAtMs: DURABLE_FIXTURE_OBSERVED_AT_MS,
     }));
     assert.deepEqual(
       await worker(repository, transaction, pipeline(pool, null, [])).runOnce(),
       { kind: 'processed', signature: transaction.signature },
+    );
+    assert.equal(
+      await inboxObservedAtMs(pool, transaction.signature),
+      DURABLE_FIXTURE_OBSERVED_AT_MS,
     );
 
     const primary = new FinalityReconciler(
@@ -385,6 +406,10 @@ void test('resets missing finality evidence after a restart on fallback before a
     assert.deepEqual(fallback.blockProofs, [
       Object.freeze({ providerId: 'fallback-1', slot: transaction.slot }),
     ]);
+    assert.equal(
+      await inboxObservedAtMs(pool, transaction.signature),
+      DURABLE_FIXTURE_OBSERVED_AT_MS,
+    );
   });
 });
 
@@ -502,7 +527,7 @@ function pipeline(
     maxAttempts: 5,
     baseDelayMs: 500,
     retentionHours: 4,
-    clock: () => 1_800_000_000_000,
+    clock: () => DURABLE_FIXTURE_OBSERVED_AT_MS,
   }, qualificationEngine.profileSummary);
   const after = async <T>(boundary: ReplayStage, operation: Promise<T>): Promise<T> => {
     const result = await operation;
@@ -522,7 +547,6 @@ function pipeline(
     { rebuild: (mint, policy) => after('i1', realParticipants.rebuild(mint, policy)) },
     { rebuild: (mint, policy) => after('i2', realGraph.rebuild(mint, policy)) },
     { processObserved: (observed) => after('pumpswap', realMarket.processObserved(observed)) },
-    () => 1_800_000_000_000,
     {
       enqueueLatest: (...args) => after('paper', paperDecisions.enqueueLatest(...args)),
     },
@@ -609,7 +633,7 @@ function marketPipeline(
       virtualQuoteReservesRaw: 5_000n,
       effectiveQuoteReservesRaw: 25_000n,
       observedSlot: canonical.activatedAt.slot,
-      observedAtMs: 1_800_000_000_000,
+      observedAtMs: DURABLE_FIXTURE_OBSERVED_AT_MS,
     }) },
     { quote: () => Promise.reject(new Error('unused market quote')) },
     () => undefined,
@@ -618,7 +642,6 @@ function marketPipeline(
     pump,
     market,
     new MarketObservationService(new PostgresMarketObservationRepository(pool, 4)),
-    () => 1_800_000_000_000,
   );
 }
 
@@ -929,6 +952,20 @@ async function inboxRow(pool: InstanceType<typeof pg.Pool>, signature: string): 
   const row = result.rows[0];
   if (row === undefined) throw new Error('Inbox row missing');
   return row;
+}
+
+async function inboxObservedAtMs(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+): Promise<number> {
+  const row = (await pool.query<{ observed_at: Date }>(
+    'SELECT observed_at FROM chain_transaction_inbox WHERE signature = $1',
+    [signature],
+  )).rows[0];
+  if (row === undefined || !(row.observed_at instanceof Date)) {
+    throw new Error('Inbox observed_at is missing');
+  }
+  return row.observed_at.getTime();
 }
 
 function missingFinalityPass(

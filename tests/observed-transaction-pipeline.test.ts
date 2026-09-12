@@ -215,7 +215,6 @@ function harness(options: HarnessOptions = {}) {
   const order: string[] = [];
   const rebuildPolicies: string[] = [];
   const observed: unknown[] = [];
-  let clockCalls = 0;
   const fail = (stage: ObservedPipelineStage | 'sync_tracked_mint', mint?: string): void => {
     if (
       options.fail === stage
@@ -337,11 +336,6 @@ function harness(options: HarnessOptions = {}) {
     participants,
     graph,
     market,
-    () => {
-      clockCalls += 1;
-      fail('create_observation');
-      return 1_700_000_000_500;
-    },
     paperDecisions,
     qualification,
     synchronizer,
@@ -352,7 +346,6 @@ function harness(options: HarnessOptions = {}) {
     order,
     rebuildPolicies,
     observed,
-    clockCalls: () => clockCalls,
     dependencies: { reader, launchpad, funding, participants, graph, market, qualification },
   };
 }
@@ -363,13 +356,23 @@ void test('synchronizes lexical unique launchpad mints before active events relo
     launchpadAffectedMints: ['MintB', 'MintA', 'MintB'],
   });
 
-  await h.pipeline.process(h.tx);
+  await h.pipeline.process(h.tx, 1_700_000_000_500);
 
   assert.deepEqual(h.order, [
     'tracked', 'launchpad', 'sync:MintA', 'sync:MintB', 'reload', 'funding:',
     'i1:MintA', 'i1:MintB', 'i2:MintA', 'i2:MintB', 'pumpswap',
     'qualification:MintA', 'qualification:MintB',
   ]);
+});
+
+void test('uses the supplied durable inbox observation timestamp instead of its clock', async () => {
+  const h = harness();
+
+  await h.pipeline.process(h.tx, 1_700_000_123_456);
+
+  for (const value of h.observed) {
+    assert.equal((value as { readonly observedAtMs: number }).observedAtMs, 1_700_000_123_456);
+  }
 });
 
 void test('attributes tracked-mint synchronization failure and stops later stages', async () => {
@@ -380,7 +383,7 @@ void test('attributes tracked-mint synchronization failure and stops later stage
     failMint: 'MintB',
   });
 
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'sync_tracked_mint');
     assert.equal(error.mint, 'MintB');
@@ -405,7 +408,7 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     fundingEvidenceCount: 1,
   });
 
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
 
   assert.deepEqual(h.order, [
     'tracked',
@@ -424,7 +427,6 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
   assert.equal(h.observed[0], h.observed[1]);
   assert.equal(h.observed[1], h.observed[2]);
   assert.ok(Object.isFrozen(h.observed[0]));
-  assert.equal(h.clockCalls(), 1);
   assert.deepEqual(result, {
     launchpadEventCount: 3,
     activeEventCount: 3,
@@ -444,7 +446,7 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
 
 void test('keeps an irrelevant active transaction write-minimal while PumpSwap still gets a chance', async () => {
   const h = harness({ tracked: ['ExistingMint'] });
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
   assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload', 'funding:', 'pumpswap']);
   assert.equal(result.affectedMintCount, 0);
   assert.equal(result.qualificationRebuildCount, 0);
@@ -458,7 +460,7 @@ void test('enqueues one durable paper decision per affected mint after every pro
     paperDecisions: true,
   });
 
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
 
   assert.deepEqual(h.order.slice(-7), [
     'pumpswap',
@@ -481,7 +483,7 @@ void test('rebuilds the sorted affected and market union before paper decisions'
     paperDecisions: true,
   });
 
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
 
   assert.deepEqual(h.order.slice(4), [
     'i1:MintA', 'i1:MintB',
@@ -504,7 +506,7 @@ void test('attributes a qualification failure to its mint and stops before paper
     failMint: 'MintB',
   });
 
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'qualification');
     assert.equal(error.mint, 'MintB');
@@ -522,7 +524,7 @@ void test('attributes a paper enqueue failure to its mint and stops deterministi
     failMint: 'MintA',
   });
 
-  await assert.rejects(h.pipeline.process(transaction('ORPHANED')), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(transaction('ORPHANED'), 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'paper_decision_enqueue');
     assert.equal(error.mint, 'MintA');
@@ -535,7 +537,7 @@ void test('pairs creation and initial buy for one mint only once', async () => {
   const h = harness({
     activeEvents: [event('create', 'NewMint', 'TokenLaunchDetected'), event('buy', 'NewMint')],
   });
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
   assert.deepEqual(h.order.slice(4, 6), ['i1:NewMint', 'i2:NewMint']);
   assert.equal(result.affectedMintCount, 1);
 });
@@ -547,7 +549,7 @@ void test('uses persisted launchpad impact to dissolve orphaned projections afte
     launchpadAffectedMints: ['MintA', 'MintZ', 'MintA'],
   });
   h.tx.confirmationStatus = 'ORPHANED';
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
   assert.deepEqual(h.order, [
     'tracked', 'launchpad', 'reload', 'funding:',
     'i1:MintA', 'i1:MintZ', 'i2:MintA', 'i2:MintZ', 'pumpswap',
@@ -568,7 +570,7 @@ void test('uses error policy for every active confirmation status', async () => 
   for (const status of ['PROCESSED', 'CONFIRMED', 'FINALIZED'] as const) {
     const h = harness({ launchpadAffectedMints: ['MintA'] });
     h.tx.confirmationStatus = status;
-    await h.pipeline.process(h.tx);
+    await h.pipeline.process(h.tx, 1_700_000_000_500);
     assert.deepEqual(h.rebuildPolicies, [
       'i1:MintA:ERROR',
       'i2:MintA:ERROR',
@@ -583,7 +585,7 @@ void test('stops before every I2 rebuild when I1 fails on a later lexical mint',
     fail: 'participant_analytics',
     failMint: 'MintB',
   });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'participant_analytics');
     assert.equal(error.mint, 'MintB');
@@ -602,7 +604,7 @@ void test('keeps orphan impact on replay after tracked and active rows have alre
     launchpadAffectedMints: ['RetractedMint'],
   });
   h.tx.confirmationStatus = 'ORPHANED';
-  await h.pipeline.process(h.tx);
+  await h.pipeline.process(h.tx, 1_700_000_000_500);
   assert.deepEqual(h.order.slice(4, 7), [
     'i1:RetractedMint', 'i2:RetractedMint', 'pumpswap',
   ]);
@@ -616,7 +618,7 @@ void test('runs migration activation through PumpSwap then qualification and pap
     marketAffectedMints: ['MigratedMint'],
     paperDecisions: true,
   });
-  const result = await h.pipeline.process(h.tx);
+  const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
   assert.deepEqual(h.order.slice(-3), [
     'pumpswap',
     'qualification:MigratedMint',
@@ -630,7 +632,6 @@ void test('runs migration activation through PumpSwap then qualification and pap
 
 void test('cuts off after each failed stage and identifies the exact stable stage and mint', async () => {
   const cases: readonly [ObservedPipelineStage, readonly string[], string | null][] = [
-    ['create_observation', [], null],
     ['load_tracked_mints', ['tracked'], null],
     ['launchpad_observation', ['tracked', 'launchpad'], null],
     ['reload_active_events', ['tracked', 'launchpad', 'reload'], null],
@@ -640,9 +641,17 @@ void test('cuts off after each failed stage and identifies the exact stable stag
     ['pumpswap_observation', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA', 'pumpswap'], null],
     ['qualification', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA', 'pumpswap', 'qualification:MintA'], 'MintA'],
   ];
+  const invalidTimestamp = harness({ activeEvents: [event('event-a', 'MintA')] });
+  await assert.rejects(invalidTimestamp.pipeline.process(invalidTimestamp.tx, -1), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'create_observation');
+    assert.equal(error.mint, null);
+    return true;
+  });
+  assert.deepEqual(invalidTimestamp.order, []);
   for (const [stage, expectedOrder, mint] of cases) {
     const h = harness({ activeEvents: [event('event-a', 'MintA')], fail: stage });
-    await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
       assert.ok(error instanceof ObservedPipelineError);
       assert.equal(error.code, 'PIPELINE_STAGE_FAILED');
       assert.equal(error.stage, stage);
@@ -666,7 +675,7 @@ void test('redacts hostile transaction accessors at the observation boundary', a
       return Reflect.get(_target, property, receiver);
     },
   });
-  await assert.rejects(h.pipeline.process(hostile), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(hostile, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'create_observation');
     assert.equal(error.message.includes(secret), false);
@@ -678,7 +687,7 @@ void test('redacts hostile transaction accessors at the observation boundary', a
 
 void test('full replay safely reruns the same idempotent stage sequence', async () => {
   const h = harness({ activeEvents: [event('event-a', 'MintA')] });
-  assert.deepEqual(await h.pipeline.process(h.tx), await h.pipeline.process(h.tx));
+  assert.deepEqual(await h.pipeline.process(h.tx, 1_700_000_000_500), await h.pipeline.process(h.tx, 1_700_000_000_500));
   const replayLength = h.order.length / 2;
   assert.deepEqual(h.order.slice(0, replayLength), h.order.slice(replayLength));
 });
@@ -702,9 +711,8 @@ void test('redacts hostile dependency errors without consulting their properties
     h.dependencies.participants,
     h.dependencies.graph,
     h.dependencies.market,
-    () => 1_700_000_000_500,
   );
-  await assert.rejects(pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(JSON.stringify(error).includes(secret), false);
     assert.equal(error.message.includes(secret), false);
@@ -718,7 +726,7 @@ void test('rejects unsafe dependency-provided mint labels before they reach stag
     launchpadAffectedMints: [secret],
     fail: 'participant_analytics',
   });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'launchpad_observation');
     assert.equal(error.mint, null);
@@ -730,7 +738,7 @@ void test('rejects unsafe dependency-provided mint labels before they reach stag
 
 void test('rejects oversized dependency collections before iterating them unboundedly', async () => {
   const h = harness({ tracked: Array.from({ length: MAX_OBSERVED_PIPELINE_ITEMS + 1 }, (_, i) => `Mint${i}`) });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'load_tracked_mints');
     return true;
@@ -750,7 +758,7 @@ void test('snapshots active events without invoking a stateful type getter', asy
     },
   });
   const h = harness({ activeEvents: [hostile as unknown as LaunchpadObservationEventV1] });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     assert.equal(error.message.includes(secret), false);
@@ -780,7 +788,7 @@ void test('captures active event array length once from a stateful proxy', async
     },
   });
   const h = harness({ activeEvents: events });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     return true;
@@ -804,7 +812,7 @@ void test('rejects sparse, accessor, and prototype-tricked active arrays without
   Object.setPrototypeOf(wrongPrototype, Object.create(Array.prototype));
   for (const activeEvents of [sparse, accessor, wrongPrototype]) {
     const h = harness({ activeEvents });
-    await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
       assert.ok(error instanceof ObservedPipelineError);
       assert.equal(error.stage, 'reload_active_events');
       return true;
@@ -820,7 +828,7 @@ void test('rejects one event ID carrying conflicting durable payloads', async ()
     observedAtMs: original.observedAtMs + 1,
   }) as LaunchpadObservationEventV1;
   const h = harness({ activeEvents: [original, conflicting] });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     return true;
@@ -841,7 +849,7 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
       (_, index) => `Mint_${index}`,
     ),
   });
-  await assert.doesNotReject(exactTracked.pipeline.process(exactTracked.tx));
+  await assert.doesNotReject(exactTracked.pipeline.process(exactTracked.tx, 1_700_000_000_500));
   const trackedPipeline = new ObservedTransactionPipeline(
     {
       ...h.dependencies.reader,
@@ -852,9 +860,8 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
     h.dependencies.participants,
     h.dependencies.graph,
     h.dependencies.market,
-    () => 1_700_000_000_500,
   );
-  await assert.rejects(trackedPipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(trackedPipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'load_tracked_mints');
     return true;
@@ -863,12 +870,12 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
   const exactAffected = harness({
     launchpadAffectedValue: iterable(MAX_OBSERVED_PIPELINE_ITEMS),
   });
-  const exactAffectedResult = await exactAffected.pipeline.process(exactAffected.tx);
+  const exactAffectedResult = await exactAffected.pipeline.process(exactAffected.tx, 1_700_000_000_500);
   assert.equal(exactAffectedResult.affectedMintCount, MAX_OBSERVED_PIPELINE_ITEMS);
   const affected = harness({
     launchpadAffectedValue: iterable(MAX_OBSERVED_PIPELINE_ITEMS + 1),
   });
-  await assert.rejects(affected.pipeline.process(affected.tx), (error: unknown) => {
+  await assert.rejects(affected.pipeline.process(affected.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'launchpad_observation');
     assert.equal('cause' in error, false);
@@ -896,11 +903,10 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
       h.dependencies.participants,
       h.dependencies.graph,
       h.dependencies.market,
-      () => 1_700_000_000_500,
     ),
     harness({ launchpadAffectedValue: throwing }).pipeline,
   ]) {
-    await assert.rejects(pipeline.process(h.tx), (error: unknown) => {
+    await assert.rejects(pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
       assert.ok(error instanceof ObservedPipelineError);
       assert.equal(error.message.includes(secret), false);
       assert.equal('cause' in error, false);
@@ -916,7 +922,7 @@ void test('applies the serialized bound within the active-event item bound and r
       new Array<LaunchpadObservationEventV1>(MAX_OBSERVED_PIPELINE_ITEMS).fill(repeated),
     ),
   });
-  await assert.rejects(exact.pipeline.process(exact.tx), (error: unknown) => {
+  await assert.rejects(exact.pipeline.process(exact.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     return true;
@@ -926,7 +932,7 @@ void test('applies the serialized bound within the active-event item bound and r
       new Array<LaunchpadObservationEventV1>(MAX_OBSERVED_PIPELINE_ITEMS + 1).fill(repeated),
     ),
   });
-  await assert.rejects(oversized.pipeline.process(oversized.tx), (error: unknown) => {
+  await assert.rejects(oversized.pipeline.process(oversized.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     return true;
@@ -937,12 +943,12 @@ void test('counts every visited leaf at the snapshot node limit and rejects one 
   const { exact, leaves } = launchAtSnapshotNodeLimit();
   assert.equal(visitedSnapshotValues([exact]), MAX_SNAPSHOT_NODES);
   const accepted = harness({ activeEvents: [exact] });
-  await assert.doesNotReject(accepted.pipeline.process(accepted.tx));
+  await assert.doesNotReject(accepted.pipeline.process(accepted.tx, 1_700_000_000_500));
 
   const oversized = launchWithNumericLeaves('node-bound', leaves + 1);
   assert.equal(visitedSnapshotValues([oversized]), MAX_SNAPSHOT_NODES + 1);
   const rejected = harness({ activeEvents: [oversized] });
-  await assert.rejects(rejected.pipeline.process(rejected.tx), (error: unknown) => {
+  await assert.rejects(rejected.pipeline.process(rejected.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     assert.equal('cause' in error, false);
@@ -954,7 +960,7 @@ void test('counts every visited leaf at the snapshot node limit and rejects one 
 void test('enforces exact aggregate serialized bytes including numeric leaves and JSON syntax', async () => {
   const { exact, leaves, paddingBytes } = launchAtSerializedByteLimit();
   const accepted = harness({ activeEvents: [exact] });
-  await assert.doesNotReject(accepted.pipeline.process(accepted.tx));
+  await assert.doesNotReject(accepted.pipeline.process(accepted.tx, 1_700_000_000_500));
 
   const oversized = launchWithNumericLeaves(
     'serialized-bound',
@@ -967,7 +973,7 @@ void test('enforces exact aggregate serialized bytes including numeric leaves an
     MAX_CANONICAL_JSON_TEXT_BYTES + 1,
   );
   const rejected = harness({ activeEvents: [oversized] });
-  await assert.rejects(rejected.pipeline.process(rejected.tx), (error: unknown) => {
+  await assert.rejects(rejected.pipeline.process(rejected.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     assert.equal(error.message.includes('serialized'), false);
@@ -981,7 +987,7 @@ void test('charges a shared event subtree for every logical occurrence', async (
   const shared = launchWithNumericLeaves('shared-node-bound', 50_000);
   assert.ok(visitedSnapshotValues([shared]) < MAX_SNAPSHOT_NODES);
   const h = harness({ activeEvents: [shared, shared] });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     assert.equal('cause' in error, false);
@@ -1002,7 +1008,7 @@ void test('rejects 4096 shared padded events before funding without expanding th
       MAX_OBSERVED_PIPELINE_ITEMS,
     ).fill(shared),
   });
-  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     assert.equal('cause' in error, false);
@@ -1014,7 +1020,7 @@ void test('rejects 4096 shared padded events before funding without expanding th
 void test('clones shared events below the limits, collapses their IDs, and still rejects cycles', async () => {
   const shared = launchWithNumericLeaves('shared-small', 4, 7, 'padding');
   const accepted = harness({ activeEvents: [shared, shared] });
-  const result = await accepted.pipeline.process(accepted.tx);
+  const result = await accepted.pipeline.process(accepted.tx, 1_700_000_000_500);
   assert.equal(result.activeEventCount, 1);
 
   const cyclic: unknown[] = [];
@@ -1022,7 +1028,7 @@ void test('clones shared events below the limits, collapses their IDs, and still
   const rejected = harness({
     activeEvents: cyclic as readonly LaunchpadObservationEventV1[],
   });
-  await assert.rejects(rejected.pipeline.process(rejected.tx), (error: unknown) => {
+  await assert.rejects(rejected.pipeline.process(rejected.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     return true;

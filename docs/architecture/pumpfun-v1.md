@@ -123,6 +123,11 @@ avant l’enqueue paper ; son échec arrête ce mint à l’étape `qualificatio
 laisse l’inbox durable appliquer sa politique de reprise. L’API ne formule
 aucune garantie de profit, de même slot ou de sellabilité.
 
+L’instant de l’observation est également une propriété durable de l’inbox : le
+worker transmet `chain_transaction_inbox.observed_at` à chaque pipeline. Une
+reprise après persistance partielle, un redémarrage ou une montée de finalité
+peut modifier la finalité de l’observation, mais ne recapture jamais son heure.
+
 ## Dépendances autorisées
 
 ```text
