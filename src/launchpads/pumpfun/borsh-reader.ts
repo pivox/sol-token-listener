@@ -1,5 +1,5 @@
 import { PublicKey } from '@solana/web3.js';
-import { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 
 export class PumpBorshReader {
   private position = 0;
@@ -18,7 +18,7 @@ export class PumpBorshReader {
     const value = this.readBytes(1)[0];
     if (value === 0) return false;
     if (value === 1) return true;
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_BORSH_INVALID',
       false,
       `Booléen Borsh invalide: ${value}.`,
@@ -42,7 +42,7 @@ export class PumpBorshReader {
       data.byteLength,
     ).getUint32(0, true);
     if (value > maximum) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_BORSH_INVALID',
         false,
         `Longueur Borsh ${value} supérieure à ${maximum}.`,
@@ -79,7 +79,7 @@ export class PumpBorshReader {
     try {
       return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     } catch (cause) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_BORSH_INVALID',
         false,
         'Chaîne Borsh UTF-8 invalide.',
@@ -91,14 +91,14 @@ export class PumpBorshReader {
 
   public readBytes(length: number): Uint8Array {
     if (!Number.isSafeInteger(length) || length < 0) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_BORSH_INVALID',
         false,
         `Longueur Borsh invalide: ${length}.`,
       );
     }
     if (this.remaining < length) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_BORSH_TRUNCATED',
         true,
         `Données Borsh tronquées à l’octet ${this.position}.`,

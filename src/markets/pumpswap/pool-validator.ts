@@ -20,6 +20,7 @@ import type { ReadonlyAccountSnapshot } from '../../ports/market-rpc-reader.js';
 import type { MarketRpcReader } from '../../ports/market-rpc-reader.js';
 import type { SolanaObservedTransaction } from '../../solana/rpc/observed-transaction.js';
 import { decodePumpSwapPoolAccount } from './pool-account-decoder.js';
+import { rethrowMutablePumpSwapRpcFailure } from './errors.js';
 import type {
   DecodedPumpSwapPoolAccount,
   DecodedPumpSwapPoolCreation,
@@ -43,6 +44,17 @@ export class RpcPumpSwapPoolValidator {
   public constructor(private readonly rpc: MarketRpcReader) {}
 
   public async validate(
+    creation: DecodedPumpSwapPoolCreation,
+    transaction: SolanaObservedTransaction,
+  ): Promise<CanonicalMarketPool | null> {
+    try {
+      return await this.validateMutableAccounts(creation, transaction);
+    } catch (cause) {
+      rethrowMutablePumpSwapRpcFailure(cause);
+    }
+  }
+
+  private async validateMutableAccounts(
     creation: DecodedPumpSwapPoolCreation,
     transaction: SolanaObservedTransaction,
   ): Promise<CanonicalMarketPool | null> {

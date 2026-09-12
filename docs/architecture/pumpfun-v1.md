@@ -128,6 +128,15 @@ worker transmet `chain_transaction_inbox.observed_at` à chaque pipeline. Une
 reprise après persistance partielle, un redémarrage ou une montée de finalité
 peut modifier la finalité de l’observation, mais ne recapture jamais son heure.
 
+Les nouveaux échecs de ce pipeline suivent la
+[taxonomie durable v1.0.0](../superpowers/specs/2026-09-12-observed-pipeline-failure-taxonomy-design.md).
+L’inbox conserve `PIPELINE_STAGE_FAILED` et le nom fermé
+`ObservedPipelineFailure.v1.<stage>.<origin-code>` : les 26 codes de décodage
+internes sont terminaux sur snapshot ; `UNKNOWN` et les erreurs DB/RPC restent
+retryables. Une identité enregistrée par le code interne, jamais les propriétés
+d’une erreur étrangère, porte cette autorité. Les nouvelles écritures hors
+contrat sont rejetées avant I/O, sans migration des anciennes lignes.
+
 ## Dépendances autorisées
 
 ```text

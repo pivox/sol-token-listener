@@ -1,5 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
-import { PumpSwapDecodingError } from './errors.js';
+import type { PumpSwapDecodingError } from './errors.js';
+import { createPumpSwapDecodingError } from './errors.js';
 
 export class PumpSwapBorshReader {
   private position = 0;
@@ -41,7 +42,7 @@ export class PumpSwapBorshReader {
       return new TextDecoder('utf-8', { fatal: true })
         .decode(this.readBytes(length));
     } catch (cause) {
-      throw new PumpSwapDecodingError(
+      throw createPumpSwapDecodingError(
         'PUMPSWAP_BORSH_INVALID',
         'Chaîne Borsh UTF-8 invalide.',
         null,
@@ -54,7 +55,7 @@ export class PumpSwapBorshReader {
       throw invalid(`Longueur Borsh invalide: ${length}.`);
     }
     if (this.remaining < length) {
-      throw new PumpSwapDecodingError(
+      throw createPumpSwapDecodingError(
         'PUMPSWAP_BORSH_TRUNCATED',
         `Données Borsh tronquées à l’octet ${this.position}.`,
       );
@@ -74,5 +75,5 @@ export class PumpSwapBorshReader {
 }
 
 function invalid(message: string): PumpSwapDecodingError {
-  return new PumpSwapDecodingError('PUMPSWAP_BORSH_INVALID', message);
+  return createPumpSwapDecodingError('PUMPSWAP_BORSH_INVALID', message);
 }

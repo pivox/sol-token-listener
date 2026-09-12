@@ -1,3 +1,4 @@
+import { registerInternalDecodingFailure } from '../../domain/observed-pipeline-failure.js';
 export const PUMP_DECODING_ERROR_CODES = [
   'PUMP_TRANSACTION_INDEX_REQUIRED',
   'PUMP_SCHEMA_UNSUPPORTED',
@@ -18,6 +19,17 @@ export const PUMP_DECODING_ERROR_CODES = [
 
 export type PumpDecodingErrorCode =
   (typeof PUMP_DECODING_ERROR_CODES)[number];
+
+const knownCodes = new Set<unknown>(PUMP_DECODING_ERROR_CODES);
+
+/** Internal decoder factory. Public error construction does not grant terminal authority. */
+export function createPumpDecodingError(
+  ...args: ConstructorParameters<typeof PumpDecodingError>
+): PumpDecodingError {
+  const error = new PumpDecodingError(...args);
+  if (knownCodes.has(args[0])) registerInternalDecodingFailure(error, args[0]);
+  return error;
+}
 
 export class PumpDecodingError extends Error {
   public readonly decodingCause: unknown;

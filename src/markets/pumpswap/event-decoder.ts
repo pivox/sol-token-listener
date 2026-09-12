@@ -10,7 +10,7 @@ import type {
   DecodedPumpSwapCpiEvent,
   PumpSwapIdlValue,
 } from './types.js';
-import { PumpSwapDecodingError } from './errors.js';
+import { createPumpSwapDecodingError } from './errors.js';
 
 const EVENT_TAG = Uint8Array.from(
   createHash('sha256').update('anchor:event').digest().subarray(0, 8),
@@ -66,7 +66,7 @@ function decodeValue(type: unknown, reader: PumpSwapBorshReader): PumpSwapIdlVal
   if (type === 'bool') return reader.readBool();
   if (type === 'pubkey') return reader.readPubkey();
   if (type === 'string') return reader.readString();
-  throw new PumpSwapDecodingError(
+  throw createPumpSwapDecodingError(
     'PUMPSWAP_SCHEMA_UNSUPPORTED',
     `Type d’événement PumpSwap non pris en charge: ${JSON.stringify(type)}.`,
   );

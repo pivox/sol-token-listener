@@ -13,6 +13,10 @@ import { PumpFunLaunchpadAdapter } from '../src/launchpads/pumpfun/pumpfun-launc
 import type { DecodedPumpTransaction } from '../src/launchpads/pumpfun/types.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { PumpSwapMarketAdapter } from '../src/markets/pumpswap/pumpswap-market.adapter.js';
+import { PUMPSWAP_INSTRUCTIONS } from '../src/markets/pumpswap/generated/pumpswap-idl.js';
+import { failurePipeline, failureTransaction } from './observed-pipeline-failure-fixtures.js';
+import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
+import { createDurableTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
 import type { DecodedPumpSwapTransaction } from '../src/markets/pumpswap/types.js';
 import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
@@ -201,6 +205,37 @@ void test('pipeline accepts processed to confirmed pool enrichment', async () =>
   );
   await pipeline.observe(transaction('PROCESSED'));
   await assert.doesNotReject(pipeline.observe(transaction('CONFIRMED')));
+});
+
+void test('absorbed real PumpSwap decoding issues do not become inbox failures on snapshot replay', async () => {
+  const repository = new MemoryRepository();
+  const reported: string[] = [];
+  const unused = async (): Promise<never> => { assert.fail('unneeded external I/O'); };
+  const market = new PumpSwapMarketAdapter(undefined, { validate: unused }, { read: unused }, { quote: unused },
+    (issue) => { reported.push(issue.code); });
+  const marketPipeline = new PumpSwapObservationPipeline(
+    new PumpFunLaunchpadAdapter({ read: unused }), market, new MarketObservationService(repository),
+  );
+  const observedPipeline = failurePipeline(() => {}, 'launchpad_observation', undefined, marketPipeline);
+  const raw = { ...failureTransaction(), instructions: [{
+    programId: PUMPSWAP_PROGRAM_ID, accounts: [], data: Uint8Array.from(PUMPSWAP_INSTRUCTIONS.buy.discriminator),
+    instructionIndex: 0, innerInstructionIndex: null, parentInstructionIndex: null, stackHeight: null,
+  }] };
+  let processed = false;
+  const worker = new TransactionInboxWorker({
+    async claim() { return Object.freeze({
+      signature: 'sig', slot: 1n, confirmationStatus: 'confirmed', attempts: 1,
+      leaseToken: 'lease', leaseExpiresAtMs: 11000, observedAtMs: 1000,
+      normalizedTransaction: createDurableTransactionSnapshot(raw),
+    }); },
+    async renewLease() {}, saveSnapshot: unused, markFailed: unused,
+    async markProcessed() { processed = true; },
+  }, { locate: unused }, observedPipeline,
+  { leaseSeconds: 10, renewalIntervalMs: 1000, idlePollMs: 100, now: () => 1000 });
+  assert.equal((await worker.runOnce()).kind, 'processed');
+  assert.equal(processed, true);
+  assert.deepEqual(reported, ['PUMPSWAP_ACCOUNT_MISSING']);
+  assert.equal(repository.recordedBatches.length, 0);
 });
 
 class MemoryRepository implements MarketObservationRepository {

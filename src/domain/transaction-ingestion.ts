@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { PublicKey } from '@solana/web3.js';
+import { assertValidObservedPipelineFailure } from './observed-pipeline-failure.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
 import { assertValidChainCursor, assertValidTransactionCursor } from './cursor.js';
@@ -456,6 +457,9 @@ export function assertValidIngestionFailure(
   assertText(record.errorName, 'Ingestion failure errorName');
   if (typeof record.retryable !== 'boolean') {
     throw new TypeError('Ingestion failure retryable must be boolean.');
+  }
+  if (record.code === 'PIPELINE_STAGE_FAILED') {
+    assertValidObservedPipelineFailure(record.errorName, record.retryable);
   }
 }
 

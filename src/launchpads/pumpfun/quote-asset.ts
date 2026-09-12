@@ -9,7 +9,7 @@ import {
   TOKEN_2022_PROGRAM_ADDRESS,
   WSOL_MINT,
 } from './constants.js';
-import { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 
 export function normalizePumpQuoteMint(quoteMint: string): string {
   return quoteMint === DEFAULT_PUBLIC_KEY ? WSOL_MINT : quoteMint;
@@ -30,7 +30,7 @@ export function resolvePumpQuoteAsset(
 
   const candidates = quoteBalanceCandidates(mint, transaction);
   if (candidates.length === 0) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_QUOTE_ASSET_UNRESOLVED',
       true,
       `Quote mint Pump non résolu dans ${transaction.signature}: ${mint}.`,
@@ -38,7 +38,7 @@ export function resolvePumpQuoteAsset(
     );
   }
   if (candidates.length > 1) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_QUOTE_ASSET_CONFLICT',
       true,
       `Métadonnées quote Pump conflictuelles pour ${mint}.`,
@@ -48,7 +48,7 @@ export function resolvePumpQuoteAsset(
 
   const candidate = candidates[0];
   if (candidate === undefined) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_QUOTE_ASSET_UNRESOLVED',
       true,
       `Quote mint Pump non résolu dans ${transaction.signature}: ${mint}.`,
@@ -73,7 +73,7 @@ function quoteBalanceCandidates(
   ]) {
     if (balance.mint !== mint) continue;
     if (!isValidDecimals(balance.decimals)) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_QUOTE_ASSET_CONFLICT',
         true,
         `Décimales quote Pump invalides pour ${mint}.`,
@@ -94,7 +94,7 @@ function tokenProgramKind(
 ): TokenProgramKind {
   if (tokenProgram === SPL_TOKEN_PROGRAM_ID) return 'SPL_TOKEN';
   if (tokenProgram === TOKEN_2022_PROGRAM_ADDRESS) return 'TOKEN_2022';
-  throw new PumpDecodingError(
+  throw createPumpDecodingError(
     'PUMP_TOKEN_PROGRAM_UNSUPPORTED',
     false,
     `Programme token quote Pump non pris en charge: ${tokenProgram}.`,

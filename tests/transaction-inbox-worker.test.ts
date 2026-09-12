@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { ObservedPipelineError } from '../src/application/observed-transaction-pipeline.js';
 import test from 'node:test';
 import {
   TransactionInboxWorker,
@@ -187,10 +188,29 @@ void test('classifies corrupt snapshots and pipeline failures without leaking th
     async markFailed(_signature, _token, value) { pipelineFailure = value; },
   }), locator(), { process() { return Promise.reject(hostile); } }, options());
   assert.deepEqual(await pipelineWorker.runOnce(), {
-    kind: 'failed', signature: 'sig', failure: failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineError', true),
+    kind: 'failed', signature: 'sig', failure: failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', true),
   });
-  assert.deepEqual(pipelineFailure, failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineError', true));
+  assert.deepEqual(pipelineFailure, failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', true));
   assert.equal(traps, 0);
+});
+
+void test('does not grant terminal authority to public or forged pipeline wrappers and direct primitives', async () => {
+  class ForeignPipelineError extends ObservedPipelineError {}
+  for (const error of [
+    undefined, null, false, 'secret',
+    new ObservedPipelineError('launchpad_observation'),
+    new ForeignPipelineError('launchpad_observation'),
+    Object.create(ObservedPipelineError.prototype),
+    { code: 'PIPELINE_STAGE_FAILED', stage: 'launchpad_observation', originCode: 'PUMP_BORSH_INVALID', retryable: false },
+  ]) {
+    let marked: IngestionFailure | null = null;
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() { return claim(); },
+      async markFailed(_signature, _token, value) { marked = value; },
+    }), locator(), { async process() { throw error; } }, options());
+    await worker.runOnce();
+    assert.deepEqual(marked, failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', true));
+  }
 });
 
 void test('renews during a long pipeline, uses monotonic expiry, and cleans the timer', async () => {

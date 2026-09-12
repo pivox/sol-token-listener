@@ -1,7 +1,7 @@
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpBorshReader } from './borsh-reader.js';
 import { PUMP_PROGRAM_ID } from './constants.js';
-import { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 import { PUMP_INSTRUCTIONS } from './generated/pump-idl.js';
 import { decodeIdlFields } from './idl-codec.js';
 import type {
@@ -52,7 +52,7 @@ export function decodePumpInstruction(
   const reader = new PumpBorshReader(instruction.data.subarray(8));
   const args = decodeIdlFields(matched.definition.args, reader);
   if (reader.remaining !== 0) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_BORSH_INVALID',
       false,
       `Instruction Pump ${matched.name} avec ${reader.remaining} octet(s) résiduel(s).`,
@@ -74,7 +74,7 @@ function mapAccounts(
   instruction: NormalizedInstruction,
 ): Readonly<Record<string, string>> {
   if (instruction.accounts.length < definition.accounts.length) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_ACCOUNT_MISSING',
       true,
       `Instruction Pump ${name}: ${instruction.accounts.length}/${definition.accounts.length} comptes.`,
@@ -84,7 +84,7 @@ function mapAccounts(
   const entries = definition.accounts.map((account, index) => {
     const address = instruction.accounts[index];
     if (address === undefined) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_ACCOUNT_MISSING',
         true,
         `Compte Pump ${account.name} absent à l’index ${index}.`,
@@ -97,7 +97,7 @@ function mapAccounts(
     instruction.accounts.length - definition.accounts.length;
   if (name === 'create_v2') {
     if (remainingCount !== 0 && remainingCount !== 3) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_ACCOUNT_MISSING',
         true,
         `create_v2 attend zéro ou trois remaining accounts, reçu ${remainingCount}.`,
@@ -112,7 +112,7 @@ function mapAccounts(
         || quoteCurve === undefined
         || quoteProgram === undefined
       ) {
-        throw new PumpDecodingError(
+        throw createPumpDecodingError(
           'PUMP_ACCOUNT_MISSING',
           true,
           'Remaining accounts create_v2 incomplets.',

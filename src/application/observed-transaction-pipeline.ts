@@ -1,4 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
+import type { IngestionFailure } from '../domain/transaction-ingestion.js';
+import { trustedObservedPipelineOrigin } from '../domain/observed-pipeline-failure.js';
+import type { ObservedPipelineStage } from '../domain/observed-pipeline-failure.js';
 import {
   createBondingCurveTradeObservedEvent,
   createTokenLaunchDetectedEvent,
@@ -24,21 +27,9 @@ import {
 } from '../utils/json.js';
 
 export const MAX_OBSERVED_PIPELINE_ITEMS = 4_096;
+export type { ObservedPipelineStage } from '../domain/observed-pipeline-failure.js';
 const MAX_OBSERVED_PIPELINE_SNAPSHOT_NODES =
   MAX_OBSERVED_PIPELINE_ITEMS * 24;
-
-export type ObservedPipelineStage =
-  | 'create_observation'
-  | 'load_tracked_mints'
-  | 'launchpad_observation'
-  | 'sync_tracked_mint'
-  | 'reload_active_events'
-  | 'funding_observation'
-  | 'participant_analytics'
-  | 'wallet_graph'
-  | 'pumpswap_observation'
-  | 'qualification'
-  | 'paper_decision_enqueue';
 
 export interface ObservedPipelineResult {
   readonly launchpadEventCount: number;
@@ -60,10 +51,19 @@ export class ObservedPipelineError extends Error {
   public constructor(
     public readonly stage: ObservedPipelineStage,
     public readonly mint: string | null = null,
+    cause?: unknown,
   ) {
-    super(`Observed transaction pipeline failed during ${stage}.`);
+    super(`Observed transaction pipeline failed during ${stage}.`, { cause });
     this.name = 'ObservedPipelineError';
   }
+}
+
+const trustedPipelineErrors = new WeakMap<object, IngestionFailure>();
+
+/** Read only internally registered metadata, never properties of the thrown value. */
+export function trustedObservedPipelineFailure(value: unknown): IngestionFailure | null {
+  return typeof value === 'object' && value !== null
+    ? trustedPipelineErrors.get(value) ?? null : null;
 }
 
 interface LaunchpadObserver {
@@ -221,8 +221,15 @@ export class ObservedTransactionPipeline {
   ): Promise<TResult> {
     try {
       return await operation();
-    } catch {
-      throw new ObservedPipelineError(stage, mint);
+    } catch (cause) {
+      const error = new ObservedPipelineError(stage, mint, cause);
+      const originCode = trustedObservedPipelineOrigin(cause) ?? 'UNKNOWN';
+      trustedPipelineErrors.set(error, Object.freeze({
+        code: 'PIPELINE_STAGE_FAILED',
+        errorName: `ObservedPipelineFailure.v1.${stage}.${originCode}`,
+        retryable: originCode === 'UNKNOWN',
+      }));
+      throw error;
     }
   }
 }

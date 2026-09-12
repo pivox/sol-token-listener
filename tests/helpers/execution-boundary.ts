@@ -67,7 +67,7 @@ const SIMULATION_ONLY_ALLOWED_NODE_BUILTINS = new Set([
 const SIMULATION_ONLY_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor\/(?:main|config|database|dry-run-worker|simulation-worker|logger|runtime)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor-simulation\/(?:attempt-evaluator|build-plan|build-receipt|instruction-inspector|message-compiler|provider-session|pumpfun-adapter|pumpfun-quote|pumpswap-adapter|solana-simulation-gateway|venue-router)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/(?:execution-(?:dry-run|intent|simulation)|market|market-errors|types)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/(?:execution-(?:dry-run|intent|simulation)|market|market-errors|observed-pipeline-failure|types)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/(?:execution-(?:dry-run-repository|intent-repository|market-gateway|simulation-gateway|simulation-repository|venue-repository)|market-rpc-reader|pumpswap-quote-provider)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/(?:database|execution-(?:dry-run\.repository|intent(?:-expiration|\.repository)|simulation\.repository|venue\.repository))\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/foundation-retention-fence\.(?:js|ts)$/u,

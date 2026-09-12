@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { matchPumpSwapMigrations } from '../src/application/pumpswap-migration-matcher.js';
+import { trustedObservedPipelineOrigin } from '../src/domain/observed-pipeline-failure.js';
 import type { CanonicalMarketPool, MigrationObservation } from '../src/domain/market.js';
 import type { DecodedPumpSwapTransaction } from '../src/markets/pumpswap/types.js';
 import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
@@ -45,6 +46,18 @@ void test('rapproche une migration et son create_pool dans la même portée CPI'
   assert.equal(match?.migrationEvent.type, 'MigrationObserved');
   assert.equal(match?.activationEvent?.type, 'PumpSwapPoolActivated');
   assert.equal(match?.activationEvent?.payload.migrationEventId, match?.migrationEvent.id);
+});
+
+void test('registers deterministic ambiguous migration evidence as an internal decoding failure', () => {
+  const decoded = evidence();
+  assert.throws(() => matchPumpSwapMigrations(
+    createSolanaObservedTransaction(transaction(), 2000), [migration],
+    { ...decoded, poolCreations: [...decoded.poolCreations, ...decoded.poolCreations] },
+    new Map([['pool', pool]]),
+  ), (error: unknown) => {
+    assert.equal(trustedObservedPipelineOrigin(error), 'PUMPSWAP_EVENT_AMBIGUOUS');
+    return true;
+  });
 });
 
 void test('conserve MIGRATION_PENDING si le pool canonique n’est pas prouvé', () => {

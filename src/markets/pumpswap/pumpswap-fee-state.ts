@@ -23,6 +23,7 @@ import { PumpSwapBorshReader } from './borsh-reader.js';
 import { PUMPSWAP_PROGRAM_ID } from './constants.js';
 import { PUMPSWAP_ACCOUNTS } from './generated/pumpswap-idl.js';
 import { decodePumpSwapPoolAccount } from './pool-account-decoder.js';
+import { rethrowMutablePumpSwapRpcFailure } from './errors.js';
 
 export interface PumpSwapFeeTier {
   readonly marketCapThresholdRaw: bigint;
@@ -69,15 +70,19 @@ export class PumpSwapFeeStateReader {
   public constructor(private readonly rpc: MarketRpcReader) {}
 
   public async read(pool: CanonicalMarketPool): Promise<PumpSwapFeeState> {
-    return decodePumpSwapFeeState(
-      await this.rpc.readAccountsAtSameSlot([
-        GLOBAL_CONFIG_PDA.toBase58(),
-        PUMP_AMM_FEE_CONFIG_PDA.toBase58(),
-        pool.baseMint,
-        pool.address,
-      ]),
-      pool,
-    );
+    try {
+      return decodePumpSwapFeeState(
+        await this.rpc.readAccountsAtSameSlot([
+          GLOBAL_CONFIG_PDA.toBase58(),
+          PUMP_AMM_FEE_CONFIG_PDA.toBase58(),
+          pool.baseMint,
+          pool.address,
+        ]),
+        pool,
+      );
+    } catch (cause) {
+      rethrowMutablePumpSwapRpcFailure(cause);
+    }
   }
 }
 

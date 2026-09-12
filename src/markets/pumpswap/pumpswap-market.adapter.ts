@@ -13,7 +13,8 @@ import type { PumpSwapQuotePort } from '../../ports/pumpswap-quote-provider.js';
 import type { SolanaObservedTransaction } from '../../solana/rpc/observed-transaction.js';
 import type { NormalizedTransaction } from '../../solana/rpc/types.js';
 import { PUMPSWAP_PROGRAM_ID } from './constants.js';
-import { PumpSwapDecodingError } from './errors.js';
+import type { PumpSwapDecodingError } from './errors.js';
+import { createPumpSwapDecodingError } from './errors.js';
 import { decodePumpSwapTransaction } from './transaction-decoder.js';
 import type {
   DecodedPumpSwapPoolCreation,
@@ -150,7 +151,7 @@ function requiredPool(
 ): CanonicalMarketPool {
   const pool = pools.get(address);
   if (pool === undefined) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_EVENT_MISMATCH',
       `Pool suivi absent pendant la projection: ${address}.`,
     );
@@ -167,7 +168,7 @@ function validateEnvelope(transaction: SolanaObservedTransaction): void {
     || transaction.cursor.transactionIndex !== raw.transactionIndex
     || transaction.confirmationStatus !== status
   ) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_SCHEMA_UNSUPPORTED',
       'Enveloppe PumpSwap incohérente.',
       raw.signature,
