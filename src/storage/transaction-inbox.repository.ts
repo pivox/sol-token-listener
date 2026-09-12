@@ -219,7 +219,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [value.signature],
         );
         const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
-        const decision = convergeIngestion(row, value, tracked);
+        const programs = row === undefined ? [] : storedProgramIds(row.program_ids);
+        for (const programId of value.programIds) {
+          if (!programs.includes(programId)) programs.push(programId);
+        }
+        programs.sort(lexicalOrder);
+        if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
+        const decision = convergeIngestion(row, value, tracked, programs);
         if (row === undefined) {
           if (receipt !== undefined) {
             assertTerminalReceiptAcceptsNotification(receipt, value);
@@ -261,12 +267,6 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const sources = discoverySources(row.discovery_sources);
         if (!sources.includes(value.source)) sources.push(value.source);
         sources.sort(sourceOrder);
-        const programs = storedProgramIds(row.program_ids);
-        for (const programId of value.programIds) {
-          if (!programs.includes(programId)) programs.push(programId);
-        }
-        programs.sort(lexicalOrder);
-        if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
         if (current === 'finalized' && processingStatus === 'PROCESSED') {
           reconciledStatus(current, value.confirmationStatus);
           assertTerminalReceiptMatchesInbox(receipt, row);
@@ -347,15 +347,22 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active
            )
            UPDATE chain_transaction_inbox inbox SET
-             processing_status=CASE WHEN decision.active THEN 'PENDING' ELSE 'DEFERRED' END,
-             ingestion_priority=CASE WHEN decision.active THEN 'TRACKED_TRADE' ELSE 'NORMAL' END::chain_transaction_inbox_priority,
-             terminal_at=CASE WHEN NOT decision.active THEN GREATEST(decision.at,inbox.observed_at) END,
-             purge_after=CASE WHEN NOT decision.active THEN GREATEST(decision.at,inbox.observed_at) + INTERVAL '4 hours' END,
-             missing_finality_polls=0, last_missing_finality_provider_id=NULL, finality_evidence_version=0,
+             processing_status=CASE WHEN decision.active OR CARDINALITY(inbox.program_ids)>1 THEN 'PENDING' ELSE 'DEFERRED' END,
+             ingestion_priority=CASE WHEN decision.active AND CARDINALITY(inbox.program_ids)=1
+               THEN 'TRACKED_TRADE' ELSE 'NORMAL' END::chain_transaction_inbox_priority,
+             ingestion_hint=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN 'NONE' ELSE inbox.ingestion_hint END,
+             ingestion_hint_mint=CASE WHEN CARDINALITY(inbox.program_ids)=1 THEN inbox.ingestion_hint_mint END,
+             terminal_at=CASE WHEN NOT decision.active AND CARDINALITY(inbox.program_ids)=1 THEN GREATEST(decision.at,inbox.observed_at) END,
+             purge_after=CASE WHEN NOT decision.active AND CARDINALITY(inbox.program_ids)=1 THEN GREATEST(decision.at,inbox.observed_at) + INTERVAL '4 hours' END,
+             missing_finality_polls=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN inbox.missing_finality_polls ELSE 0 END,
+             last_missing_finality_provider_id=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN inbox.last_missing_finality_provider_id END,
+             finality_evidence_version=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN inbox.finality_evidence_version ELSE 0 END,
              updated_at=GREATEST(inbox.updated_at,decision.at)
            FROM decision
            WHERE inbox.ingestion_hint='PUMPFUN_TRADE' AND inbox.ingestion_hint_mint=$1
-             AND ((decision.active AND inbox.processing_status='DEFERRED')
+             AND inbox.processing_status IN ('DEFERRED','PENDING')
+             AND (CARDINALITY(inbox.program_ids)>1
+               OR (decision.active AND inbox.processing_status='DEFERRED')
                OR (NOT decision.active AND inbox.processing_status='PENDING'
                  AND inbox.attempts=0 AND inbox.attempts_in_cycle=0
                  AND inbox.lease_token IS NULL AND inbox.lease_expires_at IS NULL
@@ -2155,6 +2162,7 @@ function convergeIngestion(
   row: InboxIdentityRow | undefined,
   incoming: TransactionNotification,
   tracked: boolean,
+  programIds: readonly string[],
 ): IngestionDecision {
   const current = row === undefined ? null : storedIngestionDecision(row);
   let hint: StoredIngestionHint = incoming.ingestionHint ?? 'NONE';
@@ -2163,12 +2171,21 @@ function convergeIngestion(
     hint = current?.hint ?? hint;
     mint = current?.mint ?? null;
   }
-  if (hint === 'PUMPFUN_TRADE' && current?.hint === 'PUMPFUN_TRADE'
-    && current.mint !== mint) {
-    throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+  // The inbox belongs to the whole signature, not just the hinted adapter.
+  // A WebSocket NONE is durable conservative evidence; only catch-up-only
+  // NONE may be refined into a trade decision. Creates always take precedence.
+  if (hint !== 'PUMPFUN_CREATE' && (
+    programIds.length > 1
+    || (incoming.source === 'WEBSOCKET' && incoming.ingestionHint === null)
+    || (current?.hint === 'NONE' && row !== undefined
+      && discoverySources(row.discovery_sources).includes('WEBSOCKET'))
+    || (hint === 'PUMPFUN_TRADE' && current?.hint === 'PUMPFUN_TRADE' && current.mint !== mint)
+  )) {
+    return { status: current?.status === 'DEFERRED' ? 'PENDING' : current?.status ?? 'PENDING',
+      priority: 'NORMAL', hint: 'NONE', mint: null };
   }
-  // No-log replay preserves the durable decision; only a trade hint or an
-  // explicit mint synchronization may reclassify membership.
+  // A single-adapter catch-up replay has no log evidence and preserves the
+  // durable trade decision. WebSocket ambiguity was handled above.
   if (incoming.ingestionHint !== 'PUMPFUN_TRADE' && hint === 'PUMPFUN_TRADE'
     && current !== null) return current;
   let status = current?.status ?? 'PENDING';

@@ -429,3 +429,46 @@ gh pr comment <PR_NUMBER> --body '@codex please review this PR. Focus on durable
 Wait for CI and Codex review. Address only verified blocking feedback, rerun the
 relevant tests and complete suite, then merge with a normal merge commit once
 all checks are green and no blocking thread remains.
+
+### Corrective review task: preserve multi-adapter ingestion (#102)
+
+**Files:**
+- Modify: `src/launchpads/pumpfun/websocket-create-hint.ts`
+- Modify: `src/storage/transaction-inbox.repository.ts`
+- Test: `tests/pumpfun-websocket-create-hint.test.ts`
+- Test: `tests/transaction-inbox.repository.test.ts`
+- Update: `docs/superpowers/specs/2026-09-12-tracked-pumpfun-trade-priority-design.md` to 1.0.3
+- Modify: `src/solana/rpc/ws-program-session.ts`
+- Test: `tests/ws-program-session.test.ts`
+
+- [x] Reproduce RED with complete TradeEvent and SellEvent bytes extracted from
+  the versioned Mainnet fixtures, the two discovery orders, legacy synchronization,
+  durable WebSocket ambiguity and contradictory trade hints: six failures.
+- [x] Implement the approved conservative decision: an exact PumpSwap runtime
+  invocation vetoes trade hints; merged program IDs and WebSocket NONE evidence
+  prevent later deferral; creation takes precedence. Normalize legacy
+  multi-adapter deferred/pending rows during mint synchronization without
+  weakening the selective index or modifying attempted finality evidence.
+- [x] Re-run the six regression tests on PostgreSQL 16: six passes, zero skips.
+- [x] Add three RED architecture/configuration tests, then delegate the bounded
+  canonical veto-program list to the WebSocket coordinator and use only durable
+  program-ID cardinality in storage. Verify GREEN plus the WS wiring regression.
+- [x] Run focused ingestion/repository/migration/retention tests, `npm run check`,
+  `npm run lint`, `npm run docs:check` and `git diff --check`.
+- [x] Commit the verified fix as `fix(listener): preserve multi-adapter ingestion (#102)`.
+  Do not push from this corrective task.
+
+**Verification evidence:** Initial functional RED: six expected failures, then
+six passes. Architecture/configuration RED: three expected failures, then
+coordinator wiring and all six selected parser/architecture checks passed.
+The first expanded PG16 run passed 248/248. After the architecture refinement,
+the expanded eight-file run passed 251/252 with one preexisting host/DB clock
+assertion failure in `records immutable strict failures once and resolves only
+the exact nullable boundary`. A read-only 30-query probe observed the container
+clock one millisecond behind the host in 17 samples. That test was left intact
+and passed its isolated rerun. The final parser/repository/WebSocket run passed
+127/127, including that clock test, with zero skipped tests. Both selective
+mint-sync plans still scanned three matching rows amid 100,000 unrelated rows
+using three/four shared blocks. Full `check`, `lint`, `docs:check`, and
+`git diff --check` passed. No migration, live execution capability, or deployment
+state changed in this correction.

@@ -12,6 +12,7 @@ import type { RpcProviderId } from './rpc-provider-catalog.js';
 export const WS_PROGRAM_SESSION_SETUP_TIMEOUT_MS = 10_000;
 export const WS_PROGRAM_SESSION_CLEANUP_TIMEOUT_MS = 5_000;
 export const MAX_WS_PROGRAM_SESSION_FRAME_BYTES = 1_048_576;
+const PUMPFUN_HINT_VETO_PROGRAM_IDS = Object.freeze([PUMPSWAP_PROGRAM_ID]);
 
 export type WsProgramEndpointId = RpcProviderId;
 export type WsProgramFamily = 'pumpfun' | 'pumpswap';
@@ -446,7 +447,7 @@ export function openWsProgramSession(
         return;
       }
       const hintResult = program === 'pumpfun'
-        ? pumpFunWebSocketHintFromLogs(ownData(value, 'logs'))
+        ? pumpFunWebSocketHintFromLogs(ownData(value, 'logs'), PUMPFUN_HINT_VETO_PROGRAM_IDS)
         : null;
       const hint = hintResult?.hint ?? 'NONE';
       const hintMint = hintResult?.hintMint ?? null;

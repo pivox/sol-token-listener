@@ -21,6 +21,8 @@ export const MAX_PUMPFUN_WEBSOCKET_LOG_TOTAL_BYTES = 65_536;
 
 const PROGRAM_DATA_PREFIX = 'Program data: ';
 const RUNTIME_LOG_TRUNCATED = 'Log truncated';
+const RUNTIME_PROGRAM_INVOCATION = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[[1-9][0-9]*\]$/u;
+const MAX_VETO_PROGRAM_COUNT = 16;
 const CREATE_EVENT_DISCRIMINATOR = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator);
 const TRADE_EVENT_DISCRIMINATOR = Buffer.from(PUMP_EVENTS.TradeEvent.discriminator);
 const TRADE_EVENT_MINT_OFFSET = TRADE_EVENT_DISCRIMINATOR.length;
@@ -35,14 +37,20 @@ export function pumpFunCreateHintFromLogs(logs: unknown): PumpFunWebSocketHint {
   return hint === 'PUMPFUN_CREATE' ? hint : 'NONE';
 }
 
-export function pumpFunWebSocketHintFromLogs(logs: unknown): PumpFunWebSocketCreateHint {
+export function pumpFunWebSocketHintFromLogs(
+  logs: unknown,
+  vetoProgramIds: unknown = [],
+): PumpFunWebSocketCreateHint {
   const snapshot = snapshotLogs(logs);
-  if (snapshot === null) return NONE_HINT;
+  const vetoPrograms = snapshotVetoPrograms(vetoProgramIds);
+  if (snapshot === null || vetoPrograms === null) return NONE_HINT;
   let firstTradeMint: string | null = null;
   let hasCreateEvent = false;
   let hasAmbiguousEvent = false;
   for (const line of snapshot) {
-    if (line === RUNTIME_LOG_TRUNCATED) {
+    const invokedProgram = RUNTIME_PROGRAM_INVOCATION.exec(line)?.[1];
+    if (line === RUNTIME_LOG_TRUNCATED
+      || (invokedProgram !== undefined && vetoPrograms.has(invokedProgram))) {
       hasAmbiguousEvent = true;
       continue;
     }
@@ -84,6 +92,20 @@ export function pumpFunWebSocketHintFromLogs(logs: unknown): PumpFunWebSocketCre
   return firstTradeMint === null || hasAmbiguousEvent
     ? NONE_HINT
     : Object.freeze({ hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint });
+}
+
+function snapshotVetoPrograms(value: unknown): ReadonlySet<string> | null {
+  const programs = snapshotLogs(value);
+  if (programs === null || programs.length > MAX_VETO_PROGRAM_COUNT) return null;
+  try {
+    for (const program of programs) {
+      if (program.length < 32 || program.length > 44
+        || new PublicKey(program).toBase58() !== program) return null;
+    }
+    return new Set(programs);
+  } catch {
+    return null;
+  }
 }
 
 function isPrefixOfEventDiscriminator(decoded: Buffer): boolean {

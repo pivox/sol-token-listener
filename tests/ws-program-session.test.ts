@@ -201,6 +201,31 @@ void test('keeps the create hint when a Pump.fun notification contains both trad
   await closing;
 });
 
+void test('supplies the PumpSwap runtime veto to Pump.fun hints without losing creation priority', async () => {
+  const socket = new FakeWebSocket();
+  const frames: unknown[] = [];
+  const session = await acknowledge(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); }, new AbortController().signal,
+    { createWebSocket: () => socket, scheduler: new ManualScheduler() },
+  ), socket);
+  const trade = Buffer.concat([Buffer.from(PUMP_EVENTS.TradeEvent.discriminator),
+    new PublicKey('So11111111111111111111111111111111111111112').toBytes()]).toString('base64');
+  const create = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator).toString('base64');
+  const logs = [`Program data: ${trade}`, `Program ${PUMPSWAP_PROGRAM_ID} invoke [2]`];
+  socket.message(notification(101, 43, '1'.repeat(64), null, logs));
+  socket.message(notification(101, 44, '1'.repeat(64), null, [...logs, `Program data: ${create}`]));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(frames, [
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 43n, hint: 'NONE', hintMint: null },
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 44n, hint: 'PUMPFUN_CREATE', hintMint: null },
+  ]);
+  const closing = session.close(new AbortController().signal);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  socket.message({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
+});
+
 void test('rejects accessor-backed ingestion programs before opening a socket', async () => {
   let getterCalls = 0;
   let socketCalls = 0;

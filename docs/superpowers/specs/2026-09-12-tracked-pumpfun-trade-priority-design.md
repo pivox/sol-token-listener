@@ -1,6 +1,6 @@
 # Priorité durable des trades Pump.fun suivis
 
-**Version :** 1.0.2 — 2026-09-12
+**Version :** 1.0.3 — 2026-09-12
 
 ## Contexte
 
@@ -49,6 +49,16 @@ lorsque son budget de logs est épuisé, rend également l'indice ambigu et forc
 priorité. Le texte applicatif préfixé `Program log: Log truncated` reste un log
 ordinaire et ne doit pas être confondu avec le marqueur du runtime.
 
+Une invocation runtime exacte de PumpSwap rend également tout indice de trade
+ambigu : la signature peut contenir une activité pertinente pour un autre
+adaptateur, même si le mint Pump.fun n'est pas suivi. Ce veto utilise seulement
+l'identifiant officiel du programme et les lignes `Program … invoke [n]`, sans
+décoder ses événements ni confondre un texte `Program log:` avec le runtime.
+Le coordinateur WebSocket fournit les programmes veto au parseur via une liste
+bornée à 16 clés canoniques, validée sans accéder aux getters. Le parseur reste
+indépendant des autres adaptateurs ; une configuration invalide force `NONE`.
+Un `CreateEvent` complet conserve toujours la priorité création.
+
 L'indice n'est pas une preuve métier. Le décodeur de transaction complète reste
 la seule autorité de `TokenLaunchDetected` et
 `BondingCurveTradeObserved`. Aucun log WebSocket n'est persisté.
@@ -79,11 +89,28 @@ Chaque signature reste sérialisée par son advisory lock actuel.
   avec rétention quatre heures.
 - `NONE` produit une ligne `PENDING` et `NORMAL`.
 
-Une découverte WebSocket plus précise peut enrichir une découverte catch-up.
+Une découverte WebSocket plus précise peut enrichir une découverte exclusivement catch-up.
 Une création ne peut jamais être dégradée par un trade ou par `NONE`. Un
-catch-up sans logs ne réactive pas une décision différée. Une création tardive
+catch-up limité à Pump.fun ne réactive pas une décision différée. Une création tardive
 pour la même signature réactive la ligne et l'élève en candidat de création.
 Une ligne déjà louée ou traitée n'est jamais réécrite en décision différée.
+
+L'inbox est commune à tous les adaptateurs de la signature. L'union durable des
+`program_ids` fait donc autorité : plusieurs programmes observés interdisent
+`DEFERRED`, dans les deux ordres de découverte. Le hint fournit la provenance
+Pump.fun ; la cardinalité des identifiants uniques suffit sans importer un
+adaptateur dans la couche stockage. Hors création,
+la décision devient `NORMAL/NONE/null`; une ligne différée redevient `PENDING`
+et perd ses timestamps terminaux, sans modifier le cycle d'une ligne déjà louée
+ou traitée. Le catch-up multi-programme a la même autorité.
+
+Deux hints de trade visant des mints différents ne constituent pas un conflit
+d'identité de transaction : ils rendent le classement ambigu et produisent la
+même décision conservatrice `NORMAL/NONE/null`. Un `NONE` observé par WebSocket
+est durable : les hints de trade ultérieurs ne peuvent plus filtrer cette
+signature, y compris après redémarrage. Cela couvre aussi un `NONE` WebSocket
+arrivé après un premier hint trade. Seul un `NONE` provenant exclusivement du
+catch-up peut être enrichi par un trade ; la priorité création reste possible.
 
 ## Synchronisation avec la projection canonique
 
@@ -98,7 +125,11 @@ Sous un advisory lock par mint, le repository relit `token_launches` :
 - s'il est absent ou terminal, seules ses lignes `PENDING/PUMPFUN_TRADE` jamais
   louées, sans snapshot et sans tentative deviennent `DEFERRED` ;
 - les lignes `PROCESSING`, `PROCESSED` ou ayant déjà une tentative restent
-  inchangées.
+  inchangées pour les reclassements de suivi Pump.fun.
+
+La synchronisation normalise aussi les anciennes lignes multi-programme
+`DEFERRED/PENDING` en `PENDING/NORMAL/NONE/null`, que le mint soit actif ou non.
+Elle ne les rediffère jamais et conserve leur preuve de finalité existante.
 
 L'index partiel `chain_transaction_inbox_tracked_mint_idx` porte sur
 `ingestion_hint_mint` pour `PUMPFUN_TRADE` aux statuts `DEFERRED` et `PENDING`.
@@ -175,6 +206,10 @@ pas une validation de la campagne paper Mainnet #49.
 - toute entrée ambiguë reste `NORMAL` ;
 - le marqueur runtime exact `Log truncated` force le chemin sûr `NORMAL` ;
 - les doublons WebSocket/catch-up convergent sans downgrade ni résurrection ;
+- une transaction composée Pump.fun/PumpSwap reste claimable dans les deux
+  ordres de découverte, après redémarrage, doublon et synchronisation inactive ;
+- un conflit inter-notifications ou un `NONE` WebSocket reste durablement
+  conservateur, tandis qu'un `NONE` exclusivement catch-up reste enrichissable ;
 - une purge concurrente ne peut supprimer un trade différé devenu suivi ;
 - les décisions différées absentes ou terminales restent purgées à quatre
   heures sans extension silencieuse ;

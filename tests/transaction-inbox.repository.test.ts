@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
@@ -42,6 +43,11 @@ import {
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
+void test('keeps durable ingestion independent of launchpad and market adapter imports', async () => {
+  const source = await readFile(new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /from ['"][^'"]*(?:launchpads|markets)\//u);
+});
+
 void test('defers untracked trade hints durably without claims, finality, retry or actionable counts', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -84,7 +90,7 @@ void test('catch-up replay preserves a deferred decision and retention while unk
     const repository = new PostgresTransactionInboxRepository(pool);
     await repository.enqueue(tradeNotification('replayed-trade', 1n));
     const original = await row(pool, 'replayed-trade');
-    await repository.enqueue(notification('replayed-trade', 1n, 'CATCH_UP', 'confirmed'));
+    await repository.enqueue(pumpCatchUpNotification('replayed-trade', 1n, 'confirmed'));
     await repository.enqueue(tradeNotification('replayed-trade', 1n));
     const replayed = await row(pool, 'replayed-trade');
     assert.deepEqual(ingestionDecision(replayed), ingestionDecision(original));
@@ -115,11 +121,89 @@ void test('late create reactivates deferred signatures and never downgrades to t
   });
 });
 
+void test('multi-adapter discoveries remain normal in both orders across restart, replay and inactive synchronization', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const reversed of [false, true]) {
+      const signature = `multi-adapter-${reversed}`;
+      const pump = tradeNotification(signature, 1n);
+      const swap = Object.freeze({ ...notification(signature, 1n), programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]) });
+      for (const discovery of reversed ? [swap, pump] : [pump, swap]) await repository.enqueue(discovery);
+      const restarted = new PostgresTransactionInboxRepository(pool);
+      await restarted.enqueue(pump);
+      await restarted.enqueue(Object.freeze({ ...swap, source: 'CATCH_UP' as const }));
+      await restarted.syncTrackedMint(tradeMint);
+      const stored = await row(pool, signature);
+      assert.deepEqual(ingestionDecision(stored), {
+        processing_status: 'PENDING', ingestion_priority: 'NORMAL', ingestion_hint: 'NONE', ingestion_hint_mint: null,
+      });
+      assert.equal(stored.terminal_at, null);
+      assert.equal(stored.purge_after, null);
+      assert.deepEqual(stored.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+      assert.equal((await restarted.claim(Date.now(), 30))?.signature, signature);
+    }
+  });
+});
+
+void test('inactive synchronization repairs legacy multi-adapter deferred and pending decisions', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(tradeNotification('legacy-multi-deferred', 1n));
+    await insertTrackedLaunch(pool);
+    await repository.enqueue(tradeNotification('legacy-multi-pending', 2n));
+    await pool.query('UPDATE chain_transaction_inbox SET program_ids=$1', [[PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()]);
+    await pool.query('UPDATE token_launches SET terminal_at=clock_timestamp()');
+    await repository.syncTrackedMint(tradeMint);
+    for (const signature of ['legacy-multi-deferred', 'legacy-multi-pending']) {
+      const stored = await row(pool, signature);
+      assert.deepEqual(ingestionDecision(stored), {
+        processing_status: 'PENDING', ingestion_priority: 'NORMAL', ingestion_hint: 'NONE', ingestion_hint_mint: null,
+      });
+      assert.equal(stored.terminal_at, null);
+      assert.equal(stored.purge_after, null);
+      assert.equal((await repository.claim(Date.now(), 30))?.signature, signature);
+    }
+  });
+});
+
+void test('ambiguous WebSocket NONE stays normal while catch-up-only NONE may gain a trade decision', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('ambiguous-websocket', 1n));
+    await repository.enqueue(pumpCatchUpNotification('catch-up-only', 2n));
+    const restarted = new PostgresTransactionInboxRepository(pool);
+    await restarted.enqueue(tradeNotification('ambiguous-websocket', 1n));
+    await restarted.enqueue(tradeNotification('catch-up-only', 2n));
+    assert.deepEqual(ingestionDecision(await row(pool, 'ambiguous-websocket')), {
+      processing_status: 'PENDING', ingestion_priority: 'NORMAL', ingestion_hint: 'NONE', ingestion_hint_mint: null,
+    });
+    assert.equal((await row(pool, 'catch-up-only')).processing_status, 'DEFERRED');
+    await restarted.syncTrackedMint(tradeMint);
+    assert.equal((await restarted.claim(Date.now(), 30))?.signature, 'ambiguous-websocket');
+  });
+});
+
+void test('contradictory trade hints become durably normal across restart and duplicate hints', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(tradeNotification('conflicting-mint', 1n));
+    await repository.enqueue(tradeNotification('conflicting-mint', 1n, PUMP_PROGRAM_ID));
+    const restarted = new PostgresTransactionInboxRepository(pool);
+    await restarted.enqueue(tradeNotification('conflicting-mint', 1n));
+    await restarted.enqueue(tradeNotification('conflicting-mint', 1n, PUMP_PROGRAM_ID));
+    await restarted.syncTrackedMint(tradeMint);
+    assert.deepEqual(ingestionDecision(await row(pool, 'conflicting-mint')), {
+      processing_status: 'PENDING', ingestion_priority: 'NORMAL', ingestion_hint: 'NONE', ingestion_hint_mint: null,
+    });
+    assert.equal((await restarted.claim(Date.now(), 30))?.signature, 'conflicting-mint');
+  });
+});
+
 void test('only pristine normal discoveries may become deferred after a more precise trade hint', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
-    await repository.enqueue(notification('pristine', 1n, 'CATCH_UP'));
-    await repository.enqueue(notification('pristine', 1n, 'CATCH_UP'));
+    await repository.enqueue(pumpCatchUpNotification('pristine', 1n));
+    await repository.enqueue(pumpCatchUpNotification('pristine', 1n));
     await repository.enqueue(tradeNotification('pristine', 1n));
     assert.equal((await row(pool, 'pristine')).processing_status, 'DEFERRED');
     await repository.enqueue(notification('leased-trade', 2n));
@@ -266,7 +350,7 @@ void test('concurrent trade, catch-up and create discoveries converge without re
     for (let index = 0; index < 8; index += 1) {
       const signature = `concurrent-trade-${index}`;
       const operations = [
-        () => repository.enqueue(notification(signature, 1n, 'CATCH_UP')),
+        () => repository.enqueue(pumpCatchUpNotification(signature, 1n)),
         () => repository.enqueue(tradeNotification(signature, 1n)),
       ];
       if (index % 2 === 0) operations.reverse();
@@ -325,13 +409,9 @@ void test('shares urgent FIFO and the 32-to-1 fairness budget between creates an
   });
 });
 
-void test('rejects corrupt stored hint combinations and conflicting trade mints without mutation', async (context) => {
+void test('rejects corrupt stored hint combinations without mutation', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
-    await repository.enqueue(tradeNotification('conflicting-mint', 1n));
-    const original = await row(pool, 'conflicting-mint');
-    await assert.rejects(repository.enqueue(tradeNotification('conflicting-mint', 1n, PUMP_PROGRAM_ID)), TransactionInboxConflictError);
-    assert.deepEqual(await row(pool, 'conflicting-mint'), original);
     await repository.enqueue(notification('corrupt-hint', 2n));
     await pool.query('ALTER TABLE chain_transaction_inbox DROP CONSTRAINT chain_transaction_inbox_ingestion_hint_check');
     await pool.query("UPDATE chain_transaction_inbox SET ingestion_hint_mint=$1 WHERE signature='corrupt-hint'", [tradeMint]);
@@ -2936,6 +3016,13 @@ function notification(
 function tradeNotification(signature: string, slot: bigint, mint = tradeMint): TransactionNotification {
   return Object.freeze({ ...notification(signature, slot),
     ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: mint,
+  });
+}
+
+function pumpCatchUpNotification(signature: string, slot: bigint,
+  confirmationStatus: TransactionNotification['confirmationStatus'] = 'processed'): TransactionNotification {
+  return Object.freeze({ ...notification(signature, slot, 'CATCH_UP', confirmationStatus),
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
   });
 }
 
