@@ -54,6 +54,8 @@ const VALUES: Record<PumpInstructionName, Readonly<Record<string, unknown>>> = {
     creator: CREATOR,
     is_mayhem_mode: true,
     is_cashback_enabled: [false],
+    creator_fee_bps: [1_200n],
+    is_holder_reward: [true],
   },
   migrate: {},
   migrate_v2: {},
@@ -108,6 +110,73 @@ void test('décode les trois remaining accounts multi-quote de create_v2', () =>
   assert.equal(decoded.accounts.quote_token_program, remaining[2]);
 });
 
+void test('décode uniquement les quatre suffixes EOF officiels de create_v2', () => {
+  const cases = [
+    {
+      suffix: Buffer.alloc(0),
+      cashback: false,
+      creatorFeeBps: 0n,
+      holderReward: false,
+    },
+    {
+      suffix: Buffer.from([1]),
+      cashback: true,
+      creatorFeeBps: 0n,
+      holderReward: false,
+    },
+    {
+      suffix: Buffer.concat([Buffer.from([0]), u64(975n)]),
+      cashback: false,
+      creatorFeeBps: 975n,
+      holderReward: false,
+    },
+    {
+      suffix: Buffer.concat([Buffer.from([0]), u64(1_200n), Buffer.from([1])]),
+      cashback: false,
+      creatorFeeBps: 1_200n,
+      holderReward: true,
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const decoded = decodePumpInstruction(
+      createV2InstructionWithSuffix(fixture.suffix),
+    );
+    assert.ok(decoded);
+    assert.deepEqual(decoded.args.is_cashback_enabled, [fixture.cashback]);
+    assert.deepEqual(decoded.args.creator_fee_bps, [fixture.creatorFeeBps]);
+    assert.deepEqual(decoded.args.is_holder_reward, [fixture.holderReward]);
+  }
+});
+
+void test('accepte le quatrième remaining account seulement pour le PDA quote-control', () => {
+  const instruction = pumpInstruction('create_v2');
+  const quoteControl = PublicKey.findProgramAddressSync(
+    [Buffer.from('quote-control')],
+    new PublicKey(PUMP_PROGRAM),
+  )[0].toBase58();
+  const remaining = [
+    address(21),
+    address(22),
+    address(23),
+    quoteControl,
+  ];
+  const decoded = decodePumpInstruction({
+    ...instruction,
+    accounts: [...instruction.accounts, ...remaining],
+  });
+
+  assert.ok(decoded);
+  assert.equal(decoded.accounts.quote_control, quoteControl);
+  assert.throws(
+    () => decodePumpInstruction({
+      ...instruction,
+      accounts: [...instruction.accounts, ...remaining.slice(0, 3), address(24)],
+    }),
+    isPumpError('PUMP_ACCOUNT_MISSING'),
+  );
+});
+
 void test('ignore une instruction Pump hors périmètre', () => {
   assert.equal(
     decodePumpInstruction(normalizedInstruction(Uint8Array.of(1, 2, 3))),
@@ -146,6 +215,33 @@ void test('refuse les octets résiduels après les arguments', () => {
   );
 });
 
+void test('refuse chaque taille de suffixe create_v2 non documentée', () => {
+  for (const length of [2, 7, 8, 11]) {
+    assert.throws(
+      () => decodePumpInstruction(
+        createV2InstructionWithSuffix(Buffer.alloc(length)),
+      ),
+      isPumpError('PUMP_BORSH_INVALID'),
+    );
+  }
+});
+
+void test('refuse les remaining account counts create_v2 hors 0, 3 et 4', () => {
+  const instruction = pumpInstruction('create_v2');
+  for (const count of [1, 2, 5]) {
+    assert.throws(
+      () => decodePumpInstruction({
+        ...instruction,
+        accounts: [
+          ...instruction.accounts,
+          ...Array.from({ length: count }, (_, index) => address(index + 25)),
+        ],
+      }),
+      isPumpError('PUMP_ACCOUNT_MISSING'),
+    );
+  }
+});
+
 function pumpInstruction(name: PumpInstructionName): NormalizedInstruction {
   const definition = PUMP_INSTRUCTIONS[name];
   const encodedArgs = encodeFields(definition.args, VALUES[name]);
@@ -154,6 +250,15 @@ function pumpInstruction(name: PumpInstructionName): NormalizedInstruction {
     ...encodedArgs,
   ]), definition.accounts.map((account, index) =>
     `${account.name}-${index}`));
+}
+
+function createV2InstructionWithSuffix(suffix: Uint8Array): NormalizedInstruction {
+  const definition = PUMP_INSTRUCTIONS.create_v2;
+  return normalizedInstruction(Uint8Array.from([
+    ...definition.discriminator,
+    ...encodeFields(definition.args.slice(0, 5), VALUES.create_v2),
+    ...suffix,
+  ]), definition.accounts.map((account, index) => `${account.name}-${index}`));
 }
 
 function normalizedInstruction(
@@ -208,7 +313,31 @@ function encodeValue(type: unknown, value: unknown): Buffer {
     assert.ok(Array.isArray(value));
     return Buffer.from([value[0] === true ? 1 : 0]);
   }
+  if (isOptionU64(type)) {
+    assert.ok(Array.isArray(value));
+    return u64(value[0]);
+  }
   throw new Error(`Type de test non pris en charge: ${JSON.stringify(type)}.`);
+}
+
+function isOptionU64(
+  type: unknown,
+): type is { readonly defined: { readonly name: 'OptionU64' } } {
+  if (typeof type !== 'object' || type === null) return false;
+  const defined = Reflect.get(type, 'defined');
+  if (typeof defined !== 'object' || defined === null) return false;
+  return Reflect.get(defined, 'name') === 'OptionU64';
+}
+
+function u64(value: unknown): Buffer {
+  if (typeof value !== 'bigint') throw new Error('Valeur u64 de test invalide.');
+  const bytes = Buffer.alloc(8);
+  bytes.writeBigUInt64LE(value);
+  return bytes;
+}
+
+function address(seed: number): string {
+  return new PublicKey(Uint8Array.from({ length: 32 }, () => seed)).toBase58();
 }
 
 function isOptionBool(

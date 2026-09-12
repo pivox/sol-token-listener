@@ -28,27 +28,26 @@ void test('attests exact official Pump IDL bytes and generated coverage offline'
   const manifest = JSON.parse(await readFile(path, 'utf8')) as OfficialManifest;
 
   assert.deepEqual(Object.keys(manifest).sort(), [
-    'artifacts', 'repository', 'revision', 'revisionUrl', 'schemaVersion', 'verifiedHeadOn',
+    'artifacts', 'repository', 'schemaVersion',
   ]);
-  assert.equal(manifest.schemaVersion, 'official-pump-idl-manifest.v1');
+  assert.equal(manifest.schemaVersion, 'official-pump-idl-manifest.v2');
   assert.equal(manifest.repository, 'https://github.com/pump-fun/pump-public-docs');
-  assert.equal(manifest.revision, '9c82f61cb711b044a17f770ab8ce9f9bdf78f333');
-  assert.equal(
-    manifest.revisionUrl,
-    `https://github.com/pump-fun/pump-public-docs/tree/${manifest.revision}`,
-  );
-  assert.equal(manifest.verifiedHeadOn, '2026-08-08');
   assert.equal(manifest.artifacts.length, 2);
 
   for (const artifact of manifest.artifacts) {
     assert.deepEqual(Object.keys(artifact).sort(), [
-      'family', 'localPath', 'requiredEvents', 'requiredInstructions', 'sha256', 'upstreamPath',
+      'family', 'localPath', 'requiredEvents', 'requiredInstructions', 'revision',
+      'revisionUrl', 'sha256', 'upstreamPath', 'verifiedHeadOn',
     ]);
     const bytes = await readFile(new URL(`../${artifact.localPath}`, import.meta.url));
     assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256);
     assert.match(
       artifact.upstreamPath,
       /^idl\/(?:pump|pump_amm)\.json$/u,
+    );
+    assert.equal(
+      artifact.revisionUrl,
+      `https://github.com/pump-fun/pump-public-docs/tree/${artifact.revision}`,
     );
   }
 
@@ -60,10 +59,12 @@ void test('attests exact official Pump IDL bytes and generated coverage offline'
   assert.equal(pump.sha256, PUMP_IDL_SHA256);
   assert.equal(swap.sha256, OFFICIAL_PUMP_AMM_IDL_SHA256);
   assert.equal(swap.sha256, PUMPSWAP_IDL_SHA256);
-  assert.equal(manifest.revision, OFFICIAL_PUMP_IDL_REVISION);
-  assert.equal(manifest.revision, OFFICIAL_PUMP_AMM_IDL_REVISION);
-  assert.equal(manifest.revision, PUMP_IDL_REVISION);
-  assert.equal(manifest.revision, PUMPSWAP_IDL_REVISION);
+  assert.equal(pump.revision, OFFICIAL_PUMP_IDL_REVISION);
+  assert.equal(swap.revision, OFFICIAL_PUMP_AMM_IDL_REVISION);
+  assert.equal(pump.revision, PUMP_IDL_REVISION);
+  assert.equal(swap.revision, PUMPSWAP_IDL_REVISION);
+  assert.equal(pump.verifiedHeadOn, '2026-09-12');
+  assert.equal(swap.verifiedHeadOn, '2026-08-08');
   assert.deepEqual(Object.keys(PUMP_INSTRUCTIONS).sort(), [...pump.requiredInstructions].sort());
   assert.deepEqual(Object.keys(PUMPSWAP_INSTRUCTIONS).sort(), [...swap.requiredInstructions].sort());
   assert.deepEqual(Object.keys(PUMP_EVENTS).sort(), [...pump.requiredEvents].sort());
@@ -73,11 +74,11 @@ void test('attests exact official Pump IDL bytes and generated coverage offline'
 interface OfficialManifest {
   readonly schemaVersion: string;
   readonly repository: string;
-  readonly revision: string;
-  readonly revisionUrl: string;
-  readonly verifiedHeadOn: string;
   readonly artifacts: readonly {
     readonly family: string;
+    readonly revision: string;
+    readonly revisionUrl: string;
+    readonly verifiedHeadOn: string;
     readonly upstreamPath: string;
     readonly localPath: string;
     readonly sha256: string;

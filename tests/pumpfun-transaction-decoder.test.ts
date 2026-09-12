@@ -25,6 +25,10 @@ import {
 
 const MINT = address(1);
 const CREATOR = address(2);
+const HOLDER_REWARDS_CREATOR = PublicKey.findProgramAddressSync(
+  [Buffer.from('holder-rewards'), new PublicKey(MINT).toBuffer()],
+  new PublicKey(PUMP_PROGRAM_ID),
+)[0].toBase58();
 const USER = address(3);
 const QUOTE_MINT = address(4);
 const OTHER = address(10);
@@ -35,6 +39,14 @@ const CREATE_ARGS = {
   creator: CREATOR,
   is_mayhem_mode: true,
   is_cashback_enabled: [true],
+  creator_fee_bps: [1_200n],
+  is_holder_reward: [true],
+} as const;
+const CREATE_LEGACY_ARGS = {
+  name: 'Éclair',
+  symbol: 'ECL',
+  uri: 'ipfs://metadata',
+  creator: CREATOR,
 } as const;
 const TRADE_ARGS = {
   amount: 1n,
@@ -56,6 +68,25 @@ void test('apparie une action externe à son événement interne', () => {
     decoded.creations[0]?.action.instruction.innerInstructionIndex,
     null,
   );
+});
+
+void test('conserve le décodage create legacy sans holder reward', () => {
+  const decoded = decodePumpTransaction(transaction([
+    action('create', cursor(2, null, 1)),
+    eventAt(createEventInstruction(new Uint8Array(), {
+      is_mayhem_mode: false,
+      is_cashback_enabled: false,
+      creator_fee_bps: 0n,
+      is_holder_reward: false,
+      creator: CREATOR,
+      quote_mint: PublicKey.default.toBase58(),
+    }), cursor(2, 0, 2)),
+  ]));
+
+  assert.equal(decoded.creations[0]?.action.name, 'create');
+  assert.equal(decoded.creations[0]?.requestedCreator, CREATOR);
+  assert.equal(decoded.creations[0]?.effectiveCreator, CREATOR);
+  assert.equal(decoded.creations[0]?.isHolderReward, false);
 });
 
 void test('apparie une action CPI à son événement enfant par stackHeight', () => {
@@ -81,6 +112,78 @@ void test('décode création puis achat initial dans la même transaction', () =
   assert.equal(
     decoded.trades[0]?.event.mint,
     decoded.creations[0]?.event.mint,
+  );
+});
+
+void test('sépare le créateur demandé du routage effectif holder-reward', () => {
+  const requestedCreator = OTHER;
+  const decoded = decodePumpTransaction(transaction([
+    action(
+      'create_v2',
+      cursor(2, null, 1),
+      {},
+      { creator: requestedCreator, is_holder_reward: [true] },
+    ),
+    eventAt(createEventInstruction(), cursor(2, 0, 2)),
+  ]));
+
+  assert.equal(decoded.creations[0]?.requestedCreator, requestedCreator);
+  assert.equal(
+    decoded.creations[0]?.effectiveCreator,
+    HOLDER_REWARDS_CREATOR,
+  );
+  assert.equal(decoded.creations[0]?.creatorFeeBps, 1_200n);
+  assert.equal(decoded.creations[0]?.isHolderReward, true);
+});
+
+void test('exige le même créateur demandé et effectif hors holder-reward', () => {
+  assert.throws(
+    () => decodePumpTransaction(transaction([
+      action(
+        'create_v2',
+        cursor(2, null, 1),
+        {},
+        { creator: OTHER, is_holder_reward: [false] },
+      ),
+      eventAt(createEventInstruction(new Uint8Array(), {
+        is_holder_reward: false,
+      }), cursor(2, 0, 2)),
+    ])),
+    isPumpError('PUMP_EVENT_MISMATCH'),
+  );
+});
+
+void test('conserve le creator fee effectif avec un quote-control redondant', () => {
+  const quoteControl = PublicKey.findProgramAddressSync(
+    [Buffer.from('quote-control')],
+    new PublicKey(PUMP_PROGRAM_ID),
+  )[0].toBase58();
+
+  const decoded = decodePumpTransaction(transaction([
+    action(
+      'create_v2',
+      cursor(2, null, 1),
+      { quote_control: quoteControl },
+      { creator_fee_bps: [300n] },
+    ),
+    eventAt(createEventInstruction(new Uint8Array(), {
+      creator_fee_bps: 0n,
+    }), cursor(2, 0, 2)),
+  ]));
+
+  assert.deepEqual(decoded.creations[0]?.action.args.creator_fee_bps, [300n]);
+  assert.equal(decoded.creations[0]?.creatorFeeBps, 0n);
+});
+
+void test('refuse un créateur holder-reward qui n’est pas le PDA du mint', () => {
+  assert.throws(
+    () => decodePumpTransaction(transaction([
+      action('create_v2', cursor(2, null, 1)),
+      eventAt(createEventInstruction(new Uint8Array(), {
+        creator: OTHER,
+      }), cursor(2, 0, 2)),
+    ])),
+    isPumpError('PUMP_EVENT_MISMATCH'),
   );
 });
 
@@ -141,7 +244,7 @@ void test('refuse un événement ambigu dans la portée d’une action', () => {
     () => decodePumpTransaction(transaction([
       action('buy_v2', cursor(3, null, 1)),
       eventAt(tradeEventInstruction(), cursor(3, 0, 2)),
-      eventAt(tradeEventInstruction(Uint8Array.of(1)), cursor(3, 1, 2)),
+      eventAt(tradeEventInstruction(), cursor(3, 1, 2)),
     ])),
     isPumpError('PUMP_EVENT_AMBIGUOUS'),
   );
@@ -193,6 +296,10 @@ void test('refuse les contradictions mint, user, sens, quote et programme', () =
       action('create_v2', cursor(2, null, 1), { user: OTHER }),
       eventAt(createEventInstruction(), cursor(2, 0, 2)),
     ],
+    [
+      action('create_v2', cursor(2, null, 1), { bonding_curve: OTHER }),
+      eventAt(createEventInstruction(), cursor(2, 0, 2)),
+    ],
   ];
   for (const instructions of mismatches) {
     assert.throws(
@@ -230,13 +337,17 @@ function action(
   name: PumpInstructionName,
   location: Cursor,
   accountOverrides: Readonly<Record<string, string>> = {},
+  argumentOverrides: Readonly<Record<string, unknown>> = {},
 ): NormalizedInstruction {
   const definition = PUMP_INSTRUCTIONS[name];
-  const values = name === 'create_v2'
+  const baseValues = name === 'create_v2'
     ? CREATE_ARGS
+    : name === 'create'
+      ? CREATE_LEGACY_ARGS
     : name === 'sell_v2'
       ? SELL_ARGS
       : TRADE_ARGS;
+  const values = { ...baseValues, ...argumentOverrides };
   const accounts = definition.accounts.map((account) =>
     accountOverrides[account.name] ?? accountValue(account.name));
   if (name === 'create_v2') {
@@ -245,6 +356,9 @@ function action(
       address(11),
       accountOverrides.quote_token_program ?? SPL_TOKEN_PROGRAM_ID,
     );
+    if (accountOverrides.quote_control !== undefined) {
+      accounts.push(accountOverrides.quote_control);
+    }
   }
   return {
     programId: PUMP_PROGRAM_ID,
@@ -263,6 +377,7 @@ function action(
 
 function accountValue(name: string): string {
   if (name === 'mint' || name === 'base_mint') return MINT;
+  if (name === 'bonding_curve') return address(5);
   if (name === 'quote_mint') return QUOTE_MINT;
   if (name === 'user') return USER;
   if (name === 'token_program' || name === 'base_token_program') {
@@ -372,6 +487,14 @@ function encodeValue(type: unknown, value: unknown): Buffer {
     if (!Array.isArray(value)) throw new Error('OptionBool de test invalide.');
     return Buffer.from([value[0] === true ? 1 : 0]);
   }
+  if (isOptionU64(type)) {
+    if (!Array.isArray(value) || typeof value[0] !== 'bigint') {
+      throw new Error('OptionU64 de test invalide.');
+    }
+    const bytes = Buffer.alloc(8);
+    bytes.writeBigUInt64LE(value[0]);
+    return bytes;
+  }
   throw new Error(`Type de test non pris en charge: ${JSON.stringify(type)}.`);
 }
 
@@ -381,6 +504,14 @@ function isOptionBool(type: unknown): boolean {
   return typeof defined === 'object'
     && defined !== null
     && Reflect.get(defined, 'name') === 'OptionBool';
+}
+
+function isOptionU64(type: unknown): boolean {
+  if (typeof type !== 'object' || type === null) return false;
+  const defined = Reflect.get(type, 'defined');
+  return typeof defined === 'object'
+    && defined !== null
+    && Reflect.get(defined, 'name') === 'OptionU64';
 }
 
 function isPumpError(code: string) {

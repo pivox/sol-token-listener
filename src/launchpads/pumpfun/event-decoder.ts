@@ -67,7 +67,14 @@ function decodeCreateEvent(
   payload: Uint8Array,
 ): DecodedPumpCpiEvent {
   const reader = new PumpBorshReader(payload);
-  const fields = decodeIdlFields(PUMP_TYPES.CreateEvent.type.fields, reader);
+  const definition = PUMP_TYPES.CreateEvent.type.fields;
+  const fields = decodeIdlFields(definition.slice(0, -2), reader);
+  const suffixLength = reader.remaining;
+  if (suffixLength !== 0 && suffixLength !== 8 && suffixLength !== 9) {
+    throw invalidEventSuffix('CreateEvent', suffixLength, '0, 8 ou 9');
+  }
+  const creatorFeeBps = suffixLength >= 8 ? reader.readU64() : 0n;
+  const isHolderReward = suffixLength === 9 ? reader.readBool() : false;
   const event: DecodedPumpCreateEvent = Object.freeze({
     name: requireString(fields, 'name'),
     symbol: requireString(fields, 'symbol'),
@@ -89,12 +96,14 @@ function decodeCreateEvent(
       fields,
       'virtual_quote_reserves',
     ),
+    creatorFeeBps,
+    isHolderReward,
   });
   return Object.freeze({
     kind: 'CREATE',
     event,
     instruction,
-    trailingDataHex: trailingHex(payload, reader.offset),
+    trailingDataHex: '',
   });
 }
 
@@ -103,7 +112,14 @@ function decodeTradeEvent(
   payload: Uint8Array,
 ): DecodedPumpCpiEvent {
   const reader = new PumpBorshReader(payload);
-  const fields = decodeIdlFields(PUMP_TYPES.TradeEvent.type.fields, reader);
+  const definition = PUMP_TYPES.TradeEvent.type.fields;
+  const fields = decodeIdlFields(definition.slice(0, -2), reader);
+  const suffixLength = reader.remaining;
+  if (suffixLength !== 0 && suffixLength !== 16) {
+    throw invalidEventSuffix('TradeEvent', suffixLength, '0 ou 16');
+  }
+  const holderRewardsBps = suffixLength === 16 ? reader.readU64() : 0n;
+  const holderRewards = suffixLength === 16 ? reader.readU64() : 0n;
   const event: DecodedPumpTradeEvent = Object.freeze({
     mint: requireString(fields, 'mint'),
     solAmount: requireBigInt(fields, 'sol_amount'),
@@ -149,12 +165,14 @@ function decodeTradeEvent(
       'virtual_quote_reserves',
     ),
     realQuoteReserves: requireBigInt(fields, 'real_quote_reserves'),
+    holderRewardsBps,
+    holderRewards,
   });
   return Object.freeze({
     kind: 'TRADE',
     event,
     instruction,
-    trailingDataHex: trailingHex(payload, reader.offset),
+    trailingDataHex: '',
   });
 }
 
@@ -221,6 +239,14 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.every((value, index) => value === right[index]);
 }
 
-function trailingHex(payload: Uint8Array, offset: number): string {
-  return Buffer.from(payload.subarray(offset)).toString('hex');
+function invalidEventSuffix(
+  eventName: string,
+  actualLength: number,
+  allowedLengths: string,
+): PumpDecodingError {
+  return createPumpDecodingError(
+    'PUMP_BORSH_INVALID',
+    false,
+    `${eventName} attend un suffixe officiel de ${allowedLengths} octets, reçu ${actualLength}.`,
+  );
 }

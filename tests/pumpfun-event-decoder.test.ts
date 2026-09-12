@@ -23,6 +23,10 @@ const PUMP_PROGRAM =
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const MINT = address(1);
 const CREATOR = address(2);
+const HOLDER_REWARDS_CREATOR = PublicKey.findProgramAddressSync(
+  [Buffer.from('holder-rewards'), new PublicKey(MINT).toBuffer()],
+  new PublicKey(PUMP_PROGRAM),
+)[0].toBase58();
 const USER = address(3);
 const QUOTE_MINT = address(4);
 const CREATE_VALUES: Readonly<Record<string, unknown>> = {
@@ -32,7 +36,7 @@ const CREATE_VALUES: Readonly<Record<string, unknown>> = {
   mint: MINT,
   bonding_curve: address(5),
   user: USER,
-  creator: CREATOR,
+  creator: HOLDER_REWARDS_CREATOR,
   timestamp: 9_007_199_254_740_993n,
   virtual_token_reserves: 1_000_000_000_000n,
   virtual_sol_reserves: 30_000_000_000n,
@@ -43,6 +47,8 @@ const CREATE_VALUES: Readonly<Record<string, unknown>> = {
   is_cashback_enabled: true,
   quote_mint: QUOTE_MINT,
   virtual_quote_reserves: 30_000_000_001n,
+  creator_fee_bps: 1_200n,
+  is_holder_reward: true,
 };
 const TRADE_VALUES: Readonly<Record<string, unknown>> = {
   mint: MINT,
@@ -77,6 +83,8 @@ const TRADE_VALUES: Readonly<Record<string, unknown>> = {
   quote_amount: 250_000_001n,
   virtual_quote_reserves: 30_250_000_001n,
   real_quote_reserves: 250_000_001n,
+  holder_rewards_bps: 30n,
+  holder_rewards: 750_000n,
 };
 
 void test('décode CreateEvent avec Token-2022, Mayhem, Cashback et quote mint', () => {
@@ -85,12 +93,46 @@ void test('décode CreateEvent avec Token-2022, Mayhem, Cashback et quote mint',
   assert.ok(decoded);
   assert.equal(decoded.kind, 'CREATE');
   assert.equal(decoded.event.mint, MINT);
-  assert.equal(decoded.event.creator, CREATOR);
+  assert.equal(decoded.event.creator, HOLDER_REWARDS_CREATOR);
   assert.equal(decoded.event.tokenProgram, TOKEN_2022_PROGRAM_ADDRESS);
   assert.equal(decoded.event.isMayhemMode, true);
   assert.equal(decoded.event.isCashbackEnabled, true);
   assert.equal(decoded.event.virtualQuoteReserves, 30_000_000_001n);
+  assert.equal(decoded.event.creatorFeeBps, 1_200n);
+  assert.equal(decoded.event.isHolderReward, true);
   assert.equal(decoded.trailingDataHex, '');
+});
+
+void test('décode uniquement les suffixes officiels historiques de CreateEvent', () => {
+  const cases = [
+    { suffix: Buffer.alloc(0), creatorFeeBps: 0n, holderReward: false },
+    { suffix: encodeInteger(975n, 8, true), creatorFeeBps: 975n, holderReward: false },
+    {
+      suffix: Buffer.concat([encodeInteger(1_200n, 8, true), Buffer.from([1])]),
+      creatorFeeBps: 1_200n,
+      holderReward: true,
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const decoded = decodePumpCpiEvent(createEventWithSuffix(fixture.suffix));
+    assert.ok(decoded);
+    assert.equal(decoded.kind, 'CREATE');
+    assert.equal(decoded.event.creatorFeeBps, fixture.creatorFeeBps);
+    assert.equal(decoded.event.isHolderReward, fixture.holderReward);
+    assert.equal(decoded.trailingDataHex, '');
+  }
+});
+
+void test('refuse les suffixes CreateEvent non officiels', () => {
+  for (const length of [1, 7, 10]) {
+    assert.throws(
+      () => decodePumpCpiEvent(createEventWithSuffix(Buffer.alloc(length))),
+      (error: unknown) =>
+        error instanceof PumpDecodingError
+        && error.code === 'PUMP_BORSH_INVALID',
+    );
+  }
 });
 
 void test('décode TradeEvent avec montants réels, réserves et frais', () => {
@@ -102,6 +144,8 @@ void test('décode TradeEvent avec montants réels, réserves et frais', () => {
   assert.equal(decoded.event.quoteAmount, 250_000_001n);
   assert.equal(decoded.event.isBuy, true);
   assert.equal(decoded.event.creatorFee, 750_000n);
+  assert.equal(decoded.event.holderRewardsBps, 30n);
+  assert.equal(decoded.event.holderRewards, 750_000n);
   assert.equal(decoded.event.shareholders[0]?.shareBps, 1_250n);
   assert.equal(decoded.event.ixName, 'buy_exact_quote_in');
 });
@@ -122,7 +166,7 @@ void test('ignore un mauvais programme, tag Anchor ou événement inconnu', () =
   )), null);
 });
 
-void test('échoue explicitement sur un événement connu tronqué', () => {
+void test('échoue explicitement sur un suffixe d’événement connu incomplet', () => {
   const trade = tradeEventInstruction();
   assert.throws(
     () => decodePumpCpiEvent({
@@ -131,27 +175,38 @@ void test('échoue explicitement sur un événement connu tronqué', () => {
     }),
     (error: unknown) =>
       error instanceof PumpDecodingError
-      && error.code === 'PUMP_BORSH_TRUNCATED',
+      && error.code === 'PUMP_BORSH_INVALID',
   );
 });
 
-void test('conserve les octets finaux d’une extension append-only', () => {
-  const decoded = decodePumpCpiEvent(tradeEventInstruction(
-    Uint8Array.of(0xaa, 0xbb),
-  ));
-
-  assert.ok(decoded);
-  assert.equal(decoded.kind, 'TRADE');
-  assert.equal(decoded.trailingDataHex, 'aabb');
+void test('refuse les octets finaux sans schéma officiel', () => {
+  assert.throws(
+    () => decodePumpCpiEvent(tradeEventInstruction(
+      Uint8Array.of(0xaa, 0xbb),
+    )),
+    (error: unknown) =>
+      error instanceof PumpDecodingError
+      && error.code === 'PUMP_BORSH_INVALID',
+  );
 });
 
 export function createEventInstruction(
   trailing: Uint8Array = new Uint8Array(),
+  overrides: Readonly<Record<string, unknown>> = {},
 ): NormalizedInstruction {
   return eventInstruction(
     Uint8Array.from(PUMP_EVENTS.CreateEvent.discriminator),
-    encodeNamedType('CreateEvent', CREATE_VALUES),
+    encodeNamedType('CreateEvent', { ...CREATE_VALUES, ...overrides }),
     trailing,
+  );
+}
+
+function createEventWithSuffix(suffix: Uint8Array): NormalizedInstruction {
+  const fields = PUMP_TYPES.CreateEvent.type.fields;
+  return eventInstruction(
+    Uint8Array.from(PUMP_EVENTS.CreateEvent.discriminator),
+    encodeFields(fields.slice(0, -2), CREATE_VALUES),
+    suffix,
   );
 }
 

@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { PUMP_IDL_REVISION, PUMP_IDL_SHA256, PUMP_INSTRUCTIONS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
-import { PUMPSWAP_IDL_REVISION, PUMPSWAP_IDL_SHA256, PUMPSWAP_INSTRUCTIONS } from '../src/markets/pumpswap/generated/pumpswap-idl.js';
+import { PUMP_INSTRUCTIONS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
+import { PUMPSWAP_INSTRUCTIONS } from '../src/markets/pumpswap/generated/pumpswap-idl.js';
 import { pumpAmmJson } from '../src/markets/pumpswap/official-sdk.js';
 import type {
   BuildRecipientSelectionV1,
@@ -20,7 +20,7 @@ const CASE_FILES = Object.freeze([
 ] as const);
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
 
-void test('loads the closed golden manifest pinned to local SDK and official IDL versions', async () => {
+void test('loads the closed golden manifest pinned to its immutable SDK and IDL evidence', async () => {
   const manifest = record(await json('manifest.json'), [
     'schemaVersion', 'specificationVersion', 'parentSpecificationVersion',
     'sdkVersions', 'idl', 'sanitization', 'cases',
@@ -45,10 +45,19 @@ void test('loads the closed golden manifest pinned to local SDK and official IDL
   });
 
   const idl = record(manifest.idl, ['revision', 'pumpSha256', 'pumpSwapSha256']);
-  assert.equal(idl.revision, PUMP_IDL_REVISION);
-  assert.equal(idl.revision, PUMPSWAP_IDL_REVISION);
-  assert.equal(idl.pumpSha256, PUMP_IDL_SHA256);
-  assert.equal(idl.pumpSwapSha256, PUMPSWAP_IDL_SHA256);
+  assert.equal(idl.revision, '9c82f61cb711b044a17f770ab8ce9f9bdf78f333');
+  const [pumpIdl, pumpSwapIdl] = await Promise.all([
+    readFile(new URL('../vendor/pumpfun/idl/pump-9c82f61.json', import.meta.url)),
+    readFile(new URL('../vendor/pumpfun/idl/pump-amm-9c82f61.json', import.meta.url)),
+  ]);
+  assert.equal(
+    idl.pumpSha256,
+    createHash('sha256').update(pumpIdl).digest('hex'),
+  );
+  assert.equal(
+    idl.pumpSwapSha256,
+    createHash('sha256').update(pumpSwapIdl).digest('hex'),
+  );
 
   const sanitization = record(manifest.sanitization, [
     'publicAccountsOnly', 'instructionBytesOnly', 'containsSecret',
