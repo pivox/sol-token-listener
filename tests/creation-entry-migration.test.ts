@@ -25,7 +25,7 @@ void test('defines additive V2 creation sessions and unique buyer evidence', asy
   assert.doesNotMatch(sql, /DELETE FROM|DROP TABLE|\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
 });
 
-void test('applies migrations 001-042 on an empty schema and replays cleanly', async (context) => {
+void test('applies migrations 001-047 on an empty schema and replays cleanly', async (context) => {
   if (databaseUrl === undefined || databaseUrl.length === 0) {
     context.skip('TEST_DATABASE_URL is not configured');
     return;
@@ -37,7 +37,7 @@ void test('applies migrations 001-042 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '046_listener_strict_catch_up_runs.sql');
+    assert.equal(applied.at(-1), '047_transaction_inbox_tracked_trade_priority.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const versions = await pool.query(
       `SELECT payload_version FROM paper_strategy_sessions
