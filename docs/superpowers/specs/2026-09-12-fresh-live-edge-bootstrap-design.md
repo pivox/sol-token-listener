@@ -39,6 +39,17 @@ Every other case preserves the strict resumable protocol. In particular, a
 non-null checkpoint is recovered losslessly even under `live-edge`, and a
 matching active strict run is always resumed rather than rebased.
 
+## Lossless subscription handshake
+
+Production prepares the initial `live-edge` frontier before opening the first
+WebSocket session. It then opens and acknowledges the subscriptions and runs the
+normal strict scan from that persisted frontier before publishing `RUNNING`.
+The second scan therefore covers every signature produced between the baseline
+read and the subscription acknowledgement. Its enqueues also make concurrent
+WebSocket observations idempotent: a failed WebSocket write cannot be skipped
+past by the baseline checkpoint. A process failure after the first CAS and
+before subscription is recovered from the same durable frontier on restart.
+
 ## Result and failure semantics
 
 For a non-empty live-edge bootstrap, `discoveredCount` reports validated rows,
@@ -62,4 +73,6 @@ Tests prove:
 - `live-edge` resumes an active strict run;
 - malformed policies fail closed;
 - the production factory wires the parsed policy;
+- the initial frontier completes before the first WebSocket is opened, followed
+  by the ordinary post-acknowledgement strict scan;
 - build, check, lint, backend/frontend tests, and documentation checks pass.

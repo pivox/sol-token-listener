@@ -1054,6 +1054,9 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /pinnedCatchUpSources/u);
   assert.match(source, /verifyProviderGenesis:/u);
   assert.match(source, /source\.verifyGenesis\(signal\)/u);
+  assert.match(source, /prepareInitialFrontier:\s*async/u);
+  assert.match(source, /config\.listenerCatchUpPolicy\s*!==\s*'live-edge'/u);
+  assert.match(source, /await coordinator\.run\(signal\)/u);
   assert.match(source, /runStrictScan:/u);
   assert.match(source, /readPinnedProviderId:/u);
   assert.match(source, /new StrictCatchUpCoordinator\(scanner, inbox, strictCheckpointKeys\)/u);

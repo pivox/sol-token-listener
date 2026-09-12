@@ -93,6 +93,32 @@ void test('reads durable affinity before network and only attempts the pinned pr
   assert.equal(fixture.supervisor.activeProviderId(), 'fallback-1');
 });
 
+void test('prepares the initial frontier before opening the first WebSocket and still scans after acknowledgement', async () => {
+  const frontier = deferred<undefined>();
+  const fixture = supervisorFixture({
+    initialFrontierResults: [frontier.promise],
+    sessionFactories: [() => Promise.resolve(controlledSession('primary').session)],
+  });
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.deepEqual(fixture.initialFrontierCalls.map(({ providerId }) => providerId), ['primary']);
+  assert.equal(fixture.openedAttempts.length, 0);
+  assert.equal(fixture.strictCalls.length, 0);
+
+  frontier.resolve(undefined);
+  await flushLifecycle();
+
+  assert.equal(fixture.openedAttempts.length, 1);
+  assert.equal(fixture.strictCalls.length, 1);
+  assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+  assert.ok(fixture.calls.indexOf('frontier.prepare:primary') < fixture.calls.indexOf('session.open:primary'));
+  assert.ok(fixture.calls.indexOf('session.open:primary') < fixture.calls.indexOf('strict.scan:primary'));
+});
+
 void test('invalid, unavailable, removed, and hostile affinity reads back off without network', async () => {
   let traps = 0;
   const hostileThenable = Object.defineProperty({}, 'then', { get() { traps += 1; throw new Error('secret'); } });
@@ -2733,6 +2759,7 @@ interface FixtureOptions {
   readonly sessionFactories?: (() => Promise<WsProgramSession>)[];
   readonly resolveFailures?: Error[];
   readonly genesisResults?: Promise<void>[];
+  readonly initialFrontierResults?: Promise<void>[];
   readonly reporterStopFailure?: Error;
   readonly reporterStopResult?: Promise<undefined>;
   readonly scheduleFailureDelay?: number;
@@ -2750,6 +2777,7 @@ interface SupervisorFixture {
   readonly strictResults: Promise<StrictCatchUpScanResult>[];
   readonly strictCalls: StrictCall[];
   readonly genesisSignals: AbortSignal[];
+  readonly initialFrontierCalls: StrictCall[];
   readonly openSessionDeferred: Deferred<WsProgramSession>;
   readonly completionDeferred: Deferred<WsProgramSessionCompletion>;
   readonly resolveOpenSession: () => void;
@@ -2791,6 +2819,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
   const strictResults: Promise<StrictCatchUpScanResult>[] = [];
   const strictCalls: StrictCall[] = [];
   const genesisSignals: AbortSignal[] = [];
+  const initialFrontierCalls: StrictCall[] = [];
   const affinitySignals: AbortSignal[] = [];
   const openSessionDeferred = deferred<WsProgramSession>();
   const completionDeferred = deferred<WsProgramSessionCompletion>();
@@ -2838,6 +2867,11 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
       genesisSignals.push(signal);
       return settings.genesisResults?.shift() ?? Promise.resolve();
     },
+    prepareInitialFrontier(providerId: RpcProviderId, signal: AbortSignal): Promise<void> {
+      calls.push(`frontier.prepare:${providerId}`);
+      initialFrontierCalls.push(Object.freeze({ providerId, signal }));
+      return settings.initialFrontierResults?.shift() ?? Promise.resolve();
+    },
     openSession,
     runStrictScan(providerId: RpcProviderId, signal: AbortSignal): Promise<StrictCatchUpScanResult> {
       calls.push(`strict.scan:${providerId}`);
@@ -2867,6 +2901,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     strictResults,
     strictCalls,
     genesisSignals,
+    initialFrontierCalls,
     affinitySignals,
     openSessionDeferred,
     completionDeferred,

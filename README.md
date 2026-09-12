@@ -789,9 +789,10 @@ touches reste indépendante de la latence de persistance avec une seule relance
 coalescée. La projection est calculée depuis un snapshot cohérent et son
 horloge de fraîcheur est capturée après les lectures.
 
-Le superviseur est `ACTIVE` : il acquiert d’abord son propriétaire durable,
-attend le double ACK Pump.fun/PumpSwap, exécute ensuite une frontière stricte
-HTTP des deux programmes avant de publier `RUNNING`. Il lance une vérification
+Le superviseur est `ACTIVE` : il acquiert d’abord son propriétaire durable et,
+pour un premier bootstrap `live-edge`, prépare la baseline avant le WebSocket.
+Il attend ensuite le double ACK Pump.fun/PumpSwap, exécute une seconde frontière
+stricte HTTP des deux programmes avant de publier `RUNNING`. Il lance une vérification
 de frontière périodique toutes les 30 secondes. Une rotation parcourt une fois
 les fournisseurs positionnels et applique un equal jitter borné de 1–60 secondes
 après un cycle transitoire. Une affinité durable relue sans cache avant tout

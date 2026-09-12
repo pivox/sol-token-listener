@@ -247,6 +247,14 @@ export function createProductionListenerRuntime(
         }
         return source.verifyGenesis(signal);
       },
+      prepareInitialFrontier: async (providerId, signal): Promise<void> => {
+        if (config.listenerCatchUpPolicy !== 'live-edge') return;
+        const coordinator = strictCoordinators.get(providerId);
+        if (coordinator === undefined) {
+          throw new TypeError('Strict catch-up coordinator is unavailable.');
+        }
+        await coordinator.run(signal);
+      },
       openSession: (endpoint, observe, signal): ReturnType<typeof openWsProgramSession> => openWsProgramSession(
         endpoint,
         observe,

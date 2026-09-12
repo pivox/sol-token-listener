@@ -93,6 +93,10 @@ export interface WebSocketFailoverSupervisorDependencies {
     providerId: RpcProviderId,
     signal: AbortSignal,
   ) => Promise<void>;
+  readonly prepareInitialFrontier: (
+    providerId: RpcProviderId,
+    signal: AbortSignal,
+  ) => Promise<void>;
   readonly openSession: typeof openWsProgramSession;
   readonly runStrictScan: (
     providerId: RpcProviderId,
@@ -165,6 +169,7 @@ interface ValidatedDependencies {
   readonly promoted: ValidatedPromotedSelector;
   readonly readPinnedProviderId: WebSocketFailoverSupervisorDependencies['readPinnedProviderId'];
   readonly verifyProviderGenesis: WebSocketFailoverSupervisorDependencies['verifyProviderGenesis'];
+  readonly prepareInitialFrontier: WebSocketFailoverSupervisorDependencies['prepareInitialFrontier'];
   readonly openSession: typeof openWsProgramSession;
   readonly runStrictScan: WebSocketFailoverSupervisorDependencies['runStrictScan'];
 }
@@ -198,6 +203,7 @@ export class WebSocketFailoverSupervisor {
   #transitionActive = false;
   readonly #transitionWaiters: (() => void)[] = [];
   #shutdownResourceFailed = false;
+  #initialFrontierPrepared = false;
 
   public constructor(
     dependencies: WebSocketFailoverSupervisorDependencies,
@@ -481,6 +487,22 @@ export class WebSocketFailoverSupervisor {
       controller.abort();
       if (this.#candidateAbort === controller) this.#candidateAbort = null;
       return abortedAttempt();
+    }
+    if (!this.#initialFrontierPrepared) {
+      try {
+        await this.#dependencies.prepareInitialFrontier(providerId, controller.signal);
+      } catch (error) {
+        const stopped = this.#isPermanentlyClosed() || controller.signal.aborted;
+        controller.abort();
+        if (this.#candidateAbort === controller) this.#candidateAbort = null;
+        return stopped ? abortedAttempt() : strictScanFailureFrom(error);
+      }
+      if (this.#isPermanentlyClosed() || this.#candidateAbort !== controller) {
+        controller.abort();
+        if (this.#candidateAbort === controller) this.#candidateAbort = null;
+        return abortedAttempt();
+      }
+      this.#initialFrontierPrepared = true;
     }
     let endpoint: RpcProviderPair;
     try {
@@ -1343,6 +1365,7 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     'promoted',
     'readPinnedProviderId',
     'verifyProviderGenesis',
+    'prepareInitialFrontier',
     'openSession',
     'runStrictScan',
   ]);
@@ -1351,6 +1374,7 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
   const reporterValue = dependencies.reporter;
   const promotedValue = dependencies.promoted;
   const verifyProviderGenesis = dependencies.verifyProviderGenesis;
+  const prepareInitialFrontier = dependencies.prepareInitialFrontier;
   const openSession = dependencies.openSession;
   const runStrictScan = dependencies.runStrictScan;
   const readPinnedProviderId = dependencies.readPinnedProviderId;
@@ -1364,6 +1388,8 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     || isProxy(readPinnedProviderId)
     || typeof verifyProviderGenesis !== 'function'
     || isProxy(verifyProviderGenesis)
+    || typeof prepareInitialFrontier !== 'function'
+    || isProxy(prepareInitialFrontier)
     || typeof openSession !== 'function'
     || isProxy(openSession)
     || typeof runStrictScan !== 'function'
@@ -1477,6 +1503,23 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     verifyProviderGenesis(providerId: RpcProviderId, signal: AbortSignal): Promise<void> {
       try {
         const result: unknown = Reflect.apply(verifyProviderGenesis, dependencyReceiver, [
+          providerId,
+          signal,
+        ]);
+        if (!nativePromise(result)) return Promise.reject(configurationError());
+        return Reflect.apply(PROMISE_THEN, result, [
+          (value: unknown): void => {
+            if (value !== undefined) throw configurationError();
+          },
+          (error: unknown): never => { throw error; },
+        ]);
+      } catch {
+        return Promise.reject(configurationError());
+      }
+    },
+    prepareInitialFrontier(providerId: RpcProviderId, signal: AbortSignal): Promise<void> {
+      try {
+        const result: unknown = Reflect.apply(prepareInitialFrontier, dependencyReceiver, [
           providerId,
           signal,
         ]);
@@ -1773,7 +1816,7 @@ function attemptFailureFrom(error: unknown): ProviderAttemptResult {
 
 function strictScanFailureFrom(
   error: unknown,
-  record: SessionRecord,
+  record?: SessionRecord,
 ): ProviderAttemptResult {
   if (typeof error === 'object' && error !== null && isProxy(error)) return attemptFailureFrom(null);
   if (error instanceof StrictCatchUpAbortedError) return nonShutdownAbortFailure(record);

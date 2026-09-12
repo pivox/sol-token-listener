@@ -714,8 +714,9 @@ constat reste `CANARY_NOT_STARTED`.
 Sur une base vide, le scanner prend uniquement la page la plus récente de
 chaque programme comme baseline, conformément au périmètre sans historique.
 Avec la politique V1 `live-edge`, cette page est validée mais ses signatures ne
-sont pas enfilées ; le checkpoint nul avance par CAS vers la tête. Avec `strict`,
-elle reste enfilée. Une fois un checkpoint présent, ou un run actif, les deux
+ne sont pas enfilées ; avant l'ouverture du premier WebSocket, le checkpoint nul
+avance par CAS vers la tête. Avec `strict`, elle reste enfilée. Une fois un
+checkpoint présent, ou un run actif, les deux
 politiques suivent le protocole strict, durable et sans rebasage.
 Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.
 Une reprise après panne rejoue toujours l'intégralité des étapes launchpad,

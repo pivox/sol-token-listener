@@ -102,11 +102,13 @@ d'un seul fournisseur, pas une chaîne de basculement de production.
 
 ## Supervision WebSocket et reprise stricte
 
-Le superviseur actif acquiert son owner PostgreSQL avant tout appel Solana,
-attend le double ACK des abonnements Pump.fun et PumpSwap, puis réalise une
-frontière appairée sur les deux programmes avec le provider candidat. Sur une
-base fraîche, `live-edge` valide une page sans l'enfiler et fixe le checkpoint ;
-dès qu'un checkpoint ou run actif existe, la frontière est strictement reprise.
+Le superviseur actif acquiert son owner PostgreSQL avant tout appel Solana. Pour
+le premier démarrage `live-edge`, il prépare la baseline appairée avant d'ouvrir
+le WebSocket. Il attend ensuite le double ACK des abonnements Pump.fun et
+PumpSwap, puis réalise une seconde frontière stricte avec le même provider avant
+de publier `RUNNING`. Cette seconde passe couvre la fenêtre entre baseline et
+abonnement et rend les écritures WebSocket concurrentes idempotentes. Dès qu'un
+checkpoint ou run actif existe, la frontière est strictement reprise.
 La publication durable de `RUNNING` précède la promotion du fournisseur. Une
 frontière périodique, elle aussi appairée, est exécutée toutes les 30 secondes.
 Chaque cycle donne au plus un setup et une analyse stricte à chaque fournisseur
