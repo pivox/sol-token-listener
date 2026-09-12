@@ -978,6 +978,7 @@ void test('enqueues current program and finality per page while inbox merges ide
   assert.deepEqual(shared, {
     signature: 'shared', slot: 3n, source: 'CATCH_UP',
     ingestionHint: null,
+    ingestionHintMint: null,
     programIds: [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID],
     confirmationStatus: 'finalized', observedAtMs: 9_000,
   });

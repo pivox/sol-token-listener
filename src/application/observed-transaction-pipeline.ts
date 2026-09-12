@@ -31,6 +31,7 @@ export type ObservedPipelineStage =
   | 'create_observation'
   | 'load_tracked_mints'
   | 'launchpad_observation'
+  | 'sync_tracked_mint'
   | 'reload_active_events'
   | 'funding_observation'
   | 'participant_analytics'
@@ -70,6 +71,10 @@ interface LaunchpadObserver {
     transaction: SolanaObservedTransaction,
     trackedMints: ReadonlySet<string>,
   ): Promise<LaunchpadEventBatchResult>;
+}
+
+export interface TrackedMintInboxSynchronizer {
+  syncTrackedMint(mint: string): Promise<void>;
 }
 
 interface FundingObservationResult {
@@ -122,6 +127,7 @@ export class ObservedTransactionPipeline {
     private readonly clock: () => number = Date.now,
     private readonly paperDecisions: PaperDecisionScheduler | null = null,
     private readonly qualification: MintProjectionRebuilder | null = null,
+    private readonly trackedMintInbox: TrackedMintInboxSynchronizer | null = null,
   ) {}
 
   public async process(
@@ -133,6 +139,13 @@ export class ObservedTransactionPipeline {
       boundedMintSet(await this.reader.listTrackedMints()));
     const launchpad = await this.stage('launchpad_observation', null, async () =>
       snapshotLaunchpadResult(await this.launchpad.observe(observed, trackedMints)));
+    const trackedMintInbox = this.trackedMintInbox;
+    if (trackedMintInbox !== null) {
+      for (const mint of affectedMintList([], launchpad.affectedMints)) {
+        await this.stage('sync_tracked_mint', mint, () =>
+          trackedMintInbox.syncTrackedMint(mint));
+      }
+    }
     const active = await this.stage('reload_active_events', null, async () =>
       snapshotActiveContext(
         await this.reader.listActiveEventsBySignature(observed.signature),

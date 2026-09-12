@@ -133,6 +133,7 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
     await assert.rejects(inbox.enqueue(Object.freeze({
       signature: SHARED_SIGNATURE, slot: 43n, source: 'WEBSOCKET',
       ingestionHint: null,
+      ingestionHintMint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'confirmed', observedAtMs: 10_001,
     })), (error: unknown) => error instanceof TransactionInboxConflictError
       && error.conflict === 'identity');
@@ -606,7 +607,7 @@ void test('active market completes before failed launchpad and releases the prov
       if (program.key === 'market') {
         for (const value of rows) await inbox.enqueue(Object.freeze({
           signature: value.signature, slot: value.slot, confirmationStatus: value.confirmationStatus,
-          source: 'CATCH_UP', ingestionHint: null, observedAtMs: 10_000, programIds: Object.freeze([program.id]),
+          source: 'CATCH_UP', ingestionHint: null, ingestionHintMint: null, observedAtMs: 10_000, programIds: Object.freeze([program.id]),
         }));
         await inbox.createStrictCatchUpRun(createStrictCatchUpRun({
           checkpointKey: program.key, previous, providerId: 'primary',
@@ -1195,7 +1196,7 @@ function wsNotification(
   endpointId: RpcProviderId = 'primary',
   hint: 'NONE' | 'PUMPFUN_CREATE' = 'NONE',
 ): WsProgramNotification {
-  return Object.freeze({ endpointId, program, signature: SHARED_SIGNATURE, slot: 42n, hint });
+  return Object.freeze({ endpointId, program, signature: SHARED_SIGNATURE, slot: 42n, hint, hintMint: null });
 }
 
 function establishNativeSession(socket: NativeSetupSocket): void {
@@ -1243,6 +1244,7 @@ async function seedCrashBoundary(
   await inbox.enqueue(Object.freeze({
     signature: SHARED_SIGNATURE, slot: 42n, source: 'CATCH_UP',
       ingestionHint: null,
+    ingestionHintMint: null,
     programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID]),
     confirmationStatus: 'confirmed', observedAtMs: 10_000,
   }));

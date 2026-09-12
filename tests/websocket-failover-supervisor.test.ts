@@ -509,6 +509,7 @@ void test('unrecoverable fences notifications and closes a live incumbent before
     endpointId: 'primary',
     program: 'pumpfun',
     hint: 'NONE',
+    hintMint: null,
     signature: '1'.repeat(64),
     slot: 47n,
   }));
@@ -942,6 +943,7 @@ void test('periodic frontier rearms only after successful settlement and never f
     endpointId: 'primary',
     program: 'pumpfun',
     hint: 'NONE',
+    hintMint: null,
     signature: '1'.repeat(64),
     slot: 50n,
   }));
@@ -1204,6 +1206,7 @@ void test('stale incumbent completion cannot degrade a replacement promoted afte
     endpointId: 'primary',
     program: 'pumpswap',
     hint: 'NONE',
+    hintMint: null,
     signature: '1'.repeat(64),
     slot: 51n,
   }));
@@ -1668,6 +1671,7 @@ void test('dual ACK forwards a partial notification and promotion follows strict
     endpointId: 'primary',
     program: 'pumpfun',
     hint: 'PUMPFUN_CREATE',
+    hintMint: null,
     signature: '1'.repeat(64),
     slot: 41n,
   }));
@@ -1679,6 +1683,7 @@ void test('dual ACK forwards a partial notification and promotion follows strict
       slot: 41n,
       source: 'WEBSOCKET',
       ingestionHint: 'PUMPFUN_CREATE',
+      ingestionHintMint: null,
       programIds: [PUMP_PROGRAM_ID],
       confirmationStatus: 'confirmed',
       observedAtMs: 1_000,
@@ -1752,6 +1757,7 @@ void test('promoted incumbent keeps forwarding valid websocket notifications', a
     endpointId: 'primary',
     program: 'pumpswap',
     hint: 'NONE',
+    hintMint: null,
     signature: '1'.repeat(64),
     slot: 43n,
   }));
@@ -1762,6 +1768,7 @@ void test('promoted incumbent keeps forwarding valid websocket notifications', a
       slot: 43n,
       source: 'WEBSOCKET',
       ingestionHint: null,
+      ingestionHintMint: null,
       programIds: [PUMPSWAP_PROGRAM_ID],
       confirmationStatus: 'confirmed',
       observedAtMs: 1_000,
@@ -1769,6 +1776,66 @@ void test('promoted incumbent keeps forwarding valid websocket notifications', a
     ownerGeneration: 1n,
     sessionGeneration: 1n,
   });
+});
+
+void test('forwards an exact durable Pump.fun trade mint and rejects invalid hint pairs', async () => {
+  const tradeMint = '4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw';
+  const fixture = supervisorFixture();
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+
+  await observe(Object.freeze({
+    endpointId: 'primary', program: 'pumpfun', hint: 'PUMPFUN_TRADE', hintMint: tradeMint,
+    signature: '1'.repeat(64), slot: 43n,
+  }));
+  assert.deepEqual(fixture.reporter.observations.at(-1), {
+    notification: {
+      signature: '1'.repeat(64), slot: 43n, source: 'WEBSOCKET',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+      programIds: [PUMP_PROGRAM_ID], confirmationStatus: 'confirmed', observedAtMs: 1_000,
+    },
+    ownerGeneration: 1n,
+    sessionGeneration: 1n,
+  });
+  assert.ok(Object.isFrozen(fixture.reporter.observations.at(-1)?.notification));
+
+  for (const invalid of [
+    { program: 'pumpfun', hint: 'PUMPFUN_TRADE', hintMint: null },
+    { program: 'pumpfun', hint: 'PUMPFUN_CREATE', hintMint: tradeMint },
+    { program: 'pumpswap', hint: 'PUMPFUN_TRADE', hintMint: tradeMint },
+    { program: 'pumpfun', hint: 'PUMPFUN_TRADE', hintMint: ` ${tradeMint}` },
+  ]) {
+    await assert.rejects(observe(Object.freeze({
+      endpointId: 'primary', signature: '1'.repeat(64), slot: 43n, ...invalid,
+    }) as unknown as WsProgramNotification), TypeError);
+  }
+
+  let mintAccessorReads = 0;
+  let mintProxyTraps = 0;
+  const mintAccessor = Object.defineProperty({
+    endpointId: 'primary', program: 'pumpfun', hint: 'PUMPFUN_TRADE',
+    signature: '1'.repeat(64), slot: 43n,
+  }, 'hintMint', {
+    enumerable: true,
+    get() { mintAccessorReads += 1; throw new Error('secret mint accessor'); },
+  });
+  const mintProxy = new Proxy(Object.freeze({
+    endpointId: 'primary', program: 'pumpfun', hint: 'PUMPFUN_TRADE', hintMint: tradeMint,
+    signature: '1'.repeat(64), slot: 43n,
+  }), {
+    getOwnPropertyDescriptor() { mintProxyTraps += 1; throw new Error('secret mint proxy'); },
+  });
+  for (const invalid of [mintAccessor, mintProxy]) {
+    await assert.rejects(observe(invalid as unknown as WsProgramNotification), TypeError);
+  }
+  assert.equal(mintAccessorReads, 0);
+  assert.equal(mintProxyTraps, 0);
 });
 
 void test('promotion is abandoned when candidate completion wins before recovery', async () => {
@@ -1884,6 +1951,7 @@ void test('queued degradation persistence failure clears and stops the promoted 
     endpointId: 'primary',
     program: 'pumpfun',
     hint: 'NONE',
+    hintMint: null,
     signature: '4'.repeat(64),
     slot: 44n,
   }));
@@ -2077,6 +2145,7 @@ void test('hostile notification payloads are rejected without traps, clock, or o
     endpointId: 'primary',
     program: 'pumpfun',
     hint: 'NONE',
+    hintMint: null,
     signature: hostile,
     slot: 45n,
   });
@@ -2084,6 +2153,7 @@ void test('hostile notification payloads are rejected without traps, clock, or o
     endpointId: 'primary',
     program: 'pumpfun',
     hint: 'NONE',
+    hintMint: null,
     signature: '5'.repeat(64),
     slot: 45,
   });
@@ -2194,6 +2264,7 @@ void test('opened session rejects own completion then without invoking it or ret
       endpointId: 'primary',
       program: 'pumpfun',
     hint: 'NONE',
+      hintMint: null,
       signature: '1'.repeat(64),
       slot: 46n,
     }));

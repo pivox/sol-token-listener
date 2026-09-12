@@ -221,7 +221,7 @@ void test('execution intent migration applies and replays on an isolated schema'
 
   await withTemporarySchema(databaseUrl, 'execution_intents', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '046_listener_strict_catch_up_runs.sql');
+    assert.equal(applied.at(-1), '047_transaction_inbox_tracked_trade_priority.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const schemaState = await pool.query(`SELECT current_schema() AS schema,

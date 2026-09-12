@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { PublicKey } from '@solana/web3.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMP_EVENTS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
@@ -45,6 +46,7 @@ void test('opens only after both confirmed subscriptions acknowledge and forward
     signature,
     slot: 41n,
     hint: 'NONE',
+    hintMint: null,
   }]);
 
   socket.message({ jsonrpc: '2.0', id: 1, result: 101 });
@@ -89,6 +91,7 @@ void test('subscribes and unsubscribes only the configured launchpad program', a
     signature,
     slot: 41n,
     hint: 'NONE',
+    hintMint: null,
   }]);
 
   const closing = session.close(new AbortController().signal);
@@ -130,8 +133,93 @@ void test('derives only the closed Pump.fun create hint from the official event 
     signature: '1'.repeat(64),
     slot: 42n,
     hint: 'PUMPFUN_CREATE',
+    hintMint: null,
   })]);
   assert.equal(Object.hasOwn(frames[0] as object, 'logs'), false);
+  const closing = session.close(new AbortController().signal);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  socket.message({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
+});
+
+void test('forwards the detached canonical Pump.fun trade mint', async () => {
+  const socket = new FakeWebSocket();
+  const scheduler = new ManualScheduler();
+  const frames: unknown[] = [];
+  const session = await acknowledge(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); },
+    new AbortController().signal,
+    { createWebSocket: () => socket, scheduler },
+  ), socket);
+  const mint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+  const encodedTradeEvent = Buffer.concat([
+    Buffer.from(PUMP_EVENTS.TradeEvent.discriminator), mint.toBytes(),
+  ]).toString('base64');
+
+  socket.message(notification(101, 43, '1'.repeat(64), null, [`Program data: ${encodedTradeEvent}`]));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+  assert.deepEqual(frames, [Object.freeze({
+    endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 43n,
+    hint: 'PUMPFUN_TRADE', hintMint: mint.toBase58(),
+  })]);
+  const closing = session.close(new AbortController().signal);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  socket.message({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
+});
+
+void test('keeps the create hint when a Pump.fun notification contains both trade and create events', async () => {
+  const socket = new FakeWebSocket();
+  const scheduler = new ManualScheduler();
+  const frames: unknown[] = [];
+  const session = await acknowledge(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); },
+    new AbortController().signal,
+    { createWebSocket: () => socket, scheduler },
+  ), socket);
+  const mint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+  const encodedTradeEvent = Buffer.concat([
+    Buffer.from(PUMP_EVENTS.TradeEvent.discriminator), mint.toBytes(),
+  ]).toString('base64');
+  const encodedCreateEvent = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator).toString('base64');
+
+  socket.message(notification(101, 43, '1'.repeat(64), null, [
+    `Program data: ${encodedTradeEvent}`, `Program data: ${encodedCreateEvent}`,
+  ]));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+  assert.deepEqual(frames, [Object.freeze({
+    endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 43n,
+    hint: 'PUMPFUN_CREATE', hintMint: null,
+  })]);
+  const closing = session.close(new AbortController().signal);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  socket.message({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
+});
+
+void test('supplies the PumpSwap runtime veto to Pump.fun hints without losing creation priority', async () => {
+  const socket = new FakeWebSocket();
+  const frames: unknown[] = [];
+  const session = await acknowledge(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); }, new AbortController().signal,
+    { createWebSocket: () => socket, scheduler: new ManualScheduler() },
+  ), socket);
+  const trade = Buffer.concat([Buffer.from(PUMP_EVENTS.TradeEvent.discriminator),
+    new PublicKey('So11111111111111111111111111111111111111112').toBytes()]).toString('base64');
+  const create = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator).toString('base64');
+  const logs = [`Program data: ${trade}`, `Program ${PUMPSWAP_PROGRAM_ID} invoke [2]`];
+  socket.message(notification(101, 43, '1'.repeat(64), null, logs));
+  socket.message(notification(101, 44, '1'.repeat(64), null, [...logs, `Program data: ${create}`]));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(frames, [
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 43n, hint: 'NONE', hintMint: null },
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 44n, hint: 'PUMPFUN_CREATE', hintMint: null },
+  ]);
   const closing = session.close(new AbortController().signal);
   socket.message({ jsonrpc: '2.0', id: 3, result: true });
   socket.message({ jsonrpc: '2.0', id: 4, result: true });

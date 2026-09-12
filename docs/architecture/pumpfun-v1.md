@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.2 — 2026-09-08
+**Version :** 1.1.3 — 2026-09-12
 
 ## Périmètre produit
 
@@ -661,13 +661,36 @@ checkpoints sont indépendants de la source.
 
 L'inbox durable déduplique les notifications WebSocket et le rattrapage HTTP.
 
-Depuis la version 1.1.2, le WebSocket Pump.fun peut joindre l'indice éphémère
-fermé `PUMPFUN_CREATE` lorsque les logs bornés contiennent le discriminator
-officiel de `CreateEvent`. L'inbox le traduit en priorité durable
-`LAUNCH_CANDIDATE`; un doublon ne peut jamais la redescendre. Le claim sert
-jusqu'à 32 créations prioritaires avant de réserver une tranche à une ligne
-`NORMAL` éligible. Les logs WebSocket ne sont pas persistés et le décodeur de
+Depuis la version 1.1.3, le WebSocket Pump.fun peut joindre les indices
+éphémères fermés `PUMPFUN_CREATE` ou `PUMPFUN_TRADE`. Le premier est détecté
+depuis le discriminator officiel de `CreateEvent`; le second transporte le mint
+public lu après le discriminator officiel de `TradeEvent`. Une création trouvée
+dans les logs bornés l'emporte toujours sur un trade. Toute entrée ambiguë reste
+`NONE`, donc suit la voie normale sans filtrage.
+
+La migration 047 traduit une création en priorité durable
+`LAUNCH_CANDIDATE`. Pour `PUMPFUN_TRADE`, PostgreSQL relit la projection
+canonique : un mint actif produit `TRACKED_TRADE`, tandis qu'un mint absent ou
+terminal produit `DEFERRED` sans lease, tentative, snapshot ni récupération de
+corps RPC. La projection d'une création synchronise ensuite ce mint et réactive
+les trades différés ; un doublon catch-up sans logs ne ressuscite pas une
+décision filtrée. Les logs WebSocket ne sont jamais persistés et le décodeur de
 la transaction RPC complète reste la seule autorité métier.
+
+`LAUNCH_CANDIDATE` et `TRACKED_TRADE` partagent la cohorte urgente. Le claim
+sert jusqu'à 32 lignes urgentes avant de réserver une tranche à une ligne
+`NORMAL` éligible. `DEFERRED` n'est jamais claimable, sort du backlog
+actionnable et constitue le backlog filtré directement mesurable pour H2i. Sa
+décision terminale est conservée exactement quatre heures avant purge. Le gate
+H2i exige zéro réponse 429, un backlog actionnable non croissant, le superviseur
+`RUNNING` et un p95 création vers BUY/SELL inférieur ou égal à 45 secondes.
+
+L'upgrade 047 remplace l'enum de priorité, élargit les contraintes, renomme le
+compteur du scheduler et reconstruit l'index de claim sous des verrous
+`ACCESS EXCLUSIVE`. L'opérateur arrête donc les anciennes réplicas, applique la
+migration dans une fenêtre de maintenance, rejoue le provisioning des rôles et
+démarre ensuite le nouveau binaire. Cela n'arme ni ne démarre un canary : le
+constat reste `CANARY_NOT_STARTED`.
 Sur une base vide, le scanner prend uniquement la page la plus récente de
 chaque programme comme baseline, conformément au périmètre sans historique.
 Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.

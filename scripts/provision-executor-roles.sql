@@ -384,7 +384,7 @@ TO sol_token_listener_writer;
 
 GRANT SELECT ON TABLE chain_transaction_inbox_claim_scheduler
 TO sol_token_listener_writer;
-GRANT UPDATE (consecutive_launch_candidate_claims,updated_at)
+GRANT UPDATE (consecutive_urgent_claims,updated_at)
 ON TABLE chain_transaction_inbox_claim_scheduler
 TO sol_token_listener_writer;
 

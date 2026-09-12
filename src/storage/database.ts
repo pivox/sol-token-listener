@@ -5,6 +5,7 @@ import pg from 'pg';
 import type { PoolClient } from 'pg';
 import { expireExecutionIntentsPreSubmissionInTransaction } from
   './execution-intent-expiration.js';
+import { FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL } from './foundation-retention-fence.js';
 
 type PgPool = InstanceType<typeof pg.Pool>;
 let sharedPool: PgPool | null = null;
@@ -211,9 +212,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   let failureCleanupHandled = false;
   try {
     await client.query('BEGIN');
-    await client.query(
-      "SELECT pg_advisory_xact_lock(hashtextextended('foundation-retention-fence:v1', 0))",
-    );
+    await client.query(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL);
     await client.query(PAPER_MVP_RETENTION_FENCE_SQL);
     const executionIntentsExpiredPreSubmission =
       await expireExecutionIntentsPreSubmissionInTransaction(
@@ -980,6 +979,15 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `DELETE FROM chain_transaction_inbox
        WHERE terminal_at IS NOT NULL
          AND purge_after <= clock_timestamp()
+         AND NOT (
+           processing_status='DEFERRED'
+           AND ingestion_hint='PUMPFUN_TRADE'
+           AND EXISTS (
+             SELECT 1 FROM token_launches launch
+             WHERE launch.mint=chain_transaction_inbox.ingestion_hint_mint
+               AND launch.terminal_at IS NULL
+           )
+         )
          AND (
            processing_status<>'PROCESSED'
            OR target_confirmation_status NOT IN ('finalized','orphaned')

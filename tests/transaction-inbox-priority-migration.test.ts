@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const migrationName = '044_transaction_inbox_launch_priority.sql';
@@ -12,14 +11,12 @@ const pumpProgramId = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 
 void test('migration 044 defines a closed durable priority and an ordered claim index', async () => {
   const sql = await readFile(migrationUrl, 'utf8').catch(() => '');
-  const repository = await readFile(
-    new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url),
-    'utf8',
-  );
 
   assert.match(sql, /CREATE TYPE chain_transaction_inbox_priority AS ENUM \('NORMAL', 'LAUNCH_CANDIDATE'\)/u);
   assert.match(sql, /ingestion_priority chain_transaction_inbox_priority\s+NOT NULL DEFAULT 'NORMAL'/u);
-  assert.match(repository, /ingestion_priority\s*=\s*GREATEST\(/u);
+  // Historical backfill must preserve classified rows. Runtime monotone
+  // discovery convergence is covered by transaction-inbox.repository.test.ts.
+  assert.match(sql, /SET ingestion_priority = 'NORMAL'\s+WHERE ingestion_priority IS NULL/u);
   assert.match(sql, /ingestion_priority DESC, observed_slot, signature/u);
   assert.match(sql, /chain_transaction_inbox_claim_scheduler/u);
 });
@@ -53,11 +50,9 @@ void test('migration 044 upgrades 043, replays, and keeps its enum ordering on P
       processing_status, observed_at
     ) VALUES ('legacy-normal',1,ARRAY['CATCH_UP'],ARRAY[$1],'confirmed','PENDING',NOW())`, [pumpProgramId]);
 
-    assert.deepEqual(await migrateDatabase({ pool }), [
-      migrationName,
-      '045_execution_wallet_snapshot_refresh.sql',
-      '046_listener_strict_catch_up_runs.sql',
-    ]);
+    // This is the historical 044 contract, not the current migration head.
+    const sql = await readFile(migrationUrl, 'utf8');
+    await pool.query(sql);
     assert.deepEqual((await pool.query(`SELECT ingestion_priority::TEXT AS priority
       FROM chain_transaction_inbox WHERE signature='legacy-normal'`)).rows, [{ priority: 'NORMAL' }]);
     assert.deepEqual((await pool.query(`SELECT enumlabel
@@ -74,9 +69,11 @@ void test('migration 044 upgrades 043, replays, and keeps its enum ordering on P
       scheduler_key: 'global', consecutive_launch_candidate_claims: 0,
     }]);
 
-    const sql = await readFile(migrationUrl, 'utf8');
+    await pool.query(`UPDATE chain_transaction_inbox SET ingestion_priority='LAUNCH_CANDIDATE'
+      WHERE signature='legacy-normal'`);
     await pool.query(sql);
-    assert.deepEqual(await migrateDatabase({ pool }), []);
+    assert.deepEqual((await pool.query(`SELECT ingestion_priority::TEXT AS priority
+      FROM chain_transaction_inbox WHERE signature='legacy-normal'`)).rows, [{ priority: 'LAUNCH_CANDIDATE' }]);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);

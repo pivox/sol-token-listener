@@ -8,6 +8,7 @@ import { PostgresExecutionIntentRepository } from '../src/storage/execution-inte
 import { PostgresExecutionOperationsRepository } from
   '../src/storage/execution-operations.repository.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL } from '../src/storage/foundation-retention-fence.js';
 import {
   LIVE_EXECUTOR_DATABASE_AUTHORITY_V1,
   LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL,
@@ -315,7 +316,9 @@ void test('foundation retention has an isolated executable role without signed-b
     executable,
     /GRANT\s+(?:ALL(?:\s+PRIVILEGES)?|UPDATE\s+ON\s+TABLE)[^;]*TO\s+sol_token_retention_worker/iu,
   );
-  assert.match(purge, /pg_advisory_xact_lock\(hashtextextended\('foundation-retention-fence:v1', 0\)\)/u);
+  assert.match(purge, /client\.query\(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL\)/u);
+  assert.match(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL,
+    /pg_advisory_xact_lock\(hashtextextended\('foundation-retention-fence:v1', 0\)\)/u);
   assert.match(purge, /DELETE FROM listener_strict_catch_up_runs\s+WHERE state <> 'ACTIVE'\s+AND purge_after <= clock_timestamp\(\)/u);
   for (const privilege of ['SELECT', 'DELETE']) {
     assert.match(executable, new RegExp(`GRANT ${privilege} ON TABLE[^;]*listener_strict_catch_up_runs[^;]*TO sol_token_retention_worker`, 'iu'));
@@ -779,14 +782,30 @@ void test('provisioned retention role runs the complete purge without reading si
       try { await operationsClient.query('RESET ROLE'); } finally { operationsClient.release(); }
     }
 
+    const trackedMint = 'So11111111111111111111111111111111111111112';
+    await isolated.query(`INSERT INTO token_launches (
+      mint,launchpad,program_id,creator,token_program,current_state,created_signature,
+      created_slot,created_transaction_index,created_instruction_index,detected_at,updated_at
+    ) VALUES ($1,'pumpfun','pump',$1,'SPL_TOKEN','OBSERVING','retention-role-launch',1,0,0,NOW(),NOW())`,
+    [trackedMint]);
+    await isolated.query(`INSERT INTO chain_transaction_inbox (
+      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+      processing_status,ingestion_hint,ingestion_hint_mint,observed_at,terminal_at,purge_after
+    ) SELECT signature,1,ARRAY['WEBSOCKET'],ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],
+      'processed','DEFERRED','PUMPFUN_TRADE',mint,TIMESTAMPTZ '2020-01-01T00:00:00Z',
+      TIMESTAMPTZ '2020-01-01T00:00:00Z',TIMESTAMPTZ '2020-01-01T04:00:00Z'
+      FROM (VALUES ('active-deferred',$1),('inactive-deferred',$2)) AS seeds(signature,mint)`,
+    [trackedMint, '11111111111111111111111111111111']);
     const restrictedClient = await isolated.connect();
     await restrictedClient.query('SET ROLE sol_token_retention_worker');
     const restrictedPool = { connect: async () => restrictedClient };
-    await purgeExpiredFoundationData(restrictedPool as never);
+    assert.equal((await purgeExpiredFoundationData(restrictedPool as never)).transactionInbox, 1);
 
     const byteProbe = await isolated.connect();
     try {
       await byteProbe.query('SET ROLE sol_token_retention_worker');
+      assert.deepEqual((await byteProbe.query('SELECT signature FROM chain_transaction_inbox')).rows,
+        [{ signature: 'active-deferred' }]);
       await byteProbe.query('SELECT * FROM listener_strict_catch_up_runs WHERE FALSE');
       await byteProbe.query('DELETE FROM listener_strict_catch_up_runs WHERE FALSE');
       for (const forbidden of [

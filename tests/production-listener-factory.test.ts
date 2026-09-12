@@ -248,7 +248,20 @@ void test('production composes one canonical qualification writer before paper d
   assert.match(source, /new QualificationProjectionService\([\s\S]*?qualificationRebuilder,[\s\S]*?config\.paperQuoteMintAllowlist[\s\S]*?\)/u);
   assert.match(source,/new SocialQualificationRefreshService\(qualification,paperRepository\)/u);
   assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualificationRebuilder,/u);
-  assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*\)/u);
+  assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*\)/u);
+});
+
+void test('production injects the worker inbox into the observed pipeline for tracked-mint synchronization', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.equal(count(source, /new PostgresTransactionInboxRepository\(/gu), 1);
+  assert.match(
+    source,
+    /const pipeline = new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*\)/u,
+  );
 });
 
 void test('production selects creation-entry-v1 without adding a second paper pipeline', async () => {
