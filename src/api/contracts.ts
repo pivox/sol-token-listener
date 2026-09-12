@@ -541,6 +541,29 @@ export interface ApiHeartbeat {
   readonly pendingTransactions: number | null;
   readonly activeSessions: number | null;
   readonly websocket: ApiWebSocketHealth;
+  /** Optional only during rolling deployment from API V1 implementations predating issue #114. */
+  readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
+}
+
+export interface ApiBlockHydrationMetricsV1 {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly callerConcurrency: 1;
+  readonly locates: number;
+  readonly hits: number;
+  readonly misses: number;
+  readonly inFlightJoins: number;
+  readonly fetches: number;
+  readonly forcedRefreshes: number;
+  readonly evictions: number;
+  readonly oversizeBypasses: number;
+  readonly fetchFailures: number;
+  readonly epochInvalidations: number;
+  readonly retainedEntries: number;
+  readonly retainedBytes: number;
+  readonly inFlightFetches: number;
+  readonly queuedFetches: number;
+  readonly queueDelayMs: Readonly<{ readonly last: number | null; readonly maximum: number | null }>;
 }
 
 export interface ApiSseEvent {

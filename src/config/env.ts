@@ -61,6 +61,13 @@ export interface AppConfig {
   readonly listenerCatchUpPageSize: number;
   readonly listenerFinalityMissingPolls: number;
   readonly listenerShutdownTimeoutMs: number;
+  readonly listenerBlockHydrationEnabled: boolean;
+  readonly listenerBlockHydrationMaxEntries: number;
+  readonly listenerBlockHydrationMaxBytes: number;
+  readonly listenerBlockHydrationMaxEntryBytes: number;
+  readonly listenerBlockHydrationConfirmedTtlMs: number;
+  readonly listenerBlockHydrationFinalizedTtlMs: number;
+  readonly listenerBlockHydrationFetchIntervalMs: number;
   readonly socialHttpTimeoutMs: number;
   readonly socialHttpMaxBytes: number;
   readonly socialHttpMaxRedirects: number;
@@ -201,6 +208,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     environment.API_PAGE_LIMIT_DEFAULT, 50, 'API_PAGE_LIMIT_DEFAULT', 1, apiPageLimitMaximum,
   );
   const transactionInboxRetryPolicy = parseTransactionInboxRetryPolicy(environment);
+  const blockHydration = parseBlockHydrationConfig(environment);
   const qualificationProfilePath = parseQualificationProfilePath(environment.QUALIFICATION_PROFILE_PATH);
   const riskMaxRoundTripLossBps = parseInteger(
     environment.RISK_MAX_ROUNDTRIP_LOSS_BPS,
@@ -289,6 +297,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerShutdownTimeoutMs: parseInteger(
       environment.LISTENER_SHUTDOWN_TIMEOUT_MS, 30_000, 'LISTENER_SHUTDOWN_TIMEOUT_MS', 1_000, 120_000,
     ),
+    ...blockHydration,
     socialHttpTimeoutMs: parseCanonicalBoundedInteger(
       environment.SOCIAL_HTTP_TIMEOUT_MS, 5_000, 'SOCIAL_HTTP_TIMEOUT_MS', 100, 30_000,
     ),
@@ -385,6 +394,77 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     apiSsePollMs: parseInteger(environment.API_SSE_POLL_MS, 1_000, 'API_SSE_POLL_MS', 100, 10_000),
     logLevel: optional(environment.LOG_LEVEL, 'info'),
   };
+}
+
+function parseBlockHydrationConfig(
+  environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): Pick<AppConfig,
+  | 'listenerBlockHydrationEnabled'
+  | 'listenerBlockHydrationMaxEntries'
+  | 'listenerBlockHydrationMaxBytes'
+  | 'listenerBlockHydrationMaxEntryBytes'
+  | 'listenerBlockHydrationConfirmedTtlMs'
+  | 'listenerBlockHydrationFinalizedTtlMs'
+  | 'listenerBlockHydrationFetchIntervalMs'> {
+  const listenerBlockHydrationMaxBytes = parseCanonicalBoundedInteger(
+    environment.LISTENER_BLOCK_HYDRATION_MAX_BYTES,
+    67_108_864,
+    'LISTENER_BLOCK_HYDRATION_MAX_BYTES',
+    1,
+    268_435_456,
+  );
+  const listenerBlockHydrationMaxEntryBytes = parseCanonicalBoundedInteger(
+    environment.LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES,
+    8_388_608,
+    'LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES',
+    1,
+    67_108_864,
+  );
+  const listenerBlockHydrationConfirmedTtlMs = parseCanonicalBoundedInteger(
+    environment.LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS,
+    10_000,
+    'LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS',
+    1_000,
+    60_000,
+  );
+  const listenerBlockHydrationFinalizedTtlMs = parseCanonicalBoundedInteger(
+    environment.LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS,
+    60_000,
+    'LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS',
+    1_000,
+    300_000,
+  );
+  if (listenerBlockHydrationMaxEntryBytes > listenerBlockHydrationMaxBytes) {
+    throw new Error('LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES must not exceed LISTENER_BLOCK_HYDRATION_MAX_BYTES.');
+  }
+  if (listenerBlockHydrationFinalizedTtlMs < listenerBlockHydrationConfirmedTtlMs) {
+    throw new Error('LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS must not be below LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS.');
+  }
+  return Object.freeze({
+    listenerBlockHydrationEnabled: parseBoolean(
+      environment.LISTENER_BLOCK_HYDRATION_ENABLED,
+      false,
+      'LISTENER_BLOCK_HYDRATION_ENABLED',
+    ),
+    listenerBlockHydrationMaxEntries: parseCanonicalBoundedInteger(
+      environment.LISTENER_BLOCK_HYDRATION_MAX_ENTRIES,
+      64,
+      'LISTENER_BLOCK_HYDRATION_MAX_ENTRIES',
+      1,
+      256,
+    ),
+    listenerBlockHydrationMaxBytes,
+    listenerBlockHydrationMaxEntryBytes,
+    listenerBlockHydrationConfirmedTtlMs,
+    listenerBlockHydrationFinalizedTtlMs,
+    listenerBlockHydrationFetchIntervalMs: parseCanonicalBoundedInteger(
+      environment.LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS,
+      250,
+      'LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS',
+      250,
+      60_000,
+    ),
+  });
 }
 
 function parsePaperStrategyConfig(

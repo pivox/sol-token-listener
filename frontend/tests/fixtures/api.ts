@@ -260,6 +260,14 @@ export const health = {
     leasedCount: 0, exhaustedCount: 0, startedAt: NOW, updatedAt: NOW,
     lastHttpSlot: '100', lastWebsocketSlot: '100', lastFinalizedSlot: '99',
     lastSignature: null, pendingTransactions: 1, activeSessions: 1,
+    blockHydration: {
+      version: 1, enabled: true, callerConcurrency: 1,
+      locates: 10, hits: 6, misses: 4, inFlightJoins: 0, fetches: 4,
+      forcedRefreshes: 1, evictions: 2, oversizeBypasses: 0, fetchFailures: 0,
+      epochInvalidations: 0, retainedEntries: 2, retainedBytes: 4096,
+      inFlightFetches: 0, queuedFetches: 1,
+      queueDelayMs: { last: 250, maximum: 500 },
+    },
     websocket: {
       version: 1,
       supervision: 'ACTIVE',

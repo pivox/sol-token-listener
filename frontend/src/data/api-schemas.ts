@@ -453,6 +453,31 @@ const jobCountsSchema = z.object({
   retryableFailedCount: countSchema,
   exhaustedCount: countSchema,
 }).loose();
+const blockHydrationSchema = z.object({
+  version: z.literal(1),
+  enabled: z.boolean(),
+  callerConcurrency: z.literal(1),
+  locates: countSchema,
+  hits: countSchema,
+  misses: countSchema,
+  inFlightJoins: countSchema,
+  fetches: countSchema,
+  forcedRefreshes: countSchema,
+  evictions: countSchema,
+  oversizeBypasses: countSchema,
+  fetchFailures: countSchema,
+  epochInvalidations: countSchema,
+  retainedEntries: countSchema,
+  retainedBytes: countSchema,
+  inFlightFetches: countSchema,
+  queuedFetches: countSchema,
+  queueDelayMs: z.object({
+    last: countSchema.nullable(),
+    maximum: countSchema.nullable(),
+  }).strict(),
+}).strict().refine(({ queueDelayMs }) => queueDelayMs.last === null
+  || queueDelayMs.maximum === null
+  || queueDelayMs.last <= queueDelayMs.maximum);
 const healthSchema = z.object({
   status: z.enum(['OK', 'DEGRADED']),
   observedAt: timestampSchema,
@@ -496,6 +521,7 @@ const healthSchema = z.object({
     pendingTransactions: countSchema.nullable(),
     activeSessions: countSchema.nullable(),
     websocket: websocketHealthSchema.optional(),
+    blockHydration: blockHydrationSchema.nullish(),
   }).loose(),
   lagSlots: unsignedIntegerSchema.nullable(),
 }).loose();

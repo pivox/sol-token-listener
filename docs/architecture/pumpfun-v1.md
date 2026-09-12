@@ -862,20 +862,24 @@ erreur interne n'est incluse.
 - simulation inverse indisponible = preuve inconnue ou blocker configuré, jamais
   affirmation de sellabilité.
 
-## Source d'hydratation par slot (préparée, non active)
+## Source d’hydratation par slot (restart-only, inactive par défaut)
 
-La source expérimentale `SolanaBlockTransactionLocator` peut reconstruire une
-transaction et son index depuis une réponse `getBlock` complète. Elle n'est pas
-branchée dans la factory de production : aucun changement de listener n'est
-introduit avant une mesure de taille, quota et reorg. Son contrat et les
+La source `CachedSolanaBlockTransactionLocator` peut reconstruire une
+transaction et son index depuis une réponse `getBlock` complète. La factory
+conserve exactement le locator legacy lorsque
+`LISTENER_BLOCK_HYDRATION_ENABLED=false`. Après un redémarrage explicite avec
+la valeur `true`, elle branche uniquement le locator bloc/cache : il n’existe
+aucun double appel ni fallback legacy. Le worker V1 sérialise les callers
+(`callerConcurrency=1`) et ferme le cache après son propre arrêt. Son contrat et les
 contraintes de validation sont versionnés dans
 [`2026-09-12-coherent-slot-block-hydration-design.md`](../superpowers/specs/2026-09-12-coherent-slot-block-hydration-design.md).
 
 Le [cache cohérent de blocs normalisés v1.0.0](../superpowers/specs/2026-09-12-coherent-block-cache-design.md)
-ajoute un locator distinct non activé, avec single-flight par slot/commitment/epoch
+ajoute un locator distinct initialement non activé, avec single-flight par slot/commitment/epoch
 HTTP, snapshots data-only immutables, LRU borné en octets et entrées, TTL et
-pacing FIFO. La factory de production, les leases, le catch-up strict et la
-réconciliation de finalité restent inchangés.
+pacing FIFO. Les réglages stricts et les métriques de l’activation sont
+versionnés dans la [spécification #114](../superpowers/specs/2026-09-12-block-hydration-activation-design.md).
+Les leases, le catch-up strict et la réconciliation de finalité restent inchangés.
 
 ## Console opérateur indépendante
 

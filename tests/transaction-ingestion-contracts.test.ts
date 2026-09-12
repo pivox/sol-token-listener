@@ -210,6 +210,14 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     backlogCount: 2,
     leasedCount: 1,
     exhaustedCount: 3,
+    blockHydration: Object.freeze({
+      version: 1, enabled: false, callerConcurrency: 1,
+      locates: 0, hits: 0, misses: 0, inFlightJoins: 0, fetches: 0,
+      forcedRefreshes: 0, evictions: 0, oversizeBypasses: 0, fetchFailures: 0,
+      epochInvalidations: 0, retainedEntries: 0, retainedBytes: 0,
+      inFlightFetches: 0, queuedFetches: 0,
+      queueDelayMs: Object.freeze({ last: null, maximum: null }),
+    }),
   });
   const recovery: InboxRecoveryResult = Object.freeze({
     code: 'RECOVERY_SCHEDULED',
@@ -225,6 +233,16 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
   assert.doesNotThrow(() => { assertValidFinalityRevision(finalizedRevision); });
   assert.doesNotThrow(() => { assertValidFinalityRevision(orphanedRevision); });
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  for (const blockHydration of [
+    Object.freeze({ ...heartbeat.blockHydration, signature: 'must-not-persist' }),
+    Object.freeze({
+      ...heartbeat.blockHydration,
+      queueDelayMs: Object.freeze({ last: null, maximum: null, endpoint: 'must-not-persist' }),
+    }),
+  ]) assert.throws(
+    () => { assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, blockHydration })); },
+    /block hydration/u,
+  );
   assert.doesNotThrow(() => { assertValidInboxRecoveryResult(recovery); });
   assert.equal(typeof notification.slot, 'bigint');
   assert.ok(Number.isSafeInteger(heartbeat.updatedAtMs));

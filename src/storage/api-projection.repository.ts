@@ -5,6 +5,7 @@ import {
   MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS,
   toApiDomainPayload,
   type ApiHealth,
+  type ApiBlockHydrationMetricsV1,
   type ApiWebSocketHealth,
   type ApiHolders,
   type ApiHolderSnapshot,
@@ -480,6 +481,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         `SELECT
             heartbeat.service_key AS heartbeat_service_key,
             heartbeat.updated_at AS heartbeat_updated_at,
+            heartbeat.payload AS heartbeat_payload,
             heartbeat.started_at, heartbeat.last_http_slot,
             heartbeat.last_websocket_slot, heartbeat.last_finalized_slot,
             heartbeat.pending_transactions, heartbeat.active_sessions,
@@ -2100,7 +2102,7 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket });
+    websocket, blockHydration: null });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2184,7 +2186,46 @@ function heartbeatFromRow(
     lastWebsocketSlot: nullableDecimal(row.last_websocket_slot), lastFinalizedSlot: nullableDecimal(row.last_finalized_slot),
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
+    blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
   });
+}
+
+const BLOCK_HYDRATION_FIELDS = [
+  'version', 'enabled', 'callerConcurrency', 'locates', 'hits', 'misses',
+  'inFlightJoins', 'fetches', 'forcedRefreshes', 'evictions', 'oversizeBypasses',
+  'fetchFailures', 'epochInvalidations', 'retainedEntries', 'retainedBytes',
+  'inFlightFetches', 'queuedFetches', 'queueDelayMs',
+] as const;
+
+function blockHydrationFromPayload(value: unknown): ApiBlockHydrationMetricsV1 | null {
+  if (typeof value !== 'object' || value === null || isProxy(value) || !isRecord(value)) return null;
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'blockHydration');
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return null;
+  const candidate: unknown = descriptor.value as unknown;
+  try {
+    const metrics = exactDataRecord(candidate, BLOCK_HYDRATION_FIELDS, 'Block hydration metrics');
+    if (metrics.version !== 1 || typeof metrics.enabled !== 'boolean'
+      || metrics.callerConcurrency !== 1) throw invalid();
+    const count = (field: string): number => nonNegativeSafeNumber(metrics[field]);
+    const queue = exactDataRecord(metrics.queueDelayMs, ['last', 'maximum'], 'Block hydration queue delay');
+    const last = nullableSafeNumber(queue.last);
+    const maximum = nullableSafeNumber(queue.maximum);
+    if ((last !== null && last < 0) || (maximum !== null && maximum < 0)
+      || (last !== null && maximum !== null && last > maximum)) throw invalid();
+    return freeze({
+      version: 1, enabled: metrics.enabled, callerConcurrency: 1,
+      locates: count('locates'), hits: count('hits'), misses: count('misses'),
+      inFlightJoins: count('inFlightJoins'), fetches: count('fetches'),
+      forcedRefreshes: count('forcedRefreshes'), evictions: count('evictions'),
+      oversizeBypasses: count('oversizeBypasses'), fetchFailures: count('fetchFailures'),
+      epochInvalidations: count('epochInvalidations'),
+      retainedEntries: count('retainedEntries'), retainedBytes: count('retainedBytes'),
+      inFlightFetches: count('inFlightFetches'), queuedFetches: count('queuedFetches'),
+      queueDelayMs: freeze({ last, maximum }),
+    });
+  } catch {
+    return null;
+  }
 }
 
 function canonicalHealthRowPresent(value: unknown): boolean {

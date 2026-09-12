@@ -14,6 +14,73 @@ const base = {
   SOLANA_EXPECTED_GENESIS_HASH: bs58.encode(Uint8Array.from({ length: 32 }, () => 7)),
 };
 
+void test('block hydration is restart-only opt-in with bounded production defaults', () => {
+  const config = parseConfig(base);
+  assert.deepEqual({
+    enabled: config.listenerBlockHydrationEnabled,
+    maxEntries: config.listenerBlockHydrationMaxEntries,
+    maxBytes: config.listenerBlockHydrationMaxBytes,
+    maxEntryBytes: config.listenerBlockHydrationMaxEntryBytes,
+    confirmedTtlMs: config.listenerBlockHydrationConfirmedTtlMs,
+    finalizedTtlMs: config.listenerBlockHydrationFinalizedTtlMs,
+    fetchIntervalMs: config.listenerBlockHydrationFetchIntervalMs,
+  }, {
+    enabled: false,
+    maxEntries: 64,
+    maxBytes: 67_108_864,
+    maxEntryBytes: 8_388_608,
+    confirmedTtlMs: 10_000,
+    finalizedTtlMs: 60_000,
+    fetchIntervalMs: 250,
+  });
+});
+
+void test('block hydration validates canonical values and relations even when disabled', () => {
+  for (const override of [
+    { LISTENER_BLOCK_HYDRATION_MAX_ENTRIES: '01' },
+    { LISTENER_BLOCK_HYDRATION_MAX_BYTES: '0' },
+    { LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES: '67108865' },
+    { LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS: '999' },
+    { LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS: '1000', LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS: '1001' },
+    { LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS: '249' },
+  ]) assert.throws(() => parseConfig({ ...base, ...override }), /LISTENER_BLOCK_HYDRATION/u);
+
+  assert.equal(parseConfig({
+    ...base,
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_MAX_ENTRIES: '1',
+    LISTENER_BLOCK_HYDRATION_MAX_BYTES: '8388608',
+    LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES: '8388608',
+    LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS: '1000',
+    LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS: '1000',
+    LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS: '250',
+  }).listenerBlockHydrationEnabled, true);
+});
+
+void test('tracked block hydration configuration and versioned canary remain fail-closed', async () => {
+  const [environment, specification, runbook] = await Promise.all([
+    readFile(new URL('../.env.example', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/specs/2026-09-12-block-hydration-activation-design.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/operations/block-hydration-canary.md', import.meta.url), 'utf8'),
+  ]);
+  for (const expected of [
+    'LISTENER_BLOCK_HYDRATION_ENABLED=false',
+    'LISTENER_BLOCK_HYDRATION_MAX_ENTRIES=64',
+    'LISTENER_BLOCK_HYDRATION_MAX_BYTES=67108864',
+    'LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES=8388608',
+    'LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS=10000',
+    'LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS=60000',
+    'LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS=250',
+  ]) assert.match(environment, new RegExp(`^${expected}$`, 'mu'));
+  assert.match(specification, /Version : 1\.0\.0/u);
+  assert.match(specification, /aucun double appel ni fallback legacy/iu);
+  assert.match(runbook, /15 minutes/iu);
+  assert.match(runbook, /zéro HTTP 429/iu);
+  assert.match(runbook, /strictement inférieur à 45 s/iu);
+  assert.match(runbook, /LISTENER_BLOCK_HYDRATION_ENABLED=false/u);
+  assert.doesNotMatch(runbook, /private.?key|keypair|sendTransaction|sendRawTransaction/iu);
+});
+
 void test('fallback HTTP RPC defaults to a frozen empty list when absent or whitespace-only', () => {
   for (const value of [undefined, '   ']) {
     const config = parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value });

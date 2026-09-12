@@ -64,6 +64,95 @@ void test('whole-slot single-flight and sequential hits preserve canonical index
   assert.equal(h.locator.stats.inFlight, 0);
 });
 
+void test('publishes one frozen bounded V1 metrics snapshot for hits and shared misses', async () => {
+  const h = harness();
+
+  assert.deepEqual(h.locator.metrics, {
+    version: 1,
+    locates: 0,
+    hits: 0,
+    misses: 0,
+    inFlightJoins: 0,
+    fetches: 0,
+    forcedRefreshes: 0,
+    evictions: 0,
+    oversizeBypasses: 0,
+    fetchFailures: 0,
+    epochInvalidations: 0,
+    retainedEntries: 0,
+    retainedBytes: 0,
+    inFlightFetches: 0,
+    queuedFetches: 0,
+    queueDelayMs: { last: null, maximum: null },
+  });
+  assert.equal(Object.isFrozen(h.locator.metrics), true);
+  assert.equal(Object.isFrozen(h.locator.metrics.queueDelayMs), true);
+
+  await Promise.all([h.locator.locate(target()), h.locator.locate(target('two'))]);
+  await h.locator.locate(target());
+
+  assert.deepEqual(h.locator.metrics, {
+    version: 1,
+    locates: 3,
+    hits: 1,
+    misses: 2,
+    inFlightJoins: 1,
+    fetches: 1,
+    forcedRefreshes: 0,
+    evictions: 0,
+    oversizeBypasses: 0,
+    fetchFailures: 0,
+    epochInvalidations: 0,
+    retainedEntries: 1,
+    retainedBytes: h.locator.stats.bytes,
+    inFlightFetches: 0,
+    queuedFetches: 0,
+    queueDelayMs: { last: 0, maximum: 0 },
+  });
+});
+
+void test('metrics distinguish forced refreshes, evictions, oversize bypasses and fetch failures', async () => {
+  const h = harness();
+  await h.locator.locate(target());
+  h.setFetch(async () => block(['one', 'new']));
+  await h.locator.locate(target('new'));
+  assert.equal(h.locator.metrics.forcedRefreshes, 1);
+  assert.equal(h.locator.metrics.evictions, 1);
+
+  const oversized = harness({ maxEntryBytes: 1 });
+  await Promise.all([
+    oversized.locator.locate(target()),
+    oversized.locator.locate(target('two')),
+  ]);
+  assert.equal(oversized.locator.metrics.oversizeBypasses, 1);
+  assert.equal(oversized.locator.metrics.retainedEntries, 0);
+
+  const failed = harness();
+  failed.setFetch(async () => null);
+  await Promise.allSettled([
+    failed.locator.locate(target()),
+    failed.locator.locate(target('two')),
+  ]);
+  assert.equal(failed.locator.metrics.fetchFailures, 1);
+  assert.equal(failed.locator.metrics.fetches, 1);
+});
+
+void test('metrics expose FIFO queue delay and epoch invalidations without identities', async () => {
+  const h = harness();
+  await Promise.all(Array.from(
+    { length: 4 },
+    (_unused, index) => h.locator.locate(target('one', BigInt(42 + index))),
+  ));
+  assert.deepEqual(h.locator.metrics.queueDelayMs, { last: 500, maximum: 500 });
+  assert.equal(h.locator.metrics.fetches, 4);
+
+  h.setEpoch(1);
+  void h.locator.metrics;
+  assert.equal(h.locator.metrics.epochInvalidations, 1);
+  assert.equal(h.locator.metrics.retainedEntries, 0);
+  assert.doesNotMatch(JSON.stringify(h.locator.metrics), /one|42|primary|https?:/u);
+});
+
 void test('effective commitments coalesce processed/confirmed and isolate finalized', async () => {
   const h = harness();
   assert.equal((await h.locator.locate(target('one', 42n, 'PROCESSED'))).confirmationStatus, 'PROCESSED');
@@ -284,6 +373,8 @@ void test('close cancels the pacing sleeper and rejects all queued flights', asy
   await locator.locate(target());
   const second = locator.locate(target('one', 43n));
   const third = locator.locate(target('one', 44n));
+  assert.equal(locator.metrics.inFlightFetches, 0);
+  assert.equal(locator.metrics.queuedFetches, 2);
   locator.close();
   await assert.rejects(second, RpcTransientError);
   await assert.rejects(third, RpcTransientError);
@@ -299,6 +390,21 @@ void test('an epoch change inside the only in-flight fetch prevents retention', 
   assert.equal(h.locator.stats.entries, 0);
   await h.locator.locate(target());
   assert.equal(h.calls.length, 2);
+});
+
+void test('active RPC gauge survives clear until the detached request settles', async () => {
+  const h = harness();
+  let release!: (value: unknown) => void;
+  h.setFetch(async () => new Promise((resolve) => { release = resolve; }));
+  const locating = h.locator.locate(target());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(h.locator.metrics.inFlightFetches, 1);
+  h.locator.clear();
+  assert.equal(h.locator.stats.inFlight, 0);
+  assert.equal(h.locator.metrics.inFlightFetches, 1);
+  release(block());
+  await locating;
+  assert.equal(h.locator.metrics.inFlightFetches, 0);
 });
 
 void test('duplicate signatures and malformed selected transactions retain no cache entry', async () => {
