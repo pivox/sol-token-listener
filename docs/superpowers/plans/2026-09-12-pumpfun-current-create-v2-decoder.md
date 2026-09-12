@@ -68,4 +68,4 @@
 
 - [x] Run `npm run build`, `npm run check`, `npm run lint`, `npm run docs:check`, and `npm test`.
 - [x] Inspect `git diff --check`, the complete diff, and repository status.
-- [ ] Commit, push the isolated branch, and open a PR linked to issue 121 without requesting review or merging.
+- [x] Commit, push the isolated branch, and open a PR linked to issue 121 without requesting review or merging.
