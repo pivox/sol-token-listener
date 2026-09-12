@@ -713,7 +713,13 @@ démarre ensuite le nouveau binaire. Cela n'arme ni ne démarre un canary : le
 constat reste `CANARY_NOT_STARTED`.
 Sur une base vide, le scanner prend uniquement la page la plus récente de
 chaque programme comme baseline, conformément au périmètre sans historique.
-Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.
+Avec la politique V1 `live-edge`, cette page est validée mais ses signatures ne
+ne sont pas enfilées ; avant l'ouverture du premier WebSocket, le checkpoint nul
+avance par CAS vers la tête. Avec `strict`, elle reste enfilée. Une fois un
+checkpoint présent, ou un run actif, les deux
+politiques suivent le protocole strict, durable et sans rebasage.
+Une seconde passe, forcée en mode strict après l'abonnement WebSocket, ferme la
+fenêtre de démarrage et enfile le premier token même si la baseline était vide.
 Une reprise après panne rejoue toujours l'intégralité des étapes launchpad,
 financement, I1, I2, PumpSwap, qualification puis enqueue paper ; les identités
 et écritures déterministes garantissent des effets persistés exactement une

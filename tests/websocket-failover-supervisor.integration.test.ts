@@ -79,6 +79,7 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
         finalityPass('primary'), finalityPass('fallback-1'),
       ]),
       verifyProviderGenesis: async () => undefined,
+      prepareInitialFrontier: async () => undefined,
       readPinnedProviderId: (signal) => affinity.readPinnedProviderId(signal),
       openSession: sessions.open,
       runStrictScan: async (providerId, signal) => {
@@ -726,6 +727,7 @@ function supervisorFor(value: Readonly<{
     reporter: value.reporter,
     promoted: new PromotedProviderSelector([finalityPass('primary'), finalityPass('fallback-1')]),
     verifyProviderGenesis: async () => undefined,
+    prepareInitialFrontier: async () => undefined,
     readPinnedProviderId: (signal) => affinity.readPinnedProviderId(signal),
     openSession: value.sessions.open,
     runStrictScan: value.strict,

@@ -1054,15 +1054,19 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /pinnedCatchUpSources/u);
   assert.match(source, /verifyProviderGenesis:/u);
   assert.match(source, /source\.verifyGenesis\(signal\)/u);
+  assert.match(source, /prepareInitialFrontier:\s*async/u);
+  assert.match(source, /config\.listenerCatchUpPolicy\s*!==\s*'live-edge'/u);
+  assert.match(source, /await baselineScanner\.scan\(signal\)/u);
   assert.match(source, /runStrictScan:/u);
   assert.match(source, /readPinnedProviderId:/u);
-  assert.match(source, /new StrictCatchUpCoordinator\(scanner, inbox, strictCheckpointKeys\)/u);
+  assert.match(source, /new StrictCatchUpCoordinator\(recoveryScanner, inbox, strictCheckpointKeys\)/u);
   assert.match(source, /strictCheckpointKeys\s*=\s*Object\.freeze\(ingestionPrograms\.map/u);
   assert.match(
     source,
     /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{ programs: ingestionPrograms \}/u,
   );
-  assert.match(source, /new StrictCatchUpScanner\([\s\S]*?programs:\s*ingestionPrograms/u);
+  assert.match(source, /const recoveryScanner\s*=\s*new StrictCatchUpScanner\([\s\S]*?policy:\s*'strict'[\s\S]*?programs:\s*ingestionPrograms/u);
+  assert.match(source, /const baselineScanner\s*=\s*new StrictCatchUpScanner\([\s\S]*?policy:\s*'live-edge'[\s\S]*?programs:\s*ingestionPrograms/u);
 }
 
 function hasSchedulerWaiterState(scheduler: ManualScheduler): boolean {

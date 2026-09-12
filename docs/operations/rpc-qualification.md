@@ -102,9 +102,15 @@ d'un seul fournisseur, pas une chaîne de basculement de production.
 
 ## Supervision WebSocket et reprise stricte
 
-Le superviseur actif acquiert son owner PostgreSQL avant tout appel Solana,
-attend le double ACK des abonnements Pump.fun et PumpSwap, puis réalise une
-frontière stricte sur les deux programmes avec le provider candidat appairé.
+Le superviseur actif acquiert son owner PostgreSQL avant tout appel Solana. Pour
+le premier démarrage `live-edge`, il prépare la baseline appairée avant d'ouvrir
+le WebSocket. Il attend ensuite le double ACK des abonnements Pump.fun et
+PumpSwap, puis réalise une seconde frontière stricte avec le même provider avant
+de publier `RUNNING`. Cette seconde passe couvre la fenêtre entre baseline et
+abonnement et rend les écritures WebSocket concurrentes idempotentes. Elle est
+forcée en mode strict même si la page initiale était vide et sans checkpoint :
+le premier token arrivé est donc enfilé. Dès qu'un checkpoint ou run actif
+existe, la frontière est strictement reprise.
 La publication durable de `RUNNING` précède la promotion du fournisseur. Une
 frontière périodique, elle aussi appairée, est exécutée toutes les 30 secondes.
 Chaque cycle donne au plus un setup et une analyse stricte à chaque fournisseur
@@ -123,12 +129,14 @@ Chaque reprise est épinglée à un provider positionnel ; les diagnostics et
 erreurs ne contiennent ni endpoint, ni hôte, ni URL, ni hash ni secret.
 
 La reprise reste exclusivement en observation ou paper : elle ne signe,
-construit, simule ni soumet de transaction. Elle lit les deux checkpoints,
-parcourt les deux programmes sur le même provider, puis enfile les découvertes
-avant d'avancer chaque checkpoint par CAS exact `(slot, signature)`. Un conflit
-CAS impose une reprise ultérieure depuis des limites durables fraîches ; il ne
-déclenche jamais un rebasage `live-edge`. Les appels concurrents sont coalescés
-en une seule analyse en vol. Il n’existe aucun fallback legacy automatique : un
+construit, simule ni soumet de transaction. Elle lit les deux checkpoints et
+parcourt les deux programmes sur le même provider. Le bootstrap `live-edge`
+sans checkpoint valide la première page, n'enfile pas ses signatures et avance
+le checkpoint par CAS `null -> tête`. Toute frontière déjà persistée enfile les
+découvertes avant d'avancer le checkpoint par CAS exact `(slot, signature)`. Un
+conflit CAS impose une reprise ultérieure depuis des limites durables fraîches ;
+il ne déclenche jamais un rebasage. Les appels concurrents sont coalescés en une
+seule analyse en vol. Il n’existe aucun fallback legacy automatique : un
 processus actif ne revient jamais à `SolanaProgramSubscriber`.
 
 Le budget `MAX_PAGES` est local à chaque passe. Après chaque page entièrement
