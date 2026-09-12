@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const migrationName = '044_transaction_inbox_launch_priority.sql';
@@ -53,11 +52,9 @@ void test('migration 044 upgrades 043, replays, and keeps its enum ordering on P
       processing_status, observed_at
     ) VALUES ('legacy-normal',1,ARRAY['CATCH_UP'],ARRAY[$1],'confirmed','PENDING',NOW())`, [pumpProgramId]);
 
-    assert.deepEqual(await migrateDatabase({ pool }), [
-      migrationName,
-      '045_execution_wallet_snapshot_refresh.sql',
-      '046_listener_strict_catch_up_runs.sql',
-    ]);
+    // This is the historical 044 contract, not the current migration head.
+    const sql = await readFile(migrationUrl, 'utf8');
+    await pool.query(sql);
     assert.deepEqual((await pool.query(`SELECT ingestion_priority::TEXT AS priority
       FROM chain_transaction_inbox WHERE signature='legacy-normal'`)).rows, [{ priority: 'NORMAL' }]);
     assert.deepEqual((await pool.query(`SELECT enumlabel
@@ -74,9 +71,7 @@ void test('migration 044 upgrades 043, replays, and keeps its enum ordering on P
       scheduler_key: 'global', consecutive_launch_candidate_claims: 0,
     }]);
 
-    const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
-    assert.deepEqual(await migrateDatabase({ pool }), []);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
