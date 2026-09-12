@@ -1,5 +1,9 @@
 # Live-edge catch-up design
 
+Status: historical legacy-scanner contract. The active provider-pinned runtime
+contract is superseded by
+`2026-09-12-fresh-live-edge-bootstrap-design.md` version 1.
+
 ## Problem
 
 The listener currently walks at most `MAX_PAGES × PAGE_SIZE` signatures to

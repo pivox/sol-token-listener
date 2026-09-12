@@ -495,17 +495,17 @@ désactive explicitement le listener et expose un pipeline `STOPPED` si l'API
 reste active.
 
 Le WebSocket est le chemin nominal. Sans checkpoint, le premier rattrapage
-prend une seule page récente comme baseline au lieu de parcourir l'historique.
+`live-edge` valide une seule page récente, n'enfile aucune de ses signatures
+historiques et avance le checkpoint par CAS vers sa tête. `strict` conserve le
+comportement d'audit qui enfile cette première page.
 Après l'ouverture des souscriptions, un second rattrapage ferme la fenêtre de
 course et converge par l'inbox idempotente. La politique V1 par défaut,
-`LISTENER_CATCH_UP_POLICY=live-edge`, lit au plus une page de
-`LISTENER_CATCH_UP_PAGE_SIZE` signatures par programme et par scan. Si un
-checkpoint ancien n'est plus dans cette page, aucune transaction historique
-abandonnée n'est publiée comme nouvelle : le listener persiste atomiquement
-la lacune pendant quatre heures, déplace son checkpoint au bord courant et
-émet `listener.catch_up_gap_recorded` sans signature ni URL RPC. La politique
-`strict` borne chaque passe à `LISTENER_CATCH_UP_MAX_PAGES` pages et conserve
-le curseur après chaque page entièrement enfilée. L'épuisement du budget produit
+`LISTENER_CATCH_UP_POLICY=live-edge`, ne s'applique qu'à ce bootstrap sans
+checkpoint. Dès qu'un checkpoint existe, ou qu'un run strict est actif, les deux
+politiques utilisent la reprise stricte : chaque passe est bornée à
+`LISTENER_CATCH_UP_MAX_PAGES` pages et conserve le curseur après chaque page
+entièrement enfilée. Aucun rebasage silencieux d'un checkpoint existant n'est
+autorisé. L'épuisement du budget produit
 `CATCH_UP_PAGE_BUDGET_EXHAUSTED`, une pause reprise sur le provider épinglé après
 jitter, sans rotation ni rebasage. Seule une frontière réellement absente de
 l'historique produit `CATCH_UP_WINDOW_EXCEEDED`.
@@ -513,6 +513,8 @@ Les runs actifs sont prioritaires sur les historiques FAILED des autres clés.
 Après complétion d'un run repris, `CATCH_UP_REFRESH_REQUIRED` exige encore un
 nouveau cycle et une nouvelle session : le scan frais doit couvrir la nouvelle
 tête jusqu'à l'ancienne tête figée avant toute promotion `RUNNING`.
+Ce bootstrap réduit uniquement l'historique d'une base fraîche ; il ne suffit
+pas à lui seul à garantir les seuils backlog/RSS du canary Mainnet de 15 minutes.
 
 Une panne retryable est replanifiée avec un
 délai exponentiel piloté par `RPC_RETRY_BASE_DELAY_MS` et plafonné à 60 s.

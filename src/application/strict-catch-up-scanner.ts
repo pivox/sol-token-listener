@@ -35,6 +35,7 @@ import {
 } from './catch-up-discovery.js';
 
 export const MAX_STRICT_CATCH_UP_PAGES = 100;
+export type StrictCatchUpPolicy = 'live-edge' | 'strict';
 
 export interface StrictCatchUpSource extends CatchUpSource {
   readonly providerId: RpcProviderId;
@@ -44,6 +45,7 @@ export interface StrictCatchUpScannerOptions {
   readonly pageSize: number;
   readonly maxPages: number;
   readonly now?: () => number;
+  readonly policy?: StrictCatchUpPolicy;
   readonly programs?: readonly ListenerIngestionProgram[];
 }
 
@@ -182,6 +184,7 @@ export class StrictCatchUpWindowExceededError extends Error {
 
 interface StrictProgramScan {
   readonly discoveredCount: number;
+  readonly enqueuedCount: number;
   readonly checkpointCasCount: number;
   readonly pageCount: number;
   readonly refreshRequired: boolean;
@@ -197,6 +200,7 @@ export class StrictCatchUpScanner {
   private readonly pageSize: number;
   private readonly maxPages: number;
   private readonly now: () => number;
+  private readonly policy: StrictCatchUpPolicy;
   private readonly programs: readonly ListenerIngestionProgram[];
 
   public constructor(
@@ -205,15 +209,17 @@ export class StrictCatchUpScanner {
     options: StrictCatchUpScannerOptions,
   ) {
     this.providerId = snapshotProviderId(source);
-    const { pageSize, maxPages, now, programs } = snapshotOptions(options);
+    const { pageSize, maxPages, now, policy, programs } = snapshotOptions(options);
     if (!positiveBound(pageSize, MAX_CATCH_UP_PAGE_SIZE)
       || !positiveBound(maxPages, MAX_STRICT_CATCH_UP_PAGES)
+      || (policy !== undefined && policy !== 'live-edge' && policy !== 'strict')
       || (now !== undefined && typeof now !== 'function')) {
       throw new TypeError('Strict catch-up scanner bounds are invalid.');
     }
     this.pageSize = pageSize;
     this.maxPages = maxPages;
     this.now = now === undefined ? Date.now : now as () => number;
+    this.policy = policy ?? 'strict';
     this.programs = snapshotPrograms(programs ?? DEFAULT_PROGRAMS);
   }
 
@@ -280,7 +286,7 @@ export class StrictCatchUpScanner {
     return Object.freeze({
       providerId: this.providerId,
       discoveredCount: scans.reduce((sum, scan) => sum + scan.discoveredCount, 0),
-      enqueuedCount: scans.reduce((sum, scan) => sum + scan.discoveredCount, 0),
+      enqueuedCount: scans.reduce((sum, scan) => sum + scan.enqueuedCount, 0),
       checkpointCasCount: scans.reduce((sum, scan) => sum + scan.checkpointCasCount, 0),
       pageCount: scans.reduce((sum, scan) => sum + scan.pageCount, 0),
       boundaries,
@@ -326,6 +332,8 @@ export class StrictCatchUpScanner {
     let previousSlot = run?.lastAcceptedSlot ?? null;
     let observedHead = run?.observedHead ?? null;
     let discoveredCount = 0;
+    let enqueuedCount = 0;
+    const liveEdgeBootstrap = this.policy === 'live-edge' && expected === null && run === null;
 
     for (let pageCount = 1; pageCount <= this.maxPages; pageCount += 1) {
       const page = await this.awaited(
@@ -361,34 +369,39 @@ export class StrictCatchUpScanner {
           crossedBoundarySlot = true;
           break;
         }
-        const previous = discoveries.get(row.signature);
-        if (previous !== undefined) {
-          try {
-            const merged = mergeCatchUpDiscoveries([
-              { program, rows: [previous] }, { program, rows: [row] },
-            ]);
-            discoveries.set(row.signature, merged[0] ?? row);
-          } catch {
-            throw this.failure('source', program.key, 'response');
+        if (!liveEdgeBootstrap) {
+          const previous = discoveries.get(row.signature);
+          if (previous !== undefined) {
+            try {
+              const merged = mergeCatchUpDiscoveries([
+                { program, rows: [previous] }, { program, rows: [row] },
+              ]);
+              discoveries.set(row.signature, merged[0] ?? row);
+            } catch {
+              throw this.failure('source', program.key, 'response');
+            }
+          } else {
+            discoveries.set(row.signature, row);
           }
-        } else {
-          discoveries.set(row.signature, row);
         }
         rows.push(row);
       }
       observedHead ??= rows[0] ?? null;
-      for (const row of rows) {
-        const notification: TransactionNotification = Object.freeze({
-          signature: row.signature,
-          slot: row.slot,
-          source: 'CATCH_UP',
-          ingestionHint: null,
-          ingestionHintMint: null,
-          programIds: Object.freeze([program.id]),
-          confirmationStatus: row.confirmationStatus,
-          observedAtMs,
-        });
-        await this.operation(signal, 'enqueue', program.key, () => this.repository.enqueue(notification));
+      if (!liveEdgeBootstrap) {
+        for (const row of rows) {
+          const notification: TransactionNotification = Object.freeze({
+            signature: row.signature,
+            slot: row.slot,
+            source: 'CATCH_UP',
+            ingestionHint: null,
+            ingestionHintMint: null,
+            programIds: Object.freeze([program.id]),
+            confirmationStatus: row.confirmationStatus,
+            observedAtMs,
+          });
+          await this.operation(signal, 'enqueue', program.key, () => this.repository.enqueue(notification));
+        }
+        enqueuedCount += rows.length;
       }
       discoveredCount += rows.length;
 
@@ -439,7 +452,7 @@ export class StrictCatchUpScanner {
           }
           checkpointCasCount = 1;
         }
-        return Object.freeze({ discoveredCount, checkpointCasCount, pageCount, refreshRequired });
+        return Object.freeze({ discoveredCount, enqueuedCount, checkpointCasCount, pageCount, refreshRequired });
       }
 
       if (page.length < this.pageSize || crossedBoundarySlot) {
@@ -649,6 +662,7 @@ function snapshotOptions(options: unknown): {
   readonly pageSize: unknown;
   readonly maxPages: unknown;
   readonly now: unknown;
+  readonly policy: unknown;
   readonly programs: unknown;
 } {
   try {
@@ -658,12 +672,13 @@ function snapshotOptions(options: unknown): {
     const prototype: object | null = Object.getPrototypeOf(options) as object | null;
     if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
     const keys = Reflect.ownKeys(options);
-    if (keys.length < 2 || keys.length > 4
+    if (keys.length < 2 || keys.length > 5
       || !keys.includes('pageSize')
       || !keys.includes('maxPages')
       || keys.some((key) => key !== 'pageSize'
         && key !== 'maxPages'
         && key !== 'now'
+        && key !== 'policy'
         && key !== 'programs')) {
       throw new TypeError();
     }
@@ -671,6 +686,7 @@ function snapshotOptions(options: unknown): {
       pageSize: ownData(options, 'pageSize'),
       maxPages: ownData(options, 'maxPages'),
       now: keys.includes('now') ? ownData(options, 'now') : undefined,
+      policy: keys.includes('policy') ? ownData(options, 'policy') : undefined,
       programs: keys.includes('programs') ? ownData(options, 'programs') : undefined,
     });
   } catch {

@@ -900,6 +900,70 @@ void test('cold start consumes exactly one bounded newest page and handles empty
   });
 });
 
+void test('fresh live-edge baselines exactly one validated page without enqueueing history', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch-new', 4), sig('launch-old', 3)], [sig('must-not-read', 2)]],
+  });
+  const repository = new FakeRepository();
+
+  const result = await scanner(source, repository, {
+    pageSize: 2,
+    maxPages: 3,
+    policy: 'live-edge',
+    programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED);
+
+  assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
+  assert.deepEqual(repository.enqueued, []);
+  assert.deepEqual(repository.runs, []);
+  assert.deepEqual(repository.cas, [[
+    null, checkpoint('launchpad', 'launch-new', 4, 9_000),
+  ]]);
+  assert.deepEqual(result, {
+    providerId: 'primary', discoveredCount: 2, enqueuedCount: 0,
+    checkpointCasCount: 1, pageCount: 1,
+    boundaries: Object.freeze({ launchpad: null, market: null }),
+  });
+});
+
+void test('live-edge remains strict and lossless after a checkpoint exists', async () => {
+  const previous = checkpoint('launchpad', 'boundary', 10);
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('cursor', 11)], [sig('boundary', 10)]],
+  });
+  const repository = new FakeRepository({ launchpad: previous });
+
+  const result = await scanner(source, repository, {
+    pageSize: 2,
+    policy: 'live-edge',
+    programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED);
+
+  assert.deepEqual(source.calls, [
+    [PUMP_PROGRAM_ID, undefined, 2], [PUMP_PROGRAM_ID, 'cursor', 2],
+  ]);
+  assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['head', 'cursor']);
+  assert.equal(result.enqueuedCount, 2);
+  assert.equal((await repository.readCheckpoint('launchpad'))?.signature, 'head');
+});
+
+void test('live-edge resumes a matching active strict run instead of rebaselining', async () => {
+  const previous = checkpoint('launchpad', 'boundary', 10);
+  const repository = new FakeRepository({ launchpad: previous });
+  repository.runs.push(activeRun());
+  const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('boundary', 10)]] });
+
+  await assert.rejects(scanner(source, repository, {
+    maxPages: 1,
+    policy: 'live-edge',
+    programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED), refreshRequired);
+
+  assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, 'cursor', 2]]);
+  assert.equal(repository.runs[0]?.state, 'COMPLETED');
+  assert.deepEqual(repository.cas, []);
+});
+
 void test('rejects ascending slots, duplicate signatures, and repeated pagination cursors', async () => {
   const cases: readonly (readonly (readonly CatchUpSignature[])[])[] = [
     [[sig('older', 2), sig('newer', 3)]],
@@ -1185,8 +1249,13 @@ void test('accepts exact bounds and rejects invalid options and checkpoint persi
   for (const [pageSize, maxPages] of invalidBounds) {
     assert.throws(() => new StrictCatchUpScanner(source, new FakeRepository(), { pageSize, maxPages }), /bounds/u);
   }
+  for (const policy of ['live-edge', 'strict'] as const) {
+    assert.doesNotThrow(() => new StrictCatchUpScanner(source, new FakeRepository(), {
+      pageSize: 1, maxPages: 1, policy,
+    } as never));
+  }
   assert.throws(() => new StrictCatchUpScanner(source, new FakeRepository(), {
-    pageSize: 1, maxPages: 1, policy: 'live-edge',
+    pageSize: 1, maxPages: 1, policy: 'latest',
   } as never), /bounds/u);
   const accessorOptions = Object.defineProperty({ pageSize: 1, maxPages: 1 }, 'now', {
     enumerable: true,
@@ -1205,10 +1274,10 @@ void test('accepts exact bounds and rejects invalid options and checkpoint persi
   }
 });
 
-void test('has no live-edge, checkpoint overwrite, gap, WebSocket, or execution dependencies', async () => {
+void test('has no checkpoint overwrite, gap, WebSocket, or execution dependencies', async () => {
   const path = fileURLToPath(new URL('src/application/strict-catch-up-scanner.ts', repositoryRootUrl));
   const sourceText = await readFile(path, 'utf8');
-  assert.doesNotMatch(sourceText, /live-edge|storeCheckpoint|recordCatchUpGap|websocket|\bws\b/iu);
+  assert.doesNotMatch(sourceText, /storeCheckpoint|recordCatchUpGap|websocket|\bws\b/iu);
   assert.deepEqual(executionBoundaryViolations(sourceText, path, repositoryRoot), []);
 });
 
@@ -1219,6 +1288,7 @@ function scanner(
     readonly pageSize?: number;
     readonly maxPages?: number;
     readonly now?: () => number;
+    readonly policy?: 'live-edge' | 'strict';
     readonly programs?: readonly Readonly<{
       readonly key: ProcessingCheckpointKey;
       readonly family: 'pumpfun' | 'pumpswap';
@@ -1230,6 +1300,7 @@ function scanner(
     pageSize: overrides.pageSize ?? 2,
     maxPages: overrides.maxPages ?? 3,
     now: overrides.now ?? (() => 9_000),
+    ...(overrides.policy === undefined ? {} : { policy: overrides.policy }),
     ...(overrides.programs === undefined ? {} : { programs: overrides.programs }),
   });
 }

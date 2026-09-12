@@ -221,6 +221,7 @@ export function createProductionListenerRuntime(
         {
           pageSize: config.listenerCatchUpPageSize,
           maxPages: config.listenerCatchUpMaxPages,
+          policy: config.listenerCatchUpPolicy,
           programs: ingestionPrograms,
         },
       );

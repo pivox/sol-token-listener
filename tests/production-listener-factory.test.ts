@@ -1063,6 +1063,7 @@ function assertProductionCatchUpWiring(source: string): void {
     /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{ programs: ingestionPrograms \}/u,
   );
   assert.match(source, /new StrictCatchUpScanner\([\s\S]*?programs:\s*ingestionPrograms/u);
+  assert.match(source, /new StrictCatchUpScanner\([\s\S]*?policy:\s*config\.listenerCatchUpPolicy/u);
 }
 
 function hasSchedulerWaiterState(scheduler: ManualScheduler): boolean {
