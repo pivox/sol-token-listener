@@ -109,6 +109,17 @@ void test('requires canonical bounded base64 rather than a textual discriminator
   ]), 'NONE');
 });
 
+void test('treats the exact runtime truncation marker as ambiguous unless a full CreateEvent exists', () => {
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), 'Log truncated']),
+    { hint: 'NONE', hintMint: null },
+  );
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs(['Log truncated', tradeLine(firstTradeMint), createLine]),
+    { hint: 'PUMPFUN_CREATE', hintMint: null },
+  );
+});
+
 void test('ignores valid unrelated event data and plain non-data logs', () => {
   const unrelatedEvent = programDataLine([255, 254, 253, 252, 251, 250, 249, 248], [1, 2, 3]);
   assert.deepEqual(

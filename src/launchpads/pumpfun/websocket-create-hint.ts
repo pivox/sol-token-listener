@@ -20,6 +20,7 @@ export const MAX_PUMPFUN_WEBSOCKET_LOG_LINE_BYTES = 16_384;
 export const MAX_PUMPFUN_WEBSOCKET_LOG_TOTAL_BYTES = 65_536;
 
 const PROGRAM_DATA_PREFIX = 'Program data: ';
+const RUNTIME_LOG_TRUNCATED = 'Log truncated';
 const CREATE_EVENT_DISCRIMINATOR = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator);
 const TRADE_EVENT_DISCRIMINATOR = Buffer.from(PUMP_EVENTS.TradeEvent.discriminator);
 const TRADE_EVENT_MINT_OFFSET = TRADE_EVENT_DISCRIMINATOR.length;
@@ -41,6 +42,10 @@ export function pumpFunWebSocketHintFromLogs(logs: unknown): PumpFunWebSocketCre
   let hasCreateEvent = false;
   let hasAmbiguousEvent = false;
   for (const line of snapshot) {
+    if (line === RUNTIME_LOG_TRUNCATED) {
+      hasAmbiguousEvent = true;
+      continue;
+    }
     if (!line.startsWith(PROGRAM_DATA_PREFIX)) continue;
     const encoded = line.slice(PROGRAM_DATA_PREFIX.length);
     if (!canonicalBase64(encoded)) {
