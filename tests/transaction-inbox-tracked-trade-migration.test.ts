@@ -344,6 +344,8 @@ void test('047 exactly validates the tracked-mint index on upgrade and replay, r
       `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint text_pattern_ops) ${predicate}`,
       `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox USING hash (ingestion_hint_mint) ${predicate}`,
       `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint) INCLUDE (signature) ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint) WITH (fillfactor=70) ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint) WITH (deduplicate_items=off) ${predicate}`,
     ];
     for (const replay of [false, true]) {
       if (replay) await pool.query(sql);
@@ -441,7 +443,7 @@ async function assertCatalog(pool: pg.Pool): Promise<void> {
   ]);
   assert.deepEqual((await pool.query(`SELECT typname FROM pg_type WHERE typnamespace=(SELECT oid FROM pg_namespace WHERE nspname=CURRENT_SCHEMA())
     AND typname LIKE 'chain_transaction_inbox_priority%' ORDER BY typname`)).rows, [{ typname: 'chain_transaction_inbox_priority' }]);
-  assert.deepEqual((await pool.query(`SELECT table_relation.relname AS table_name, access_method.amname,
+  assert.deepEqual((await pool.query(`SELECT table_relation.relname AS table_name, access_method.amname, index_relation.reloptions,
     index.indisvalid, index.indisready, index.indisunique, index.indisprimary, index.indnkeyatts, index.indnatts,
     pg_get_indexdef(index.indexrelid, 1, TRUE) AS key,
     pg_get_expr(index.indpred, index.indrelid) AS predicate
@@ -450,7 +452,7 @@ async function assertCatalog(pool: pg.Pool): Promise<void> {
     JOIN pg_am access_method ON access_method.oid=index_relation.relam
     WHERE index_relation.relnamespace=(SELECT oid FROM pg_namespace WHERE nspname=CURRENT_SCHEMA())
       AND index_relation.relname='chain_transaction_inbox_tracked_mint_idx'`)).rows, [{
-    table_name: 'chain_transaction_inbox', amname: 'btree', indisvalid: true, indisready: true,
+    table_name: 'chain_transaction_inbox', amname: 'btree', reloptions: null, indisvalid: true, indisready: true,
     indisunique: false, indisprimary: false, indnkeyatts: 1, indnatts: 1, key: 'ingestion_hint_mint',
     predicate: "((ingestion_hint = 'PUMPFUN_TRADE'::text) AND (processing_status = ANY (ARRAY['DEFERRED'::text, 'PENDING'::text])))",
   }]);

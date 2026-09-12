@@ -202,6 +202,7 @@ BEGIN
       WHERE actual.indexrelid=actual_index AND actual.indrelid='chain_transaction_inbox'::REGCLASS
         AND actual.indisvalid AND actual.indisready AND NOT actual.indisunique AND NOT actual.indisprimary
         AND relation.relam=expected_relation.relam AND actual.indnkeyatts=expected.indnkeyatts
+        AND relation.reloptions IS NOT DISTINCT FROM expected_relation.reloptions
         AND actual.indnatts=expected.indnatts AND actual.indoption=expected.indoption
         AND actual.indclass=expected.indclass AND actual.indcollation=expected.indcollation
         AND pg_get_expr(actual.indpred,actual.indrelid) IS NOT DISTINCT FROM pg_get_expr(expected.indpred,expected.indrelid)
