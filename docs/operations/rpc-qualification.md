@@ -140,6 +140,16 @@ reprise sans réseau. Les diagnostics n'exposent jamais de signature ou endpoint
 Un unique provider épinglé en échec de fenêtre ne suffit jamais à déclarer
 `UNRECOVERABLE`, même si le catalogue ne contient qu'un provider.
 
+Les runs `ACTIVE` valides passent avant les clés à historique `FAILED`, afin de
+ne pas bloquer le curseur d'un autre programme sous le même pin. Compléter un
+run repris n'autorise pas encore `RUNNING` : sa tête figée H1 précède la nouvelle
+session. `CATCH_UP_REFRESH_REQUIRED` provoque cleanup et un seul jitter en
+`DEGRADED`/`REQUIRED`, raison durable `RPC_UNAVAILABLE`. Le prochain cycle ouvre
+une nouvelle session et doit couvrir H2 → H1 depuis le checkpoint durable avant
+promotion ; aucune page supplémentaire hors budget. Sans ACTIVE restant, la
+rotation normale est à nouveau possible. Un crash entre complétion et refresh
+ne supprime pas cette obligation de couverture.
+
 Si le provider prouve une fin d'historique (page courte/vide ou slot sous la
 frontière sans correspondance exacte), une preuve strictement
 redactée est conservée avec cette limite. Une preuve non résolue ne reçoit pas

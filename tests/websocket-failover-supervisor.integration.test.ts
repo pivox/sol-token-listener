@@ -19,6 +19,7 @@ import {
 import { PersistentWebSocketHealthReporter } from '../src/application/websocket-health-reporter.js';
 import type { RpcProviderId } from '../src/domain/rpc-provider.js';
 import { createStrictCatchUpFailure } from '../src/domain/strict-catch-up.js';
+import { createStrictCatchUpRun } from '../src/domain/strict-catch-up-run.js';
 import type { ProcessingCheckpoint } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
@@ -505,7 +506,7 @@ void test('persists native partial-ACK and setup-timeout failures after the real
   }
 });
 
-void test('restarts a durably paused fallback run and promotes only after its exact final page', async (context) => {
+void test('restarts a paused fallback run, then bridges its frozen H1 to H2 before promotion in a fresh process', async (context) => {
   await withDatabase(context, async (pool) => {
     const inbox = new PostgresTransactionInboxRepository(pool);
     const health = new PostgresWebSocketHealthRepository(pool);
@@ -514,11 +515,14 @@ void test('restarts a durably paused fallback run and promotes only after its ex
     });
     await inbox.compareAndSwapCheckpoint(null, previous);
     const sourceCalls: [RpcProviderId, string | undefined][] = [];
+    let freshHead = false;
     const strict = (providerId: RpcProviderId, signal: AbortSignal) => new StrictCatchUpScanner({
       providerId,
       async list(_programId: string, before: string | undefined) {
         sourceCalls.push([providerId, before]);
-        const rows: [string, bigint][] = before === undefined
+        const rows: [string, bigint][] = freshHead
+          ? [[STRICT_WINDOW_MARKET_SIGNATURE, 46n], [MULTI_PAGE_SIGNATURE, 45n]]
+          : before === undefined
           ? [[MULTI_PAGE_SIGNATURE, 45n], [SHARED_SIGNATURE, 44n]]
           : before === SHARED_SIGNATURE
             ? [[STRICT_WINDOW_HEAD_SIGNATURE, 43n], [STRICT_WINDOW_LAUNCHPAD_SIGNATURE, 42n]]
@@ -551,14 +555,104 @@ void test('restarts a durably paused fallback run and promotes only after its ex
       reporter: reporterFor(inbox, health), strict });
     await restarted.start();
     restartScheduler.fire(0);
-    await waitForProvider(restarted, 'fallback-1');
+    await waitForPhase(health, 'DEGRADED');
+    assert.equal(restarted.activeProviderId(), null);
     assert.equal(restartSessions.count, 1);
+    assert.equal(restartSessions.at(0).closeCalls, 1);
+    assert.deepEqual(restartScheduler.pendingDelays(), [500]);
     assert.equal(await inbox.readActiveStrictCatchUpRun('launchpad'), null);
     assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, MULTI_PAGE_SIGNATURE);
     assert.deepEqual(sourceCalls, [['fallback-1', undefined], ['fallback-1', SHARED_SIGNATURE],
       ['fallback-1', STRICT_WINDOW_LAUNCHPAD_SIGNATURE]]);
     assert.equal(await unresolvedStrictFailureCount(pool), 0);
     await restarted.close();
+
+    // No in-memory flag survives: the canonical checkpoint alone forces H2 -> H1.
+    freshHead = true;
+    const bridgeScheduler = new ManualScheduler();
+    const bridgeSessions = new SessionFactory();
+    const bridge = supervisorFor({ inbox, health, scheduler: bridgeScheduler, sessions: bridgeSessions,
+      reporter: reporterFor(inbox, health), strict });
+    await bridge.start();
+    bridgeScheduler.fire(0);
+    await waitForProvider(bridge, 'primary');
+    assert.equal(bridgeSessions.count, 1);
+    assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, STRICT_WINDOW_MARKET_SIGNATURE);
+    assert.equal((await pool.query('SELECT 1 FROM chain_transaction_inbox WHERE signature=$1', [STRICT_WINDOW_MARKET_SIGNATURE])).rowCount, 1);
+    assert.deepEqual(sourceCalls.at(-1), ['primary', undefined]);
+    assert.equal(sourceCalls.length, 4);
+    await bridge.close();
+  });
+});
+
+void test('active market completes before failed launchpad and releases the provider pin for normal rotation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const inbox = new PostgresTransactionInboxRepository(pool);
+    const health = new PostgresWebSocketHealthRepository(pool);
+    const programs = Object.freeze([
+      Object.freeze({ key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID } as const),
+      Object.freeze({ key: 'market', family: 'pumpswap', id: PUMPSWAP_PROGRAM_ID } as const),
+    ]);
+    const row = (signature: string, slot: bigint): CatchUpSignature => Object.freeze({
+      signature, slot, confirmationStatus: 'confirmed', blockTimeMs: null,
+    });
+    for (const program of programs) {
+      const previous = Object.freeze({
+        key: program.key, signature: MULTI_PAGE_BOUNDARY_SIGNATURE, slot: 41n, updatedAtMs: 9_000,
+      });
+      await inbox.compareAndSwapCheckpoint(null, previous);
+      const rows = program.key === 'launchpad' ? [row(MULTI_PAGE_SIGNATURE, 45n)]
+        : [row(MULTI_PAGE_SIGNATURE, 45n), row(SHARED_SIGNATURE, 44n)];
+      if (program.key === 'market') {
+        for (const value of rows) await inbox.enqueue(Object.freeze({
+          signature: value.signature, slot: value.slot, confirmationStatus: value.confirmationStatus,
+          source: 'CATCH_UP', ingestionHint: null, observedAtMs: 10_000, programIds: Object.freeze([program.id]),
+        }));
+        await inbox.createStrictCatchUpRun(createStrictCatchUpRun({
+          checkpointKey: program.key, previous, providerId: 'primary',
+          observedHead: { signature: MULTI_PAGE_SIGNATURE, slot: 45n },
+          beforeSignature: SHARED_SIGNATURE, lastAcceptedSlot: 44n,
+          pagesScanned: 1n, signaturesEnqueued: 2n, revision: 0n, startedAtMs: 10_000, updatedAtMs: 10_000,
+        }));
+        continue;
+      }
+      await assert.rejects(new StrictCatchUpScanner({ providerId: 'primary',
+        list: async () => rows,
+      }, inbox, { programs: Object.freeze([program]), pageSize: 2, maxPages: 1, now: () => 10_000 })
+        .scan(new AbortController().signal), {
+        name: 'StrictCatchUpWindowExceededError',
+      });
+    }
+    const sourceCalls: [RpcProviderId, string, string | undefined][] = [];
+    const scheduler = new ManualScheduler();
+    const sessions = new SessionFactory();
+    const supervisor = supervisorFor({ inbox, health, scheduler, sessions,
+      reporter: reporterFor(inbox, health),
+      strict: (providerId, signal) => new StrictCatchUpScanner({ providerId,
+        async list(programId: string, before: string | undefined) {
+          sourceCalls.push([providerId, programId, before]);
+          if (before === SHARED_SIGNATURE) return [row(MULTI_PAGE_BOUNDARY_SIGNATURE, 41n)];
+          return [row(STRICT_WINDOW_MARKET_SIGNATURE, 46n),
+            programId === PUMP_PROGRAM_ID ? row(MULTI_PAGE_BOUNDARY_SIGNATURE, 41n) : row(MULTI_PAGE_SIGNATURE, 45n)];
+        },
+      }, inbox, { programs, pageSize: 2, maxPages: 1, now: () => 10_000 }).scan(signal),
+    });
+    await supervisor.start();
+    scheduler.fire(0);
+    await waitForPhase(health, 'DEGRADED');
+    assert.equal(supervisor.activeProviderId(), null);
+    assert.deepEqual(sourceCalls, [['primary', PUMPSWAP_PROGRAM_ID, SHARED_SIGNATURE]]);
+    assert.equal(await inbox.readActiveStrictCatchUpRun('market'), null);
+    assert.equal(await unresolvedStrictFailureCount(pool), 1);
+    assert.equal(sessions.at(0).closeCalls, 1);
+    assert.deepEqual(scheduler.pendingDelays(), [500]);
+    scheduler.fire(500);
+    await waitForProvider(supervisor, 'fallback-1');
+    assert.deepEqual(sourceCalls, [['primary', PUMPSWAP_PROGRAM_ID, SHARED_SIGNATURE],
+      ['fallback-1', PUMP_PROGRAM_ID, undefined], ['fallback-1', PUMPSWAP_PROGRAM_ID, undefined]]);
+    assert.equal((await inbox.readCheckpoint('market'))?.signature, STRICT_WINDOW_MARKET_SIGNATURE);
+    assert.equal(await unresolvedStrictFailureCount(pool), 0);
+    await supervisor.close();
   });
 });
 

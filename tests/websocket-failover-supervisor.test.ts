@@ -16,6 +16,7 @@ import {
 import {
   StrictCatchUpAbortedError,
   StrictCatchUpPausedError,
+  StrictCatchUpRefreshRequiredError,
   StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError,
   type StrictCatchUpScanResult,
@@ -140,6 +141,32 @@ void test('page-budget pause closes the candidate and retries only the newly pin
   await flushLifecycle();
   assert.deepEqual(fixture.openedAttempts.map(({ endpoint }) => endpoint.id), ['primary', 'primary']);
   assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+});
+
+void test('refresh-required from recovery or periodic scan closes the session and backs off without rotation', async () => {
+  for (const periodic of [false, true]) {
+    const session = controlledSession('primary');
+    const fixture = supervisorFixture({
+      providerIds: ['primary', 'fallback-1'], random: () => 0,
+      sessionFactories: [() => Promise.resolve(session.session)],
+    });
+    if (periodic) fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+    fixture.strictResults.push(rejected(new StrictCatchUpRefreshRequiredError('primary')));
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    if (periodic) {
+      fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+      await flushLifecycle();
+    }
+    assert.deepEqual(fixture.openedAttempts.map(({ endpoint }) => endpoint.id), ['primary']);
+    assert.equal(session.closeCalls(), 1);
+    assert.equal(fixture.supervisor.activeProviderId(), null);
+    assert.equal(fixture.supervisor.state(), 'DEGRADED');
+    assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'RUNNING').length, periodic ? 1 : 0);
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    await fixture.supervisor.close();
+  }
 });
 
 void test('rereads durable affinity after a transient scan before rotating providers', async () => {

@@ -4,6 +4,7 @@ import {
   assertValidStrictCatchUpRun,
   createStrictCatchUpRun,
   terminalizeStrictCatchUpRun,
+  type StrictCatchUpRun,
 } from '../domain/strict-catch-up-run.js';
 import {
   MAX_DATE_MS,
@@ -92,6 +93,18 @@ export class StrictCatchUpPausedError extends Error {
   }
 }
 
+export class StrictCatchUpRefreshRequiredError extends Error {
+  public readonly code = 'CATCH_UP_REFRESH_REQUIRED' as const;
+  public readonly retryable = true;
+  public readonly stage = 'head-refresh' as const;
+
+  public constructor(public readonly providerId: RpcProviderId) {
+    super('Strict catch-up requires a fresh recovery cycle.');
+    Object.defineProperty(this, 'name', { value: 'StrictCatchUpRefreshRequiredError' });
+    Object.freeze(this);
+  }
+}
+
 export class StrictCatchUpProviderAffinityError extends Error {
   public readonly retryable = true;
   public readonly stage = 'provider-affinity' as const;
@@ -171,6 +184,7 @@ interface StrictProgramScan {
   readonly discoveredCount: number;
   readonly checkpointCasCount: number;
   readonly pageCount: number;
+  readonly refreshRequired: boolean;
 }
 
 const DEFAULT_PROGRAMS: readonly ListenerIngestionProgram[] = Object.freeze([
@@ -219,10 +233,48 @@ export class StrictCatchUpScanner {
     const boundaries: StrictCatchUpBoundaries = Object.freeze({ ...checkpoints });
     const scans: StrictProgramScan[] = [];
     const discoveries = new Map<string, CatchUpSignature>();
+    const activePrograms: { readonly program: ListenerIngestionProgram; readonly run: StrictCatchUpRun }[] = [];
+    const staleRuns: StrictCatchUpRun[] = [];
+    // Read every configured key before source access: a failed earlier key must
+    // never starve a different key that still owns the durable provider pin.
     for (const program of this.programs) {
-      scans.push(await this.awaited(signal, () => this.scanProgram(
-        program, boundaries, observedAtMs, discoveries, signal,
-      )));
+      const run = await this.operation(signal, 'run-read', program.key, async () => {
+        const active = await this.repository.readActiveStrictCatchUpRun(program.key);
+        if (active !== null) {
+          assertValidStrictCatchUpRun(active);
+          if (active.state !== 'ACTIVE' || active.checkpointKey !== program.key) throw new TypeError();
+        }
+        return active;
+      });
+      if (run === null) continue;
+      if (!sameCheckpoint(run.previous, boundaries[program.key])) {
+        staleRuns.push(run);
+      } else {
+        if (run.providerId !== this.providerId) {
+          throw new StrictCatchUpProviderAffinityError(run.providerId, this.providerId, program.key);
+        }
+        if (observedAtMs < run.updatedAtMs) throw this.failure('run-read', program.key);
+        activePrograms.push({ program, run });
+      }
+    }
+    for (const { program, run } of activePrograms) {
+      await this.awaited(signal, () => this.scanProgram(
+        program, boundaries, observedAtMs, discoveries, signal, run,
+      ));
+    }
+    for (const stale of staleRuns) {
+      await this.operation(signal, 'run-supersede', stale.checkpointKey,
+        () => this.repository.supersedeStaleStrictCatchUpRun(stale, observedAtMs));
+    }
+    // The frozen head predates this recovery session. Complete durable work,
+    // then open a new session and bridge the new head in a separate bounded pass.
+    if (activePrograms.length > 0) throw new StrictCatchUpRefreshRequiredError(this.providerId);
+    for (const program of this.programs) {
+      const scan = await this.awaited(signal, () => this.scanProgram(
+        program, boundaries, observedAtMs, discoveries, signal, null,
+      ));
+      if (scan.refreshRequired) throw new StrictCatchUpRefreshRequiredError(this.providerId);
+      scans.push(scan);
     }
 
     return Object.freeze({
@@ -241,22 +293,10 @@ export class StrictCatchUpScanner {
     observedAtMs: number,
     discoveries: Map<string, CatchUpSignature>,
     signal: AbortSignal,
+    initialRun: StrictCatchUpRun | null,
   ): Promise<StrictProgramScan> {
     const expected = boundaries[program.key];
-    let run = expected === null ? null : await this.operation(signal, 'run-read', program.key, async () => {
-      const active = await this.repository.readActiveStrictCatchUpRun(program.key);
-      if (active !== null) {
-        assertValidStrictCatchUpRun(active);
-        if (active.state !== 'ACTIVE' || active.checkpointKey !== program.key) throw new TypeError();
-      }
-      return active;
-    });
-    if (run !== null && !sameCheckpoint(run.previous, expected)) {
-      const stale = run;
-      await this.operation(signal, 'run-supersede', program.key,
-        () => this.repository.supersedeStaleStrictCatchUpRun(stale, observedAtMs));
-      run = null;
-    }
+    let run = initialRun;
     if (run === null && expected !== null) {
       run = await this.operation(signal, 'run-read', program.key, async () => {
         const historical = await this.repository.readStrictCatchUpRun(program.key, expected, this.providerId);
@@ -276,6 +316,7 @@ export class StrictCatchUpScanner {
       throw new StrictCatchUpProviderAffinityError(run.providerId, this.providerId, program.key);
     }
     if (run !== null && observedAtMs < run.updatedAtMs) throw this.failure('run-read', program.key);
+    const refreshRequired = run !== null;
     const signatures = new Set<string>();
     if (run !== null) {
       signatures.add(run.beforeSignature);
@@ -397,7 +438,7 @@ export class StrictCatchUpScanner {
           }
           checkpointCasCount = 1;
         }
-        return Object.freeze({ discoveredCount, checkpointCasCount, pageCount });
+        return Object.freeze({ discoveredCount, checkpointCasCount, pageCount, refreshRequired });
       }
 
       if (page.length < this.pageSize || crossedBoundarySlot) {

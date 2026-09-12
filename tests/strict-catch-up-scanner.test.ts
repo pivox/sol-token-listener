@@ -78,7 +78,7 @@ void test('persists a full page before budget pause and resumes its frozen head 
   const resumed = new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('same-slot', 13), sig('boundary', 10)]],
   });
-  const result = await scanner(resumed, repository, { ...options, now: () => 10_000 }).scan(NEVER_ABORTED);
+  await assert.rejects(scanner(resumed, repository, { ...options, now: () => 10_000 }).scan(NEVER_ABORTED), refreshRequired);
   assert.deepEqual(resumed.calls, [[PUMP_PROGRAM_ID, 'cursor', 2]]);
   assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['head', 'cursor', 'same-slot']);
   assert.equal(repository.enqueued[2]?.observedAtMs, 10_000);
@@ -86,11 +86,80 @@ void test('persists a full page before budget pause and resumes its frozen head 
   assert.equal(repository.runs[0]?.pagesScanned, 2n);
   assert.equal(repository.runs[0]?.signaturesEnqueued, 3n);
   assert.deepEqual(await repository.readCheckpoint('launchpad'), checkpoint('launchpad', 'head', 14, 10_000));
+  // A new process must bridge the persisted old head to its newly opened WebSocket.
+  const fresh = new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('new-head', 16), sig('head', 14)]] });
+  const result = await scanner(fresh, repository, { ...options, now: () => 11_000 }).scan(NEVER_ABORTED);
+  assert.deepEqual(fresh.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
   assert.equal(result.pageCount, 1);
-  assert.equal(result.discoveredCount, 1);
   assert.equal(result.enqueuedCount, 1);
-  assert.equal(result.checkpointCasCount, 1);
+  assert.equal((await repository.readCheckpoint('launchpad'))?.signature, 'new-head');
 });
+
+void test('processes active market before retained failed or stale launchpad, then requires a fresh scan', async () => {
+  for (const launchState of ['FAILED', 'STALE', 'STALE_NULL'] as const) {
+    const repository = new FakeRepository({
+      ...(launchState === 'STALE_NULL' ? {} : {
+        launchpad: checkpoint('launchpad', launchState === 'STALE' ? 'replacement' : 'boundary', 10),
+      }),
+      market: checkpoint('market', 'boundary', 10),
+    });
+    repository.runs.push(launchState === 'FAILED'
+      ? terminalizeStrictCatchUpRun(activeRun(), {
+        state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: 2_000,
+      }) : activeRun());
+    repository.runs.push(activeRun('market'));
+    const source = new FakeSource({ [PUMPSWAP_PROGRAM_ID]: [[sig('boundary', 10)]] });
+    await assert.rejects(scanner(source, repository, { maxPages: 1 }).scan(NEVER_ABORTED), refreshRequired);
+    assert.deepEqual(source.calls, [[PUMPSWAP_PROGRAM_ID, 'cursor', 2]]);
+    assert.equal(repository.runs[1]?.state, 'COMPLETED');
+    assert.equal(repository.runs[0]?.state, launchState === 'FAILED' ? 'FAILED' : 'SUPERSEDED');
+    assert.equal(repository.eventsSeen.includes('run-history:launchpad'), false);
+    assert.ok(repository.eventsSeen.indexOf('run-complete:market') > repository.eventsSeen.indexOf('run-read:market'));
+    if (launchState !== 'FAILED') {
+      assert.ok(repository.eventsSeen.indexOf('run-supersede:launchpad') > repository.eventsSeen.indexOf('run-complete:market'));
+    } else {
+      const nextSource = new FakeSource({});
+      await assert.rejects(scanner(nextSource, repository).scan(NEVER_ABORTED), StrictCatchUpWindowExceededError);
+      assert.deepEqual(nextSource.calls, []);
+    }
+  }
+});
+
+void test('completes all matching active keys before refresh, without scanning any fresh page', async () => {
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10),
+    market: checkpoint('market', 'boundary', 10) });
+  repository.runs.push(activeRun(), activeRun('market'));
+  const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('boundary', 10)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('boundary', 10)]] });
+  await assert.rejects(scanner(source, repository, { maxPages: 1 }).scan(NEVER_ABORTED), refreshRequired);
+  assert.deepEqual(repository.runs.map(({ state }) => state), ['COMPLETED', 'COMPLETED']);
+  assert.deepEqual(source.calls, programs.map((id) => [id, 'cursor', 2]));
+});
+
+void test('a paused active market never reads failed launchpad history or a fresh source page', async () => {
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10),
+    market: checkpoint('market', 'boundary', 10) });
+  repository.runs.push(terminalizeStrictCatchUpRun(activeRun(), {
+    state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: 2_000,
+  }), activeRun('market'));
+  const source = new FakeSource({ [PUMPSWAP_PROGRAM_ID]: [[sig('next', 12), sig('tail', 11)]] });
+  await assert.rejects(scanner(source, repository, { maxPages: 1 }).scan(NEVER_ABORTED), { name: 'StrictCatchUpPausedError' });
+  assert.equal(repository.runs[1]?.beforeSignature, 'tail');
+  assert.equal(repository.eventsSeen.includes('run-history:launchpad'), false);
+  assert.deepEqual(source.calls, [[PUMPSWAP_PROGRAM_ID, 'cursor', 2]]);
+});
+
+function refreshRequired(error: unknown): boolean {
+  assert.ok(error instanceof Error);
+  assert.equal(error.name, 'StrictCatchUpRefreshRequiredError');
+  assert.equal(Reflect.get(error, 'code'), 'CATCH_UP_REFRESH_REQUIRED');
+  assert.equal(Reflect.get(error, 'retryable'), true);
+  assert.equal(Reflect.get(error, 'stage'), 'head-refresh');
+  assert.ok(Object.isFrozen(error));
+  assert.doesNotMatch(JSON.stringify(error), /signature|boundary|cursor|https/u);
+  assert.equal((TRANSACTION_INGESTION_ERROR_CODES as readonly string[]).includes(Reflect.get(error, 'code') as string), false);
+  return true;
+}
 
 void test('replays page enqueues idempotently when run progress persistence crashes', async () => {
   const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
@@ -239,9 +308,9 @@ void test('crossing below the checkpoint slot persists only eligible rows and pr
   }
 });
 
-function activeRun(): StrictCatchUpRun {
+function activeRun(key: ProcessingCheckpointKey = 'launchpad'): StrictCatchUpRun {
   return createStrictCatchUpRun({
-    checkpointKey: 'launchpad', previous: checkpoint('launchpad', 'boundary', 10), providerId: 'primary',
+    checkpointKey: key, previous: checkpoint(key, 'boundary', 10), providerId: 'primary',
     observedHead: { signature: 'head', slot: 14n }, beforeSignature: 'cursor', lastAcceptedSlot: 13n,
     pagesScanned: 1n, signaturesEnqueued: 2n, revision: 0n, startedAtMs: 1_000, updatedAtMs: 1_000,
   });
@@ -304,7 +373,7 @@ void test('retries final completion from its persisted final-page tail without r
   assert.deepEqual(await repository.readCheckpoint('launchpad'), checkpoint('launchpad', 'boundary', 10));
   repository.failRunOperation = null;
   const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('boundary', 10)]] });
-  await scanner(source, repository, { programs: LAUNCHPAD_ONLY }).scan(NEVER_ABORTED);
+  await assert.rejects(scanner(source, repository, { programs: LAUNCHPAD_ONLY }).scan(NEVER_ABORTED), refreshRequired);
   assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, 'last', 2]]);
   assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['last']);
   assert.equal(repository.runs[0]?.state, 'COMPLETED');
@@ -398,6 +467,7 @@ void test('scans only the configured launchpad program without touching market s
 
   assert.deepEqual(repository.eventsSeen, [
     'read:launchpad',
+    'run-read:launchpad',
     'enqueue:launch',
     'cas:launchpad',
   ]);
@@ -751,8 +821,8 @@ void test('captures now and both exact checkpoints before the first provider pag
   }).scan(NEVER_ABORTED);
 
   assert.equal(nowCalls, 1);
-  assert.deepEqual(events.slice(0, 6), [
-    'now', 'read:launchpad', 'read:market', 'run-read:launchpad', 'run-history:launchpad', `source:${PUMP_PROGRAM_ID}:head`,
+  assert.deepEqual(events.slice(0, 7), [
+    'now', 'read:launchpad', 'read:market', 'run-read:launchpad', 'run-read:market', 'run-history:launchpad', `source:${PUMP_PROGRAM_ID}:head`,
   ]);
   assert.equal(source.providerIdsSeen.every((value) => value === source.providerId), true);
   assert.deepEqual(result.boundaries, {

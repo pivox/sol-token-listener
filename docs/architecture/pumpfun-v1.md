@@ -700,6 +700,14 @@ avant une rotation après erreur transitoire ; seule l'identité provider est
 publique, jamais les signatures ou endpoints. La frontière périodique applique
 la même règle. Des pins divergents, invalides ou retirés restent fail-closed.
 
+Tous les runs `ACTIVE` à frontière canonique sont traités avant les clés sans
+run actif, même si une clé antérieure a un historique `FAILED`. Leur complétion
+couvre seulement la tête figée H1 : `CATCH_UP_REFRESH_REQUIRED` impose cleanup,
+`DEGRADED`/`REQUIRED` et un jitter, sans promotion. Le cycle suivant ouvre une
+nouvelle session et couvre H2 → H1 avant `RUNNING`, sans page hors budget.
+Sans pin actif restant, la sélection normale des providers reprend. Le checkpoint
+durable conserve cette obligation après un crash ou un restart.
+
 La fin d'historique prouvée sans frontière exacte reste terminale ; un run
 `FAILED` retenu rejoue la même erreur sans relire le RPC. L'unanimité
 `UNRECOVERABLE` exige le catalogue entier non épinglé, la même clé en échec et

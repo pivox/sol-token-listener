@@ -1053,7 +1053,7 @@ void test('resumable strict recovery documents durable pause, private affinity a
   ];
   for (const file of files) {
     const source = await readFile(new URL(file, import.meta.url), 'utf8');
-    for (const term of ['CATCH_UP_PAGE_BUDGET_EXHAUSTED', 'RPC_UNAVAILABLE',
+    for (const term of ['CATCH_UP_PAGE_BUDGET_EXHAUSTED', 'CATCH_UP_REFRESH_REQUIRED', 'RPC_UNAVAILABLE',
       'DEGRADED', 'REQUIRED', 'listener_strict_catch_up_runs']) {
       assert.ok(source.includes(term), `${file} misses ${term}`);
     }
@@ -1063,7 +1063,7 @@ void test('resumable strict recovery documents durable pause, private affinity a
   assert.match(environment, /monthly quota.*instantaneous capacity/iu);
   assert.match(environment, /^LISTENER_CATCH_UP_PAGE_SIZE=100$/mu);
   const design = await readFile(new URL('../docs/superpowers/specs/2026-09-09-resumable-strict-catch-up-design.md', import.meta.url), 'utf8');
-  assert.match(design, /Version: 2/u);
+  assert.match(design, /Version: 3/u);
   assert.match(design, /readStrictCatchUpRun/u);
   assert.match(design, /pagesScanned/u);
   assert.match(design, /sameFrontier/u);

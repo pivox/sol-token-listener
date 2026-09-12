@@ -1,7 +1,7 @@
 # Resumable strict catch-up design
 
 Status: approved for implementation  
-Version: 2
+Version: 3
 Issue: #100  
 Scope: listener ingestion only; no signer, submission, wallet loading, or armament
 
@@ -10,6 +10,22 @@ Scope: listener ingestion only; no signer, submission, wallet loading, or armame
 - v1 (2026-09-09): approved durable page-resumption design.
 - v2 (2026-09-12): records the implemented terminal lookup, exact failing-key
   comparison, durable counters, atomic completion and operational pause contract.
+- v3 (2026-09-12): resumed completion requires a fresh recovery cycle, and
+  matching ACTIVE runs take precedence over other keys' retained failures.
+- Before source access, preload and validate active runs for every configured
+  key. Process all ACTIVE runs whose previous boundary is still canonical before
+  any non-active key or historical failure. Supersede stale runs after valid
+  ACTIVE work, including stale runs whose canonical checkpoint is now null.
+- Completing a pre-existing run only covers the frozen head H1, not the interval
+  up to the new session's head H2. After completing all matching active runs,
+  throw `StrictCatchUpRefreshRequiredError` (`CATCH_UP_REFRESH_REQUIRED`,
+  retryable, redacted) before scanning non-active keys or reporting success.
+  The supervisor handles it as `paused`: cleanup, DEGRADED/REQUIRED with durable
+  `RPC_UNAVAILABLE`, and one jitter, without rotation or promotion in that cycle.
+  A new session and bounded fresh scan must cover H2 -> H1 before RUNNING.
+  Once no ACTIVE pin remains, the next cycle uses normal provider selection.
+  The persisted checkpoint makes this safe even across a process crash between
+  completion and refresh. No extra page is appended beyond the invocation budget.
 - After no active run, `readStrictCatchUpRun` looks up retained history by
   checkpoint key, previous slot/signature and provider across every state.
   `previous.updatedAtMs` remains evidence, not identity. A matching `FAILED`
@@ -127,6 +143,12 @@ same rule. This rule also restores affinity after a process restart.
 
 For each configured program, the scanner follows this protocol:
 
+The scan first reads all configured checkpoints and ACTIVE runs, then handles
+matching ACTIVE keys as a priority cohort. A FAILED earlier key cannot preempt
+another key's ACTIVE cursor. A pause/failure while processing this cohort stops
+the pass safely; successful completion of the entire cohort requires the fresh
+cycle described above, before any historical failure or non-active key is read.
+
 1. Read the canonical checkpoint and the active run.
 2. Validate the active run's exact checkpoint and pinned provider, superseding
    stale active state first; if absent, check retained historical identity.
@@ -162,6 +184,10 @@ and checkpoint-update time and must not precede the run update. A resumed final
 page with eligible rows persists progress before completion; a boundary-only
 page completes without advancing the cursor. If the boundary is in the first
 page with no active run, existing direct checkpoint CAS remains sufficient.
+Completion of a run that already existed before its page reads never authorizes
+promotion: the next fresh recovery must bridge the current head to this frozen
+checkpoint. Runs created and completed entirely within a fresh pass do not
+require another cycle.
 
 If the first page is empty for a missing checkpoint, existing cold-start
 semantics remain unchanged. If the old checkpoint is non-null and the provider
@@ -187,7 +213,9 @@ never age-purged. Listener grants are SELECT/INSERT/UPDATE/DELETE; retention
 grants are SELECT/DELETE only.
 
 The scanner returns its existing complete result when all configured programs
-are recovered. Page-budget exhaustion throws a typed retryable
+are recovered by a fresh pass. Resumed completion instead throws the operational
+`StrictCatchUpRefreshRequiredError`, not an inbox terminal error or durable
+health reason. Page-budget exhaustion throws a typed retryable
 `StrictCatchUpPausedError` containing only provider ID, checkpoint key, run ID,
 and aggregate counters. It contains no signatures or endpoints in its public
 message.

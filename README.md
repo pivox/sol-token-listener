@@ -480,6 +480,10 @@ le curseur après chaque page entièrement enfilée. L'épuisement du budget pro
 `CATCH_UP_PAGE_BUDGET_EXHAUSTED`, une pause reprise sur le provider épinglé après
 jitter, sans rotation ni rebasage. Seule une frontière réellement absente de
 l'historique produit `CATCH_UP_WINDOW_EXCEEDED`.
+Les runs actifs sont prioritaires sur les historiques FAILED des autres clés.
+Après complétion d'un run repris, `CATCH_UP_REFRESH_REQUIRED` exige encore un
+nouveau cycle et une nouvelle session : le scan frais doit couvrir la nouvelle
+tête jusqu'à l'ancienne tête figée avant toute promotion `RUNNING`.
 
 Une panne retryable est replanifiée avec un
 délai exponentiel piloté par `RPC_RETRY_BASE_DELAY_MS` et plafonné à 60 s.

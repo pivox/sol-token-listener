@@ -3,6 +3,7 @@ import bs58 from 'bs58';
 import {
   StrictCatchUpAbortedError,
   StrictCatchUpPausedError,
+  StrictCatchUpRefreshRequiredError,
   StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError,
   type StrictCatchUpScanResult,
@@ -1770,7 +1771,7 @@ function strictScanFailureFrom(
 ): ProviderAttemptResult {
   if (typeof error === 'object' && error !== null && isProxy(error)) return attemptFailureFrom(null);
   if (error instanceof StrictCatchUpAbortedError) return nonShutdownAbortFailure(record);
-  if (error instanceof StrictCatchUpPausedError) {
+  if (error instanceof StrictCatchUpPausedError || error instanceof StrictCatchUpRefreshRequiredError) {
     return Object.freeze({ kind: 'paused', recoveryReason: 'RPC_UNAVAILABLE', disconnectReason: null });
   }
   if (error instanceof StrictCatchUpWindowExceededError) {
