@@ -145,6 +145,26 @@ void test('exige le même créateur demandé et effectif hors holder-reward', ()
   );
 });
 
+void test('refuse un creator fee contradictoire pour une quote admise par quote-control', () => {
+  const quoteControl = PublicKey.findProgramAddressSync(
+    [Buffer.from('quote-control')],
+    new PublicKey(PUMP_PROGRAM_ID),
+  )[0].toBase58();
+
+  assert.throws(
+    () => decodePumpTransaction(transaction([
+      action(
+        'create_v2',
+        cursor(2, null, 1),
+        { quote_control: quoteControl },
+        { creator_fee_bps: [300n] },
+      ),
+      eventAt(createEventInstruction(), cursor(2, 0, 2)),
+    ])),
+    isPumpError('PUMP_EVENT_MISMATCH'),
+  );
+});
+
 void test('sépare plusieurs actions Pump sous un même wrapper', () => {
   const decoded = decodePumpTransaction(transaction([
     action('buy_v2', cursor(4, 0, 2)),
@@ -310,6 +330,9 @@ function action(
       address(11),
       accountOverrides.quote_token_program ?? SPL_TOKEN_PROGRAM_ID,
     );
+    if (accountOverrides.quote_control !== undefined) {
+      accounts.push(accountOverrides.quote_control);
+    }
   }
   return {
     programId: PUMP_PROGRAM_ID,

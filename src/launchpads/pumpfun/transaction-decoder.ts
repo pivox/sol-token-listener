@@ -317,6 +317,14 @@ function validateCreation(
       transaction,
       'is_holder_reward',
     );
+    if (action.accounts.quote_control !== undefined) {
+      requireEqual(
+        event.creatorFeeBps,
+        optionBigIntArg(action, 'creator_fee_bps'),
+        transaction,
+        'creator_fee_bps',
+      );
+    }
   } else if (event.isHolderReward) {
     throw mismatch(transaction, 'Preuves Pump contradictoires: is_holder_reward.');
   }
@@ -448,6 +456,17 @@ function optionBooleanArg(
   return value[0];
 }
 
+function optionBigIntArg(
+  action: DecodedPumpInstruction,
+  name: string,
+): bigint {
+  const value = action.args[name];
+  if (!isIdlArray(value) || typeof value[0] !== 'bigint') {
+    throw schemaMismatch(action, name);
+  }
+  return value[0];
+}
+
 function isIdlArray(
   value: PumpIdlValue | undefined,
 ): value is readonly PumpIdlValue[] {
@@ -480,8 +499,8 @@ function requireSupportedProgram(
 }
 
 function requireEqual(
-  actual: string | boolean,
-  expected: string | boolean,
+  actual: string | boolean | bigint,
+  expected: string | boolean | bigint,
   transaction: NormalizedTransaction,
   field: string,
 ): void {
