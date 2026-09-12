@@ -13,6 +13,7 @@ import type {
   FinalityCandidate,
   FinalityPollObservation,
   FinalityRevision,
+  RuntimeHeartbeat,
 } from '../src/domain/transaction-ingestion.js';
 import type { TokenLaunch } from '../src/domain/types.js';
 import type {
@@ -30,11 +31,65 @@ import {
   createProductionListenerRuntime,
   catchUpGapLogContext,
   createUnavailableBondingCurveReader,
+  createProductionBlockHydration,
+  lifecycleComponent,
   type RecurringFinalityOptions,
   type ListenerRuntimeScheduler,
 } from '../src/application/production-listener-factory.js';
+import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
+import { SolanaTransactionLocator } from '../src/solana/rpc/transaction-locator.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+void test('production block hydration keeps the exact legacy locator unless explicitly enabled', () => {
+  const rpc = Object.freeze({
+    httpTransportEpoch: 0,
+    async getTransaction() { return null; },
+    async getBlockSignatures() { return []; },
+    async getBlockTransactions() { return null; },
+  });
+  const disabled = createProductionBlockHydration(parseConfig({
+    SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+    SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
+  }), rpc);
+  assert.ok(disabled.locator instanceof SolanaTransactionLocator);
+  assert.deepEqual(disabled.metrics(), {
+    version: 1, enabled: false, callerConcurrency: 1,
+    locates: 0, hits: 0, misses: 0, inFlightJoins: 0, fetches: 0,
+    forcedRefreshes: 0, evictions: 0, oversizeBypasses: 0, fetchFailures: 0,
+    epochInvalidations: 0, retainedEntries: 0, retainedBytes: 0,
+    inFlightFetches: 0, queuedFetches: 0,
+    queueDelayMs: { last: null, maximum: null },
+  });
+
+  const enabled = createProductionBlockHydration(parseConfig({
+    SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+    SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+  }), rpc);
+  assert.ok(enabled.locator instanceof CachedSolanaBlockTransactionLocator);
+  assert.equal(enabled.metrics().enabled, true);
+  assert.equal(enabled.metrics().callerConcurrency, 1);
+  disabled.close();
+  enabled.close();
+});
+
+void test('worker shutdown closes block hydration before awaiting a stuck worker', async () => {
+  const workerClose = deferred<undefined>();
+  let cacheClosed = false;
+  const component = lifecycleComponent({
+    async start() { return undefined; },
+    async close() { await workerClose.promise; },
+    state: 'RUNNING' as const,
+  }, () => { cacheClosed = true; });
+
+  const closing = component.close();
+  assert.equal(cacheClosed, true);
+  workerClose.resolve(undefined);
+  await closing;
+});
 
 void test('selects one frozen canonical ingestion program list and rejects unknown scopes', () => {
   assert.equal(listenerIngestionPrograms('launchpad-only'), LAUNCHPAD_ONLY_INGESTION_PROGRAMS);
@@ -370,6 +425,31 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
   assert.equal(writes[0]?.leasedCount, 1);
   assert.equal(writes[0]?.exhaustedCount, 1);
   await heartbeat.stop();
+});
+
+void test('heartbeat publishes one bounded block hydration snapshot without identities', async () => {
+  const writes: RuntimeHeartbeat[] = [];
+  const metrics = Object.freeze({
+    version: 1 as const, enabled: true, callerConcurrency: 1 as const,
+    locates: 3, hits: 2, misses: 1, inFlightJoins: 0, fetches: 1,
+    forcedRefreshes: 0, evictions: 0, oversizeBypasses: 0, fetchFailures: 0,
+    epochInvalidations: 0, retainedEntries: 1, retainedBytes: 1024,
+    inFlightFetches: 0, queuedFetches: 0,
+    queueDelayMs: Object.freeze({ last: 0, maximum: 0 }),
+  });
+  const heartbeat = new PersistentListenerHeartbeat(
+    {
+      async counts() { return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0 }; },
+      async writeHeartbeat(value) { writes.push(value); },
+    },
+    { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING',
+    { intervalMs: 5, shutdownTimeoutMs: 100, blockHydrationMetrics: () => metrics },
+  );
+  await heartbeat.start();
+  await heartbeat.stop();
+  assert.deepEqual(writes.map(({ blockHydration }) => blockHydration), [metrics, metrics]);
+  assert.doesNotMatch(JSON.stringify(metrics), /signature|slot|https?:|wss?:/iu);
 });
 
 void test('heartbeat refreshes post-drain counts without another shutdown RPC read', async () => {

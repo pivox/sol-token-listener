@@ -133,15 +133,18 @@ describe('frontend-owned API V1 schemas', () => {
   it('accepts the complete WebSocket diagnostic and an older backend without it', () => {
     const current = apiHealthEnvelopeSchema.parse(success(health)).data;
     expect(current.heartbeat.websocket).toEqual(health.heartbeat.websocket);
+    expect(current.heartbeat.blockHydration).toEqual(health.heartbeat.blockHydration);
 
     const legacyHeartbeat: Record<string, unknown> = { ...health.heartbeat };
     delete legacyHeartbeat.websocket;
+    delete legacyHeartbeat.blockHydration;
     legacyHeartbeat.lastSignature = 'legacy-backend-signature';
     const legacy = apiHealthEnvelopeSchema.parse(success({
       ...health,
       heartbeat: legacyHeartbeat,
     })).data;
     expect(legacy.heartbeat.websocket).toBeUndefined();
+    expect(legacy.heartbeat.blockHydration).toBeUndefined();
   });
 
   it('keeps hostile additive WebSocket fields opaque in the inferred client contract', () => {

@@ -1682,6 +1682,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
       worker_state: 'RUNNING', reconciler_state: 'RUNNING', started_at: openedAt,
       leased_transactions: 0, exhausted_transactions: 2,
+      payload: { blockHydration: blockHydrationMetrics() },
     }];
     if (call.text.includes('FROM social_enrichment_jobs')) return [{
       pending_count: 2, leased_count: 1, retryable_failed_count: 3, exhausted_count: 4,
@@ -1718,6 +1719,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       startedAt: openedAt.toISOString(), updatedAt: openedAt.toISOString(), lastHttpSlot: '60',
       lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: null,
       pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
+      blockHydration: blockHydrationMetrics(),
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2113,7 +2115,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket: inactiveWebSocketHealth(),
+    websocket: inactiveWebSocketHealth(), blockHydration: null,
   });
   assert.equal(health.lagSlots, null);
 });
@@ -2335,6 +2337,7 @@ function joinedHealthSnapshotRow(
   return {
     heartbeat_service_key: heartbeat === undefined ? null : 'transaction-listener',
     heartbeat_updated_at: heartbeat?.updated_at ?? null,
+    heartbeat_payload: heartbeat?.payload ?? null,
     started_at: heartbeat?.started_at ?? null,
     last_http_slot: heartbeat?.last_http_slot ?? null,
     last_websocket_slot: heartbeat?.last_websocket_slot ?? null,
@@ -2374,6 +2377,17 @@ function joinedHealthSnapshotRow(
   };
 }
 
+function blockHydrationMetrics(): Readonly<Record<string, unknown>> {
+  return {
+    version: 1, enabled: true, callerConcurrency: 1,
+    locates: 10, hits: 6, misses: 4, inFlightJoins: 0, fetches: 4,
+    forcedRefreshes: 1, evictions: 2, oversizeBypasses: 0, fetchFailures: 0,
+    epochInvalidations: 0, retainedEntries: 2, retainedBytes: 4096,
+    inFlightFetches: 0, queuedFetches: 1,
+    queueDelayMs: { last: 250, maximum: 500 },
+  };
+}
+
 function heartbeatRowFromSnapshot(
   snapshot: Readonly<Record<string, unknown>>,
 ): Readonly<Record<string, unknown>> {
@@ -2392,6 +2406,7 @@ function heartbeatRowFromSnapshot(
     reconciler_state: snapshot.reconciler_state,
     leased_transactions: snapshot.leased_transactions,
     exhausted_transactions: snapshot.exhausted_transactions,
+    heartbeat_payload: snapshot.heartbeat_payload,
   };
 }
 

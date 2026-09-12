@@ -1814,6 +1814,14 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
       updatedAtMs: 300_000, lastHttpSlot: 51n, lastWebsocketSlot: 50n,
       lastFinalizedSlot: 49n, lastSignature: 'checkpoint', backlogCount: 3, leasedCount: 1,
       exhaustedCount: 0,
+      blockHydration: Object.freeze({
+        version: 1, enabled: true, callerConcurrency: 1,
+        locates: 3, hits: 2, misses: 1, inFlightJoins: 0, fetches: 1,
+        forcedRefreshes: 0, evictions: 0, oversizeBypasses: 0, fetchFailures: 0,
+        epochInvalidations: 0, retainedEntries: 1, retainedBytes: 1024,
+        inFlightFetches: 0, queuedFetches: 0,
+        queueDelayMs: Object.freeze({ last: 0, maximum: 0 }),
+      }),
     });
     await repository.writeHeartbeat(heartbeat);
     await repository.writeHeartbeat(Object.freeze({
@@ -1842,7 +1850,10 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
     assert.equal(storedHeartbeat.last_http_slot, '51');
     assert.equal(storedHeartbeat.runtime_state, 'RUNNING');
     assert.equal(storedHeartbeat.last_signature, 'checkpoint');
-    assert.deepEqual(storedHeartbeat.payload, { startedAt: '1970-01-01T00:04:50.000Z' });
+    assert.deepEqual(storedHeartbeat.payload, {
+      startedAt: '1970-01-01T00:04:50.000Z',
+      blockHydration: heartbeat.blockHydration,
+    });
 
     await insertTerminal(pool, 'purge-me', new Date(Date.now() - 1_000));
     await insertTerminal(pool, 'keep-me', new Date(Date.now() + 60_000));

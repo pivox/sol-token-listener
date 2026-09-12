@@ -25,11 +25,28 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Décisions paper"><JobCounts value={health.paperDecisionJobs} /><p>Dernier succès : <Timestamp value={health.paperDecisionJobs.lastSuccessAt} /></p><p>Dernière erreur : <code>{health.paperDecisionJobs.lastErrorCode ?? 'Aucune'}</code></p></HealthCard>
         <HealthCard title="Qualification"><p>Rapports courants : {health.qualification.currentCount}</p><p>Dernier succès : <Timestamp value={health.qualification.lastSuccessAt} /></p></HealthCard>
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
+        <HealthCard title="Hydratation des blocs"><BlockHydrationDiagnostic value={health.heartbeat.blockHydration} /></HealthCard>
         <HealthCard title="WebSocket Solana"><WebSocketDiagnostic websocket={health.heartbeat.websocket} /></HealthCard>
         <HealthCard title="Checkpoints"><p>Launchpad : {health.checkpoints.launchpad ?? 'Indisponible'}</p><p>Marché : {health.checkpoints.market ?? 'Indisponible'}</p><p>Retard : {health.lagSlots ?? 'Indisponible'} slot(s)</p></HealthCard>
       </div>
     </section>
   );
+}
+
+function BlockHydrationDiagnostic({
+  value,
+}: {
+  readonly value: ApiHealth['heartbeat']['blockHydration'];
+}): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  return <>
+    <p>{value.enabled ? 'Activée' : 'Désactivée'} ; concurrence appelante : {value.callerConcurrency}</p>
+    <p>Hits : {value.hits} ; misses : {value.misses} ; locates : {value.locates}</p>
+    <p>Fetches : {value.fetches} ; échecs : {value.fetchFailures} ; refresh forcés : {value.forcedRefreshes}</p>
+    <p>Queue : {value.queuedFetches} ; délai dernier/max : {value.queueDelayMs.last ?? 'Indisponible'}/{value.queueDelayMs.maximum ?? 'Indisponible'} ms</p>
+    <p>Cache : {value.retainedEntries} entrée(s), {value.retainedBytes} octet(s) ; oversize : {value.oversizeBypasses}</p>
+  </>;
 }
 
 function HealthCard({ title, children }: { readonly title: string; readonly children: ReactNode }): ReactNode {

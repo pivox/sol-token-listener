@@ -257,6 +257,29 @@ export interface RuntimeHeartbeat {
   readonly backlogCount: number;
   readonly leasedCount: number;
   readonly exhaustedCount: number;
+  readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
+}
+
+export interface RuntimeBlockHydrationMetricsV1 {
+  readonly version: 1;
+  readonly enabled: boolean;
+  /** The transaction inbox worker serializes locator callers in V1. */
+  readonly callerConcurrency: 1;
+  readonly locates: number;
+  readonly hits: number;
+  readonly misses: number;
+  readonly inFlightJoins: number;
+  readonly fetches: number;
+  readonly forcedRefreshes: number;
+  readonly evictions: number;
+  readonly oversizeBypasses: number;
+  readonly fetchFailures: number;
+  readonly epochInvalidations: number;
+  readonly retainedEntries: number;
+  readonly retainedBytes: number;
+  readonly inFlightFetches: number;
+  readonly queuedFetches: number;
+  readonly queueDelayMs: Readonly<{ readonly last: number | null; readonly maximum: number | null }>;
 }
 
 export interface InboxCounts {
@@ -651,6 +674,59 @@ export function assertValidRuntimeHeartbeat(
   if (record.leasedCount > record.backlogCount) {
     throw new TypeError('Runtime heartbeat leasedCount exceeds backlogCount.');
   }
+  if (record.blockHydration !== undefined) {
+    assertValidRuntimeBlockHydrationMetrics(record.blockHydration);
+  }
+}
+
+function assertValidRuntimeBlockHydrationMetrics(value: unknown): void {
+  const metrics = frozenRecord(value, 'Runtime heartbeat block hydration');
+  assertExactKeys(metrics, [
+    'version', 'enabled', 'callerConcurrency', 'locates', 'hits', 'misses',
+    'inFlightJoins', 'fetches', 'forcedRefreshes', 'evictions', 'oversizeBypasses',
+    'fetchFailures', 'epochInvalidations', 'retainedEntries', 'retainedBytes',
+    'inFlightFetches', 'queuedFetches', 'queueDelayMs',
+  ], 'Runtime heartbeat block hydration');
+  if (metrics.version !== 1 || typeof metrics.enabled !== 'boolean'
+    || metrics.callerConcurrency !== 1) {
+    throw new TypeError('Runtime heartbeat block hydration identity is invalid.');
+  }
+  for (const field of [
+    'locates', 'hits', 'misses', 'inFlightJoins', 'fetches', 'forcedRefreshes',
+    'evictions', 'oversizeBypasses', 'fetchFailures', 'epochInvalidations',
+    'retainedEntries', 'retainedBytes', 'inFlightFetches', 'queuedFetches',
+  ] as const) assertCount(metrics[field], `Runtime heartbeat block hydration ${field}`);
+  const queueDelay = frozenRecord(
+    metrics.queueDelayMs,
+    'Runtime heartbeat block hydration queueDelayMs',
+  );
+  assertExactKeys(
+    queueDelay,
+    ['last', 'maximum'],
+    'Runtime heartbeat block hydration queueDelayMs',
+  );
+  assertNullableCount(queueDelay.last, 'Runtime heartbeat block hydration queue delay last');
+  assertNullableCount(queueDelay.maximum, 'Runtime heartbeat block hydration queue delay maximum');
+  if (queueDelay.last !== null && queueDelay.maximum !== null
+    && queueDelay.last > queueDelay.maximum) {
+    throw new TypeError('Runtime heartbeat block hydration queue delay is inconsistent.');
+  }
+}
+
+function assertExactKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+  name: string,
+): void {
+  const keys = Object.keys(value);
+  if (keys.length !== expected.length
+    || expected.some((key) => !Object.hasOwn(value, key))) {
+    throw new TypeError(`${name} fields are invalid.`);
+  }
+}
+
+function assertNullableCount(value: unknown, name: string): asserts value is number | null {
+  if (value !== null) assertCount(value, name);
 }
 
 export function assertValidInboxCounts(value: unknown): asserts value is InboxCounts {

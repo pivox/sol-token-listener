@@ -56,6 +56,11 @@ describe('technical health page', () => {
     expect(screen.getByText('Rapports courants : 2')).toBeVisible();
     expect(screen.getAllByText('Indisponible')).not.toHaveLength(0);
     expect(screen.getByText(/Backlog : 1/)).toBeVisible();
+    const hydration = screen.getByRole('heading', { name: 'Hydratation des blocs' }).closest('section');
+    expect(hydration).not.toBeNull();
+    expect(within(hydration!).getByText(/Activée/)).toBeVisible();
+    expect(within(hydration!).getByText(/Hits : 6 ; misses : 4/)).toBeVisible();
+    expect(within(hydration!).getByText(/Queue : 1/)).toBeVisible();
     const websocketHeading = screen.getByRole('heading', { name: 'WebSocket Solana' });
     const websocketCard = websocketHeading.closest('section');
     expect(websocketCard).not.toBeNull();
@@ -105,6 +110,7 @@ describe('technical health page', () => {
   it('shows a bounded rolling-deployment fallback for an older backend', async () => {
     const legacyHeartbeat: Record<string, unknown> = { ...health.heartbeat };
     delete legacyHeartbeat.websocket;
+    delete legacyHeartbeat.blockHydration;
     legacyHeartbeat.lastSignature = 'legacy-secret-signature';
     const legacy = apiHealthEnvelopeSchema.parse(success({
       ...health,

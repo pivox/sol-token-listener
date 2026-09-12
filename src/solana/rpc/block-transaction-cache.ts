@@ -27,6 +27,25 @@ export const BLOCK_TRANSACTION_CACHE_DEFAULTS = Object.freeze({
   confirmedTtlMs: 10000, finalizedTtlMs: 60000, fetchIntervalMs: 250,
 });
 
+export interface BlockTransactionCacheMetricsV1 {
+  readonly version: 1;
+  readonly locates: number;
+  readonly hits: number;
+  readonly misses: number;
+  readonly inFlightJoins: number;
+  readonly fetches: number;
+  readonly forcedRefreshes: number;
+  readonly evictions: number;
+  readonly oversizeBypasses: number;
+  readonly fetchFailures: number;
+  readonly epochInvalidations: number;
+  readonly retainedEntries: number;
+  readonly retainedBytes: number;
+  readonly inFlightFetches: number;
+  readonly queuedFetches: number;
+  readonly queueDelayMs: Readonly<{ last: number | null; maximum: number | null }>;
+}
+
 interface CacheEntry {
   readonly snapshot: BlockTransactionDataSnapshot;
   readonly fetchedAt: number;
@@ -36,11 +55,12 @@ interface CacheEntry {
 }
 
 interface Admission {
+  readonly enqueuedAt: number;
   readonly start: () => void;
   readonly reject: (error: Error) => void;
 }
 
-/** Explicit experimental opt-in only; the production factory does not construct this class. */
+/** Restart-only production opt-in; disabled by default and never paired with a legacy fallback. */
 export class CachedSolanaBlockTransactionLocator {
   private readonly entries = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<CacheEntry>>();
@@ -60,6 +80,19 @@ export class CachedSolanaBlockTransactionLocator {
   private nextStart = -Infinity;
   private pumping = false;
   private closed = false;
+  private locates = 0;
+  private hits = 0;
+  private misses = 0;
+  private inFlightJoins = 0;
+  private fetches = 0;
+  private forcedRefreshes = 0;
+  private evictions = 0;
+  private oversizeBypasses = 0;
+  private fetchFailures = 0;
+  private epochInvalidations = 0;
+  private lastQueueDelayMs: number | null = null;
+  private maximumQueueDelayMs: number | null = null;
+  private activeFetches = 0;
 
   public constructor(private readonly rpc: EpochTransactionBlockRpc, options: BlockTransactionCacheOptions = {}) {
     this.now = options.now ?? ((): number => performance.now());
@@ -82,11 +115,38 @@ export class CachedSolanaBlockTransactionLocator {
     return Object.freeze({ entries: this.entries.size, bytes: this.bytes, inFlight: this.inFlight.size, queued: this.queue.length });
   }
 
+  public get metrics(): BlockTransactionCacheMetricsV1 {
+    this.synchronizeEpoch();
+    this.pruneExpired();
+    return Object.freeze({
+      version: 1,
+      locates: this.locates,
+      hits: this.hits,
+      misses: this.misses,
+      inFlightJoins: this.inFlightJoins,
+      fetches: this.fetches,
+      forcedRefreshes: this.forcedRefreshes,
+      evictions: this.evictions,
+      oversizeBypasses: this.oversizeBypasses,
+      fetchFailures: this.fetchFailures,
+      epochInvalidations: this.epochInvalidations,
+      retainedEntries: this.entries.size,
+      retainedBytes: this.bytes,
+      inFlightFetches: this.activeFetches,
+      queuedFetches: this.queue.length,
+      queueDelayMs: Object.freeze({
+        last: this.lastQueueDelayMs,
+        maximum: this.maximumQueueDelayMs,
+      }),
+    });
+  }
+
   public async locate(target: TransactionLocationTarget): Promise<NormalizedTransaction> {
     if (this.closed) throw internalLocatorError(new RpcTransientError());
     if (typeof target.slot !== 'bigint' || target.slot < 0n || target.slot > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw internalLocatorError(new BlockUnavailableError());
     }
+    this.locates = increment(this.locates);
     this.synchronizeEpoch();
     this.pruneExpired();
     const status = target.confirmationStatus === 'FINALIZED' ? 'FINALIZED' : 'CONFIRMED';
@@ -97,11 +157,13 @@ export class CachedSolanaBlockTransactionLocator {
       this.entries.set(key, entry);
       if (!entry.snapshot.transactions.some(({ signature }) => signature === target.signature)) {
         // A cached miss receives exactly one fresh fetch, shared with other callers.
-        this.remove(key);
+        this.forcedRefreshes = increment(this.forcedRefreshes);
+        this.remove(key, true);
         entry = undefined;
       }
     }
     if (entry === undefined) {
+      this.misses = increment(this.misses);
       try {
         entry = await this.fetch(key, { ...target, confirmationStatus: status });
       } catch (error) {
@@ -109,6 +171,8 @@ export class CachedSolanaBlockTransactionLocator {
         throw internalLocatorError(error instanceof BlockUnavailableError
           ? new BlockUnavailableError() : new RpcTransientError());
       }
+    } else {
+      this.hits = increment(this.hits);
     }
     const duplicate = entry.snapshot.duplicateSignature;
     if (duplicate !== null) {
@@ -122,7 +186,7 @@ export class CachedSolanaBlockTransactionLocator {
     try {
       normalized = deserialize(Buffer.from(selected.payload, 'base64')) as NormalizedTransaction;
     } catch {
-      this.remove(key);
+      this.remove(key, true);
       throw internalLocatorError(new TransactionNormalizationError());
     }
     normalized.confirmationStatus = target.confirmationStatus;
@@ -149,26 +213,34 @@ export class CachedSolanaBlockTransactionLocator {
   private synchronizeEpoch(): void {
     if (this.epoch === this.rpc.httpTransportEpoch) return;
     this.epoch = this.rpc.httpTransportEpoch;
+    this.epochInvalidations = increment(this.epochInvalidations);
     this.clear();
   }
 
   private fetch(key: string, target: TransactionLocationTarget): Promise<CacheEntry> {
     const existing = this.inFlight.get(key);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      this.inFlightJoins = increment(this.inFlightJoins);
+      return existing;
+    }
     const epoch = this.epoch;
     const generation = this.generation;
     const ttlMs = target.confirmationStatus === 'FINALIZED' ? this.finalizedTtlMs : this.confirmedTtlMs;
+    const enqueuedAt = this.now();
     const promise = new Promise<CacheEntry>((resolve, reject) => {
       this.queue.push({
+        enqueuedAt,
         reject,
         start: () => {
           if (epoch !== this.rpc.httpTransportEpoch || generation !== this.generation) {
             reject(internalLocatorError(new RpcTransientError()));
             return;
           }
+          this.fetches = increment(this.fetches);
+          this.activeFetches += 1;
           void this.fetchSnapshot(target).then(
             (snapshot) => { resolve({ snapshot, fetchedAt: this.now(), epoch, generation, ttlMs }); }, reject,
-          );
+          ).finally(() => { this.activeFetches -= 1; });
         },
       });
     }).finally(() => {
@@ -184,10 +256,17 @@ export class CachedSolanaBlockTransactionLocator {
     try {
       raw = await this.rpc.getBlockTransactions(target.slot, target.confirmationStatus);
     } catch {
+      this.fetchFailures = increment(this.fetchFailures);
       throw internalLocatorError(new RpcTransientError());
     }
     const snapshot = snapshotBlockTransactionData(raw, target.slot, target.confirmationStatus);
-    if (snapshot === null) throw internalLocatorError(new BlockUnavailableError());
+    if (snapshot === null) {
+      this.fetchFailures = increment(this.fetchFailures);
+      throw internalLocatorError(new BlockUnavailableError());
+    }
+    if (snapshot.bytes > Math.min(this.maxBytes, this.maxEntryBytes)) {
+      this.oversizeBypasses = increment(this.oversizeBypasses);
+    }
     return snapshot;
   }
 
@@ -205,7 +284,9 @@ export class CachedSolanaBlockTransactionLocator {
         }
         const admission = this.queue.shift();
         if (admission === undefined) break;
-        this.nextStart = this.now() + this.fetchIntervalMs;
+        const startedAt = this.now();
+        this.recordQueueDelay(startedAt - admission.enqueuedAt);
+        this.nextStart = startedAt + this.fetchIntervalMs;
         admission.start();
       }
     } catch {
@@ -217,7 +298,8 @@ export class CachedSolanaBlockTransactionLocator {
 
   private retain(key: string, entry: CacheEntry): void {
     this.synchronizeEpoch();
-    if (this.closed || !entry.snapshot.cacheable || entry.snapshot.bytes > Math.min(this.maxBytes, this.maxEntryBytes)
+    const oversized = entry.snapshot.bytes > Math.min(this.maxBytes, this.maxEntryBytes);
+    if (this.closed || !entry.snapshot.cacheable || oversized
       || entry.epoch !== this.epoch || entry.generation !== this.generation
       || this.now() - entry.fetchedAt >= entry.ttlMs) return;
     this.remove(key);
@@ -226,22 +308,31 @@ export class CachedSolanaBlockTransactionLocator {
     while (this.entries.size > this.maxEntries || this.bytes > this.maxBytes) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
-      this.remove(oldest);
+      this.remove(oldest, true);
     }
   }
 
   private pruneExpired(): void {
     const now = this.now();
     for (const [key, entry] of this.entries) {
-      if (now - entry.fetchedAt >= entry.ttlMs) this.remove(key);
+      if (now - entry.fetchedAt >= entry.ttlMs) this.remove(key, true);
     }
   }
 
-  private remove(key: string): void {
+  private remove(key: string, eviction = false): void {
     const entry = this.entries.get(key);
     if (entry === undefined) return;
     this.bytes -= entry.snapshot.bytes;
     this.entries.delete(key);
+    if (eviction) this.evictions = increment(this.evictions);
+  }
+
+  private recordQueueDelay(value: number): void {
+    const delayMs = Number.isFinite(value) && value > 0
+      ? Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(value))
+      : 0;
+    this.lastQueueDelayMs = delayMs;
+    this.maximumQueueDelayMs = Math.max(this.maximumQueueDelayMs ?? 0, delayMs);
   }
 
   private rejectQueuedAdmissions(): void {
@@ -249,4 +340,8 @@ export class CachedSolanaBlockTransactionLocator {
       admission.reject(internalLocatorError(new RpcTransientError()));
     }
   }
+}
+
+function increment(value: number): number {
+  return value < Number.MAX_SAFE_INTEGER ? value + 1 : value;
 }

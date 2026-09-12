@@ -8,6 +8,7 @@ import type {
   CatchUpGap,
   ListenerRuntimeState,
   RuntimeHeartbeat,
+  RuntimeBlockHydrationMetricsV1,
 } from '../domain/transaction-ingestion.js';
 import {
   PumpFunLaunchpadAdapter,
@@ -33,6 +34,11 @@ import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
 import { openWsProgramSession } from '../solana/rpc/ws-program-session.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
+import type { TransactionLocatorRpc } from '../solana/rpc/transaction-locator.js';
+import {
+  CachedSolanaBlockTransactionLocator,
+  type EpochTransactionBlockRpc,
+} from '../solana/rpc/block-transaction-cache.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../solana/wallet-funding-evidence-extractor.js';
 import { getDatabasePool } from '../storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../storage/launchpad-event.repository.js';
@@ -61,7 +67,10 @@ import {
 } from './promoted-provider-selector.js';
 import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';
 import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';
-import { TransactionInboxWorker } from './transaction-inbox-worker.js';
+import {
+  TransactionInboxWorker,
+  type TransactionInboxWorkerLocator,
+} from './transaction-inbox-worker.js';
 import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
 import { PersistentWebSocketHealthReporter } from './websocket-health-reporter.js';
 import { WalletEvidenceObservationService } from './wallet-evidence-observation.service.js';
@@ -101,6 +110,60 @@ export function createUnavailableBondingCurveReader(): PumpFunBondingCurveStateR
   });
 }
 
+type BlockHydrationConfig = Pick<AppConfig,
+  | 'listenerBlockHydrationEnabled'
+  | 'listenerBlockHydrationMaxEntries'
+  | 'listenerBlockHydrationMaxBytes'
+  | 'listenerBlockHydrationMaxEntryBytes'
+  | 'listenerBlockHydrationConfirmedTtlMs'
+  | 'listenerBlockHydrationFinalizedTtlMs'
+  | 'listenerBlockHydrationFetchIntervalMs'>;
+
+export interface ProductionBlockHydration {
+  readonly locator: TransactionInboxWorkerLocator;
+  readonly metrics: () => RuntimeBlockHydrationMetricsV1;
+  readonly close: () => void;
+}
+
+const DISABLED_BLOCK_HYDRATION_METRICS: RuntimeBlockHydrationMetricsV1 = Object.freeze({
+  version: 1, enabled: false, callerConcurrency: 1,
+  locates: 0, hits: 0, misses: 0, inFlightJoins: 0, fetches: 0,
+  forcedRefreshes: 0, evictions: 0, oversizeBypasses: 0, fetchFailures: 0,
+  epochInvalidations: 0, retainedEntries: 0, retainedBytes: 0,
+  inFlightFetches: 0, queuedFetches: 0,
+  queueDelayMs: Object.freeze({ last: null, maximum: null }),
+});
+
+export function createProductionBlockHydration(
+  config: BlockHydrationConfig,
+  rpc: TransactionLocatorRpc & EpochTransactionBlockRpc,
+): ProductionBlockHydration {
+  if (!config.listenerBlockHydrationEnabled) {
+    return Object.freeze({
+      locator: new SolanaTransactionLocator(rpc),
+      metrics: (): RuntimeBlockHydrationMetricsV1 => DISABLED_BLOCK_HYDRATION_METRICS,
+      close: (): void => undefined,
+    });
+  }
+  const locator = new CachedSolanaBlockTransactionLocator(rpc, {
+    maxEntries: config.listenerBlockHydrationMaxEntries,
+    maxBytes: config.listenerBlockHydrationMaxBytes,
+    maxEntryBytes: config.listenerBlockHydrationMaxEntryBytes,
+    confirmedTtlMs: config.listenerBlockHydrationConfirmedTtlMs,
+    finalizedTtlMs: config.listenerBlockHydrationFinalizedTtlMs,
+    fetchIntervalMs: config.listenerBlockHydrationFetchIntervalMs,
+  });
+  return Object.freeze({
+    locator,
+    metrics: (): RuntimeBlockHydrationMetricsV1 => Object.freeze({
+      enabled: true,
+      callerConcurrency: 1,
+      ...locator.metrics,
+    }),
+    close: (): void => { locator.close(); },
+  });
+}
+
 function logRpcHttpFailoverEvent(event: RpcHttpFailoverEvent): void {
   logger.warn(event, 'Événement de basculement HTTP RPC observé.');
 }
@@ -124,7 +187,7 @@ export function createProductionListenerRuntime(
     maxAttempts: config.rpcRetryMaxAttempts,
     baseDelayMs: config.rpcRetryBaseDelayMs,
   }));
-  const locator = new SolanaTransactionLocator(rpc);
+  const blockHydration = createProductionBlockHydration(config, rpc);
   const websocketHealth = new PostgresWebSocketHealthRepository(databasePool);
   const websocketReporter = new PersistentWebSocketHealthReporter(
     inbox,
@@ -379,12 +442,12 @@ export function createProductionListenerRuntime(
     inbox,
   );
 
-  const worker = new TransactionInboxWorker(inbox, locator, pipeline, {
+  const worker = new TransactionInboxWorker(inbox, blockHydration.locator, pipeline, {
     leaseSeconds: config.listenerWorkerLeaseSeconds,
     renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
     idlePollMs: 1_000,
   });
-  const workerComponent = lifecycleComponent(worker);
+  const workerComponent = lifecycleComponent(worker, blockHydration.close);
   const socialWorkerComponent = lifecycleComponent(socialWorker);
   const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
@@ -394,7 +457,11 @@ export function createProductionListenerRuntime(
     () => supervisor.state(),
     () => worker.state,
     () => reconciler.state(),
-    { intervalMs: 5_000, shutdownTimeoutMs: config.listenerShutdownTimeoutMs },
+    {
+      intervalMs: 5_000,
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+      blockHydrationMetrics: blockHydration.metrics,
+    },
   );
 
   return new SolanaListenerRuntime({
@@ -438,6 +505,10 @@ export interface RecurringListenerOptions {
   readonly intervalMs: number;
   readonly shutdownTimeoutMs: number;
   readonly scheduler?: ListenerRuntimeScheduler;
+}
+
+export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
+  readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
 }
 
 export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
@@ -679,6 +750,7 @@ export class PersistentListenerHeartbeat {
   private inFlight: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private closed = false;
+  private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository, 'counts' | 'writeHeartbeat'>,
@@ -687,12 +759,17 @@ export class PersistentListenerHeartbeat {
     private readonly scannerState: () => ListenerRuntimeState,
     private readonly workerState: () => ListenerRuntimeState,
     private readonly reconcilerState: () => ListenerRuntimeState,
-    options: RecurringListenerOptions,
+    options: ListenerHeartbeatOptions,
   ) {
     validateRecurringOptions(options);
     this.intervalMs = options.intervalMs;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs;
     this.scheduler = options.scheduler ?? listenerScheduler;
+    if (options.blockHydrationMetrics !== undefined
+      && typeof options.blockHydrationMetrics !== 'function') {
+      throw new TypeError('Block hydration metrics provider is invalid.');
+    }
+    this.blockHydrationMetrics = options.blockHydrationMetrics ?? null;
   }
 
   public async start(): Promise<void> {
@@ -794,6 +871,7 @@ export class PersistentListenerHeartbeat {
       this.leasedCount = counts.processing;
       this.exhaustedCount = counts.exhaustedFailed;
     }
+    const blockHydration = this.blockHydrationMetrics?.();
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
       subscriberState: runtimeState === 'STOPPED' ? 'STOPPED' : this.subscriberState(),
@@ -809,6 +887,7 @@ export class PersistentListenerHeartbeat {
       backlogCount: this.backlogCount,
       leasedCount: this.leasedCount,
       exhaustedCount: this.exhaustedCount,
+      ...(blockHydration === undefined ? {} : { blockHydration }),
     });
     await this.inbox.writeHeartbeat(value);
   }
@@ -856,14 +935,20 @@ function validateRecurringOptions(options: RecurringListenerOptions): void {
   }
 }
 
-function lifecycleComponent(component: {
+export function lifecycleComponent(component: {
   start(): Promise<void>;
   close(): Promise<void>;
   readonly state: ListenerRuntimeState;
-}): { start(): Promise<void>; close(): Promise<void>; state(): ListenerRuntimeState } {
+}, afterClose: () => void = () => undefined): {
+  start(): Promise<void>; close(): Promise<void>; state(): ListenerRuntimeState;
+} {
   return {
     start: () => component.start(),
-    close: () => component.close(),
+    close: async (): Promise<void> => {
+      let closing: Promise<void> | null = null;
+      try { closing = component.close(); } finally { afterClose(); }
+      await closing;
+    },
     state: () => component.state,
   };
 }
