@@ -277,7 +277,7 @@ void test('Compose defines an observe-only, five-service deployment without expo
   }
 });
 
-void test('Compose forwards the seven block hydration settings with canonical fail-closed defaults', async () => {
+void test('Compose forwards block hydration and ingestion scope with canonical safe defaults', async () => {
   const compose = await readArtifact('deploy/compose.yaml');
   const environment = await readArtifact('deploy/env.example');
   const app = composeService(compose, 'app');
@@ -299,6 +299,12 @@ void test('Compose forwards the seven block hydration settings with canonical fa
     assert.match(environment, new RegExp(`^${name}=${fallback}$`, 'mu'));
     assert.equal((compose.match(new RegExp(`^ {6}${name}:`, 'gmu')) ?? []).length, 1);
   }
+  assert.match(
+    app,
+    /^ {6}LISTENER_INGESTION_SCOPE: "\$\{LISTENER_INGESTION_SCOPE:-launchpad-and-market\}"$/mu,
+  );
+  assert.match(environment, /^LISTENER_INGESTION_SCOPE=launchpad-and-market$/mu);
+  assert.equal((compose.match(/^ {6}LISTENER_INGESTION_SCOPE:/gmu) ?? []).length, 1);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
 });
 
@@ -306,6 +312,8 @@ void test('block hydration canary proves active routing and bounded serialized a
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
   assert.match(runbook, /T0, T\+5 min et T\+15 min/iu);
   assert.match(runbook, /heartbeat\.blockHydration\.enabled=true/iu);
+  assert.match(runbook, /LISTENER_INGESTION_SCOPE=launchpad-only/iu);
+  assert.match(runbook, /pipeline\.pumpswap=IDLE/iu);
   assert.match(runbook, /à chaque relevé/iu);
   assert.match(runbook, /queuedFetches <= 1/u);
   assert.match(runbook, /inFlightFetches <= 1/u);

@@ -11,7 +11,9 @@ les compteurs inbox, le RSS et le tableau fournisseur avant activation.
 
 1. Copier `deploy/env.example` hors du dépôt, vérifier une baseline saine avec
    le flag `false`, puis configurer les sept valeurs suivies dans ce fichier
-   opérateur avec `LISTENER_BLOCK_HYDRATION_ENABLED=true`.
+   opérateur avec `LISTENER_BLOCK_HYDRATION_ENABLED=true` et remplacer
+   explicitement `LISTENER_INGESTION_SCOPE=launchpad-and-market` par
+   `LISTENER_INGESTION_SCOPE=launchpad-only`.
 2. Redémarrer exactement une réplique. Ne jamais changer le flag à chaud.
 3. Capturer `/api/v1/health`, backlog/échecs terminaux, RSS et compteurs HTTP du
    fournisseur à T0, T+5 min et T+15 min.
@@ -26,6 +28,8 @@ les compteurs inbox, le RSS et le tableau fournisseur avant activation.
   `callerConcurrency=1` à chaque relevé T0, T+5 min et T+15 min; une valeur
   conforme prouve que le chemin activé est observé. Toute autre valeur entraîne
   `FAIL`;
+- `pipeline.pumpswap=IDLE` à chaque relevé confirme que le scope effectif est
+  `launchpad-only`; toute autre valeur entraîne `FAIL`;
 - `queuedFetches <= 1` et `inFlightFetches <= 1` à chaque relevé, avec backlog
   inbox non croissant;
 - aucun nouvel échec terminal inexpliqué;
