@@ -19,6 +19,11 @@ non suivi devient `DEFERRED` sans récupération de corps RPC. Cette décision e
 réversible lorsqu'une création tardive rend le mint actif. Le décodeur complet
 reste l'unique autorité métier et aucun log WebSocket n'est persisté.
 
+L'index partiel `chain_transaction_inbox_tracked_mint_idx` cible
+`ingestion_hint_mint` pour les trades `DEFERRED` ou `PENDING` : la
+resynchronisation d'un mint ne parcourt pas toute l'inbox conservée. La migration
+vérifie sa définition exacte lors de l'upgrade et du rejeu.
+
 Une ligne `DEFERRED` n'appartient pas au backlog actionnable et devient
 purgeable exactement quatre heures après la décision ; son volume forme le
 backlog filtré observé séparément pendant H2i. Le gate de quinze minutes exige

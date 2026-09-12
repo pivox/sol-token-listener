@@ -20,6 +20,7 @@ void test('047 defines additive durable trade hints, deferred retention and urge
     'TRACKED_TRADE', 'ingestion_hint', 'ingestion_hint_mint', 'PUMPFUN_CREATE',
     'PUMPFUN_TRADE', 'DEFERRED', 'consecutive_urgent_claims',
     'chain_transaction_inbox_claim_order_idx',
+    'chain_transaction_inbox_tracked_mint_idx',
   ]) assert.ok(sql.includes(fragment), `missing migration contract: ${fragment}`);
   assert.match(sql, /OCTET_LENGTH\(ingestion_hint_mint\) BETWEEN 32 AND 44/u);
   assert.match(sql, /\^\[1-9A-HJ-NP-Za-km-z\]\{32,44\}\$/u);
@@ -102,6 +103,23 @@ void test('047 backfills compatible preexisting hint columns without overwriting
       { signature: 'classified-trade', ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: mint },
       { signature: 'legacy-launch', ingestion_hint: 'PUMPFUN_CREATE', ingestion_hint_mint: null },
     ]);
+    await assertCatalog(pool);
+  });
+});
+
+void test('047 accepts an exactly compatible preexisting tracked-mint index and preserves it on replay', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await applyThrough046(pool);
+    await pool.query(`ALTER TABLE chain_transaction_inbox
+      ADD COLUMN ingestion_hint TEXT NOT NULL DEFAULT 'NONE', ADD COLUMN ingestion_hint_mint TEXT`);
+    await pool.query(`CREATE INDEX chain_transaction_inbox_tracked_mint_idx
+      ON chain_transaction_inbox (ingestion_hint_mint)
+      WHERE ingestion_hint='PUMPFUN_TRADE' AND processing_status IN ('DEFERRED','PENDING')`);
+    const before = (await pool.query("SELECT 'chain_transaction_inbox_tracked_mint_idx'::REGCLASS::OID AS oid")).rows;
+    await pool.query(await migrationSql());
+    await pool.query(await migrationSql());
+    await assertCatalog(pool);
+    assert.deepEqual((await pool.query("SELECT 'chain_transaction_inbox_tracked_mint_idx'::REGCLASS::OID AS oid")).rows, before);
   });
 });
 
@@ -304,6 +322,51 @@ void test('047 rejects incompatible preexisting objects before changing durable 
   });
 });
 
+void test('047 exactly validates the tracked-mint index on upgrade and replay, rejecting drift', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const sql = await migrationSql();
+    await applyThrough046(pool);
+    const predicate = "WHERE ingestion_hint='PUMPFUN_TRADE' AND processing_status IN ('DEFERRED','PENDING')";
+    const incompatibleIndexes = [
+      'CREATE TABLE chain_transaction_inbox_tracked_mint_idx (mint TEXT)',
+      'CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON token_launches (mint)',
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (signature) ${predicate}`,
+      'CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint)',
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint)
+       WHERE ingestion_hint='PUMPFUN_TRADE' AND processing_status='DEFERRED'`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint)
+       WHERE ingestion_hint='PUMPFUN_TRADE' AND processing_status IN ('DEFERRED','PENDING','PROCESSED')`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint)
+       WHERE processing_status IN ('DEFERRED','PENDING')`,
+      `CREATE UNIQUE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint) ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint DESC) ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint COLLATE "C") ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint text_pattern_ops) ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox USING hash (ingestion_hint_mint) ${predicate}`,
+      `CREATE INDEX chain_transaction_inbox_tracked_mint_idx ON chain_transaction_inbox (ingestion_hint_mint) INCLUDE (signature) ${predicate}`,
+    ];
+    for (const replay of [false, true]) {
+      if (replay) await pool.query(sql);
+      for (const drift of [...incompatibleIndexes, ...(replay ? [''] : [])]) {
+        await pool.query('BEGIN');
+        try {
+          if (replay) {
+            await pool.query('DROP INDEX chain_transaction_inbox_tracked_mint_idx');
+          } else {
+            await pool.query(`ALTER TABLE chain_transaction_inbox
+              ADD COLUMN ingestion_hint TEXT NOT NULL DEFAULT 'NONE', ADD COLUMN ingestion_hint_mint TEXT`);
+          }
+          if (drift !== '') await pool.query(drift);
+          await assert.rejects(pool.query(sql), /chain_transaction_inbox_tracked_mint_idx index definition is incompatible/u,
+            `${replay ? 'replay' : 'upgrade'}: ${drift || 'missing index'}`);
+        } finally {
+          await pool.query('ROLLBACK');
+        }
+      }
+    }
+  });
+});
+
 async function migrationSql(): Promise<string> {
   const sql = await readFile(migrationUrl, 'utf8').catch(() => '');
   assert.notEqual(sql, '', 'migration 047 must exist');
@@ -378,4 +441,17 @@ async function assertCatalog(pool: pg.Pool): Promise<void> {
   ]);
   assert.deepEqual((await pool.query(`SELECT typname FROM pg_type WHERE typnamespace=(SELECT oid FROM pg_namespace WHERE nspname=CURRENT_SCHEMA())
     AND typname LIKE 'chain_transaction_inbox_priority%' ORDER BY typname`)).rows, [{ typname: 'chain_transaction_inbox_priority' }]);
+  assert.deepEqual((await pool.query(`SELECT table_relation.relname AS table_name, access_method.amname,
+    index.indisvalid, index.indisready, index.indisunique, index.indisprimary, index.indnkeyatts, index.indnatts,
+    pg_get_indexdef(index.indexrelid, 1, TRUE) AS key,
+    pg_get_expr(index.indpred, index.indrelid) AS predicate
+    FROM pg_index index JOIN pg_class index_relation ON index_relation.oid=index.indexrelid
+    JOIN pg_class table_relation ON table_relation.oid=index.indrelid
+    JOIN pg_am access_method ON access_method.oid=index_relation.relam
+    WHERE index_relation.relnamespace=(SELECT oid FROM pg_namespace WHERE nspname=CURRENT_SCHEMA())
+      AND index_relation.relname='chain_transaction_inbox_tracked_mint_idx'`)).rows, [{
+    table_name: 'chain_transaction_inbox', amname: 'btree', indisvalid: true, indisready: true,
+    indisunique: false, indisprimary: false, indnkeyatts: 1, indnatts: 1, key: 'ingestion_hint_mint',
+    predicate: "((ingestion_hint = 'PUMPFUN_TRADE'::text) AND (processing_status = ANY (ARRAY['DEFERRED'::text, 'PENDING'::text])))",
+  }]);
 }

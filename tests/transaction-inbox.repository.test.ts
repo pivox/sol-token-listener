@@ -175,6 +175,78 @@ void test('syncTrackedMint reactivates all deferred trades and deactivates only 
   });
 });
 
+void test('syncTrackedMint uses a mint-selective index for activation and deactivation amid 100000 unrelated rows', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const version = await pool.query("SELECT current_setting('server_version_num')::INTEGER / 10000 AS major");
+    assert.equal(version.rows[0]?.major, 16);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, ingestion_hint, ingestion_hint_mint, observed_at, terminal_at, purge_after
+    ) SELECT 'unrelated-' || value, value, ARRAY['WEBSOCKET'], ARRAY[$1], 'confirmed',
+      CASE WHEN value % 3 = 0 THEN 'DEFERRED' ELSE 'PENDING' END,
+      CASE WHEN value % 3 = 1 THEN 'NONE' ELSE 'PUMPFUN_TRADE' END,
+      CASE WHEN value % 3 <> 1 THEN $2 END, at,
+      CASE WHEN value % 3 = 0 THEN at END,
+      CASE WHEN value % 3 = 0 THEN at + INTERVAL '4 hours' END
+      FROM generate_series(1, 100000) value CROSS JOIN (SELECT NOW() AS at) observed`,
+    [PUMP_PROGRAM_ID, '1'.repeat(32)]);
+    const plans: ExplainPlan[] = [];
+    // Delegate every operation to PG16. Explain the exact repository UPDATE in
+    // a savepoint, then roll it back before running the ordinary operation.
+    const repository = new PostgresTransactionInboxRepository({
+      query: (sql, values) => pool.query(sql, [...(values ?? [])]),
+      connect: async () => {
+        const client = await pool.connect();
+        return {
+          release: () => { client.release(); },
+          query: async (sql, values) => {
+            if (sql.includes('UPDATE chain_transaction_inbox inbox SET')) {
+              await client.query('SAVEPOINT explain_sync');
+              try {
+                const result = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, [...(values ?? [])]);
+                plans.push(result.rows[0]?.['QUERY PLAN']?.[0]?.Plan);
+              } finally {
+                await client.query('ROLLBACK TO SAVEPOINT explain_sync');
+                await client.query('RELEASE SAVEPOINT explain_sync');
+              }
+            }
+            return client.query(sql, [...(values ?? [])]);
+          },
+        };
+      },
+    });
+    for (let index = 0; index < 3; index += 1) {
+      await repository.enqueue(tradeNotification(`selected-${index}`, BigInt(index)));
+    }
+    await pool.query('ANALYZE chain_transaction_inbox');
+    await insertTrackedLaunch(pool);
+    await repository.syncTrackedMint(tradeMint);
+    assert.equal((await row(pool, 'selected-0')).processing_status, 'PENDING');
+    await pool.query('UPDATE token_launches SET terminal_at=clock_timestamp()');
+    await repository.syncTrackedMint(tradeMint);
+    assert.equal((await row(pool, 'selected-0')).processing_status, 'DEFERRED');
+    assert.equal(plans.length, 2);
+    for (const [index, plan] of plans.entries()) {
+      assert.ok(plan);
+      const nodes = flattenPlan(plan);
+      const inboxScans = nodes.filter((node) => node['Relation Name'] === 'chain_transaction_inbox'
+        && String(node['Node Type']).includes('Scan'));
+      const evidence = JSON.stringify(inboxScans);
+      context.diagnostic(`${index === 0 ? 'activation' : 'deactivation'} inbox scan: ${JSON.stringify(inboxScans.map((node) => ({
+        type: node['Node Type'], index: node['Index Name'], rows: node['Actual Rows'],
+        removed: node['Rows Removed by Filter'], blocks: Number(node['Shared Hit Blocks']) + Number(node['Shared Read Blocks']),
+        milliseconds: node['Actual Total Time'],
+      })))}`);
+      assert.equal(inboxScans.some((node) => node['Node Type'] === 'Seq Scan'), false, evidence);
+      assert.ok(nodes.some((node) => node['Index Name'] === 'chain_transaction_inbox_tracked_mint_idx'), evidence);
+      assert.equal(inboxScans.reduce((sum, node) => sum + Number(node['Actual Rows']), 0), 3, evidence);
+      assert.ok(inboxScans.every((node) => Number(node['Rows Removed by Filter'] ?? 0) <= 3), evidence);
+      assert.ok(inboxScans.every((node) =>
+        Number(node['Shared Hit Blocks'] ?? 0) + Number(node['Shared Read Blocks'] ?? 0) < 64), evidence);
+    }
+  });
+});
+
 void test('validates syncTrackedMint and trade notification mints before checking out a database client', async () => {
   let calls = 0;
   const repository = new PostgresTransactionInboxRepository({

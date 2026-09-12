@@ -178,11 +178,23 @@ BEGIN
         OR (processing_status = 'FAILED' AND error_retryable = TRUE AND retry_exhausted_at IS NULL);
   END IF;
   CREATE INDEX inbox_047_purge_expected ON pg_temp.inbox_047_expected (purge_after) WHERE purge_after IS NOT NULL;
-  FOREACH index_name IN ARRAY ARRAY['chain_transaction_inbox_claim_order_idx','chain_transaction_inbox_purge_idx'] LOOP
+  -- Each projected trade resynchronizes one mint. Keep both activation and
+  -- deactivation selective even with a large retained, unrelated inbox.
+  CREATE INDEX inbox_047_tracked_mint_expected ON pg_temp.inbox_047_expected (ingestion_hint_mint)
+    WHERE ingestion_hint='PUMPFUN_TRADE' AND processing_status IN ('DEFERRED','PENDING');
+  FOREACH index_name IN ARRAY ARRAY['chain_transaction_inbox_claim_order_idx','chain_transaction_inbox_purge_idx',
+    'chain_transaction_inbox_tracked_mint_idx'] LOOP
     SELECT relation.oid INTO actual_index FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
       WHERE namespace.nspname=CURRENT_SCHEMA() AND relation.relname=index_name;
-    expected_index := CASE WHEN index_name='chain_transaction_inbox_claim_order_idx'
-      THEN 'pg_temp.inbox_047_claim_expected'::REGCLASS ELSE 'pg_temp.inbox_047_purge_expected'::REGCLASS END;
+    -- Only a first upgrade may lack the new index. Never repair replay drift
+    -- or accept an incompatible preexisting object under IF NOT EXISTS.
+    IF upgrading AND index_name='chain_transaction_inbox_tracked_mint_idx' AND actual_index IS NULL THEN
+      CONTINUE;
+    END IF;
+    expected_index := CASE index_name
+      WHEN 'chain_transaction_inbox_claim_order_idx' THEN 'pg_temp.inbox_047_claim_expected'::REGCLASS
+      WHEN 'chain_transaction_inbox_purge_idx' THEN 'pg_temp.inbox_047_purge_expected'::REGCLASS
+      ELSE 'pg_temp.inbox_047_tracked_mint_expected'::REGCLASS END;
     IF actual_index IS NULL OR NOT EXISTS (
       SELECT 1 FROM pg_index actual JOIN pg_class relation ON relation.oid=actual.indexrelid
       JOIN pg_index expected ON expected.indexrelid=expected_index
@@ -308,6 +320,9 @@ BEGIN
       ON chain_transaction_inbox ((ingestion_priority <> 'NORMAL') DESC, observed_slot, signature)
       WHERE processing_status = 'PENDING' OR processing_status = 'PROCESSING'
         OR (processing_status = 'FAILED' AND error_retryable = TRUE AND retry_exhausted_at IS NULL);
+    CREATE INDEX IF NOT EXISTS chain_transaction_inbox_tracked_mint_idx
+      ON chain_transaction_inbox (ingestion_hint_mint)
+      WHERE ingestion_hint='PUMPFUN_TRADE' AND processing_status IN ('DEFERRED','PENDING');
   ELSE
     DROP TABLE pg_temp.inbox_047_expected;
   END IF;

@@ -1,6 +1,6 @@
 # Priorité durable des trades Pump.fun suivis
 
-**Version :** 1.0.0 — 2026-09-12
+**Version :** 1.0.1 — 2026-09-12
 
 ## Contexte
 
@@ -93,6 +93,15 @@ Sous un advisory lock par mint, le repository relit `token_launches` :
   louées, sans snapshot et sans tentative deviennent `DEFERRED` ;
 - les lignes `PROCESSING`, `PROCESSED` ou ayant déjà une tentative restent
   inchangées.
+
+L'index partiel `chain_transaction_inbox_tracked_mint_idx` porte sur
+`ingestion_hint_mint` pour `PUMPFUN_TRADE` aux statuts `DEFERRED` et `PENDING`.
+Il couvre activation et désactivation sans parcourir les lignes d'autres mints.
+La migration valide sa définition exacte sur les objets préexistants et au
+rejeu ; un index absent au rejeu ou incompatible n'est pas réparé silencieusement.
+Une régression PostgreSQL 16 explique l'UPDATE réel du repository au milieu de
+100 000 lignes non pertinentes et exige un accès indexé sélectif dans les deux
+directions, sans désactiver les scans séquentiels.
 
 Un crash après la projection mais avant la synchronisation fait échouer le
 pipeline. Le replay idempotent de la transaction de création recommence la
