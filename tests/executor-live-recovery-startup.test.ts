@@ -14,11 +14,11 @@ import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js
 const GENERATION_ID = `execution_wallet_generation_${'a'.repeat(64)}`;
 const PUBLIC_KEY = '11111111111111111111111111111111';
 
-void test('pins every migration through 045 to a non-placeholder sha256', async () => {
-  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 45);
+void test('pins every migration through 046 to a non-placeholder sha256', async () => {
+  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 46);
   assert.equal(
     LIVE_RECOVERY_MIGRATION_CATALOG.at(-1)?.name,
-    '045_execution_wallet_snapshot_refresh.sql',
+    '046_listener_strict_catch_up_runs.sql',
   );
   for (const entry of LIVE_RECOVERY_MIGRATION_CATALOG) {
     assert.match(entry.name, /^\d{3}_[a-z0-9_-]+\.sql$/u);
@@ -38,7 +38,7 @@ void test('validates role, exact migration history, generation and open-work aff
   assert.deepEqual(evidence, {
     payloadVersion: 1,
     role: 'sol_token_executor_live_recovery',
-    migrationHead: '045_execution_wallet_snapshot_refresh.sql',
+    migrationHead: '046_listener_strict_catch_up_runs.sql',
     generationId: GENERATION_ID,
     providerId: 'primary',
   });

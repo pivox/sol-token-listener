@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { QueryResultRow } from 'pg';
 import {
   reconcileConfirmationStatus,
@@ -37,6 +38,12 @@ import {
   STRICT_CATCH_UP_FAILURE_REASON,
   type StrictCatchUpFailure,
 } from '../domain/strict-catch-up.js';
+import {
+  advanceStrictCatchUpRun as advanceDomainStrictCatchUpRun,
+  assertValidStrictCatchUpRun,
+  terminalizeStrictCatchUpRun,
+  type StrictCatchUpRun,
+} from '../domain/strict-catch-up-run.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { StrictCatchUpRepository } from '../ports/strict-catch-up-repository.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
@@ -83,6 +90,28 @@ interface TerminalReplayReceiptRow extends QueryResultRow {
   readonly finality_evidence_version: unknown;
   readonly immutable_fingerprint: unknown;
   readonly replay_completed_at: unknown;
+}
+
+interface StrictCatchUpRunRow extends QueryResultRow {
+  readonly run_id: unknown;
+  readonly checkpoint_key: unknown;
+  readonly previous_slot: unknown;
+  readonly previous_signature: unknown;
+  readonly provider_id: unknown;
+  readonly observed_head_slot: unknown;
+  readonly observed_head_signature: unknown;
+  readonly before_signature: unknown;
+  readonly last_accepted_slot: unknown;
+  readonly pages_scanned: unknown;
+  readonly signatures_enqueued: unknown;
+  readonly revision: unknown;
+  readonly state: unknown;
+  readonly terminal_reason: unknown;
+  readonly previous_updated_at: unknown;
+  readonly started_at: unknown;
+  readonly updated_at: unknown;
+  readonly completed_at: unknown;
+  readonly purge_after: unknown;
 }
 
 const SERVICE_KEY = 'transaction-listener';
@@ -1058,6 +1087,215 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
+  public async readActiveStrictCatchUpRun(
+    key: 'launchpad' | 'market',
+  ): Promise<StrictCatchUpRun | null> {
+    return this.safely(async () => {
+      requireCheckpointKey(key);
+      const result = await this.pool.query(
+        `${strictCatchUpRunSelect()} WHERE checkpoint_key = $1 AND state = 'ACTIVE'`,
+        [key],
+      );
+      if (result.rows.length === 0 && result.rowCount === 0) return null;
+      if (result.rows.length !== 1 || result.rowCount !== 1) {
+        throw new TypeError('Strict catch-up active run query returned an invalid row count.');
+      }
+      return strictCatchUpRunFromRow(result.rows[0] as StrictCatchUpRunRow);
+    });
+  }
+
+  public async readStrictCatchUpRun(
+    key: ProcessingCheckpoint['key'],
+    previous: ProcessingCheckpoint,
+    providerId: StrictCatchUpRun['providerId'],
+  ): Promise<StrictCatchUpRun | null> {
+    return this.safely(async () => {
+      requireCheckpointKey(key);
+      assertValidStrictCheckpoint(previous);
+      requireRpcProviderId(providerId);
+      if (previous.key !== key) throw new TypeError('Checkpoint keys must match.');
+      const result = await this.pool.query(
+        `${strictCatchUpRunSelect()} WHERE checkpoint_key = $1
+         AND previous_slot = $2 AND previous_signature = $3 AND provider_id = $4`,
+        [key, previous.slot.toString(), previous.signature, providerId],
+      );
+      if (result.rows.length === 0 && result.rowCount === 0) return null;
+      if (result.rows.length !== 1 || result.rowCount !== 1) {
+        throw new TypeError('Strict catch-up run query returned an invalid row count.');
+      }
+      const run = strictCatchUpRunFromRow(result.rows[0] as StrictCatchUpRunRow);
+      if (run.checkpointKey !== key || !matchesCheckpointBoundary(run.previous, previous)
+        || run.providerId !== providerId) throw new TypeError('Strict catch-up run identity mismatch.');
+      return run;
+    });
+  }
+
+  public async createStrictCatchUpRun(value: StrictCatchUpRun): Promise<StrictCatchUpRun> {
+    return this.safely(async () => {
+      assertActiveStrictCatchUpRun(value);
+      return this.transaction(async (client) => {
+        await lockStrictCheckpoint(client, value.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, value.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, value.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const existing = await client.query(
+          `${strictCatchUpRunSelect()} WHERE run_id = $1 FOR UPDATE`,
+          [value.runId],
+        );
+        if (existing.rows.length > 1 || (existing.rows.length === 0 && existing.rowCount !== 0)
+          || (existing.rows.length === 1 && existing.rowCount !== 1)) {
+          throw new TypeError('Strict catch-up run query returned an invalid row count.');
+        }
+        if (existing.rows.length === 1) {
+          const stored = strictCatchUpRunFromRow(existing.rows[0] as StrictCatchUpRunRow);
+          if (!strictCatchUpRunsEqual(stored, value)) {
+            throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+          }
+          return stored;
+        }
+        const active = await client.query(
+          `SELECT run_id FROM listener_strict_catch_up_runs
+           WHERE checkpoint_key = $1 AND state = 'ACTIVE' FOR UPDATE`,
+          [value.checkpointKey],
+        );
+        if (active.rows.length > 0 || active.rowCount !== 0) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const inserted = await client.query(
+          `INSERT INTO listener_strict_catch_up_runs (
+             run_id, checkpoint_key, previous_slot, previous_signature, provider_id,
+             observed_head_slot, observed_head_signature, before_signature, last_accepted_slot,
+             pages_scanned, signatures_enqueued, revision, state, terminal_reason,
+             previous_updated_at, started_at, updated_at, completed_at, purge_after
+           ) VALUES (
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
+           )`,
+          strictCatchUpRunValues(value),
+        );
+        requireOne(inserted.rowCount);
+        return value;
+      });
+    });
+  }
+
+  public async advanceStrictCatchUpRun(
+    expected: StrictCatchUpRun,
+    next: StrictCatchUpRun,
+  ): Promise<void> {
+    return this.safely(async () => {
+      assertActiveStrictCatchUpRun(expected);
+      assertActiveStrictCatchUpRun(next);
+      assertExactStrictCatchUpAdvance(expected, next);
+      await this.transaction(async (client) => {
+        await lockStrictCheckpoint(client, expected.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, expected.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, expected.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const updated = await client.query(
+          `UPDATE listener_strict_catch_up_runs SET
+             before_signature = $20, last_accepted_slot = $21, pages_scanned = $22,
+             signatures_enqueued = $23, revision = $24, updated_at = $25
+           WHERE ${strictCatchUpRunSnapshotWhere()}`,
+          [...strictCatchUpRunValues(expected), next.beforeSignature,
+            next.lastAcceptedSlot.toString(), next.pagesScanned.toString(),
+            next.signaturesEnqueued.toString(), next.revision.toString(), dateFromMs(next.updatedAtMs)],
+        );
+        if (updated.rowCount !== 1) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+      });
+    });
+  }
+
+  public async completeStrictCatchUpRun(value: {
+    readonly run: StrictCatchUpRun;
+    readonly nextCheckpoint: ProcessingCheckpoint;
+  }): Promise<void> {
+    return this.safely(async () => {
+      const completion = snapshotStrictCatchUpCompletionInput(value);
+      const run = completion.run;
+      const nextCheckpoint = completion.nextCheckpoint;
+      if (nextCheckpoint.key !== run.checkpointKey
+        || nextCheckpoint.slot !== run.observedHead.slot
+        || nextCheckpoint.signature !== run.observedHead.signature
+        || nextCheckpoint.updatedAtMs < run.updatedAtMs) {
+        throw new TypeError('Strict catch-up completion is invalid.');
+      }
+      const completed = terminalizeStrictCatchUpRun(run, {
+        state: 'COMPLETED', terminalReason: null, completedAtMs: nextCheckpoint.updatedAtMs,
+      });
+      await this.transaction(async (client) => {
+        await lockStrictCheckpoint(client, run.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, run.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, run.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const checkpointUpdated = await client.query(
+          `UPDATE processing_checkpoints SET slot = $2, signature = $3, updated_at = $4
+           WHERE checkpoint_key = $1 AND slot = $5 AND signature = $6`,
+          [nextCheckpoint.key, nextCheckpoint.slot.toString(), nextCheckpoint.signature,
+            dateFromMs(nextCheckpoint.updatedAtMs), run.previous.slot.toString(),
+            run.previous.signature],
+        );
+        if (checkpointUpdated.rowCount !== 1) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        await terminalizeStrictCatchUpRunAt(client, run, completed);
+        await resolveStrictCatchUpFailuresAt(client, run.checkpointKey, run.previous);
+      });
+    });
+  }
+
+  public async failStrictCatchUpRun(
+    expected: StrictCatchUpRun,
+    failed: StrictCatchUpRun,
+  ): Promise<void> {
+    return this.safely(async () => {
+      assertActiveStrictCatchUpRun(expected);
+      assertExactStrictCatchUpTerminal(expected, failed, 'FAILED');
+      await this.transaction(async (client) => {
+        await lockStrictCheckpoint(client, expected.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, expected.checkpointKey);
+        if (!matchesCheckpointBoundary(checkpoint, expected.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        await terminalizeStrictCatchUpRunAt(client, expected, failed);
+      });
+    });
+  }
+
+  public async supersedeStaleStrictCatchUpRun(
+    expected: StrictCatchUpRun,
+    atMs: number,
+  ): Promise<void> {
+    return this.safely(async () => {
+      assertActiveStrictCatchUpRun(expected);
+      const superseded = terminalizeStrictCatchUpRun(expected, {
+        state: 'SUPERSEDED', terminalReason: 'CHECKPOINT_SUPERSEDED', completedAtMs: atMs,
+      });
+      await this.transaction(async (client) => {
+        await lockStrictCheckpoint(client, expected.checkpointKey);
+        const checkpoint = await lockedStrictCheckpoint(client, expected.checkpointKey);
+        if (matchesCheckpointBoundary(checkpoint, expected.previous)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const updated = await terminalizeStrictCatchUpRunAtOrZero(client, expected, superseded);
+        if (updated === 1) return;
+        const replay = await client.query(
+          `${strictCatchUpRunSelect()} WHERE run_id = $1 FOR UPDATE`,
+          [expected.runId],
+        );
+        if (replay.rows.length === 1 && replay.rowCount === 1
+          && strictCatchUpRunsEqual(strictCatchUpRunFromRow(replay.rows[0] as StrictCatchUpRunRow), superseded)) {
+          return;
+        }
+        throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+      });
+    });
+  }
+
   public async storeCheckpoint(value: ProcessingCheckpoint): Promise<void> {
     return this.safely(async () => {
       assertValidProcessingCheckpoint(value);
@@ -1416,6 +1654,203 @@ function checkpointFromRow(row: QueryResultRow): ProcessingCheckpoint {
   });
   assertValidProcessingCheckpoint(value);
   return value;
+}
+
+function strictCatchUpRunSelect(): string {
+  return `SELECT run_id, checkpoint_key, previous_slot, previous_signature, provider_id,
+    observed_head_slot, observed_head_signature, before_signature, last_accepted_slot,
+    pages_scanned, signatures_enqueued, revision, state, terminal_reason,
+    previous_updated_at, started_at, updated_at, completed_at, purge_after
+    FROM listener_strict_catch_up_runs`;
+}
+
+function strictCatchUpRunValues(value: StrictCatchUpRun): readonly unknown[] {
+  return [
+    value.runId, value.checkpointKey, value.previous.slot.toString(), value.previous.signature,
+    value.providerId, value.observedHead.slot.toString(), value.observedHead.signature,
+    value.beforeSignature, value.lastAcceptedSlot.toString(), value.pagesScanned.toString(),
+    value.signaturesEnqueued.toString(), value.revision.toString(), value.state,
+    value.terminalReason, dateFromMs(value.previous.updatedAtMs), dateFromMs(value.startedAtMs),
+    dateFromMs(value.updatedAtMs), nullableDateFromMs(value.completedAtMs),
+    nullableDateFromMs(value.purgeAfterMs),
+  ];
+}
+
+function strictCatchUpRunSnapshotWhere(): string {
+  return `run_id = $1 AND checkpoint_key = $2 AND previous_slot = $3 AND previous_signature = $4
+    AND provider_id = $5 AND observed_head_slot = $6 AND observed_head_signature = $7
+    AND before_signature = $8 AND last_accepted_slot = $9 AND pages_scanned = $10
+    AND signatures_enqueued = $11 AND revision = $12 AND state = $13
+    AND terminal_reason IS NOT DISTINCT FROM $14 AND previous_updated_at = $15
+    AND started_at = $16 AND updated_at = $17 AND completed_at IS NOT DISTINCT FROM $18
+    AND purge_after IS NOT DISTINCT FROM $19`;
+}
+
+function strictCatchUpRunFromRow(row: StrictCatchUpRunRow): StrictCatchUpRun {
+  const checkpointKey: unknown = row.checkpoint_key;
+  requireCheckpointKey(checkpointKey);
+  const value = Object.freeze({
+    runId: requiredText(row.run_id, 'strict catch-up run ID'),
+    checkpointKey,
+    previous: Object.freeze({
+      key: checkpointKey,
+      slot: numericBigInt(row.previous_slot, 'strict catch-up previous slot'),
+      signature: strictCatchUpSignature(row.previous_signature, 'strict catch-up previous signature'),
+      updatedAtMs: dateMs(row.previous_updated_at, 'strict catch-up previous updated at'),
+    }),
+    providerId: row.provider_id,
+    observedHead: Object.freeze({
+      slot: numericBigInt(row.observed_head_slot, 'strict catch-up observed head slot'),
+      signature: strictCatchUpSignature(row.observed_head_signature, 'strict catch-up observed head signature'),
+    }),
+    beforeSignature: strictCatchUpSignature(row.before_signature, 'strict catch-up cursor'),
+    lastAcceptedSlot: numericBigInt(row.last_accepted_slot, 'strict catch-up accepted slot'),
+    pagesScanned: numericBigInt(row.pages_scanned, 'strict catch-up pages scanned'),
+    signaturesEnqueued: numericBigInt(row.signatures_enqueued, 'strict catch-up signatures enqueued'),
+    revision: numericBigInt(row.revision, 'strict catch-up revision'),
+    state: row.state,
+    terminalReason: row.terminal_reason,
+    startedAtMs: dateMs(row.started_at, 'strict catch-up started at'),
+    updatedAtMs: dateMs(row.updated_at, 'strict catch-up updated at'),
+    completedAtMs: nullableDateMs(row.completed_at, 'strict catch-up completed at'),
+    purgeAfterMs: nullableDateMs(row.purge_after, 'strict catch-up purge after'),
+  });
+  assertValidStrictCatchUpRun(value);
+  return value;
+}
+
+function assertActiveStrictCatchUpRun(value: unknown): asserts value is StrictCatchUpRun {
+  assertValidStrictCatchUpRun(value);
+  if (value.state !== 'ACTIVE') throw new TypeError('Strict catch-up run must be active.');
+}
+
+function snapshotStrictCatchUpCompletionInput(value: unknown): Readonly<{
+  run: StrictCatchUpRun;
+  nextCheckpoint: ProcessingCheckpoint;
+}> {
+  if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 2 || !keys.includes('run') || !keys.includes('nextCheckpoint')) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const runDescriptor = Object.getOwnPropertyDescriptor(value, 'run');
+  const nextDescriptor = Object.getOwnPropertyDescriptor(value, 'nextCheckpoint');
+  if (runDescriptor === undefined || nextDescriptor === undefined
+    || !runDescriptor.enumerable || !nextDescriptor.enumerable
+    || !('value' in runDescriptor) || !('value' in nextDescriptor)) {
+    throw new TypeError('Strict catch-up completion is invalid.');
+  }
+  const run: unknown = runDescriptor.value;
+  const nextCheckpoint: unknown = nextDescriptor.value;
+  assertActiveStrictCatchUpRun(run);
+  assertValidStrictCheckpoint(nextCheckpoint);
+  return Object.freeze({ run, nextCheckpoint });
+}
+
+function assertExactStrictCatchUpAdvance(expected: StrictCatchUpRun, next: StrictCatchUpRun): void {
+  const advanced = advanceDomainStrictCatchUpRun(expected, {
+    beforeSignature: next.beforeSignature,
+    lastAcceptedSlot: next.lastAcceptedSlot,
+    pagesScanned: next.pagesScanned,
+    signaturesEnqueued: next.signaturesEnqueued,
+    updatedAtMs: next.updatedAtMs,
+  });
+  if (!strictCatchUpRunsEqual(advanced, next)) throw new TypeError('Strict catch-up advance is invalid.');
+}
+
+function assertExactStrictCatchUpTerminal(
+  expected: StrictCatchUpRun,
+  terminal: StrictCatchUpRun,
+  state: 'FAILED' | 'SUPERSEDED' | 'COMPLETED',
+): void {
+  assertValidStrictCatchUpRun(terminal);
+  const expectedTerminal = terminalizeStrictCatchUpRun(expected, {
+    state, terminalReason: terminal.terminalReason, completedAtMs: terminal.completedAtMs,
+  });
+  if (!strictCatchUpRunsEqual(expectedTerminal, terminal)) {
+    throw new TypeError('Strict catch-up terminal transition is invalid.');
+  }
+}
+
+function strictCatchUpRunsEqual(left: StrictCatchUpRun, right: StrictCatchUpRun): boolean {
+  return left.runId === right.runId
+    && left.checkpointKey === right.checkpointKey
+    && left.previous.key === right.previous.key
+    && left.previous.slot === right.previous.slot
+    && left.previous.signature === right.previous.signature
+    && left.previous.updatedAtMs === right.previous.updatedAtMs
+    && left.providerId === right.providerId
+    && left.observedHead.slot === right.observedHead.slot
+    && left.observedHead.signature === right.observedHead.signature
+    && left.beforeSignature === right.beforeSignature
+    && left.lastAcceptedSlot === right.lastAcceptedSlot
+    && left.pagesScanned === right.pagesScanned
+    && left.signaturesEnqueued === right.signaturesEnqueued
+    && left.revision === right.revision
+    && left.state === right.state
+    && left.terminalReason === right.terminalReason
+    && left.startedAtMs === right.startedAtMs
+    && left.updatedAtMs === right.updatedAtMs
+    && left.completedAtMs === right.completedAtMs
+    && left.purgeAfterMs === right.purgeAfterMs;
+}
+
+async function lockStrictCheckpoint(client: Queryable, key: ProcessingCheckpoint['key']): Promise<void> {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended('transaction-checkpoint:' || $1, 0))",
+    [key],
+  );
+}
+
+async function lockedStrictCheckpoint(
+  client: Queryable,
+  key: ProcessingCheckpoint['key'],
+): Promise<ProcessingCheckpoint | null> {
+  const selected = await client.query(
+    `SELECT checkpoint_key, slot, signature, updated_at
+     FROM processing_checkpoints WHERE checkpoint_key = $1 FOR UPDATE`,
+    [key],
+  );
+  if (selected.rows.length === 0 && selected.rowCount === 0) return null;
+  if (selected.rows.length !== 1 || selected.rowCount !== 1) {
+    throw new TypeError('Strict catch-up checkpoint query returned an invalid row count.');
+  }
+  return checkpointFromRow(requiredRow(selected.rows[0]));
+}
+
+async function terminalizeStrictCatchUpRunAt(
+  client: Queryable,
+  expected: StrictCatchUpRun,
+  terminal: StrictCatchUpRun,
+): Promise<void> {
+  const count = await terminalizeStrictCatchUpRunAtOrZero(client, expected, terminal);
+  if (count !== 1) throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+}
+
+async function terminalizeStrictCatchUpRunAtOrZero(
+  client: Queryable,
+  expected: StrictCatchUpRun,
+  terminal: StrictCatchUpRun,
+): Promise<number | null> {
+  const updated = await client.query(
+    `UPDATE listener_strict_catch_up_runs SET revision = $20, state = $21,
+       terminal_reason = $22, updated_at = $23, completed_at = $24, purge_after = $25
+     WHERE ${strictCatchUpRunSnapshotWhere()}`,
+    [...strictCatchUpRunValues(expected), terminal.revision.toString(), terminal.state,
+      terminal.terminalReason, dateFromMs(terminal.updatedAtMs),
+      nullableDateFromMs(terminal.completedAtMs), nullableDateFromMs(terminal.purgeAfterMs)],
+  );
+  return updated.rowCount;
+}
+
+function nullableDateFromMs(value: number | null): Date | null {
+  return value === null ? null : dateFromMs(value);
 }
 
 function isCheckpointRegression(

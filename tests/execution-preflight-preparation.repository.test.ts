@@ -633,9 +633,14 @@ void test('PostgreSQL rechecks proofs after waiting on the exact parent locks', 
     let writerCommitted = false;
     try {
       await writer.query('BEGIN');
+      const writerBackend = await writer.query<{ readonly pid: number }>(
+        'SELECT pg_backend_pid()::INTEGER AS pid',
+      );
+      const writerPid = requiredValue(writerBackend.rows[0]).pid;
+      assert.ok(Number.isSafeInteger(writerPid) && writerPid > 0);
       await writer.query('SELECT id FROM execution_intents WHERE id=$1 FOR UPDATE', [targetId]);
       selection = repository.selectFirstPair(started);
-      await waitForBlockedParentLock(pool);
+      await waitForBlockedParentLock(pool, writerPid);
       await insertTargetAssessment(writer, targetId);
       await writer.query('COMMIT');
       writerCommitted = true;
@@ -1127,13 +1132,13 @@ async function completeSimulationProbe(pool: Queryable, intentId: string): Promi
   ]);
 }
 
-async function waitForBlockedParentLock(pool: Queryable): Promise<void> {
+async function waitForBlockedParentLock(pool: Queryable, blockingPid: number): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const resultValue = await pool.query(`SELECT COUNT(*)::INTEGER AS count
       FROM pg_catalog.pg_stat_activity
       WHERE datname=current_database() AND wait_event_type='Lock'
-        AND cardinality(pg_catalog.pg_blocking_pids(pid))>0`);
+        AND $1=ANY(pg_catalog.pg_blocking_pids(pid))`, [blockingPid]);
     if (resultValue.rows.some((row) => row.count === 1)) return;
     await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
   }

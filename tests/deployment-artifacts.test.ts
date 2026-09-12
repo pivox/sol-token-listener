@@ -415,6 +415,8 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'paperMvpSamples'/);
   assert.match(smoke, /'listenerCatchUpGaps'/);
   assert.match(smoke, /'listenerStrictCatchUpFailures'/);
+  assert.match(smoke, /'listenerStrictCatchUpRuns'/);
+  assert.match(smoke, /'046_listener_strict_catch_up_runs\.sql'/);
   assert.match(smoke, /'executionIntentTransitions'/);
   assert.match(smoke, /'executionAttempts'/);
   assert.match(smoke, /'executionIntents'/);

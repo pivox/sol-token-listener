@@ -1046,6 +1046,29 @@ void test('durable WebSocket health documentation is versioned and exposes the e
   assert.match(revisedSemantics, /horloge[^.]*après[^.]*lectures/isu);
 });
 
+void test('resumable strict recovery documents durable pause, private affinity and bounded H2i tuning', async () => {
+  const files = [
+    '../docs/architecture/pumpfun-v1.md', '../docs/api/v1.md',
+    '../docs/operations/rpc-qualification.md', '../docs/system-overview.html',
+  ];
+  for (const file of files) {
+    const source = await readFile(new URL(file, import.meta.url), 'utf8');
+    for (const term of ['CATCH_UP_PAGE_BUDGET_EXHAUSTED', 'CATCH_UP_REFRESH_REQUIRED', 'RPC_UNAVAILABLE',
+      'DEGRADED', 'REQUIRED', 'listener_strict_catch_up_runs']) {
+      assert.ok(source.includes(term), `${file} misses ${term}`);
+    }
+  }
+  const environment = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  assert.match(environment, /LISTENER_CATCH_UP_PAGE_SIZE=1000/u);
+  assert.match(environment, /monthly quota.*instantaneous capacity/iu);
+  assert.match(environment, /^LISTENER_CATCH_UP_PAGE_SIZE=100$/mu);
+  const design = await readFile(new URL('../docs/superpowers/specs/2026-09-09-resumable-strict-catch-up-design.md', import.meta.url), 'utf8');
+  assert.match(design, /Version: 3/u);
+  assert.match(design, /readStrictCatchUpRun/u);
+  assert.match(design, /pagesScanned/u);
+  assert.match(design, /sameFrontier/u);
+});
+
 void test('HTTP RPC failover documentation states the bounded production and soak contract', async () => {
   const [readme, operations] = await Promise.all([
     readFile(new URL('../README.md', import.meta.url), 'utf8'),

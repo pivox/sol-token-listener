@@ -56,6 +56,7 @@ void test('migration 044 upgrades 043, replays, and keeps its enum ordering on P
     assert.deepEqual(await migrateDatabase({ pool }), [
       migrationName,
       '045_execution_wallet_snapshot_refresh.sql',
+      '046_listener_strict_catch_up_runs.sql',
     ]);
     assert.deepEqual((await pool.query(`SELECT ingestion_priority::TEXT AS priority
       FROM chain_transaction_inbox WHERE signature='legacy-normal'`)).rows, [{ priority: 'NORMAL' }]);

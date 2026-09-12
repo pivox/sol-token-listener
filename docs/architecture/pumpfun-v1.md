@@ -677,7 +677,7 @@ et écritures déterministes garantissent des effets persistés exactement une
 fois, sans reprendre après une étape intermédiaire. Les leases expirés rendent
 le travail réclamable.
 
-Le WebSocket est le chemin nominal. Le catch-up initial est borné par
+Le WebSocket est le chemin nominal. Chaque passe de catch-up strict est bornée par
 `LISTENER_CATCH_UP_MAX_PAGES * LISTENER_CATCH_UP_PAGE_SIZE` pour chacun des
 programmes du scope. Avec `launchpad-and-market`, il couvre Pump.fun et
 PumpSwap, soit 20 × 100 signatures par programme par défaut. Avec
@@ -688,6 +688,39 @@ plafonné à 60 s, sans plafond du nombre de tentatives. Les variables
 pour compatibilité, mais ne pilotent pas encore ce scheduler durable. Les lots
 de finalité et durées d'arrêt sont bornés; le quota RPC réel dépend du trafic,
 des déconnexions et des reprises.
+
+La migration 046 ajoute `listener_strict_catch_up_runs` : après l'enqueue
+idempotent complet d'une page, son curseur et ses compteurs deviennent durables.
+`CATCH_UP_PAGE_BUDGET_EXHAUSTED` met la passe en pause, sans créer d'erreur
+terminale inbox ni `CATCH_UP_WINDOW_EXCEEDED`. Le run reste `ACTIVE` ; après
+cleanup, la santé est `DEGRADED`, la reprise `REQUIRED` et sa raison durable
+`RPC_UNAVAILABLE`. Un seul jitter précède la reprise, sans promotion ni rotation.
+Le coordinateur relit l'affinité PostgreSQL sans cache avant tout réseau et
+avant une rotation après erreur transitoire ; seule l'identité provider est
+publique, jamais les signatures ou endpoints. La frontière périodique applique
+la même règle. Des pins divergents, invalides ou retirés restent fail-closed.
+
+Tous les runs `ACTIVE` à frontière canonique sont traités avant les clés sans
+run actif, même si une clé antérieure a un historique `FAILED`. Leur complétion
+couvre seulement la tête figée H1 : `CATCH_UP_REFRESH_REQUIRED` impose cleanup,
+`DEGRADED`/`REQUIRED` et un jitter, sans promotion. Le cycle suivant ouvre une
+nouvelle session et couvre H2 → H1 avant `RUNNING`, sans page hors budget.
+Sans pin actif restant, la sélection normale des providers reprend. Le checkpoint
+durable conserve cette obligation après un crash ou un restart.
+
+La fin d'historique prouvée sans frontière exacte reste terminale ; un run
+`FAILED` retenu rejoue la même erreur sans relire le RPC. L'unanimité
+`UNRECOVERABLE` exige le catalogue entier non épinglé, la même clé en échec et
+sa boundary exacte, indépendamment de l'autre programme. La complétion et le
+checkpoint de tête figé sont atomiques. La maintenance conserve les runs
+terminaux quatre heures après leur terminalisation, puis les purge à l'égalité
+de l'échéance ; aucun run `ACTIVE` n'est purgé par âge. Les preuves d'échec
+non résolues restent conservées séparément.
+
+Pour H2i, `LISTENER_CATCH_UP_PAGE_SIZE=1000` est un tuning optionnel borné,
+pas une nouvelle valeur par défaut ni une preuve de capacité. Un quota mensuel
+disponible ne démontre pas la capacité instantanée : vérifier les 429, le backlog
+et la latence avant toute conclusion opérationnelle.
 
 Le traitement réclame un événement avec un lease et reste idempotent.
 `raw_chain_events` est alimenté séparément : le batch du sink conserve les

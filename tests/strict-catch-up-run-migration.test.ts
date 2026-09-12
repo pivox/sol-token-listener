@@ -1,0 +1,365 @@
+import { createHash, randomUUID } from 'node:crypto';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+import pg from 'pg';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+
+const migrationName = '046_listener_strict_catch_up_runs.sql';
+const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
+
+void test('migration 046 defines the durable strict catch-up run contract without diagnostics', async () => {
+  const sql = withoutSqlComments(await readFile(migrationUrl, 'utf8'));
+
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS listener_strict_catch_up_runs/u);
+  assert.match(sql, /run_id TEXT PRIMARY KEY/u);
+  assert.match(sql, /checkpoint_key TEXT NOT NULL/u);
+  assert.match(sql, /previous_slot NUMERIC\(78,0\) NOT NULL/u);
+  assert.match(sql, /previous_updated_at TIMESTAMPTZ NOT NULL/u);
+  assert.match(sql, /observed_head_slot NUMERIC\(78,0\) NOT NULL/u);
+  assert.match(sql, /pages_scanned BIGINT NOT NULL/u);
+  assert.match(sql, /listener_strict_catch_up_runs_id_check/u);
+  assert.match(sql, /listener_strict_catch_up_runs_lifecycle_check/u);
+  assert.match(sql, /CHR\(160\)/u);
+  assert.match(sql, /CHR\(65279\)/u);
+  assert.match(sql, /listener_strict_catch_up_runs_active_key_unique/u);
+  assert.match(sql, /listener_strict_catch_up_runs_provider_key_idx/u);
+  assert.match(sql, /listener_strict_catch_up_runs_terminal_purge_idx/u);
+  assert.doesNotMatch(sql, /rpc[_ ]?url|api[_ ]?key|private[_ ]?key|raw[_ ]?log|payload/iu);
+});
+
+void test('migration 046 migrates an empty database and safely replays directly', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+
+  await withTemporarySchema(databaseUrl, 'strict_catch_up_runs_empty', async (pool) => {
+    const applied = await migrateDatabase({ pool });
+    assert.equal(applied.at(-1), migrationName);
+    assert.deepEqual(await migrateDatabase({ pool }), []);
+    await pool.query(await readFile(migrationUrl, 'utf8'));
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(await readFile(migrationUrl, 'utf8'));
+      await client.query(await readFile(migrationUrl, 'utf8'));
+      await client.query('COMMIT');
+    } finally {
+      client.release();
+    }
+    await assertRunIndexes(pool);
+  });
+});
+
+void test('migration 046 accepts valid active and terminal runs and rejects invalid durable state', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+
+  await withTemporarySchema(databaseUrl, 'strict_catch_up_runs_constraints', async (pool) => {
+    await migrateDatabase({ pool });
+    await insertRun(pool, 'active');
+    await insertRun(pool, 'completed', {
+      checkpointKey: 'market',
+      state: 'COMPLETED',
+      terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z',
+      purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
+    assert.deepEqual((await pool.query(`SELECT to_char(previous_updated_at AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS previous_updated_at
+      FROM listener_strict_catch_up_runs WHERE checkpoint_key='launchpad'`)).rows, [
+      { previous_updated_at: '2026-01-01T00:00:00.000Z' },
+    ]);
+    for (const values of [
+      { runId: 'wrong' },
+      { observedHeadSlot: '-1' },
+      { lastAcceptedSlot: '12' },
+      { state: 'FAILED', terminalReason: null, completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z', updatedAt: '2026-01-01T00:00:01.000Z' },
+    ] as const) {
+      await assert.rejects(() => insertRun(pool, randomUUID(), values), isCheckViolation);
+    }
+    for (const values of [
+      { previousSignature: '\tprevious' },
+      { observedHeadSignature: '\thead' },
+      { beforeSignature: '\tbefore' },
+      { beforeSignature: 'previous' },
+      { beforeSignature: 'head' },
+    ] as const) await assert.rejects(() => insertRun(pool, randomUUID(), values), isCheckViolation);
+    const terminalRun: RunValues = {
+      checkpointKey: 'market', state: 'COMPLETED', terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    };
+    for (const values of [
+      { previousSignature: '\u00a0previous' }, { previousSignature: 'previous\ufeff' },
+      { observedHeadSignature: '\u00a0head' }, { observedHeadSignature: 'head\ufeff' },
+      { beforeSignature: '\u00a0before' }, { beforeSignature: 'before\ufeff' },
+    ] as const) await assert.rejects(() => insertRun(pool, randomUUID(), { ...terminalRun, ...values }), isCheckViolation);
+    await insertRun(pool, 'internal_whitespace', {
+      checkpointKey: 'market', previousSignature: 'pre vious', observedHeadSignature: 'he ad',
+      beforeSignature: 'be fore', state: 'COMPLETED', terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
+    await insertRun(pool, 'active_initial', {
+      checkpointKey: 'market', observedHeadSlot: '11', lastAcceptedSlot: '11',
+      beforeSignature: 'head',
+    });
+    await insertRun(pool, 'terminal_initial', {
+      checkpointKey: 'market', state: 'COMPLETED', revision: '1', observedHeadSlot: '11',
+      lastAcceptedSlot: '11', beforeSignature: 'head', terminalReason: null,
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
+  });
+});
+
+void test('migration 046 allows only one active run per checkpoint key and retains terminal rows exactly four hours', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+
+  await withTemporarySchema(databaseUrl, 'strict_catch_up_runs_lifecycle', async (pool) => {
+    await migrateDatabase({ pool });
+    await insertRun(pool, 'active_a');
+    await assert.rejects(() => insertRun(pool, 'active_b'), isUniqueViolation);
+    const firstClient = await pool.connect();
+    const secondClient = await pool.connect();
+    try {
+      const backendPids = await Promise.all([firstClient.query<{ readonly pid: number }>('SELECT pg_backend_pid() AS pid'),
+        secondClient.query<{ readonly pid: number }>('SELECT pg_backend_pid() AS pid')]);
+      assert.notEqual(backendPids[0].rows[0]?.pid, backendPids[1].rows[0]?.pid);
+      await firstClient.query('BEGIN');
+      await secondClient.query('BEGIN');
+      await insertRun(firstClient, 'active_c', { checkpointKey: 'market' });
+      const loser = insertRun(secondClient, 'active_d', { checkpointKey: 'market' });
+      let loserSettled = false;
+      void loser.then(() => { loserSettled = true; }, () => { loserSettled = true; });
+      await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+      assert.equal(loserSettled, false);
+      await firstClient.query('COMMIT');
+      await assert.rejects(() => loser, isUniqueViolation);
+      await secondClient.query('ROLLBACK');
+    } finally {
+      await Promise.allSettled([firstClient.query('ROLLBACK'), secondClient.query('ROLLBACK')]);
+      firstClient.release();
+      secondClient.release();
+    }
+    await insertRun(pool, 'failed', {
+      checkpointKey: 'market', state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED',
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
+    await assert.rejects(() => insertRun(pool, 'bad_retention', {
+      checkpointKey: 'market', state: 'SUPERSEDED', terminalReason: 'CHECKPOINT_SUPERSEDED',
+      completedAt: '2026-01-01T00:00:01.000Z', purgeAfter: '2026-01-01T04:00:00.999Z',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    }), isCheckViolation);
+  });
+});
+
+void test('migration 046 rejects incompatible pre-existing table and named index collisions', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  const sql = await readFile(migrationUrl, 'utf8');
+
+  await withTemporarySchema(databaseUrl, 'strict_catch_up_runs_table_collision', async (pool) => {
+    await pool.query('CREATE TABLE listener_strict_catch_up_runs (run_id TEXT PRIMARY KEY)');
+    await assert.rejects(() => pool.query(sql), /strict catch-up run table definition is incompatible/u);
+  });
+  await withTemporarySchema(databaseUrl, 'strict_catch_up_runs_index_collision', async (pool) => {
+    await migrateDatabase({ pool });
+    await pool.query('DROP INDEX listener_strict_catch_up_runs_active_key_unique');
+    await pool.query(`CREATE UNIQUE INDEX listener_strict_catch_up_runs_active_key_unique
+      ON listener_strict_catch_up_runs (checkpoint_key) INCLUDE (provider_id) WHERE state='ACTIVE'`);
+    await assert.rejects(() => pool.query(sql), /strict catch-up run target index definition is incompatible/u);
+  });
+});
+
+void test('migration 046 rejects altered named checks, unvalidated checks, and a missing primary key on replay', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  const sql = await readFile(migrationUrl, 'utf8');
+
+  for (const [label, mutation] of [
+    ['changed_check', `ALTER TABLE listener_strict_catch_up_runs
+      DROP CONSTRAINT listener_strict_catch_up_runs_key_check,
+      ADD CONSTRAINT listener_strict_catch_up_runs_key_check CHECK (TRUE)`],
+    ['unvalidated_check', `ALTER TABLE listener_strict_catch_up_runs
+      DROP CONSTRAINT listener_strict_catch_up_runs_key_check,
+      ADD CONSTRAINT listener_strict_catch_up_runs_key_check
+      CHECK (checkpoint_key IN ('launchpad', 'market')) NOT VALID`],
+    ['missing_primary_key', 'ALTER TABLE listener_strict_catch_up_runs DROP CONSTRAINT listener_strict_catch_up_runs_pkey'],
+    ['unlogged_table', 'ALTER TABLE listener_strict_catch_up_runs SET UNLOGGED'],
+    ['generated_pages_scanned', `ALTER TABLE listener_strict_catch_up_runs
+      DROP CONSTRAINT listener_strict_catch_up_runs_numeric_bounds_check,
+      DROP CONSTRAINT listener_strict_catch_up_runs_cursor_order_check,
+      DROP COLUMN pages_scanned,
+      ADD COLUMN pages_scanned BIGINT GENERATED ALWAYS AS (1) STORED`],
+    ['unexpected_default', 'ALTER TABLE listener_strict_catch_up_runs ALTER COLUMN pages_scanned SET DEFAULT 1'],
+    ['identity_pages_scanned', 'ALTER TABLE listener_strict_catch_up_runs ALTER COLUMN pages_scanned ADD GENERATED BY DEFAULT AS IDENTITY'],
+  ] as const) {
+    await withTemporarySchema(databaseUrl, `strict_catch_up_runs_${label}`, async (pool) => {
+      await migrateDatabase({ pool });
+      await pool.query(mutation);
+      await assert.rejects(() => pool.query(sql), /strict catch-up run (table|constraint) definition is incompatible/u);
+    });
+  }
+});
+
+void test('strict run retention deletes only terminal rows at or before the exact deadline', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'strict_runs_retention', async (pool) => {
+    await migrateDatabase({ pool });
+    // Freeze PostgreSQL's clock in this isolated schema, including the maintenance connection.
+    await pool.query(`CREATE FUNCTION clock_timestamp() RETURNS TIMESTAMPTZ
+      LANGUAGE SQL IMMUTABLE AS $$ SELECT TIMESTAMPTZ '2026-01-02T00:00:00Z' $$`);
+    const schema = (await pool.query<{ schema: string }>('SELECT CURRENT_SCHEMA() AS schema')).rows[0]?.schema;
+    assert.ok(schema);
+    const frozenPool = new pg.Pool({ connectionString: databaseUrl,
+      options: `-c search_path=${schema},pg_catalog`, max: 1 });
+    try {
+      await insertRun(frozenPool, 'ancient-active');
+      for (const [suffix, state, offset] of [
+        ['completed-before', 'COMPLETED', -1], ['failed-boundary', 'FAILED', 0],
+        ['superseded-boundary', 'SUPERSEDED', 0], ['completed-future', 'COMPLETED', 1],
+        ['failed-future', 'FAILED', 1], ['superseded-future', 'SUPERSEDED', 1],
+      ] as const) {
+        const purgeAfter = new Date(Date.parse('2026-01-02T00:00:00Z') + offset).toISOString();
+        const completedAt = new Date(Date.parse(purgeAfter) - 14_400_000).toISOString();
+        await insertRun(frozenPool, suffix, { state, completedAt, updatedAt: completedAt, purgeAfter,
+          terminalReason: state === 'FAILED' ? 'CATCH_UP_WINDOW_EXCEEDED'
+            : state === 'SUPERSEDED' ? 'CHECKPOINT_SUPERSEDED' : null });
+      }
+      const purged = await purgeExpiredFoundationData(frozenPool);
+      assert.equal(purged.listenerStrictCatchUpRuns, 3);
+      assert.equal((await frozenPool.query('SELECT * FROM listener_strict_catch_up_runs')).rowCount, 4);
+      assert.equal((await frozenPool.query("SELECT * FROM listener_strict_catch_up_runs WHERE state='ACTIVE'")).rowCount, 1);
+      assert.equal((await purgeExpiredFoundationData(frozenPool)).listenerStrictCatchUpRuns, 0);
+    } finally { await frozenPool.end(); }
+  });
+});
+
+void test('strict run retention rolls back when a later maintenance statement fails', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'strict_runs_retention_rollback', async (pool) => {
+    await migrateDatabase({ pool });
+    await insertRun(pool, 'expired-terminal', { state: 'COMPLETED',
+      completedAt: '2026-01-01T00:00:01.000Z', updatedAt: '2026-01-01T00:00:01.000Z',
+      purgeAfter: '2026-01-01T04:00:01.000Z' });
+    await pool.query(`CREATE FUNCTION reject_maintenance() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced strict run retention rollback'; END $$;
+      CREATE TRIGGER reject_maintenance BEFORE DELETE ON chain_transaction_inbox
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_maintenance()`);
+    await assert.rejects(purgeExpiredFoundationData(pool), /forced strict run retention rollback/u);
+    assert.equal((await pool.query('SELECT * FROM listener_strict_catch_up_runs')).rowCount, 1);
+    await pool.query('DROP TRIGGER reject_maintenance ON chain_transaction_inbox');
+    assert.equal((await purgeExpiredFoundationData(pool)).listenerStrictCatchUpRuns, 1);
+  });
+});
+
+type RunValues = Readonly<Partial<{
+  runId: string;
+  checkpointKey: 'launchpad' | 'market';
+  previousSlot: string;
+  previousUpdatedAt: string;
+  previousSignature: string;
+  providerId: string;
+  observedHeadSlot: string;
+  observedHeadSignature: string;
+  beforeSignature: string;
+  lastAcceptedSlot: string;
+  pagesScanned: string;
+  signaturesEnqueued: string;
+  revision: string;
+  state: 'ACTIVE' | 'COMPLETED' | 'FAILED' | 'SUPERSEDED';
+  terminalReason: string | null;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  purgeAfter: string | null;
+}>>;
+
+async function insertRun(pool: InstanceType<typeof pg.Pool> | pg.PoolClient, suffix: string, values: RunValues = {}): Promise<void> {
+  const runSuffix = createHash('sha256').update(suffix).digest('hex');
+  const runId = values.runId ?? `strict_catchup_run_${runSuffix}`;
+  await pool.query(`INSERT INTO listener_strict_catch_up_runs (
+    run_id,checkpoint_key,previous_slot,previous_signature,provider_id,observed_head_slot,
+    observed_head_signature,before_signature,last_accepted_slot,pages_scanned,
+    signatures_enqueued,revision,state,terminal_reason,previous_updated_at,started_at,updated_at,completed_at,purge_after
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, [
+    runId, values.checkpointKey ?? 'launchpad', values.previousSlot ?? '10',
+    values.previousSignature ?? 'previous', values.providerId ?? 'primary', values.observedHeadSlot ?? '11',
+    values.observedHeadSignature ?? 'head', values.beforeSignature ?? 'before', values.lastAcceptedSlot ?? '10',
+    values.pagesScanned ?? '1', values.signaturesEnqueued ?? '1', values.revision ?? '0',
+    values.state ?? 'ACTIVE', values.terminalReason ?? null,
+    values.previousUpdatedAt ?? '2026-01-01T00:00:00.000Z', values.startedAt ?? '2026-01-01T00:00:00.000Z',
+    values.updatedAt ?? '2026-01-01T00:00:00.000Z', values.completedAt ?? null, values.purgeAfter ?? null,
+  ]);
+}
+
+async function assertRunIndexes(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  const result = await pool.query<{ readonly indexname: string }>(`SELECT indexname FROM pg_indexes
+    WHERE schemaname=CURRENT_SCHEMA() AND tablename='listener_strict_catch_up_runs'
+      AND indexname IN ('listener_strict_catch_up_runs_active_key_unique',
+        'listener_strict_catch_up_runs_provider_key_idx',
+        'listener_strict_catch_up_runs_terminal_purge_idx') ORDER BY indexname`);
+  assert.deepEqual(result.rows.map((row) => row.indexname), [
+    'listener_strict_catch_up_runs_active_key_unique',
+    'listener_strict_catch_up_runs_provider_key_idx',
+    'listener_strict_catch_up_runs_terminal_purge_idx',
+  ]);
+}
+
+function isCheckViolation(error: unknown): boolean {
+  return isPostgresError(error, '23514');
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return isPostgresError(error, '23505');
+}
+
+function isPostgresError(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
+}
+
+function testDatabaseUrl(context: Readonly<{ skip(message?: string): void }>): string | null {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl !== undefined && databaseUrl.trim() !== '') return databaseUrl;
+  context.skip('TEST_DATABASE_URL absent: strict catch-up run migration test skipped');
+  return null;
+}
+
+async function withTemporarySchema(
+  databaseUrl: string, prefix: string, callback: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+): Promise<void> {
+  const schema = `${prefix}_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 3, options: `-c search_path=${quoteIdentifier(schema)}` });
+  let created = false;
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    created = true;
+    await pool.query(`SET search_path TO ${quoteIdentifier(schema)}`);
+    await callback(pool);
+  } finally {
+    try {
+      await pool.end();
+    } finally {
+      try {
+        if (created) await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+      } finally {
+        await admin.end();
+      }
+    }
+  }
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function withoutSqlComments(sql: string): string {
+  return sql.replaceAll(/^\s*--.*$/gmu, '');
+}

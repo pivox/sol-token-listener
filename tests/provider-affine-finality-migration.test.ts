@@ -53,6 +53,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       '043_execution_intent_causal_lineage.sql',
       '044_transaction_inbox_launch_priority.sql',
       '045_execution_wallet_snapshot_refresh.sql',
+      '046_listener_strict_catch_up_runs.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

@@ -45,7 +45,7 @@ void test('applique toutes les migrations sur une base vide et accepte les évé
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '045_execution_wallet_snapshot_refresh.sql');
+    assert.equal(applied.at(-1), '046_listener_strict_catch_up_runs.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
