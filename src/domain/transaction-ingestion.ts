@@ -63,6 +63,7 @@ export type ListenerRuntimeState = (typeof LISTENER_RUNTIME_STATES)[number];
 export type IngestionComponentState = ListenerRuntimeState;
 export type TransactionDiscoverySource = 'WEBSOCKET' | 'CATCH_UP';
 export type TransactionIngestionHint = (typeof TRANSACTION_INGESTION_HINTS)[number];
+export type TransactionNotificationIngestionHint = Exclude<TransactionIngestionHint, 'NONE'>;
 export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
 export type InboxRecoveryResultCode =
   (typeof TRANSACTION_INBOX_RECOVERY_RESULT_CODES)[number];
@@ -124,7 +125,7 @@ export interface TransactionNotification {
   readonly signature: string;
   readonly slot: bigint;
   readonly source: TransactionDiscoverySource;
-  readonly ingestionHint: TransactionIngestionHint | null;
+  readonly ingestionHint: TransactionNotificationIngestionHint | null;
   readonly ingestionHintMint: string | null;
   readonly programIds: readonly string[];
   readonly confirmationStatus: Exclude<ChainConfirmationStatus, 'orphaned'>;
@@ -403,6 +404,11 @@ function assertCanonicalProgramIds(value: unknown): void {
 }
 
 export function isCanonicalSolanaProgramId(value: string): boolean {
+  const byteLength = Buffer.byteLength(value, 'utf8');
+  if (byteLength < MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
+    || byteLength > MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
+    || value !== value.trim()
+    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(value)) return false;
   try {
     return new PublicKey(value).toBase58() === value;
   } catch {

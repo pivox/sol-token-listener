@@ -48,6 +48,11 @@ import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
+const notificationTradeHint: TransactionNotification['ingestionHint'] = 'PUMPFUN_TRADE';
+// @ts-expect-error NONE is parser-only and cannot be persisted in a notification.
+const parserOnlyHint: TransactionNotification['ingestionHint'] = 'NONE';
+void notificationTradeHint;
+void parserOnlyHint;
 
 void test('creates one deterministic frozen four-hour catch-up gap', () => {
   const previous = Object.freeze({
@@ -850,6 +855,8 @@ void test('enforces exact source-compatible ingestion hint and mint pairs withou
     { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: null },
     { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: ` ${mint}` },
     { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: 'not-a-public-key' },
+    { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: 'é'.repeat(32) },
+    { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: 'x'.repeat(16_384) },
   ]) {
     assert.throws(
       () => { assertValidTransactionNotification(Object.freeze({ ...canonical, ...invalid })); },

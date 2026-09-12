@@ -43,17 +43,26 @@ void test('rejects truncated TradeEvent payloads', () => {
   assert.deepEqual(pumpFunWebSocketHintFromLogs([truncated]), { hint: 'NONE', hintMint: null });
 });
 
-void test('gives CreateEvent precedence even after a valid TradeEvent', () => {
+void test('gives CreateEvent precedence even after ambiguous TradeEvents', () => {
   assert.deepEqual(
-    pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), createLine]),
+    pumpFunWebSocketHintFromLogs([
+      tradeLine(firstTradeMint), tradeLine(secondTradeMint), createLine,
+    ]),
     { hint: 'PUMPFUN_CREATE', hintMint: null },
   );
 });
 
-void test('uses the first valid trade mint deterministically', () => {
+void test('keeps a trade hint when repeated TradeEvents use the same mint', () => {
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), tradeLine(firstTradeMint)]),
+    { hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint.toBase58() },
+  );
+});
+
+void test('fails safe when valid TradeEvents use distinct mints', () => {
   assert.deepEqual(
     pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), tradeLine(secondTradeMint)]),
-    { hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint.toBase58() },
+    { hint: 'NONE', hintMint: null },
   );
 });
 
