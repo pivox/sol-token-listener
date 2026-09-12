@@ -11,14 +11,12 @@ const pumpProgramId = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 
 void test('migration 044 defines a closed durable priority and an ordered claim index', async () => {
   const sql = await readFile(migrationUrl, 'utf8').catch(() => '');
-  const repository = await readFile(
-    new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url),
-    'utf8',
-  );
 
   assert.match(sql, /CREATE TYPE chain_transaction_inbox_priority AS ENUM \('NORMAL', 'LAUNCH_CANDIDATE'\)/u);
   assert.match(sql, /ingestion_priority chain_transaction_inbox_priority\s+NOT NULL DEFAULT 'NORMAL'/u);
-  assert.match(repository, /ingestion_priority\s*=\s*GREATEST\(/u);
+  // Historical backfill must preserve classified rows. Runtime monotone
+  // discovery convergence is covered by transaction-inbox.repository.test.ts.
+  assert.match(sql, /SET ingestion_priority = 'NORMAL'\s+WHERE ingestion_priority IS NULL/u);
   assert.match(sql, /ingestion_priority DESC, observed_slot, signature/u);
   assert.match(sql, /chain_transaction_inbox_claim_scheduler/u);
 });
@@ -71,7 +69,11 @@ void test('migration 044 upgrades 043, replays, and keeps its enum ordering on P
       scheduler_key: 'global', consecutive_launch_candidate_claims: 0,
     }]);
 
+    await pool.query(`UPDATE chain_transaction_inbox SET ingestion_priority='LAUNCH_CANDIDATE'
+      WHERE signature='legacy-normal'`);
     await pool.query(sql);
+    assert.deepEqual((await pool.query(`SELECT ingestion_priority::TEXT AS priority
+      FROM chain_transaction_inbox WHERE signature='legacy-normal'`)).rows, [{ priority: 'LAUNCH_CANDIDATE' }]);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
