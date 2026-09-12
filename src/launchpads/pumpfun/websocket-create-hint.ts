@@ -38,33 +38,52 @@ export function pumpFunWebSocketHintFromLogs(logs: unknown): PumpFunWebSocketCre
   const snapshot = snapshotLogs(logs);
   if (snapshot === null) return NONE_HINT;
   let firstTradeMint: string | null = null;
-  let hasAmbiguousTradeMint = false;
+  let hasCreateEvent = false;
+  let hasAmbiguousEvent = false;
   for (const line of snapshot) {
     if (!line.startsWith(PROGRAM_DATA_PREFIX)) continue;
     const encoded = line.slice(PROGRAM_DATA_PREFIX.length);
-    if (!canonicalBase64(encoded)) continue;
+    if (!canonicalBase64(encoded)) {
+      hasAmbiguousEvent = true;
+      continue;
+    }
     const decoded = Buffer.from(encoded, 'base64');
     if (decoded.length >= CREATE_EVENT_DISCRIMINATOR.length
       && decoded.subarray(0, CREATE_EVENT_DISCRIMINATOR.length)
-        .equals(CREATE_EVENT_DISCRIMINATOR)) return CREATE_HINT;
-    if (!hasAmbiguousTradeMint
-      && decoded.length >= TRADE_EVENT_MINT_OFFSET + TRADE_EVENT_MINT_LENGTH
-      && decoded.subarray(0, TRADE_EVENT_DISCRIMINATOR.length)
-        .equals(TRADE_EVENT_DISCRIMINATOR)) {
+        .equals(CREATE_EVENT_DISCRIMINATOR)) {
+      hasCreateEvent = true;
+      continue;
+    }
+    if (isPrefixOfTradeEvent(decoded)) {
+      hasAmbiguousEvent = true;
+      continue;
+    }
+    if (decoded.subarray(0, TRADE_EVENT_DISCRIMINATOR.length)
+      .equals(TRADE_EVENT_DISCRIMINATOR)) {
+      if (decoded.length < TRADE_EVENT_MINT_OFFSET + TRADE_EVENT_MINT_LENGTH) {
+        hasAmbiguousEvent = true;
+        continue;
+      }
       try {
         const tradeMint = new PublicKey(
           decoded.subarray(TRADE_EVENT_MINT_OFFSET, TRADE_EVENT_MINT_OFFSET + TRADE_EVENT_MINT_LENGTH),
         ).toBase58();
         if (firstTradeMint === null) firstTradeMint = tradeMint;
-        else if (firstTradeMint !== tradeMint) hasAmbiguousTradeMint = true;
+        else if (firstTradeMint !== tradeMint) hasAmbiguousEvent = true;
       } catch {
-        // Ignore malformed trade payloads without retaining their bytes.
+        hasAmbiguousEvent = true;
       }
     }
   }
-  return firstTradeMint === null || hasAmbiguousTradeMint
+  if (hasCreateEvent) return CREATE_HINT;
+  return firstTradeMint === null || hasAmbiguousEvent
     ? NONE_HINT
     : Object.freeze({ hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint });
+}
+
+function isPrefixOfTradeEvent(decoded: Buffer): boolean {
+  return decoded.length < TRADE_EVENT_DISCRIMINATOR.length
+    && TRADE_EVENT_DISCRIMINATOR.subarray(0, decoded.length).equals(decoded);
 }
 
 function snapshotLogs(value: unknown): readonly string[] | null {

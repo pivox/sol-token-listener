@@ -35,18 +35,36 @@ void test('extracts the canonical mint from the 32 bytes after an official Trade
   assert.ok(Object.isFrozen(hint));
 });
 
-void test('rejects truncated TradeEvent payloads', () => {
-  const truncated = programDataLine(
-    PUMP_EVENTS.TradeEvent.discriminator,
-    [...firstTradeMint.toBytes().subarray(0, 31)],
+void test('fails safe when a valid trade is followed by malformed Program data', () => {
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), 'Program data: not-base64']),
+    { hint: 'NONE', hintMint: null },
   );
-  assert.deepEqual(pumpFunWebSocketHintFromLogs([truncated]), { hint: 'NONE', hintMint: null });
+});
+
+void test('fails safe when a valid trade is followed by a truncated TradeEvent', () => {
+  const truncatedDiscriminator = `Program data: ${Buffer.from(
+    PUMP_EVENTS.TradeEvent.discriminator.slice(0, -1),
+  ).toString('base64')}`;
+  const discriminatorOnly = programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []);
+  const missingOneMintByte = programDataLine(
+    PUMP_EVENTS.TradeEvent.discriminator,
+    firstTradeMint.toBytes().subarray(0, 31),
+  );
+
+  for (const truncated of [truncatedDiscriminator, discriminatorOnly, missingOneMintByte]) {
+    assert.deepEqual(
+      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), truncated]),
+      { hint: 'NONE', hintMint: null },
+    );
+  }
 });
 
 void test('gives CreateEvent precedence even after ambiguous TradeEvents', () => {
   assert.deepEqual(
     pumpFunWebSocketHintFromLogs([
-      tradeLine(firstTradeMint), tradeLine(secondTradeMint), createLine,
+      tradeLine(firstTradeMint), 'Program data: not-base64',
+      programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []), createLine,
     ]),
     { hint: 'PUMPFUN_CREATE', hintMint: null },
   );
@@ -74,6 +92,16 @@ void test('requires canonical bounded base64 rather than a textual discriminator
   assert.equal(pumpFunCreateHintFromLogs([
     `Program data: ${Buffer.from(PUMP_EVENTS.CreateEvent.discriminator).toString('base64')}suffix`,
   ]), 'NONE');
+});
+
+void test('ignores valid unrelated event data and plain non-data logs', () => {
+  const unrelatedEvent = programDataLine([255, 254, 253, 252, 251, 250, 249, 248], [1, 2, 3]);
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([
+      'Program log: Log truncated', 'Program log: unrelated', unrelatedEvent, tradeLine(firstTradeMint),
+    ]),
+    { hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint.toBase58() },
+  );
 });
 
 void test('rejects hostile arrays without invoking accessors or proxy traps', () => {
