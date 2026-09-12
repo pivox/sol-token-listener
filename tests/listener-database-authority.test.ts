@@ -22,7 +22,7 @@ const BUSINESS_TABLES = Object.freeze([
   'chain_transaction_finality_replay_receipts', 'chain_transaction_inbox',
   'creator_profiles', 'discovered_pools', 'domain_events', 'ignored_assets',
   'launch_trades', 'listener_catch_up_gaps', 'listener_checkpoints',
-  'listener_heartbeats', 'listener_strict_catch_up_failures',
+  'listener_heartbeats', 'listener_strict_catch_up_failures', 'listener_strict_catch_up_runs',
   'listener_websocket_health', 'market_pools', 'market_reserve_snapshots',
   'market_trades', 'migrations', 'observed_wallet_positions',
   'paper_decision_jobs', 'paper_external_buy_events', 'paper_mvp_position_samples',

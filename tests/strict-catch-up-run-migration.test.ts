@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationName = '046_listener_strict_catch_up_runs.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -204,6 +204,59 @@ void test('migration 046 rejects altered named checks, unvalidated checks, and a
       await assert.rejects(() => pool.query(sql), /strict catch-up run (table|constraint) definition is incompatible/u);
     });
   }
+});
+
+void test('strict run retention deletes only terminal rows at or before the exact deadline', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'strict_runs_retention', async (pool) => {
+    await migrateDatabase({ pool });
+    // Freeze PostgreSQL's clock in this isolated schema, including the maintenance connection.
+    await pool.query(`CREATE FUNCTION clock_timestamp() RETURNS TIMESTAMPTZ
+      LANGUAGE SQL IMMUTABLE AS $$ SELECT TIMESTAMPTZ '2026-01-02T00:00:00Z' $$`);
+    const schema = (await pool.query<{ schema: string }>('SELECT CURRENT_SCHEMA() AS schema')).rows[0]?.schema;
+    assert.ok(schema);
+    const frozenPool = new pg.Pool({ connectionString: databaseUrl,
+      options: `-c search_path=${schema},pg_catalog`, max: 1 });
+    try {
+      await insertRun(frozenPool, 'ancient-active');
+      for (const [suffix, state, offset] of [
+        ['completed-before', 'COMPLETED', -1], ['failed-boundary', 'FAILED', 0],
+        ['superseded-boundary', 'SUPERSEDED', 0], ['completed-future', 'COMPLETED', 1],
+        ['failed-future', 'FAILED', 1], ['superseded-future', 'SUPERSEDED', 1],
+      ] as const) {
+        const purgeAfter = new Date(Date.parse('2026-01-02T00:00:00Z') + offset).toISOString();
+        const completedAt = new Date(Date.parse(purgeAfter) - 14_400_000).toISOString();
+        await insertRun(frozenPool, suffix, { state, completedAt, updatedAt: completedAt, purgeAfter,
+          terminalReason: state === 'FAILED' ? 'CATCH_UP_WINDOW_EXCEEDED'
+            : state === 'SUPERSEDED' ? 'CHECKPOINT_SUPERSEDED' : null });
+      }
+      const purged = await purgeExpiredFoundationData(frozenPool);
+      assert.equal(purged.listenerStrictCatchUpRuns, 3);
+      assert.equal((await frozenPool.query('SELECT * FROM listener_strict_catch_up_runs')).rowCount, 4);
+      assert.equal((await frozenPool.query("SELECT * FROM listener_strict_catch_up_runs WHERE state='ACTIVE'")).rowCount, 1);
+      assert.equal((await purgeExpiredFoundationData(frozenPool)).listenerStrictCatchUpRuns, 0);
+    } finally { await frozenPool.end(); }
+  });
+});
+
+void test('strict run retention rolls back when a later maintenance statement fails', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'strict_runs_retention_rollback', async (pool) => {
+    await migrateDatabase({ pool });
+    await insertRun(pool, 'expired-terminal', { state: 'COMPLETED',
+      completedAt: '2026-01-01T00:00:01.000Z', updatedAt: '2026-01-01T00:00:01.000Z',
+      purgeAfter: '2026-01-01T04:00:01.000Z' });
+    await pool.query(`CREATE FUNCTION reject_maintenance() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced strict run retention rollback'; END $$;
+      CREATE TRIGGER reject_maintenance BEFORE DELETE ON chain_transaction_inbox
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_maintenance()`);
+    await assert.rejects(purgeExpiredFoundationData(pool), /forced strict run retention rollback/u);
+    assert.equal((await pool.query('SELECT * FROM listener_strict_catch_up_runs')).rowCount, 1);
+    await pool.query('DROP TRIGGER reject_maintenance ON chain_transaction_inbox');
+    assert.equal((await purgeExpiredFoundationData(pool)).listenerStrictCatchUpRuns, 1);
+  });
 });
 
 type RunValues = Readonly<Partial<{

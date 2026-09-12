@@ -475,8 +475,11 @@ checkpoint ancien n'est plus dans cette page, aucune transaction historique
 abandonnée n'est publiée comme nouvelle : le listener persiste atomiquement
 la lacune pendant quatre heures, déplace son checkpoint au bord courant et
 émet `listener.catch_up_gap_recorded` sans signature ni URL RPC. La politique
-`strict` conserve le parcours borné à `LISTENER_CATCH_UP_MAX_PAGES` pages et
-échoue avec `CATCH_UP_WINDOW_EXCEEDED` si la frontière reste introuvable.
+`strict` borne chaque passe à `LISTENER_CATCH_UP_MAX_PAGES` pages et conserve
+le curseur après chaque page entièrement enfilée. L'épuisement du budget produit
+`CATCH_UP_PAGE_BUDGET_EXHAUSTED`, une pause reprise sur le provider épinglé après
+jitter, sans rotation ni rebasage. Seule une frontière réellement absente de
+l'historique produit `CATCH_UP_WINDOW_EXCEEDED`.
 
 Une panne retryable est replanifiée avec un
 délai exponentiel piloté par `RPC_RETRY_BASE_DELAY_MS` et plafonné à 60 s.
@@ -756,8 +759,11 @@ attend le double ACK Pump.fun/PumpSwap, exécute ensuite une frontière stricte
 HTTP des deux programmes avant de publier `RUNNING`. Il lance une vérification
 de frontière périodique toutes les 30 secondes. Une rotation parcourt une fois
 les fournisseurs positionnels et applique un equal jitter borné de 1–60 secondes
-après un cycle transitoire. Seule une frontière strictement identique et
-dépassée auprès de tous les fournisseurs conduit à `UNRECOVERABLE`; tout cycle
+après un cycle transitoire. Une affinité durable relue sans cache avant tout
+réseau limite le cycle au seul provider épinglé. Les pauses de budget gardent
+`DEGRADED`/`REQUIRED`, raison durable `RPC_UNAVAILABLE`, sans promotion.
+Seule la même clé en échec et sa frontière exacte prouvées manquantes auprès de
+tout le catalogue non épinglé conduisent à `UNRECOVERABLE`; tout cycle
 mixte reste `DEGRADED`. Aucun fallback legacy automatique n’est disponible :
 un même processus ne revient jamais à `SolanaProgramSubscriber`. Cette
 projection n’expose ni matériel de connexion ni capacité d’exécution.

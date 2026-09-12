@@ -316,6 +316,10 @@ void test('foundation retention has an isolated executable role without signed-b
     /GRANT\s+(?:ALL(?:\s+PRIVILEGES)?|UPDATE\s+ON\s+TABLE)[^;]*TO\s+sol_token_retention_worker/iu,
   );
   assert.match(purge, /pg_advisory_xact_lock\(hashtextextended\('foundation-retention-fence:v1', 0\)\)/u);
+  assert.match(purge, /DELETE FROM listener_strict_catch_up_runs\s+WHERE state <> 'ACTIVE'\s+AND purge_after <= clock_timestamp\(\)/u);
+  for (const privilege of ['SELECT', 'DELETE']) {
+    assert.match(executable, new RegExp(`GRANT ${privilege} ON TABLE[^;]*listener_strict_catch_up_runs[^;]*TO sol_token_retention_worker`, 'iu'));
+  }
   assert.doesNotMatch(purge, /FOR UPDATE/iu);
 });
 
@@ -783,6 +787,12 @@ void test('provisioned retention role runs the complete purge without reading si
     const byteProbe = await isolated.connect();
     try {
       await byteProbe.query('SET ROLE sol_token_retention_worker');
+      await byteProbe.query('SELECT * FROM listener_strict_catch_up_runs WHERE FALSE');
+      await byteProbe.query('DELETE FROM listener_strict_catch_up_runs WHERE FALSE');
+      for (const forbidden of [
+        'INSERT INTO listener_strict_catch_up_runs DEFAULT VALUES',
+        'UPDATE listener_strict_catch_up_runs SET state=state WHERE FALSE',
+      ]) await assert.rejects(byteProbe.query(forbidden), permissionDenied);
       await assert.rejects(
         byteProbe.query('SELECT signed_transaction_bytes FROM execution_signed_transactions'),
         (error: unknown) => typeof error === 'object' && error !== null

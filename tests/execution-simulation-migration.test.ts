@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '045_execution_wallet_snapshot_refresh.sql';
+const latestMigrationName = '046_listener_strict_catch_up_runs.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -124,6 +124,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '042_execution_preflight_intent_preparation.sql',
       '043_execution_intent_causal_lineage.sql',
       '044_transaction_inbox_launch_priority.sql',
+      '045_execution_wallet_snapshot_refresh.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);

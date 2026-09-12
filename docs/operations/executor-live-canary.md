@@ -49,7 +49,7 @@ aucune procédure ni frontière de sécurité.
 
 H2k-b reste disponible mais désactivé par défaut : son
 runner one-shot prépare une paire target/probe exacte et H2h v2 l'exporte par
-`preparationRunId`. Le head de migration est 045. Aucune clé n'est chargée,
+`preparationRunId`. Le head de migration est 046. Aucune clé n'est chargée,
 aucune transaction n'est signée, armée ou soumise par H2k-b, et le canary
 reste non démarré.
 

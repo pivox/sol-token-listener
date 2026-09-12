@@ -107,7 +107,8 @@ frontière périodique, elle aussi appairée, est exécutée toutes les 30 secon
 Chaque cycle donne au plus un setup et une analyse stricte à chaque fournisseur
 positionnel. Après un cycle transitoire exhaustif, l’equal jitter exponentiel
 reste borné de 1–60 secondes. Une preuve `UNRECOVERABLE` exige que tous les
-fournisseurs aient dépassé la même frontière exacte; un échec mixte demeure
+fournisseurs du catalogue non épinglé aient prouvé la même clé en échec et sa
+frontière exacte, indépendamment de l'autre programme ; un échec mixte demeure
 `DEGRADED`.
 
 La reprise stricte reçoit `SOLANA_EXPECTED_GENESIS_HASH`, un hash de genèse
@@ -127,12 +128,35 @@ déclenche jamais un rebasage `live-edge`. Les appels concurrents sont coalescé
 en une seule analyse en vol. Il n’existe aucun fallback legacy automatique : un
 processus actif ne revient jamais à `SolanaProgramSubscriber`.
 
-Si une fenêtre bornée ne rejoint pas la limite exacte, une preuve strictement
+Le budget `MAX_PAGES` est local à chaque passe. Après chaque page entièrement
+enfilée, `listener_strict_catch_up_runs` conserve le curseur et le provider.
+`CATCH_UP_PAGE_BUDGET_EXHAUSTED` arrête la passe en pause retryable, sans preuve
+`CATCH_UP_WINDOW_EXCEEDED` ni erreur terminale inbox : après cleanup, la phase
+reste `DEGRADED`, la reprise `REQUIRED` et la raison durable `RPC_UNAVAILABLE`.
+Un seul jitter est programmé, sans rotation ni promotion. L'affinité est relue
+sans cache avant tout réseau, après erreur transitoire avant rotation et pour
+la frontière périodique. Des pins divergents, invalides ou retirés ferment la
+reprise sans réseau. Les diagnostics n'exposent jamais de signature ou endpoint.
+Un unique provider épinglé en échec de fenêtre ne suffit jamais à déclarer
+`UNRECOVERABLE`, même si le catalogue ne contient qu'un provider.
+
+Si le provider prouve une fin d'historique (page courte/vide ou slot sous la
+frontière sans correspondance exacte), une preuve strictement
 redactée est conservée avec cette limite. Une preuve non résolue ne reçoit pas
 de date de purge et reste conservée. Une analyse stricte ultérieure qui atteint
 la même limite la résout ; elle devient alors purgeable quatre heures après sa
-résolution. Ces limites volontairement bornées échouent de façon visible au
-lieu d'augmenter le trafic ou de prétendre à une continuité non démontrée.
+résolution. Un run `FAILED` retenu restitue cet échec sans refaire le scan ni
+dupliquer les preuves. Les runs `COMPLETED`, `FAILED` et `SUPERSEDED` sont
+purgeables quatre heures après terminalisation, échéance incluse, via le compteur
+`listenerStrictCatchUpRuns` de maintenance. Les runs `ACTIVE` sont toujours
+conservés, sans délai de purge ; ce n'est pas la même rétention que les preuves
+d'échec non résolues.
+
+Pour une répétition H2i, `LISTENER_CATCH_UP_PAGE_SIZE=1000` est un réglage
+optionnel borné ; la valeur par défaut reste 100. Un quota mensuel largement
+disponible ne prouve pas la capacité instantanée : qualifier l'absence de 429,
+le backlog non croissant sur 1/5/15 minutes et la latence p95. Ne pas effacer les
+checkpoints ou acheter davantage de concurrence pour masquer une discontinuité.
 
 ## Exécution
 

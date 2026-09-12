@@ -1,11 +1,28 @@
 # Resumable strict catch-up design
 
 Status: approved for implementation  
-Version: 1  
+Version: 2
 Issue: #100  
 Scope: listener ingestion only; no signer, submission, wallet loading, or armament
 
-## Context
+## Revision history and implementation decisions
+
+- v1 (2026-09-09): approved durable page-resumption design.
+- v2 (2026-09-12): records the implemented terminal lookup, exact failing-key
+  comparison, durable counters, atomic completion and operational pause contract.
+- After no active run, `readStrictCatchUpRun` looks up retained history by
+  checkpoint key, previous slot/signature and provider across every state.
+  `previous.updatedAtMs` remains evidence, not identity. A matching `FAILED`
+  immediately rethrows its window failure without source reads, enqueue, creation
+  or duplicate failure evidence. Unexpected `COMPLETED`/`SUPERSEDED` at the still
+  current frontier is a retryable consistency failure, not a recreated run ID.
+- `sameFrontier` compares only the failed checkpoint key and its exact boundary
+  (including null); the other program's frontier cannot affect unanimity.
+- `pagesScanned` counts pages whose eligible tail cursor was durably persisted,
+  not all RPC reads. A boundary-only or empty response adds no durable page.
+  Scanner success counts remain invocation-local; pause counters are cumulative.
+
+## Incident background
 
 The Mainnet H2i rehearsal reached a durable Pump.fun checkpoint that was older
 than the configured strict scan window. The scanner read the same bounded
@@ -15,17 +32,18 @@ window on every provider, found no exact boundary, persisted
 HTTP 429 responses. Its monthly allowance was mostly unused; the failure was
 instantaneous request capacity, not monthly quota exhaustion.
 
-The current scanner buffers all discovered signatures until it finds the old
-checkpoint. It therefore makes no durable progress when `maxPages` is reached.
+The previous scanner buffered all discovered signatures until it found the old
+checkpoint. It therefore made no durable progress when `maxPages` was reached.
 Raising that bound may recover one outage, but it does not make recovery
 restart-safe and can create another long, rate-limited request burst.
 
 ## Decision
 
 Strict catch-up becomes paginated and resumable. A bounded pass is allowed to
-stop in an explicit `PAUSED` state. It is not classified as irrecoverable until
-the provider proves that history ended without the exact checkpoint, or the
-provider returns structurally inconsistent pagination.
+stop with an explicit `PAUSED` outcome, while its durable run stays `ACTIVE`.
+Only proven missing history produces a terminal window failure. Structurally
+inconsistent pagination remains a typed retryable source failure, never proof
+of irrecoverability.
 
 The existing `live-edge` policy is unchanged. This change applies only to the
 strict scanner used by the WebSocket failover supervisor.
@@ -34,9 +52,9 @@ strict scanner used by the WebSocket failover supervisor.
 
 ### Configuration-only larger window
 
-Using `LISTENER_CATCH_UP_PAGE_SIZE=1000` remains a useful operational setting,
-but a larger `MAX_PAGES * PAGE_SIZE` still loses all scan progress on restart
-or page-budget exhaustion. It is not the durable fix.
+Using `LISTENER_CATCH_UP_PAGE_SIZE=1000` remains a useful optional operational
+setting. Without durable cursors, a larger `MAX_PAGES * PAGE_SIZE` still loses
+all scan progress on restart or page-budget exhaustion. It is not the durable fix.
 
 ### Silent rebaseline or checkpoint deletion
 
@@ -95,28 +113,34 @@ keeps the durable run resumable. Provider replacement during an active run is
 out of scope; an explicit future recovery operation may supersede it only with
 durable evidence.
 
-Before opening a candidate session, the supervisor asks the scanner for the
-provider pinned by any active run. If one exists, that provider is placed first
+Before any provider network access, the supervisor asks the repository-backed
+coordinator for the provider pinned by active runs of configured keys, without
+caching. If one exists, that provider is placed first
 and is the only provider attempted for that cycle. Active runs for different
 checkpoint keys with different providers are invalid durable state and keep
-recovery degraded. This rule also restores affinity after a process restart.
+recovery degraded, as do invalid reads or a removed provider, without network
+access. A transient scan failure triggers a fresh affinity read before rotation
+because that scan may have committed its first page. Periodic scans enforce the
+same rule. This rule also restores affinity after a process restart.
 
 ## Page protocol
 
 For each configured program, the scanner follows this protocol:
 
 1. Read the canonical checkpoint and the active run.
-2. Create a run if none exists, or validate that the active run has the exact
-   checkpoint and pinned provider.
+2. Validate the active run's exact checkpoint and pinned provider, superseding
+   stale active state first; if absent, check retained historical identity.
 3. Read a page using the persisted `before_signature` cursor.
 4. Validate bounds, order, unique signatures, and continuation against the
    last accepted row.
-5. Stop before the old checkpoint; the checkpoint itself is not enqueued as a
-   new discovery.
+5. Stop before the exact old checkpoint; it is not enqueued. A row below the
+   previous slot without that exact match proves a missing boundary. Never
+   enqueue this row or anything older; other signatures at the same slot remain
+   eligible.
 6. Enqueue every newly discovered signature through the existing idempotent
    inbox contract.
-7. Only after every enqueue succeeds, compare-and-swap the run revision and
-   persist the next cursor and counters.
+7. Only after every eligible enqueue succeeds, create the first run or
+   compare-and-swap its revision to persist the eligible tail cursor and counters.
 8. Repeat until the checkpoint is found, provider history is exhausted, or the
    per-pass page budget is reached.
 
@@ -132,26 +156,35 @@ program IDs for an existing transaction signature.
 
 Finding the exact old slot/signature completes the page walk. The scanner then
 CAS-advances the canonical checkpoint from that exact boundary to the frozen
-head captured by the run. The run is marked `COMPLETED` only after the
-checkpoint CAS succeeds. If the process dies after checkpoint advancement but
-before terminalizing the run, the next pass detects that the run is stale and
-marks it `SUPERSEDED`; it never rewinds the checkpoint.
+head and marks the run `COMPLETED` in one repository transaction, resolving
+failure evidence atomically. The current pass observation time is the completion
+and checkpoint-update time and must not precede the run update. A resumed final
+page with eligible rows persists progress before completion; a boundary-only
+page completes without advancing the cursor. If the boundary is in the first
+page with no active run, existing direct checkpoint CAS remains sufficient.
 
 If the first page is empty for a missing checkpoint, existing cold-start
 semantics remain unchanged. If the old checkpoint is non-null and the provider
-returns a short or empty page before finding it, the run becomes `FAILED` with
-`CATCH_UP_WINDOW_EXCEEDED` and the existing durable failure evidence is
-recorded. Pagination corruption remains a typed source failure, never a pause.
+returns a short or empty page (or passes below the previous slot) before finding
+it, eligible progress is persisted first, then existing failure evidence is
+recorded before the exact run becomes `FAILED` with `CATCH_UP_WINDOW_EXCEEDED`.
+An empty result without a run records failure directly. Pagination corruption
+remains a typed source failure, never a pause.
 
 ## Application contracts
 
 `StrictCatchUpRepository` gains focused operations to:
 
-- read or create the active run for an exact checkpoint/provider;
+- read active or retained terminal runs and create an exact checkpoint/provider run;
 - CAS-persist one completed page of progress;
 - mark a stale run superseded;
-- complete or fail a run;
-- purge terminal runs whose four-hour retention expired.
+- complete or fail a run.
+
+The existing maintenance transaction purges terminal runs when
+`state <> 'ACTIVE' AND purge_after <= clock_timestamp()` and returns the typed
+`listenerStrictCatchUpRuns` counter. ACTIVE runs have no purge deadline and are
+never age-purged. Listener grants are SELECT/INSERT/UPDATE/DELETE; retention
+grants are SELECT/DELETE only.
 
 The scanner returns its existing complete result when all configured programs
 are recovered. Page-budget exhaustion throws a typed retryable
@@ -181,9 +214,15 @@ The next scheduled recovery resumes the run.
 ## Observability and readiness
 
 Structured logs expose stable event names, provider ID, checkpoint key, run ID,
-page/signature counters, and state. They never expose signatures, RPC URLs, or
-secrets. API health remains `DEGRADED` while a run is `ACTIVE`; a paused pass is
-visible as recoverable progress, distinct from `UNRECOVERABLE`.
+page/signature counters, and state where diagnostics are emitted. They never
+expose signatures, RPC URLs, or secrets. No new public progress endpoint is
+introduced. `CATCH_UP_PAGE_BUDGET_EXHAUSTED` is a retryable scanner outcome, not
+an inbox terminal error or a durable health reason. After candidate/incumbent
+cleanup, API health remains `DEGRADED`, recovery `REQUIRED`, durable reason
+`RPC_UNAVAILABLE`, with one bounded jitter and no promotion or rotation. A
+single pinned window failure never proves `UNRECOVERABLE`, even for a
+single-provider catalogue: unanimity must cover the entire unpinned catalogue
+with matching failing key and boundary.
 
 After deployment, H2i must still pass an operational soak. A successful code
 path alone is insufficient. The gate requires, over a representative 15-minute

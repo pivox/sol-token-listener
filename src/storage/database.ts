@@ -199,6 +199,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly transactionInboxRecoveries: number;
   readonly listenerCatchUpGaps: number;
   readonly listenerStrictCatchUpFailures: number;
+  readonly listenerStrictCatchUpRuns: number;
   readonly websocketHealthEvidence: number;
   readonly transactionInbox: number;
   readonly apiEventStream: number;
@@ -945,6 +946,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        WHERE resolved_at IS NOT NULL
          AND purge_after <= clock_timestamp()`,
     );
+    const listenerStrictCatchUpRuns = await client.query(
+      `DELETE FROM listener_strict_catch_up_runs
+       WHERE state <> 'ACTIVE'
+         AND purge_after <= clock_timestamp()`,
+    );
     const websocketHealthEvidence = await client.query(
       `UPDATE listener_websocket_health
        SET disconnect_occurred_at = NULL,
@@ -1244,6 +1250,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
       listenerCatchUpGaps: listenerCatchUpGaps.rowCount ?? 0,
       listenerStrictCatchUpFailures: listenerStrictCatchUpFailures.rowCount ?? 0,
+      listenerStrictCatchUpRuns: listenerStrictCatchUpRuns.rowCount ?? 0,
       websocketHealthEvidence: websocketHealthEvidence.rowCount ?? 0,
       transactionInbox: transactionInbox.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
