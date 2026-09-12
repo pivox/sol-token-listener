@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -95,6 +96,14 @@ const pumpFunArchitectureUrl = new URL(
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const systemOverviewUrl = new URL('../docs/system-overview.html', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
+const liveMigrationCatalogUrl = new URL(
+  '../src/execution-migrations/live-catalog.ts',
+  import.meta.url,
+);
+const trackedTradeMigrationUrl = new URL(
+  '../migrations/047_transaction_inbox_tracked_trade_priority.sql',
+  import.meta.url,
+);
 
 void test('documents H2d-H2k external evidence without starting a canary',
   async () => {
@@ -117,6 +126,8 @@ void test('documents H2d-H2k external evidence without starting a canary',
     runbook,
     systemOverview,
     deploymentSmoke,
+    liveMigrationCatalog,
+    trackedTradeMigration,
   ] =
     await Promise.all([
       readFile(packageUrl, 'utf8'),
@@ -137,6 +148,8 @@ void test('documents H2d-H2k external evidence without starting a canary',
       readFile(runbookUrl, 'utf8'),
       readFile(systemOverviewUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
+      readFile(liveMigrationCatalogUrl, 'utf8'),
+      readFile(trackedTradeMigrationUrl),
     ]);
   const packageJson = JSON.parse(packageText) as {
     readonly scripts?: Readonly<Record<string, string>>;
@@ -291,14 +304,14 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.17.6 — 2026-09-09',
+    '**Version :** 1.17.7 — 2026-09-12',
     'runbook version',
   );
-  assert.match(runbook, /Le head de migration est 046\./u);
-  assert.match(systemOverview, /La migration 046 est le head/u);
+  assert.match(runbook, /Le head de migration est 047\./u);
+  assert.match(systemOverview, /La migration 047 est le head/u);
   assertContainsExactlyOnce(
     pumpFunArchitecture,
-    '**Version :** 1.1.2 — 2026-09-08',
+    '**Version :** 1.1.3 — 2026-09-12',
     'Pump.fun architecture version',
   );
   for (const document of [pumpFunArchitecture, runbook]) {
@@ -309,7 +322,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
   }
   assertContainsExactlyOnce(
     systemOverview,
-    '<meta name="doc-version" content="1.1.1">',
+    '<meta name="doc-version" content="1.1.2">',
     'system overview version',
   );
   for (const document of [
@@ -493,8 +506,25 @@ void test('documents H2d-H2k external evidence without starting a canary',
   assert.equal((deploymentSmoke.match(/'044_transaction_inbox_launch_priority\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'045_execution_wallet_snapshot_refresh\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'046_listener_strict_catch_up_runs\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'047_transaction_inbox_tracked_trade_priority\.sql'/gu) ?? []).length, 1);
+  const trackedTradeMigrationHash = createHash('sha256').update(trackedTradeMigration).digest('hex');
+  assert.notEqual(trackedTradeMigrationHash, '0'.repeat(64));
   assert.equal(
-  /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n {2}'042_execution_preflight_intent_preparation\.sql',\n {2}'043_execution_intent_causal_lineage\.sql',\n {2}'044_transaction_inbox_launch_priority\.sql',\n {2}'045_execution_wallet_snapshot_refresh\.sql',\n {2}'046_listener_strict_catch_up_runs\.sql',\n\]\);/u.test(deploymentSmoke),
+    (liveMigrationCatalog.match(/^047_transaction_inbox_tracked_trade_priority\.sql\b/gmu)
+      ?? []).length,
+    1,
+    'live migration catalogue contains migration 047 once',
+  );
+  assert.equal(
+    (liveMigrationCatalog.match(new RegExp(
+      `^047_transaction_inbox_tracked_trade_priority\\.sql ${trackedTradeMigrationHash}$`,
+      'gmu',
+    )) ?? []).length,
+    1,
+    'live migration catalogue contains the exact 047 bytes hash once',
+  );
+  assert.equal(
+  /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n {2}'042_execution_preflight_intent_preparation\.sql',\n {2}'043_execution_intent_causal_lineage\.sql',\n {2}'044_transaction_inbox_launch_priority\.sql',\n {2}'045_execution_wallet_snapshot_refresh\.sql',\n {2}'046_listener_strict_catch_up_runs\.sql',\n {2}'047_transaction_inbox_tracked_trade_priority\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );

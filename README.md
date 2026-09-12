@@ -9,6 +9,27 @@ combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
 leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
 secondaire isolé; son code n'est pas activé par ce bootstrap.
 
+## Priorité des trades Pump.fun suivis (#102)
+
+La migration `047_transaction_inbox_tracked_trade_priority.sql` ajoute l'indice
+fermé `PUMPFUN_TRADE` et sa priorité durable `TRACKED_TRADE`. PostgreSQL compare
+le mint public indiqué à la projection canonique : un trade d'un lancement
+actif reste réclamable dans la cohorte urgente, tandis qu'un trade explicitement
+non suivi devient `DEFERRED` sans récupération de corps RPC. Cette décision est
+réversible lorsqu'une création tardive rend le mint actif. Le décodeur complet
+reste l'unique autorité métier et aucun log WebSocket n'est persisté.
+
+Une ligne `DEFERRED` n'appartient pas au backlog actionnable et devient
+purgeable exactement quatre heures après la décision ; son volume forme le
+backlog filtré observé séparément pendant H2i. Le gate de quinze minutes exige
+zéro réponse 429, un backlog actionnable non croissant, le superviseur
+`RUNNING` et un p95 création vers BUY/SELL inférieur ou égal à 45 secondes.
+La migration 047 prend des verrous `ACCESS EXCLUSIVE` lors du remplacement de
+l'enum, des contraintes et de l'index : arrêter les anciennes réplicas, prévoir
+une fenêtre de maintenance, appliquer la migration, rejouer le provisioning des
+rôles puis démarrer le nouveau binaire. Cette procédure n'active aucun chemin
+d'exécution et l'état reste `CANARY_NOT_STARTED`.
+
 Le parcours paper E2E est opt-in. Après une qualification sans blocker, un
 worker durable produit un candidat, ouvre une position simulée, compte les
 achats externes confirmés après l'entrée puis cote et simule la sortie. Avec
@@ -64,7 +85,7 @@ frontières et l'état non activé.
 `executor:preflight-source:start` reçoit uniquement le
 `EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID` produit par H2k-b, reconstruit et
 vérifie toute la lignée run/pair/candidate/assessment/artifact avant d'écrire
-un fichier owner-only hors Git. Le head de migration est 044.
+un fichier owner-only hors Git. Le head de migration est 047.
 
 #51-H2k-b ajoute la préparation one-shot exacte : sélection d'une seule paire
 target/probe finalisée, dry-run non consommant, simulation du probe, puis run

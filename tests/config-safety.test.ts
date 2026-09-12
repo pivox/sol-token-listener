@@ -1069,6 +1069,28 @@ void test('resumable strict recovery documents durable pause, private affinity a
   assert.match(design, /sameFrontier/u);
 });
 
+void test('tracked Pump.fun trade priority documents the closed H2i operational gates', async () => {
+  const files = [
+    '../README.md', '../docs/architecture/pumpfun-v1.md',
+    '../docs/operations/executor-live-canary.md', '../docs/system-overview.html',
+  ] as const;
+  const documents = await Promise.all(
+    files.map((file) => readFile(new URL(file, import.meta.url), 'utf8')),
+  );
+  for (const [index, document] of documents.entries()) {
+    for (const term of ['PUMPFUN_TRADE', 'DEFERRED', 'quatre heures', 'CANARY_NOT_STARTED']) {
+      assert.ok(document.includes(term), `${files[index]} misses ${term}`);
+    }
+  }
+  const documentation = documents.join('\n');
+  for (const term of [
+    'backlog actionnable', 'backlog filtré', 'H2i', 'ACCESS EXCLUSIVE',
+  ]) assert.ok(documentation.includes(term), `tracked trade documentation misses ${term}`);
+  assert.match(documentation, /superviseur[^.]*`RUNNING`/iu);
+  assert.match(documentation, /p95[^.]*45 secondes/iu);
+  assert.match(documentation, /zéro[^.]*429/iu);
+});
+
 void test('HTTP RPC failover documentation states the bounded production and soak contract', async () => {
   const [readme, operations] = await Promise.all([
     readFile(new URL('../README.md', import.meta.url), 'utf8'),

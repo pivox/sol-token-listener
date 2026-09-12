@@ -1,6 +1,14 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.6 — 2026-09-09
+**Version :** 1.17.7 — 2026-09-12
+
+La version 1.17.7 ajoute la migration 047. Le hint fermé `PUMPFUN_TRADE`
+transporte uniquement un mint public ; PostgreSQL le classe `TRACKED_TRADE` si
+le lancement canonique est actif ou `DEFERRED` s'il est absent ou terminal.
+Une ligne `DEFERRED` ne reçoit ni lease, ni tentative, ni snapshot et ne
+déclenche aucune récupération de corps RPC. Une création tardive peut la
+réactiver, et la décision différée est purgeable exactement quatre heures après
+sa prise. Le décodeur RPC complet reste la seule autorité métier.
 
 La version 1.17.6 permet de rafraîchir H2d pour la même génération wallet tant
 que l'état de risque n'a pas changé. Chaque observation reste immuable, la
@@ -13,14 +21,34 @@ La version 1.17.5 priorise durablement les créations Pump.fun signalées par le
 L'indice ne remplace jamais le décodage RPC, ne persiste aucun log WebSocket et
 n'ajoute aucune capacité wallet, armement, signature ou soumission.
 
-Le backlog par classe se mesure sans lire de payload ni de logs :
+Le backlog actionnable et le backlog filtré se mesurent séparément sans lire de
+payload ni de logs :
 
 ```sql
-SELECT ingestion_priority, processing_status, count(*)::BIGINT AS count
-FROM chain_transaction_inbox
-GROUP BY ingestion_priority, processing_status
-ORDER BY ingestion_priority DESC, processing_status;
+SELECT
+  count(*) FILTER (
+    WHERE processing_status IN ('PENDING', 'PROCESSING')
+       OR (processing_status = 'FAILED' AND error_retryable = TRUE
+           AND retry_exhausted_at IS NULL AND next_attempt_at IS NOT NULL)
+  )::BIGINT AS actionable_backlog,
+  count(*) FILTER (WHERE processing_status = 'DEFERRED')::BIGINT
+    AS filtered_backlog
+FROM chain_transaction_inbox;
 ```
+
+Pendant le probe H2i de quinze minutes, relever ces deux compteurs à intervalles
+réguliers. Le gate exige zéro réponse 429, un backlog actionnable non croissant,
+un superviseur `RUNNING` et un p95 création vers BUY/SELL inférieur ou égal à
+45 secondes. Le backlog filtré confirme la charge RPC évitée mais n'est pas du
+travail en attente et ne doit jamais être additionné au backlog actionnable.
+
+La migration 047 remplace l'enum de priorité, élargit les contraintes, renomme
+le compteur du scheduler et reconstruit l'index de claim. Ces opérations prennent
+des verrous `ACCESS EXCLUSIVE` : arrêter les anciennes réplicas, réserver une
+fenêtre de maintenance, appliquer les migrations, rejouer
+`scripts/provision-executor-roles.sql`, puis démarrer le nouveau binaire. Ne pas
+faire cohabiter un binaire pré-047 avec le schéma renommé. Ce rollout ne lance
+aucun canary et son constat reste `CANARY_NOT_STARTED`.
 
 La version 1.17.4 impose `LISTENER_INGESTION_SCOPE=launchpad-only` pour le
 probe H2i. La valeur par défaut compatible reste `launchpad-and-market` pour
@@ -49,7 +77,7 @@ aucune procédure ni frontière de sécurité.
 
 H2k-b reste disponible mais désactivé par défaut : son
 runner one-shot prépare une paire target/probe exacte et H2h v2 l'exporte par
-`preparationRunId`. Le head de migration est 046. Aucune clé n'est chargée,
+`preparationRunId`. Le head de migration est 047. Aucune clé n'est chargée,
 aucune transaction n'est signée, armée ou soumise par H2k-b, et le canary
 reste non démarré.
 
