@@ -113,6 +113,24 @@ export class SolanaRpcClient {
     return Object.freeze([...block.signatures]);
   }
 
+  /** Complete slot source for the experimental block transaction locator. */
+  async getBlockTransactions(
+    slot: bigint,
+    confirmationStatus: Exclude<LegacyConfirmationStatus, 'ORPHANED'>,
+  ): Promise<unknown> {
+    if (typeof slot !== 'bigint'
+      || slot < 0n
+      || slot > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new TypeError('Solana block slot is invalid.');
+    }
+    return this.http.getBlock(Number(slot), {
+      commitment: rpcFinality(confirmationStatus),
+      transactionDetails: 'full',
+      maxSupportedTransactionVersion: 0,
+      rewards: false,
+    });
+  }
+
   async getHistoryStatuses(signatures: readonly string[]): Promise<readonly ({
     readonly slot: bigint;
     readonly confirmationStatus: 'processed' | 'confirmed' | 'finalized';

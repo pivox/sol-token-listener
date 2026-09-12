@@ -168,6 +168,44 @@ void test('uses web3 getBlockSignatures so getBlock receives its official signat
   }]);
 });
 
+void test('uses web3 getBlock with the exact full-transaction source request', async () => {
+  const calls: { readonly method: string; readonly params: readonly unknown[] }[] = [];
+  const fetch: FetchFn = async (_input, init) => {
+    const request = parseRequestBody(init) as {
+      readonly id: string;
+      readonly method: string;
+      readonly params: readonly unknown[];
+    };
+    calls.push({ method: request.method, params: request.params });
+    return jsonRpcResponse(request.id, {
+      blockhash: '11111111111111111111111111111111',
+      previousBlockhash: '11111111111111111111111111111111',
+      parentSlot: 3,
+      blockHeight: 4,
+      transactions: [],
+      blockTime: null,
+    });
+  };
+  const rpc = new SolanaRpcClient({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze(['https://fallback.invalid/rpc']),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+    finality: 'finalized',
+  }, { fetch });
+
+  const block = await rpc.getBlockTransactions(4n, 'FINALIZED');
+
+  assert.ok(block);
+  assert.deepEqual(calls, [{
+    method: 'getBlock',
+    params: [4, {
+      commitment: 'finalized', transactionDetails: 'full',
+      maxSupportedTransactionVersion: 0, rewards: false,
+    }],
+  }]);
+});
+
 void test('rejects non-bigint and out-of-range block slots before any RPC request', async () => {
   let fetchCalls = 0;
   const fetch: FetchFn = async (_input, init) => {
