@@ -1,8 +1,8 @@
 # Resumable strict catch-up design
 
-Status: approved for implementation  
+Status: approved for implementation
 Version: 3
-Issue: #100  
+Issue: #100
 Scope: listener ingestion only; no signer, submission, wallet loading, or armament
 
 ## Revision history and implementation decisions

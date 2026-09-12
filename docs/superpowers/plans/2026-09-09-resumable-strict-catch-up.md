@@ -61,7 +61,7 @@ const run = createStrictCatchUpRun({
 
 - [ ] **Step 2: Run the domain test and verify it fails because the module is absent**
 
-Run: `npm run build && node --test dist/tests/strict-catch-up-run.test.js`  
+Run: `npm run build && node --test dist/tests/strict-catch-up-run.test.js`
 Expected: build fails with `Cannot find module '../src/domain/strict-catch-up-run.js'`.
 
 - [ ] **Step 3: Implement immutable types and constructors**
@@ -139,8 +139,8 @@ and named indexes before accepting replay.
 
 - [ ] **Step 6: Run focused tests and commit**
 
-Run: `npm run build && node --test dist/tests/strict-catch-up-run.test.js dist/tests/strict-catch-up-run-migration.test.js`  
-Expected: all pass, using `TEST_DATABASE_URL` for PostgreSQL cases.  
+Run: `npm run build && node --test dist/tests/strict-catch-up-run.test.js dist/tests/strict-catch-up-run-migration.test.js`
+Expected: all pass, using `TEST_DATABASE_URL` for PostgreSQL cases.
 Commit: `feat(ingestion): define resumable catch-up runs (#100)`
 
 ### Task 2: Add advisory-locked repository transitions
@@ -190,8 +190,8 @@ never silently adopt a different provider/frontier.
 
 - [ ] **Step 4: Run repository tests including real PostgreSQL and commit**
 
-Run: `npm run build && node --test dist/tests/transaction-inbox.repository.test.js dist/tests/strict-catch-up-run-migration.test.js`  
-Expected: all pass.  
+Run: `npm run build && node --test dist/tests/transaction-inbox.repository.test.js dist/tests/strict-catch-up-run-migration.test.js`
+Expected: all pass.
 Commit: `feat(ingestion): persist catch-up page progress (#100)`
 
 ### Task 3: Make the scanner page-resumable
@@ -251,8 +251,8 @@ advance the cursor.
 
 - [ ] **Step 5: Run scanner/recovery tests and commit**
 
-Run: `npm run build && node --test dist/tests/strict-catch-up-scanner.test.js dist/tests/transaction-ingestion-recovery.test.js`  
-Expected: all pass.  
+Run: `npm run build && node --test dist/tests/strict-catch-up-scanner.test.js dist/tests/transaction-ingestion-recovery.test.js`
+Expected: all pass.
 Commit: `feat(ingestion): resume strict scans page by page (#100)`
 
 ### Task 4: Keep supervisor recovery pinned and honest
@@ -287,8 +287,8 @@ fallback, promote a candidate, or set `#unrecoverable`.
 
 - [ ] **Step 4: Wire the repository-backed affinity and run tests**
 
-Run: `npm run build && node --test dist/tests/websocket-failover-supervisor.test.js dist/tests/websocket-failover-supervisor.integration.test.js`  
-Expected: all pass.  
+Run: `npm run build && node --test dist/tests/websocket-failover-supervisor.test.js dist/tests/websocket-failover-supervisor.integration.test.js`
+Expected: all pass.
 Commit: `fix(listener): resume the pinned catch-up provider (#100)`
 
 ### Task 5: Retention, migration inventory, documentation, and full verification
@@ -351,9 +351,9 @@ PostgreSQL 16 test URL and finish with no leaked schemas.
 
 - [ ] **Step 6: Review the diff and commit**
 
-Run: `git diff --check && git status --short && git diff --stat`  
+Run: `git diff --check && git status --short && git diff --stat`
 Expected: only issue #100 files, no secrets, generated runtime evidence, wallet
-files, or root-worktree changes.  
+files, or root-worktree changes.
 Commit: `docs(ingestion): document resumable strict recovery (#100)`
 
 ### Task 6: Deliver with two review cycles maximum
@@ -392,4 +392,3 @@ page-size 1000, and observe recovery plus a 15-minute capacity soak. Stop before
 wallet conversion, signer loading, armament, or transaction submission. If
 backlog does not shrink or creation-to-pair p95 exceeds 45 seconds, open the
 separate tracked-mint trade-priority issue instead of weakening gates.
-
