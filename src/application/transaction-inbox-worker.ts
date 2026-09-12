@@ -193,7 +193,7 @@ export class TransactionInboxWorker {
       assertValidClaimedTransaction(claimed);
     } catch {
       if (hasPotentialCorruptSnapshot(claimed)) {
-        return this.failClaim(claimed, normalizationFailure());
+        return this.processClaim(claimed, normalizationFailure());
       }
       this.reportDegraded();
       throw new TransactionInboxWorkerError('claim');
@@ -201,11 +201,37 @@ export class TransactionInboxWorker {
     return this.processClaim(claimed);
   }
 
-  private async processClaim(claim: ClaimedTransaction): Promise<TransactionInboxRunResult> {
+  private async processClaim(
+    claim: ClaimedTransaction,
+    invalidSnapshot: IngestionFailure | null = null,
+  ): Promise<TransactionInboxRunResult> {
+    const lease = new LeaseGuard(
+      claim,
+      this.repository,
+      this.scheduler,
+      this.renewalIntervalMs,
+      this.leaseDurationMs,
+      () => this.readNow(),
+      () => { this.reportDegraded(); },
+      () => { this.reportCleanupFailure(); },
+    );
+    try {
+      if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+      if (invalidSnapshot !== null) return await this.failClaim(claim, invalidSnapshot, lease);
+      return await this.processOwnedClaim(claim, lease);
+    } finally {
+      await lease.finish();
+    }
+  }
+
+  private async processOwnedClaim(
+    claim: ClaimedTransaction,
+    lease: LeaseGuard,
+  ): Promise<TransactionInboxRunResult> {
     let transaction: NormalizedTransaction;
     if (claim.normalizedTransaction === null) {
       if (claim.confirmationStatus === 'orphaned') {
-        return this.failClaim(claim, normalizationFailure());
+        return this.failClaim(claim, normalizationFailure(), lease);
       }
       try {
         transaction = await this.locator.locate(Object.freeze({
@@ -214,8 +240,9 @@ export class TransactionInboxWorker {
           confirmationStatus: legacyStatus(claim.confirmationStatus),
         }));
       } catch (error) {
-        return this.failClaim(claim, locatorFailure(error));
+        return this.failClaim(claim, locatorFailure(error), lease);
       }
+      if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
       let view: NormalizedTransaction;
       try {
         const snapshot = createDurableTransactionSnapshot(transaction);
@@ -228,8 +255,9 @@ export class TransactionInboxWorker {
           claim.confirmationStatus,
         );
       } catch {
-        return this.failClaim(claim, normalizationFailure());
+        return this.failClaim(claim, normalizationFailure(), lease);
       }
+      if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
       try {
         await this.repository.saveSnapshot(
           claim.signature,
@@ -248,21 +276,11 @@ export class TransactionInboxWorker {
           claim.confirmationStatus,
         );
       } catch {
-        return this.failClaim(claim, normalizationFailure());
+        return this.failClaim(claim, normalizationFailure(), lease);
       }
     }
 
-    const lease = new LeaseGuard(
-      claim,
-      this.repository,
-      this.scheduler,
-      this.renewalIntervalMs,
-      this.leaseDurationMs,
-      () => this.readNow(),
-      () => { this.reportDegraded(); },
-      () => { this.reportCleanupFailure(); },
-    );
-    if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+    if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
 
     let pipelineFailed: IngestionFailure | null = null;
     try {
@@ -290,13 +308,9 @@ export class TransactionInboxWorker {
   private async failClaim(
     claim: ClaimedTransaction,
     failure: IngestionFailure,
+    lease: LeaseGuard,
   ): Promise<TransactionInboxRunResult> {
-    const owned = await renewOnce(
-      claim,
-      this.repository,
-      this.leaseDurationMs,
-      () => this.readNow(),
-    );
+    const owned = await lease.finish();
     if (!owned) {
       this.reportDegraded();
       return frozenResult({ kind: 'lease-lost', signature: claim.signature });
@@ -383,6 +397,7 @@ export class TransactionInboxWorker {
 class LeaseGuard {
   private handle: unknown = null;
   private pending: Promise<void> | null = null;
+  private finishPromise: Promise<boolean> | null = null;
   private stopped = false;
   private owned = true;
   private untilMs: number;
@@ -401,23 +416,34 @@ class LeaseGuard {
   }
 
   public async start(): Promise<boolean> {
-    await this.renew();
-    if (this.owned) this.schedule();
+    await this.startRenewal();
     return this.owned;
   }
 
-  public async finish(): Promise<boolean> {
+  public finish(): Promise<boolean> {
+    if (this.finishPromise !== null) return this.finishPromise;
     this.stopped = true;
-    if (this.handle !== null) {
-      try {
-        this.scheduler.cancel(this.handle);
-      } catch {
-        this.owned = false;
-        this.cleanupFailed();
-      }
-    }
-    this.handle = null;
+    this.cancelScheduledRenewal();
+    const operation = this.checkOwnership();
+    this.finishPromise = operation;
+    return operation;
+  }
+
+  public async checkOwnership(): Promise<boolean> {
     if (this.pending !== null) await this.pending;
+    if (!this.owned) return false;
+    let expired = false;
+    try {
+      expired = this.now() >= this.untilMs;
+    } catch {
+      this.owned = false;
+      this.lost();
+      return false;
+    }
+    if (expired) {
+      this.cancelScheduledRenewal();
+      await this.startRenewal();
+    }
     return this.owned;
   }
 
@@ -426,18 +452,35 @@ class LeaseGuard {
     try {
       this.handle = this.scheduler.schedule(() => {
         this.handle = null;
-        const renewal = this.renew();
-        this.pending = renewal;
-        void renewal.then(() => {
-          if (this.pending === renewal) this.pending = null;
-          this.schedule();
-        });
+        void this.startRenewal();
       }, this.intervalMs);
     } catch {
       this.handle = null;
       this.owned = false;
       this.lost();
     }
+  }
+
+  private startRenewal(): Promise<void> {
+    if (this.pending !== null) return this.pending;
+    const renewal = this.renew();
+    this.pending = renewal;
+    void renewal.then(() => {
+      if (this.pending === renewal) this.pending = null;
+      this.schedule();
+    });
+    return renewal;
+  }
+
+  private cancelScheduledRenewal(): void {
+    if (this.handle === null) return;
+    try {
+      this.scheduler.cancel(this.handle);
+    } catch {
+      this.owned = false;
+      this.cleanupFailed();
+    }
+    this.handle = null;
   }
 
   private async renew(): Promise<void> {
@@ -449,21 +492,6 @@ class LeaseGuard {
       this.owned = false;
       this.lost();
     }
-  }
-}
-
-async function renewOnce(
-  claim: ClaimedTransaction,
-  repository: TransactionInboxWorkerRepository,
-  leaseDurationMs: number,
-  now: () => number,
-): Promise<boolean> {
-  try {
-    const until = Math.max(claim.leaseExpiresAtMs, safeAdd(now(), leaseDurationMs));
-    await repository.renewLease(claim.signature, claim.leaseToken, until);
-    return true;
-  } catch {
-    return false;
   }
 }
 

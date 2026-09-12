@@ -57,7 +57,7 @@ void test('claims one row and processes it in durable order with claim finality'
   const result = await worker.runOnce();
 
   assert.deepEqual(calls, [
-    'claim:1000:10', 'locate', 'save:sig:lease', 'renew:sig:lease:11000',
+    'claim:1000:10', 'renew:sig:lease:11000', 'locate', 'save:sig:lease',
     'pipeline', 'processed:sig:lease:confirmed',
   ]);
   assert.deepEqual(result, { kind: 'processed', signature: 'sig' });
@@ -88,6 +88,89 @@ void test('promotes saved snapshots to one immutable finalized or orphaned pipel
 
     assert.deepEqual(await worker.runOnce(), { kind: 'processed', signature: tx.signature });
     assert.deepEqual(calls, ['renew', 'pipeline', `processed:${status}`]);
+  }
+});
+
+void test('revalidates a locally expired lease before processing a saved snapshot', async () => {
+  for (const renewalSucceeds of [false, true]) {
+    let now = 1_000;
+    let renewals = 0;
+    let pipelines = 0;
+    let processed = 0;
+    let failed = 0;
+    const tx = normalized('saved-stall');
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() {
+        return claim(tx.signature, tx.slot, 'processed', createDurableTransactionSnapshot(tx));
+      },
+      async renewLease() {
+        renewals += 1;
+        if (renewals === 1) {
+          now = 12_000;
+          return;
+        }
+        if (!renewalSucceeds) throw new Error('stale token');
+      },
+      async markProcessed() { processed += 1; },
+      async markFailed() { failed += 1; },
+    }), locator(), { async process() { pipelines += 1; } }, options({ now: () => now }));
+
+    const result = await worker.runOnce();
+
+    assert.equal(renewals, 2);
+    assert.equal(pipelines, renewalSucceeds ? 1 : 0);
+    assert.equal(processed, renewalSucceeds ? 1 : 0);
+    assert.equal(failed, 0);
+    assert.deepEqual(result, renewalSucceeds
+      ? { kind: 'processed', signature: tx.signature }
+      : { kind: 'lease-lost', signature: tx.signature });
+  }
+});
+
+void test('serializes an expired checkpoint renewal with an overdue timer', async () => {
+  let overdueCallback: (() => void) | null = null;
+  let cancellations = 0;
+  const scheduler: TransactionInboxWorkerScheduler = {
+    schedule(callback) {
+      overdueCallback = callback;
+      return Object.freeze({});
+    },
+    cancel() { cancellations += 1; },
+  };
+  let now = 1_000;
+  let renewals = 0;
+  let releaseRenewal!: () => void;
+  const renewalBlocked = new Promise<void>((resolve) => { releaseRenewal = resolve; });
+  const tx = normalized('saved-overdue');
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() {
+      return claim(tx.signature, tx.slot, 'processed', createDurableTransactionSnapshot(tx));
+    },
+    async renewLease() {
+      renewals += 1;
+      if (renewals === 1) {
+        now = 12_000;
+        return;
+      }
+      await renewalBlocked;
+    },
+  }), locator(), pipeline(), options({ now: () => now, scheduler }));
+
+  const running = worker.runOnce();
+  try {
+    await eventually(() => renewals === 2);
+    const callback = overdueCallback as (() => void) | null;
+    assert.notEqual(callback, null);
+    callback?.();
+    await Promise.resolve();
+    assert.equal(renewals, 2);
+    releaseRenewal();
+    assert.deepEqual(await running, { kind: 'processed', signature: tx.signature });
+    assert.ok(cancellations >= 1);
+  } finally {
+    releaseRenewal();
+    await running;
+    await worker.close();
   }
 });
 
@@ -136,13 +219,21 @@ void test('trusts only consumed internal locator failures and redacts public con
     { locator: { async locate() { throw Object.create(TransactionIndexNotFoundError.prototype); } }, failure: failure('RPC_TRANSIENT', 'TransactionLocatorError', true) },
   ]) {
     let marked: IngestionFailure | null = null;
+    let renewals = 0;
+    const scheduler = new ManualScheduler();
     const worker = new TransactionInboxWorker(repositoryWith({
       async claim() { return claim(); },
+      async renewLease() { renewals += 1; },
       async markFailed(_signature, _token, value) { marked = value; },
-    }), scenario.locator, pipeline(), options());
+    }), { async locate(target) {
+      assert.equal(scheduler.activeCount, 1);
+      return scenario.locator.locate(target);
+    } }, pipeline(), options({ scheduler }));
     assert.deepEqual(await worker.runOnce(), { kind: 'failed', signature: 'sig', failure: scenario.failure });
     assert.deepEqual(marked, scenario.failure);
     assert.ok(Object.isFrozen(marked));
+    assert.equal(renewals, 1);
+    assert.equal(scheduler.activeCount, 0);
   }
   assert.ok(consumedInternal);
   let replayed: IngestionFailure | null = null;
@@ -236,6 +327,108 @@ void test('renews during a long pipeline, uses monotonic expiry, and cleans the 
   assert.equal(scheduler.activeCount, 0);
 });
 
+void test('renews while hydration is blocked and close waits for hydration cleanup', async () => {
+  const scheduler = new ManualScheduler();
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let locating = false;
+  let renewals = 0;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim(); },
+    async renewLease() { renewals += 1; },
+  }), { async locate() { locating = true; await blocked; return normalized(); } }, pipeline(), options({ scheduler }));
+  const running = worker.runOnce();
+  try {
+    await eventually(() => locating);
+    assert.equal(scheduler.activeCount, 1);
+    await scheduler.fire();
+    assert.equal(renewals, 2);
+    let closed = false;
+    const closing = worker.close().then(() => { closed = true; });
+    await Promise.resolve();
+    assert.equal(closed, false);
+    release();
+    assert.deepEqual(await running, { kind: 'processed', signature: 'sig' });
+    await closing;
+    assert.equal(scheduler.activeCount, 0);
+    assert.equal(worker.state, 'STOPPED');
+  } finally {
+    release();
+    await running;
+    await worker.close();
+  }
+});
+
+void test('lease loss during hydration suppresses every durable write for success and failure', async () => {
+  for (const locatorThrows of [false, true]) {
+    const scheduler = new ManualScheduler();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let locating = false;
+    let renewals = 0;
+    const writes: string[] = [];
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() { return claim(); },
+      async renewLease() { renewals += 1; if (renewals > 1) throw new Error('lost'); },
+      async saveSnapshot() { writes.push('snapshot'); },
+      async markFailed() { writes.push('failed'); },
+      async markProcessed() { writes.push('processed'); },
+    }), { async locate() {
+      locating = true;
+      await blocked;
+      if (locatorThrows) throw new Error('locator');
+      return normalized();
+    } }, { async process() { writes.push('pipeline'); } }, options({ scheduler }));
+    const running = worker.runOnce();
+    try {
+      await eventually(() => locating);
+      assert.equal(scheduler.activeCount, 1);
+      await scheduler.fire();
+      release();
+      assert.deepEqual(await running, { kind: 'lease-lost', signature: 'sig' });
+      assert.deepEqual(writes, []);
+      assert.equal(scheduler.activeCount, 0);
+    } finally {
+      release();
+      await running;
+      await worker.close();
+    }
+  }
+});
+
+void test('awaits an in-flight renewal before persisting a hydrated snapshot', async () => {
+  const scheduler = new ManualScheduler();
+  let rejectRenewal!: (error: Error) => void;
+  const renewal = new Promise<void>((_resolve, reject) => { rejectRenewal = reject; });
+  void renewal.catch(() => {});
+  let renewals = 0;
+  const writes: string[] = [];
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim(); },
+    async renewLease() { renewals += 1; if (renewals > 1) await renewal; },
+    async saveSnapshot() { writes.push('snapshot'); },
+    async markFailed() { writes.push('failed'); },
+    async markProcessed() { writes.push('processed'); },
+  }), { async locate() {
+    if (scheduler.activeCount > 0) await scheduler.fire();
+    return normalized();
+  } }, { async process() { writes.push('pipeline'); } }, options({ scheduler }));
+  const running = worker.runOnce();
+  try {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    // The locator has returned, but the renewal has not yet proved ownership.
+    assert.deepEqual(writes, []);
+    rejectRenewal(new Error('lost'));
+    assert.deepEqual(await running, { kind: 'lease-lost', signature: 'sig' });
+    assert.deepEqual(writes, []);
+    assert.equal(scheduler.activeCount, 0);
+  } finally {
+    rejectRenewal(new Error('lost'));
+    await running;
+    await worker.close();
+  }
+});
+
 void test('does not complete or fail with a lost lease token', async () => {
   const scheduler = new ManualScheduler();
   let release!: () => void;
@@ -263,17 +456,50 @@ void test('does not complete or fail with a lost lease token', async () => {
   assert.equal(worker.state, 'STOPPED');
 });
 
+void test('lease loss during snapshot projection suppresses snapshot and failure persistence', async () => {
+  for (const corruptProjection of [false, true]) {
+    const scheduler = new ManualScheduler();
+    let renewals = 0;
+    const writes: string[] = [];
+    const tx = normalized();
+    Object.defineProperty(tx, 'instructions', { get() {
+      void scheduler.fire();
+      if (corruptProjection) throw new Error('projection');
+      return [];
+    } });
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() { return claim(); },
+      async renewLease() { renewals += 1; if (renewals > 1) throw new Error('lost'); },
+      async saveSnapshot() { writes.push('snapshot'); },
+      async markFailed() { writes.push('failed'); },
+      async markProcessed() { writes.push('processed'); },
+    }), { async locate() { return tx; } }, {
+      async process() { writes.push('pipeline'); },
+    }, options({ scheduler }));
+    assert.deepEqual(await worker.runOnce(), { kind: 'lease-lost', signature: 'sig' });
+    assert.deepEqual(writes, []);
+    assert.equal(renewals, 2);
+    assert.equal(scheduler.activeCount, 0);
+  }
+});
+
 void test('stops before pipeline when the initial ownership guard loses its lease', async () => {
   let pipelines = 0;
   let completions = 0;
+  let locates = 0;
+  const writes: string[] = [];
   const worker = new TransactionInboxWorker(repositoryWith({
     async claim() { return claim(); },
     async renewLease() { throw new Error('stale'); },
     async markProcessed() { completions += 1; },
-  }), locator(), { async process() { pipelines += 1; } }, options());
+    async saveSnapshot() { writes.push('snapshot'); },
+    async markFailed() { writes.push('failed'); },
+  }), { async locate() { locates += 1; return normalized(); } }, { async process() { pipelines += 1; } }, options());
   assert.deepEqual(await worker.runOnce(), { kind: 'lease-lost', signature: 'sig' });
   assert.equal(pipelines, 0);
   assert.equal(completions, 0);
+  assert.equal(locates, 0);
+  assert.deepEqual(writes, []);
   assert.equal(worker.state, 'DEGRADED');
 });
 
@@ -403,13 +629,14 @@ void test('durable mutation failures are redacted, degraded, and never double-co
     }), locateError: new RpcTransientError() },
   ]) {
     let processed = 0;
+    const scheduler = new ManualScheduler();
     const repository = { ...scenario.repository, async markProcessed() { processed += 1; } };
     const worker = new TransactionInboxWorker(repository, {
       async locate(target) {
         if (scenario.locateError !== undefined) throw scenario.locateError;
         return normalized(target.signature, target.slot, target.confirmationStatus);
       },
-    }, pipeline(), options());
+    }, pipeline(), options({ scheduler }));
     await assert.rejects(worker.runOnce(), (error: unknown) => {
       assert.ok(error instanceof TransactionInboxWorkerError);
       assert.equal(error.stage, scenario.stage);
@@ -418,6 +645,7 @@ void test('durable mutation failures are redacted, degraded, and never double-co
     });
     assert.equal(processed, 0);
     assert.equal(worker.state, 'DEGRADED');
+    assert.equal(scheduler.activeCount, 0);
   }
 });
 
