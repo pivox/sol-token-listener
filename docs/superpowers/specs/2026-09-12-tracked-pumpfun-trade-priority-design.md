@@ -1,6 +1,6 @@
 # Priorité durable des trades Pump.fun suivis
 
-**Version :** 1.0.1 — 2026-09-12
+**Version :** 1.0.2 — 2026-09-12
 
 ## Contexte
 
@@ -42,6 +42,12 @@ qu'une transaction composée création + achat initial soit récupérée et déc
 en entier. Si le tableau, le base64, le discriminator, la longueur ou la clé
 publique est ambigu, le résultat est `NONE`. `NONE` reste une transaction
 normale et n'est jamais filtré.
+
+Le marqueur exact `Log truncated`, émis sans préfixe par le runtime Solana
+lorsque son budget de logs est épuisé, rend également l'indice ambigu et force
+`NONE`. Un `CreateEvent` complet observé avant ce marqueur garde toutefois la
+priorité. Le texte applicatif préfixé `Program log: Log truncated` reste un log
+ordinaire et ne doit pas être confondu avec le marqueur du runtime.
 
 L'indice n'est pas une preuve métier. Le décodeur de transaction complète reste
 la seule autorité de `TokenLaunchDetected` et
@@ -108,6 +114,20 @@ pipeline. Le replay idempotent de la transaction de création recommence la
 synchronisation. Un trade arrivé avant sa création est donc récupéré sans
 course silencieuse.
 
+La purge et les écritures de cette projection partagent un verrou de rétention
+transactionnel versionné `foundation-retention-fence:v1`. La purge prend ce
+verrou en mode exclusif avant toute autre ressource ; `record`, `enqueue` et
+`syncTrackedMint` le prennent en mode partagé comme premier verrou. L'ordre est
+donc uniforme et auditable : fence de fondation, puis signature ou mint, puis
+lignes métier.
+
+La purge conserve en outre toute ligne `DEFERRED/PUMPFUN_TRADE` expirée dont le
+mint possède encore un lancement actif. Cette protection couvre l'intervalle
+entre le commit de la création et sa synchronisation, y compris après un crash.
+Elle ne décale aucun timestamp : les lignes absentes ou terminales restent
+supprimables exactement quatre heures après leur décision différée, tandis
+qu'une ligne active perd sa rétention dès que la synchronisation réussit.
+
 ## Ordonnancement et équité
 
 `LAUNCH_CANDIDATE` et `TRACKED_TRADE` forment une cohorte urgente commune,
@@ -153,7 +173,11 @@ pas une validation de la campagne paper Mainnet #49.
 - une transaction création + achat initial conserve le hint création et produit
   les deux événements après décodage complet ;
 - toute entrée ambiguë reste `NORMAL` ;
+- le marqueur runtime exact `Log truncated` force le chemin sûr `NORMAL` ;
 - les doublons WebSocket/catch-up convergent sans downgrade ni résurrection ;
+- une purge concurrente ne peut supprimer un trade différé devenu suivi ;
+- les décisions différées absentes ou terminales restent purgées à quatre
+  heures sans extension silencieuse ;
 - l'équité urgente/normal est bornée à 32 pour 1 ;
 - migration 047 base vide, upgrade 046 et rejeu sont verts sur PostgreSQL 16 ;
 - build, check, lint, tests, documentation et smoke sont verts ;
