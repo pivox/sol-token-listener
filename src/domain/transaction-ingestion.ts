@@ -41,7 +41,9 @@ export const TRANSACTION_INBOX_RECOVERY_RESULT_CODES = Object.freeze([
 ] as const);
 
 export const TRANSACTION_INGESTION_HINTS = Object.freeze([
+  'NONE',
   'PUMPFUN_CREATE',
+  'PUMPFUN_TRADE',
 ] as const);
 
 export const TRANSACTION_INGESTION_ERROR_CODES = Object.freeze([
@@ -123,6 +125,7 @@ export interface TransactionNotification {
   readonly slot: bigint;
   readonly source: TransactionDiscoverySource;
   readonly ingestionHint: TransactionIngestionHint | null;
+  readonly ingestionHintMint: string | null;
   readonly programIds: readonly string[];
   readonly confirmationStatus: Exclude<ChainConfirmationStatus, 'orphaned'>;
   readonly observedAtMs: number;
@@ -348,6 +351,7 @@ export function assertValidTransactionNotification(
     'slot',
     'source',
     'ingestionHint',
+    'ingestionHintMint',
     'programIds',
     'confirmationStatus',
     'observedAtMs',
@@ -357,11 +361,11 @@ export function assertValidTransactionNotification(
   if (record.source !== 'WEBSOCKET' && record.source !== 'CATCH_UP') {
     throw new TypeError('Transaction notification source is invalid.');
   }
-  if (record.ingestionHint !== null
-    && !TRANSACTION_INGESTION_HINTS.includes(record.ingestionHint as TransactionIngestionHint)) {
+  if (!isValidIngestionHintPair(record.ingestionHint, record.ingestionHintMint)) {
     throw new TypeError('Transaction notification ingestion hint is invalid.');
   }
-  if (record.source === 'CATCH_UP' && record.ingestionHint !== null) {
+  if (record.source === 'CATCH_UP'
+    && (record.ingestionHint !== null || record.ingestionHintMint !== null)) {
     throw new TypeError('Transaction notification ingestion hint is invalid for catch-up.');
   }
   assertCanonicalProgramIds(record.programIds);
@@ -369,6 +373,14 @@ export function assertValidTransactionNotification(
     throw new TypeError('Transaction notification confirmation status is invalid.');
   }
   assertMilliseconds(record.observedAtMs, 'Transaction notification observedAtMs');
+}
+
+function isValidIngestionHintPair(hint: unknown, mint: unknown): boolean {
+  if (hint === null && mint === null) return true;
+  if (hint === 'PUMPFUN_CREATE' && mint === null) return true;
+  return hint === 'PUMPFUN_TRADE'
+    && typeof mint === 'string'
+    && isCanonicalSolanaProgramId(mint);
 }
 
 function assertCanonicalProgramIds(value: unknown): void {

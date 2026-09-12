@@ -122,7 +122,7 @@ void test('publishes exact frozen ingestion status constants', () => {
     'RECOVERY_NOT_FOUND',
   ]);
   assert.ok(Object.isFrozen(TRANSACTION_INBOX_RECOVERY_RESULT_CODES));
-  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['PUMPFUN_CREATE']);
+  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE']);
   assert.ok(Object.isFrozen(TRANSACTION_INGESTION_HINTS));
 });
 
@@ -132,6 +132,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     slot: 42n,
     source: 'WEBSOCKET',
     ingestionHint: 'PUMPFUN_CREATE',
+    ingestionHintMint: null,
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'confirmed',
     observedAtMs,
@@ -582,6 +583,7 @@ void test('rejects mutable contracts, number slots and non-integer millisecond t
     slot: 42n,
     source: 'CATCH_UP' as const,
     ingestionHint: null,
+    ingestionHintMint: null,
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'finalized' as const,
     observedAtMs,
@@ -768,6 +770,7 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
       slot: 42n,
       source: 'POLLING',
       ingestionHint: null,
+      ingestionHintMint: null,
       programIds: Object.freeze([PUMP_PROGRAM_ID]),
       confirmationStatus: 'confirmed',
       observedAtMs,
@@ -776,7 +779,7 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
   );
   const notification = Object.freeze({
     signature: 'signature', slot: 42n, source: 'CATCH_UP' as const,
-    ingestionHint: null, confirmationStatus: 'confirmed' as const, observedAtMs,
+    ingestionHint: null, ingestionHintMint: null, confirmationStatus: 'confirmed' as const, observedAtMs,
   });
   for (const programIds of [
     [],
@@ -817,12 +820,13 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
   );
 });
 
-void test('enforces the closed source-compatible ingestion hint without extra fields', () => {
+void test('enforces exact source-compatible ingestion hint and mint pairs without extra fields', () => {
   const canonical = Object.freeze({
     signature: 'signature',
     slot: 42n,
     source: 'WEBSOCKET' as const,
     ingestionHint: 'PUMPFUN_CREATE' as const,
+    ingestionHintMint: null,
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'confirmed' as const,
     observedAtMs,
@@ -832,11 +836,40 @@ void test('enforces the closed source-compatible ingestion hint without extra fi
     () => { assertValidTransactionNotification(Object.freeze({ ...canonical, ingestionHint: 'UNKNOWN' })); },
     /ingestion hint/u,
   );
+  const mint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1)).toBase58();
+  assert.doesNotThrow(() => { assertValidTransactionNotification(Object.freeze({
+    ...canonical, ingestionHint: null, ingestionHintMint: null,
+  })); });
+  assert.doesNotThrow(() => { assertValidTransactionNotification(Object.freeze({
+    ...canonical, ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: mint,
+  })); });
+  for (const invalid of [
+    { ingestionHint: 'NONE', ingestionHintMint: null },
+    { ingestionHint: null, ingestionHintMint: mint },
+    { ingestionHint: 'PUMPFUN_CREATE', ingestionHintMint: mint },
+    { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: null },
+    { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: ` ${mint}` },
+    { ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: 'not-a-public-key' },
+  ]) {
+    assert.throws(
+      () => { assertValidTransactionNotification(Object.freeze({ ...canonical, ...invalid })); },
+      /ingestion hint/u,
+    );
+  }
   assert.throws(
     () => { assertValidTransactionNotification(Object.freeze({
-      ...canonical, source: 'CATCH_UP', ingestionHint: 'PUMPFUN_CREATE',
+      ...canonical, source: 'CATCH_UP', ingestionHint: 'PUMPFUN_CREATE', ingestionHintMint: null,
     })); },
     /ingestion hint/u,
+  );
+  assert.doesNotThrow(() => { assertValidTransactionNotification(Object.freeze({
+    ...canonical, source: 'CATCH_UP', ingestionHint: null, ingestionHintMint: null,
+  })); });
+  assert.throws(
+    () => { assertValidTransactionNotification(Object.freeze({
+      ...canonical, source: 'CATCH_UP', ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: mint,
+    })); },
+    /catch-up/u,
   );
   assert.throws(
     () => { assertValidTransactionNotification(Object.freeze({

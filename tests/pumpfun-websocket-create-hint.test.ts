@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { PublicKey } from '@solana/web3.js';
 import { PUMP_EVENTS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import {
   MAX_PUMPFUN_WEBSOCKET_LOG_COUNT,
@@ -7,18 +8,53 @@ import {
   MAX_PUMPFUN_WEBSOCKET_LOG_TOTAL_BYTES,
   PUMPFUN_WEBSOCKET_HINTS,
   pumpFunCreateHintFromLogs,
+  pumpFunWebSocketHintFromLogs,
 } from '../src/launchpads/pumpfun/websocket-create-hint.js';
 
 const createLine = programDataLine(PUMP_EVENTS.CreateEvent.discriminator, [0, 1, 2, 3]);
+const firstTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+const secondTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 2));
 
-void test('exports the exact closed hint vocabulary and detects only the official CreateEvent', () => {
-  assert.deepEqual(PUMPFUN_WEBSOCKET_HINTS, ['NONE', 'PUMPFUN_CREATE']);
+void test('exports the exact closed hint vocabulary and creates frozen exact results', () => {
+  assert.deepEqual(PUMPFUN_WEBSOCKET_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE']);
   assert.ok(Object.isFrozen(PUMPFUN_WEBSOCKET_HINTS));
+  const createHint = pumpFunWebSocketHintFromLogs([createLine]);
+  assert.deepEqual(createHint, { hint: 'PUMPFUN_CREATE', hintMint: null });
+  assert.ok(Object.isFrozen(createHint));
+  assert.deepEqual(Reflect.ownKeys(createHint), ['hint', 'hintMint']);
   assert.equal(pumpFunCreateHintFromLogs([createLine]), 'PUMPFUN_CREATE');
   assert.equal(pumpFunCreateHintFromLogs([
     programDataLine(PUMP_EVENTS.TradeEvent.discriminator, [0, 1, 2, 3]),
   ]), 'NONE');
   assert.equal(pumpFunCreateHintFromLogs([`Program log: ${createLine}`]), 'NONE');
+});
+
+void test('extracts the canonical mint from the 32 bytes after an official TradeEvent discriminator', () => {
+  const hint = pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint)]);
+  assert.deepEqual(hint, { hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint.toBase58() });
+  assert.ok(Object.isFrozen(hint));
+});
+
+void test('rejects truncated TradeEvent payloads', () => {
+  const truncated = programDataLine(
+    PUMP_EVENTS.TradeEvent.discriminator,
+    [...firstTradeMint.toBytes().subarray(0, 31)],
+  );
+  assert.deepEqual(pumpFunWebSocketHintFromLogs([truncated]), { hint: 'NONE', hintMint: null });
+});
+
+void test('gives CreateEvent precedence even after a valid TradeEvent', () => {
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), createLine]),
+    { hint: 'PUMPFUN_CREATE', hintMint: null },
+  );
+});
+
+void test('uses the first valid trade mint deterministically', () => {
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), tradeLine(secondTradeMint)]),
+    { hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint.toBase58() },
+  );
 });
 
 void test('requires canonical bounded base64 rather than a textual discriminator prefix', () => {
@@ -57,7 +93,7 @@ void test('rejects hostile arrays without invoking accessors or proxy traps', ()
 
   for (const value of [accessor, sparse, extra, proxied, revoked.proxy]) {
     assert.doesNotThrow(() => {
-      assert.equal(pumpFunCreateHintFromLogs(value), 'NONE');
+      assert.deepEqual(pumpFunWebSocketHintFromLogs(value), { hint: 'NONE', hintMint: null });
     });
   }
   assert.equal(getterCalls, 0);
@@ -88,9 +124,13 @@ void test('rejects excessive log count, per-line bytes, and cumulative bytes', (
   assert.equal(pumpFunCreateHintFromLogs('not-an-array'), 'NONE');
 });
 
+function tradeLine(mint: PublicKey): string {
+  return programDataLine(PUMP_EVENTS.TradeEvent.discriminator, mint.toBytes());
+}
+
 function programDataLine(
   discriminator: readonly number[],
-  payload: readonly number[],
+  payload: readonly number[] | Uint8Array,
 ): string {
   return `Program data: ${Buffer.concat([
     Buffer.from(discriminator),
