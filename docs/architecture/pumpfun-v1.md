@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.3 — 2026-09-12
+**Version :** 1.1.6 — 2026-09-12
 
 ## Périmètre produit
 
@@ -25,8 +25,8 @@ initialement limité à SOL/WSOL par `PAPER_QUOTE_MINT_ALLOWLIST`.
 
 ## Runtime durable
 
-La PR C épingle l’IDL officiel Pump.fun au commit
-`9c82f61cb711b044a17f770ab8ce9f9bdf78f333` et décode localement `create`,
+L’IDL officiel Pump.fun est épinglé au commit
+`f216b6724c6ede79d7cef9ce210b741f7e17e93b` et décode localement `create`,
 `create_v2`, `buy`, `buy_v2`, `buy_exact_sol_in`,
 `buy_exact_quote_in_v2`, `sell` et `sell_v2`. Les montants réels, réserves et
 frais viennent exclusivement des événements CPI `CreateEvent` et `TradeEvent`
@@ -301,11 +301,25 @@ vers PumpSwap.
 
 La source épinglée est
 [pump-fun/pump-public-docs](https://github.com/pump-fun/pump-public-docs),
-commit `9c82f61cb711b044a17f770ab8ce9f9bdf78f333`. Les discriminators et schémas
+commit `f216b6724c6ede79d7cef9ce210b741f7e17e93b`. Les discriminators et schémas
 sont générés depuis cet IDL, jamais copiés depuis un projet tiers. Ce commit
-était toujours le HEAD de `main` lors de la vérification. Le manifeste
-`vendor/pumpfun/idl/manifest.json` lie hors ligne révision, chemins officiels,
-SHA-256 et sous-ensembles générés Pump.fun/PumpSwap.
+a été vérifié le 12 septembre 2026. Le manifeste
+`vendor/pumpfun/idl/manifest.json` lie hors ligne, pour chaque artefact, sa
+révision, ses chemins officiels, son SHA-256 et son sous-ensemble généré.
+PumpSwap reste épinglé séparément à sa révision auditée précédente.
+
+`create_v2` accepte uniquement ses suffixes EOF officiels de 0, 1, 9 ou 10
+octets et exactement 0, 3 ou 4 comptes restants. Le quatrième compte doit être
+le PDA Pump `quote-control`. `CreateEvent` accepte ses suffixes historiques
+officiels de 0, 8 ou 9 octets ; les champs absents valent respectivement zéro
+et faux. Le créateur demandé reste distinct du créateur effectif de routage des
+frais pour un token holder-reward, mais ce dernier doit être exactement le PDA
+Pump dérivé de `holder-rewards` et du mint. Le taux effectif vient de
+`CreateEvent` : la présence optionnelle de `quote-control` ne prouve pas que le
+taux demandé a été appliqué, car ce compte peut être redondant pour un quote
+mint déjà autorisé par `Global`. Le mint et la bonding curve de l’événement
+doivent correspondre exactement aux comptes de l’instruction. Aucun octet final
+inconnu n’est toléré.
 
 Les fixtures mainnet minimisées et versionnées couvrent une création avec
 achat initial, une vente CPI, un achat V2 CPI, une migration V2 avec son

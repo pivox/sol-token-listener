@@ -1,9 +1,11 @@
+import { PublicKey } from '@solana/web3.js';
 import type { TokenProgramKind } from '../../domain/types.js';
 import type {
   NormalizedInstruction,
   NormalizedTransaction,
 } from '../../solana/rpc/types.js';
 import {
+  PUMP_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ADDRESS,
   WSOL_MINT,
@@ -39,6 +41,8 @@ const BUY_IX_NAMES = new Set([
   'buy_exact_quote_in_v2',
 ]);
 const SELL_IX_NAMES = new Set(['sell', 'sell_v2']);
+const PUMP_PROGRAM = new PublicKey(PUMP_PROGRAM_ID);
+const HOLDER_REWARDS_SEED = Buffer.from('holder-rewards');
 
 export function decodePumpTransaction(
   transaction: NormalizedTransaction,
@@ -285,16 +289,17 @@ function validateCreation(
 ): DecodedPumpCreation {
   const event = eventCpi.event;
   requireEqual(event.mint, account(action, 'mint'), transaction, 'mint');
+  requireEqual(
+    event.bondingCurve,
+    account(action, 'bonding_curve'),
+    transaction,
+    'bonding_curve',
+  );
   requireEqual(event.name, stringArg(action, 'name'), transaction, 'name');
   requireEqual(event.symbol, stringArg(action, 'symbol'), transaction, 'symbol');
   requireEqual(event.uri, stringArg(action, 'uri'), transaction, 'uri');
   requireEqual(event.user, account(action, 'user'), transaction, 'user');
-  requireEqual(
-    event.creator,
-    stringArg(action, 'creator'),
-    transaction,
-    'creator',
-  );
+  const requestedCreator = stringArg(action, 'creator');
   requireEqual(
     event.tokenProgram,
     account(action, 'token_program'),
@@ -316,6 +321,29 @@ function validateCreation(
       transaction,
       'is_cashback_enabled',
     );
+    requireEqual(
+      event.isHolderReward,
+      optionBooleanArg(action, 'is_holder_reward'),
+      transaction,
+      'is_holder_reward',
+    );
+  } else if (event.isHolderReward) {
+    throw mismatch(transaction, 'Preuves Pump contradictoires: is_holder_reward.');
+  }
+  if (event.isHolderReward) {
+    requireEqual(
+      event.creator,
+      deriveHolderRewardsCreator(event.mint),
+      transaction,
+      'holder_rewards_creator',
+    );
+  } else {
+    requireEqual(
+      event.creator,
+      requestedCreator,
+      transaction,
+      'creator',
+    );
   }
 
   const rawQuoteMint = action.accounts.quote_mint ?? WSOL_MINT;
@@ -335,7 +363,16 @@ function validateCreation(
       'quote_token_program',
     );
   }
-  return Object.freeze({ action, event, eventCpi, quoteAsset });
+  return Object.freeze({
+    action,
+    event,
+    eventCpi,
+    quoteAsset,
+    requestedCreator,
+    effectiveCreator: event.creator,
+    creatorFeeBps: event.creatorFeeBps,
+    isHolderReward: event.isHolderReward,
+  });
 }
 
 function validateTrade(
@@ -468,6 +505,13 @@ function requireEqual(
   if (actual !== expected) {
     throw mismatch(transaction, `Preuves Pump contradictoires: ${field}.`);
   }
+}
+
+function deriveHolderRewardsCreator(mint: string): string {
+  return PublicKey.findProgramAddressSync(
+    [HOLDER_REWARDS_SEED, new PublicKey(mint).toBuffer()],
+    PUMP_PROGRAM,
+  )[0].toBase58();
 }
 
 function mismatch(

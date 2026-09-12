@@ -4,9 +4,9 @@ import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 
 export const OFFICIAL_PUMP_IDL_REVISION =
-  '9c82f61cb711b044a17f770ab8ce9f9bdf78f333';
+  'f216b6724c6ede79d7cef9ce210b741f7e17e93b';
 export const OFFICIAL_PUMP_IDL_SHA256 =
-  'b90bc471327f671449271d5d1d42354d1fae6f5a06502f5834459a3108138e49';
+  'ffe966c42f1af41652ee753fe2f1e3f7cd4077d7e6f49faf3138959c8b56064b';
 
 const PUMP_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const REQUIRED_INSTRUCTIONS = [
@@ -25,6 +25,7 @@ const REQUIRED_EVENTS = ['CreateEvent', 'TradeEvent'] as const;
 const REQUIRED_TYPES = [
   'CreateEvent',
   'OptionBool',
+  'OptionU64',
   'Shareholder',
   'TradeEvent',
 ] as const;
@@ -94,7 +95,7 @@ export function renderPumpIdlModule(json: string): string {
 
 async function main(): Promise<void> {
   const snapshot = new URL(
-    '../vendor/pumpfun/idl/pump-9c82f61.json',
+    '../vendor/pumpfun/idl/pump-f216b672.json',
     import.meta.url,
   );
   const outputDirectory = new URL(

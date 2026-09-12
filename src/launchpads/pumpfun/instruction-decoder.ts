@@ -1,3 +1,4 @@
+import { PublicKey } from '@solana/web3.js';
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpBorshReader } from './borsh-reader.js';
 import { PUMP_PROGRAM_ID } from './constants.js';
@@ -6,6 +7,7 @@ import { PUMP_INSTRUCTIONS } from './generated/pump-idl.js';
 import { decodeIdlFields } from './idl-codec.js';
 import type {
   DecodedPumpInstruction,
+  PumpIdlValue,
   PumpInstructionFamily,
   PumpInstructionName,
 } from './types.js';
@@ -28,6 +30,12 @@ const DEFINITION_BY_DISCRIMINATOR = new Map(
     { name, definition },
   ]),
 );
+const CREATE_V2_REQUIRED_ARGUMENT_COUNT = 5;
+const CREATE_V2_SUFFIX_LENGTHS = new Set([0, 1, 9, 10]);
+const QUOTE_CONTROL_PDA = PublicKey.findProgramAddressSync(
+  [Buffer.from('quote-control')],
+  new PublicKey(PUMP_PROGRAM_ID),
+)[0].toBase58();
 
 export function decodePumpInstruction(
   instruction: NormalizedInstruction,
@@ -50,7 +58,9 @@ export function decodePumpInstruction(
     instruction,
   );
   const reader = new PumpBorshReader(instruction.data.subarray(8));
-  const args = decodeIdlFields(matched.definition.args, reader);
+  const args = matched.name === 'create_v2'
+    ? decodeCreateV2Args(matched.definition, reader)
+    : decodeIdlFields(matched.definition.args, reader);
   if (reader.remaining !== 0) {
     throw createPumpDecodingError(
       'PUMP_BORSH_INVALID',
@@ -65,6 +75,34 @@ export function decodePumpInstruction(
     instruction,
     accounts,
     args,
+  });
+}
+
+function decodeCreateV2Args(
+  definition: InstructionDefinition,
+  reader: PumpBorshReader,
+): Readonly<Record<string, PumpIdlValue>> {
+  const required = decodeIdlFields(
+    definition.args.slice(0, CREATE_V2_REQUIRED_ARGUMENT_COUNT),
+    reader,
+  );
+  const suffixLength = reader.remaining;
+  if (!CREATE_V2_SUFFIX_LENGTHS.has(suffixLength)) {
+    throw createPumpDecodingError(
+      'PUMP_BORSH_INVALID',
+      false,
+      `create_v2 attend un suffixe officiel de 0, 1, 9 ou 10 octets, reçu ${suffixLength}.`,
+    );
+  }
+
+  const cashback = suffixLength >= 1 ? reader.readBool() : false;
+  const creatorFeeBps = suffixLength >= 9 ? reader.readU64() : 0n;
+  const holderReward = suffixLength === 10 ? reader.readBool() : false;
+  return Object.freeze({
+    ...required,
+    is_cashback_enabled: Object.freeze([cashback]),
+    creator_fee_bps: Object.freeze([creatorFeeBps]),
+    is_holder_reward: Object.freeze([holderReward]),
   });
 }
 
@@ -96,14 +134,14 @@ function mapAccounts(
   const remainingCount =
     instruction.accounts.length - definition.accounts.length;
   if (name === 'create_v2') {
-    if (remainingCount !== 0 && remainingCount !== 3) {
+    if (remainingCount !== 0 && remainingCount !== 3 && remainingCount !== 4) {
       throw createPumpDecodingError(
         'PUMP_ACCOUNT_MISSING',
         true,
-        `create_v2 attend zéro ou trois remaining accounts, reçu ${remainingCount}.`,
+        `create_v2 attend zéro, trois ou quatre remaining accounts, reçu ${remainingCount}.`,
       );
     }
-    if (remainingCount === 3) {
+    if (remainingCount >= 3) {
       const quoteMint = instruction.accounts[definition.accounts.length];
       const quoteCurve = instruction.accounts[definition.accounts.length + 1];
       const quoteProgram = instruction.accounts[definition.accounts.length + 2];
@@ -123,6 +161,17 @@ function mapAccounts(
         ['associated_quote_bonding_curve', quoteCurve],
         ['quote_token_program', quoteProgram],
       );
+    }
+    if (remainingCount === 4) {
+      const quoteControl = instruction.accounts[definition.accounts.length + 3];
+      if (quoteControl !== QUOTE_CONTROL_PDA) {
+        throw createPumpDecodingError(
+          'PUMP_ACCOUNT_MISSING',
+          false,
+          'Remaining account quote_control create_v2 invalide.',
+        );
+      }
+      entries.push(['quote_control', quoteControl]);
     }
   }
 
