@@ -856,6 +856,15 @@ erreur interne n'est incluse.
 - simulation inverse indisponible = preuve inconnue ou blocker configuré, jamais
   affirmation de sellabilité.
 
+## Source d'hydratation par slot (préparée, non active)
+
+La source expérimentale `SolanaBlockTransactionLocator` peut reconstruire une
+transaction et son index depuis une réponse `getBlock` complète. Elle n'est pas
+branchée dans la factory de production : aucun changement de listener n'est
+introduit avant une mesure de taille, quota et reorg. Son contrat et les
+contraintes de validation sont versionnés dans
+[`2026-09-12-coherent-slot-block-hydration-design.md`](../superpowers/specs/2026-09-12-coherent-slot-block-hydration-design.md).
+
 ## Console opérateur indépendante
 
 Le frontend React est un consommateur externe des ports HTTP/SSE : il n’importe

@@ -7,8 +7,10 @@ import {
 import {
   BlockUnavailableError,
   MAX_BLOCK_SIGNATURE_COUNT,
+  MAX_TRANSACTION_SIGNATURES,
   MAX_TRANSACTION_SIGNATURE_LENGTH,
   RpcTransientError,
+  SolanaBlockTransactionLocator,
   TransactionIndexNotFoundError,
   TransactionLocator,
   TransactionNormalizationError,
@@ -50,6 +52,12 @@ function response(
           accountKeyIndexes: options.rich === true ? [2] : [],
           data: new Uint8Array([1, 2, 3]),
         }],
+        ...(options.rich === true
+          ? {
+            staticAccountKeys: staticKeys,
+            addressTableLookups: [{ writableIndexes: [0], readonlyIndexes: [] }],
+          }
+          : { accountKeys: staticKeys }),
         getAccountKeys: (args?: unknown) => {
           if (options.rich === true) assert.notEqual(args, undefined);
           return {
@@ -107,6 +115,22 @@ function rpc(
   };
 }
 
+function completeBlock(
+  transactions: readonly VersionedTransactionResponse[],
+): unknown {
+  return Object.freeze({
+    blockhash: PAYER.toBase58(),
+    previousBlockhash: PROGRAM.toBase58(),
+    parentSlot: 41,
+    blockTime: 1_725_000_000,
+    transactions: Object.freeze(transactions.map(({ transaction, meta, version }) => Object.freeze({
+      transaction,
+      meta,
+      version,
+    }))),
+  });
+}
+
 void test('uses position zero only when the target is actually first in its block', async () => {
   const located = await new TransactionLocator(rpc(response('pump'), ['pump', 'other']))
     .locate(target('pump'));
@@ -122,6 +146,393 @@ void test('locates Pump and PumpSwap signatures independently in the same slot',
 
   assert.equal((await locator.locate(target('pump'))).transactionIndex, 1);
   assert.equal((await locator.locate(target('swap'))).transactionIndex, 2);
+});
+
+void test('hydrates transactions from complete slot blocks with their canonical indexes', async () => {
+  let calls = 0;
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions(slot, confirmationStatus) {
+      calls += 1;
+      assert.equal(slot, 42n);
+      assert.equal(confirmationStatus, 'CONFIRMED');
+      return completeBlock([
+        response('other'),
+        response('pump', 42, { rich: true }),
+        response('swap'),
+      ]);
+    },
+  });
+
+  const pump = await locator.locate(target('pump'));
+  const swap = await locator.locate(target('swap'));
+
+  assert.equal(pump.transactionIndex, 1);
+  assert.equal(swap.transactionIndex, 2);
+  assert.equal(pump.version, 0);
+  assert.equal(pump.blockTimeMs, 1_725_000_000_000);
+  assert.equal(calls, 2);
+});
+
+void test('preserves legacy normalization from a complete block source', async () => {
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([response('pump')]); },
+  });
+
+  const located = await locator.locate(target('pump'));
+
+  assert.equal(located.transactionIndex, 0);
+  assert.equal(located.version, 'legacy');
+  assert.equal(located.blockTimeMs, 1_725_000_000_000);
+});
+
+void test('maps null, rejected and malformed complete blocks without provider details', async () => {
+  const secret = 'https://rpc.invalid/private-token';
+  const cases: readonly [unknown, new (...args: never[]) => Error][] = [
+    [null, BlockUnavailableError],
+    [Object.freeze({
+      blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+      parentSlot: 41, blockTime: null, transactions: new Array(MAX_BLOCK_SIGNATURE_COUNT + 1),
+    }), BlockUnavailableError],
+    [new Proxy({}, { getOwnPropertyDescriptor() { throw new Error(secret); } }), BlockUnavailableError],
+  ];
+  for (const [block, expected] of cases) {
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() { return block; },
+    });
+    await assert.rejects(locator.locate(target('pump')), (error: unknown) => {
+      assert.ok(error instanceof expected);
+      assert.doesNotMatch(String(error), /rpc\.invalid|private-token/u);
+      return true;
+    });
+  }
+  const rejected = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { throw new Error(secret); },
+  });
+  await assert.rejects(rejected.locate(target('pump')), (error: unknown) => error instanceof RpcTransientError
+    && !String(error).includes('private-token'));
+});
+
+void test('rejects complete blocks whose parent cannot precede the requested slot', async () => {
+  for (const parentSlot of [42, 43]) {
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() {
+        return Object.freeze({
+          blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+          parentSlot, blockTime: null, transactions: Object.freeze([Object.freeze({
+            transaction: response('pump').transaction, meta: response('pump').meta, version: 'legacy',
+          })]),
+        });
+      },
+    });
+    await assert.rejects(locator.locate(target('pump')), BlockUnavailableError);
+  }
+});
+
+void test('keeps absent and duplicate complete-block targets terminal', async () => {
+  for (const block of [
+    completeBlock([response('other')]),
+    completeBlock([response('pump'), response('pump')]),
+  ]) {
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() { return block; },
+    });
+    await assert.rejects(locator.locate(target('pump')), TransactionIndexNotFoundError);
+  }
+});
+
+void test('rejects selected complete-block metadata and versions outside the supported normalizer contract', async () => {
+  for (const entry of [
+    Object.freeze({ transaction: response('pump').transaction, meta: 1, version: 'legacy' }),
+    Object.freeze({ transaction: response('pump').transaction, meta: null, version: 1 }),
+  ]) {
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() {
+        return Object.freeze({
+          blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+          parentSlot: 41, blockTime: null, transactions: Object.freeze([entry]),
+        });
+      },
+    });
+    await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+  }
+});
+
+void test('rejects selected transaction and meta accessors before normalizing them', async () => {
+  let accesses = 0;
+  const raw = response('pump');
+  Object.defineProperty(raw.transaction, 'message', {
+    enumerable: true,
+    get() { accesses += 1; return raw.transaction.message; },
+  });
+  const hostileMeta = Object.create(Object.prototype, {
+    err: { enumerable: true, get() { accesses += 1; return null; } },
+  });
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() {
+      return Object.freeze({
+        blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+        parentSlot: 41, blockTime: null, transactions: Object.freeze([Object.freeze({
+          transaction: raw.transaction, meta: hostileMeta, version: 'legacy',
+        })]),
+      });
+    },
+  });
+
+  await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+  assert.equal(accesses, 0);
+
+  const safe = response('pump');
+  const metaOnly = Object.create(Object.prototype, {
+    fee: { enumerable: true, get() { accesses += 1; return 5_000; } },
+  });
+  const metaLocator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() {
+      return Object.freeze({
+        blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+        parentSlot: 41, blockTime: null, transactions: Object.freeze([Object.freeze({
+          transaction: safe.transaction, meta: metaOnly, version: 'legacy',
+        })]),
+      });
+    },
+  });
+  await assert.rejects(metaLocator.locate(target('pump')), TransactionNormalizationError);
+  assert.equal(accesses, 0);
+});
+
+void test('does not invoke a complete-block message getAccountKeys implementation', async () => {
+  let accesses = 0;
+  const raw = response('pump');
+  Object.defineProperty(raw.transaction.message, 'getAccountKeys', {
+    enumerable: true,
+    value() {
+      accesses += 1;
+      throw new Error('must not invoke RPC message methods');
+    },
+  });
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  assert.equal((await locator.locate(target('pump'))).transactionIndex, 0);
+  assert.equal(accesses, 0);
+});
+
+void test('does not read shadowed PublicKey methods from complete-block lookup addresses', async () => {
+  let accesses = 0;
+  const raw = response('pump', 42, { rich: true });
+  const hostile = new PublicKey(LOADED.toBytes());
+  Object.defineProperty(hostile, 'toBytes', {
+    enumerable: true,
+    get() {
+      accesses += 1;
+      throw new Error('must not read RPC PublicKey methods');
+    },
+  });
+  const meta = raw.meta;
+  if (meta === null) throw new Error('test fixture must include metadata');
+  meta.loadedAddresses = { writable: [hostile], readonly: [] };
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  assert.equal((await locator.locate(target('pump'))).transactionIndex, 0);
+  assert.equal(accesses, 0);
+});
+
+void test('rejects a proxy meta error before instanceof can evaluate its traps', async () => {
+  let accesses = 0;
+  const raw = response('pump');
+  const meta = raw.meta;
+  if (meta === null) throw new Error('test fixture must include metadata');
+  meta.err = new Proxy(new Uint8Array([1]), {
+    getPrototypeOf() {
+      accesses += 1;
+      return Uint8Array.prototype;
+    },
+  }) as unknown as null;
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+  assert.equal(accesses, 0);
+});
+
+void test('copies a real Uint8Array without reading its shadowed iterator', async () => {
+  let accesses = 0;
+  const raw = response('pump');
+  const hostile = new Uint8Array([1, 2, 3]);
+  Object.defineProperty(hostile, Symbol.iterator, {
+    enumerable: true,
+    get() {
+      accesses += 1;
+      throw new Error('must not read the RPC typed-array iterator');
+    },
+  });
+  const instruction = raw.transaction.message.compiledInstructions[0];
+  if (instruction === undefined) throw new Error('test fixture must include an instruction');
+  instruction.data = hostile;
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  assert.equal((await locator.locate(target('pump'))).transactionIndex, 0);
+  assert.equal(accesses, 0);
+});
+
+void test('rejects a typed-array prototype proxy without consulting it', async () => {
+  let accesses = 0;
+  const raw = response('pump');
+  const prototype = new Proxy(Uint8Array.prototype, {
+    getPrototypeOf() {
+      accesses += 1;
+      throw new Error('must not consult the RPC prototype');
+    },
+  });
+  const instruction = raw.transaction.message.compiledInstructions[0];
+  if (instruction === undefined) throw new Error('test fixture must include an instruction');
+  instruction.data = Object.create(prototype) as Uint8Array;
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+  assert.equal(accesses, 0);
+});
+
+void test('classifies selected entry meta and version accessors as terminal normalization failures', async () => {
+  for (const field of ['meta', 'version'] as const) {
+    let accesses = 0;
+    const raw = response('pump');
+    const entry = Object.freeze(Object.defineProperty({
+      transaction: raw.transaction,
+      meta: raw.meta,
+      version: 'legacy',
+    }, field, {
+      enumerable: true,
+      get() {
+        accesses += 1;
+        throw new Error('must not read selected entry accessors');
+      },
+    }));
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() {
+        return Object.freeze({
+          blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+          parentSlot: 41, blockTime: null, transactions: Object.freeze([entry]),
+        });
+      },
+    });
+
+    await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+    assert.equal(accesses, 0);
+  }
+});
+
+void test('rejects oversized legacy instruction data before decoding it', async () => {
+  for (const encodedLength of [4_096, 1_300]) {
+    const raw = response('pump');
+    const message = raw.transaction.message as unknown as {
+      instructions: { programIdIndex: number; accounts: number[]; data: string }[];
+      compiledInstructions?: unknown;
+    };
+    message.instructions = [{ programIdIndex: 1, accounts: [], data: '1'.repeat(encodedLength) }];
+    delete message.compiledInstructions;
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() { return completeBlock([raw]); },
+    });
+
+    await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+  }
+});
+
+void test('rejects oversized compiled instruction bytes without reading a shadowed length', async () => {
+  let accesses = 0;
+  const raw = response('pump');
+  const hostile = new Uint8Array(1_233);
+  Object.defineProperty(hostile, 'byteLength', {
+    enumerable: true,
+    get() {
+      accesses += 1;
+      throw new Error('must not read the RPC typed-array byteLength');
+    },
+  });
+  const instruction = raw.transaction.message.compiledInstructions[0];
+  if (instruction === undefined) throw new Error('test fixture must include an instruction');
+  instruction.data = hostile;
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  await assert.rejects(locator.locate(target('pump')), TransactionNormalizationError);
+  assert.equal(accesses, 0);
+});
+
+void test('preserves an own __proto__ metadata field without prototype pollution', async () => {
+  const raw = response('pump');
+  const hostile = Object.create(Object.prototype) as Record<string, unknown>;
+  Object.defineProperty(hostile, '__proto__', {
+    enumerable: true,
+    value: Object.freeze({ inheritedAttack: true }),
+  });
+  const meta = raw.meta;
+  if (meta === null) throw new Error('test fixture must include metadata');
+  meta.err = hostile;
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([raw]); },
+  });
+
+  const located = await locator.locate(target('pump'));
+  const copied = located.error as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(copied), null);
+  assert.equal(Object.hasOwn(copied, '__proto__'), true);
+  assert.equal(Object.hasOwn(copied, 'inheritedAttack'), false);
+});
+
+void test('rejects a transaction version that disagrees with its message shape', async () => {
+  const legacyAsV0 = response('legacy-as-v0');
+  legacyAsV0.version = 0;
+  const v0AsLegacy = response('v0-as-legacy', 42, { rich: true });
+  v0AsLegacy.version = 'legacy';
+
+  for (const [signature, raw] of [
+    ['legacy-as-v0', legacyAsV0],
+    ['v0-as-legacy', v0AsLegacy],
+  ] as const) {
+    const locator = new SolanaBlockTransactionLocator({
+      async getBlockTransactions() { return completeBlock([raw]); },
+    });
+    await assert.rejects(locator.locate(target(signature)), TransactionNormalizationError);
+  }
+});
+
+void test('bounds signatures of the selected complete-block transaction', async () => {
+  const raw = response('pump');
+  raw.transaction.signatures = Array.from(
+    { length: MAX_TRANSACTION_SIGNATURES + 1 },
+    (_unused, index) => `signature-${index}`,
+  );
+  raw.transaction.signatures[0] = 'pump';
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() {
+      return completeBlock([raw]);
+    },
+  });
+  await assert.rejects(locator.locate(target('pump')), BlockUnavailableError);
+});
+
+void test('bounds signatures before scanning a non-target complete-block transaction', async () => {
+  const oversized = response('other');
+  oversized.transaction.signatures = Array.from(
+    { length: MAX_TRANSACTION_SIGNATURES + 1 },
+    (_unused, index) => `signature-${index}`,
+  );
+  oversized.transaction.signatures[0] = 'other';
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return completeBlock([oversized, response('pump')]); },
+  });
+
+  await assert.rejects(locator.locate(target('pump')), BlockUnavailableError);
 });
 
 void test('classifies a null transaction as retryable and exposes no target details', async () => {
