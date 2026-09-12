@@ -63,6 +63,8 @@ export interface DecodedPumpCreateEvent {
   readonly isCashbackEnabled: boolean;
   readonly quoteMint: string;
   readonly virtualQuoteReserves: bigint;
+  readonly creatorFeeBps: bigint;
+  readonly isHolderReward: boolean;
 }
 
 export interface DecodedPumpTradeEvent {
@@ -98,6 +100,8 @@ export interface DecodedPumpTradeEvent {
   readonly quoteAmount: bigint;
   readonly virtualQuoteReserves: bigint;
   readonly realQuoteReserves: bigint;
+  readonly holderRewardsBps: bigint;
+  readonly holderRewards: bigint;
 }
 
 export type DecodedPumpCpiEvent =
@@ -122,6 +126,10 @@ export interface DecodedPumpCreation {
     { readonly kind: 'CREATE' }
   >;
   readonly quoteAsset: QuoteAsset;
+  readonly requestedCreator: string;
+  readonly effectiveCreator: string;
+  readonly creatorFeeBps: bigint;
+  readonly isHolderReward: boolean;
 }
 
 export interface DecodedPumpTrade {

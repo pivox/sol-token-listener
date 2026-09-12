@@ -60,6 +60,10 @@ void test('projette création et achat initial via le service sans double décod
     tokenTotalSupplyRaw: 1_000n,
     mayhem: true,
     cashback: true,
+    requestedCreator: USER,
+    effectiveCreator: CREATOR,
+    creatorFeeBps: 1_200n,
+    holderReward: true,
     rawQuoteMint: QUOTE,
     trailingEventDataHex: '',
   });
@@ -153,10 +157,15 @@ function decoded(raw: NormalizedTransaction): DecodedPumpTransaction {
       virtualSolReserves: 2_000n, realTokenReserves: 900n,
       tokenTotalSupply: 1_000n, tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
       isMayhemMode: true, isCashbackEnabled: true, quoteMint: QUOTE,
-      virtualQuoteReserves: 2_000n,
+      virtualQuoteReserves: 2_000n, creatorFeeBps: 1_200n,
+      isHolderReward: true,
     }),
     eventCpi: Object.freeze({ kind: 'CREATE' as const, event: undefined as never, instruction: instruction(2, 0), trailingDataHex: '' }),
     quoteAsset,
+    requestedCreator: USER,
+    effectiveCreator: CREATOR,
+    creatorFeeBps: 1_200n,
+    isHolderReward: true,
   });
   const trade = Object.freeze({
     action: Object.freeze({
@@ -174,6 +183,7 @@ function decoded(raw: NormalizedTransaction): DecodedPumpTransaction {
       cashbackFeeBasisPoints: 0n, cashback: 0n, buybackFeeBasisPoints: 0n,
       buybackFee: 0n, shareholders: Object.freeze([]), quoteMint: QUOTE,
       quoteAmount: 75n, virtualQuoteReserves: 2_075n, realQuoteReserves: 75n,
+      holderRewardsBps: 0n, holderRewards: 0n,
     }),
     eventCpi: Object.freeze({ kind: 'TRADE' as const, event: undefined as never, instruction: instruction(3, 0), trailingDataHex: '' }),
     quoteAsset,

@@ -289,12 +289,7 @@ function validateCreation(
   requireEqual(event.symbol, stringArg(action, 'symbol'), transaction, 'symbol');
   requireEqual(event.uri, stringArg(action, 'uri'), transaction, 'uri');
   requireEqual(event.user, account(action, 'user'), transaction, 'user');
-  requireEqual(
-    event.creator,
-    stringArg(action, 'creator'),
-    transaction,
-    'creator',
-  );
+  const requestedCreator = stringArg(action, 'creator');
   requireEqual(
     event.tokenProgram,
     account(action, 'token_program'),
@@ -316,6 +311,22 @@ function validateCreation(
       transaction,
       'is_cashback_enabled',
     );
+    requireEqual(
+      event.isHolderReward,
+      optionBooleanArg(action, 'is_holder_reward'),
+      transaction,
+      'is_holder_reward',
+    );
+  } else if (event.isHolderReward) {
+    throw mismatch(transaction, 'Preuves Pump contradictoires: is_holder_reward.');
+  }
+  if (!event.isHolderReward) {
+    requireEqual(
+      event.creator,
+      requestedCreator,
+      transaction,
+      'creator',
+    );
   }
 
   const rawQuoteMint = action.accounts.quote_mint ?? WSOL_MINT;
@@ -335,7 +346,16 @@ function validateCreation(
       'quote_token_program',
     );
   }
-  return Object.freeze({ action, event, eventCpi, quoteAsset });
+  return Object.freeze({
+    action,
+    event,
+    eventCpi,
+    quoteAsset,
+    requestedCreator,
+    effectiveCreator: event.creator,
+    creatorFeeBps: event.creatorFeeBps,
+    isHolderReward: event.isHolderReward,
+  });
 }
 
 function validateTrade(

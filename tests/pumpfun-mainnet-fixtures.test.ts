@@ -18,6 +18,35 @@ void test('décode hors ligne la création mainnet et son achat initial', async 
   assert.equal(decoded.trades[0]?.event.isBuy, true);
 });
 
+void test('décode la création Mainnet courante et son achat initial', async () => {
+  const fixture = await loadPumpFixture(
+    'create-v2-current-initial-buy-mainnet.json',
+  );
+  const decoded = decodePumpTransaction(fixture.transaction);
+
+  assert.equal(
+    fixture.provenance.signature,
+    '28yWZwRAEfMTvD4H82PaCaK3oxwuia4HqWa9QQbHZoCuu5EPJwiJyazn2udwM8PT3wfEPLac6kcpEoGi4LRFBvT7',
+  );
+  assert.equal(decoded.creations.length, 1);
+  assert.equal(decoded.trades.length, 1);
+  assert.equal(decoded.trades[0]?.event.isBuy, true);
+  assert.equal(decoded.creations[0]?.creatorFeeBps, 0n);
+  assert.equal(decoded.creations[0]?.isHolderReward, false);
+});
+
+void test('valide le PDA quote-control et le créateur effectif holder-reward Mainnet', async () => {
+  const fixture = await loadPumpFixture('create-v2-quote-control-mainnet.json');
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const creation = decoded.creations[0];
+
+  assert.equal(decoded.creations.length, 1);
+  assert.equal(creation?.action.accounts.quote_control, '6z6GDdfb2AjR9ZhJmAUQ5cipJCVxQvLJhB2H8mCwTFBP');
+  assert.equal(creation?.creatorFeeBps, 300n);
+  assert.equal(creation?.isHolderReward, true);
+  assert.notEqual(creation?.requestedCreator, creation?.effectiveCreator);
+});
+
 void test('décode hors ligne une vente CPI avec stackHeight 3', async () => {
   const fixture = await loadPumpFixture('sell-cpi-mainnet.json');
   const decoded = decodePumpTransaction(fixture.transaction);

@@ -35,6 +35,14 @@ const CREATE_ARGS = {
   creator: CREATOR,
   is_mayhem_mode: true,
   is_cashback_enabled: [true],
+  creator_fee_bps: [1_200n],
+  is_holder_reward: [true],
+} as const;
+const CREATE_LEGACY_ARGS = {
+  name: 'Éclair',
+  symbol: 'ECL',
+  uri: 'ipfs://metadata',
+  creator: CREATOR,
 } as const;
 const TRADE_ARGS = {
   amount: 1n,
@@ -56,6 +64,24 @@ void test('apparie une action externe à son événement interne', () => {
     decoded.creations[0]?.action.instruction.innerInstructionIndex,
     null,
   );
+});
+
+void test('conserve le décodage create legacy sans holder reward', () => {
+  const decoded = decodePumpTransaction(transaction([
+    action('create', cursor(2, null, 1)),
+    eventAt(createEventInstruction(new Uint8Array(), {
+      is_mayhem_mode: false,
+      is_cashback_enabled: false,
+      creator_fee_bps: 0n,
+      is_holder_reward: false,
+      quote_mint: PublicKey.default.toBase58(),
+    }), cursor(2, 0, 2)),
+  ]));
+
+  assert.equal(decoded.creations[0]?.action.name, 'create');
+  assert.equal(decoded.creations[0]?.requestedCreator, CREATOR);
+  assert.equal(decoded.creations[0]?.effectiveCreator, CREATOR);
+  assert.equal(decoded.creations[0]?.isHolderReward, false);
 });
 
 void test('apparie une action CPI à son événement enfant par stackHeight', () => {
@@ -81,6 +107,41 @@ void test('décode création puis achat initial dans la même transaction', () =
   assert.equal(
     decoded.trades[0]?.event.mint,
     decoded.creations[0]?.event.mint,
+  );
+});
+
+void test('sépare le créateur demandé du routage effectif holder-reward', () => {
+  const requestedCreator = OTHER;
+  const decoded = decodePumpTransaction(transaction([
+    action(
+      'create_v2',
+      cursor(2, null, 1),
+      {},
+      { creator: requestedCreator, is_holder_reward: [true] },
+    ),
+    eventAt(createEventInstruction(), cursor(2, 0, 2)),
+  ]));
+
+  assert.equal(decoded.creations[0]?.requestedCreator, requestedCreator);
+  assert.equal(decoded.creations[0]?.effectiveCreator, CREATOR);
+  assert.equal(decoded.creations[0]?.creatorFeeBps, 1_200n);
+  assert.equal(decoded.creations[0]?.isHolderReward, true);
+});
+
+void test('exige le même créateur demandé et effectif hors holder-reward', () => {
+  assert.throws(
+    () => decodePumpTransaction(transaction([
+      action(
+        'create_v2',
+        cursor(2, null, 1),
+        {},
+        { creator: OTHER, is_holder_reward: [false] },
+      ),
+      eventAt(createEventInstruction(new Uint8Array(), {
+        is_holder_reward: false,
+      }), cursor(2, 0, 2)),
+    ])),
+    isPumpError('PUMP_EVENT_MISMATCH'),
   );
 });
 
@@ -141,7 +202,7 @@ void test('refuse un événement ambigu dans la portée d’une action', () => {
     () => decodePumpTransaction(transaction([
       action('buy_v2', cursor(3, null, 1)),
       eventAt(tradeEventInstruction(), cursor(3, 0, 2)),
-      eventAt(tradeEventInstruction(Uint8Array.of(1)), cursor(3, 1, 2)),
+      eventAt(tradeEventInstruction(), cursor(3, 1, 2)),
     ])),
     isPumpError('PUMP_EVENT_AMBIGUOUS'),
   );
@@ -230,13 +291,17 @@ function action(
   name: PumpInstructionName,
   location: Cursor,
   accountOverrides: Readonly<Record<string, string>> = {},
+  argumentOverrides: Readonly<Record<string, unknown>> = {},
 ): NormalizedInstruction {
   const definition = PUMP_INSTRUCTIONS[name];
-  const values = name === 'create_v2'
+  const baseValues = name === 'create_v2'
     ? CREATE_ARGS
+    : name === 'create'
+      ? CREATE_LEGACY_ARGS
     : name === 'sell_v2'
       ? SELL_ARGS
       : TRADE_ARGS;
+  const values = { ...baseValues, ...argumentOverrides };
   const accounts = definition.accounts.map((account) =>
     accountOverrides[account.name] ?? accountValue(account.name));
   if (name === 'create_v2') {
@@ -372,6 +437,14 @@ function encodeValue(type: unknown, value: unknown): Buffer {
     if (!Array.isArray(value)) throw new Error('OptionBool de test invalide.');
     return Buffer.from([value[0] === true ? 1 : 0]);
   }
+  if (isOptionU64(type)) {
+    if (!Array.isArray(value) || typeof value[0] !== 'bigint') {
+      throw new Error('OptionU64 de test invalide.');
+    }
+    const bytes = Buffer.alloc(8);
+    bytes.writeBigUInt64LE(value[0]);
+    return bytes;
+  }
   throw new Error(`Type de test non pris en charge: ${JSON.stringify(type)}.`);
 }
 
@@ -381,6 +454,14 @@ function isOptionBool(type: unknown): boolean {
   return typeof defined === 'object'
     && defined !== null
     && Reflect.get(defined, 'name') === 'OptionBool';
+}
+
+function isOptionU64(type: unknown): boolean {
+  if (typeof type !== 'object' || type === null) return false;
+  const defined = Reflect.get(type, 'defined');
+  return typeof defined === 'object'
+    && defined !== null
+    && Reflect.get(defined, 'name') === 'OptionU64';
 }
 
 function isPumpError(code: string) {

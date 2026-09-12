@@ -11,10 +11,11 @@ import {
   PUMP_IDL_REVISION,
   PUMP_IDL_SHA256,
   PUMP_INSTRUCTIONS,
+  PUMP_TYPES,
 } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 
 const SNAPSHOT = new URL(
-  '../vendor/pumpfun/idl/pump-9c82f61.json',
+  '../vendor/pumpfun/idl/pump-f216b672.json',
   import.meta.url,
 );
 const GENERATED = new URL(
@@ -28,6 +29,14 @@ void test('épingle et régénère exactement le sous-ensemble IDL Pump officiel
 
   assert.equal(PUMP_IDL_REVISION, OFFICIAL_PUMP_IDL_REVISION);
   assert.equal(PUMP_IDL_SHA256, OFFICIAL_PUMP_IDL_SHA256);
+  assert.equal(
+    PUMP_IDL_REVISION,
+    'f216b6724c6ede79d7cef9ce210b741f7e17e93b',
+  );
+  assert.equal(
+    PUMP_IDL_SHA256,
+    'ffe966c42f1af41652ee753fe2f1e3f7cd4077d7e6f49faf3138959c8b56064b',
+  );
   assert.equal(renderPumpIdlModule(idl), generated);
   assert.deepEqual(Object.keys(PUMP_INSTRUCTIONS), [
     'buy',
@@ -42,4 +51,13 @@ void test('épingle et régénère exactement le sous-ensemble IDL Pump officiel
     'sell_v2',
   ]);
   assert.deepEqual(Object.keys(PUMP_EVENTS), ['CreateEvent', 'TradeEvent']);
+  assert.ok(Object.hasOwn(PUMP_TYPES, 'OptionU64'));
+  assert.deepEqual(
+    PUMP_INSTRUCTIONS.create_v2.args.slice(-2).map((argument) => argument.name),
+    ['creator_fee_bps', 'is_holder_reward'],
+  );
+  assert.deepEqual(
+    PUMP_TYPES.CreateEvent.type.fields.slice(-2).map((field) => field.name),
+    ['creator_fee_bps', 'is_holder_reward'],
+  );
 });
