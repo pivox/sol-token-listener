@@ -25,6 +25,10 @@ import {
 
 const MINT = address(1);
 const CREATOR = address(2);
+const HOLDER_REWARDS_CREATOR = PublicKey.findProgramAddressSync(
+  [Buffer.from('holder-rewards'), new PublicKey(MINT).toBuffer()],
+  new PublicKey(PUMP_PROGRAM_ID),
+)[0].toBase58();
 const USER = address(3);
 const QUOTE_MINT = address(4);
 const OTHER = address(10);
@@ -74,6 +78,7 @@ void test('conserve le décodage create legacy sans holder reward', () => {
       is_cashback_enabled: false,
       creator_fee_bps: 0n,
       is_holder_reward: false,
+      creator: CREATOR,
       quote_mint: PublicKey.default.toBase58(),
     }), cursor(2, 0, 2)),
   ]));
@@ -123,7 +128,10 @@ void test('sépare le créateur demandé du routage effectif holder-reward', () 
   ]));
 
   assert.equal(decoded.creations[0]?.requestedCreator, requestedCreator);
-  assert.equal(decoded.creations[0]?.effectiveCreator, CREATOR);
+  assert.equal(
+    decoded.creations[0]?.effectiveCreator,
+    HOLDER_REWARDS_CREATOR,
+  );
   assert.equal(decoded.creations[0]?.creatorFeeBps, 1_200n);
   assert.equal(decoded.creations[0]?.isHolderReward, true);
 });
@@ -145,21 +153,35 @@ void test('exige le même créateur demandé et effectif hors holder-reward', ()
   );
 });
 
-void test('refuse un creator fee contradictoire pour une quote admise par quote-control', () => {
+void test('conserve le creator fee effectif avec un quote-control redondant', () => {
   const quoteControl = PublicKey.findProgramAddressSync(
     [Buffer.from('quote-control')],
     new PublicKey(PUMP_PROGRAM_ID),
   )[0].toBase58();
 
+  const decoded = decodePumpTransaction(transaction([
+    action(
+      'create_v2',
+      cursor(2, null, 1),
+      { quote_control: quoteControl },
+      { creator_fee_bps: [300n] },
+    ),
+    eventAt(createEventInstruction(new Uint8Array(), {
+      creator_fee_bps: 0n,
+    }), cursor(2, 0, 2)),
+  ]));
+
+  assert.deepEqual(decoded.creations[0]?.action.args.creator_fee_bps, [300n]);
+  assert.equal(decoded.creations[0]?.creatorFeeBps, 0n);
+});
+
+void test('refuse un créateur holder-reward qui n’est pas le PDA du mint', () => {
   assert.throws(
     () => decodePumpTransaction(transaction([
-      action(
-        'create_v2',
-        cursor(2, null, 1),
-        { quote_control: quoteControl },
-        { creator_fee_bps: [300n] },
-      ),
-      eventAt(createEventInstruction(), cursor(2, 0, 2)),
+      action('create_v2', cursor(2, null, 1)),
+      eventAt(createEventInstruction(new Uint8Array(), {
+        creator: OTHER,
+      }), cursor(2, 0, 2)),
     ])),
     isPumpError('PUMP_EVENT_MISMATCH'),
   );

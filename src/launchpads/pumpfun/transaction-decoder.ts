@@ -1,9 +1,11 @@
+import { PublicKey } from '@solana/web3.js';
 import type { TokenProgramKind } from '../../domain/types.js';
 import type {
   NormalizedInstruction,
   NormalizedTransaction,
 } from '../../solana/rpc/types.js';
 import {
+  PUMP_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ADDRESS,
   WSOL_MINT,
@@ -39,6 +41,8 @@ const BUY_IX_NAMES = new Set([
   'buy_exact_quote_in_v2',
 ]);
 const SELL_IX_NAMES = new Set(['sell', 'sell_v2']);
+const PUMP_PROGRAM = new PublicKey(PUMP_PROGRAM_ID);
+const HOLDER_REWARDS_SEED = Buffer.from('holder-rewards');
 
 export function decodePumpTransaction(
   transaction: NormalizedTransaction,
@@ -317,18 +321,17 @@ function validateCreation(
       transaction,
       'is_holder_reward',
     );
-    if (action.accounts.quote_control !== undefined) {
-      requireEqual(
-        event.creatorFeeBps,
-        optionBigIntArg(action, 'creator_fee_bps'),
-        transaction,
-        'creator_fee_bps',
-      );
-    }
   } else if (event.isHolderReward) {
     throw mismatch(transaction, 'Preuves Pump contradictoires: is_holder_reward.');
   }
-  if (!event.isHolderReward) {
+  if (event.isHolderReward) {
+    requireEqual(
+      event.creator,
+      deriveHolderRewardsCreator(event.mint),
+      transaction,
+      'holder_rewards_creator',
+    );
+  } else {
     requireEqual(
       event.creator,
       requestedCreator,
@@ -456,17 +459,6 @@ function optionBooleanArg(
   return value[0];
 }
 
-function optionBigIntArg(
-  action: DecodedPumpInstruction,
-  name: string,
-): bigint {
-  const value = action.args[name];
-  if (!isIdlArray(value) || typeof value[0] !== 'bigint') {
-    throw schemaMismatch(action, name);
-  }
-  return value[0];
-}
-
 function isIdlArray(
   value: PumpIdlValue | undefined,
 ): value is readonly PumpIdlValue[] {
@@ -499,14 +491,21 @@ function requireSupportedProgram(
 }
 
 function requireEqual(
-  actual: string | boolean | bigint,
-  expected: string | boolean | bigint,
+  actual: string | boolean,
+  expected: string | boolean,
   transaction: NormalizedTransaction,
   field: string,
 ): void {
   if (actual !== expected) {
     throw mismatch(transaction, `Preuves Pump contradictoires: ${field}.`);
   }
+}
+
+function deriveHolderRewardsCreator(mint: string): string {
+  return PublicKey.findProgramAddressSync(
+    [HOLDER_REWARDS_SEED, new PublicKey(mint).toBuffer()],
+    PUMP_PROGRAM,
+  )[0].toBase58();
 }
 
 function mismatch(

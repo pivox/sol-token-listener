@@ -311,7 +311,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
   assert.match(systemOverview, /La migration 047 est le head/u);
   assertContainsExactlyOnce(
     pumpFunArchitecture,
-    '**Version :** 1.1.4 — 2026-09-12',
+    '**Version :** 1.1.5 — 2026-09-12',
     'Pump.fun architecture version',
   );
   for (const document of [pumpFunArchitecture, runbook]) {

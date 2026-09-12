@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.4 — 2026-09-12
+**Version :** 1.1.5 — 2026-09-12
 
 ## Périmètre produit
 
@@ -313,7 +313,11 @@ octets et exactement 0, 3 ou 4 comptes restants. Le quatrième compte doit être
 le PDA Pump `quote-control`. `CreateEvent` accepte ses suffixes historiques
 officiels de 0, 8 ou 9 octets ; les champs absents valent respectivement zéro
 et faux. Le créateur demandé reste distinct du créateur effectif de routage des
-frais pour un token holder-reward. Aucun octet final inconnu n’est toléré.
+frais pour un token holder-reward, mais ce dernier doit être exactement le PDA
+Pump dérivé de `holder-rewards` et du mint. Le taux effectif vient de
+`CreateEvent` : la présence optionnelle de `quote-control` ne prouve pas que le
+taux demandé a été appliqué, car ce compte peut être redondant pour un quote
+mint déjà autorisé par `Global`. Aucun octet final inconnu n’est toléré.
 
 Les fixtures mainnet minimisées et versionnées couvrent une création avec
 achat initial, une vente CPI, un achat V2 CPI, une migration V2 avec son

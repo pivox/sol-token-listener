@@ -69,3 +69,19 @@
 - [x] Run `npm run build`, `npm run check`, `npm run lint`, `npm run docs:check`, and `npm test`.
 - [x] Inspect `git diff --check`, the complete diff, and repository status.
 - [x] Commit, push the isolated branch, and open a PR linked to issue 121 without requesting review or merging.
+
+### Task 6: Correct cycle-one protocol review findings
+
+**Files:**
+- Modify: `src/launchpads/pumpfun/transaction-decoder.ts`
+- Modify: `tests/pumpfun-event-decoder.test.ts`
+- Modify: `tests/pumpfun-transaction-decoder.test.ts`
+- Modify: `tests/pumpfun-mainnet-fixtures.test.ts`
+- Modify: `docs/architecture/pumpfun-v1.md`
+- Modify: `docs/superpowers/specs/2026-09-12-pumpfun-current-create-v2-decoder-design.md`
+
+- [x] Demonstrate RED for a redundant QuoteControl account with an ignored nonzero requested fee.
+- [x] Keep `CreateEvent.creatorFeeBps` authoritative without unavailable account-state inference.
+- [x] Demonstrate RED for an arbitrary effective holder-reward creator.
+- [x] Require the exact Pump `holder-rewards` PDA derived from the mint.
+- [x] Re-run complete verification, publish the correction, and resolve both review threads.

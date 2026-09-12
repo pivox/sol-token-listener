@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { PublicKey } from '@solana/web3.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
 import { loadPumpFixture, parsePumpFixture } from './helpers/pumpfun-fixture.js';
 
@@ -41,10 +43,21 @@ void test('valide le PDA quote-control et le créateur effectif holder-reward Ma
   const creation = decoded.creations[0];
 
   assert.equal(decoded.creations.length, 1);
-  assert.equal(creation?.action.accounts.quote_control, '6z6GDdfb2AjR9ZhJmAUQ5cipJCVxQvLJhB2H8mCwTFBP');
-  assert.equal(creation?.creatorFeeBps, 300n);
-  assert.equal(creation?.isHolderReward, true);
-  assert.notEqual(creation?.requestedCreator, creation?.effectiveCreator);
+  assert.ok(creation);
+  assert.equal(creation.action.accounts.quote_control, '6z6GDdfb2AjR9ZhJmAUQ5cipJCVxQvLJhB2H8mCwTFBP');
+  assert.equal(creation.creatorFeeBps, 300n);
+  assert.equal(creation.isHolderReward, true);
+  assert.notEqual(creation.requestedCreator, creation.effectiveCreator);
+  assert.equal(
+    creation.effectiveCreator,
+    PublicKey.findProgramAddressSync(
+      [
+        Buffer.from('holder-rewards'),
+        new PublicKey(creation.event.mint).toBuffer(),
+      ],
+      new PublicKey(PUMP_PROGRAM_ID),
+    )[0].toBase58(),
+  );
 });
 
 void test('décode hors ligne une vente CPI avec stackHeight 3', async () => {

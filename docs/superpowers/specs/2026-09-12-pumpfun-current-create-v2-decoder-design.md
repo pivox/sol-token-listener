@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-Specification version: `pumpfun-current-create-v2-decoder.v1`.
+Specification version: `pumpfun-current-create-v2-decoder.v2`.
 
 This change updates only the observe-side Pump.fun decoder. It adds no wallet,
 signing, transaction submission, paper-entry, or live-execution capability.
@@ -49,7 +49,15 @@ single seed `quote-control`. Partial and extra layouts fail closed.
 fields. Other suffix sizes fail closed. The decoded creation keeps
 `requestedCreator` (instruction argument) distinct from `effectiveCreator`
 (event fee-routing creator). Equality is required for regular coins and is
-not required for holder-reward coins.
+not required for holder-reward coins. For a holder-reward coin, the effective
+creator must equal the Pump PDA derived from `holder-rewards` and the mint;
+arbitrary fee-routing wallets fail closed.
+
+`creatorFeeBps` is the effective value emitted by `CreateEvent`. The requested
+instruction argument is decoded as `bigint`, but is not assumed to have been
+applied merely because the optional QuoteControl account is present: that
+account may be redundantly supplied for a quote mint already whitelisted by
+`Global`, in which case Pump ignores both the account and the requested fee.
 
 The launch projection retains `creator` as the effective fee-routing creator
 for database compatibility and records the requested creator, effective

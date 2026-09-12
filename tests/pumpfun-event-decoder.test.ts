@@ -23,6 +23,10 @@ const PUMP_PROGRAM =
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const MINT = address(1);
 const CREATOR = address(2);
+const HOLDER_REWARDS_CREATOR = PublicKey.findProgramAddressSync(
+  [Buffer.from('holder-rewards'), new PublicKey(MINT).toBuffer()],
+  new PublicKey(PUMP_PROGRAM),
+)[0].toBase58();
 const USER = address(3);
 const QUOTE_MINT = address(4);
 const CREATE_VALUES: Readonly<Record<string, unknown>> = {
@@ -32,7 +36,7 @@ const CREATE_VALUES: Readonly<Record<string, unknown>> = {
   mint: MINT,
   bonding_curve: address(5),
   user: USER,
-  creator: CREATOR,
+  creator: HOLDER_REWARDS_CREATOR,
   timestamp: 9_007_199_254_740_993n,
   virtual_token_reserves: 1_000_000_000_000n,
   virtual_sol_reserves: 30_000_000_000n,
@@ -89,7 +93,7 @@ void test('décode CreateEvent avec Token-2022, Mayhem, Cashback et quote mint',
   assert.ok(decoded);
   assert.equal(decoded.kind, 'CREATE');
   assert.equal(decoded.event.mint, MINT);
-  assert.equal(decoded.event.creator, CREATOR);
+  assert.equal(decoded.event.creator, HOLDER_REWARDS_CREATOR);
   assert.equal(decoded.event.tokenProgram, TOKEN_2022_PROGRAM_ADDRESS);
   assert.equal(decoded.event.isMayhemMode, true);
   assert.equal(decoded.event.isCashbackEnabled, true);
