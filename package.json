@@ -41,7 +41,7 @@
     "lint": "npm run lint:backend && npm run lint --workspace frontend",
     "lint:backend": "eslint src tests scripts --max-warnings=0 --ignore-pattern scripts/deployment-smoke.mjs --ignore-pattern scripts/validate-deployment-images.mjs && node --check scripts/deployment-smoke.mjs && node --check scripts/validate-deployment-images.mjs",
     "test": "npm run test:backend && npm test --workspace frontend",
-    "test:backend": "tsx --test tests/*.test.ts",
+    "test:backend": "tsx --test --test-concurrency=4 tests/*.test.ts",
     "frontend:dev": "npm run dev --workspace frontend",
     "frontend:e2e": "npm run e2e --workspace frontend",
     "db:migrate": "tsx scripts/migrate.ts",
