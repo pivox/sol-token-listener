@@ -9,19 +9,29 @@ les compteurs inbox, le RSS et le tableau fournisseur avant activation.
 
 ## Déroulement
 
-1. Vérifier une baseline saine avec le flag `false`, puis configurer les sept
-   valeurs suivies dans `.env.example`, avec le flag `true`.
+1. Copier `deploy/env.example` hors du dépôt, vérifier une baseline saine avec
+   le flag `false`, puis configurer les sept valeurs suivies dans ce fichier
+   opérateur avec `LISTENER_BLOCK_HYDRATION_ENABLED=true`.
 2. Redémarrer exactement une réplique. Ne jamais changer le flag à chaud.
 3. Capturer `/api/v1/health`, backlog/échecs terminaux, RSS et compteurs HTTP du
    fournisseur à T0, T+5 min et T+15 min.
 4. Classer la fenêtre `PASS`, `FAIL` ou `INCONCLUSIVE`. Un trafic insuffisant
-   pour mesurer la latence rend le test `INCONCLUSIVE`, jamais `PASS` implicite.
+   pour produire un delta `fetches` strictement positif rend le test
+   `INCONCLUSIVE`, jamais `PASS` implicite.
 
 ## Gates PASS
 
 - zéro HTTP 429 dans les métriques fournisseur ou les logs;
-- `queuedFetches` final inférieur ou égal à T+5 min et backlog inbox non croissant;
+- `heartbeat.blockHydration.enabled=true`, `version=1` et
+  `callerConcurrency=1` à chaque relevé T0, T+5 min et T+15 min; une valeur
+  conforme prouve que le chemin activé est observé. Toute autre valeur entraîne
+  `FAIL`;
+- `queuedFetches <= 1` et `inFlightFetches <= 1` à chaque relevé, avec backlog
+  inbox non croissant;
 - aucun nouvel échec terminal inexpliqué;
+- delta `fetches` strictement positif sur la fenêtre; un delta nul dû à un
+  trafic insuffisant classe la fenêtre `INCONCLUSIVE` tant qu’aucun autre gate
+  n’a échoué;
 - delta `fetches` moyen inférieur ou égal à 4/s (nominal attendu ~2,5/s);
 - p95 détection → traitement strictement inférieur à 45 s;
 - aucun oversize récurrent (au plus un pendant la fenêtre);

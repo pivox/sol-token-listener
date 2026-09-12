@@ -277,6 +277,43 @@ void test('Compose defines an observe-only, five-service deployment without expo
   }
 });
 
+void test('Compose forwards the seven block hydration settings with canonical fail-closed defaults', async () => {
+  const compose = await readArtifact('deploy/compose.yaml');
+  const environment = await readArtifact('deploy/env.example');
+  const app = composeService(compose, 'app');
+  const settings = Object.freeze([
+    ['LISTENER_BLOCK_HYDRATION_ENABLED', 'false'],
+    ['LISTENER_BLOCK_HYDRATION_MAX_ENTRIES', '64'],
+    ['LISTENER_BLOCK_HYDRATION_MAX_BYTES', '67108864'],
+    ['LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES', '8388608'],
+    ['LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS', '10000'],
+    ['LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS', '60000'],
+    ['LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS', '250'],
+  ] as const);
+
+  for (const [name, fallback] of settings) {
+    assert.match(
+      app,
+      new RegExp(`^ {6}${name}: "\\$\\{${name}:-${fallback}\\}"$`, 'mu'),
+    );
+    assert.match(environment, new RegExp(`^${name}=${fallback}$`, 'mu'));
+    assert.equal((compose.match(new RegExp(`^ {6}${name}:`, 'gmu')) ?? []).length, 1);
+  }
+  assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
+});
+
+void test('block hydration canary proves active routing and bounded serialized admission', async () => {
+  const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
+  assert.match(runbook, /T0, T\+5 min et T\+15 min/iu);
+  assert.match(runbook, /heartbeat\.blockHydration\.enabled=true/iu);
+  assert.match(runbook, /à chaque relevé/iu);
+  assert.match(runbook, /queuedFetches <= 1/u);
+  assert.match(runbook, /inFlightFetches <= 1/u);
+  assert.match(runbook, /delta `fetches` strictement positif/iu);
+  assert.match(runbook, /trafic insuffisant[\s\S]*INCONCLUSIVE/iu);
+  assert.match(runbook, /Toute autre valeur entraîne\s+`FAIL`/iu);
+});
+
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {
   const vite = await readArtifact('frontend/vite.config.ts');
   const readme = await readArtifact('frontend/README.md');
