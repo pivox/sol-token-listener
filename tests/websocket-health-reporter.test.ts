@@ -782,6 +782,7 @@ const notification: TransactionNotification = Object.freeze({
   slot: 42n,
   source: 'WEBSOCKET',
       ingestionHint: null,
+  ingestionHintMint: null,
   programIds: Object.freeze(['11111111111111111111111111111111']),
   confirmationStatus: 'processed',
   observedAtMs: 1_000,

@@ -2631,7 +2631,7 @@ function notification(
     ])
     : Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']);
   return Object.freeze({
-    signature, slot, source, ingestionHint, programIds, confirmationStatus, observedAtMs,
+    signature, slot, source, ingestionHint, ingestionHintMint: null, programIds, confirmationStatus, observedAtMs,
   });
 }
 

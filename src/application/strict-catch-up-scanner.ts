@@ -383,6 +383,7 @@ export class StrictCatchUpScanner {
           slot: row.slot,
           source: 'CATCH_UP',
           ingestionHint: null,
+          ingestionHintMint: null,
           programIds: Object.freeze([program.id]),
           confirmationStatus: row.confirmationStatus,
           observedAtMs,

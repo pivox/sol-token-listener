@@ -129,6 +129,7 @@ export class CatchUpScanner {
         slot: discovery.slot,
         source: 'CATCH_UP',
         ingestionHint: null,
+        ingestionHintMint: null,
         programIds: discovery.programIds,
         confirmationStatus: discovery.confirmationStatus,
         observedAtMs,

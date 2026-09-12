@@ -1,6 +1,6 @@
 import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
 import {
-  pumpFunCreateHintFromLogs,
+  pumpFunWebSocketHintFromLogs,
   type PumpFunWebSocketHint,
 } from '../../launchpads/pumpfun/websocket-create-hint.js';
 import { PUMPSWAP_PROGRAM_ID } from '../../markets/pumpswap/constants.js';
@@ -28,6 +28,7 @@ export interface WsProgramNotification {
   readonly signature: string;
   readonly slot: bigint;
   readonly hint: WsProgramHint;
+  readonly hintMint: string | null;
 }
 
 export type WsProgramSessionErrorReason =
@@ -444,9 +445,11 @@ export function openWsProgramSession(
         fail('PROTOCOL_INVALID');
         return;
       }
-      const hint = program === 'pumpfun'
-        ? pumpFunCreateHintFromLogs(ownData(value, 'logs'))
-        : 'NONE';
+      const hintResult = program === 'pumpfun'
+        ? pumpFunWebSocketHintFromLogs(ownData(value, 'logs'))
+        : null;
+      const hint = hintResult?.hint ?? 'NONE';
+      const hintMint = hintResult?.hintMint ?? null;
       let task: Promise<void>;
       try {
         task = observe(Object.freeze({
@@ -455,6 +458,7 @@ export function openWsProgramSession(
           signature,
           slot: BigInt(slot),
           hint,
+          hintMint,
         }));
       } catch {
         fail('NOTIFICATION_FAILED');

@@ -20,6 +20,7 @@ import {
 } from '../domain/websocket-health.js';
 import {
   assertValidTransactionNotification,
+  isCanonicalSolanaProgramId,
   type TransactionNotification,
   type ListenerRuntimeState,
 } from '../domain/transaction-ingestion.js';
@@ -917,18 +918,23 @@ export class WebSocketFailoverSupervisor {
     }
     let preliminary: TransactionNotification;
     try {
-      const payload = exactOwnData(value, ['endpointId', 'program', 'signature', 'slot', 'hint']);
+      const payload = exactOwnData(value, [
+        'endpointId', 'program', 'signature', 'slot', 'hint', 'hintMint',
+      ]);
       const programId = programIdFrom(payload.program);
       if (payload.endpointId !== providerId
         || programId === null
-        || (payload.hint !== 'NONE' && payload.hint !== 'PUMPFUN_CREATE')
-        || (payload.program !== 'pumpfun' && payload.hint === 'PUMPFUN_CREATE')
+        || !isValidWebSocketHintPair(payload.program, payload.hint, payload.hintMint)
         || !isCanonicalWebSocketSignature(payload.signature)) throw new TypeError();
+      const ingestionHint = payload.hint === 'PUMPFUN_CREATE'
+        ? 'PUMPFUN_CREATE'
+        : payload.hint === 'PUMPFUN_TRADE' ? 'PUMPFUN_TRADE' : null;
       preliminary = Object.freeze({
         signature: payload.signature,
         slot: payload.slot as bigint,
         source: 'WEBSOCKET',
-        ingestionHint: payload.hint === 'PUMPFUN_CREATE' ? 'PUMPFUN_CREATE' : null,
+        ingestionHint,
+        ingestionHintMint: ingestionHint === 'PUMPFUN_TRADE' ? payload.hintMint as string : null,
         programIds: Object.freeze([programId]),
         confirmationStatus: 'confirmed',
         observedAtMs: 0,
@@ -1858,6 +1864,15 @@ function programIdFrom(value: unknown): string | null {
     case 'pumpswap': return PUMPSWAP_PROGRAM_ID;
     default: return null;
   }
+}
+
+function isValidWebSocketHintPair(program: unknown, hint: unknown, mint: unknown): boolean {
+  if (program === 'pumpswap') return hint === 'NONE' && mint === null;
+  if (program !== 'pumpfun') return false;
+  if (hint === 'NONE' || hint === 'PUMPFUN_CREATE') return mint === null;
+  return hint === 'PUMPFUN_TRADE'
+    && typeof mint === 'string'
+    && isCanonicalSolanaProgramId(mint);
 }
 
 function isCanonicalWebSocketSignature(value: unknown): value is string {
