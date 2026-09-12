@@ -31,7 +31,8 @@ import type {
   LaunchpadEventSink,
 } from '../ports/launchpad-event-sink.js';
 import {
-  LaunchpadObservationError,
+  createLaunchpadObservationError,
+  matchesLaunchpadObservationError,
   type LaunchpadObservationStage,
 } from './launchpad-observation-errors.js';
 
@@ -124,15 +125,12 @@ export class LaunchpadObservationService<
       return await operation();
     } catch (cause) {
       if (
-        cause instanceof LaunchpadObservationError
-        && cause.stage === stage
-        && cause.source === envelope.source
-        && cause.program === envelope.program
-        && cause.signature === envelope.transaction.signature
+        matchesLaunchpadObservationError(cause, stage, envelope.source,
+          envelope.program, envelope.transaction.signature)
       ) {
         throw cause;
       }
-      throw new LaunchpadObservationError(
+      throw createLaunchpadObservationError(
         stage,
         envelope.source,
         envelope.program,

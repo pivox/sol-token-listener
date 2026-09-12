@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpBorshReader } from './borsh-reader.js';
 import { PUMP_PROGRAM_ID } from './constants.js';
-import { PumpDecodingError } from './errors.js';
+import type { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 import {
   PUMP_EVENTS,
   PUMP_TYPES,
@@ -198,7 +199,7 @@ function requireBoolean(
 }
 
 function invalidField(name: string): PumpDecodingError {
-  return new PumpDecodingError(
+  return createPumpDecodingError(
     'PUMP_SCHEMA_UNSUPPORTED',
     false,
     `Champ d’événement Pump invalide: ${name}.`,

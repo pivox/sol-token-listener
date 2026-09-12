@@ -8,7 +8,8 @@ import {
   TOKEN_2022_PROGRAM_ADDRESS,
   WSOL_MINT,
 } from './constants.js';
-import { PumpDecodingError } from './errors.js';
+import type { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 import { decodePumpCpiEvent } from './event-decoder.js';
 import { decodePumpInstruction } from './instruction-decoder.js';
 import {
@@ -44,7 +45,7 @@ export function decodePumpTransaction(
 ): DecodedPumpTransaction {
   if (transaction.error !== null) return emptyResult(transaction);
   if (transaction.transactionIndex === null) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_TRANSACTION_INDEX_REQUIRED',
       true,
       `Transaction ${transaction.signature} sans index canonique.`,
@@ -97,7 +98,7 @@ export function decodePumpTransaction(
 
   const orphan = events.find((event) => !consumed.has(event.index));
   if (orphan !== undefined) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_EVENT_ORPHANED',
       true,
       `Événement Pump orphelin à ${cursorKey(orphan.decoded.instruction)}.`,
@@ -171,7 +172,7 @@ function validateStackHeights(
     }
     const minimum = instruction.innerInstructionIndex === null ? 1 : 2;
     if (instruction.stackHeight < minimum) {
-      throw new PumpDecodingError(
+      throw createPumpDecodingError(
         'PUMP_STACK_HEIGHT_INVALID',
         true,
         `Stack height Pump invalide à ${cursorKey(instruction)}.`,
@@ -190,7 +191,7 @@ function stackRequired(
   transaction: NormalizedTransaction,
   instruction: NormalizedInstruction,
 ): PumpDecodingError {
-  return new PumpDecodingError(
+  return createPumpDecodingError(
     'PUMP_STACK_HEIGHT_REQUIRED',
     true,
     `Stack height Pump absent à ${cursorKey(instruction)}.`,
@@ -228,7 +229,7 @@ function isEventInsideActionScope(
 
 function requireInnerIndex(instruction: NormalizedInstruction): number {
   if (instruction.innerInstructionIndex === null) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_STACK_HEIGHT_INVALID',
       true,
       'Borne CPI Pump sans index interne.',
@@ -243,7 +244,7 @@ function requireOnlyEvent(
   transaction: NormalizedTransaction,
 ): IndexedEvent {
   if (candidates.length === 0) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_EVENT_MISSING',
       true,
       `Événement Pump absent pour ${action.name} à ${
@@ -258,7 +259,7 @@ function requireOnlyEvent(
     const code = cursors.size < candidates.length
       ? 'PUMP_EVENT_DUPLICATE'
       : 'PUMP_EVENT_AMBIGUOUS';
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       code,
       true,
       `Plusieurs événements Pump pour ${action.name}.`,
@@ -267,7 +268,7 @@ function requireOnlyEvent(
   }
   const candidate = candidates[0];
   if (candidate === undefined) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_EVENT_MISSING',
       true,
       `Événement Pump absent pour ${action.name}.`,
@@ -395,7 +396,7 @@ function requireTradeIxSemantic(
 function account(action: DecodedPumpInstruction, name: string): string {
   const value = action.accounts[name];
   if (value === undefined) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_ACCOUNT_MISSING',
       true,
       `Compte ${name} absent de ${action.name}.`,
@@ -437,7 +438,7 @@ function schemaMismatch(
   action: DecodedPumpInstruction,
   name: string,
 ): PumpDecodingError {
-  return new PumpDecodingError(
+  return createPumpDecodingError(
     'PUMP_SCHEMA_UNSUPPORTED',
     false,
     `Argument ${name} invalide dans ${action.name}.`,
@@ -450,7 +451,7 @@ function requireSupportedProgram(
 ): TokenProgramKind {
   if (program === SPL_TOKEN_PROGRAM_ID) return 'SPL_TOKEN';
   if (program === TOKEN_2022_PROGRAM_ADDRESS) return 'TOKEN_2022';
-  throw new PumpDecodingError(
+  throw createPumpDecodingError(
     'PUMP_TOKEN_PROGRAM_UNSUPPORTED',
     false,
     `Programme token Pump non pris en charge: ${program}.`,
@@ -473,7 +474,7 @@ function mismatch(
   transaction: NormalizedTransaction,
   message: string,
 ): PumpDecodingError {
-  return new PumpDecodingError(
+  return createPumpDecodingError(
     'PUMP_EVENT_MISMATCH',
     false,
     message,

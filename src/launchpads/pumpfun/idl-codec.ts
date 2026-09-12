@@ -1,5 +1,6 @@
 import type { PumpBorshReader } from './borsh-reader.js';
-import { PumpDecodingError } from './errors.js';
+import type { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 import { PUMP_TYPES } from './generated/pump-idl.js';
 import type { PumpIdlValue } from './types.js';
 
@@ -109,7 +110,7 @@ function freezeRecord(
 }
 
 function unsupportedType(type: unknown): PumpDecodingError {
-  return new PumpDecodingError(
+  return createPumpDecodingError(
     'PUMP_SCHEMA_UNSUPPORTED',
     false,
     `Type IDL Pump non pris en charge: ${safeStringify(type)}.`,

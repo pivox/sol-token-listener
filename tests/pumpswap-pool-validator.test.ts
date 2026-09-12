@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
+import { MarketError } from '../src/domain/market-errors.js';
 import { poolPda } from '../src/markets/pumpswap/official-sdk.js';
 import {
   AccountType,
@@ -11,7 +12,11 @@ import {
 } from '@solana/spl-token';
 import { PUMPSWAP_ACCOUNTS, PUMPSWAP_TYPES } from '../src/markets/pumpswap/generated/pumpswap-idl.js';
 import { decodePumpSwapPoolAccount } from '../src/markets/pumpswap/pool-account-decoder.js';
-import { validateCanonicalPumpSwapPool } from '../src/markets/pumpswap/pool-validator.js';
+import { RpcPumpSwapPoolValidator, validateCanonicalPumpSwapPool } from '../src/markets/pumpswap/pool-validator.js';
+import { trustedObservedPipelineOrigin } from '../src/domain/observed-pipeline-failure.js';
+import { trustedObservedPipelineFailure } from '../src/application/observed-transaction-pipeline.js';
+import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
+import { failurePipeline, failureTransaction } from './observed-pipeline-failure-fixtures.js';
 import type { ReadonlyAccountSnapshot } from '../src/ports/market-rpc-reader.js';
 
 const CREATOR = key(1);
@@ -29,6 +34,58 @@ void test('décode et valide le pool PumpSwap canonique index zéro', () => {
   assert.equal(pool.address, ADDRESS);
   assert.equal(pool.index, 0);
   assert.equal(decoded.virtualQuoteReservesRaw, 5_000n);
+});
+
+void test('the same decoder code is terminal on immutable evidence but retryable across mutable RPC pool validation', async () => {
+  const account = { ...poolAccount(), data: Uint8Array.from(PUMPSWAP_ACCOUNTS.Pool.discriminator) };
+  const raw = failureTransaction();
+  const observed = createSolanaObservedTransaction(raw, 1000);
+  let decoderError: unknown;
+  try { decodePumpSwapPoolAccount(account); } catch (error) { decoderError = error; }
+  assert.equal(trustedObservedPipelineOrigin(decoderError), 'PUMPSWAP_BORSH_TRUNCATED');
+  await assert.rejects(failurePipeline(() => { throw decoderError; }).process(raw, 1000), (error: unknown) => {
+    assert.equal(trustedObservedPipelineFailure(error)?.retryable, false);
+    return true;
+  });
+  const validator = new RpcPumpSwapPoolValidator({
+    async readAccountsAtSameSlot() {
+      return [account, mintAccount(BASE, TOKEN_2022_PROGRAM_ID, 6), mintAccount(QUOTE, TOKEN_PROGRAM_ID, 6)];
+    },
+  });
+  await assert.rejects(validator.validate(creation(), observed), (error: unknown) => {
+    assert.equal(trustedObservedPipelineOrigin(error), null);
+    assert.ok(error instanceof Error);
+    assert.equal(trustedObservedPipelineOrigin(error.cause), 'PUMPSWAP_BORSH_TRUNCATED');
+    return true;
+  });
+  await assert.rejects(failurePipeline(() => validator.validate(creation(), observed), 'pumpswap_observation')
+    .process(raw, 1000), (error: unknown) => {
+    assert.deepEqual(trustedObservedPipelineFailure(error), {
+      code: 'PIPELINE_STAGE_FAILED', errorName: 'ObservedPipelineFailure.v1.pumpswap_observation.UNKNOWN', retryable: true,
+    });
+    return true;
+  });
+});
+
+void test('mutable RPC boundary preserves non-decoder market errors', async () => {
+  const account = poolAccount({ index: 1n });
+  const validator = new RpcPumpSwapPoolValidator({
+    async readAccountsAtSameSlot() {
+      return [
+        account,
+        mintAccount(BASE, TOKEN_2022_PROGRAM_ID, 6),
+        mintAccount(QUOTE, TOKEN_PROGRAM_ID, 6),
+      ];
+    },
+  });
+  await assert.rejects(
+    validator.validate(
+      creation(),
+      createSolanaObservedTransaction(failureTransaction(), 1_000),
+    ),
+    (error: unknown) => error instanceof MarketError
+      && error.code === 'MARKET_POOL_NON_CANONICAL',
+  );
 });
 
 void test('refuse un index ou une PDA non canonique', () => {

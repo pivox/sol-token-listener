@@ -10,7 +10,7 @@ import type {
 } from '../domain/market.js';
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
-import { PumpSwapDecodingError } from '../markets/pumpswap/errors.js';
+import { createPumpSwapDecodingError } from '../markets/pumpswap/errors.js';
 import type {
   DecodedPumpSwapPoolCreation,
   DecodedPumpSwapTransaction,
@@ -54,7 +54,7 @@ export function matchPumpSwapMigrations(
         transaction.raw.instructions,
       ));
     if (candidates.length > 1) {
-      throw new PumpSwapDecodingError(
+      throw createPumpSwapDecodingError(
         'PUMPSWAP_EVENT_AMBIGUOUS',
         `Plusieurs create_pool pour la migration ${migration.mint}.`,
         transaction.signature,
@@ -118,7 +118,7 @@ function assertValidatedPool(
     || pool.activatedAt.innerInstructionIndex !== cursor.innerInstructionIndex
     || pool.confirmationStatus !== confirmationStatus
   ) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_EVENT_MISMATCH',
       `Pool PumpSwap validé contradictoire dans ${signature}.`,
       signature,
@@ -143,7 +143,7 @@ function findInstruction(
     && instruction.innerInstructionIndex === migration.cursor.innerInstructionIndex
     && instruction.programId === PUMP_PROGRAM_ID);
   if (found === undefined) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_EVENT_MISMATCH',
       'Instruction Pump de migration absente de la transaction.',
       transaction.signature,
@@ -184,7 +184,7 @@ function isDirectCpiChild(
 
 function requireInnerIndex(instruction: NormalizedInstruction): number {
   if (instruction.innerInstructionIndex === null) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_STACK_HEIGHT_REQUIRED',
       'Index CPI PumpSwap requis.',
     );

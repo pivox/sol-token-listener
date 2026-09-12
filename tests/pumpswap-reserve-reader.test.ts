@@ -6,6 +6,7 @@ import {
 } from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
 import type { CanonicalMarketPool } from '../src/domain/market.js';
+import { trustedObservedPipelineOrigin } from '../src/domain/observed-pipeline-failure.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { PUMPSWAP_ACCOUNTS, PUMPSWAP_TYPES } from '../src/markets/pumpswap/generated/pumpswap-idl.js';
 import {
@@ -60,6 +61,30 @@ void test('PumpSwap reserves reject non-positive effective quote liquidity', asy
     (error: unknown) => error instanceof InvalidEffectiveQuoteReserveError
       && error.amountRaw === 0n,
   );
+});
+
+void test('PumpSwap reserve RPC decoding failures lose terminal authority and can be retried', async () => {
+  const valid = fixtures();
+  let calls = 0;
+  const reader = new PumpSwapReserveReader({
+    readAccountsAtSameSlot: () => {
+      calls += 1;
+      return Promise.resolve(calls === 1
+        ? [{ ...valid[0], data: Uint8Array.from(PUMPSWAP_ACCOUNTS.Pool.discriminator) }, valid[1], valid[2]]
+        : valid);
+    },
+  }, () => 2_000);
+  await assert.rejects(reader.read(canonicalPool()), (error: unknown) => {
+    assert.equal(trustedObservedPipelineOrigin(error), null);
+    assert.ok(error instanceof Error);
+    assert.equal(
+      trustedObservedPipelineOrigin(error.cause),
+      'PUMPSWAP_BORSH_TRUNCATED',
+    );
+    return true;
+  });
+  assert.equal((await reader.read(canonicalPool())).observedSlot, 123n);
+  assert.equal(calls, 2);
 });
 
 void test('Solana market RPC reader snapshots one immutable context without writes', async () => {

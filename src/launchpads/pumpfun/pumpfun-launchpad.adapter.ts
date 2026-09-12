@@ -21,7 +21,7 @@ import {
   SPL_TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ADDRESS,
 } from './constants.js';
-import { PumpDecodingError } from './errors.js';
+import { createPumpDecodingError } from './errors.js';
 import { decodePumpTransaction } from './transaction-decoder.js';
 import type {
   DecodedPumpCreation,
@@ -183,7 +183,7 @@ function validateObservedTransaction(
     || transaction.cursor.transactionIndex !== raw.transactionIndex
     || transaction.confirmationStatus !== CONFIRMATION_STATUS[raw.confirmationStatus]
   ) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_SCHEMA_UNSUPPORTED',
       false,
       'Enveloppe Pump.fun incohérente avec la transaction normalisée.',
@@ -197,7 +197,7 @@ function validateObservedTransaction(
 function mapTokenProgram(program: string): TokenProgramKind {
   if (program === SPL_TOKEN_PROGRAM_ID) return 'SPL_TOKEN';
   if (program === TOKEN_2022_PROGRAM_ADDRESS) return 'TOKEN_2022';
-  throw new PumpDecodingError(
+  throw createPumpDecodingError(
     'PUMP_TOKEN_PROGRAM_UNSUPPORTED',
     false,
     `Programme token Pump non pris en charge: ${program}.`,
@@ -221,7 +221,7 @@ function deterministicTradeId(
 
 function requiredTransactionIndex(transaction: NormalizedTransaction): number {
   if (transaction.transactionIndex === null) {
-    throw new PumpDecodingError(
+    throw createPumpDecodingError(
       'PUMP_TRANSACTION_INDEX_REQUIRED',
       true,
       `Transaction ${transaction.signature} sans index canonique.`,

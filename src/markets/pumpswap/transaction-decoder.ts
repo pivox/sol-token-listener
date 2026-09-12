@@ -2,7 +2,7 @@ import type {
   NormalizedInstruction,
   NormalizedTransaction,
 } from '../../solana/rpc/types.js';
-import { PumpSwapDecodingError } from './errors.js';
+import { createPumpSwapDecodingError, trustedPumpSwapDecodingCode, type PumpSwapDecodingError } from './errors.js';
 import { decodePumpSwapCpiEvent } from './event-decoder.js';
 import { decodePumpSwapInstruction } from './instruction-decoder.js';
 import type {
@@ -194,7 +194,7 @@ function requireStack(
 function account(action: DecodedPumpSwapInstruction, name: string): string {
   const value = action.accounts[name];
   if (value === undefined) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_ACCOUNT_MISSING',
       `Compte PumpSwap absent: ${name}.`,
     );
@@ -228,7 +228,7 @@ function equal(
 }
 
 function schema(name: string): PumpSwapDecodingError {
-  return new PumpSwapDecodingError(
+  return createPumpSwapDecodingError(
     'PUMPSWAP_SCHEMA_UNSUPPORTED',
     `Champ PumpSwap invalide: ${name}.`,
   );
@@ -244,7 +244,7 @@ function error(
   transaction: NormalizedTransaction,
   detail: string,
 ): PumpSwapDecodingError {
-  return new PumpSwapDecodingError(
+  return createPumpSwapDecodingError(
     code,
     `Preuve PumpSwap invalide (${detail}) dans ${transaction.signature}.`,
     transaction.signature,
@@ -284,10 +284,11 @@ function contextualIssue(
   detail: string,
   instruction: NormalizedInstruction,
 ): PumpSwapDecodingError {
-  if (cause instanceof PumpSwapDecodingError) {
-    return new PumpSwapDecodingError(
-      cause.code,
-      `${cause.message} (${detail})`,
+  const code = trustedPumpSwapDecodingCode(cause);
+  if (code !== null) {
+    return createPumpSwapDecodingError(
+      code,
+      `Preuve PumpSwap invalide (${detail}).`,
       transaction.signature,
       { cause },
       transaction.transactionIndex === null

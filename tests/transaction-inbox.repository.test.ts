@@ -3,6 +3,10 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
+import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
+import { createPumpDecodingError, PUMP_DECODING_ERROR_CODES } from '../src/launchpads/pumpfun/errors.js';
+import { createPumpSwapDecodingError, PUMPSWAP_DECODING_ERROR_CODES } from '../src/markets/pumpswap/errors.js';
+import { failurePipeline, failureTransaction, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
 import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import { FinalityReconciler } from '../src/application/finality-reconciler.js';
@@ -1513,6 +1517,114 @@ void test('terminalizes a capped expired lease and claims the next row atomicall
     assert.ok(expired.retry_exhausted_at);
     assert.ok(expired.terminal_at);
     assert.equal(expired.next_attempt_at, null);
+  });
+});
+
+void test('persists every internal pipeline code terminal at the first PostgreSQL claim without secrets', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const cases = [
+      ...PUMP_DECODING_ERROR_CODES.map((code) => ({ code, stage: 'launchpad_observation' as const,
+        origin: createPumpDecodingError(code, true, 'secret provider URL', 'secret signature') })),
+      ...PUMPSWAP_DECODING_ERROR_CODES.map((code) => ({ code, stage: 'pumpswap_observation' as const,
+        origin: createPumpSwapDecodingError(code, 'secret provider URL', 'secret signature') })),
+    ];
+    for (const [index, scenario] of cases.entries()) {
+      const signature = `taxonomy-${index}`;
+      await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'confirmed'));
+      const worker = new TransactionInboxWorker(repository, {
+        async locate() { return failureTransaction(signature); },
+      }, failurePipeline(() => { throw scenario.origin; }, scenario.stage), {
+        leaseSeconds: 30, renewalIntervalMs: 1000, idlePollMs: 100,
+      });
+      assert.equal((await worker.runOnce()).kind, 'failed');
+      await worker.close();
+      const stored = await row(pool, signature);
+      assert.equal(stored.error_code, 'PIPELINE_STAGE_FAILED');
+      assert.equal(stored.error_name, `ObservedPipelineFailure.v1.${scenario.stage}.${scenario.code}`);
+      assert.equal(stored.error_retryable, false);
+      assert.equal(stored.attempts_in_cycle, 1);
+      assert.equal(stored.next_attempt_at, null);
+      assert.equal(stored.retry_exhausted_at, null);
+      assert.ok(stored.terminal_at);
+      assert.equal(stored.purge_after.getTime() - stored.terminal_at.getTime(), 14_400_000);
+      assert.ok(stored.normalized_transaction);
+      assert.doesNotMatch(JSON.stringify(stored), /secret|provider URL/);
+      assert.equal(await repository.claim(Date.now() + 60000, 30), null);
+    }
+  });
+});
+
+void test('PostgreSQL real Pump decode failures terminalize fresh and legacy-snapshot replay without RPC', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, { maxAttempts: 5, baseDelayMs: 1000 });
+    for (const replay of [false, true]) {
+      for (const code of ['PUMP_BORSH_INVALID', 'PUMP_BORSH_TRUNCATED', 'PUMP_ACCOUNT_MISSING'] as const) {
+        const signature = `real-${code}-${replay}`;
+        const transaction = malformedPumpTransaction(code, signature);
+        await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'confirmed'));
+        let now = Date.now();
+        if (replay) {
+          const seed = await repository.claim(now, 30);
+          assert.ok(seed);
+          await repository.saveSnapshot(signature, seed.leaseToken, transaction);
+          await repository.markFailed(signature, seed.leaseToken, Object.freeze({
+            code: 'PIPELINE_STAGE_FAILED', errorName: 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', retryable: true,
+          }));
+          // Existing legacy rows remain readable; no new legacy writes through the repository.
+          await pool.query("UPDATE chain_transaction_inbox SET error_name='ObservedPipelineError' WHERE signature=$1", [signature]);
+          now = new Date((await row(pool, signature)).next_attempt_at).getTime() + 1;
+        }
+        const worker = new TransactionInboxWorker(repository, {
+          async locate() { assert.equal(replay, false); return transaction; },
+        }, realPumpPipeline(), { leaseSeconds: 30, renewalIntervalMs: 1000, idlePollMs: 100, now: () => now });
+        assert.equal((await worker.runOnce()).kind, 'failed');
+        await worker.close();
+        const stored = await row(pool, signature);
+        assert.equal(stored.error_name, `ObservedPipelineFailure.v1.launchpad_observation.${code}`);
+        assert.equal(stored.error_retryable, false);
+        assert.equal(stored.attempts_in_cycle, replay ? 2 : 1);
+        assert.ok(stored.terminal_at);
+        assert.equal(stored.next_attempt_at, null);
+        assert.equal(await repository.claim(now + 60000, 30), null);
+      }
+    }
+  });
+});
+
+void test('PostgreSQL snapshot replay stays offline and foreign DB/RPC failures remain scheduled', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, { maxAttempts: 5, baseDelayMs: 1000 });
+    for (const stage of ['load_tracked_mints', 'pumpswap_observation'] as const) {
+      const signature = `transient-${stage}`;
+      await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'confirmed'));
+      const first = await repository.claim(Date.now(), 30);
+      assert.ok(first);
+      await repository.saveSnapshot(signature, first.leaseToken, failureTransaction(signature));
+      await repository.markFailed(signature, first.leaseToken, Object.freeze({
+        code: 'PIPELINE_STAGE_FAILED', errorName: 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', retryable: true,
+      }));
+      const retryAt = new Date((await row(pool, signature)).next_attempt_at).getTime();
+      let now = retryAt + 1;
+      const worker = new TransactionInboxWorker(repository, {
+        async locate() { assert.fail('snapshot replay must not invoke RPC locator'); },
+      }, failurePipeline(() => { throw new Error('secret DB/RPC URL'); }, stage), {
+        leaseSeconds: 30, renewalIntervalMs: 1000, idlePollMs: 100, now: () => now,
+      });
+      assert.equal((await worker.runOnce()).kind, 'failed');
+      await worker.close();
+      const stored = await row(pool, signature);
+      assert.equal(stored.error_name, `ObservedPipelineFailure.v1.${stage}.UNKNOWN`);
+      assert.equal(stored.error_retryable, true);
+      assert.equal(stored.terminal_at, null);
+      assert.ok(stored.next_attempt_at);
+      assert.doesNotMatch(JSON.stringify(stored), /secret/);
+      now = new Date(stored.next_attempt_at).getTime() + 1;
+      const retried = await repository.claim(now, 30);
+      assert.ok(retried);
+      // Finish the synthetic row so the next scenario has its own claim.
+      await repository.markProcessed(signature, retried.leaseToken, 'confirmed');
+    }
   });
 });
 

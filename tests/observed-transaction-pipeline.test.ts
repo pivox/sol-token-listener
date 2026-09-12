@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   MAX_OBSERVED_PIPELINE_ITEMS,
   ObservedPipelineError,
+  trustedObservedPipelineFailure,
   ObservedTransactionPipeline,
   type ObservedPipelineStage,
 } from '../src/application/observed-transaction-pipeline.js';
@@ -655,9 +656,12 @@ void test('cuts off after each failed stage and identifies the exact stable stag
       assert.ok(error instanceof ObservedPipelineError);
       assert.equal(error.code, 'PIPELINE_STAGE_FAILED');
       assert.equal(error.stage, stage);
+      assert.deepEqual(trustedObservedPipelineFailure(error), {
+        code: 'PIPELINE_STAGE_FAILED', errorName: `ObservedPipelineFailure.v1.${stage}.UNKNOWN`, retryable: true,
+      });
       assert.equal(error.mint, mint);
       assert.equal(error.message, `Observed transaction pipeline failed during ${stage}.`);
-      assert.equal('cause' in error, false);
+      assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
       return true;
     });
     assert.deepEqual(h.order, expectedOrder);
@@ -679,7 +683,7 @@ void test('redacts hostile transaction accessors at the observation boundary', a
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'create_observation');
     assert.equal(error.message.includes(secret), false);
-    assert.equal('cause' in error, false);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
     return true;
   });
   assert.deepEqual(h.order, []);
@@ -878,7 +882,7 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
   await assert.rejects(affected.pipeline.process(affected.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'launchpad_observation');
-    assert.equal('cause' in error, false);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
     return true;
   });
 
@@ -909,7 +913,7 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
     await assert.rejects(pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
       assert.ok(error instanceof ObservedPipelineError);
       assert.equal(error.message.includes(secret), false);
-      assert.equal('cause' in error, false);
+      assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
       return true;
     });
   }
@@ -951,7 +955,7 @@ void test('counts every visited leaf at the snapshot node limit and rejects one 
   await assert.rejects(rejected.pipeline.process(rejected.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
-    assert.equal('cause' in error, false);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
     return true;
   });
   assert.deepEqual(rejected.order, ['tracked', 'launchpad', 'reload']);
@@ -977,7 +981,7 @@ void test('enforces exact aggregate serialized bytes including numeric leaves an
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
     assert.equal(error.message.includes('serialized'), false);
-    assert.equal('cause' in error, false);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
     return true;
   });
   assert.deepEqual(rejected.order, ['tracked', 'launchpad', 'reload']);
@@ -990,7 +994,7 @@ void test('charges a shared event subtree for every logical occurrence', async (
   await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
-    assert.equal('cause' in error, false);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
     return true;
   });
   assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload']);
@@ -1011,7 +1015,7 @@ void test('rejects 4096 shared padded events before funding without expanding th
   await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
     assert.equal(error.stage, 'reload_active_events');
-    assert.equal('cause' in error, false);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable, false);
     return true;
   });
   assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload']);

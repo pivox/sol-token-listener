@@ -1,7 +1,8 @@
 import type { ReadonlyAccountSnapshot } from '../../ports/market-rpc-reader.js';
 import { PumpSwapBorshReader } from './borsh-reader.js';
 import { PUMPSWAP_PROGRAM_ID } from './constants.js';
-import { PumpSwapDecodingError } from './errors.js';
+import type { PumpSwapDecodingError } from './errors.js';
+import { createPumpSwapDecodingError } from './errors.js';
 import { PUMPSWAP_ACCOUNTS } from './generated/pumpswap-idl.js';
 import type { DecodedPumpSwapPoolAccount } from './types.js';
 
@@ -56,5 +57,5 @@ function number(value: bigint, field: string, maximum: number): number {
 }
 
 function invalid(message: string): PumpSwapDecodingError {
-  return new PumpSwapDecodingError('PUMPSWAP_SCHEMA_UNSUPPORTED', message);
+  return createPumpSwapDecodingError('PUMPSWAP_SCHEMA_UNSUPPORTED', message);
 }

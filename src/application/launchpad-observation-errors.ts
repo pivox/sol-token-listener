@@ -1,3 +1,25 @@
+import { inheritObservedPipelineOrigin } from '../domain/observed-pipeline-failure.js';
+
+const identities = new WeakMap<object, readonly unknown[]>();
+
+export function matchesLaunchpadObservationError(
+  value: unknown,
+  ...identity: readonly [LaunchpadObservationStage, string, string, string]
+): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const registered = identities.get(value);
+  return registered?.every((field, index) => field === identity[index]) ?? false;
+}
+
+/** Internal service factory: public wrappers cannot confer trust by carrying a cause. */
+export function createLaunchpadObservationError(
+  ...args: ConstructorParameters<typeof LaunchpadObservationError>
+): LaunchpadObservationError {
+  const error = new LaunchpadObservationError(...args);
+  inheritObservedPipelineOrigin(error, args[4]);
+  return error;
+}
+
 export type LaunchpadObservationStage =
   | 'detect_launches'
   | 'decode_trades'
@@ -20,5 +42,6 @@ export class LaunchpadObservationError extends Error {
     );
     this.name = 'LaunchpadObservationError';
     this.cause = cause;
+    identities.set(this, Object.freeze([stage, source, program, signature]));
   }
 }

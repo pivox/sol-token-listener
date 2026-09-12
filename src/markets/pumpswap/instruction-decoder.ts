@@ -1,7 +1,7 @@
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpSwapBorshReader } from './borsh-reader.js';
 import { PUMPSWAP_PROGRAM_ID } from './constants.js';
-import { PumpSwapDecodingError } from './errors.js';
+import { createPumpSwapDecodingError } from './errors.js';
 import { PUMPSWAP_INSTRUCTIONS } from './generated/pumpswap-idl.js';
 import type {
   DecodedPumpSwapInstruction,
@@ -37,7 +37,7 @@ export function decodePumpSwapInstruction(
   );
   if (matched === undefined) return null;
   if (instruction.accounts.length < matched.definition.accounts.length) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_ACCOUNT_MISSING',
       `Instruction ${matched.name}: comptes incomplets.`,
     );
@@ -56,7 +56,7 @@ export function decodePumpSwapInstruction(
     ]),
   ));
   if (reader.remaining !== 0) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_BORSH_INVALID',
       `Instruction ${matched.name}: octets résiduels.`,
     );
@@ -77,7 +77,7 @@ function requiredAccount(
 ): string {
   const value = instruction.accounts[index];
   if (value === undefined) {
-    throw new PumpSwapDecodingError(
+    throw createPumpSwapDecodingError(
       'PUMPSWAP_ACCOUNT_MISSING',
       `Compte PumpSwap ${name} absent à l’index ${index}.`,
     );
@@ -97,7 +97,7 @@ function decodeValue(type: unknown, reader: PumpSwapBorshReader): PumpSwapIdlVal
   ) {
     return Object.freeze([reader.readBool()]);
   }
-  throw new PumpSwapDecodingError(
+  throw createPumpSwapDecodingError(
     'PUMPSWAP_SCHEMA_UNSUPPORTED',
     `Type d’argument PumpSwap non pris en charge: ${JSON.stringify(type)}.`,
   );

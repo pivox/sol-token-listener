@@ -12,6 +12,7 @@ import {
   type TransactionLocationTarget,
 } from '../solana/rpc/transaction-locator.js';
 import type { LegacyConfirmationStatus, NormalizedTransaction } from '../solana/rpc/types.js';
+import { trustedObservedPipelineFailure } from './observed-transaction-pipeline.js';
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -263,15 +264,15 @@ export class TransactionInboxWorker {
     );
     if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
 
-    let pipelineFailed = false;
+    let pipelineFailed: IngestionFailure | null = null;
     try {
       await this.pipeline.process(transaction, claim.observedAtMs);
-    } catch {
-      pipelineFailed = true;
+    } catch (error) {
+      pipelineFailed = trustedObservedPipelineFailure(error) ?? pipelineFailure();
     }
     const owned = await lease.finish();
     if (!owned) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
-    if (pipelineFailed) return this.markFailed(claim, pipelineFailure());
+    if (pipelineFailed !== null) return this.markFailed(claim, pipelineFailed);
 
     try {
       await this.repository.markProcessed(
@@ -480,7 +481,7 @@ function normalizationFailure(): IngestionFailure {
 
 function pipelineFailure(): IngestionFailure {
   return Object.freeze({
-    code: 'PIPELINE_STAGE_FAILED', errorName: 'ObservedPipelineError', retryable: true,
+    code: 'PIPELINE_STAGE_FAILED', errorName: 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', retryable: true,
   });
 }
 

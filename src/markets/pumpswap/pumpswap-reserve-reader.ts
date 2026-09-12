@@ -13,6 +13,7 @@ import type {
   ReadonlyAccountSnapshot,
 } from '../../ports/market-rpc-reader.js';
 import { decodePumpSwapPoolAccount } from './pool-account-decoder.js';
+import { rethrowMutablePumpSwapRpcFailure } from './errors.js';
 import {
   computeEffectiveQuoteReservesRaw,
   InvalidEffectiveQuoteReservesError,
@@ -56,7 +57,12 @@ export class PumpSwapReserveReader {
         'Les réserves PumpSwap ne partagent pas le même slot RPC.',
       );
     }
-    const decodedPool = decodePumpSwapPoolAccount(poolAccount);
+    let decodedPool: ReturnType<typeof decodePumpSwapPoolAccount>;
+    try {
+      decodedPool = decodePumpSwapPoolAccount(poolAccount);
+    } catch (cause) {
+      rethrowMutablePumpSwapRpcFailure(cause);
+    }
     if (
       decodedPool.baseVault !== pool.baseVault
       || decodedPool.quoteVault !== pool.quoteVault
