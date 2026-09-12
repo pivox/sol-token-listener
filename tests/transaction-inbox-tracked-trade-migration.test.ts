@@ -177,6 +177,30 @@ void test('047 permits every existing lifecycle and strictly rejects hint/deferr
       await assert.rejects(insertInbox(pool, row), (error: unknown) =>
         error instanceof pg.DatabaseError && ['23514', '23502'].includes(error.code ?? ''), JSON.stringify(row));
     }
+    // Keep these cases valid under all unrelated checks: generic rejection
+    // alone could otherwise conceal a missing hint or deferred invariant.
+    const hintConstraintCases = [
+      { ingestion_hint: 'UNKNOWN' }, { ingestion_hint_mint: mint },
+      { ingestion_hint: 'PUMPFUN_CREATE', ingestion_hint_mint: mint },
+      { ingestion_hint: 'PUMPFUN_TRADE' },
+      { ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: '0'.repeat(32) },
+    ];
+    for (const row of hintConstraintCases) {
+      await assert.rejects(insertInbox(pool, row), {
+        code: '23514', constraint: 'chain_transaction_inbox_ingestion_hint_check',
+      }, JSON.stringify(row));
+    }
+    const deferredConstraintCases = [
+      { ingestion_hint: 'NONE', ingestion_hint_mint: null },
+      { ingestion_priority: 'TRACKED_TRADE' }, { attempts: 1 }, snapshot,
+      { terminal_at: null, purge_after: null },
+      { terminal_at: '2026-09-12T09:59:00.000Z', purge_after: '2026-09-12T13:59:00.000Z' },
+    ];
+    for (const patch of deferredConstraintCases) {
+      await assert.rejects(insertInbox(pool, { ...deferred, ...patch }), {
+        code: '23514', constraint: 'chain_transaction_inbox_deferred_check',
+      }, JSON.stringify(patch));
+    }
     for (const count of [0, 32]) {
       await pool.query('UPDATE chain_transaction_inbox_claim_scheduler SET consecutive_urgent_claims=$1', [count]);
       assert.equal((await pool.query('SELECT consecutive_urgent_claims FROM chain_transaction_inbox_claim_scheduler')).rows[0]?.consecutive_urgent_claims, count);
