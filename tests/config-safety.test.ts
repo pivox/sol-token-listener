@@ -1092,9 +1092,12 @@ void test('tracked Pump.fun trade priority documents the closed H2i operational 
 });
 
 void test('HTTP RPC failover documentation states the bounded production and soak contract', async () => {
-  const [readme, operations] = await Promise.all([
+  const [readme, operations, legacyDesign, legacyPlan, monoEndpointSpec] = await Promise.all([
     readFile(new URL('../README.md', import.meta.url), 'utf8'),
     readFile(new URL('../docs/operations/rpc-qualification.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/specs/2026-08-27-solana-http-rpc-failover-design.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/plans/2026-08-27-solana-http-rpc-failover.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/specs/2026-09-12-mono-endpoint-rpc-rate-limit-design.md', import.meta.url), 'utf8'),
   ]);
   const documentation = `${readme}\n${operations}`;
 
@@ -1128,9 +1131,16 @@ void test('HTTP RPC failover documentation states the bounded production and soa
     'non exécutée',
     'non validée',
     'observe/paper only',
+    'disableRetryOnRateLimit: true',
+    'une seule tentative fetch déclenchée par web3.js',
+    'aucun retry 429 web3.js',
+    'aucun fetch custom',
   ]) assert.ok(documentation.includes(statement), `missing HTTP RPC failover documentation statement: ${statement}`);
 
-  assert.match(readme, /Sans fallback[\s\S]{0,180}web3\.js[\s\S]{0,100}rate.limit retry/iu);
+  assert.match(readme, /Sans fallback[\s\S]{0,220}disableRetryOnRateLimit[\s\S]{0,220}une seule tentative fetch déclenchée par web3\.js/iu);
+  assert.match(operations, /Sans fallback[\s\S]{0,220}disableRetryOnRateLimit[\s\S]{0,220}une seule tentative fetch déclenchée par web3\.js/iu);
+  assert.match(readme, /aucun retry 429 web3\.js/iu);
+  assert.match(operations, /aucun retry 429 web3\.js/iu);
   assert.match(operations, /rejet réseau[\s\S]{0,180}429[\s\S]{0,180}502[\s\S]{0,180}503[\s\S]{0,180}504/iu);
   assert.match(operations, /chaque endpoint éligible[\s\S]{0,120}au plus une fois[\s\S]{0,120}requête logique/iu);
   assert.match(operations, /refroidissement[\s\S]{0,120}aucune attente interne/iu);
@@ -1138,6 +1148,12 @@ void test('HTTP RPC failover documentation states the bounded production and soa
   assert.match(operations, /indépendamment[\s\S]{0,180}quota[\s\S]{0,180}cohérence archive/iu);
   assert.match(operations, /basculement de production[\s\S]{0,180}soak/iu);
   assert.match(readme, /wallet[\s\S]{0,80}signature[\s\S]{0,80}soumission/iu);
+  assert.match(legacyDesign, /^Version: 1\.1\.1$/mu);
+  assert.match(legacyDesign, /partiellement supersédée[\s\S]{0,300}\[issue #106 specification\]\(\.\/2026-09-12-mono-endpoint-rpc-rate-limit-design\.md\)/iu);
+  assert.match(legacyPlan, /plan historique[\s\S]{0,300}2026-09-12-mono-endpoint-rpc-rate-limit-design\.md/iu);
+  assert.match(monoEndpointSpec, /Version : 1\.0\.1/u);
+  assert.match(monoEndpointSpec, /une seule tentative fetch déclenchée par web3\.js/iu);
+  assert.match(monoEndpointSpec, /aucun retry 429 web3\.js/iu);
 });
 
 void test('qualification loader, evaluator, profile, and public API boundaries exclude execution primitives', async () => {

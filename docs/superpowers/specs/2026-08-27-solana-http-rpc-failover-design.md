@@ -2,8 +2,19 @@
 
 Date: 2026-08-27
 Issue: #56
-Version: 1.0.3
-Status: approved through the standing instruction to use the recommended option
+Version: 1.1.1
+Status: approved; partiellement supersédée par l’issue #106 pour la politique
+de rate-limit mono-endpoint
+
+Revision 1.1.0: the mono-endpoint retry statement in this historical #56
+contract is superseded by the versioned [issue #106 specification](./2026-09-12-mono-endpoint-rpc-rate-limit-design.md).
+That specification is the current authority for the main connection when no
+fallback is configured. The bounded multi-endpoint transport and all other
+#56 boundaries remain governed here.
+
+Revision 1.1.1: clarifies that the mono-endpoint guarantee is one `fetch`
+attempt triggered by web3.js, without a web3.js 429 retry. Standard `fetch`
+redirect handling is unchanged.
 
 Revision 1.0.3: a non-success HTTP response clears stale fallback stickiness
 and makes the primary endpoint preferred for the next logical request.
@@ -83,8 +94,8 @@ Configuration parsing:
 - rejects primary and fallback URL fragments when failover is configured;
 - never includes a configured URL in a validation error;
 - freezes the resulting ordered endpoint list;
-- preserves the existing single-endpoint `Connection` and its web3.js retry
-  behavior when the fallback variable is absent.
+- preserves the existing single-endpoint `Connection` and disables its hidden
+  web3.js 429 retry when the fallback variable is absent, as specified by #106.
 
 Endpoint identities are positional and non-secret: `primary`, `fallback-1`,
 `fallback-2`, and `fallback-3`. Provider names and URL-derived identifiers are
@@ -141,8 +152,10 @@ remain authoritative.
 When at least one fallback is configured, the transport sets
 `disableRetryOnRateLimit: true` on `Connection`. Otherwise web3.js would
 perform its own 500/1,000/2,000/4,000 ms retry cycle independently for every
-fallback endpoint. With no fallback, no rotating fetch is injected and the
-existing web3.js rate-limit retry remains unchanged.
+fallback endpoint. With no fallback, no rotating fetch is injected: a HTTP
+`429` produces one `fetch` attempt triggered by web3.js and no web3.js 429
+retry, as specified by #106. Standard `fetch` redirect handling remains
+unchanged.
 
 ## Cooldown and concurrency
 
