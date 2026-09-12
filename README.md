@@ -499,7 +499,8 @@ Le WebSocket est le chemin nominal. Sans checkpoint, le premier rattrapage
 historiques et avance le checkpoint par CAS vers sa tête. `strict` conserve le
 comportement d'audit qui enfile cette première page.
 Après l'ouverture des souscriptions, un second rattrapage ferme la fenêtre de
-course et converge par l'inbox idempotente. La politique V1 par défaut,
+course et converge par l'inbox idempotente. Cette passe est toujours stricte :
+si la page de baseline était vide, le premier token arrivé est enfilé. La politique V1 par défaut,
 `LISTENER_CATCH_UP_POLICY=live-edge`, ne s'applique qu'à ce bootstrap sans
 checkpoint. Dès qu'un checkpoint existe, ou qu'un run strict est actif, les deux
 politiques utilisent la reprise stricte : chaque passe est bornée à

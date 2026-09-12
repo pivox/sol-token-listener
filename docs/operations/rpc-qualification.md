@@ -107,8 +107,10 @@ le premier démarrage `live-edge`, il prépare la baseline appairée avant d'ouv
 le WebSocket. Il attend ensuite le double ACK des abonnements Pump.fun et
 PumpSwap, puis réalise une seconde frontière stricte avec le même provider avant
 de publier `RUNNING`. Cette seconde passe couvre la fenêtre entre baseline et
-abonnement et rend les écritures WebSocket concurrentes idempotentes. Dès qu'un
-checkpoint ou run actif existe, la frontière est strictement reprise.
+abonnement et rend les écritures WebSocket concurrentes idempotentes. Elle est
+forcée en mode strict même si la page initiale était vide et sans checkpoint :
+le premier token arrivé est donc enfilé. Dès qu'un checkpoint ou run actif
+existe, la frontière est strictement reprise.
 La publication durable de `RUNNING` précède la promotion du fournisseur. Une
 frontière périodique, elle aussi appairée, est exécutée toutes les 30 secondes.
 Chaque cycle donne au plus un setup et une analyse stricte à chaque fournisseur

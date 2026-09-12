@@ -926,6 +926,25 @@ void test('fresh live-edge baselines exactly one validated page without enqueuei
   });
 });
 
+void test('an empty live-edge preparation is followed by strict admission of the first arriving signature', async () => {
+  const repository = new FakeRepository();
+  const empty = new FakeSource({ [PUMP_PROGRAM_ID]: [[]] });
+
+  await scanner(empty, repository, {
+    policy: 'live-edge', programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED);
+  assert.equal(await repository.readCheckpoint('launchpad'), null);
+
+  const arrived = new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('first-arrival', 4)]] });
+  const result = await scanner(arrived, repository, {
+    policy: 'strict', programs: LAUNCHPAD_ONLY,
+  }).scan(NEVER_ABORTED);
+
+  assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['first-arrival']);
+  assert.equal(result.enqueuedCount, 1);
+  assert.equal((await repository.readCheckpoint('launchpad'))?.signature, 'first-arrival');
+});
+
 void test('live-edge remains strict and lossless after a checkpoint exists', async () => {
   const previous = checkpoint('launchpad', 'boundary', 10);
   const source = new FakeSource({

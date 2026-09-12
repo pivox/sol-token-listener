@@ -718,7 +718,8 @@ ne sont pas enfilées ; avant l'ouverture du premier WebSocket, le checkpoint nu
 avance par CAS vers la tête. Avec `strict`, elle reste enfilée. Une fois un
 checkpoint présent, ou un run actif, les deux
 politiques suivent le protocole strict, durable et sans rebasage.
-Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.
+Une seconde passe, forcée en mode strict après l'abonnement WebSocket, ferme la
+fenêtre de démarrage et enfile le premier token même si la baseline était vide.
 Une reprise après panne rejoue toujours l'intégralité des étapes launchpad,
 financement, I1, I2, PumpSwap, qualification puis enqueue paper ; les identités
 et écritures déterministes garantissent des effets persistés exactement une

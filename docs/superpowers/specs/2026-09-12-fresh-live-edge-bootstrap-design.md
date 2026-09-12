@@ -43,7 +43,10 @@ matching active strict run is always resumed rather than rebased.
 
 Production prepares the initial `live-edge` frontier before opening the first
 WebSocket session. It then opens and acknowledges the subscriptions and runs the
-normal strict scan from that persisted frontier before publishing `RUNNING`.
+normal scanner forced to `strict` before publishing `RUNNING`. If the baseline
+page was empty and therefore produced no checkpoint, this strict phase enqueues
+the first signature that arrived during subscription instead of treating it as
+another baseline.
 The second scan therefore covers every signature produced between the baseline
 read and the subscription acknowledgement. Its enqueues also make concurrent
 WebSocket observations idempotent: a failed WebSocket write cannot be skipped
@@ -75,4 +78,6 @@ Tests prove:
 - the production factory wires the parsed policy;
 - the initial frontier completes before the first WebSocket is opened, followed
   by the ordinary post-acknowledgement strict scan;
+- an empty initial page followed by a first arrival enqueues that arrival and
+  persists its checkpoint;
 - build, check, lint, backend/frontend tests, and documentation checks pass.

@@ -215,17 +215,20 @@ export function createProductionListenerRuntime(
       if (source === undefined) {
         throw new TypeError('Provider-pinned catch-up source is unavailable.');
       }
-      const scanner = new StrictCatchUpScanner(
+      const recoveryScanner = new StrictCatchUpScanner(
         source,
         inbox,
         {
           pageSize: config.listenerCatchUpPageSize,
           maxPages: config.listenerCatchUpMaxPages,
-          policy: config.listenerCatchUpPolicy,
+          policy: 'strict',
           programs: ingestionPrograms,
         },
       );
-      return [providerId, new StrictCatchUpCoordinator(scanner, inbox, strictCheckpointKeys)] as const;
+      return [
+        providerId,
+        new StrictCatchUpCoordinator(recoveryScanner, inbox, strictCheckpointKeys),
+      ] as const;
     }),
   );
   const strictAffinity = strictCoordinators.get('primary');
@@ -249,11 +252,17 @@ export function createProductionListenerRuntime(
       },
       prepareInitialFrontier: async (providerId, signal): Promise<void> => {
         if (config.listenerCatchUpPolicy !== 'live-edge') return;
-        const coordinator = strictCoordinators.get(providerId);
-        if (coordinator === undefined) {
-          throw new TypeError('Strict catch-up coordinator is unavailable.');
+        const source = pinnedCatchUpSources.get(providerId);
+        if (source === undefined) {
+          throw new TypeError('Provider-pinned catch-up source is unavailable.');
         }
-        await coordinator.run(signal);
+        const baselineScanner = new StrictCatchUpScanner(source, inbox, {
+          pageSize: config.listenerCatchUpPageSize,
+          maxPages: config.listenerCatchUpMaxPages,
+          policy: 'live-edge',
+          programs: ingestionPrograms,
+        });
+        await baselineScanner.scan(signal);
       },
       openSession: (endpoint, observe, signal): ReturnType<typeof openWsProgramSession> => openWsProgramSession(
         endpoint,
