@@ -39,6 +39,7 @@ export function createSolanaConnectionConfig(
     return {
       commitment: config.commitment,
       wsEndpoint: config.wsRpcUrl,
+      disableRetryOnRateLimit: true,
     };
   }
 

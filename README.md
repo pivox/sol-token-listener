@@ -394,10 +394,13 @@ Pour un basculement HTTP optionnel en production, définir
 virgules de maximum trois fallbacks; l'endpoint principal reste
 `SOLANA_HTTP_RPC_URL`, les doublons canoniques sont refusés et toutes les URLs
 HTTP doivent utiliser le même schéma.
-Sans fallback, le comportement single-endpoint web3.js et son rate-limit retry
-restent exactement inchangés. Avec des fallbacks, la rotation est limitée aux
+Sans fallback, la connexion principale configure `disableRetryOnRateLimit: true` :
+un HTTP 429 produit une seule tentative fetch déclenchée par web3.js ; aucun retry 429 web3.js n'est ajouté, puis l'erreur est pilotée par la reprise explicite du listener.
+Dans ce mode, aucun fetch custom n'est injecté.
+Avec des fallbacks, la rotation est limitée aux
 rejets réseau et aux statuts 429/502/503/504; elle ne s'applique ni aux autres
 4xx, ni à une erreur JSON-RPC en HTTP 200, ni à un résultat archive `null`.
+Le contrat mono-endpoint est versionné dans la [specification RPC #106](docs/superpowers/specs/2026-09-12-mono-endpoint-rpc-rate-limit-design.md).
 Le superviseur WebSocket actif utilise la même chaîne positionnelle HTTP/WS :
 `primary`, puis `fallback-1` à `fallback-3`, sans exposer les URL. Les événements sans secret `rpc.http_endpoint_degraded`,
 `rpc.http_failover` et `rpc.http_endpoints_exhausted` sont la source des

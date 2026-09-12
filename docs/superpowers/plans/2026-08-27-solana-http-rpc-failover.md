@@ -1,10 +1,16 @@
 # Solana HTTP RPC Failover Implementation Plan
 
+> Ce plan historique est partiellement supersédé pour le comportement
+> mono-endpoint par la [specification #106](../specs/2026-09-12-mono-endpoint-rpc-rate-limit-design.md).
+> Les étapes ci-dessous décrivent l’implémentation #56 et restent une trace
+> du transport multi-endpoint livré; la specification #106 est l’autorité
+> actuelle pour la connexion principale sans fallback.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add bounded, observable HTTP RPC failover without changing the existing mono-endpoint behavior or any WebSocket path.
 
-**Architecture:** Configuration keeps `SOLANA_HTTP_RPC_URL` as the primary and adds an ordered, validated fallback list. When fallbacks exist, one `Connection` receives a stateful rotating `fetch` that retries each endpoint at most once, applies bounded cooldowns, emits secret-free structured events, and delegates durable retries to the existing inbox. Without fallbacks, `Connection` construction is unchanged.
+**Architecture:** Configuration keeps `SOLANA_HTTP_RPC_URL` as the primary and adds an ordered, validated fallback list. When fallbacks exist, one `Connection` receives a stateful rotating `fetch` that retries each endpoint at most once, applies bounded cooldowns, emits secret-free structured events, and delegates durable retries to the existing inbox. Without fallbacks, `Connection` construction stays on the same endpoint, sets `disableRetryOnRateLimit: true` per #106, and injects no custom `fetch`.
 
 **Tech Stack:** TypeScript 5 strict ESM, Node.js 22 test runner, `@solana/web3.js` 1.98, Pino structured logging.
 

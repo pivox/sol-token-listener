@@ -10,7 +10,7 @@ import type { RpcHttpFailoverEvent } from '../src/solana/rpc/http-failover-trans
 
 type FetchInput = Parameters<FetchFn>[0];
 
-void test('keeps the exact legacy Connection config unless fallback transport is active', () => {
+void test('configures the mono-endpoint Connection exactly without injecting a custom fetch', () => {
   const injectedFetch: FetchFn = async () => {
     throw new Error('must remain unused without fallbacks');
   };
@@ -31,8 +31,9 @@ void test('keeps the exact legacy Connection config unless fallback transport is
   assert.deepEqual(mono, {
     commitment: 'confirmed',
     wsEndpoint: 'wss://websocket.invalid/private',
+    disableRetryOnRateLimit: true,
   });
-  assert.deepEqual(Object.keys(mono), ['commitment', 'wsEndpoint']);
+  assert.deepEqual(Object.keys(mono), ['commitment', 'wsEndpoint', 'disableRetryOnRateLimit']);
 
   const failover = createSolanaConnectionConfig(
     { ...base, httpRpcFallbackUrls: Object.freeze(['https://fallback.invalid/rpc']) },

@@ -61,14 +61,17 @@ SOLANA_WS_RPC_URL=wss://primary.example.invalid
 SOLANA_WS_RPC_FALLBACK_URLS=wss://fallback-one.example.invalid,wss://fallback-two.example.invalid
 ```
 
-Sans fallback, le listener conserve exactement le comportement à endpoint unique
-de web3.js, y compris son rate-limit retry. Avec des fallbacks, le transport HTTP
+Sans fallback, la connexion principale configure `disableRetryOnRateLimit: true` :
+un HTTP 429 produit une seule tentative fetch déclenchée par web3.js ; aucun retry 429 web3.js n'est ajouté, puis l'erreur est pilotée par la reprise explicite du listener.
+Dans ce mode, aucun fetch custom n'est injecté.
+Avec des fallbacks, le transport HTTP
 de production ne bascule que sur un rejet réseau ou HTTP 429, 502, 503 et 504.
 Il essaie chaque endpoint éligible au plus une fois par requête logique; le
 dernier endpoint sain reste privilégié. Une réponse HTTP non réussie est
 retournée sans rotation et réinitialise la préférence vers le principal pour
 la requête logique suivante. Il ne bascule pas pour un autre 4xx, une erreur
 JSON-RPC en HTTP 200, ou un résultat archive null applicatif.
+Le contrat détaillé du mono-endpoint est versionné dans la [specification RPC #106](../superpowers/specs/2026-09-12-mono-endpoint-rpc-rate-limit-design.md).
 
 `Retry-After` et le délai de refroidissement sont bornés à 60 secondes. Lorsque
 tous les endpoints sont en refroidissement, il n'y a aucune attente interne :
