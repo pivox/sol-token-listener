@@ -63,4 +63,3 @@ Tests prove:
 - malformed policies fail closed;
 - the production factory wires the parsed policy;
 - build, check, lint, backend/frontend tests, and documentation checks pass.
-
