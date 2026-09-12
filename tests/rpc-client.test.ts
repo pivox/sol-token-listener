@@ -50,6 +50,7 @@ void test('fails over real client calls in order and shares the sticky HTTP tran
   const fallbackUrl = 'https://fallback.invalid/rpc';
   const calls: string[] = [];
   const events: RpcHttpFailoverEvent[] = [];
+  const epochsObservedByPublicEvents: number[] = [];
   let fallbackCalls = 0;
   const fetch: FetchFn = async (input, init) => {
     const url = inputUrl(input);
@@ -79,11 +80,17 @@ void test('fails over real client calls in order and shares the sticky HTTP tran
   }, {
     fetch,
     now: () => 100,
-    onHttpFailoverEvent: (event) => { events.push(event); },
+    onHttpFailoverEvent: (event) => {
+      events.push(event);
+      epochsObservedByPublicEvents.push(rpc.httpTransportEpoch);
+    },
   });
 
+  assert.equal(rpc.httpTransportEpoch, 0);
   assert.equal(await rpc.getSlot(), 42n);
+  assert.equal(rpc.httpTransportEpoch, 1);
   const signatures = await rpc.http.getSignaturesForAddress(new PublicKey(new Uint8Array(32)));
+  assert.equal(rpc.httpTransportEpoch, 1);
 
   assert.equal(fallbackCalls, 2);
   assert.equal(signatures[0]?.slot, 41);
@@ -92,6 +99,7 @@ void test('fails over real client calls in order and shares the sticky HTTP tran
     { event: 'rpc.http_endpoint_degraded', endpointId: 'primary', reason: 'UNAVAILABLE', cooldownMs: 1000 },
     { event: 'rpc.http_failover', fromEndpointId: 'primary', toEndpointId: 'fallback-1', reason: 'UNAVAILABLE' },
   ]);
+  assert.deepEqual(epochsObservedByPublicEvents, [0, 1]);
   assert.equal(events.every(Object.isFrozen), true);
 });
 
@@ -243,6 +251,39 @@ function inputUrl(input: FetchInput): string {
   if (input instanceof URL) return input.toString();
   return input.url;
 }
+
+void test('transport epoch follows sticky resets without relying on public failover events', async () => {
+  let now = 0;
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
+  const rpc = new SolanaRpcClient({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: ['https://fallback.invalid/rpc'],
+    wsRpcUrl: 'wss://websocket.invalid/rpc', commitment: 'confirmed', finality: 'finalized',
+  }, {
+    now: () => now,
+    onHttpFailoverEvent: () => { throw new Error('untrusted observer'); },
+    fetch: async (input, init) => {
+      if (inputUrl(input).includes('primary')) {
+        primaryCalls += 1;
+        if (primaryCalls === 1) return new Response('unavailable', { status: 503 });
+      } else {
+        fallbackCalls += 1;
+        if (fallbackCalls === 2) return new Response('bad request', { status: 400 });
+      }
+      const request = parseRequestBody(init) as { readonly id: string };
+      return jsonRpcResponse(request.id, 42);
+    },
+  });
+  await rpc.getSlot();
+  assert.equal(rpc.httpTransportEpoch, 1);
+  await assert.rejects(rpc.getSlot());
+  assert.equal(rpc.httpTransportEpoch, 1);
+  now = 1000;
+  await rpc.getSlot();
+  assert.equal(rpc.httpTransportEpoch, 2);
+  assert.equal(primaryCalls, 2);
+});
 
 function parseRequestBody(init: Parameters<FetchFn>[1]): unknown {
   const body = init?.body;

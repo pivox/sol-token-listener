@@ -871,6 +871,12 @@ introduit avant une mesure de taille, quota et reorg. Son contrat et les
 contraintes de validation sont versionnés dans
 [`2026-09-12-coherent-slot-block-hydration-design.md`](../superpowers/specs/2026-09-12-coherent-slot-block-hydration-design.md).
 
+Le [cache cohérent de blocs normalisés v1.0.0](../superpowers/specs/2026-09-12-coherent-block-cache-design.md)
+ajoute un locator distinct non activé, avec single-flight par slot/commitment/epoch
+HTTP, snapshots data-only immutables, LRU borné en octets et entrées, TTL et
+pacing FIFO. La factory de production, les leases, le catch-up strict et la
+réconciliation de finalité restent inchangés.
+
 ## Console opérateur indépendante
 
 Le frontend React est un consommateur externe des ports HTTP/SSE : il n’importe

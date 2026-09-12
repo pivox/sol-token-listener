@@ -36,6 +36,7 @@ type RpcHttpFailoverFetchOptions = Readonly<{
   fetch?: FetchFn;
   now?: () => number;
   onEvent?: (event: RpcHttpFailoverEvent) => void;
+  onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void;
 }>;
 
 interface EndpointState {
@@ -104,6 +105,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
 
       const endpoint = states[endpointIndex];
       if (endpoint === undefined) throw new RpcHttpEndpointsExhaustedError();
+      validated.onEndpointSelected?.(endpoint.id);
       if (lastFailure !== undefined) {
         throwIfAborted(signal);
         emit(onEvent, Object.freeze({
@@ -202,11 +204,15 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
   if (candidate.onEvent !== undefined && typeof candidate.onEvent !== 'function') {
     throw new TypeError('HTTP RPC event callback is invalid.');
   }
+  if (candidate.onEndpointSelected !== undefined && typeof candidate.onEndpointSelected !== 'function') {
+    throw new TypeError('HTTP RPC endpoint callback is invalid.');
+  }
   return Object.freeze({
     endpoints: Object.freeze(endpoints),
     ...(candidate.fetch === undefined ? {} : { fetch: candidate.fetch }),
     ...(candidate.now === undefined ? {} : { now: candidate.now }),
     ...(candidate.onEvent === undefined ? {} : { onEvent: candidate.onEvent }),
+    ...(candidate.onEndpointSelected === undefined ? {} : { onEndpointSelected: candidate.onEndpointSelected }),
   });
 }
 

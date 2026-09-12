@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import {
   PublicKey,
   type VersionedTransactionResponse,
@@ -171,6 +172,29 @@ void test('hydrates transactions from complete slot blocks with their canonical 
   assert.equal(pump.version, 0);
   assert.equal(pump.blockTimeMs, 1_725_000_000_000);
   assert.equal(calls, 2);
+});
+
+void test('cached normalized snapshots preserve rich legacy/v0/ALT data exactly across caller copies', async () => {
+  const source = {
+    httpTransportEpoch: 0,
+    async getBlockTransactions() {
+      return completeBlock([response('legacy'), response('rich', 42, { rich: true, error: { InstructionError: [1, 'Custom'] } })]);
+    },
+  };
+  const cached = new CachedSolanaBlockTransactionLocator(source);
+  const direct = new SolanaBlockTransactionLocator(source);
+  for (const signature of ['legacy', 'rich']) {
+    const expected = await direct.locate(target(signature));
+    // Error records deliberately have null prototypes at the defensive boundary.
+    assert.deepEqual(JSON.stringify(await cached.locate(target(signature)), (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value),
+      JSON.stringify(expected, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value));
+  }
+  const first = await cached.locate(target('rich'));
+  const second = await cached.locate(target('rich'));
+  assert.notEqual(first, second);
+  assert.notEqual(first.instructions[0]?.data, second.instructions[0]?.data);
+  assert.notEqual(first.error, second.error);
+  assert.equal(first.postTokenBalances[0]?.amountRaw, 9007199254740994n);
 });
 
 void test('preserves legacy normalization from a complete block source', async () => {
