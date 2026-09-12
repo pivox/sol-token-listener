@@ -16,6 +16,7 @@ import type { NormalizedTransaction } from '../solana/rpc/types.js';
 
 export interface TransactionInboxRepository {
   enqueue(value: TransactionNotification): Promise<void>;
+  syncTrackedMint(mint: string): Promise<void>;
   claim(nowMs: number, leaseSeconds: number): Promise<ClaimedTransaction | null>;
   renewLease(signature: string, token: string, untilMs: number): Promise<void>;
 

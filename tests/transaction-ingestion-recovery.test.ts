@@ -50,6 +50,33 @@ import { PostgresWalletGraphRepository } from '../src/storage/wallet-graph.repos
 import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+
+void test('purges deferred decisions after four hours without recovering or purging actionable work', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const signature of ['expired-deferred', 'retained-deferred']) {
+      await repository.enqueue(Object.freeze({
+        signature, slot: 1n, source: 'WEBSOCKET', ingestionHint: 'PUMPFUN_TRADE',
+        ingestionHintMint: 'So11111111111111111111111111111111111111112',
+        programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'processed', observedAtMs: 1000,
+      }));
+    }
+    assert.equal((await inboxRow(pool, 'expired-deferred')).processing_status, 'DEFERRED');
+    await pool.query(`WITH decision_clock AS (SELECT clock_timestamp() - INTERVAL '5 hours' AS at)
+      UPDATE chain_transaction_inbox SET terminal_at=decision_clock.at,
+        purge_after=decision_clock.at + INTERVAL '4 hours'
+      FROM decision_clock WHERE signature='expired-deferred'`);
+    await repository.enqueue(Object.freeze({
+      signature: 'retained-normal', slot: 2n, source: 'CATCH_UP', ingestionHint: null,
+      ingestionHintMint: null, programIds: Object.freeze([PUMP_PROGRAM_ID]),
+      confirmationStatus: 'confirmed', observedAtMs: 1000,
+    }));
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    assert.deepEqual((await pool.query('SELECT signature FROM chain_transaction_inbox ORDER BY signature')).rows,
+      [{ signature: 'retained-deferred' }, { signature: 'retained-normal' }]);
+    assert.equal((await repository.claim(Date.now(), 30))?.signature, 'retained-normal');
+  });
+});
 const EXTERNAL_BUYER = '8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR';
 const BOUNDARIES = Object.freeze([
   'launchpad', 'funding', 'i1', 'i2', 'pumpswap', 'qualification',

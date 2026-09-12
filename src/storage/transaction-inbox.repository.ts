@@ -72,6 +72,8 @@ interface InboxPool extends Queryable {
 interface InboxIdentityRow extends QueryResultRow {
   readonly observed_slot: unknown;
   readonly ingestion_priority: unknown;
+  readonly ingestion_hint: unknown;
+  readonly ingestion_hint_mint: unknown;
   readonly discovery_sources: unknown;
   readonly program_ids: unknown;
   readonly target_confirmation_status: unknown;
@@ -117,10 +119,12 @@ interface StrictCatchUpRunRow extends QueryResultRow {
 const SERVICE_KEY = 'transaction-listener';
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM = 100;
-export const MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS = 32;
+export const MAX_CONSECUTIVE_URGENT_CLAIMS = 32;
 const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
 
-type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE';
+type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE' | 'TRACKED_TRADE';
+type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED';
+type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE';
 
 export interface TransactionInboxRetryPolicy {
   readonly maxAttempts: number;
@@ -174,14 +178,30 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   public async enqueue(value: TransactionNotification): Promise<void> {
     return this.safely(async () => {
       assertValidTransactionNotification(value);
-      const ingestionPriority = priorityFromHint(value.ingestionHint);
       await this.transaction(async (client) => {
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
           [value.signature],
         );
+        // Take the mint lock before any inbox row lock: synchronization locks
+        // mint -> rows. The shared lock closes enqueue/projection races.
+        let tracked = false;
+        if (value.ingestionHint === 'PUMPFUN_TRADE') {
+          await lockTrackedMint(client, value.ingestionHintMint);
+          const membership = await client.query(
+            'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
+            [value.ingestionHintMint],
+          );
+          const active: unknown = requiredRow(membership.rows[0]).active;
+          if (typeof active !== 'boolean') throw new TypeError('Stored tracked mint membership is invalid.');
+          tracked = active;
+        }
         const existing = await client.query(
-          `SELECT observed_slot, ingestion_priority, discovery_sources, program_ids, target_confirmation_status,
+          `SELECT observed_slot, ingestion_priority, ingestion_hint, ingestion_hint_mint,
+             attempts, attempts_in_cycle, lease_token, lease_expires_at,
+             error_code, error_name, error_retryable, next_attempt_at, retry_exhausted_at,
+             terminal_at, purge_after, observed_at, manual_recovery_count, last_manual_recovery_at,
+             discovery_sources, program_ids, target_confirmation_status,
              processing_status, normalized_transaction, immutable_fingerprint, processed_at,
              missing_finality_polls,
              last_missing_finality_provider_id, finality_evidence_version
@@ -197,17 +217,22 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [value.signature],
         );
         const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
+        const decision = convergeIngestion(row, value, tracked);
         if (row === undefined) {
           if (receipt !== undefined) {
             assertTerminalReceiptAcceptsNotification(receipt, value);
             return;
           }
           const inserted = await client.query(
-            `INSERT INTO chain_transaction_inbox (
+            `WITH decision_clock AS MATERIALIZED (SELECT clock_timestamp() AS at)
+            INSERT INTO chain_transaction_inbox (
               signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
               processing_status, observed_at, retry_max_attempts, retry_base_delay_ms,
-              ingestion_priority
-            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,$5,'PENDING',$6,$7,$8,$9)`,
+              ingestion_priority, ingestion_hint, ingestion_hint_mint, terminal_at, purge_after
+            ) SELECT $1,$2,ARRAY[$3]::TEXT[],$4,$5,$12,$6,$7,$8,$9,$10,$11,
+              CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) END,
+              CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) + INTERVAL '4 hours' END
+              FROM decision_clock`,
             [
               value.signature,
               value.slot.toString(),
@@ -217,7 +242,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               dateFromMs(value.observedAtMs),
               this.retryPolicy.maxAttempts,
               this.retryPolicy.baseDelayMs,
-              ingestionPriority,
+              decision.priority,
+              decision.hint,
+              decision.mint,
+              decision.status,
             ],
           );
           requireOne(inserted.rowCount);
@@ -243,19 +271,20 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           const updated = await client.query(
             `UPDATE chain_transaction_inbox SET
                discovery_sources=$2,program_ids=$3,
-               ingestion_priority = GREATEST(
-                 ingestion_priority,$5::chain_transaction_inbox_priority
-               ),
+               ingestion_priority=$5::chain_transaction_inbox_priority,
+               ingestion_hint=$6, ingestion_hint_mint=$7,
                updated_at=GREATEST(updated_at,$4)
              WHERE signature=$1`,[
-              value.signature,sources,programs,dateFromMs(value.observedAtMs),ingestionPriority,
+              value.signature,sources,programs,dateFromMs(value.observedAtMs),
+              decision.priority,decision.hint,decision.mint,
             ],
           );
           requireOne(updated.rowCount);
           return;
         }
         const next = reconciledStatus(current, value.confirmationStatus);
-        if (finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
+        if (decision.status !== 'DEFERRED'
+          && finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         const shouldReplay = processingStatus === 'PROCESSED' && next !== current;
@@ -263,24 +292,29 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
         }
         const updated = await client.query(
-          `UPDATE chain_transaction_inbox SET
+          `WITH decision_clock AS MATERIALIZED (SELECT clock_timestamp() AS at)
+           UPDATE chain_transaction_inbox SET
              discovery_sources = $2,
              program_ids = $3,
              target_confirmation_status = $4,
-             processing_status = CASE WHEN $5 THEN 'PENDING' ELSE processing_status END,
+             processing_status = CASE WHEN $5 THEN 'PENDING' ELSE $10 END,
              processed_at = CASE WHEN $5 THEN NULL ELSE processed_at END,
-             terminal_at = CASE WHEN $5 THEN NULL ELSE terminal_at END,
-             purge_after = CASE WHEN $5 THEN NULL ELSE purge_after END,
+             terminal_at = CASE
+               WHEN $10='DEFERRED' THEN COALESCE(terminal_at,GREATEST(decision_clock.at,observed_at))
+               WHEN $5 OR processing_status='DEFERRED' THEN NULL ELSE terminal_at END,
+             purge_after = CASE
+               WHEN $10='DEFERRED' THEN COALESCE(purge_after,GREATEST(decision_clock.at,observed_at) + INTERVAL '4 hours')
+               WHEN $5 OR processing_status='DEFERRED' THEN NULL ELSE purge_after END,
              attempts_in_cycle = CASE WHEN $5 THEN 0 ELSE attempts_in_cycle END,
              retry_exhausted_at = CASE WHEN $5 THEN NULL ELSE retry_exhausted_at END,
              missing_finality_polls = 0,
              last_missing_finality_provider_id = NULL,
-             finality_evidence_version = finality_evidence_version + 1,
-             ingestion_priority = GREATEST(
-               ingestion_priority,$7::chain_transaction_inbox_priority
-             ),
+             finality_evidence_version = CASE WHEN $10='DEFERRED' THEN 0 ELSE finality_evidence_version + 1 END,
+             ingestion_priority = $7::chain_transaction_inbox_priority,
+             ingestion_hint = $8,
+             ingestion_hint_mint = $9,
              updated_at = GREATEST(updated_at, $6)
-           WHERE signature = $1`,
+           FROM decision_clock WHERE signature = $1`,
           [
             value.signature,
             sources,
@@ -288,10 +322,45 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             next,
             shouldReplay,
             dateFromMs(value.observedAtMs),
-            ingestionPriority,
+            decision.priority,
+            decision.hint,
+            decision.mint,
+            decision.status,
           ],
         );
         requireOne(updated.rowCount);
+      });
+    });
+  }
+
+  public async syncTrackedMint(mint: string): Promise<void> {
+    return this.safely(async () => {
+      assertCanonicalMint(mint);
+      await this.transaction(async (client) => {
+        await lockTrackedMint(client, mint);
+        await client.query(
+          `WITH decision AS MATERIALIZED (
+             SELECT clock_timestamp() AS at,
+               EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active
+           )
+           UPDATE chain_transaction_inbox inbox SET
+             processing_status=CASE WHEN decision.active THEN 'PENDING' ELSE 'DEFERRED' END,
+             ingestion_priority=CASE WHEN decision.active THEN 'TRACKED_TRADE' ELSE 'NORMAL' END::chain_transaction_inbox_priority,
+             terminal_at=CASE WHEN NOT decision.active THEN GREATEST(decision.at,inbox.observed_at) END,
+             purge_after=CASE WHEN NOT decision.active THEN GREATEST(decision.at,inbox.observed_at) + INTERVAL '4 hours' END,
+             missing_finality_polls=0, last_missing_finality_provider_id=NULL, finality_evidence_version=0,
+             updated_at=GREATEST(inbox.updated_at,decision.at)
+           FROM decision
+           WHERE inbox.ingestion_hint='PUMPFUN_TRADE' AND inbox.ingestion_hint_mint=$1
+             AND ((decision.active AND inbox.processing_status='DEFERRED')
+               OR (NOT decision.active AND inbox.processing_status='PENDING'
+                 AND inbox.attempts=0 AND inbox.attempts_in_cycle=0
+                 AND inbox.lease_token IS NULL AND inbox.lease_expires_at IS NULL
+                 AND inbox.normalized_transaction IS NULL AND inbox.immutable_fingerprint IS NULL
+                 AND inbox.processed_at IS NULL AND inbox.manual_recovery_count=0
+                 AND inbox.last_manual_recovery_at IS NULL))`,
+          [mint],
+        );
       });
     });
   }
@@ -345,7 +414,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [now, MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM],
         );
         const scheduler = await client.query(
-          `SELECT consecutive_launch_candidate_claims
+          `SELECT consecutive_urgent_claims
            FROM chain_transaction_inbox_claim_scheduler
            WHERE scheduler_key = 'global'
            FOR UPDATE`,
@@ -353,14 +422,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (scheduler.rowCount !== 1 || scheduler.rows.length !== 1) {
           throw new TypeError('Transaction inbox claim scheduler is invalid.');
         }
-        const launchCandidateStreak = safeCount(
-          scheduler.rows[0]?.consecutive_launch_candidate_claims,
-          'consecutive launch candidate claims',
+        const urgentStreak = safeCount(
+          scheduler.rows[0]?.consecutive_urgent_claims,
+          'consecutive urgent claims',
         );
-        if (launchCandidateStreak > MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS) {
+        if (urgentStreak > MAX_CONSECUTIVE_URGENT_CLAIMS) {
           throw new TypeError('Transaction inbox claim scheduler is invalid.');
         }
-        let selected = launchCandidateStreak === MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS
+        let selected = urgentStreak === MAX_CONSECUTIVE_URGENT_CLAIMS
           ? await client.query(
             `SELECT signature, ingestion_priority
              FROM chain_transaction_inbox
@@ -388,7 +457,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                   AND attempts_in_cycle < retry_max_attempts)
               OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1
                   AND attempts_in_cycle < retry_max_attempts)
-           ORDER BY ingestion_priority DESC, observed_slot, signature
+           ORDER BY (ingestion_priority <> 'NORMAL') DESC, observed_slot, signature
            FOR UPDATE SKIP LOCKED
            LIMIT 1`,
           [now],
@@ -413,14 +482,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         requireOne(updated.rowCount);
         const schedulerUpdated = await client.query(
           `UPDATE chain_transaction_inbox_claim_scheduler SET
-             consecutive_launch_candidate_claims = CASE
-               WHEN $1::chain_transaction_inbox_priority = 'LAUNCH_CANDIDATE'
-                 THEN LEAST(consecutive_launch_candidate_claims + 1, $2)
+             consecutive_urgent_claims = CASE
+               WHEN $1::chain_transaction_inbox_priority <> 'NORMAL'
+                 THEN LEAST(consecutive_urgent_claims + 1, $2)
                ELSE 0
              END,
              updated_at = GREATEST(updated_at, $3)
            WHERE scheduler_key = 'global'`,
-          [ingestionPriority, MAX_CONSECUTIVE_LAUNCH_CANDIDATE_CLAIMS, now],
+          [ingestionPriority, MAX_CONSECUTIVE_URGENT_CLAIMS, now],
         );
         requireOne(schedulerUpdated.rowCount);
         return claimFromRow(requiredRow(updated.rows[0]));
@@ -2064,22 +2133,113 @@ function requireConfirmation(value: unknown): asserts value is ChainConfirmation
   }
 }
 
-function inboxStatus(value: unknown): 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' {
+function inboxStatus(value: unknown): InboxStatus {
   if (value !== 'PENDING' && value !== 'PROCESSING'
-    && value !== 'PROCESSED' && value !== 'FAILED') {
+    && value !== 'PROCESSED' && value !== 'FAILED' && value !== 'DEFERRED') {
     throw new TypeError('Stored inbox status is invalid.');
   }
   return value;
 }
 
-function priorityFromHint(
-  hint: TransactionNotification['ingestionHint'],
-): TransactionInboxPriority {
-  return hint === 'PUMPFUN_CREATE' ? 'LAUNCH_CANDIDATE' : 'NORMAL';
+interface IngestionDecision {
+  readonly status: InboxStatus;
+  readonly priority: TransactionInboxPriority;
+  readonly hint: StoredIngestionHint;
+  readonly mint: string | null;
+}
+
+function convergeIngestion(
+  row: InboxIdentityRow | undefined,
+  incoming: TransactionNotification,
+  tracked: boolean,
+): IngestionDecision {
+  const current = row === undefined ? null : storedIngestionDecision(row);
+  let hint: StoredIngestionHint = incoming.ingestionHint ?? 'NONE';
+  let mint = incoming.ingestionHintMint;
+  if (current?.hint === 'PUMPFUN_CREATE' || hint === 'NONE') {
+    hint = current?.hint ?? hint;
+    mint = current?.mint ?? null;
+  }
+  if (hint === 'PUMPFUN_TRADE' && current?.hint === 'PUMPFUN_TRADE'
+    && current.mint !== mint) {
+    throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+  }
+  // No-log replay preserves the durable decision; only a trade hint or an
+  // explicit mint synchronization may reclassify membership.
+  if (incoming.ingestionHint !== 'PUMPFUN_TRADE' && hint === 'PUMPFUN_TRADE'
+    && current !== null) return current;
+  let status = current?.status ?? 'PENDING';
+  let priority: TransactionInboxPriority = 'NORMAL';
+  if (hint === 'PUMPFUN_CREATE') {
+    priority = 'LAUNCH_CANDIDATE';
+    if (status === 'DEFERRED') status = 'PENDING';
+  } else if (hint === 'PUMPFUN_TRADE') {
+    if (tracked) {
+      priority = 'TRACKED_TRADE';
+      if (status === 'DEFERRED') status = 'PENDING';
+    } else if (row === undefined || (status === 'PENDING' && isPristineInbox(row))) {
+      status = 'DEFERRED';
+    } else {
+      priority = current?.priority ?? 'NORMAL';
+    }
+  }
+  return { status, priority, hint, mint };
+}
+
+function isPristineInbox(row: InboxIdentityRow): boolean {
+  return safeCount(row.attempts, 'attempts') === 0
+    && safeCount(row.attempts_in_cycle, 'attempts in cycle') === 0
+    && row.lease_token === null && row.lease_expires_at === null
+    && row.normalized_transaction === null && row.immutable_fingerprint === null
+    && row.processed_at === null
+    && safeCount(row.manual_recovery_count, 'manual recovery count') === 0
+    && row.last_manual_recovery_at === null;
+}
+
+function storedIngestionDecision(row: InboxIdentityRow): IngestionDecision {
+  const status = inboxStatus(row.processing_status);
+  const priority = storedInboxPriority(row.ingestion_priority);
+  const hint = row.ingestion_hint;
+  const mint = row.ingestion_hint_mint;
+  if (hint !== 'NONE' && hint !== 'PUMPFUN_CREATE' && hint !== 'PUMPFUN_TRADE') {
+    throw new TypeError('Stored ingestion hint is invalid.');
+  }
+  if (hint === 'PUMPFUN_TRADE') assertCanonicalMint(mint);
+  else if (mint !== null) throw new TypeError('Stored ingestion hint mint is invalid.');
+  if ((priority === 'LAUNCH_CANDIDATE') !== (hint === 'PUMPFUN_CREATE')
+    || (priority === 'TRACKED_TRADE' && hint !== 'PUMPFUN_TRADE')) {
+    throw new TypeError('Stored ingestion priority contradicts its hint.');
+  }
+  if (status === 'DEFERRED' && (hint !== 'PUMPFUN_TRADE' || priority !== 'NORMAL'
+    || !isPristineInbox(row)
+    || row.error_code !== null || row.error_name !== null || row.error_retryable !== null
+    || row.next_attempt_at !== null || row.retry_exhausted_at !== null
+    || safeCount(row.missing_finality_polls, 'missing finality polls') !== 0
+    || row.last_missing_finality_provider_id !== null
+    || finalityEvidenceVersion(row.finality_evidence_version) !== 0n
+    || dateMs(row.terminal_at, 'deferred terminal at') < dateMs(row.observed_at, 'observed at')
+    || dateMs(row.purge_after, 'deferred purge after') - dateMs(row.terminal_at, 'deferred terminal at') !== 14_400_000)) {
+    throw new TypeError('Stored deferred decision is invalid.');
+  }
+  return { status, priority, hint, mint };
+}
+
+function assertCanonicalMint(value: unknown): asserts value is string {
+  if (typeof value !== 'string' || value.length < 32 || value.length > 44
+    || !isCanonicalSolanaProgramId(value)) {
+    throw new TypeError('Tracked mint must be a canonical Solana public key.');
+  }
+}
+
+async function lockTrackedMint(client: Queryable, mint: string | null): Promise<void> {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox-mint:' || $1, 0))",
+    [mint],
+  );
 }
 
 function storedInboxPriority(value: unknown): TransactionInboxPriority {
-  if (value !== 'NORMAL' && value !== 'LAUNCH_CANDIDATE') {
+  if (value !== 'NORMAL' && value !== 'LAUNCH_CANDIDATE' && value !== 'TRACKED_TRADE') {
     throw new TypeError('Stored inbox priority is invalid.');
   }
   return value;
