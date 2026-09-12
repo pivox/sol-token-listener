@@ -54,7 +54,7 @@ export function pumpFunWebSocketHintFromLogs(logs: unknown): PumpFunWebSocketCre
       hasCreateEvent = true;
       continue;
     }
-    if (isPrefixOfTradeEvent(decoded)) {
+    if (isPrefixOfEventDiscriminator(decoded)) {
       hasAmbiguousEvent = true;
       continue;
     }
@@ -81,9 +81,13 @@ export function pumpFunWebSocketHintFromLogs(logs: unknown): PumpFunWebSocketCre
     : Object.freeze({ hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint });
 }
 
-function isPrefixOfTradeEvent(decoded: Buffer): boolean {
-  return decoded.length < TRADE_EVENT_DISCRIMINATOR.length
-    && TRADE_EVENT_DISCRIMINATOR.subarray(0, decoded.length).equals(decoded);
+function isPrefixOfEventDiscriminator(decoded: Buffer): boolean {
+  return (decoded.length > 0
+      && decoded.length < CREATE_EVENT_DISCRIMINATOR.length
+      && CREATE_EVENT_DISCRIMINATOR.subarray(0, decoded.length).equals(decoded))
+    || (decoded.length > 0
+      && decoded.length < TRADE_EVENT_DISCRIMINATOR.length
+      && TRADE_EVENT_DISCRIMINATOR.subarray(0, decoded.length).equals(decoded));
 }
 
 function snapshotLogs(value: unknown): readonly string[] | null {

@@ -60,6 +60,21 @@ void test('fails safe when a valid trade is followed by a truncated TradeEvent',
   }
 });
 
+void test('fails safe on every truncated CreateEvent discriminator prefix after a trade', () => {
+  const discriminator = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator);
+  for (let length = 1; length < discriminator.length; length += 1) {
+    const truncated = `Program data: ${discriminator.subarray(0, length).toString('base64')}`;
+    assert.deepEqual(
+      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), truncated]),
+      { hint: 'NONE', hintMint: null },
+    );
+    assert.deepEqual(
+      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), truncated, createLine]),
+      { hint: 'PUMPFUN_CREATE', hintMint: null },
+    );
+  }
+});
+
 void test('gives CreateEvent precedence even after ambiguous TradeEvents', () => {
   assert.deepEqual(
     pumpFunWebSocketHintFromLogs([
