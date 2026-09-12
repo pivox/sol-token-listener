@@ -149,6 +149,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     attempts: 0,
     leaseToken: 'opaque-token',
     leaseExpiresAtMs: observedAtMs + 120_000,
+    observedAtMs,
     normalizedTransaction: null,
   });
   const failure: IngestionFailure = Object.freeze({
@@ -246,10 +247,20 @@ void test('accepts a deeply frozen snapshot whose earlier finality can advance o
     attempts: 1,
     leaseToken: 'opaque-token',
     leaseExpiresAtMs: observedAtMs + 120_000,
+    observedAtMs,
     normalizedTransaction: snapshot,
   });
 
   assert.doesNotThrow(() => { assertValidClaimedTransaction(claim); });
+});
+
+void test('rejects a claim without a durable inbox observation timestamp', () => {
+  const { observedAtMs: _observedAtMs, ...claim } = claimWithSnapshot(null);
+
+  assert.throws(
+    () => { assertValidClaimedTransaction(Object.freeze(claim)); },
+    /observedAtMs|milliseconds/u,
+  );
 });
 
 void test('rejects empty and malformed normalized transaction snapshots', () => {
@@ -902,6 +913,7 @@ function claimWithSnapshot(
     attempts: 0,
     leaseToken: 'opaque-token',
     leaseExpiresAtMs: observedAtMs + 120_000,
+    observedAtMs,
     normalizedTransaction,
     ...overrides,
   }) as ClaimedTransaction;

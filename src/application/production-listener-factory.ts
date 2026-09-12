@@ -374,7 +374,6 @@ export function createProductionListenerRuntime(
     participants,
     graph,
     marketPipeline,
-    Date.now,
     paperRepository,
     qualification,
     inbox,

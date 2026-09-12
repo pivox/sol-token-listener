@@ -50,7 +50,6 @@ void test('persists a deferred trade without a body fetch until creation persist
       { rebuild: async () => undefined },
       { rebuild: async () => undefined },
       { processObserved: async () => ({ migrations: [], activations: [], affectedMints: [] }) },
-      () => 2_000,
       null,
       null,
       inbox,
@@ -72,7 +71,7 @@ void test('persists a deferred trade without a body fetch until creation persist
     assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
     assert.equal(locatorCalls, 0);
 
-    await pipeline.process(create);
+    await pipeline.process(create, 2_000);
     const decision = await pool.query(`SELECT processing_status,ingestion_priority
       FROM chain_transaction_inbox WHERE signature=$1`, [tradeSignature]);
     assert.deepEqual(decision.rows[0], {

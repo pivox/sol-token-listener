@@ -45,7 +45,7 @@ export interface TransactionInboxWorkerLocator {
 }
 
 export interface TransactionInboxWorkerPipeline {
-  process(transaction: NormalizedTransaction): Promise<unknown>;
+  process(transaction: NormalizedTransaction, observedAtMs: number): Promise<unknown>;
 }
 
 export interface TransactionInboxWorkerScheduler {
@@ -265,7 +265,7 @@ export class TransactionInboxWorker {
 
     let pipelineFailed = false;
     try {
-      await this.pipeline.process(transaction);
+      await this.pipeline.process(transaction, claim.observedAtMs);
     } catch {
       pipelineFailed = true;
     }

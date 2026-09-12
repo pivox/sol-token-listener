@@ -486,7 +486,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              updated_at = GREATEST(updated_at, $1)
            WHERE signature = $4
            RETURNING signature, observed_slot, target_confirmation_status, attempts,
-             lease_token, lease_expires_at, normalized_transaction, immutable_fingerprint`,
+             lease_token, lease_expires_at, observed_at, normalized_transaction, immutable_fingerprint`,
           [now, token, expires, signature],
         );
         requireOne(updated.rowCount);
@@ -1657,6 +1657,7 @@ function claimFromRow(row: QueryResultRow): ClaimedTransaction {
     attempts: safeCount(row.attempts, 'claim attempts'),
     leaseToken: requiredText(row.lease_token, 'claim lease token'),
     leaseExpiresAtMs: dateMs(row.lease_expires_at, 'claim lease expiry'),
+    observedAtMs: dateMs(row.observed_at, 'claim observed at'),
     normalizedTransaction: snapshot,
   });
   assertValidClaimedTransaction(value);
@@ -1678,6 +1679,7 @@ function decodeSnapshot(
     attempts: 0,
     leaseToken: 'validation',
     leaseExpiresAtMs: 0,
+    observedAtMs: 0,
     normalizedTransaction: decoded,
   });
   assertValidClaimedTransaction(probe);
@@ -1698,6 +1700,7 @@ function assertSnapshotCompatible(
     attempts: 0,
     leaseToken: 'validation',
     leaseExpiresAtMs: 0,
+    observedAtMs: 0,
     normalizedTransaction: snapshot,
   });
   assertValidClaimedTransaction(probe);

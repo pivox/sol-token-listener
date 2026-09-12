@@ -45,10 +45,11 @@ void test('claims one row and processes it in durable order with claim finality'
       calls.push('locate');
       return tx;
     },
-  }, { async process(value) {
+  }, { async process(value, observedAtMs) {
     assert.notEqual(value, tx);
     assert.equal(value.confirmationStatus, 'CONFIRMED');
     assert.ok(Object.isFrozen(value));
+    assert.equal(observedAtMs, 1_000);
     calls.push('pipeline');
   } }, options());
 
@@ -419,7 +420,8 @@ function claim(
   signature = 'sig', slot = 1n, confirmationStatus: ClaimedTransaction['confirmationStatus'] = 'processed',
   snapshot: ClaimedTransaction['normalizedTransaction'] = null,
 ): ClaimedTransaction {
-  return Object.freeze({ signature, slot, confirmationStatus, attempts: 1, leaseToken: 'lease', leaseExpiresAtMs: 11_000, normalizedTransaction: snapshot });
+  return Object.freeze({ signature, slot, confirmationStatus, attempts: 1, leaseToken: 'lease',
+    leaseExpiresAtMs: 11_000, observedAtMs: 1_000, normalizedTransaction: snapshot });
 }
 
 function normalized(signature = 'sig', slot = 1n, confirmationStatus: NormalizedTransaction['confirmationStatus'] = 'PROCESSED'): NormalizedTransaction {
