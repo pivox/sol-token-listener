@@ -34,6 +34,7 @@ type SolanaConnectionConfig = Pick<
 export function createSolanaConnectionConfig(
   config: SolanaConnectionConfig,
   dependencies: SolanaRpcClientDependencies = {},
+  onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void,
 ): ConnectionConfig {
   if (config.httpRpcFallbackUrls.length === 0) {
     return {
@@ -57,6 +58,7 @@ export function createSolanaConnectionConfig(
       endpoints,
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
       ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+      ...(onEndpointSelected === undefined ? {} : { onEndpointSelected }),
       ...(dependencies.onHttpFailoverEvent === undefined
         ? {}
         : { onEvent: dependencies.onHttpFailoverEvent }),
@@ -69,6 +71,13 @@ export class SolanaRpcClient {
   readonly http: Connection;
   readonly commitment: Commitment;
   readonly finality: Finality;
+  private transportEpoch = 0;
+  private selectedHttpEndpoint: RpcHttpEndpointId = 'primary';
+
+  /** Local transport identity only; never contains an endpoint URL or credential. */
+  get httpTransportEpoch(): number {
+    return this.transportEpoch;
+  }
 
   constructor(
     config: Pick<
@@ -81,7 +90,12 @@ export class SolanaRpcClient {
     this.finality = config.finality;
     this.http = new Connection(
       config.httpRpcUrl,
-      createSolanaConnectionConfig(config, dependencies),
+      createSolanaConnectionConfig(config, dependencies, (endpointId) => {
+        if (endpointId !== this.selectedHttpEndpoint) {
+          this.selectedHttpEndpoint = endpointId;
+          this.transportEpoch += 1;
+        }
+      }),
     );
   }
 

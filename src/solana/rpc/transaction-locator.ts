@@ -1,6 +1,7 @@
 import { PublicKey, type VersionedTransactionResponse } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { isProxy, isUint8Array } from 'node:util/types';
+import { serialize } from 'node:v8';
 import type {
   IngestionFailure,
   TransactionIngestionErrorCode,
@@ -211,7 +212,7 @@ function fixedLocatorFailure(code: TransactionIngestionErrorCode): IngestionFail
   }
 }
 
-function internalLocatorError<TError extends TransactionLocatorError>(error: TError): TError {
+export function internalLocatorError<TError extends TransactionLocatorError>(error: TError): TError {
   trustedTransactionLocatorErrors.set(error, fixedLocatorFailure(error.code));
   return error;
 }
@@ -318,6 +319,69 @@ type BlockTransactionSnapshot = Readonly<{
   index: number;
   response: VersionedTransactionResponse;
 }>;
+
+/** Immutable, data-only normalized payloads. No provider graph survives this boundary. */
+export interface BlockTransactionDataSnapshot {
+  readonly transactions: readonly Readonly<{ signature: string; payload: string | null }>[];
+  readonly duplicateSignature: string | null;
+  readonly cacheable: boolean;
+  readonly bytes: number;
+}
+
+/** Single linear block scan; malformed unrelated normalization only disables retention. */
+export function snapshotBlockTransactionData(
+  value: unknown,
+  slot: bigint,
+  confirmationStatus: LocatableConfirmationStatus,
+): BlockTransactionDataSnapshot | null {
+  try {
+    if (!validTargetSlot(slot)) return null;
+    const record = ownRecord(value);
+    const blockTime = ownData(record, 'blockTime');
+    if (!validBlockhash(ownData(record, 'blockhash'))
+      || !validBlockhash(ownData(record, 'previousBlockhash'))
+      || !validParentSlot(ownData(record, 'parentSlot'), slot)
+      || !validBlockTime(blockTime)) return null;
+    const entries = denseBlockTransactions(ownData(record, 'transactions'));
+    if (entries === null) return null;
+    const transactions: { readonly signature: string; readonly payload: string | null }[] = [];
+    const seen = new Set<string>();
+    let cacheable = true;
+    let bytes = 64;
+    for (const [index, entry] of entries.entries()) {
+      const entryRecord = ownRecord(entry);
+      const transaction = ownData(entryRecord, 'transaction');
+      const signature = primaryTransactionSignature(transaction);
+      if (signature === null) return null;
+      if (seen.has(signature)) {
+        return Object.freeze({ transactions: Object.freeze([]), duplicateSignature: signature, cacheable: false, bytes: 0 });
+      }
+      seen.add(signature);
+      let payload: string | null = null;
+      try {
+        const version = ownOptionalData(entryRecord, 'version');
+        const meta = ownData(entryRecord, 'meta');
+        if (!validBlockTransactionVersion(version) || !validBlockTransactionMeta(meta)) throw new TypeError();
+        const snapshot = snapshotSelectedTransaction(transaction, meta, version ?? 'legacy');
+        if (snapshot === null) throw new TypeError();
+        const normalized = normalizeTransaction({
+          slot: Number(slot), blockTime, transaction: snapshot.transaction, meta: snapshot.meta,
+          ...(version === undefined ? {} : { version }),
+        }, confirmationStatus, index);
+        if (normalized.signature !== signature || normalized.slot !== slot) throw new TypeError();
+        // V8 preserves bigint and typed arrays, but the retained representation is just text.
+        payload = serialize(normalized).toString('base64');
+      } catch {
+        cacheable = false;
+      }
+      transactions.push(Object.freeze({ signature, payload }));
+      bytes += Buffer.byteLength(signature, 'utf8') + (payload?.length ?? 0) + 32;
+    }
+    return Object.freeze({ transactions: Object.freeze(transactions), duplicateSignature: null, cacheable, bytes });
+  } catch {
+    return null;
+  }
+}
 
 function validTargetSlot(value: unknown): value is bigint {
   return typeof value === 'bigint'
