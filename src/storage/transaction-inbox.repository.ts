@@ -5,6 +5,10 @@ import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
 import {
+  assertValidCatchUpClassification,
+  type CatchUpClassification,
+} from '../domain/catch-up-classification.js';
+import {
   assertValidClaimedTransaction,
   assertValidCatchUpGap,
   assertValidFinalityCandidate,
@@ -46,6 +50,7 @@ import {
 } from '../domain/strict-catch-up-run.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { StrictCatchUpRepository } from '../ports/strict-catch-up-repository.js';
+import type { CatchUpClassificationRepository } from '../ports/catch-up-classification-repository.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
@@ -107,6 +112,7 @@ interface StrictCatchUpRunRow extends QueryResultRow {
   readonly last_accepted_slot: unknown;
   readonly pages_scanned: unknown;
   readonly signatures_enqueued: unknown;
+  readonly signatures_classified: unknown;
   readonly revision: unknown;
   readonly state: unknown;
   readonly terminal_reason: unknown;
@@ -124,7 +130,8 @@ export const MAX_CONSECUTIVE_URGENT_CLAIMS = 32;
 const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
 
 type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE' | 'TRACKED_TRADE';
-type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED';
+type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED'
+  | 'IGNORED' | 'QUARANTINED';
 type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE';
 
 export interface TransactionInboxRetryPolicy {
@@ -151,7 +158,7 @@ export class TransactionInboxRepositoryError extends Error {
 }
 
 export class TransactionInboxConflictError extends TransactionInboxRepositoryError {
-  public constructor(public readonly conflict: 'identity' | 'snapshot' | 'finality' | 'checkpoint') {
+  public constructor(public readonly conflict: 'identity' | 'snapshot' | 'finality' | 'checkpoint' | 'classification') {
     super();
     this.name = 'TransactionInboxConflictError';
     this.message = 'Transaction inbox immutable state conflicts.';
@@ -166,7 +173,8 @@ export class TransactionInboxLeaseError extends TransactionInboxRepositoryError 
   }
 }
 
-export class PostgresTransactionInboxRepository implements TransactionInboxRepository, StrictCatchUpRepository {
+export class PostgresTransactionInboxRepository implements TransactionInboxRepository,
+  StrictCatchUpRepository, CatchUpClassificationRepository {
   private readonly retryPolicy: TransactionInboxRetryPolicy;
 
   public constructor(
@@ -181,15 +189,17 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       assertValidTransactionNotification(value);
       await this.transaction(async (client) => {
         await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
+        // All trade paths lock mint -> signature -> inbox row. The projection
+        // synchronizer locks mint -> rows, so no row holder waits for a mint.
+        if (value.ingestionHint === 'PUMPFUN_TRADE') {
+          await lockTrackedMint(client, value.ingestionHintMint);
+        }
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
           [value.signature],
         );
-        // Take the mint lock before any inbox row lock: synchronization locks
-        // mint -> rows. The shared lock closes enqueue/projection races.
         let tracked = false;
         if (value.ingestionHint === 'PUMPFUN_TRADE') {
-          await lockTrackedMint(client, value.ingestionHintMint);
           const membership = await client.query(
             'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
             [value.ingestionHintMint],
@@ -328,6 +338,153 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             decision.hint,
             decision.mint,
             decision.status,
+          ],
+        );
+        requireOne(updated.rowCount);
+      });
+    });
+  }
+
+  public async recordCatchUpClassification(value: CatchUpClassification): Promise<void> {
+    return this.safely(async () => {
+      assertValidCatchUpClassification(value);
+      await this.transaction(async (client) => {
+        await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
+        let tracked = false;
+        if (value.ingestionHint === 'PUMPFUN_TRADE') {
+          await lockTrackedMint(client, value.ingestionHintMint);
+        }
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
+          [value.signature],
+        );
+        if (value.ingestionHint === 'PUMPFUN_TRADE') {
+          const membership = await client.query(
+            'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
+            [value.ingestionHintMint],
+          );
+          const active: unknown = requiredRow(membership.rows[0]).active;
+          if (typeof active !== 'boolean') throw new TypeError('Stored tracked mint membership is invalid.');
+          tracked = active;
+        }
+        const selected = await client.query(
+          `SELECT observed_slot, ingestion_priority, ingestion_hint, ingestion_hint_mint,
+             attempts, attempts_in_cycle, lease_token, lease_expires_at,
+             error_code, error_name, error_retryable, next_attempt_at, retry_exhausted_at,
+             terminal_at, purge_after, observed_at, manual_recovery_count, last_manual_recovery_at,
+             discovery_sources, program_ids, target_confirmation_status,
+             processing_status, normalized_transaction, immutable_fingerprint, processed_at,
+             missing_finality_polls, last_missing_finality_provider_id, finality_evidence_version,
+             catch_up_classification_version, catch_up_disposition, catch_up_reason_code,
+             catch_up_action_key, catch_up_mints, catch_up_evidence_fingerprint, catch_up_classified_at
+           FROM chain_transaction_inbox WHERE signature=$1 FOR UPDATE`,
+          [value.signature],
+        );
+        if (selected.rows.length > 1 || (selected.rows.length === 1 && selected.rowCount !== 1)
+          || (selected.rows.length === 0 && selected.rowCount !== 0)) {
+          throw new TypeError('Catch-up classification query returned an invalid row count.');
+        }
+        const row = selected.rows[0] as InboxIdentityRow | undefined;
+        const programs = row === undefined ? [] : storedProgramIds(row.program_ids);
+        for (const programId of value.programIds) if (!programs.includes(programId)) programs.push(programId);
+        programs.sort(lexicalOrder);
+        if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
+        const actionKey = catchUpActionKey(value);
+        const decision = classificationDecision(value, tracked, programs);
+        const terminalAt = decision.status === 'PENDING' ? null : dateFromMs(value.classifiedAtMs);
+        if (row !== undefined && row.catch_up_classification_version !== null) {
+          if (!storedClassificationMatches(row, value, actionKey)) {
+            throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+          }
+          const sources = discoverySources(row.discovery_sources);
+          if (!sources.includes('CATCH_UP')) sources.push('CATCH_UP');
+          sources.sort(sourceOrder);
+          const status = reconciledStatus(confirmation(row.target_confirmation_status), value.confirmationStatus);
+          const currentDecision = storedIngestionDecision(row);
+          const pristine = isPristineInbox(row);
+          const replayDecision = pristine ? decision : currentDecision;
+          const currentStatus = confirmation(row.target_confirmation_status);
+          const shouldReplay = currentDecision.status === 'PROCESSED' && status !== currentStatus;
+          if (shouldReplay && row.normalized_transaction === null) {
+            throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
+          }
+          if (shouldReplay
+            && finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
+            throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+          }
+          const replayTerminalAt = shouldReplay ? null : pristine
+            ? (replayDecision.status === 'PENDING' ? null : dateFromMs(value.classifiedAtMs))
+            : nullableDateFromMs(nullableDateMs(row.terminal_at, 'classification replay terminal at'));
+          const updated = await client.query(
+            `UPDATE chain_transaction_inbox SET
+               discovery_sources=$2,program_ids=$3,target_confirmation_status=$4,
+               processing_status=CASE WHEN $11 THEN 'PENDING' ELSE $5 END,
+               processed_at=CASE WHEN $11 THEN NULL ELSE processed_at END,
+               attempts_in_cycle=CASE WHEN $11 THEN 0 ELSE attempts_in_cycle END,
+               retry_exhausted_at=CASE WHEN $11 THEN NULL ELSE retry_exhausted_at END,
+               missing_finality_polls=CASE WHEN $11 THEN 0 ELSE missing_finality_polls END,
+               last_missing_finality_provider_id=CASE WHEN $11 THEN NULL ELSE last_missing_finality_provider_id END,
+               finality_evidence_version=CASE WHEN $11 THEN finality_evidence_version+1
+                 ELSE finality_evidence_version END,
+               ingestion_priority=$6::chain_transaction_inbox_priority,
+               ingestion_hint=$7,ingestion_hint_mint=$8,terminal_at=$9,
+               purge_after=CASE WHEN $9::TIMESTAMPTZ IS NULL THEN NULL
+                 ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
+               updated_at=GREATEST(updated_at,$10)
+             WHERE signature=$1`,
+            [
+              value.signature, sources, programs, status, replayDecision.status,
+              replayDecision.priority, replayDecision.hint, replayDecision.mint,
+              replayTerminalAt, dateFromMs(value.observedAtMs), shouldReplay,
+            ],
+          );
+          requireOne(updated.rowCount);
+          return;
+        }
+        if (row === undefined) {
+          const inserted = await client.query(
+            `INSERT INTO chain_transaction_inbox (
+               signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+               processing_status,observed_at,retry_max_attempts,retry_base_delay_ms,
+               ingestion_priority,ingestion_hint,ingestion_hint_mint,terminal_at,purge_after,
+               catch_up_classification_version,catch_up_disposition,catch_up_reason_code,
+               catch_up_action_key,catch_up_mints,catch_up_evidence_fingerprint,catch_up_classified_at
+             ) VALUES ($1,$2,ARRAY['CATCH_UP']::TEXT[],$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+               CASE WHEN $12::TIMESTAMPTZ IS NULL THEN NULL ELSE $12::TIMESTAMPTZ+INTERVAL '4 hours' END,
+               $13,$14,$15,$16,$17,$18,$19)`,
+            [
+              value.signature, value.slot.toString(), value.programIds, value.confirmationStatus,
+              decision.status, dateFromMs(value.observedAtMs), this.retryPolicy.maxAttempts,
+              this.retryPolicy.baseDelayMs, decision.priority, decision.hint, decision.mint,
+              terminalAt, value.classificationVersion, value.disposition, value.reasonCode,
+              actionKey, value.mints, value.evidenceFingerprint, dateFromMs(value.classifiedAtMs),
+            ],
+          );
+          requireOne(inserted.rowCount);
+          return;
+        }
+        if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot || !isPristineInbox(row)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+        }
+        const sources = discoverySources(row.discovery_sources);
+        if (!sources.includes('CATCH_UP')) sources.push('CATCH_UP');
+        sources.sort(sourceOrder);
+        const status = reconciledStatus(confirmation(row.target_confirmation_status), value.confirmationStatus);
+        const updated = await client.query(
+          `UPDATE chain_transaction_inbox SET
+             discovery_sources=$2,program_ids=$3,target_confirmation_status=$4,
+             processing_status=$5,ingestion_priority=$6::chain_transaction_inbox_priority,
+             ingestion_hint=$7,ingestion_hint_mint=$8,terminal_at=$9,
+             purge_after=CASE WHEN $9::TIMESTAMPTZ IS NULL THEN NULL ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
+             catch_up_classification_version=$10,catch_up_disposition=$11,catch_up_reason_code=$12,
+             catch_up_action_key=$13,catch_up_mints=$14,catch_up_evidence_fingerprint=$15,
+             catch_up_classified_at=$16,updated_at=GREATEST(updated_at,$16)
+           WHERE signature=$1 AND catch_up_classification_version IS NULL`,
+          [
+            value.signature, sources, programs, status, decision.status, decision.priority,
+            decision.hint, decision.mint, terminalAt, value.classificationVersion,
+            value.disposition, value.reasonCode, actionKey, value.mints, value.evidenceFingerprint,
+            dateFromMs(value.classifiedAtMs),
           ],
         );
         requireOne(updated.rowCount);
@@ -1245,10 +1402,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           `INSERT INTO listener_strict_catch_up_runs (
              run_id, checkpoint_key, previous_slot, previous_signature, provider_id,
              observed_head_slot, observed_head_signature, before_signature, last_accepted_slot,
-             pages_scanned, signatures_enqueued, revision, state, terminal_reason,
+             pages_scanned, signatures_enqueued, signatures_classified, revision, state, terminal_reason,
              previous_updated_at, started_at, updated_at, completed_at, purge_after
            ) VALUES (
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
            )`,
           strictCatchUpRunValues(value),
         );
@@ -1274,12 +1431,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         const updated = await client.query(
           `UPDATE listener_strict_catch_up_runs SET
-             before_signature = $20, last_accepted_slot = $21, pages_scanned = $22,
-             signatures_enqueued = $23, revision = $24, updated_at = $25
+             before_signature = $21, last_accepted_slot = $22, pages_scanned = $23,
+             signatures_enqueued = $24, signatures_classified = $25,
+             revision = $26, updated_at = $27
            WHERE ${strictCatchUpRunSnapshotWhere()}`,
           [...strictCatchUpRunValues(expected), next.beforeSignature,
             next.lastAcceptedSlot.toString(), next.pagesScanned.toString(),
-            next.signaturesEnqueued.toString(), next.revision.toString(), dateFromMs(next.updatedAtMs)],
+            next.signaturesEnqueued.toString(), next.signaturesClassified.toString(),
+            next.revision.toString(), dateFromMs(next.updatedAtMs)],
         );
         if (updated.rowCount !== 1) {
           throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
@@ -1746,7 +1905,7 @@ function checkpointFromRow(row: QueryResultRow): ProcessingCheckpoint {
 function strictCatchUpRunSelect(): string {
   return `SELECT run_id, checkpoint_key, previous_slot, previous_signature, provider_id,
     observed_head_slot, observed_head_signature, before_signature, last_accepted_slot,
-    pages_scanned, signatures_enqueued, revision, state, terminal_reason,
+    pages_scanned, signatures_enqueued, signatures_classified, revision, state, terminal_reason,
     previous_updated_at, started_at, updated_at, completed_at, purge_after
     FROM listener_strict_catch_up_runs`;
 }
@@ -1756,7 +1915,8 @@ function strictCatchUpRunValues(value: StrictCatchUpRun): readonly unknown[] {
     value.runId, value.checkpointKey, value.previous.slot.toString(), value.previous.signature,
     value.providerId, value.observedHead.slot.toString(), value.observedHead.signature,
     value.beforeSignature, value.lastAcceptedSlot.toString(), value.pagesScanned.toString(),
-    value.signaturesEnqueued.toString(), value.revision.toString(), value.state,
+    value.signaturesEnqueued.toString(), value.signaturesClassified.toString(),
+    value.revision.toString(), value.state,
     value.terminalReason, dateFromMs(value.previous.updatedAtMs), dateFromMs(value.startedAtMs),
     dateFromMs(value.updatedAtMs), nullableDateFromMs(value.completedAtMs),
     nullableDateFromMs(value.purgeAfterMs),
@@ -1767,10 +1927,11 @@ function strictCatchUpRunSnapshotWhere(): string {
   return `run_id = $1 AND checkpoint_key = $2 AND previous_slot = $3 AND previous_signature = $4
     AND provider_id = $5 AND observed_head_slot = $6 AND observed_head_signature = $7
     AND before_signature = $8 AND last_accepted_slot = $9 AND pages_scanned = $10
-    AND signatures_enqueued = $11 AND revision = $12 AND state = $13
-    AND terminal_reason IS NOT DISTINCT FROM $14 AND previous_updated_at = $15
-    AND started_at = $16 AND updated_at = $17 AND completed_at IS NOT DISTINCT FROM $18
-    AND purge_after IS NOT DISTINCT FROM $19`;
+    AND signatures_enqueued = $11 AND signatures_classified = $12
+    AND revision = $13 AND state = $14
+    AND terminal_reason IS NOT DISTINCT FROM $15 AND previous_updated_at = $16
+    AND started_at = $17 AND updated_at = $18 AND completed_at IS NOT DISTINCT FROM $19
+    AND purge_after IS NOT DISTINCT FROM $20`;
 }
 
 function strictCatchUpRunFromRow(row: StrictCatchUpRunRow): StrictCatchUpRun {
@@ -1794,6 +1955,7 @@ function strictCatchUpRunFromRow(row: StrictCatchUpRunRow): StrictCatchUpRun {
     lastAcceptedSlot: numericBigInt(row.last_accepted_slot, 'strict catch-up accepted slot'),
     pagesScanned: numericBigInt(row.pages_scanned, 'strict catch-up pages scanned'),
     signaturesEnqueued: numericBigInt(row.signatures_enqueued, 'strict catch-up signatures enqueued'),
+    signaturesClassified: numericBigInt(row.signatures_classified, 'strict catch-up signatures classified'),
     revision: numericBigInt(row.revision, 'strict catch-up revision'),
     state: row.state,
     terminalReason: row.terminal_reason,
@@ -1846,6 +2008,7 @@ function assertExactStrictCatchUpAdvance(expected: StrictCatchUpRun, next: Stric
     lastAcceptedSlot: next.lastAcceptedSlot,
     pagesScanned: next.pagesScanned,
     signaturesEnqueued: next.signaturesEnqueued,
+    signaturesClassified: next.signaturesClassified,
     updatedAtMs: next.updatedAtMs,
   });
   if (!strictCatchUpRunsEqual(advanced, next)) throw new TypeError('Strict catch-up advance is invalid.');
@@ -1879,6 +2042,7 @@ function strictCatchUpRunsEqual(left: StrictCatchUpRun, right: StrictCatchUpRun)
     && left.lastAcceptedSlot === right.lastAcceptedSlot
     && left.pagesScanned === right.pagesScanned
     && left.signaturesEnqueued === right.signaturesEnqueued
+    && left.signaturesClassified === right.signaturesClassified
     && left.revision === right.revision
     && left.state === right.state
     && left.terminalReason === right.terminalReason
@@ -1926,8 +2090,8 @@ async function terminalizeStrictCatchUpRunAtOrZero(
   terminal: StrictCatchUpRun,
 ): Promise<number | null> {
   const updated = await client.query(
-    `UPDATE listener_strict_catch_up_runs SET revision = $20, state = $21,
-       terminal_reason = $22, updated_at = $23, completed_at = $24, purge_after = $25
+    `UPDATE listener_strict_catch_up_runs SET revision = $21, state = $22,
+       terminal_reason = $23, updated_at = $24, completed_at = $25, purge_after = $26
      WHERE ${strictCatchUpRunSnapshotWhere()}`,
     [...strictCatchUpRunValues(expected), terminal.revision.toString(), terminal.state,
       terminal.terminalReason, dateFromMs(terminal.updatedAtMs),
@@ -2153,7 +2317,8 @@ function requireConfirmation(value: unknown): asserts value is ChainConfirmation
 
 function inboxStatus(value: unknown): InboxStatus {
   if (value !== 'PENDING' && value !== 'PROCESSING'
-    && value !== 'PROCESSED' && value !== 'FAILED' && value !== 'DEFERRED') {
+    && value !== 'PROCESSED' && value !== 'FAILED' && value !== 'DEFERRED'
+    && value !== 'IGNORED' && value !== 'QUARANTINED') {
     throw new TypeError('Stored inbox status is invalid.');
   }
   return value;
@@ -2164,6 +2329,84 @@ interface IngestionDecision {
   readonly priority: TransactionInboxPriority;
   readonly hint: StoredIngestionHint;
   readonly mint: string | null;
+}
+
+function classificationDecision(
+  value: CatchUpClassification,
+  tracked: boolean,
+  programIds: readonly string[],
+): IngestionDecision {
+  if (value.disposition === 'ACTIONABLE') {
+    if (value.ingestionHint === 'PUMPFUN_CREATE') {
+      return { status: 'PENDING', priority: 'LAUNCH_CANDIDATE', hint: value.ingestionHint, mint: null };
+    }
+    if (value.ingestionHint !== 'PUMPFUN_TRADE' || value.ingestionHintMint === null) {
+      throw new TypeError('Actionable catch-up classification hint is invalid.');
+    }
+    if (programIds.length > 1) {
+      return { status: 'PENDING', priority: 'NORMAL', hint: 'NONE', mint: null };
+    }
+    return {
+      status: 'PENDING', priority: 'TRACKED_TRADE',
+      hint: value.ingestionHint, mint: value.ingestionHintMint,
+    };
+  }
+  if (value.disposition === 'DEFERRED') {
+    if (value.ingestionHint !== 'PUMPFUN_TRADE' || value.ingestionHintMint === null) {
+      throw new TypeError('Deferred catch-up classification hint is invalid.');
+    }
+    if (programIds.length > 1) {
+      return { status: 'PENDING', priority: 'NORMAL', hint: 'NONE', mint: null };
+    }
+    return tracked
+      ? { status: 'PENDING', priority: 'TRACKED_TRADE', hint: value.ingestionHint, mint: value.ingestionHintMint }
+      : { status: 'DEFERRED', priority: 'NORMAL', hint: value.ingestionHint, mint: value.ingestionHintMint };
+  }
+  return { status: value.disposition, priority: 'NORMAL', hint: 'NONE', mint: null };
+}
+
+function storedClassificationMatches(
+  row: InboxIdentityRow,
+  value: CatchUpClassification,
+  actionKey: string,
+): boolean {
+  if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot
+    || safeCount(row.catch_up_classification_version, 'catch-up classification version')
+      !== value.classificationVersion
+    || row.catch_up_disposition !== value.disposition
+    || row.catch_up_reason_code !== value.reasonCode
+    || row.catch_up_action_key !== actionKey
+    || row.catch_up_evidence_fingerprint !== value.evidenceFingerprint
+    || dateMs(row.catch_up_classified_at, 'catch-up classified at') !== value.classifiedAtMs
+    || !discoverySources(row.discovery_sources).includes('CATCH_UP')) return false;
+  const storedMints = storedCatchUpMints(row.catch_up_mints);
+  if (storedMints.length !== value.mints.length
+    || storedMints.some((mint, index) => mint !== value.mints[index])) return false;
+  return true;
+}
+
+function catchUpActionKey(value: CatchUpClassification): string {
+  if (value.ingestionHint === null) return 'NONE';
+  if (value.ingestionHint === 'PUMPFUN_CREATE') return value.ingestionHint;
+  if (value.ingestionHintMint === null) throw new TypeError('Catch-up trade action mint is missing.');
+  return `${value.ingestionHint}:${value.ingestionHintMint}`;
+}
+
+function storedCatchUpMints(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 16) {
+    throw new TypeError('Stored catch-up mints are invalid.');
+  }
+  const result: string[] = [];
+  let previous: string | null = null;
+  for (const mint of value) {
+    assertCanonicalMint(mint);
+    if (previous !== null && mint <= previous) {
+      throw new TypeError('Stored catch-up mints are not canonical.');
+    }
+    result.push(mint);
+    previous = mint;
+  }
+  return result;
 }
 
 function convergeIngestion(

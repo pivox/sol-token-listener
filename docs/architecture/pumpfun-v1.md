@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.3 — 2026-09-12
+**Version :** 1.1.5 — 2026-09-13
 
 ## Périmètre produit
 
@@ -711,6 +711,37 @@ compteur du scheduler et reconstruit l'index de claim sous des verrous
 migration dans une fenêtre de maintenance, rejoue le provisioning des rôles et
 démarre ensuite le nouveau binaire. Cela n'arme ni ne démarre un canary : le
 constat reste `CANARY_NOT_STARTED`.
+
+La migration `048_transaction_inbox_catch_up_classification.sql` prépare une
+classification durable versionnée directement dans `chain_transaction_inbox`,
+sans nouvelle table. Le contrat est **inactif** dans cette PR : aucun scanner,
+RPC, worker ou factory ne l'appelle. Une décision atomique associe les sept
+champs de classification, tous nuls ou tous présents, à l'un des états fermés
+`ACTIONABLE`, `DEFERRED`, `IGNORED`, `QUARANTINED`. Les deux premiers réutilisent
+respectivement le chemin actionnable et le chemin différé promotable existants ;
+les deux derniers sont terminaux, non claimables et purgeables après exactement
+4 heures, sans erreur de décodage.
+
+Les reason codes V1 sont stables : `PUMP_ACTION_SUPPORTED`,
+`PUMP_TRADE_UNTRACKED`, `SOLANA_TRANSACTION_FAILED`,
+`NO_SUPPORTED_PUMP_ACTION`, `PUMP_SCHEMA_UNSUPPORTED` et
+`PROVIDER_SIGNATURE_MISSING`. Une preuve porte une empreinte SHA-256 hexadécimale
+minuscule et un tableau multi-mint canonique, trié et sans doublon ; ce tableau
+peut être vide seulement pour une décision ignorée ou quarantainée. Le compteur
+durable `signatures_classified` doit toujours être supérieur ou égal à
+`signatures_enqueued`. Le scanner actuel incrémente les deux à l'identique :
+la sélection, les admissions et le comportement du worker restent inchangés.
+
+Le septième champ, `catch_up_action_key`, conserve l'action initialement
+qualifiée (`PUMPFUN_CREATE`, `PUMPFUN_TRADE:<mint>` ou `NONE`) même si le hint
+inbox courant converge ensuite vers `NONE` pour une transaction
+multi-programme. Un replay exact fusionne les programmes canoniques et peut
+faire progresser `confirmed` vers `finalized`, mais une substitution CREATE ↔
+TRADE reste un conflit. Les trades prennent toujours les verrous dans l'ordre
+`mint -> signature -> row`, compatible avec `syncTrackedMint` (`mint -> rows`),
+et l'appartenance active est relue sous verrou avant l'admission. PostgreSQL
+décode chaque mint base58 et exige exactement 32 octets, sans extension.
+
 Sur une base vide, le scanner prend uniquement la page la plus récente de
 chaque programme comme baseline, conformément au périmètre sans historique.
 Avec la politique V1 `live-edge`, cette page est validée mais ses signatures ne

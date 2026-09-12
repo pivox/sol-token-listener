@@ -614,7 +614,8 @@ void test('active market completes before failed launchpad and releases the prov
           checkpointKey: program.key, previous, providerId: 'primary',
           observedHead: { signature: MULTI_PAGE_SIGNATURE, slot: 45n },
           beforeSignature: SHARED_SIGNATURE, lastAcceptedSlot: 44n,
-          pagesScanned: 1n, signaturesEnqueued: 2n, revision: 0n, startedAtMs: 10_000, updatedAtMs: 10_000,
+          pagesScanned: 1n, signaturesEnqueued: 2n, signaturesClassified: 2n,
+          revision: 0n, startedAtMs: 10_000, updatedAtMs: 10_000,
         }));
         continue;
       }

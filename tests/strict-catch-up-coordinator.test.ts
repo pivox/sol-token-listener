@@ -56,7 +56,7 @@ function activeRun(key: 'launchpad' | 'market', providerId: 'primary' | 'fallbac
   return createStrictCatchUpRun({
     checkpointKey: key, previous: { key, slot: 10n, signature: 'boundary', updatedAtMs: 100 },
     providerId, observedHead: { slot: 14n, signature: 'head' }, beforeSignature: 'cursor',
-    lastAcceptedSlot: 13n, pagesScanned: 1n, signaturesEnqueued: 2n,
+    lastAcceptedSlot: 13n, pagesScanned: 1n, signaturesEnqueued: 2n, signaturesClassified: 2n,
     revision: 0n, startedAtMs: 1_000, updatedAtMs: 1_000,
   });
 }
