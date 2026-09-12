@@ -128,6 +128,12 @@ worker transmet `chain_transaction_inbox.observed_at` à chaque pipeline. Une
 reprise après persistance partielle, un redémarrage ou une montée de finalité
 peut modifier la finalité de l’observation, mais ne recapture jamais son heure.
 
+Le [guard de lease v1.0.0](../superpowers/specs/2026-09-12-inbox-lease-before-hydration-design.md)
+est actif dès le claim validé, avant l’hydratation RPC et le snapshot. Il
+renouvelle le lease pendant le locator et le pipeline ; une perte constatée
+avant persistance interdit le snapshot, les écritures terminales et le pipeline.
+Toutes les sorties clôturent le guard et attendent le renouvellement en cours.
+
 Les nouveaux échecs de ce pipeline suivent la
 [taxonomie durable v1.0.0](../superpowers/specs/2026-09-12-observed-pipeline-failure-taxonomy-design.md).
 L’inbox conserve `PIPELINE_STAGE_FAILED` et le nom fermé
