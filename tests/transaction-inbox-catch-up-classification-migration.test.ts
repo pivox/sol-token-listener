@@ -87,6 +87,25 @@ void test('048 rejects weakened inbox and strict-run constraints on direct repla
   }
 });
 
+void test('048 replay rejects rows admitted through a weakened public-key helper', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await migrateDatabase({ pool });
+    await pool.query(`CREATE OR REPLACE FUNCTION transaction_inbox_solana_public_key_valid(value TEXT)
+      RETURNS BOOLEAN LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT TRUE $$`);
+    await insertInbox(pool, classified({
+      signature: 'invalid-mint-admitted-by-weakened-helper',
+      catch_up_mints: ['z'.repeat(44)],
+      ingestion_hint: 'PUMPFUN_CREATE',
+      processing_status: 'PENDING',
+    }));
+
+    await assert.rejects(pool.query(await migrationSql()),
+      (error: unknown) => error instanceof pg.DatabaseError
+        && error.code === '23514'
+        && error.message.includes('stored catch-up helper-dependent evidence is invalid'));
+  });
+});
+
 void test('048 enforces all-or-none evidence, stable reasons, canonical multi-mints and terminal states', async (context) => {
   await withDatabase(context, async (pool) => {
     await applyThrough047(pool);

@@ -105,6 +105,44 @@ void test('persists ignored and quarantined classifications as non-claimable fou
   });
 });
 
+void test('ordinary discovery converges terminal catch-up evidence without resurrecting it', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const [signature, disposition, reasonCode] of [
+      ['classified-ignored-discovery', 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION'],
+      ['classified-quarantined-discovery', 'QUARANTINED', 'PUMP_SCHEMA_UNSUPPORTED'],
+    ] as const) {
+      const classification = createCatchUpClassification({
+        ...catchUpClassificationInput(signature), disposition, reasonCode,
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      });
+      await repository.recordCatchUpClassification(classification);
+      const before = await row(pool, signature);
+      const discovery = Object.freeze({
+        ...notification(signature, classification.slot, 'WEBSOCKET', 'finalized', 1_002,
+          'PUMPFUN_CREATE'),
+        programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]),
+      });
+
+      await repository.enqueue(discovery);
+      await repository.enqueue(discovery);
+
+      const stored = await row(pool, signature);
+      assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+      assert.deepEqual(stored.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+      assert.equal(stored.target_confirmation_status, 'finalized');
+      assert.equal(stored.processing_status, disposition);
+      assert.equal(stored.ingestion_priority, 'NORMAL');
+      assert.equal(stored.ingestion_hint, 'NONE');
+      assert.equal(stored.ingestion_hint_mint, null);
+      assert.equal(stored.finality_evidence_version, '0');
+      assert.equal(stored.terminal_at.getTime(), before.terminal_at.getTime());
+      assert.equal(stored.purge_after.getTime(), before.purge_after.getTime());
+    }
+    assert.equal(await repository.claim(1_003, 30), null);
+  });
+});
+
 void test('replays exact classification idempotently and rejects every immutable contradiction', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -1715,6 +1753,54 @@ void test('uses a purged orphaned receipt as a non-resurrectable terminal tombst
     assert.equal((await pool.query(`SELECT confirmation_status
       FROM chain_transaction_finality_replay_receipts WHERE signature=$1`,[signature]))
       .rows[0]?.confirmation_status,'orphaned');
+  });
+});
+
+void test('uses a purged finalized receipt as a terminal classification tombstone', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'finalized-classification-tombstone';
+    await repository.enqueue(notification(signature, 45n, 'WEBSOCKET', 'finalized'));
+    const claim = await repository.claim(250_000, 120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 45n));
+    await repository.markProcessed(signature, claim.leaseToken, 'finalized');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [signature]);
+
+    const replay = createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 45n, confirmationStatus: 'confirmed',
+    });
+    await repository.recordCatchUpClassification(replay);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1', [signature],
+    )).rows[0]?.count, '0');
+    await assert.rejects(repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 46n, confirmationStatus: 'finalized',
+    })), TransactionInboxConflictError);
+  });
+});
+
+void test('uses a purged orphaned receipt as a non-resurrectable classification tombstone', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'orphaned-classification-tombstone';
+    await repository.enqueue(notification(signature, 46n, 'WEBSOCKET', 'confirmed'));
+    const claim = await repository.claim(260_000, 120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 46n));
+    await pool.query(
+      "UPDATE chain_transaction_inbox SET target_confirmation_status='orphaned' WHERE signature=$1",
+      [signature],
+    );
+    await repository.markProcessed(signature, claim.leaseToken, 'orphaned');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [signature]);
+
+    await assert.rejects(repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 46n, confirmationStatus: 'confirmed',
+    })), TransactionInboxConflictError);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1', [signature],
+    )).rows[0]?.count, '0');
   });
 });
 

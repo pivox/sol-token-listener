@@ -216,7 +216,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              discovery_sources, program_ids, target_confirmation_status,
              processing_status, normalized_transaction, immutable_fingerprint, processed_at,
              missing_finality_polls,
-             last_missing_finality_provider_id, finality_evidence_version
+             last_missing_finality_provider_id, finality_evidence_version,
+             catch_up_disposition
            FROM chain_transaction_inbox WHERE signature = $1 FOR UPDATE`,
           [value.signature],
         );
@@ -235,6 +236,31 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         programs.sort(lexicalOrder);
         if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
+        if (row !== undefined
+          && (row.catch_up_disposition === 'IGNORED' || row.catch_up_disposition === 'QUARANTINED')) {
+          if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot) {
+            throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+          }
+          if (row.processing_status !== row.catch_up_disposition) {
+            throw new TypeError('Stored terminal catch-up classification is invalid.');
+          }
+          const sources = discoverySources(row.discovery_sources);
+          if (!sources.includes(value.source)) sources.push(value.source);
+          sources.sort(sourceOrder);
+          const next = reconciledStatus(
+            confirmation(row.target_confirmation_status),
+            value.confirmationStatus,
+          );
+          const updated = await client.query(
+            `UPDATE chain_transaction_inbox SET
+               discovery_sources=$2,program_ids=$3,target_confirmation_status=$4,
+               updated_at=GREATEST(updated_at,$5)
+             WHERE signature=$1`,
+            [value.signature, sources, programs, next, dateFromMs(value.observedAtMs)],
+          );
+          requireOne(updated.rowCount);
+          return;
+        }
         const decision = convergeIngestion(row, value, tracked, programs);
         if (row === undefined) {
           if (receipt !== undefined) {
@@ -385,6 +411,18 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw new TypeError('Catch-up classification query returned an invalid row count.');
         }
         const row = selected.rows[0] as InboxIdentityRow | undefined;
+        const receiptResult = await client.query(
+          `SELECT observed_slot, confirmation_status, finality_evidence_version,
+             immutable_fingerprint, replay_completed_at
+           FROM chain_transaction_finality_replay_receipts
+           WHERE signature = $1 FOR SHARE`,
+          [value.signature],
+        );
+        const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
+        if (row === undefined && receipt !== undefined) {
+          assertTerminalReceiptAcceptsNotification(receipt, value);
+          return;
+        }
         const programs = row === undefined ? [] : storedProgramIds(row.program_ids);
         for (const programId of value.programIds) if (!programs.includes(programId)) programs.push(programId);
         programs.sort(lexicalOrder);
@@ -2263,7 +2301,11 @@ function reconciledStatus(
 
 function assertTerminalReceiptAcceptsNotification(
   receipt: TerminalReplayReceiptRow,
-  notification: TransactionNotification,
+  notification: Readonly<{
+    signature: string;
+    slot: bigint;
+    confirmationStatus: ChainConfirmationStatus;
+  }>,
 ): void {
   if (numericBigInt(receipt.observed_slot, 'receipt observed slot') !== notification.slot) {
     throw internalRepositoryError(new TransactionInboxConflictError('identity'));

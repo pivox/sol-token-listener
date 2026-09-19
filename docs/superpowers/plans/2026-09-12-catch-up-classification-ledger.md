@@ -1,6 +1,6 @@
 # Catch-up Classification Ledger V1 Implementation Plan
 
-Version: 3 — 2026-09-13
+Version: 4 — 2026-09-19
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -95,3 +95,14 @@ Version: 3 — 2026-09-13
 - [x] Demonstrate RED for the wildcard-compatible impostor `PUMPFUNXTRADE:<mint>`.
 - [x] Replace SQL `LIKE` with an exact literal `PUMPFUN_TRADE:` prefix in the live and replay-drift constraint definitions.
 - [x] Re-run focused PostgreSQL and all static gates, then refresh the immutable migration catalog hash.
+
+### Task 9: Close cycle-one terminal replay and migration-helper gaps
+
+- [x] Demonstrate RED when classification would recreate a purged finalized or orphaned inbox row despite a durable replay receipt.
+- [x] Reuse the terminal receipt identity/finality checks and return without recreating actionable work.
+- [x] Demonstrate RED when an ordinary discovery reaches a classified ignored or quarantined row.
+- [x] Converge only sources, programs and finality while preserving terminal disposition, four-hour retention and finality evidence version zero.
+- [x] Demonstrate RED for a non-key mint inserted while the SQL public-key helper is weakened.
+- [x] Restore helpers and scan helper-dependent stored evidence before replacing any CHECK constraint on migration replay.
+- [x] Restore omitted migration 047 entries in the three exact migration-history expectations reported by CI.
+- [x] Re-run the targeted PostgreSQL 16 suites and all static gates, then refresh the immutable migration catalog hash.

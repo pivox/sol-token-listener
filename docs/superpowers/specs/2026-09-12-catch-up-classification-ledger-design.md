@@ -1,6 +1,6 @@
 # Catch-up Classification Ledger V1 Design
 
-Version: 3 — 2026-09-13
+Version: 4 — 2026-09-19
 
 ## Scope
 
@@ -71,6 +71,14 @@ advanced. Finalized is therefore not projected as processed until the retained
 snapshot has been reclaimed and processed again. Missing snapshots or saturated
 finality evidence fail closed.
 
+A terminal finality replay receipt is also a durable tombstone for catch-up
+classification. If the inbox row has already been purged, exact stale evidence
+is accepted without recreating work, while a slot or finality contradiction
+fails closed. A later ordinary discovery of a classified `IGNORED` or
+`QUARANTINED` row may only union provenance and programs and reconcile finality;
+it cannot change the terminal disposition, immutable retention deadline,
+current hint or finality evidence version.
+
 Multi-mint values are stored only in `catch_up_mints`. The existing singular
 `ingestion_hint_mint` remains for compatibility with the inactive current
 runtime and identifies the current canonical hinted trade when required. The
@@ -95,7 +103,11 @@ signatures than it admits.
 
 Migration 048 must apply from 047, apply on an empty database, and replay
 without changing rows. It rejects incompatible columns or weakened
-constraints. Existing rows are preserved as unclassified. Purging continues
+constraints. After restoring its validation helper bodies, replay explicitly
+checks all stored helper-dependent mint and trade-action evidence before it
+replaces any durable CHECK constraint. Rows admitted through a weakened helper
+therefore abort replay with SQLSTATE `23514`. Existing rows are preserved as
+unclassified. Purging continues
 through the existing inbox retention boundary: terminal ignored and
 quarantined rows become eligible exactly four hours after classification,
 while actionable work follows its existing lifecycle.
@@ -113,6 +125,8 @@ and direct replay, catalog constraints, canonical multi-mint ordering,
 terminal four-hour purge, exact replay, contradictory action replay,
 program/finality convergence, concurrent lock ordering, transactional rollback,
 processed-confirmed finality replay, exact action-key prefixes, exact 32-byte
-base58 decoding and `signatures_classified >=
+base58 decoding, terminal receipt tombstones, ordinary discovery convergence
+for ignored/quarantined evidence, weakened-helper replay rejection and
+`signatures_classified >=
 signatures_enqueued`. No test contacts an RPC provider or loads
 signing/submission code.

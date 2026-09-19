@@ -151,6 +151,24 @@ ALTER TABLE chain_transaction_inbox
   ADD COLUMN IF NOT EXISTS catch_up_evidence_fingerprint TEXT,
   ADD COLUMN IF NOT EXISTS catch_up_classified_at TIMESTAMPTZ;
 
+-- Restore helper bodies first, then validate every value whose admissibility
+-- depends on those helpers before replacing any durable CHECK constraint.
+DO $$
+BEGIN
+  IF (SELECT replay FROM pg_temp.migration_048_preflight) AND EXISTS (
+    SELECT 1 FROM chain_transaction_inbox
+    WHERE catch_up_classification_version IS NOT NULL
+      AND (catch_up_mints IS NULL
+        OR NOT transaction_inbox_catch_up_mints_valid(catch_up_mints)
+        OR (LEFT(catch_up_action_key,14)='PUMPFUN_TRADE:'
+          AND NOT transaction_inbox_solana_public_key_valid(
+            SUBSTRING(catch_up_action_key FROM 15))))
+  ) THEN
+    RAISE EXCEPTION 'stored catch-up helper-dependent evidence is invalid' USING ERRCODE='23514';
+  END IF;
+END;
+$$;
+
 ALTER TABLE listener_strict_catch_up_runs
   ADD COLUMN IF NOT EXISTS signatures_classified BIGINT;
 UPDATE listener_strict_catch_up_runs
