@@ -48,7 +48,8 @@ function responseStatus(response: Response): number | undefined {
 }
 
 function requestSignal(input: FetchInput, init: FetchInit): AbortSignal | undefined {
-  if (init?.signal !== undefined && init.signal !== null) return init.signal;
+  if (init?.signal === null) return undefined;
+  if (init?.signal !== undefined) return init.signal;
   return input instanceof Request ? input.signal : undefined;
 }
 
@@ -125,7 +126,8 @@ function recordSafely(
   providerId: RpcProviderId,
 ): void {
   try {
-    recorder[method](providerId);
+    if (method === 'recordAttempt') recorder.recordAttempt(providerId);
+    else recorder.recordHttp429(providerId);
   } catch {
     // Instrumentation never changes the outcome of the physical RPC fetch.
   }

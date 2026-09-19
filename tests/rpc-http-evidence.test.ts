@@ -203,6 +203,26 @@ void test('uses init signal before the Request signal for abort admission', asyn
   assert.equal(recorder.snapshot(['primary']).providers[0]?.attempts, 1);
 });
 
+void test('treats an explicit null init signal as disabling the Request signal', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  const requestController = new AbortController();
+  requestController.abort();
+  let fetchCalls = 0;
+  const observed = createObservedRpcFetch('primary', recorder, async () => {
+    fetchCalls += 1;
+    return new Response(null, { status: 200 });
+  });
+
+  await observed(new Request('https://rpc.example.invalid', {
+    method: 'POST', signal: requestController.signal,
+  }), { signal: null });
+
+  assert.equal(fetchCalls, 1);
+  assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+    providerId: 'primary', configured: true, attempts: 1, http429Responses: 0,
+  });
+});
+
 void test('rejects extra, accessor, proxy and noncanonical top-level evidence safely', () => {
   const extra = mutableEvidence();
   Object.assign(extra, { apiKey: 'must-not-appear' });
