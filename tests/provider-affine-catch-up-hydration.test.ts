@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
-import { ProviderAffineCatchUpHydration } from '../src/application/provider-affine-catch-up-hydration.js';
+import { ProviderAffineCatchUpHydration, ProviderAffineCatchUpHydrationError } from '../src/application/provider-affine-catch-up-hydration.js';
 import type { PromotedProviderSelection } from '../src/application/promoted-provider-selector.js';
 import {
-  StrictCatchUpPausedError, StrictCatchUpRefreshRequiredError, StrictCatchUpScannerError,
+  StrictCatchUpAbortedError, StrictCatchUpPausedError, StrictCatchUpRefreshRequiredError, StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError, type StrictCatchUpScanResult,
 } from '../src/application/strict-catch-up-scanner.js';
 import type { RpcProviderId } from '../src/domain/rpc-provider.js';
@@ -577,3 +577,43 @@ void test('safe window wrappers compare only private-provenance peers with match
   assert.doesNotMatch(JSON.stringify(first), /stack|cause|secret/u);
   h.hydration.close();
 });
+
+for (const cancellation of ['abort', 'close'] as const) {
+  void test(`${cancellation} preserves a freshly reconstructed scanner abort for supervisor recovery`, async () => {
+    const h = harness();
+    const abort = new AbortController();
+    const original = new StrictCatchUpAbortedError();
+    await assert.rejects(h.hydration.runStrictScan('primary', async (signal) => {
+      if (cancellation === 'abort') abort.abort(new Error('secret-abort-reason'));
+      else h.hydration.close();
+      assert.equal(signal.aborted, true);
+      throw original;
+    }, abort.signal), (error: unknown) => {
+      assert.ok(error instanceof StrictCatchUpAbortedError);
+      assert.notEqual(error, original);
+      assert.equal(Object.isFrozen(error), true);
+      assert.doesNotMatch(error.stack ?? '', /secret-abort-reason/u);
+      assert.equal(Object.hasOwn(error, 'cause'), false);
+      return true;
+    });
+    h.hydration.close();
+  });
+
+  void test(`${cancellation} suppresses stale non-abort scanner recovery categories`, async () => {
+    for (const original of [
+      new StrictCatchUpPausedError('primary', 'launchpad', `strict_catchup_run_${'a'.repeat(64)}`, 1n, 0n),
+      new StrictCatchUpWindowExceededError('primary', 'launchpad', { launchpad: null, market: null }),
+      new StrictCatchUpRefreshRequiredError('primary'),
+      new StrictCatchUpScannerError('checkpoint-cas', 'primary', 'launchpad'),
+    ]) {
+      const h = harness();
+      const abort = new AbortController();
+      await assert.rejects(h.hydration.runStrictScan('primary', async () => {
+        if (cancellation === 'abort') abort.abort();
+        else h.hydration.close();
+        throw original;
+      }, abort.signal), ProviderAffineCatchUpHydrationError);
+      h.hydration.close();
+    }
+  });
+}

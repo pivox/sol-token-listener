@@ -162,7 +162,10 @@ export class ProviderAffineCatchUpHydration {
       this.assertOpen(combined);
       return result;
     } catch (error) {
-      if (!this.closed && !signal.aborted && safeScannerError(error)) throw reconstructScannerError(error);
+      if (safeScannerError(error)
+        && (error instanceof StrictCatchUpAbortedError || (!this.closed && !signal.aborted))) {
+        throw reconstructScannerError(error);
+      }
       throw new ProviderAffineCatchUpHydrationError();
     } finally {
       if (acquired) this.release();
