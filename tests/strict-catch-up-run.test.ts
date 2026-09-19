@@ -29,6 +29,7 @@ const canonicalInput = () => ({
   lastAcceptedSlot: 11n,
   pagesScanned: 1n,
   signaturesEnqueued: 9n,
+  signaturesClassified: 9n,
   revision: 0n,
   startedAtMs: 2_000,
   updatedAtMs: 2_000,
@@ -67,6 +68,7 @@ void test('uses only the versioned checkpoint boundary and provider for run iden
     lastAcceptedSlot: 12n,
     pagesScanned: 2n,
     signaturesEnqueued: 10n,
+    signaturesClassified: 12n,
     revision: 5n,
     startedAtMs: 2_500,
     updatedAtMs: 3_000,
@@ -118,6 +120,7 @@ void test('accepts exact durable slot, bigint counter, and timestamp bounds', ()
     lastAcceptedSlot: MAX_STRICT_CATCH_UP_SLOT,
     pagesScanned: MAX_STRICT_CATCH_UP_RUN_COUNTER,
     signaturesEnqueued: MAX_STRICT_CATCH_UP_RUN_COUNTER,
+    signaturesClassified: MAX_STRICT_CATCH_UP_RUN_COUNTER,
     revision: MAX_STRICT_CATCH_UP_RUN_COUNTER,
     startedAtMs: MAX_DATE_MS,
     updatedAtMs: MAX_DATE_MS,
@@ -133,7 +136,8 @@ void test('permits only the exact initial one-row head cursor and advances beyon
     ...canonicalInput(),
     beforeSignature: 'head',
     lastAcceptedSlot: 20n,
-    signaturesEnqueued: 1n,
+    signaturesEnqueued: 0n,
+    signaturesClassified: 1n,
   };
   const initial = createStrictCatchUpRun(initialInput);
 
@@ -142,7 +146,8 @@ void test('permits only the exact initial one-row head cursor and advances beyon
     beforeSignature: 'next-tail',
     lastAcceptedSlot: 20n,
     pagesScanned: 2n,
-    signaturesEnqueued: 2n,
+    signaturesEnqueued: 1n,
+    signaturesClassified: 2n,
     updatedAtMs: 2_001,
   });
   assert.equal(advanced.beforeSignature, 'next-tail');
@@ -151,7 +156,8 @@ void test('permits only the exact initial one-row head cursor and advances beyon
     beforeSignature: 'head',
     lastAcceptedSlot: 20n,
     pagesScanned: 3n,
-    signaturesEnqueued: 3n,
+    signaturesEnqueued: 2n,
+    signaturesClassified: 3n,
     updatedAtMs: 2_002,
   }), /strict catch-up run/i);
 
@@ -177,6 +183,7 @@ void test('permits only the exact initial one-row head cursor and advances beyon
   for (const value of [
     { ...initialInput, pagesScanned: 2n },
     { ...initialInput, signaturesEnqueued: 2n },
+    { ...initialInput, signaturesClassified: 2n },
     { ...initialInput, revision: 1n },
     { ...initialInput, lastAcceptedSlot: 19n },
   ]) {
@@ -185,6 +192,7 @@ void test('permits only the exact initial one-row head cursor and advances beyon
   for (const value of [
     Object.freeze({ ...initial, pagesScanned: 2n }),
     Object.freeze({ ...initial, signaturesEnqueued: 2n }),
+    Object.freeze({ ...initial, signaturesClassified: 2n }),
     Object.freeze({ ...initial, revision: 1n }),
     Object.freeze({ ...initial, lastAcceptedSlot: 19n }),
   ]) {
@@ -210,6 +218,7 @@ void test('rejects malformed creation input and durable bounds', () => {
     { ...base, pagesScanned: 0n },
     { ...base, pagesScanned: 1 },
     { ...base, signaturesEnqueued: -1n },
+    { ...base, signaturesClassified: 8n },
     { ...base, revision: MAX_STRICT_CATCH_UP_RUN_COUNTER + 1n },
     { ...base, startedAtMs: 999 },
     { ...base, updatedAtMs: 1_999 },
@@ -288,6 +297,7 @@ void test('advances active progress with one revision and immutable snapshots', 
     lastAcceptedSlot: 11n,
     pagesScanned: 2n,
     signaturesEnqueued: 15n,
+    signaturesClassified: 18n,
     updatedAtMs: 2_500,
   });
 
@@ -297,6 +307,7 @@ void test('advances active progress with one revision and immutable snapshots', 
   assert.equal(advanced.beforeSignature, 'older-tail');
   assert.equal(advanced.pagesScanned, 2n);
   assert.equal(advanced.signaturesEnqueued, 15n);
+  assert.equal(advanced.signaturesClassified, 18n);
   assert.ok(Object.isFrozen(advanced));
   assert.notEqual(advanced.previous, current.previous);
   assert.notEqual(advanced.observedHead, current.observedHead);
@@ -315,6 +326,7 @@ void test('accepts a different cursor signature in the previous checkpoint slot'
     lastAcceptedSlot: current.previous.slot,
     pagesScanned: 2n,
     signaturesEnqueued: current.signaturesEnqueued,
+    signaturesClassified: current.signaturesClassified,
     updatedAtMs: current.updatedAtMs,
   });
 
@@ -330,6 +342,7 @@ void test('rejects cursor and counter regression, no-op cursors, and revision ov
     lastAcceptedSlot: 11n,
     pagesScanned: 2n,
     signaturesEnqueued: 9n,
+    signaturesClassified: 9n,
     updatedAtMs: 2_001,
   };
   const cases: readonly unknown[] = [
@@ -341,6 +354,7 @@ void test('rejects cursor and counter regression, no-op cursors, and revision ov
     { ...valid, lastAcceptedSlot: 12n },
     { ...valid, pagesScanned: 1n },
     { ...valid, signaturesEnqueued: 8n },
+    { ...valid, signaturesClassified: 8n },
     { ...valid, updatedAtMs: 1_999 },
     { ...valid, extra: true },
   ];
@@ -362,6 +376,7 @@ void test('rejects cursor and counter regression, no-op cursors, and revision ov
     lastAcceptedSlot: 11n,
     pagesScanned: 2n,
     signaturesEnqueued: sameSlotHead.signaturesEnqueued,
+    signaturesClassified: sameSlotHead.signaturesClassified,
     updatedAtMs: sameSlotHead.updatedAtMs,
   }), /strict catch-up run/i);
   assert.throws(() => { assertValidStrictCatchUpRun(Object.freeze({
