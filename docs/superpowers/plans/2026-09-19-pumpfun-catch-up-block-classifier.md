@@ -157,11 +157,13 @@ reject the group and persist nothing.
 
 - [ ] **Step 4: Add slot barrier, commitment and deterministic-order tests**
 
-First add invalid-input cases for an accessor, proxy, extra or missing field,
-malformed slot/finality/block time, unsorted or duplicate program IDs and a
-duplicate signature. Assert each rejects before a clock read, locator call or
-repository call. Return a transaction whose signature or slot differs from its
-discovery and assert the entire slot rejects with zero writes.
+First add invalid-input cases for a top-level proxy, sparse array, accessor,
+extra key, more than 100,000 entries, an accessor/proxy/extra or missing row
+field, malformed slot/finality/block time, missing Pump.fun provenance,
+unsorted or duplicate program IDs and a duplicate signature. Assert each
+rejects before a clock read, locator call or repository call. Return a
+transaction whose signature or slot differs from its discovery and assert the
+entire slot rejects with zero writes.
 
 Use deferred locator promises for two signatures in one slot. Resolve the
 lexically first hydration and assert no repository call occurs until the second
@@ -250,11 +252,13 @@ which contains the effective locator status.
 
 - [ ] **Step 2: Validate and snapshot the complete input before effects**
 
-Before reading `now`, validate every discovery as an exact plain data record:
-no proxies/accessors/extra keys; bounded non-empty signature; safe non-negative
-bigint slot; lowercase `processed|confirmed|finalized`; valid nullable safe
-`blockTimeMs`; and one to sixteen canonical sorted unique program IDs. Copy and
-freeze every record and nested array. Reject duplicate signatures globally.
+Before reading `now`, validate the top-level input as a non-proxy, dense,
+data-only array with no extra keys and at most 100,000 entries. Validate every
+discovery as an exact plain data record: no proxies/accessors/extra keys;
+bounded non-empty signature; safe non-negative bigint slot; lowercase
+`processed|confirmed|finalized`; valid nullable safe `blockTimeMs`; and one to
+sixteen canonical sorted unique program IDs including `PUMP_PROGRAM_ID`. Copy
+and freeze every record and nested array. Reject duplicate signatures globally.
 
 The RED tests from Task 1 prove malicious input has zero clock reads, locator
 calls and repository calls.
@@ -284,7 +288,9 @@ or untrusted exception rejects before persistence.
 
 Check `transaction.error !== null` before decoding. Otherwise call
 `decodePumpTransaction(transaction)` and accept only exact trusted decoder
-identity from `trustedObservedPipelineOrigin(error)`. The service passes the
+identity from `trustedObservedPipelineOrigin(error)` whose code is also in
+`PUMP_DECODING_ERROR_CODES`; a trusted origin from another adapter is rejected.
+The service passes the
 decoded value to an exported pure decoded-evidence projector used by focused
 policy tests. Apply:
 

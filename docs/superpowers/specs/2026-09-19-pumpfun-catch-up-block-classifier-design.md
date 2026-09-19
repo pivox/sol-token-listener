@@ -1,6 +1,6 @@
 # Pump.fun Catch-up Block Classifier Design
 
-Version: 1.0.1 — 2026-09-19 — issue #133.
+Version: 1.0.2 — 2026-09-19 — issue #133.
 
 ## Goal and status
 
@@ -45,12 +45,17 @@ are excluded from semantic identity.
 ## Grouping and deterministic order
 
 Before sampling the clock or calling the locator, the service validates and
-snapshots the entire input as deeply immutable plain data. Every discovery must
+snapshots the entire input as deeply immutable plain data. The top-level value
+must be a non-proxy, dense, data-only array with no extra keys and at most
+100,000 entries. Every discovery must
 have exactly the merged-discovery fields, data descriptors only, no proxy or
 accessor, a bounded signature, safe non-negative bigint slot, valid lowercase
 finality, valid nullable block time, and one to sixteen canonical sorted unique
-Solana program IDs. Duplicate signatures are rejected globally. Any invalid
-element rejects the call with zero clock reads, RPC calls and writes.
+Solana program IDs including the Pump.fun program. Duplicate signatures are
+rejected globally. Any invalid container or element rejects the call with zero
+clock reads, RPC calls and writes. Requiring Pump.fun provenance at this
+boundary prevents an accidental mixed PumpSwap-only feed from being persisted
+as unsupported launchpad evidence.
 
 Validated input is grouped first by slot. Each slot contains effective
 `CONFIRMED` and `FINALIZED` hydration buckets. Slots are processed in ascending
@@ -99,7 +104,9 @@ Pump migrations alone are not actionable in B2b and therefore follow
 `NO_SUPPORTED_PUMP_ACTION`.
 
 Only authority-bearing failures from the existing trusted locator and decoder
-registries may become terminal quarantine evidence. Trusted locator failures
+registries may become terminal quarantine evidence. A decoder origin must also
+belong to the closed Pump.fun decoder-code registry; a trusted PumpSwap origin
+does not grant authority at this boundary. Trusted locator failures
 marked retryable, including transient RPC and block unavailability, reject the
 whole slot before any write. Any unknown, forged or untrusted exception also
 rejects the slot without being converted to a durable classification. Provider
