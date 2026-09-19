@@ -278,8 +278,11 @@ void test('Compose defines an observe-only, five-service deployment without expo
 });
 
 void test('Compose forwards catch-up policy, block hydration and ingestion scope with safe defaults', async () => {
-  const compose = await readArtifact('deploy/compose.yaml');
-  const environment = await readArtifact('deploy/env.example');
+  const [compose, environment, localEnvironment] = await Promise.all([
+    readArtifact('deploy/compose.yaml'),
+    readArtifact('deploy/env.example'),
+    readArtifact('.env.example'),
+  ]);
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
@@ -305,6 +308,10 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
     /^ {6}LISTENER_INGESTION_SCOPE: "\$\{LISTENER_INGESTION_SCOPE:-launchpad-and-market\}"$/mu,
   );
   assert.match(environment, /^LISTENER_INGESTION_SCOPE=launchpad-and-market$/mu);
+  assert.match(environment, /^LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false$/mu);
+  assert.match(environment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
+  assert.match(localEnvironment, /^LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false$/mu);
+  assert.match(localEnvironment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
   assert.equal((compose.match(/^ {6}LISTENER_INGESTION_SCOPE:/gmu) ?? []).length, 1);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
 });
