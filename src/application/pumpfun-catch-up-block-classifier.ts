@@ -124,8 +124,12 @@ export class PumpFunCatchUpBlockClassifier {
     slot: SlotGroup,
     classifiedAtMs: number,
   ): Promise<readonly CatchUpClassification[]> {
-    const outcomes: HydrationOutcome[] = [];
-    for (const row of slot.rows) outcomes.push(await this.hydrate(row));
+    const settled = await Promise.allSettled(slot.rows.map(async (row) => this.hydrate(row)));
+    const firstRejection = settled.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (firstRejection !== undefined) throw firstRejection.reason;
+    const outcomes = settled.map((result) => (result as PromiseFulfilledResult<HydrationOutcome>).value);
     return Object.freeze(outcomes.map((outcome) =>
       classificationForOutcome(outcome, classifiedAtMs)));
   }

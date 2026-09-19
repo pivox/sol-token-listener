@@ -16,6 +16,7 @@ import type {
 } from '../src/launchpads/pumpfun/types.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type { CatchUpClassificationRepository } from '../src/ports/catch-up-classification-repository.js';
+import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import {
   internalLocatorError,
   RpcTransientError,
@@ -337,23 +338,56 @@ void test('hydrates and decodes every commitment bucket in a slot before its fir
   ]));
 
   await flush();
-  assert.deepEqual(locator.targets.map((target) => [target.signature, target.confirmationStatus]), [
-    ['z-confirmed', 'CONFIRMED'],
+  const targetsBeforeSettlement = locator.targets.map((target) => [
+    target.signature, target.confirmationStatus,
   ]);
   flights.get('z-confirmed')?.resolve(confirmed);
   await flush();
-  assert.deepEqual(locator.targets.map((target) => [target.signature, target.confirmationStatus]), [
-    ['z-confirmed', 'CONFIRMED'],
-    ['a-finalized', 'FINALIZED'],
-  ]);
   assert.equal(repository.values.length, 0);
   flights.get('a-finalized')?.resolve(finalized);
   await operation;
 
+  assert.deepEqual(targetsBeforeSettlement, [
+    ['z-confirmed', 'CONFIRMED'],
+    ['a-finalized', 'FINALIZED'],
+  ]);
   assert.deepEqual(repository.values.map(({ signature, confirmationStatus }) =>
     [signature, confirmationStatus]), [
     ['z-confirmed', 'processed'],
     ['a-finalized', 'finalized'],
+  ]);
+});
+
+void test('shares one cached block fetch for missing signatures in one commitment bucket', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'missing-first', slot: 92n });
+  const second = cloneTransaction(template, { signature: 'missing-second', slot: 92n });
+  const blockFlight = deferred<unknown>();
+  let rpcFetches = 0;
+  const locator = new CachedSolanaBlockTransactionLocator({
+    httpTransportEpoch: 0,
+    async getBlockTransactions() {
+      rpcFetches += 1;
+      return blockFlight.promise;
+    },
+  }, { fetchIntervalMs: 1, sleep: async () => {} });
+  const repository = new RecordingRepository();
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 85_000)
+    .classify(Object.freeze([discovery(first, 'confirmed'), discovery(second, 'confirmed')]));
+
+  await flush();
+  const locatesBeforeSettlement = locator.metrics.locates;
+  assert.equal(repository.values.length, 0);
+  blockFlight.resolve(missingSignatureBlock(92n));
+  await operation;
+
+  assert.equal(locatesBeforeSettlement, 2);
+  assert.equal(rpcFetches, 1);
+  assert.equal(locator.metrics.fetches, 1);
+  assert.equal(locator.metrics.inFlightJoins, 1);
+  assert.deepEqual(repository.values.map(({ signature, reasonCode }) => [signature, reasonCode]), [
+    ['missing-first', 'PROVIDER_SIGNATURE_MISSING'],
+    ['missing-second', 'PROVIDER_SIGNATURE_MISSING'],
   ]);
 });
 
@@ -539,6 +573,42 @@ function address(value: number): string {
   bytes[0] = value;
   bytes[31] = 255 - value;
   return new PublicKey(bytes).toBase58();
+}
+
+function missingSignatureBlock(slot: bigint): unknown {
+  const key = new PublicKey('11111111111111111111111111111111');
+  return {
+    blockhash: key.toBase58(),
+    previousBlockhash: key.toBase58(),
+    parentSlot: Number(slot - 1n),
+    blockTime: null,
+    transactions: [{
+      version: 'legacy',
+      transaction: {
+        signatures: ['unrelated-signature'],
+        message: {
+          header: {
+            numRequiredSignatures: 1,
+            numReadonlySignedAccounts: 0,
+            numReadonlyUnsignedAccounts: 0,
+          },
+          accountKeys: [key],
+          compiledInstructions: [{
+            programIdIndex: 0,
+            accountKeyIndexes: [0],
+            data: new Uint8Array([1, 2]),
+          }],
+        },
+      },
+      meta: {
+        fee: 5_000,
+        err: null,
+        preBalances: [10_000],
+        postBalances: [5_000],
+        loadedAddresses: { writable: [], readonly: [] },
+      },
+    }],
+  };
 }
 
 function deferred<T>(): {
