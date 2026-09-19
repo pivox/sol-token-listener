@@ -81,23 +81,48 @@ void test('consumes a native rejected promise without reading a hostile then acc
   }
 });
 
-void test('consumes rejected promises returned by invalid thenables', async () => {
+void test('does not invoke arbitrary thenables while rejecting them', async () => {
   const secret = 'https://thenable-secret.invalid/token';
+  let calls = 0;
+  assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => Object.freeze({
+    then(): never { calls += 1; throw new Error(secret); },
+  }))), (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
+  assert.equal(calls, 0);
+});
+
+void test('sinks fulfilled native promise values without reading hostile then accessors', async () => {
+  const secret = 'https://fulfilled-value-secret.invalid/token';
+  let thenReads = 0;
+  const hostileValue = {};
+  const fulfilled = Promise.resolve(hostileValue);
+  void Object.defineProperty(hostileValue, 'then', {
+    get() { thenReads += 1; throw new Error(secret); },
+  });
   const unhandled: unknown[] = [];
   const observe = (reason: unknown): void => { unhandled.push(reason); };
   process.on('unhandledRejection', observe);
   try {
-    assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => Object.freeze({
-      then(_resolve: undefined, reject: (reason: unknown) => void): Promise<never> {
-        reject(new Error(secret));
-        return Promise.reject(new Error(secret));
-      },
-    }))), (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
+    assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => fulfilled)),
+      (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
     await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(thenReads, 0);
     assert.deepEqual(unhandled, []);
   } finally {
     process.removeListener('unhandledRejection', observe);
   }
+});
+
+void test('rejects native promises with hostile own constructor accessors without reading them', () => {
+  const secret = 'https://constructor-secret.invalid/token';
+  const fulfilled = Promise.resolve(null);
+  let constructorReads = 0;
+  void Object.defineProperty(fulfilled, 'constructor', {
+    get() { constructorReads += 1; throw new Error(secret); },
+  });
+
+  assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => fulfilled)),
+    (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
+  assert.equal(constructorReads, 0);
 });
 
 void test('never resolves or retains a fallback URL', () => {
