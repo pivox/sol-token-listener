@@ -34,6 +34,24 @@ activation.
 4. Classer la fenêtre `PASS`, `FAIL` ou `INCONCLUSIVE`. Un trafic insuffisant
    pour produire un delta `fetches` strictement positif rend le test
    `INCONCLUSIVE`, jamais `PASS` implicite.
+5. Pour chaque fenêtre, conserver une preuve RPC publique expurgée de lecture
+   réussie : slot public, identifiant de provider non sensible (jamais une URL,
+   un host privé ou un alias secret), statut HTTP, catégorie RPC, version de
+   transaction et nombre agrégé de transactions. Ne jamais conserver d'URL
+   signée, de clé, de corps de bloc complet ni de signature. Le jeu supporté par
+   cette release est strictement `legacy`, v0 (`version=0`) et v1 (`version=1`);
+   il ne doit pas être déduit des seules versions actuellement observées sur le
+   cluster. Pour chacune de ces trois versions, lire avec le provider configuré
+   un bloc public connu et conserver la preuve de succès correspondante. Un
+   fixture public expurgé peut seulement compléter la preuve de normalisation
+   hors réseau; il ne remplace jamais la preuve RPC.
+6. Rejouer la preuve sur une base fraîche, créée pour cette fenêtre et sans
+   checkpoint, inbox, receipt ou cache antérieur. Le replay doit hydrater et
+   normaliser les trois versions sans aucune écriture, signature ou soumission
+   on-chain, sans wallet. Les écritures PostgreSQL observe-only nécessaires
+   (inbox, checkpoints, snapshots, receipts, health et cache durable) sont
+   attendues, isolées sur cette base fraîche et incluses dans le résultat du
+   replay. Archiver ce résultat avec la preuve RPC publique expurgée.
 
 ## Gates PASS
 
@@ -47,6 +65,15 @@ activation.
 - `queuedFetches <= 1` et `inFlightFetches <= 1` à chaque relevé, avec backlog
   inbox non croissant;
 - aucun nouvel échec terminal inexpliqué;
+- le runtime lit et normalise le jeu strictement supporté par cette release :
+  `legacy`, v0 (`version=0`) et v1 (`version=1`), chacun démontré par un bloc
+  public connu lu avec le provider configuré; une réponse JSON-RPC contenant
+  l'erreur `-32015` est un `FAIL` bloquant, même si le transport HTTP répond
+  `200`;
+- la preuve RPC publique expurgée et le replay sur base fraîche sont présents et
+  concordants; une preuve partielle, un fixture hors réseau présenté comme
+  preuve RPC, un replay contaminé par un état antérieur ou une version supportée
+  non couverte est `FAIL`;
 - delta `fetches` strictement positif sur la fenêtre; un delta nul dû à un
   trafic insuffisant classe la fenêtre `INCONCLUSIVE` tant qu’aucun autre gate
   n’a échoué;

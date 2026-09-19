@@ -13,6 +13,7 @@ import {
   type RpcHttpFailoverEvent,
 } from './http-failover-transport.js';
 import type { LegacyConfirmationStatus } from './types.js';
+import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
 export interface RpcHealth {
   readonly version: string;
@@ -109,7 +110,7 @@ export class SolanaRpcClient {
   ): Promise<VersionedTransactionResponse | null> {
     return this.http.getTransaction(signature, {
       commitment: rpcFinality(confirmationStatus),
-      maxSupportedTransactionVersion: 0,
+      maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
     });
   }
 
@@ -140,7 +141,7 @@ export class SolanaRpcClient {
     return this.http.getBlock(Number(slot), {
       commitment: rpcFinality(confirmationStatus),
       transactionDetails: 'full',
-      maxSupportedTransactionVersion: 0,
+      maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
       rewards: false,
     });
   }

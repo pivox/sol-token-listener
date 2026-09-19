@@ -107,7 +107,7 @@ void test('shares one finalized transaction read and derives exact wallet deltas
   assert.deepEqual(
     requests.find((item) => item.method === 'getTransaction')?.params,
     [fixture.signature, {
-      commitment: 'finalized', encoding: 'base64', maxSupportedTransactionVersion: 0,
+      commitment: 'finalized', encoding: 'base64', maxSupportedTransactionVersion: 1,
     }],
   );
 });
@@ -137,6 +137,20 @@ void test('accepts the complete v0 getTransaction response and resolves loaded t
     baseDeltaRaw: 500n, quoteDeltaRaw: -100_000n,
     unexpectedResidualTokenBalanceRaw: 0n,
     observedAtMs: 2_000, finalizedAtMs: 2_000,
+  });
+});
+
+void test('accepts a complete version 1 getTransaction response', async () => {
+  const fixture = versionOneTransactionFixture();
+  const session = sessionFor([], ({ method }) => {
+    if (method === 'getTransaction') return fixture.rpcTransaction;
+    throw new Error('unexpected method');
+  });
+
+  assert.deepEqual(await session.readNormalizedTransaction(fixture.signature, signal()), {
+    signature: fixture.signature,
+    blockhash: GENESIS,
+    messageHash: fixture.messageHash,
   });
 });
 
@@ -584,6 +598,38 @@ function fullV0TransactionFixture() {
         returnData: null,
         computeUnitsConsumed: 123,
         costUnits: 456,
+      },
+    },
+  };
+}
+
+function versionOneTransactionFixture() {
+  const payer = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 21));
+  const message = Uint8Array.from([
+    0x81, 1, 0, 0,
+    0, 0, 0, 0,
+    ...new Uint8Array(32),
+    0,
+    1,
+    ...payer.publicKey.toBytes(),
+  ]);
+  const transaction = Uint8Array.from([...message, ...new Uint8Array(64)]);
+  const signature = '1'.repeat(64);
+  return {
+    signature,
+    messageHash: createHash('sha256').update(message).digest('hex'),
+    rpcTransaction: {
+      slot: 502,
+      blockTime: 2,
+      version: 1,
+      transaction: [Buffer.from(transaction).toString('base64'), 'base64'],
+      meta: {
+        err: null,
+        fee: 0,
+        preBalances: [1_000_000],
+        postBalances: [1_000_000],
+        preTokenBalances: [],
+        postTokenBalances: [],
       },
     },
   };

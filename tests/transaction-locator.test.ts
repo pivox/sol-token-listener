@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import {
+  Connection,
   PublicKey,
   type VersionedTransactionResponse,
 } from '@solana/web3.js';
@@ -16,6 +17,7 @@ import {
   TransactionLocator,
   TransactionNormalizationError,
   TransactionUnavailableError,
+  snapshotBlockTransactionData,
   type TransactionLocatorRpc,
   type TransactionLocationTarget,
 } from '../src/solana/rpc/transaction-locator.js';
@@ -132,6 +134,59 @@ function completeBlock(
   });
 }
 
+const V1_SIGNATURE = '1111111111111111111111111111111111111111111111111111111111111111';
+
+async function v1Block(): Promise<unknown> {
+  const connection = new Connection('https://fixture.invalid/rpc', {
+    fetch: async (_input, init) => {
+      const body = init?.body;
+      if (typeof body !== 'string') throw new TypeError('Expected string RPC body.');
+      const request = JSON.parse(body) as { readonly id: string };
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0', id: request.id, result: {
+          blockhash: PAYER.toBase58(), previousBlockhash: PROGRAM.toBase58(),
+          parentSlot: 41, blockTime: 1_725_000_000, blockHeight: 42, rewards: [],
+          transactions: [{
+            version: 1,
+            transaction: {
+              signatures: [V1_SIGNATURE],
+              message: {
+                header: {
+                  numRequiredSignatures: 1,
+                  numReadonlySignedAccounts: 0,
+                  numReadonlyUnsignedAccounts: 1,
+                },
+                accountKeys: [
+                  PAYER.toBase58(),
+                  'SysvarC1ock11111111111111111111111111111111',
+                  'ComputeBudget111111111111111111111111111111',
+                ],
+                recentBlockhash: PAYER.toBase58(),
+                instructions: [{ programIdIndex: 2, accounts: [1, 0], data: '1' }],
+                transactionConfig: {
+                  priorityFee: 2,
+                  computeUnitLimit: 19,
+                  loadedAccountsDataSizeLimit: 32_000,
+                  heapSize: null,
+                },
+              },
+            },
+            meta: {
+              err: null, fee: 0, preBalances: [10, 20, 30], postBalances: [10, 20, 30],
+              innerInstructions: [], logMessages: [], preTokenBalances: [], postTokenBalances: [], rewards: [],
+            },
+          }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  const block = await connection.getBlock(42, {
+    commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 1, rewards: false,
+  });
+  assert.notEqual(block, null);
+  return block;
+}
+
 void test('uses position zero only when the target is actually first in its block', async () => {
   const located = await new TransactionLocator(rpc(response('pump'), ['pump', 'other']))
     .locate(target('pump'));
@@ -207,6 +262,27 @@ void test('preserves legacy normalization from a complete block source', async (
   assert.equal(located.transactionIndex, 0);
   assert.equal(located.version, 'legacy');
   assert.equal(located.blockTimeMs, 1_725_000_000_000);
+});
+
+void test('locates a Connection-decoded v1 complete-block transaction', async () => {
+  const block = await v1Block();
+  const locator = new SolanaBlockTransactionLocator({
+    async getBlockTransactions() { return block; },
+  });
+
+  const located = await locator.locate(target(V1_SIGNATURE));
+
+  assert.equal(located.version, 1);
+  assert.deepEqual(located.accountKeys, [
+    PAYER.toBase58(), 'SysvarC1ock11111111111111111111111111111111', 'ComputeBudget111111111111111111111111111111',
+  ]);
+});
+
+void test('retains a Connection-decoded v1 complete-block transaction snapshot', async () => {
+  const snapshot = snapshotBlockTransactionData(await v1Block(), 42n, 'CONFIRMED');
+
+  assert.equal(snapshot?.cacheable, true);
+  assert.notEqual(snapshot?.transactions[0]?.payload, null);
 });
 
 void test('maps null, rejected and malformed complete blocks without provider details', async () => {

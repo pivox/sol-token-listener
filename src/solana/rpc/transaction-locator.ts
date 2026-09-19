@@ -7,6 +7,7 @@ import type {
   TransactionIngestionErrorCode,
 } from '../../domain/transaction-ingestion.js';
 import { normalizeTransaction } from './transaction-fetcher.js';
+import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 import type {
   LegacyConfirmationStatus,
   NormalizedTransaction,
@@ -21,6 +22,7 @@ export const MAX_DECODED_INSTRUCTION_DATA_BYTES = 1_232;
 export const MAX_TRANSACTION_SIGNATURE_LENGTH = 128;
 
 type LocatableConfirmationStatus = Exclude<LegacyConfirmationStatus, 'ORPHANED'>;
+type SupportedBlockTransactionVersion = 'legacy' | 0 | typeof MAX_SUPPORTED_TRANSACTION_VERSION;
 const trustedTransactionLocatorErrors = new WeakMap<object, IngestionFailure>();
 
 export interface TransactionLocationTarget {
@@ -470,7 +472,7 @@ type MetaSnapshot = Readonly<{
 function snapshotSelectedTransaction(
   transaction: unknown,
   meta: unknown,
-  expectedVersion: 'legacy' | 0,
+  expectedVersion: SupportedBlockTransactionVersion,
 ): SelectedTransactionSnapshot | null {
   try {
     if (!validBlockTransactionMeta(meta)) return null;
@@ -495,13 +497,13 @@ function snapshotSelectedTransaction(
 function snapshotMessage(
   value: unknown,
   loadedAddresses: SnapshotLoadedAddresses | undefined,
-  expectedVersion: 'legacy' | 0,
+  expectedVersion: SupportedBlockTransactionVersion,
 ): VersionedTransactionResponse['transaction']['message'] | null {
   try {
     const record = ownRecord(value);
     const header = snapshotHeader(ownData(record, 'header'));
     const compiledInstructions = snapshotCompiledInstructions(record);
-    const accountKeys = snapshotMessageAccountKeys(record);
+    const accountKeys = snapshotMessageAccountKeys(record, expectedVersion);
     if (header === null || compiledInstructions === null
       || accountKeys?.messageVersion !== expectedVersion) return null;
     return Object.freeze({
@@ -561,10 +563,13 @@ function snapshotCompiledInstructions(message: object): readonly unknown[] | nul
 type SnapshotMessageAccountKeys = Readonly<{
   staticAccountKeys: readonly SnapshotAccountKey[];
   lookupAccountKeyCount: number;
-  messageVersion: 'legacy' | 0;
+  messageVersion: SupportedBlockTransactionVersion;
 }>;
 
-function snapshotMessageAccountKeys(value: object): SnapshotMessageAccountKeys | null {
+function snapshotMessageAccountKeys(
+  value: object,
+  expectedVersion: SupportedBlockTransactionVersion,
+): SnapshotMessageAccountKeys | null {
   try {
     const staticAccountKeys = ownOptionalData(value, 'staticAccountKeys');
     if (staticAccountKeys === undefined) {
@@ -574,6 +579,14 @@ function snapshotMessageAccountKeys(value: object): SnapshotMessageAccountKeys |
         messageVersion: 'legacy',
       });
     }
+    if (expectedVersion === MAX_SUPPORTED_TRANSACTION_VERSION) {
+      snapshotV1TransactionConfig(ownData(value, 'transactionConfig'));
+      return Object.freeze({
+        staticAccountKeys: snapshotPublicKeys(staticAccountKeys),
+        lookupAccountKeyCount: 0,
+        messageVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
+      });
+    }
     return Object.freeze({
       staticAccountKeys: snapshotPublicKeys(staticAccountKeys),
       lookupAccountKeyCount: snapshotLookupAccountKeyCount(ownData(value, 'addressTableLookups')),
@@ -581,6 +594,18 @@ function snapshotMessageAccountKeys(value: object): SnapshotMessageAccountKeys |
     });
   } catch {
     return null;
+  }
+}
+
+function snapshotV1TransactionConfig(value: unknown): void {
+  const record = ownRecord(value);
+  const keys = ['priorityFee', 'computeUnitLimit', 'loadedAccountsDataSizeLimit', 'heapSize'];
+  if (Reflect.ownKeys(record).length !== keys.length) throw new TypeError();
+  for (const key of keys) {
+    const field = ownData(record, key);
+    if (field !== null && (typeof field !== 'number' || !Number.isSafeInteger(field) || field < 0)) {
+      throw new TypeError();
+    }
   }
 }
 
@@ -759,8 +784,9 @@ function validBlockTransactionMeta(value: unknown): value is object | null {
   return value === null || (typeof value === 'object' && !isProxy(value) && !Array.isArray(value));
 }
 
-function validBlockTransactionVersion(value: unknown): value is undefined | 'legacy' | 0 {
-  return value === undefined || value === 'legacy' || value === 0;
+function validBlockTransactionVersion(value: unknown): value is undefined | SupportedBlockTransactionVersion {
+  return value === undefined || value === 'legacy' || value === 0
+    || value === MAX_SUPPORTED_TRANSACTION_VERSION;
 }
 
 function ownRecord(value: unknown): object {

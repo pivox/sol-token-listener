@@ -5,6 +5,7 @@ import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import type { TransactionBlockRpc } from './transaction-locator.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
 export type ProviderPinnedBlockRpcErrorReason = 'CONFIG_INVALID' | 'BLOCK_UNAVAILABLE';
 
@@ -36,7 +37,7 @@ interface PinnedBlockConnection {
   getBlock(slot: number, options: {
     commitment: 'confirmed' | 'finalized';
     transactionDetails: 'full';
-    maxSupportedTransactionVersion: 0;
+    maxSupportedTransactionVersion: typeof MAX_SUPPORTED_TRANSACTION_VERSION;
     rewards: false;
   }): Promise<unknown>;
 }
@@ -88,7 +89,7 @@ export function createProviderPinnedBlockRpc(
         timer.unref();
         return await requestContext.run(requestSignal, () => connection.getBlock(numericSlot, Object.freeze({
           commitment: selectedCommitment, transactionDetails: 'full',
-          maxSupportedTransactionVersion: 0, rewards: false,
+          maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION, rewards: false,
         })));
       } catch {
         throw failure('BLOCK_UNAVAILABLE', providerId);
@@ -166,7 +167,7 @@ function createPinnedConnection(
         options: {
           commitment: 'confirmed' | 'finalized';
           transactionDetails: 'full';
-          maxSupportedTransactionVersion: 0;
+          maxSupportedTransactionVersion: typeof MAX_SUPPORTED_TRANSACTION_VERSION;
           rewards: false;
         },
       ): Promise<unknown> {

@@ -209,7 +209,7 @@ void test('uses web3 getBlock with the exact full-transaction source request', a
     method: 'getBlock',
     params: [4, {
       commitment: 'finalized', transactionDetails: 'full',
-      maxSupportedTransactionVersion: 0, rewards: false,
+      maxSupportedTransactionVersion: 1, rewards: false,
     }],
   }]);
 });

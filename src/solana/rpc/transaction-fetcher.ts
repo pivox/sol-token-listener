@@ -13,6 +13,7 @@ import type {
   NormalizedTokenBalance,
   NormalizedTransaction,
 } from './types.js';
+import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
 interface RpcInnerInstruction extends CompiledInstruction {
   readonly stackHeight?: number | null;
@@ -35,7 +36,7 @@ export class TransactionFetcher {
       commitment: confirmationStatus === 'PROCESSED'
         ? 'confirmed'
         : confirmationStatus.toLowerCase() as 'confirmed' | 'finalized',
-      maxSupportedTransactionVersion: 0,
+      maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
     });
     if (response === null) return null;
     return normalizeTransaction(response, confirmationStatus, transactionIndex);
@@ -47,6 +48,10 @@ export function normalizeTransaction(
   confirmationStatus: LegacyConfirmationStatus,
   transactionIndex: number | null,
 ): NormalizedTransaction {
+  const version: unknown = response.version;
+  if (!supportedTransactionVersion(version)) {
+    throw new Error('Version de transaction Solana non prise en charge.');
+  }
   const slot = BigInt(response.slot);
   if (transactionIndex !== null) {
     assertValidTransactionCursor({ slot, transactionIndex });
@@ -72,7 +77,7 @@ export function normalizeTransaction(
     slot,
     transactionIndex,
     confirmationStatus,
-    version: response.version ?? 'legacy',
+    version: version ?? 'legacy',
     blockTimeMs: response.blockTime == null ? null : response.blockTime * 1_000,
     accountKeys,
     signerKeys: accountKeys.slice(0, message.header.numRequiredSignatures),
@@ -86,6 +91,13 @@ export function normalizeTransaction(
     logs: meta?.logMessages ?? [],
     error: meta?.err ?? null,
   };
+}
+
+function supportedTransactionVersion(
+  value: unknown,
+): value is undefined | 'legacy' | 0 | typeof MAX_SUPPORTED_TRANSACTION_VERSION {
+  return value === undefined || value === 'legacy' || value === 0
+    || value === MAX_SUPPORTED_TRANSACTION_VERSION;
 }
 
 function normalizeInstructions(
