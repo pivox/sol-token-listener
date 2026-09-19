@@ -1,6 +1,6 @@
 # RPC HTTP Canary Evidence Design
 
-Version: 1.1.2 — 2026-09-20 — issue #142, final snapshot clarification
+Version: 1.1.3 — 2026-09-20 — issue #142, HTTP membership clarification
 
 Status: approved for implementation under the standing operator instruction
 
@@ -109,6 +109,10 @@ The entries are always ordered as `primary`, `fallback-1`, `fallback-2`, and
 `fallback-3`. Unconfigured providers remain present with `configured=false`
 and zero counters. For every configured provider,
 `0 <= http429Responses <= attempts`.
+`configured` is derived from the HTTP endpoint list independently of the
+WebSocket provider-pair catalogue: an HTTP-only fallback used by the main RPC
+client is configured evidence even when no WebSocket fallback exists at that
+position.
 
 Counters use safe JavaScript integers because they are operational counts, not
 financial values. They saturate at `Number.MAX_SAFE_INTEGER`; saturation sets
@@ -206,6 +210,9 @@ Version 1.1.2 clarifies that the final snapshot cannot come from the closed API.
 It must come from the same process's persisted `STOPPED` heartbeat while
 PostgreSQL remains available; absence, multiplicity, or invalid evidence stays
 `INCONCLUSIVE`.
+
+Version 1.1.3 clarifies that evidence membership covers every configured HTTP
+endpoint. It must not be reduced to providers that also have a WebSocket pair.
 
 Issue #142 proves only the HTTP 429 gate. It does not prove first-processing
 latency or its p95; issue #143 remains required for first-processing latency and

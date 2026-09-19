@@ -56,7 +56,7 @@ void test('production shares exactly one RPC HTTP recorder across every transpor
   assert.match(source, /createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder\)/u);
   assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*config\.listenerShutdownTimeoutMs,?\s*\}, recorder\)/u);
   assert.match(source, /createProviderPinnedCatchUpSource\(\s*providers,\s*providerId,\s*'confirmed',\s*expectedGenesisHash,\s*undefined,\s*recorder,/u);
-  assert.match(source, /rpcHttpEvidenceMetrics:\s*\(\).*?=> recorder\.snapshot\(providers\.ids\)/u);
+  assert.match(source, /rpcHttpEvidenceMetrics:\s*\(\).*?=> recorder\.snapshot\(configuredRpcHttpProviderIds\)/u);
   for (const name of ['createProviderPinnedFinalityPass', 'createProviderPinnedBlockRpc', 'createProviderPinnedCatchUpSource']) {
     assert.equal(count(source, new RegExp(`${name}\\(`, 'gu')), 1);
   }
@@ -75,6 +75,23 @@ void test('production shares exactly one RPC HTTP recorder across every transpor
     assert.deepEqual(metrics(), createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-1']));
     await dependencies.worker.close();
   }
+});
+
+void test('RPC HTTP evidence includes an HTTP-only fallback absent from the WebSocket catalog', async () => {
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'false',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'false',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://127.0.0.1:8898',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  const metrics = (dependencies.heartbeat as unknown as {
+    rpcHttpEvidenceMetrics: () => RuntimeRpcHttpEvidenceV1;
+  }).rpcHttpEvidenceMetrics;
+
+  assert.deepEqual(metrics(), createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-1']));
+  await dependencies.worker.close();
 });
 
 void test('heartbeat detaches and freezes fresh RPC HTTP evidence for every RUNNING and STOPPED write', async () => {

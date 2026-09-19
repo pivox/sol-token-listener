@@ -3,7 +3,7 @@ import {
   requireSolanaGenesisHash,
   SolanaGenesisHashError,
 } from '../domain/solana-genesis-hash.js';
-import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
+import { isRpcProviderId, RPC_PROVIDER_IDS, type RpcProviderId } from '../domain/rpc-provider.js';
 import {
   createRuntimeRpcHttpEvidence,
   type RuntimeRpcHttpEvidenceV1,
@@ -192,6 +192,9 @@ export function createProductionListenerRuntime(
   );
   if (expectedGenesisHash === null) throw new SolanaGenesisHashError();
   const providers = createRpcProviderCatalog(config);
+  const configuredRpcHttpProviderIds = Object.freeze(
+    RPC_PROVIDER_IDS.slice(0, config.httpRpcFallbackUrls.length + 1),
+  );
   const ingestionPrograms = listenerIngestionPrograms(config.listenerIngestionScope);
   const databasePool = pool ?? getDatabasePool();
   const recorder = createRpcHttpEvidenceRecorder();
@@ -537,7 +540,7 @@ export function createProductionListenerRuntime(
       intervalMs: 5_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
-      rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(providers.ids),
+      rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(configuredRpcHttpProviderIds),
       ...(hydration === null ? {} : {
         catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
           version: 1,
