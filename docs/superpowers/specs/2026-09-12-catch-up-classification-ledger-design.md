@@ -61,7 +61,9 @@ new `observedAtMs` and `classifiedAtMs` values. The evidence fingerprint exclude
 observation/classification/blockchain time and confirmation status. The first
 stored `catch_up_classified_at` remains authoritative; replay never rewrites it,
 and terminal replay preserves the first `terminal_at` and `purge_after` instead
-of starting a new four-hour window. The immutable action key compares the
+of starting a new four-hour window. `DEFERRED` preserves that window while it
+remains deferred; promotion to tracked `PENDING` clears both terminal fields.
+The immutable action key compares the
 original CREATE/TRADE/NONE evidence without trusting the mutable current inbox
 hint. Replay unions canonical program IDs, reconciles `confirmed` to
 `finalized`, and preserves normal multi-program convergence of a trade hint to

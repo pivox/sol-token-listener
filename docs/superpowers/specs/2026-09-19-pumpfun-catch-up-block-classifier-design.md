@@ -1,6 +1,6 @@
 # Pump.fun Catch-up Block Classifier Design
 
-Version: 1.0.0 — 2026-09-19 — issue #133.
+Version: 1.0.1 — 2026-09-19 — issue #133.
 
 ## Goal and status
 
@@ -27,35 +27,47 @@ constructor dependencies are deliberately narrow:
 
 The production-shaped locator dependency is satisfied by
 `CachedSolanaBlockTransactionLocator`, whose shared cache key is
-`(slot, effective commitment, HTTP epoch)` and whose admission queue guarantees
-one active block fetch. The classifier neither constructs nor clears that cache
-and does not add a direct or legacy locator fallback.
+`(slot, effective commitment, HTTP epoch)`. Callers for the same key and
+generation join one single-flight, while its admission queue guarantees at most
+one active block fetch across the instance. A retained block that lacks the
+target signature may trigger the cache's one allowed forced refresh. The
+classifier neither constructs nor clears that cache and does not add a direct
+or legacy locator fallback.
 
-`processed` and `confirmed` discoveries share the effective `CONFIRMED` cache
-commitment; `finalized` uses `FINALIZED`. The requested status is still passed
-per signature and the locator rewrites the returned normalized transaction
-status to that exact target. The classifier nevertheless derives the durable
-classification finality explicitly from `MergedCatchUpDiscovery`, never from
-the cache payload. Cache commitment and business finality are separate
-concepts. Discovery `blockTimeMs`, observation time and finality are excluded
-from semantic identity.
+`processed` and `confirmed` discoveries use the effective uppercase
+`CONFIRMED` locator commitment; `finalized` uses `FINALIZED`. The locator never
+receives `PROCESSED` from this service. The classifier derives the durable
+lowercase classification finality explicitly from `MergedCatchUpDiscovery`,
+never from the normalized cache payload. Cache commitment and business finality
+are separate concepts. Discovery `blockTimeMs`, observation time and finality
+are excluded from semantic identity.
 
 ## Grouping and deterministic order
 
-Input is snapshotted and grouped by `(slot, effective commitment)`. Groups are
-processed by ascending slot, then `CONFIRMED` before `FINALIZED`. Within a group,
-discoveries are ordered lexically by signature; their already canonical
-`programIds` are retained as provenance.
+Before sampling the clock or calling the locator, the service validates and
+snapshots the entire input as deeply immutable plain data. Every discovery must
+have exactly the merged-discovery fields, data descriptors only, no proxy or
+accessor, a bounded signature, safe non-negative bigint slot, valid lowercase
+finality, valid nullable block time, and one to sixteen canonical sorted unique
+Solana program IDs. Duplicate signatures are rejected globally. Any invalid
+element rejects the call with zero clock reads, RPC calls and writes.
 
-Every location attempt for a group settles before the first repository write
-for that group. The classifier then decodes and classifies the settled results
-in signature order and persists them in the same order. This hydration barrier
-prevents a retryable failure late in a slot group from leaving earlier
-signatures durably admitted.
+Validated input is grouped first by slot. Each slot contains effective
+`CONFIRMED` and `FINALIZED` hydration buckets. Slots are processed in ascending
+order; rows inside a slot are ordered `CONFIRMED` before `FINALIZED`, then
+lexically by signature. Their already canonical `programIds` are retained as
+provenance.
 
-Groups are independent. A group completes only after every classification has
-been recorded. If persistence fails after a prefix was written, the group
-rejects immediately. Retrying the same group safely replays that prefix through
+Every location attempt and every decode/classification for both commitment
+buckets of a slot completes before the first repository write for that slot.
+The classifier then persists classifications in effective commitment/signature
+order. This slot-wide barrier prevents a retryable or untrusted failure in the
+`FINALIZED` bucket from leaving the slot's earlier `CONFIRMED` signatures
+durably admitted.
+
+Slots are independent. A slot completes only after every classification has
+been recorded. If persistence fails after a prefix was written, the slot
+rejects immediately. Retrying the same slot safely replays that prefix through
 B1 and continues; no classifier checkpoint or private progress marker is
 introduced.
 
@@ -66,10 +78,10 @@ The classifier applies this ordered decision table:
 | Evidence | Disposition | Reason | Hint | Mints |
 | --- | --- | --- | --- | --- |
 | Solana transaction has a non-null execution error | `IGNORED` | `SOLANA_TRANSACTION_FAILED` | none | empty |
+| Decoded create/trade evidence references more than sixteen unique mints | `QUARANTINED` | `PUMP_SCHEMA_UNSUPPORTED` | none | empty |
 | At least one decoded Pump.fun creation, including a transaction with its initial buy | `ACTIONABLE` | `PUMP_ACTION_SUPPORTED` | `PUMPFUN_CREATE` | sorted unique creation/trade mints |
 | No creation and trades reference exactly one mint | `DEFERRED` | `PUMP_TRADE_UNTRACKED` | `PUMPFUN_TRADE` plus its separate hint mint | that mint |
-| No creation and trades reference more than one mint | `QUARANTINED` | `PUMP_SCHEMA_UNSUPPORTED` | none | sorted unique trade mints |
-| Decoded create/trade evidence references more than sixteen unique mints | `QUARANTINED` | `PUMP_SCHEMA_UNSUPPORTED` | none | empty |
+| No creation and trades reference two to sixteen mints | `QUARANTINED` | `PUMP_SCHEMA_UNSUPPORTED` | none | sorted unique trade mints |
 | No supported Pump.fun create or trade | `IGNORED` | `NO_SUPPORTED_PUMP_ACTION` | none | empty |
 | Trusted target normalization or trusted Pump.fun decoding failure | `QUARANTINED` | `PUMP_SCHEMA_UNSUPPORTED` | none | empty |
 | Trusted locator reports the target signature absent/ambiguous | `QUARANTINED` | `PROVIDER_SIGNATURE_MISSING` | none | empty |
@@ -89,10 +101,15 @@ Pump migrations alone are not actionable in B2b and therefore follow
 Only authority-bearing failures from the existing trusted locator and decoder
 registries may become terminal quarantine evidence. Trusted locator failures
 marked retryable, including transient RPC and block unavailability, reject the
-whole group before any write. Any unknown, forged or untrusted exception also
-rejects the group without being converted to a durable classification. Provider
+whole slot before any write. Any unknown, forged or untrusted exception also
+rejects the slot without being converted to a durable classification. Provider
 messages, URLs, response bodies and exception causes never enter the ledger or
 fingerprint.
+
+Every located transaction must exactly match the discovery signature and slot
+before error inspection or decoding. A mismatch is an untrusted dependency
+failure and rejects the entire slot before writes; it is never converted into
+provider evidence.
 
 ## Evidence fingerprint and timestamps
 
@@ -103,15 +120,22 @@ length-prefixed UTF-8 segments. The segments contain:
 2. signature and decimal slot;
 3. disposition, reason code, action hint and hint mint (or explicit `NONE`);
 4. canonical sorted mints;
-5. canonical decoded semantic actions ordered by normalized instruction cursor,
-   represented as `CREATE:<mint>`, `BUY:<mint>` or `SELL:<mint>`, or the closed
-   evidence marker used for failed, unsupported, schema, missing-signature or
-   mint-limit outcomes. Mint overflow uses `MINT_LIMIT_EXCEEDED:<count>`.
+5. `ACTION_COUNT:<count>` and canonical decoded semantic actions ordered by
+   normalized instruction cursor, represented as
+   `ACTION:<instructionIndex>:<inner-or-NONE>:<CREATE|BUY|SELL|MIGRATE>:<mint>`;
+6. a precise closed outcome marker: locator quarantine includes the trusted
+   locator code, decoder quarantine includes the trusted decoder origin, mint
+   overflow uses `MINT_LIMIT_EXCEEDED:<count>`, and failed/unsupported outcomes
+   use their stable reason marker.
 
 This identity intentionally excludes `programIds`, confirmation status,
 `blockTimeMs`, `observedAtMs` and `classifiedAtMs`. Program provenance and
 finality converge separately in B1; wall-clock replay must not create a
 classification conflict or extend retention.
+
+Migrations remain non-actionable in B2b, but their cursor and mint are retained
+as fingerprint evidence so a migration-only transaction is not semantically
+identical to a transaction with no Pump.fun instruction.
 
 The clock is sampled once for a classifier call. That finite safe integer is
 used as both observation and classification time for every new value from the
@@ -119,7 +143,9 @@ call. `createCatchUpClassification` remains the final domain validator. A later
 semantic replay may carry a newer clock value, but the repository preserves the
 first stored `catch_up_classified_at`. For terminal `IGNORED` and `QUARANTINED`
 rows it also preserves the original `terminal_at` and exact
-`purge_after = terminal_at + 4 hours`.
+`purge_after = terminal_at + 4 hours`. `DEFERRED` preserves those timestamps
+while it remains deferred; promotion to tracked `PENDING` clears both according
+to the existing admission lifecycle.
 
 ## Repository replay correction
 
@@ -130,7 +156,9 @@ retention from a replay's new timestamp. B2b changes only that replay rule:
   immutable action key, canonical mints and fingerprint, but not timestamps or
   finality;
 - an existing classified row retains its first `catch_up_classified_at`;
-- a terminal replay reuses stored `terminal_at` and `purge_after` exactly;
+- ignored/quarantined replay, and deferred replay that remains deferred, reuse
+  stored `terminal_at` and `purge_after` exactly;
+- promotion from deferred to tracked `PENDING` clears terminal retention;
 - actionable finality replay keeps the existing B1 reprocessing behavior;
 - changed semantic evidence remains a `classification` conflict.
 
@@ -141,7 +169,7 @@ the four-hour retention deadline strictly non-extendable.
 ## Failure atomicity and restart behavior
 
 Hydration and decoding produce an in-memory classification batch before writes.
-A retryable locator failure therefore persists zero rows for its entire group.
+A retryable locator failure therefore persists zero rows for its entire slot.
 Repository writes remain one classification transaction each; a database error
 may leave an already committed prefix, but replay is deterministic and B1
 accepts the prefix even with a new call timestamp. Conflicting stored evidence
@@ -155,12 +183,14 @@ across multiple signatures.
 ## Verification
 
 Pure classifier tests use normalized offline fixtures and fakes only. They cover
-group ordering, the all-hydrations-before-writes barrier, effective commitments,
+defensive input snapshotting, group ordering, the slot-wide
+all-hydrations-before-writes barrier, effective commitments,
 create plus initial buy, mono-mint trade, failed transaction, no supported
-action, multi-mint fail-closed quarantine, trusted schema/normalization and
-missing-signature quarantine, retryable and untrusted group rejection, stable
-fingerprints across time/finality, partial-write replay and deterministic
-persistence order.
+action, migration evidence, multi-mint and mint-limit fail-closed quarantine,
+located identity mismatch, trusted schema/normalization and missing-signature
+quarantine, retryable and untrusted slot rejection, precise failure markers,
+stable fingerprints across time/finality, partial-write replay and
+deterministic persistence order.
 
 PostgreSQL 16 repository tests prove that a semantic replay with newer
 `observedAtMs`/`classifiedAtMs` preserves the first classification, terminal and
@@ -168,3 +198,9 @@ purge timestamps, while a changed fingerprint or decision still conflicts.
 Build, strict type-check, lint, documentation checks and whitespace validation
 complete the PR. No test contacts a live RPC endpoint or imports signing and
 submission code.
+
+Any future runtime activation must either pass only Pump.fun launchpad
+discoveries to this classifier or extend the classifier with explicit PumpSwap
+and migration admission policy first. Feeding a mixed market stream into the
+current no-supported-action branch would silently classify PumpSwap evidence as
+ignored and is therefore forbidden.
