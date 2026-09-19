@@ -51,3 +51,19 @@
 - [x] Reuse the shared barrier after both listener-authority pools close.
 - [x] Assert the termination safety net affects zero rows before dropping the database and role.
 - [x] Repeat the PostgreSQL 16 listener-authority test ten times sequentially.
+
+### Task 5: Close every remaining database-name teardown race
+
+**Files:**
+- Modify: `tests/execution-worker-live-partition-migration.test.ts`
+- Modify: `tests/executor-main.integration.test.ts`
+- Modify: `tests/executor-roles-provisioning.test.ts`
+- Modify: `tests/executor-worker-database-authority.test.ts`
+- Modify: `tests/postgres-backend-drain.test.ts`
+
+- [x] Add a repository-wide failing audit for every `datname`-scoped forced cleanup.
+- [x] Gate all three migration 040, both role-provisioning and the executor-main cleanups.
+- [x] Preserve the executor-main termination of one intentional PID unchanged.
+- [x] Require captured termination results and zero-row assertions for all ten guarded sites.
+- [x] Run the relevant PostgreSQL 16 tests and stress the migration 040 regression.
+- [x] Run build, check, lint, docs and whitespace verification before push.

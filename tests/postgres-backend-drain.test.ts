@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import type pg from 'pg';
 import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
@@ -114,4 +114,50 @@ void test('gates listener-authority forced cleanup behind the backend drain barr
       && dropDatabase > terminationAssertion
       && dropRole > dropDatabase,
   );
+});
+
+void test('guards every datname-scoped destructive database cleanup', async () => {
+  const testsUrl = new URL('./', import.meta.url);
+  const entries = (await readdir(testsUrl, { recursive: true }))
+    .filter((entry) => entry.endsWith('.ts'))
+    .sort();
+  const cleanupCounts = new Map<string, number>();
+  const violations: string[] = [];
+  const terminationPattern = /SELECT pg_terminate_backend\(pid\)[\s\S]{0,160}?WHERE datname=\$1 AND pid<>pg_backend_pid\(\)/gu;
+  for (const entry of entries) {
+    const source = await readFile(new URL(entry, testsUrl), 'utf8');
+    for (const match of source.matchAll(terminationPattern)) {
+      const terminate = match.index;
+      cleanupCounts.set(entry, (cleanupCounts.get(entry) ?? 0) + 1);
+      const precedingDrop = source.lastIndexOf('DROP DATABASE IF EXISTS', terminate);
+      const drain = source.lastIndexOf(
+        'await waitForBackendDrain(maintenance, databaseName)',
+        terminate,
+      );
+      const close = Math.max(
+        source.lastIndexOf('.end()', drain),
+        source.lastIndexOf('.close()', drain),
+      );
+      const capture = source.lastIndexOf('const terminated = await maintenance.query(', terminate);
+      const assertion = source.indexOf('assert.equal(terminated.rowCount, 0)', terminate);
+      const drop = source.indexOf('DROP DATABASE IF EXISTS', terminate);
+      if (!(drain > precedingDrop
+        && close > precedingDrop
+        && close < drain
+        && capture > drain
+        && assertion > terminate
+        && drop > assertion)) {
+        violations.push(`${entry}:${source.slice(0, terminate).split('\n').length}`);
+      }
+    }
+  }
+  assert.deepEqual(Object.fromEntries(cleanupCounts), {
+    'execution-live.repository.test.ts': 1,
+    'execution-worker-live-partition-migration.test.ts': 3,
+    'executor-main.integration.test.ts': 1,
+    'executor-roles-provisioning.test.ts': 2,
+    'executor-worker-database-authority.test.ts': 2,
+    'listener-database-authority.test.ts': 1,
+  });
+  assert.deepEqual(violations, []);
 });

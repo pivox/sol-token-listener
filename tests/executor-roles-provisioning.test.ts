@@ -30,6 +30,7 @@ import {
 } from '../src/executor-operations/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const repositoryUrl = new URL('../src/storage/execution-operations.repository.ts', import.meta.url);
@@ -572,11 +573,13 @@ void test('PostgreSQL 16 recovery, live and operations logins are exact through 
           } catch { /* the role may not have been created before setup failed */ }
         }
         if (isolated !== undefined) await isolated.end();
-        await maintenance.query(
+        await waitForBackendDrain(maintenance, databaseName);
+        const terminated = await maintenance.query(
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
            WHERE datname=$1 AND pid<>pg_backend_pid()`,
           [databaseName],
         );
+        assert.equal(terminated.rowCount, 0);
         await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(deniedLoginName)}`);
@@ -823,11 +826,13 @@ void test('provisioned retention role runs the complete purge without reading si
   } finally {
     try {
       if (isolated !== undefined) await isolated.end();
-      await maintenance.query(
+      await waitForBackendDrain(maintenance, databaseName);
+      const terminated = await maintenance.query(
         `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
          WHERE datname=$1 AND pid<>pg_backend_pid()`,
         [databaseName],
       );
+      assert.equal(terminated.rowCount, 0);
       await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
     } finally {
       try { await releaseRoleTestLock(); } finally { await maintenance.end(); }

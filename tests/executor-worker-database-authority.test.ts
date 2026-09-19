@@ -465,8 +465,10 @@ void test('PostgreSQL 16 provisioning replay revokes a stale worker policy targe
       },
       async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          assert.equal(terminated.rowCount, 0);
           await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         }
       },
@@ -784,8 +786,10 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       },
       async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          assert.equal(terminated.rowCount, 0);
         }
       },
       async () => {
