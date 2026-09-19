@@ -64,6 +64,12 @@ interface Pool { connect(): Promise<Client> }
 
 type Operation = 'enqueue' | 'wake' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
 const MAX_PAPER_FINALITY_PREFLIGHT_JOBS=16;
+const PAPER_DECISION_CLAIM_SCHEDULER_LOCK_SQL = `SELECT pg_advisory_xact_lock(
+  hashtextextended(
+    'paper-decision-claim-scheduler:v1:' || 'paper_decision_jobs'::regclass::oid::text,
+    0
+  )
+)`;
 export type ExecutionIntentEmissionConfig = Readonly<{
   readonly quoteMintAllowlist: readonly string[];
   readonly wsolMint: string;
@@ -252,6 +258,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     const client = await this.connect('claim');
     try {
       await client.query('BEGIN');
+      await client.query(PAPER_DECISION_CLAIM_SCHEDULER_LOCK_SQL);
       const now = new Date(options.nowMs);
       const leaseToken = `paper_lease_${randomUUID()}`;
       const result = await client.query(paperDecisionClaimSql(),[

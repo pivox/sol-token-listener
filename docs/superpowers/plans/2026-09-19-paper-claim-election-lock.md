@@ -23,11 +23,11 @@
 
 **Files:**
 - Create: `tests/paper-decision-claim-election.test.ts`
-- Modify: `tests/paper-decision.repository.test.ts`
+- Test: `tests/paper-decision.repository.test.ts`
 
-- [ ] Add a repository contract test that records SQL calls and requires `BEGIN`, one relation-scoped `pg_advisory_xact_lock`, the claim CTE, then `COMMIT`.
-- [ ] Run `npx tsx --test tests/paper-decision-claim-election.test.ts` and observe failure because the scheduler lock statement is absent.
-- [ ] Preserve the PostgreSQL concurrent two-claimer regression and execute it repeatedly against PostgreSQL 16.
+- [x] Add a repository contract test that records SQL calls and requires `BEGIN`, one relation-scoped `pg_advisory_xact_lock`, the claim CTE, then `COMMIT`.
+- [x] Run `npx tsx --test tests/paper-decision-claim-election.test.ts` and observe failure because the scheduler lock statement is absent.
+- [x] Preserve the PostgreSQL concurrent two-claimer regression and execute it repeatedly against PostgreSQL 16.
 
 ### Task 3: Serialize only claim election
 
@@ -36,17 +36,17 @@
 - Test: `tests/paper-decision-claim-election.test.ts`
 - Test: `tests/paper-decision.repository.test.ts`
 
-- [ ] Add one constant SQL statement using `pg_advisory_xact_lock(hashtextextended(...))` with the resolved `paper_decision_jobs` relation OID in its key.
-- [ ] Execute that statement immediately after `BEGIN` and before constructing the claim timestamp, lease token and CTE query.
-- [ ] Re-run the contract test and observe the exact order pass.
-- [ ] Run the concurrent PostgreSQL regression repeatedly and require 32 distinct rotations on every iteration.
+- [x] Add one constant SQL statement using `pg_advisory_xact_lock(hashtextextended(...))` with the resolved `paper_decision_jobs` relation OID in its key.
+- [x] Execute that statement immediately after `BEGIN` and before constructing the claim timestamp, lease token and CTE query.
+- [x] Re-run the contract test and observe the exact order pass.
+- [x] Run the concurrent PostgreSQL regression repeatedly and require 32 distinct rotations on every iteration.
 
 ### Task 4: Verify and deliver
 
 **Files:**
 - Verify all changed files above.
 
-- [ ] Run the focused contract and PostgreSQL tests.
-- [ ] Run `npm run build`, `npm run check`, `npm run lint`, `npm run docs:check` and `git diff --check`.
-- [ ] Run the backend suite without PostgreSQL and confirm no regression.
-- [ ] Commit, push and open one pull request closing issue #131 without requesting review or merging.
+- [x] Run the focused contract and PostgreSQL tests.
+- [x] Run `npm run build`, `npm run check`, `npm run lint`, `npm run docs:check` and `git diff --check`.
+- [x] Run the backend suite without PostgreSQL and confirm no regression.
+- [x] Commit, push and open one pull request closing issue #131 without requesting review or merging.
