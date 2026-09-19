@@ -1,6 +1,6 @@
 # Catch-up Classification Ledger V1 Design
 
-Version: 5 — 2026-09-19
+Version: 6 — 2026-09-19
 
 ## Scope
 
@@ -63,6 +63,11 @@ stored `catch_up_classified_at` remains authoritative; replay never rewrites it,
 and terminal replay preserves the first `terminal_at` and `purge_after` instead
 of starting a new four-hour window. `DEFERRED` preserves that window while it
 remains deferred; promotion to tracked `PENDING` clears both terminal fields.
+If deferred evidence was initially admitted as terminal-less `PENDING`, then
+later becomes untracked before projection synchronization, its first replay to
+`DEFERRED` initializes `terminal_at` from the replay classification clock and
+creates one four-hour `purge_after`. Subsequent deferred replay cannot extend
+that window.
 The immutable action key compares the
 original CREATE/TRADE/NONE evidence without trusting the mutable current inbox
 hint. Replay unions canonical program IDs, reconciles `confirmed` to

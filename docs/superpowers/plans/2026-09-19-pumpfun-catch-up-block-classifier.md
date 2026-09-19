@@ -432,6 +432,14 @@ replays with a newer clock. Assert promotion to `PENDING/TRACKED_TRADE` clears
 both `terminal_at` and `purge_after`. This is the intended tracked-mint lifecycle,
 not retention extension.
 
+Add the inverse crash-window regression: create the tracked launch before the
+first deferred classification so it is initially `PENDING` with null terminal
+fields, deactivate the launch without running `syncTrackedMint`, then replay at
+a newer classification clock. Assert the row becomes `DEFERRED`, preserves its
+first `catch_up_classified_at`, and initializes exactly one
+`terminal_at = replay.classifiedAtMs` plus `purge_after = terminal_at + 4h`.
+A later deferred replay must preserve both timestamps.
+
 - [ ] **Step 2: Run the new PG16 test and verify RED**
 
 ```bash
@@ -462,16 +470,14 @@ dateMs(row.catch_up_classified_at, 'catch-up classified at') !== value.classifie
 - [ ] **Step 2: Anchor terminal replay to stored time**
 
 ```ts
-const firstClassifiedAt = dateFromMs(
-  dateMs(row.catch_up_classified_at, 'catch-up classified at'),
-);
+dateMs(row.catch_up_classified_at, 'catch-up classified at');
 const storedTerminalAt = nullableDateFromMs(
   nullableDateMs(row.terminal_at, 'classification replay terminal at'),
 );
 const replayTerminalAt = shouldReplay ? null : pristine
   ? (replayDecision.status === 'PENDING'
       ? null
-      : storedTerminalAt ?? firstClassifiedAt)
+      : storedTerminalAt ?? dateFromMs(value.classifiedAtMs))
   : storedTerminalAt;
 ```
 

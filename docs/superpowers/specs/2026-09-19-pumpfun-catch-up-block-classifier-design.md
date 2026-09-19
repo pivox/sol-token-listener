@@ -1,6 +1,6 @@
 # Pump.fun Catch-up Block Classifier Design
 
-Version: 1.0.4 — 2026-09-19 — issue #133.
+Version: 1.0.5 — 2026-09-19 — issue #133.
 
 ## Goal and status
 
@@ -157,7 +157,10 @@ first stored `catch_up_classified_at`. For terminal `IGNORED` and `QUARANTINED`
 rows it also preserves the original `terminal_at` and exact
 `purge_after = terminal_at + 4 hours`. `DEFERRED` preserves those timestamps
 while it remains deferred; promotion to tracked `PENDING` clears both according
-to the existing admission lifecycle.
+to the existing admission lifecycle. Conversely, if deferred evidence was
+initially admitted as terminal-less `PENDING` and later becomes untracked, its
+first transition to `DEFERRED` opens one four-hour window at that replay's
+classification clock. Later deferred replays preserve that new window exactly.
 
 ## Repository replay correction
 
@@ -171,6 +174,9 @@ retention from a replay's new timestamp. B2b changes only that replay rule:
 - ignored/quarantined replay, and deferred replay that remains deferred, reuse
   stored `terminal_at` and `purge_after` exactly;
 - promotion from deferred to tracked `PENDING` clears terminal retention;
+- a terminal-less deferred classification that first transitions from
+  `PENDING` to `DEFERRED` initializes `terminal_at` from that replay's
+  `classifiedAtMs` and creates exactly one four-hour deadline;
 - actionable finality replay keeps the existing B1 reprocessing behavior;
 - changed semantic evidence remains a `classification` conflict.
 
