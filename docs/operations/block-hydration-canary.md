@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.0.0 — 2026-09-12 — issue #114.
+Version : 1.0.1 — 2026-09-20 — issues #114 et #142.
 
 Cette procédure post-merge est opérateur-only et observe-only. Elle ne connecte
 ni ne lit aucun wallet ou clé privée, ne compose aucun executor, n'arme, ne
@@ -30,14 +30,49 @@ activation.
    configuration résolue avant le démarrage.
 2. Redémarrer exactement une réplique. Aucun flag n'est modifiable à chaud.
 3. Capturer l’état health, le backlog/les échecs terminaux et le RSS à T0, T+5
-   min et T+15 min. Capturer ensuite un relevé `final` après l’arrêt borné et
-   la persistance du dernier heartbeat. Les quatre relevés appartiennent au
-   même processus : un redémarrage entre deux relevés invalide la fenêtre.
+   min et T+15 min. Les trois premiers relevés viennent de l’API pendant que
+   l’application tourne. Capturer ensuite un relevé `final` depuis le heartbeat
+   PostgreSQL persistant après l’arrêt borné de la seule application : l’API du
+   même processus est alors fermée et ne peut pas servir ce relevé. Les quatre
+   relevés appartiennent au même processus : un redémarrage entre deux relevés
+   invalide la fenêtre.
    Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
    projection fixe suivante de la réponse health :
 
    ```text
    jq 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)}' health.json
+   ```
+
+   Après T+15, arrêter uniquement `app`, laisser PostgreSQL actif, puis extraire
+   exactement la ligne `STOPPED` persistée. La requête fabrique une enveloppe
+   temporaire limitée à `startedAt` et `rpcHttpEvidence`; le même filtre fermé
+   valide ensuite la preuve. Une ligne absente, multiple ou invalide fait
+   échouer la commande et interdit un verdict `PASS` :
+
+   ```bash
+   set -euo pipefail
+   : "${DEPLOY_ENV:?DEPLOY_ENV must reference the external operator environment file}"
+   final_source="$(mktemp)"
+   trap 'rm -f "$final_source"' EXIT
+   docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 app
+   docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T postgres sh -c 'exec psql --no-psqlrc --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --set=ON_ERROR_STOP=1 --tuples-only --no-align' <<'SQL' > "$final_source"
+   SELECT jsonb_build_object(
+     'data', jsonb_build_object(
+       'heartbeat', jsonb_build_object(
+         'startedAt', to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+         'rpcHttpEvidence', payload -> 'rpcHttpEvidence'
+       )
+     )
+   )
+   FROM listener_heartbeats
+   WHERE service_key = 'transaction-listener'
+     AND runtime_state = 'STOPPED';
+   SQL
+   test "$(wc -l < "$final_source")" -eq 1
+   jq -e 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)} | select(.startedAt != null and .rpcHttpEvidence != null)' "$final_source" > final
+   test -s final
+   rm -f "$final_source"
+   trap - EXIT
    ```
 
    Nommer les quatre fichiers `T0`, `T+5`, `T+15` et `final`. Cette projection

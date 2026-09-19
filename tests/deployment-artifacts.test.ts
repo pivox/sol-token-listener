@@ -454,6 +454,92 @@ void test('RPC HTTP canary scope separates #142 from the #143 latency gate', asy
   assert.match(design, /#143[^.]{0,180}(?:still|required|nécessaire)[^.]{0,180}(?:latency|latence|p95)/iu);
 });
 
+void test('RPC HTTP canary archives the persisted STOPPED heartbeat after the app API closes', async (context) => {
+  const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
+  const composePrefix = 'docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener';
+  const stopAt = runbook.indexOf(`${composePrefix} stop --timeout 40 app`);
+  const persistedReadAt = runbook.indexOf("runtime_state = 'STOPPED'");
+
+  assert.ok(stopAt >= 0, 'the runbook must stop only the app with its bounded grace period');
+  assert.ok(persistedReadAt > stopAt, 'the final snapshot must read PostgreSQL after app shutdown');
+  assert.match(runbook, /set -euo pipefail[\s\S]{0,120}DEPLOY_ENV:\?/u);
+  assert.match(runbook, /service_key = 'transaction-listener'/u);
+  assert.match(runbook, /payload\s*->\s*'rpcHttpEvidence'/u);
+  assert.match(runbook, /started_at/u);
+  assert.ok(runbook.includes(`${composePrefix} exec -T postgres`));
+  assert.match(runbook, /jq -e[^\n]*select\([^\n]*startedAt[^\n]*rpcHttpEvidence/iu);
+  assert.doesNotMatch(runbook, /docker compose (?:down|stop|exec)/u);
+
+  if (spawnSync('jq', ['--version']).status !== 0) {
+    context.diagnostic('jq unavailable: executable final-snapshot cases skipped');
+    return;
+  }
+  const finalBlock = [...runbook.matchAll(/^[ \t]*```bash\n([\s\S]*?)\n[ \t]*```$/gmu)]
+    .map((match) => (match[1] ?? '').split('\n').map((line) => line.replace(/^ {3}/u, '')).join('\n'))
+    .find((block) => block.includes('final_source="$(mktemp)"'));
+  assert.ok(finalBlock, 'missing executable final-snapshot block');
+
+  const directory = await mkdtemp(join(tmpdir(), 'sol-token-listener-final-heartbeat-'));
+  try {
+    await writeFile(join(directory, 'docker'), `#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" stop "*) test "\${FAKE_DOCKER_MODE:-success}" != stop-fail ;;
+  *" exec "*)
+    cat >/dev/null
+    test "\${FAKE_DOCKER_MODE:-success}" != exec-fail
+    printf '%s' "\${FAKE_DOCKER_OUTPUT:-}"
+    ;;
+  *) exit 64 ;;
+esac
+`, { encoding: 'utf8', mode: 0o700 });
+    const provider = (providerId: string, configured = false) => ({
+      providerId, configured, attempts: configured ? 3 : 0, http429Responses: 0,
+    });
+    const validSource = `${JSON.stringify({ data: { heartbeat: {
+      startedAt: '2026-09-20T10:00:00.000Z',
+      rpcHttpEvidence: {
+        version: 1, overflowed: false, providers: [
+          provider('primary', true), provider('fallback-1'),
+          provider('fallback-2'), provider('fallback-3'),
+        ],
+      },
+    } } })}\n`;
+    const run = (mode: string, output: string) => spawnSync('bash', ['-c', finalBlock], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        PATH: `${directory}:${process.env.PATH ?? ''}`,
+        DEPLOY_ENV: '/external/operator.env',
+        FAKE_DOCKER_MODE: mode,
+        FAKE_DOCKER_OUTPUT: output,
+      },
+    });
+
+    const success = run('success', validSource);
+    assert.equal(success.status, 0, success.stderr);
+    const projected = JSON.parse(await readFile(join(directory, 'final'), 'utf8')) as {
+      readonly startedAt?: unknown;
+      readonly rpcHttpEvidence?: unknown;
+    };
+    assert.equal(projected.startedAt, '2026-09-20T10:00:00.000Z');
+    assert.ok(projected.rpcHttpEvidence !== null);
+
+    for (const [mode, output] of [
+      ['stop-fail', validSource],
+      ['exec-fail', validSource],
+      ['success', ''],
+      ['success', `${validSource}${validSource}`],
+      ['success', 'not-json\n'],
+    ] as const) {
+      const result = run(mode, output);
+      assert.notEqual(result.status, 0, `${mode}:${JSON.stringify(output)}`);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 void test('catch-up admission documentation fixes the restart-only activation and Mainnet gate', async () => {
   const [readme, architecture, api, runbook, design] = await Promise.all([
     readArtifact('README.md'),

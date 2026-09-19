@@ -1,6 +1,6 @@
 # RPC HTTP Canary Evidence Design
 
-Version: 1.1.1 — 2026-09-20 — issue #142, Task 6 clarification
+Version: 1.1.2 — 2026-09-20 — issue #142, final snapshot clarification
 
 Status: approved for implementation under the standing operator instruction
 
@@ -178,8 +178,11 @@ metrics are already stored in versioned JSON payloads.
 
 ## Canary verdict
 
-The operator captures redacted health snapshots at T0, T+5 minutes, T+15
-minutes, and after bounded shutdown. A PASS for the HTTP 429 gate requires:
+The operator captures redacted health snapshots from the API at T0, T+5
+minutes, and T+15 minutes. After bounded shutdown closes that API, the final
+snapshot is extracted from the persisted `STOPPED` heartbeat in PostgreSQL
+through a fixed-field, fail-closed projection. A PASS for the HTTP 429 gate
+requires:
 
 - the same heartbeat `startedAt` at every sample;
 - evidence present at every sample and in the final persisted heartbeat;
@@ -198,6 +201,11 @@ metric may be synthesized as zero.
 Version 1.1.1 is an operator clarification of the verdict precedence and does
 not change the implementation contract: membership drift alone is not proof of
 an HTTP 429.
+
+Version 1.1.2 clarifies that the final snapshot cannot come from the closed API.
+It must come from the same process's persisted `STOPPED` heartbeat while
+PostgreSQL remains available; absence, multiplicity, or invalid evidence stays
+`INCONCLUSIVE`.
 
 Issue #142 proves only the HTTP 429 gate. It does not prove first-processing
 latency or its p95; issue #143 remains required for first-processing latency and
