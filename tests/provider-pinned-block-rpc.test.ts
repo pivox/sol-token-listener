@@ -34,11 +34,70 @@ void test('pins complete-block reads to the selected provider HTTP URL and maps 
   assert.equal(JSON.stringify(source), '{"providerId":"fallback-1"}');
   assert.deepEqual(await source.getBlockTransactions(12n, 'CONFIRMED'), { transactions: [] });
   assert.deepEqual(await source.getBlockTransactions(13n, 'FINALIZED'), { transactions: [] });
+  assert.deepEqual(await source.getBlockTransactions(14n, 'PROCESSED'), { transactions: [] });
   assert.equal(created, 1);
   assert.deepEqual(calls, [
     [12, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false }],
     [13, { commitment: 'finalized', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false }],
+    [14, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false }],
   ]);
+});
+
+void test('consumes a rejected async factory result without an unhandled rejection or secret leak', async () => {
+  const secret = 'https://factory-secret.invalid/token';
+  const unhandled: unknown[] = [];
+  const observe = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', observe);
+  try {
+    assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => (
+      Promise.reject(new Error(secret))
+    ))), (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener('unhandledRejection', observe);
+  }
+});
+
+void test('consumes a native rejected promise without reading a hostile then accessor', async () => {
+  const secret = 'https://native-promise-secret.invalid/token';
+  const rejected = new Promise<never>((_resolve, reject) => { reject(new Error(secret)); });
+  void rejected;
+  let thenReads = 0;
+  void Object.defineProperty(rejected, 'then', {
+    get() { thenReads += 1; throw new Error(secret); },
+  });
+  const unhandled: unknown[] = [];
+  const observe = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', observe);
+  try {
+    assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => rejected)),
+      (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(thenReads, 0);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener('unhandledRejection', observe);
+  }
+});
+
+void test('consumes rejected promises returned by invalid thenables', async () => {
+  const secret = 'https://thenable-secret.invalid/token';
+  const unhandled: unknown[] = [];
+  const observe = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', observe);
+  try {
+    assert.throws(() => createProviderPinnedBlockRpc(catalog(), 'primary', 'confirmed', dependencies(() => Object.freeze({
+      then(_resolve: undefined, reject: (reason: unknown) => void): Promise<never> {
+        reject(new Error(secret));
+        return Promise.reject(new Error(secret));
+      },
+    }))), (error: unknown) => invalid(error, 'CONFIG_INVALID', secret));
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener('unhandledRejection', observe);
+  }
 });
 
 void test('never resolves or retains a fallback URL', () => {

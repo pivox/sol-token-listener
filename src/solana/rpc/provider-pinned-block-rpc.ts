@@ -1,5 +1,6 @@
 import { Connection, type Commitment } from '@solana/web3.js';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
+import type { LegacyConfirmationStatus } from './types.js';
 import type { TransactionBlockRpc } from './transaction-locator.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 
@@ -50,7 +51,10 @@ export function createProviderPinnedBlockRpc(
 
   return Object.freeze({
     providerId,
-    async getBlockTransactions(slot: bigint, confirmationStatus: 'CONFIRMED' | 'FINALIZED'): Promise<unknown> {
+    async getBlockTransactions(
+      slot: bigint,
+      confirmationStatus: Exclude<LegacyConfirmationStatus, 'ORPHANED'>,
+    ): Promise<unknown> {
       let numericSlot: number;
       try {
         numericSlot = numericBlockSlot(slot);
@@ -121,6 +125,15 @@ function createPinnedConnection(
     if (typeof connection !== 'object' || connection === null || Array.isArray(connection)) {
       throw new TypeError();
     }
+    if (consumeNativePromise(connection)) throw new TypeError();
+    const then = optionalDataMethod(connection, 'then');
+    if (then !== null) {
+      const continuation = Reflect.apply(then, connection, [undefined, consumeAsyncFactoryFailure]);
+      if (typeof continuation === 'object' && continuation !== null) {
+        void consumeNativePromise(continuation);
+      }
+      throw new TypeError();
+    }
     const getBlock = dataMethod(connection, 'getBlock');
     return Object.freeze({
       getBlock(
@@ -137,6 +150,31 @@ function createPinnedConnection(
     });
   } catch {
     throw failure('CONFIG_INVALID', providerId);
+  }
+}
+
+function consumeAsyncFactoryFailure(): void {
+  // The synchronous factory contract rejects async results; consuming their
+  // rejection prevents an invalid dependency from leaking through Node's
+  // unhandled-rejection channel.
+}
+
+function consumeNativePromise(value: object): boolean {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(Promise.prototype, 'then');
+    if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'function') {
+      throw new TypeError();
+    }
+    const nativeThen = descriptor.value as (
+      this: object,
+      onFulfilled: undefined,
+      onRejected: () => void,
+    ) => unknown;
+    const continuation = Reflect.apply(nativeThen, value, [undefined, consumeAsyncFactoryFailure]);
+    void continuation;
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -190,6 +228,20 @@ function dataMethod(value: object, key: string): (...args: unknown[]) => unknown
     current = typeof prototype === 'object' && prototype !== null ? prototype : null;
   }
   throw new TypeError();
+}
+
+function optionalDataMethod(value: object, key: string): ((...args: unknown[]) => unknown) | null {
+  let current: object | null = value;
+  for (let depth = 0; current !== null && depth < 16; depth += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+    if (descriptor !== undefined) {
+      if (!('value' in descriptor) || typeof descriptor.value !== 'function') throw new TypeError();
+      return descriptor.value as (...args: unknown[]) => unknown;
+    }
+    const prototype: unknown = Object.getPrototypeOf(current);
+    current = typeof prototype === 'object' && prototype !== null ? prototype : null;
+  }
+  return null;
 }
 
 function dataProperty(value: object, key: string): unknown {
