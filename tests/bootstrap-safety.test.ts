@@ -28,6 +28,19 @@ const config = parseConfig({
   SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
 });
 
+void test('catch-up admission bootstrap includes only observational classifier and pinned hydration capabilities', async () => {
+  const graph = await readLocalImportGraph(fileURLToPath(new URL('../src/application/production-listener-factory.ts', import.meta.url)));
+  for (const module of [
+    '../src/application/provider-affine-catch-up-hydration.ts',
+    '../src/application/pumpfun-catch-up-block-classifier.ts',
+    '../src/application/pumpfun-strict-catch-up-page-admitter.ts',
+    '../src/solana/rpc/provider-pinned-block-rpc.ts',
+  ]) assert.ok(graph.has(fileURLToPath(new URL(module, import.meta.url))), module);
+  for (const [module, source] of graph) {
+    assert.deepEqual(executionBoundaryViolations(source, module, repositoryRoot), []);
+  }
+});
+
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
   assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);

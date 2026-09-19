@@ -337,6 +337,11 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 1, failed: 0,
       retryableFailed: 0, exhaustedFailed: 0,
+      catchUpAdmission: Object.freeze({
+        actionableBacklogBySource: Object.freeze({ websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 }),
+        actionableBacklogByPriority: Object.freeze({ normal: 0, launchCandidate: 0, trackedTrade: 0 }),
+        deferredCount: 0, ignoredCount: 0, quarantinedCount: 0,
+      }),
     });
 
     const replayOrder: ReplayStage[] = [];

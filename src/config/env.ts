@@ -6,6 +6,8 @@ import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 const DEFAULT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_RAYDIUM_CPMM_PROGRAM_ID = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
 const MAX_RECONCILE_SECONDS = 2_147_483;
+const PUMPFUN_CATCH_UP_PAGE_ADMISSION_ERROR =
+  'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED requires a safe observation envelope.';
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
@@ -53,6 +55,7 @@ export interface AppConfig {
   readonly qualificationMinimumScore: number | null;
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
+  readonly listenerPumpFunCatchUpPageAdmissionEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
   readonly expectedGenesisHash: string | null;
   readonly listenerWorkerLeaseSeconds: number;
@@ -168,6 +171,16 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   rejectPrivateKeyConfiguration(environment);
 
   const listenerEnabled = parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED');
+  const listenerPumpFunCatchUpPageAdmissionEnabled = parseStrictBoolean(
+    environment.LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED,
+    false,
+    'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED',
+  );
+  if (listenerPumpFunCatchUpPageAdmissionEnabled
+    && listenerEnabled
+    && !hasValue(environment.SOLANA_EXPECTED_GENESIS_HASH)) {
+    throw new Error(PUMPFUN_CATCH_UP_PAGE_ADMISSION_ERROR);
+  }
   const expectedGenesisHash = requireSolanaGenesisHash(
     environment.SOLANA_EXPECTED_GENESIS_HASH,
     listenerEnabled,
@@ -209,6 +222,28 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   );
   const transactionInboxRetryPolicy = parseTransactionInboxRetryPolicy(environment);
   const blockHydration = parseBlockHydrationConfig(environment);
+  const listenerIngestionScope = parseClosedLiteral(
+    environment.LISTENER_INGESTION_SCOPE,
+    'launchpad-and-market',
+    'LISTENER_INGESTION_SCOPE',
+    ['launchpad-only', 'launchpad-and-market'],
+  );
+  const listenerCatchUpPolicy = parseClosedLiteral(
+    environment.LISTENER_CATCH_UP_POLICY,
+    'live-edge',
+    'LISTENER_CATCH_UP_POLICY',
+    ['live-edge', 'strict'],
+  );
+  if (listenerPumpFunCatchUpPageAdmissionEnabled && (
+    !listenerEnabled
+    || executionMode !== 'observe'
+    || listenerIngestionScope !== 'launchpad-only'
+    || listenerCatchUpPolicy !== 'live-edge'
+    || !blockHydration.listenerBlockHydrationEnabled
+    || expectedGenesisHash === null
+  )) {
+    throw new Error(PUMPFUN_CATCH_UP_PAGE_ADMISSION_ERROR);
+  }
   const qualificationProfilePath = parseQualificationProfilePath(environment.QUALIFICATION_PROFILE_PATH);
   const riskMaxRoundTripLossBps = parseInteger(
     environment.RISK_MAX_ROUNDTRIP_LOSS_BPS,
@@ -269,22 +304,13 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
     listenerEnabled,
-    listenerIngestionScope: parseClosedLiteral(
-      environment.LISTENER_INGESTION_SCOPE,
-      'launchpad-and-market',
-      'LISTENER_INGESTION_SCOPE',
-      ['launchpad-only', 'launchpad-and-market'],
-    ),
+    listenerPumpFunCatchUpPageAdmissionEnabled,
+    listenerIngestionScope,
     expectedGenesisHash,
     listenerWorkerLeaseSeconds: parseInteger(
       environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
     ),
-    listenerCatchUpPolicy: parseClosedLiteral(
-      environment.LISTENER_CATCH_UP_POLICY,
-      'live-edge',
-      'LISTENER_CATCH_UP_POLICY',
-      ['live-edge', 'strict'],
-    ),
+    listenerCatchUpPolicy,
     listenerCatchUpMaxPages: parseInteger(
       environment.LISTENER_CATCH_UP_MAX_PAGES, 20, 'LISTENER_CATCH_UP_MAX_PAGES', 1, 100,
     ),
@@ -788,6 +814,13 @@ function parseOptionalInteger(
 
 function parseBoolean(raw: string | undefined, fallback: boolean, name: string): boolean {
   if (!hasValue(raw)) return fallback;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(`${name} must be true or false.`);
+}
+
+function parseStrictBoolean(raw: string | undefined, fallback: boolean, name: string): boolean {
+  if (raw === undefined) return fallback;
   if (raw === 'true') return true;
   if (raw === 'false') return false;
   throw new Error(`${name} must be true or false.`);

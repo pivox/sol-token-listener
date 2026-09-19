@@ -45,6 +45,7 @@ export interface TransactionBlockRpc {
   getBlockTransactions(
     slot: bigint,
     confirmationStatus: LocatableConfirmationStatus,
+    signal?: AbortSignal,
   ): Promise<unknown>;
 }
 

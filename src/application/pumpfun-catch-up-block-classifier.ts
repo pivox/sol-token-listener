@@ -110,7 +110,7 @@ interface ClassificationDecision {
   readonly actions: readonly SemanticAction[];
 }
 
-/** Inactive B2b service. No scanner or production factory composes it yet. */
+/** B3b composes this service for provider-affine Pump.fun strict scans when the restart-only flag is enabled. */
 export class PumpFunCatchUpBlockClassifier {
   public constructor(
     private readonly locator: PumpFunCatchUpTransactionLocator,

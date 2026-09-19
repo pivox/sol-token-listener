@@ -43,6 +43,59 @@ function renderHealth(value: ApiHealth): ReturnType<typeof vi.fn<ApiClient['getH
 }
 
 describe('technical health page', () => {
+  it('renders catch-up admission states and every disjoint count', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat, backlogCount: 6,
+        catchUpAdmission: {
+          version: 1, enabled: true, providerId: 'fallback-2', scanActive: true, workerClaimReady: false,
+          actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 3 },
+          actionableBacklogByPriority: { normal: 3, launchCandidate: 2, trackedTrade: 1 },
+          deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
+        },
+      },
+    })).data);
+    const card = (await screen.findByRole('heading', { name: 'Admission catch-up' })).closest('section');
+    const diagnostic = within(card!);
+    for (const text of [
+      'Activé', 'Fournisseur : fallback-2', 'Scan actif : Oui', 'Worker prêt à réclamer : Non',
+      'WebSocket seul : 1 ; catch-up seul : 2 ; WebSocket et catch-up : 3',
+      'Normale : 3 ; lancement candidat : 2 ; trade suivi : 1',
+      'Différés : 4 ; ignorés : 5 ; en quarantaine : 6',
+    ]) expect(diagnostic.getByText(text)).toBeVisible();
+  });
+
+  it.each([undefined, null])('does not infer catch-up admission from enabled block hydration (%s)', async (catchUpAdmission) => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health, heartbeat: { ...health.heartbeat, catchUpAdmission },
+    })).data);
+    const card = (await screen.findByRole('heading', { name: 'Admission catch-up' })).closest('section');
+    expect(within(card!).getByText('Non activé')).toBeVisible();
+    expect(within(card!).queryByText(/Fournisseur/)).not.toBeInTheDocument();
+  });
+
+  it('renders disabled catch-up admission and unavailable provider without inferring readiness', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat, backlogCount: 0,
+        catchUpAdmission: {
+          version: 1, enabled: false, providerId: null, scanActive: false, workerClaimReady: false,
+          actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
+          actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },
+          deferredCount: 0, ignoredCount: 0, quarantinedCount: 0,
+        },
+      },
+    })).data);
+    const card = (await screen.findByRole('heading', { name: 'Admission catch-up' })).closest('section');
+    const diagnostic = within(card!);
+    expect(diagnostic.getByText('Non activé')).toBeVisible();
+    expect(diagnostic.getByText('Fournisseur : Indisponible')).toBeVisible();
+    expect(diagnostic.getByText('Scan actif : Non')).toBeVisible();
+    expect(diagnostic.getByText('Worker prêt à réclamer : Non')).toBeVisible();
+  });
+
   it('renders bounded public health and supports manual refresh without leaking additive internals', async () => {
     const user = userEvent.setup();
     const getHealth = renderHealth(degraded);

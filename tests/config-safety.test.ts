@@ -14,6 +14,43 @@ const base = {
   SOLANA_EXPECTED_GENESIS_HASH: bs58.encode(Uint8Array.from({ length: 32 }, () => 7)),
 };
 
+void test('Pump.fun catch-up page admission is disabled by default', () => {
+  assert.equal(parseConfig(base).listenerPumpFunCatchUpPageAdmissionEnabled, false);
+  for (const value of ['TRUE', '1', ' true', 'true ', ' ', '']) {
+    assert.throws(
+      () => parseConfig({ ...base, LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: value }),
+      /LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED must be true or false\./u,
+    );
+  }
+});
+
+void test('Pump.fun catch-up page admission requires the complete safe observation envelope', () => {
+  const enabled = {
+    ...base,
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+    EXECUTION_MODE: 'observe',
+  };
+  assert.equal(parseConfig(enabled).listenerPumpFunCatchUpPageAdmissionEnabled, true);
+
+  for (const override of [
+    { LISTENER_ENABLED: 'false' },
+    { EXECUTION_MODE: 'paper' },
+    { LISTENER_INGESTION_SCOPE: 'launchpad-and-market' },
+    { LISTENER_CATCH_UP_POLICY: 'strict' },
+    { LISTENER_BLOCK_HYDRATION_ENABLED: 'false' },
+    { SOLANA_EXPECTED_GENESIS_HASH: undefined },
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...enabled, ...override }),
+      (error: unknown) => error instanceof Error
+        && error.message === 'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED requires a safe observation envelope.',
+    );
+  }
+});
+
 void test('block hydration is restart-only opt-in with bounded production defaults', () => {
   const config = parseConfig(base);
   assert.deepEqual({

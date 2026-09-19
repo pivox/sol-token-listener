@@ -6,6 +6,7 @@ import {
   toApiDomainPayload,
   type ApiHealth,
   type ApiBlockHydrationMetricsV1,
+  type ApiCatchUpAdmissionMetricsV1,
   type ApiWebSocketHealth,
   type ApiHolders,
   type ApiHolderSnapshot,
@@ -52,8 +53,10 @@ import {
   SOCIAL_LINK_KINDS,
 } from '../domain/social-evidence.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
+import { isRpcProviderId } from '../domain/rpc-provider.js';
 import {
   LISTENER_RUNTIME_STATES,
+  snapshotRuntimeCatchUpAdmissionMetrics,
   type ListenerRuntimeState,
 } from '../domain/transaction-ingestion.js';
 import {
@@ -2102,7 +2105,7 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null });
+    websocket, blockHydration: null, catchUpAdmission: null });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2187,7 +2190,42 @@ function heartbeatFromRow(
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
+    catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
   });
+}
+
+function catchUpAdmissionFromPayload(value: unknown, backlogCount: number): ApiCatchUpAdmissionMetricsV1 | null {
+  if (value === null || value === undefined) return null;
+  try {
+    if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'catchUpAdmission');
+    if (descriptor === undefined) return null;
+    if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+    const metrics = exactDataRecord(descriptor.value, [
+      'version', 'enabled', 'providerId', 'scanActive', 'workerClaimReady',
+      'actionableBacklogBySource', 'actionableBacklogByPriority',
+      'deferredCount', 'ignoredCount', 'quarantinedCount',
+    ], 'Catch-up admission metrics');
+    const source = exactDataRecord(metrics.actionableBacklogBySource,
+      ['websocketOnly', 'catchUpOnly', 'websocketAndCatchUp'], 'Catch-up admission source counts');
+    const priority = exactDataRecord(metrics.actionableBacklogByPriority,
+      ['normal', 'launchCandidate', 'trackedTrade'], 'Catch-up admission priority counts');
+    // The domain snapshotter requires frozen data; reject non-scalars before it can inspect them.
+    if (metrics.version !== 1 || typeof metrics.enabled !== 'boolean'
+      || typeof metrics.scanActive !== 'boolean' || typeof metrics.workerClaimReady !== 'boolean'
+      || (metrics.providerId !== null && !isRpcProviderId(metrics.providerId))) throw invalid();
+    for (const count of [
+      ...Object.values(source), ...Object.values(priority),
+      metrics.deferredCount, metrics.ignoredCount, metrics.quarantinedCount,
+    ]) nonNegativeSafeNumber(count);
+    return snapshotRuntimeCatchUpAdmissionMetrics(freeze({
+      ...metrics,
+      actionableBacklogBySource: freeze(source),
+      actionableBacklogByPriority: freeze(priority),
+    }), backlogCount);
+  } catch {
+    throw invalid();
+  }
 }
 
 const BLOCK_HYDRATION_FIELDS = [

@@ -478,6 +478,36 @@ const blockHydrationSchema = z.object({
 }).strict().refine(({ queueDelayMs }) => queueDelayMs.last === null
   || queueDelayMs.maximum === null
   || queueDelayMs.last <= queueDelayMs.maximum);
+const catchUpAdmissionCountSchema = countSchema.refine((value) => !Object.is(value, -0));
+const catchUpAdmissionSchema = z.object({
+  version: z.literal(1),
+  enabled: z.boolean(),
+  providerId: rpcProviderIdSchema.nullable(),
+  scanActive: z.boolean(),
+  workerClaimReady: z.boolean(),
+  actionableBacklogBySource: z.object({
+    websocketOnly: catchUpAdmissionCountSchema,
+    catchUpOnly: catchUpAdmissionCountSchema,
+    websocketAndCatchUp: catchUpAdmissionCountSchema,
+  }).strict(),
+  actionableBacklogByPriority: z.object({
+    normal: catchUpAdmissionCountSchema,
+    launchCandidate: catchUpAdmissionCountSchema,
+    trackedTrade: catchUpAdmissionCountSchema,
+  }).strict(),
+  deferredCount: catchUpAdmissionCountSchema,
+  ignoredCount: catchUpAdmissionCountSchema,
+  quarantinedCount: catchUpAdmissionCountSchema,
+}).strict().refine((value) => {
+  const source = value.actionableBacklogBySource;
+  const priority = value.actionableBacklogByPriority;
+  const total = source.websocketOnly + source.catchUpOnly + source.websocketAndCatchUp;
+  return Number.isSafeInteger(total)
+    && total === priority.normal + priority.launchCandidate + priority.trackedTrade
+    && !(value.scanActive && value.workerClaimReady)
+    && !(value.providerId === null && (value.scanActive || value.workerClaimReady))
+    && !(!value.enabled && (value.providerId !== null || value.scanActive || value.workerClaimReady));
+});
 const healthSchema = z.object({
   status: z.enum(['OK', 'DEGRADED']),
   observedAt: timestampSchema,
@@ -522,7 +552,13 @@ const healthSchema = z.object({
     activeSessions: countSchema.nullable(),
     websocket: websocketHealthSchema.optional(),
     blockHydration: blockHydrationSchema.nullish(),
-  }).loose(),
+    catchUpAdmission: catchUpAdmissionSchema.nullish(),
+  }).loose().refine(({ catchUpAdmission, backlogCount }) => {
+    if (catchUpAdmission === undefined || catchUpAdmission === null) return true;
+    const source = catchUpAdmission.actionableBacklogBySource;
+    return !Object.is(backlogCount, -0)
+      && source.websocketOnly + source.catchUpOnly + source.websocketAndCatchUp === backlogCount;
+  }),
   lagSlots: unsignedIntegerSchema.nullable(),
 }).loose();
 

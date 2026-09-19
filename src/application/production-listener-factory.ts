@@ -4,11 +4,16 @@ import {
   SolanaGenesisHashError,
 } from '../domain/solana-genesis-hash.js';
 import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
-import type {
-  CatchUpGap,
-  ListenerRuntimeState,
-  RuntimeHeartbeat,
-  RuntimeBlockHydrationMetricsV1,
+import {
+  assertValidInboxCounts,
+  assertValidRuntimeHeartbeat,
+  snapshotRuntimeCatchUpAdmissionMetrics,
+  type CatchUpGap,
+  type InboxCounts,
+  type ListenerRuntimeState,
+  type RuntimeHeartbeat,
+  type RuntimeBlockHydrationMetricsV1,
+  type RuntimeCatchUpAdmissionMetricsV1,
 } from '../domain/transaction-ingestion.js';
 import {
   PumpFunLaunchpadAdapter,
@@ -28,6 +33,7 @@ import type { ListenerRuntime } from '../ports/listener-runtime.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import { SolanaMarketRpcReader } from '../solana/rpc/market-rpc-reader.js';
 import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';
+import { createProviderPinnedBlockRpc } from '../solana/rpc/provider-pinned-block-rpc.js';
 import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-finality-source.js';
 import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
@@ -67,6 +73,9 @@ import {
 } from './promoted-provider-selector.js';
 import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';
 import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';
+import { ProviderAffineCatchUpHydration } from './provider-affine-catch-up-hydration.js';
+import { PumpFunCatchUpBlockClassifier } from './pumpfun-catch-up-block-classifier.js';
+import { PumpFunStrictCatchUpPageAdmitter } from './pumpfun-strict-catch-up-page-admitter.js';
 import {
   TransactionInboxWorker,
   type TransactionInboxWorkerLocator,
@@ -187,7 +196,36 @@ export function createProductionListenerRuntime(
     maxAttempts: config.rpcRetryMaxAttempts,
     baseDelayMs: config.rpcRetryBaseDelayMs,
   }));
-  const blockHydration = createProductionBlockHydration(config, rpc);
+  const promoted = new PromotedProviderSelector(
+    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId)),
+  );
+  const hydration = config.listenerPumpFunCatchUpPageAdmissionEnabled
+    ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
+      providerId, createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
+        requestTimeoutMs: config.listenerShutdownTimeoutMs,
+      }),
+    ])), {
+      maxEntries: config.listenerBlockHydrationMaxEntries,
+      maxBytes: config.listenerBlockHydrationMaxBytes,
+      maxEntryBytes: config.listenerBlockHydrationMaxEntryBytes,
+      confirmedTtlMs: config.listenerBlockHydrationConfirmedTtlMs,
+      finalizedTtlMs: config.listenerBlockHydrationFinalizedTtlMs,
+      fetchIntervalMs: config.listenerBlockHydrationFetchIntervalMs,
+      currentSelection: (): PromotedProviderSelection => promoted.selection(),
+    }) : null;
+  const blockHydration: ProductionBlockHydration = hydration === null
+    ? createProductionBlockHydration(config, rpc)
+    : Object.freeze({
+      locator: hydration.workerLocator(),
+      metrics: (): RuntimeBlockHydrationMetricsV1 => hydration.metrics(),
+      close: (): void => { hydration.close(); },
+    });
+  const pageAdmitters = new Map(hydration === null ? [] : providers.ids.map((providerId) => [
+    providerId,
+    new PumpFunStrictCatchUpPageAdmitter(new PumpFunCatchUpBlockClassifier(
+      hydration.classifierLocator(providerId), inbox,
+    )),
+  ] as const));
   const websocketHealth = new PostgresWebSocketHealthRepository(databasePool);
   const websocketReporter = new PersistentWebSocketHealthReporter(
     inbox,
@@ -224,6 +262,7 @@ export function createProductionListenerRuntime(
           policy: 'strict',
           programs: ingestionPrograms,
         },
+        pageAdmitters.get(providerId),
       );
       return [
         providerId,
@@ -233,9 +272,6 @@ export function createProductionListenerRuntime(
   );
   const strictAffinity = strictCoordinators.get('primary');
   if (strictAffinity === undefined) throw new TypeError('Strict catch-up coordinator is unavailable.');
-  const promoted = new PromotedProviderSelector(
-    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId)),
-  );
   const supervisor = new WebSocketFailoverSupervisor(
     {
       providers,
@@ -261,8 +297,9 @@ export function createProductionListenerRuntime(
           maxPages: config.listenerCatchUpMaxPages,
           policy: 'live-edge',
           programs: ingestionPrograms,
-        });
-        await baselineScanner.scan(signal);
+        }, pageAdmitters.get(providerId));
+        if (hydration === null) await baselineScanner.scan(signal);
+        else await hydration.runStrictScan(providerId, (scanSignal) => baselineScanner.scan(scanSignal), signal);
       },
       openSession: (endpoint, observe, signal): ReturnType<typeof openWsProgramSession> => openWsProgramSession(
         endpoint,
@@ -275,7 +312,8 @@ export function createProductionListenerRuntime(
         if (coordinator === undefined) {
           return Promise.reject(new TypeError('Strict catch-up coordinator is unavailable.'));
         }
-        return coordinator.run(signal);
+        return hydration === null ? coordinator.run(signal)
+          : hydration.runStrictScan(providerId, (scanSignal) => coordinator.run(scanSignal), signal);
       },
     },
     {
@@ -464,8 +502,19 @@ export function createProductionListenerRuntime(
     leaseSeconds: config.listenerWorkerLeaseSeconds,
     renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
     idlePollMs: 1_000,
+    ...(hydration === null ? {} : { canClaim: (): boolean => hydration.canWorkerClaim() }),
   });
-  const workerComponent = lifecycleComponent(worker, blockHydration.close);
+  const workerComponent = hydration === null
+    ? lifecycleComponent(worker, blockHydration.close)
+    : lifecycleComponent({
+      start: (): Promise<void> => worker.start(),
+      close: async (): Promise<void> => {
+        let closing: Promise<void> | null = null;
+        try { closing = worker.close(); } finally { hydration.close(); }
+        await closing;
+      },
+      get state(): ListenerRuntimeState { return worker.state; },
+    });
   const socialWorkerComponent = lifecycleComponent(socialWorker);
   const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
@@ -479,6 +528,14 @@ export function createProductionListenerRuntime(
       intervalMs: 5_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
+      ...(hydration === null ? {} : {
+        catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
+          version: 1,
+          enabled: true,
+          ...hydration.state(),
+          ...counts.catchUpAdmission,
+        }),
+      }),
     },
   );
 
@@ -527,6 +584,7 @@ export interface RecurringListenerOptions {
 
 export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
+  readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
 }
 
 export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
@@ -769,6 +827,7 @@ export class PersistentListenerHeartbeat {
   private stopPromise: Promise<void> | null = null;
   private closed = false;
   private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
+  private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository, 'counts' | 'writeHeartbeat'>,
@@ -788,6 +847,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Block hydration metrics provider is invalid.');
     }
     this.blockHydrationMetrics = options.blockHydrationMetrics ?? null;
+    if (options.catchUpAdmissionMetrics !== undefined
+      && typeof options.catchUpAdmissionMetrics !== 'function') {
+      throw new TypeError('Catch-up admission metrics provider is invalid.');
+    }
+    this.catchUpAdmissionMetrics = options.catchUpAdmissionMetrics ?? null;
   }
 
   public async start(): Promise<void> {
@@ -865,29 +929,31 @@ export class PersistentListenerHeartbeat {
   }
 
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
+    let counts: InboxCounts;
     if (runtimeState === 'RUNNING') {
-      const [counts, slots] = await Promise.all([
+      const [currentCounts, slots] = await Promise.all([
         this.inbox.counts(),
         Promise.all([this.rpc.getSlot(), this.rpc.getFinalizedSlot()]),
       ]);
+      counts = currentCounts;
       this.lastHttpSlot = slots[0];
       this.lastFinalizedSlot = slots[1];
-      this.backlogCount = safeInboxBacklog(
-        counts.pending,
-        counts.processing,
-        counts.retryableFailed,
-      );
-      this.leasedCount = counts.processing;
-      this.exhaustedCount = counts.exhaustedFailed;
     } else {
-      const counts = await this.inbox.counts();
-      this.backlogCount = safeInboxBacklog(
-        counts.pending,
-        counts.processing,
-        counts.retryableFailed,
-      );
-      this.leasedCount = counts.processing;
-      this.exhaustedCount = counts.exhaustedFailed;
+      counts = await this.inbox.counts();
+    }
+    this.backlogCount = safeInboxBacklog(counts.pending, counts.processing, counts.retryableFailed);
+    this.leasedCount = counts.processing;
+    this.exhaustedCount = counts.exhaustedFailed;
+    let catchUpAdmission: RuntimeCatchUpAdmissionMetricsV1 | undefined;
+    if (this.catchUpAdmissionMetrics !== null) {
+      try {
+        assertValidInboxCounts(counts);
+        catchUpAdmission = snapshotRuntimeCatchUpAdmissionMetrics(
+          this.catchUpAdmissionMetrics(counts), this.backlogCount,
+        );
+      } catch {
+        throw new TypeError('Catch-up admission metrics are invalid.');
+      }
     }
     const blockHydration = this.blockHydrationMetrics?.();
     const value: RuntimeHeartbeat = Object.freeze({
@@ -906,7 +972,13 @@ export class PersistentListenerHeartbeat {
       leasedCount: this.leasedCount,
       exhaustedCount: this.exhaustedCount,
       ...(blockHydration === undefined ? {} : { blockHydration }),
+      ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
     });
+    if (this.catchUpAdmissionMetrics !== null) {
+      try { assertValidRuntimeHeartbeat(value); } catch {
+        throw new TypeError('Catch-up admission metrics are invalid.');
+      }
+    }
     await this.inbox.writeHeartbeat(value);
   }
 }

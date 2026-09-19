@@ -259,7 +259,7 @@ export class CachedSolanaBlockTransactionLocator {
   private async fetchSnapshot(target: TransactionLocationTarget): Promise<BlockTransactionDataSnapshot> {
     let raw: unknown;
     try {
-      raw = await this.rpc.getBlockTransactions(target.slot, target.confirmationStatus);
+      raw = await this.rpc.getBlockTransactions(target.slot, target.confirmationStatus, this.abort.signal);
     } catch {
       this.fetchFailures = increment(this.fetchFailures);
       throw internalLocatorError(new RpcTransientError());

@@ -278,11 +278,15 @@ void test('Compose defines an observe-only, five-service deployment without expo
 });
 
 void test('Compose forwards catch-up policy, block hydration and ingestion scope with safe defaults', async () => {
-  const compose = await readArtifact('deploy/compose.yaml');
-  const environment = await readArtifact('deploy/env.example');
+  const [compose, environment, localEnvironment] = await Promise.all([
+    readArtifact('deploy/compose.yaml'),
+    readArtifact('deploy/env.example'),
+    readArtifact('.env.example'),
+  ]);
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
+    ['LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_MAX_ENTRIES', '64'],
     ['LISTENER_BLOCK_HYDRATION_MAX_BYTES', '67108864'],
@@ -305,8 +309,45 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
     /^ {6}LISTENER_INGESTION_SCOPE: "\$\{LISTENER_INGESTION_SCOPE:-launchpad-and-market\}"$/mu,
   );
   assert.match(environment, /^LISTENER_INGESTION_SCOPE=launchpad-and-market$/mu);
+  assert.match(environment, /^LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false$/mu);
+  assert.match(environment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
+  assert.match(localEnvironment, /^LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false$/mu);
+  assert.match(localEnvironment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
   assert.equal((compose.match(/^ {6}LISTENER_INGESTION_SCOPE:/gmu) ?? []).length, 1);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
+});
+
+void test('Compose catch-up admission resolves default-off and explicit activation without other service exposure', (context) => {
+  const docker = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 10_000 });
+  if (docker.error !== undefined || docker.status !== 0) {
+    context.skip('Docker Compose unavailable: resolved configuration contract skipped');
+    return;
+  }
+  const name = 'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED';
+  for (const configured of [undefined, 'false', 'true']) {
+    const result = spawnSync('docker', [
+      'compose', '--env-file', '/dev/null', '-f', 'deploy/compose.yaml', 'config', '--format', 'json',
+    ], {
+      cwd: fileURLToPath(root), encoding: 'utf8', timeout: 10_000,
+      env: {
+        PATH: process.env.PATH,
+        POSTGRES_DB: 'compose_contract', POSTGRES_USER: 'compose_contract',
+        POSTGRES_PASSWORD: 'contract-only', POSTGRES_PASSWORD_URI_ENCODED: 'contract-only',
+        BACKEND_IMAGE: 'registry.invalid/backend:test', FRONTEND_IMAGE: 'registry.invalid/frontend:test',
+        SOLANA_HTTP_RPC_URL: 'https://rpc.invalid', SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
+        ...(configured === undefined ? {} : { [name]: configured }),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const resolved = JSON.parse(result.stdout) as {
+      readonly services: Readonly<Record<string, { readonly environment?: Readonly<Record<string, string>> }>>;
+    };
+    assert.equal(resolved.services.app?.environment?.[name], configured ?? 'false');
+    assert.equal(resolved.services.app?.environment?.EXECUTION_MODE, 'observe');
+    for (const service of ['postgres', 'migrate', 'retention', 'frontend']) {
+      assert.equal(resolved.services[service]?.environment?.[name], undefined);
+    }
+  }
 });
 
 void test('block hydration canary proves active routing and bounded serialized admission', async () => {
@@ -321,6 +362,54 @@ void test('block hydration canary proves active routing and bounded serialized a
   assert.match(runbook, /delta `fetches` strictement positif/iu);
   assert.match(runbook, /trafic insuffisant[\s\S]*INCONCLUSIVE/iu);
   assert.match(runbook, /Toute autre valeur entraîne\s+`FAIL`/iu);
+});
+
+void test('catch-up admission documentation fixes the restart-only activation and Mainnet gate', async () => {
+  const [readme, architecture, api, runbook, design] = await Promise.all([
+    readArtifact('README.md'),
+    readArtifact('docs/architecture/pumpfun-v1.md'),
+    readArtifact('docs/api/v1.md'),
+    readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('docs/superpowers/specs/2026-09-19-production-catch-up-admission-activation-design.md'),
+  ]);
+  const all = `${readme}\n${architecture}\n${api}\n${runbook}`;
+
+  assert.match(all, /LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false/u);
+  for (const setting of [
+    'EXECUTION_MODE=observe',
+    'LISTENER_ENABLED=true',
+    'LISTENER_INGESTION_SCOPE=launchpad-only',
+    'LISTENER_CATCH_UP_POLICY=live-edge',
+    'LISTENER_BLOCK_HYDRATION_ENABLED=true',
+    'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true',
+  ]) assert.match(all, new RegExp(setting, 'u'));
+  assert.match(all, /redémarr/iu);
+  assert.match(all, /rollback[^.]{0,120}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false/iu);
+  assert.match(all, /provider-affin|affinité fournisseur/iu);
+  assert.match(all, /une seule cache|cache unique|global[^.]{0,120}4[^.]{0,40}fetch/iu);
+  assert.match(design, /hydration permit[^.]{0,240}before[^.]{0,240}StrictCatchUpCoordinator/iu);
+  assert.doesNotMatch(design, /StrictCatchUpCoordinator[^.]{0,120}remains[^.]{0,80}outside[^.]{0,80}hydration permit/iu);
+  assert.match(all, /aucun[^.]{0,80}(?:wallet|clé privée|executor|exécuteur|soumission)/iu);
+  assert.match(architecture, /pré-E\/S[^.]{0,240}enveloppe canonique base58/iu);
+  assert.match(architecture, /getGenesisHash[^.]{0,240}catch-up[^.]{0,240}fail-closed/iu);
+  for (const field of [
+    'version', 'enabled', 'providerId', 'scanActive', 'workerClaimReady',
+    'actionableBacklogBySource', 'actionableBacklogByPriority', 'deferredCount',
+    'ignoredCount', 'quarantinedCount',
+  ]) assert.match(api, new RegExp(`catchUpAdmission[\\s\\S]{0,2000}${field}`, 'u'));
+  assert.match(api, /métrique brute est absente[^.]{0,240}"catchUpAdmission": null/iu);
+  assert.match(api, /réponse plus[\s\S]{0,240}ancienne[^.]{0,240}omettre[^.]{0,240}champ optionnel/iu);
+  assert.match(api, /providerId[^.]{0,250}null/iu);
+  assert.match(api, /providerId[^.]{0,300}scan actif[^.]{0,180}provider promu/iu);
+  assert.match(runbook, /Canary Mainnet post-merge[\s\S]{0,100}15 minutes/iu);
+  for (const gate of ['zéro HTTP 429', 'backlog', 'RSS', 'p95', 'finalit', 'idempot', 'quatre heures', 'affinit', 'shutdown']) {
+    assert.match(runbook, new RegExp(gate, 'iu'));
+  }
+  assert.match(runbook, /readiness Mainnet[^.]*déclarée avant/iu);
+  assert.match(runbook, /métrique brute[^.]{0,240}omise[^.]{0,240}`heartbeat\.catchUpAdmission: null`/iu);
+  assert.doesNotMatch(runbook, /heartbeat\.catchUpAdmission\.enabled=false/iu);
+  assert.match(runbook, /Rollback B3b admission-only[\s\S]{0,500}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false[\s\S]{0,500}LISTENER_BLOCK_HYDRATION_ENABLED=true/iu);
+  assert.match(runbook, /Rollback complet d'hydratation bloc[\s\S]{0,500}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false[\s\S]{0,500}LISTENER_BLOCK_HYDRATION_ENABLED=false[\s\S]{0,300}redémarr/iu);
 });
 
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {

@@ -29,6 +29,21 @@ import {
   timelineEntry,
 } from '../../tests/fixtures/api.js';
 
+function catchUpAdmissionMetrics() {
+  return {
+    version: 1, enabled: true, providerId: 'fallback-1', scanActive: true, workerClaimReady: false,
+    actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 3 },
+    actionableBacklogByPriority: { normal: 3, launchCandidate: 2, trackedTrade: 1 },
+    deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
+  };
+}
+
+function parseCatchUpAdmission(catchUpAdmission: unknown, backlogCount = 6) {
+  return apiHealthEnvelopeSchema.parse(success({
+    ...health, heartbeat: { ...health.heartbeat, catchUpAdmission, backlogCount },
+  })).data;
+}
+
 const DOMAIN_EVENT_TYPES = [
   'TokenLaunchDetected', 'TokenMetadataResolved', 'TokenMetadataFailed',
   'SocialEvidenceCollected', 'CreatorProfileUpdated', 'HolderDistributionUpdated',
@@ -128,6 +143,64 @@ describe('frontend-owned API V1 schemas', () => {
       pipeline: { ...health.pipeline, qualification: 'RUNNING' },
       qualification: { currentCount: 3, lastSuccessAt: 'not-a-timestamp' },
     }))).toThrow();
+  });
+
+  it('accepts catch-up admission V1 metrics and absent/null rolling-deployment fields', () => {
+    const metrics = catchUpAdmissionMetrics();
+    const parsed = parseCatchUpAdmission(metrics);
+    expect(parsed.heartbeat.catchUpAdmission).toEqual(metrics);
+    expectTypeOf(parsed.heartbeat.catchUpAdmission?.providerId).toEqualTypeOf<'primary' | 'fallback-1' | 'fallback-2' | 'fallback-3' | null | undefined>();
+    expect(apiHealthEnvelopeSchema.parse(success(health)).data.heartbeat.catchUpAdmission).toBeUndefined();
+    expect(parseCatchUpAdmission(null).heartbeat.catchUpAdmission).toBeNull();
+    for (const providerId of ['primary', 'fallback-1', 'fallback-2', 'fallback-3', null]) {
+      expect(parseCatchUpAdmission({ ...metrics, providerId, scanActive: false }).heartbeat.catchUpAdmission?.providerId).toBe(providerId);
+    }
+    expect(parseCatchUpAdmission({ ...metrics, enabled: false, providerId: null, scanActive: false }).heartbeat.catchUpAdmission?.enabled).toBe(false);
+    const maximum = {
+      ...metrics,
+      actionableBacklogBySource: { websocketOnly: Number.MAX_SAFE_INTEGER, catchUpOnly: 0, websocketAndCatchUp: 0 },
+      actionableBacklogByPriority: { normal: Number.MAX_SAFE_INTEGER, launchCandidate: 0, trackedTrade: 0 },
+      deferredCount: Number.MAX_SAFE_INTEGER,
+    };
+    expect(parseCatchUpAdmission(maximum, Number.MAX_SAFE_INTEGER).heartbeat.catchUpAdmission).toEqual(maximum);
+  });
+
+  it('rejects malformed catch-up admission exact keys, states, bounded counts and sums', () => {
+    const metrics = catchUpAdmissionMetrics();
+    const invalid: unknown[] = [
+      [], 'https://secret.invalid', { ...metrics, version: 2 },
+      { ...metrics, enabled: 1 }, { ...metrics, scanActive: 'true' }, { ...metrics, workerClaimReady: 0 },
+      { ...metrics, providerId: 'fallback-99' }, { ...metrics, providerId: 'https://secret.invalid' },
+      { ...metrics, providerId: 'secret-signature' }, { ...metrics, providerId: 'secret-mint' },
+      { ...metrics, rpcUrl: 'https://secret.invalid' }, { ...metrics, signature: 'secret-signature' },
+      { ...metrics, mint: 'secret-mint' }, { ...metrics, workerClaimReady: true },
+      { ...metrics, providerId: null }, { ...metrics, enabled: false },
+      { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, extra: 0 } },
+      { ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, mint: 'secret-mint' } },
+      { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, websocketOnly: 2 } },
+      { ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, normal: 4 } },
+      { ...metrics, actionableBacklogBySource: { websocketOnly: Number.MAX_SAFE_INTEGER, catchUpOnly: 1, websocketAndCatchUp: 0 } },
+    ];
+    for (const count of [-1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, '1', 1n]) {
+      for (const field of ['deferredCount', 'ignoredCount', 'quarantinedCount']) invalid.push({ ...metrics, [field]: count });
+      for (const field of ['websocketOnly', 'catchUpOnly', 'websocketAndCatchUp']) {
+        invalid.push({ ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, [field]: count } });
+      }
+      for (const field of ['normal', 'launchCandidate', 'trackedTrade']) {
+        invalid.push({ ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, [field]: count } });
+      }
+    }
+    for (const field of Object.keys(metrics)) {
+      const incomplete = Object.fromEntries(Object.entries(metrics).filter(([key]) => key !== field));
+      invalid.push(incomplete);
+    }
+    for (const candidate of invalid) expect(() => parseCatchUpAdmission(candidate)).toThrow();
+    expect(() => parseCatchUpAdmission(metrics, 7)).toThrow();
+    for (const backlogCount of [null, undefined]) {
+      expect(() => apiHealthEnvelopeSchema.parse(success({
+        ...health, heartbeat: { ...health.heartbeat, catchUpAdmission: metrics, backlogCount },
+      }))).toThrow();
+    }
   });
 
   it('accepts the complete WebSocket diagnostic and an older backend without it', () => {

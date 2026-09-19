@@ -258,6 +258,15 @@ export interface RuntimeHeartbeat {
   readonly leasedCount: number;
   readonly exhaustedCount: number;
   readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
+  readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
+}
+
+export interface RuntimeCatchUpAdmissionMetricsV1 extends CatchUpAdmissionCounts {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly providerId: RpcProviderId | null;
+  readonly scanActive: boolean;
+  readonly workerClaimReady: boolean;
 }
 
 export interface RuntimeBlockHydrationMetricsV1 {
@@ -282,6 +291,22 @@ export interface RuntimeBlockHydrationMetricsV1 {
   readonly queueDelayMs: Readonly<{ readonly last: number | null; readonly maximum: number | null }>;
 }
 
+export interface CatchUpAdmissionCounts {
+  readonly actionableBacklogBySource: Readonly<{
+    websocketOnly: number;
+    catchUpOnly: number;
+    websocketAndCatchUp: number;
+  }>;
+  readonly actionableBacklogByPriority: Readonly<{
+    normal: number;
+    launchCandidate: number;
+    trackedTrade: number;
+  }>;
+  readonly deferredCount: number;
+  readonly ignoredCount: number;
+  readonly quarantinedCount: number;
+}
+
 export interface InboxCounts {
   readonly pending: number;
   readonly processing: number;
@@ -289,6 +314,7 @@ export interface InboxCounts {
   readonly failed: number;
   readonly retryableFailed: number;
   readonly exhaustedFailed: number;
+  readonly catchUpAdmission: CatchUpAdmissionCounts;
 }
 
 export interface InboxRecoveryResult {
@@ -677,6 +703,42 @@ export function assertValidRuntimeHeartbeat(
   if (record.blockHydration !== undefined) {
     assertValidRuntimeBlockHydrationMetrics(record.blockHydration);
   }
+  if (record.catchUpAdmission !== undefined) {
+    snapshotRuntimeCatchUpAdmissionMetrics(record.catchUpAdmission, record.backlogCount);
+  }
+}
+
+/** Detach validated metrics from callback-owned objects before JSON serialization. */
+export function snapshotRuntimeCatchUpAdmissionMetrics(
+  value: unknown,
+  backlogCount: number,
+): RuntimeCatchUpAdmissionMetricsV1 {
+  try {
+    const metrics = frozenRecord(value, 'Runtime heartbeat catch-up admission');
+    assertExactKeys(metrics, [
+      'version', 'enabled', 'providerId', 'scanActive', 'workerClaimReady',
+      'actionableBacklogBySource', 'actionableBacklogByPriority',
+      'deferredCount', 'ignoredCount', 'quarantinedCount',
+    ], 'Runtime heartbeat catch-up admission');
+    if (metrics.version !== 1 || typeof metrics.enabled !== 'boolean'
+      || typeof metrics.scanActive !== 'boolean' || typeof metrics.workerClaimReady !== 'boolean'
+      || (metrics.providerId !== null && !isRpcProviderId(metrics.providerId))
+      || (metrics.scanActive && metrics.workerClaimReady)
+      || (metrics.providerId === null && (metrics.scanActive || metrics.workerClaimReady))
+      || (!metrics.enabled && (metrics.providerId !== null || metrics.scanActive || metrics.workerClaimReady))) {
+      throw new TypeError('Runtime heartbeat catch-up admission state is invalid.');
+    }
+    assertValidCatchUpAdmissionCounts(Object.freeze({
+      actionableBacklogBySource: metrics.actionableBacklogBySource,
+      actionableBacklogByPriority: metrics.actionableBacklogByPriority,
+      deferredCount: metrics.deferredCount,
+      ignoredCount: metrics.ignoredCount,
+      quarantinedCount: metrics.quarantinedCount,
+    }), backlogCount);
+    return metrics as unknown as RuntimeCatchUpAdmissionMetricsV1;
+  } catch {
+    throw new TypeError('Runtime heartbeat catch-up admission metrics are invalid.');
+  }
 }
 
 function assertValidRuntimeBlockHydrationMetrics(value: unknown): void {
@@ -739,6 +801,36 @@ export function assertValidInboxCounts(value: unknown): asserts value is InboxCo
   assertCount(record.exhaustedFailed, 'Inbox counts exhaustedFailed');
   if (record.retryableFailed + record.exhaustedFailed > record.failed) {
     throw new TypeError('Inbox counts retryableFailed and exhaustedFailed exceed failed.');
+  }
+  assertValidCatchUpAdmissionCounts(
+    record.catchUpAdmission,
+    record.pending + record.processing + record.retryableFailed,
+  );
+}
+
+function assertValidCatchUpAdmissionCounts(value: unknown, backlog: number): void {
+  const counts = frozenRecord(value, 'Catch-up admission counts');
+  assertExactKeys(counts, [
+    'actionableBacklogBySource', 'actionableBacklogByPriority',
+    'deferredCount', 'ignoredCount', 'quarantinedCount',
+  ], 'Catch-up admission counts');
+  assertCount(backlog, 'Catch-up admission backlog');
+  for (const [field, keys] of [
+    ['actionableBacklogBySource', ['websocketOnly', 'catchUpOnly', 'websocketAndCatchUp']],
+    ['actionableBacklogByPriority', ['normal', 'launchCandidate', 'trackedTrade']],
+  ] as const) {
+    const dimension = frozenRecord(counts[field], 'Catch-up admission dimension');
+    assertExactKeys(dimension, keys, 'Catch-up admission dimension');
+    let total = 0;
+    for (const key of keys) {
+      assertCount(dimension[key], 'Catch-up admission count');
+      total += dimension[key];
+      assertCount(total, 'Catch-up admission total');
+    }
+    if (total !== backlog) throw new TypeError('Catch-up admission backlog is inconsistent.');
+  }
+  for (const field of ['deferredCount', 'ignoredCount', 'quarantinedCount'] as const) {
+    assertCount(counts[field], 'Catch-up admission count');
   }
 }
 

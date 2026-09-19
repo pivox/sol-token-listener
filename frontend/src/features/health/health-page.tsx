@@ -26,11 +26,31 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Qualification"><p>Rapports courants : {health.qualification.currentCount}</p><p>Dernier succès : <Timestamp value={health.qualification.lastSuccessAt} /></p></HealthCard>
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
         <HealthCard title="Hydratation des blocs"><BlockHydrationDiagnostic value={health.heartbeat.blockHydration} /></HealthCard>
+        <HealthCard title="Admission catch-up"><CatchUpAdmissionDiagnostic value={health.heartbeat.catchUpAdmission} /></HealthCard>
         <HealthCard title="WebSocket Solana"><WebSocketDiagnostic websocket={health.heartbeat.websocket} /></HealthCard>
         <HealthCard title="Checkpoints"><p>Launchpad : {health.checkpoints.launchpad ?? 'Indisponible'}</p><p>Marché : {health.checkpoints.market ?? 'Indisponible'}</p><p>Retard : {health.lagSlots ?? 'Indisponible'} slot(s)</p></HealthCard>
       </div>
     </section>
   );
+}
+
+function CatchUpAdmissionDiagnostic({
+  value,
+}: {
+  readonly value: ApiHealth['heartbeat']['catchUpAdmission'];
+}): ReactNode {
+  if (value === undefined || value === null) return <p>Non activé</p>;
+  const source = value.actionableBacklogBySource;
+  const priority = value.actionableBacklogByPriority;
+  return <>
+    <p>{value.enabled ? 'Activé' : 'Non activé'}</p>
+    <p>Fournisseur : {value.providerId ?? 'Indisponible'}</p>
+    <p>Scan actif : {value.scanActive ? 'Oui' : 'Non'}</p>
+    <p>Worker prêt à réclamer : {value.workerClaimReady ? 'Oui' : 'Non'}</p>
+    <p>WebSocket seul : {source.websocketOnly} ; catch-up seul : {source.catchUpOnly} ; WebSocket et catch-up : {source.websocketAndCatchUp}</p>
+    <p>Normale : {priority.normal} ; lancement candidat : {priority.launchCandidate} ; trade suivi : {priority.trackedTrade}</p>
+    <p>Différés : {value.deferredCount} ; ignorés : {value.ignoredCount} ; en quarantaine : {value.quarantinedCount}</p>
+  </>;
 }
 
 function BlockHydrationDiagnostic({

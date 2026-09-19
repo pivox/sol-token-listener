@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
+import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { createPumpDecodingError, PUMP_DECODING_ERROR_CODES } from '../src/launchpads/pumpfun/errors.js';
 import { createPumpSwapDecodingError, PUMPSWAP_DECODING_ERROR_CODES } from '../src/markets/pumpswap/errors.js';
 import { failurePipeline, failureTransaction, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
@@ -47,6 +48,210 @@ import {
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
+
+void test('catch-up admission counts partition actionable work by source and priority in one query', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await insertTrackedLaunch(pool);
+    await repository.enqueue(notification('normal', 1n));
+    await repository.recordCatchUpClassification(catchUpClassification('launch'));
+    await repository.enqueue(tradeNotification('trade', 2n));
+    await repository.enqueue(pumpCatchUpNotification('trade', 2n));
+    await repository.enqueue(notification('retry', 3n, 'CATCH_UP'));
+    await repository.enqueue(notification('fatal', 4n));
+    await repository.enqueue(notification('exhausted', 5n));
+    await repository.enqueue(notification('processed', 6n));
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='FAILED',
+      error_code='RPC_TRANSIENT', error_name='RpcError', error_retryable=TRUE,
+      next_attempt_at=clock_timestamp() WHERE signature='retry'`);
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='FAILED',
+      error_code='NORMALIZATION_FAILED', error_name='TypeError', error_retryable=FALSE,
+      terminal_at=now(), purge_after=now()+INTERVAL '4 hours'
+      WHERE signature='fatal'`);
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='FAILED',
+      error_code='RPC_TRANSIENT', error_name='RpcError', error_retryable=TRUE,
+      retry_exhausted_at=now(), terminal_at=now(), purge_after=now()+INTERVAL '4 hours'
+      WHERE signature='exhausted'`);
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='PROCESSED',
+      processed_at=clock_timestamp(), normalized_transaction='{}'::jsonb,
+      immutable_fingerprint=repeat('a',64) WHERE signature='processed'`);
+    const claim = await repository.claim(Date.now(), 30);
+    assert.equal(claim?.signature, 'launch');
+    await repository.enqueue(tradeNotification('deferred', 7n, '11111111111111111111111111111111'));
+    for (const [signature, disposition, reasonCode] of [
+      ['ignored', 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION'],
+      ['quarantined', 'QUARANTINED', 'PUMP_SCHEMA_UNSUPPORTED'],
+    ] as const) {
+      await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput(signature), disposition, reasonCode,
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      }));
+    }
+    const queries: string[] = [];
+    const measured = new PostgresTransactionInboxRepository({
+      connect: () => pool.connect(),
+      query: async (sql, values) => { queries.push(sql); return pool.query(sql, values === undefined ? undefined : [...values]); },
+    });
+    const counts = await measured.counts();
+    assert.equal(queries.length, 1);
+    assert.deepEqual(counts, {
+      pending: 2, processing: 1, processed: 1, failed: 3, retryableFailed: 1, exhaustedFailed: 1,
+      catchUpAdmission: {
+        actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 1 },
+        actionableBacklogByPriority: { normal: 2, launchCandidate: 1, trackedTrade: 1 },
+        deferredCount: 1, ignoredCount: 1, quarantinedCount: 1,
+      },
+    });
+    assert.ok(Object.isFrozen(counts.catchUpAdmission));
+    assert.ok(Object.isFrozen(counts.catchUpAdmission.actionableBacklogBySource));
+    assert.ok(Object.isFrozen(counts.catchUpAdmission.actionableBacklogByPriority));
+  });
+});
+
+void test('persists optional catch-up admission heartbeat metrics and rejects invalid payloads', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const catchUpAdmission = Object.freeze({ version: 1 as const, enabled: true,
+      providerId: 'primary' as const, scanActive: false, workerClaimReady: true,
+      actionableBacklogBySource: Object.freeze({ websocketOnly: 1, catchUpOnly: 1, websocketAndCatchUp: 1 }),
+      actionableBacklogByPriority: Object.freeze({ normal: 1, launchCandidate: 1, trackedTrade: 1 }),
+      deferredCount: 2, ignoredCount: 3, quarantinedCount: 4,
+    });
+    const heartbeat: RuntimeHeartbeat = Object.freeze({
+      runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+      workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+      updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+      lastFinalizedSlot: null, lastSignature: null, backlogCount: 3, leasedCount: 0,
+      exhaustedCount: 0, catchUpAdmission,
+    });
+    await repository.writeHeartbeat(heartbeat);
+    assert.deepEqual((await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload, {
+      startedAt: '1970-01-01T00:00:01.000Z', catchUpAdmission,
+    });
+    await assert.rejects(repository.writeHeartbeat(Object.freeze({ ...heartbeat, updatedAtMs: 3_000,
+      catchUpAdmission: Object.freeze({ ...catchUpAdmission, providerId: 'https://private-secret.invalid' }),
+    }) as unknown as RuntimeHeartbeat), (error: unknown) => {
+      assert.ok(error instanceof TransactionInboxRepositoryError);
+      assert.doesNotMatch(String(error), /private-secret/u);
+      return true;
+    });
+    const { catchUpAdmission: omitted, ...legacy } = heartbeat;
+    assert.ok(omitted);
+    await repository.writeHeartbeat(Object.freeze({ ...legacy, updatedAtMs: 4_000 }));
+    assert.deepEqual((await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload, {
+      startedAt: '1970-01-01T00:00:01.000Z',
+    });
+  });
+});
+
+for (const [location, boundary] of [
+  ['metrics', 'callback'], ['metrics', 'repository'],
+  ['source', 'callback'], ['source', 'repository'],
+  ['priority', 'callback'], ['priority', 'repository'],
+] as const) {
+  void test(`${boundary} canonicalizes catch-up admission ${location} proxies before PostgreSQL serialization`, async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool);
+      const counts = await repository.counts();
+      const expected = Object.freeze({ version: 1 as const, enabled: true,
+        providerId: 'primary' as const, scanActive: false, workerClaimReady: true,
+        ...counts.catchUpAdmission,
+      });
+      let serializationReads = 0;
+      const handler: ProxyHandler<object> = {
+        get(target, key, receiver) {
+          if (key === 'toJSON') {
+            serializationReads += 1;
+            return () => ({ endpoint: 'https://private-proxy-secret.invalid' });
+          }
+          return Reflect.get(target, key, receiver) as unknown;
+        },
+      };
+      const metrics = location === 'metrics' ? new Proxy<typeof expected>(expected, handler) : Object.freeze({
+        ...expected,
+        ...(location === 'source'
+          ? { actionableBacklogBySource: new Proxy<typeof expected.actionableBacklogBySource>(expected.actionableBacklogBySource, handler) }
+          : { actionableBacklogByPriority: new Proxy<typeof expected.actionableBacklogByPriority>(expected.actionableBacklogByPriority, handler) }),
+      });
+      if (boundary === 'repository') {
+        await repository.writeHeartbeat(Object.freeze({
+          runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+          workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+          updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+          lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0,
+          exhaustedCount: 0, catchUpAdmission: metrics,
+        }));
+        const payload: unknown = (await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload;
+        assert.deepEqual(payload, { startedAt: '1970-01-01T00:00:01.000Z', catchUpAdmission: expected });
+        assert.equal(serializationReads, 0);
+        assert.doesNotMatch(JSON.stringify(payload), /private-proxy-secret/u);
+        return;
+      }
+      let written: RuntimeHeartbeat | undefined;
+      const heartbeat = new PersistentListenerHeartbeat({
+        counts: () => repository.counts(),
+        async writeHeartbeat(value) { written = value; await repository.writeHeartbeat(value); },
+      }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+      () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+        intervalMs: 5, shutdownTimeoutMs: 100,
+        scheduler: { schedule: () => 0, cancel: () => undefined },
+        catchUpAdmissionMetrics: () => metrics,
+      });
+      try {
+        await heartbeat.start();
+        const payload: unknown = (await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload;
+        assert.ok(written);
+        assert.deepEqual(payload, {
+          startedAt: new Date(written.startedAtMs).toISOString(), catchUpAdmission: expected,
+        });
+        assert.equal(serializationReads, 0);
+        assert.notEqual(written.catchUpAdmission, metrics);
+        assert.notEqual(written.catchUpAdmission?.actionableBacklogBySource, metrics.actionableBacklogBySource);
+        assert.notEqual(written.catchUpAdmission?.actionableBacklogByPriority, metrics.actionableBacklogByPriority);
+        assert.ok(Object.isFrozen(written.catchUpAdmission));
+        assert.ok(Object.isFrozen(written.catchUpAdmission?.actionableBacklogBySource));
+        assert.ok(Object.isFrozen(written.catchUpAdmission?.actionableBacklogByPriority));
+        assert.doesNotMatch(JSON.stringify(payload), /private-proxy-secret/u);
+      } finally { await heartbeat.stop(); }
+    });
+  });
+}
+
+void test('catch-up admission counts reject malformed PostgreSQL values and inconsistent dimensions', async () => {
+  const valid = {
+    pending: '1', processing: '1', processed: '0', failed: '1', retryable_failed: '1', exhausted_failed: '0',
+    websocket_only: '1', catch_up_only: '1', websocket_and_catch_up: '1',
+    normal: '1', launch_candidate: '1', tracked_trade: '1', deferred: '0', ignored: '0', quarantined: '0',
+  };
+  for (const field of ['websocket_only', 'catch_up_only', 'websocket_and_catch_up',
+    'normal', 'launch_candidate', 'tracked_trade', 'deferred', 'ignored', 'quarantined']) {
+    for (const value of [-1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, null, undefined,
+      '-1', '01', '1.5', '9007199254740992', 'https://private-secret.invalid']) {
+      const repository = new PostgresTransactionInboxRepository({
+        async connect() { throw new Error('Not used.'); },
+        async query<Row extends pg.QueryResultRow>(): Promise<pg.QueryResult<Row>> {
+          return { rows: [{ ...valid, [field]: value }] as unknown as Row[], rowCount: 1,
+            command: 'SELECT', oid: 0, fields: [] };
+        },
+      });
+      await assert.rejects(repository.counts(), (error: unknown) => {
+        assert.ok(error instanceof TransactionInboxRepositoryError);
+        assert.doesNotMatch(String(error), /private-secret/u);
+        return true;
+      });
+    }
+  }
+  for (const patch of [{ websocket_only: '2' }, { tracked_trade: '2' }]) {
+    const repository = new PostgresTransactionInboxRepository({
+      async connect() { throw new Error('Not used.'); },
+      async query<Row extends pg.QueryResultRow>(): Promise<pg.QueryResult<Row>> {
+        return { rows: [{ ...valid, ...patch }] as unknown as Row[], rowCount: 1,
+          command: 'SELECT', oid: 0, fields: [] };
+      },
+    });
+    await assert.rejects(repository.counts(), TransactionInboxRepositoryError);
+  }
+});
 
 void test('keeps durable ingestion independent of launchpad and market adapter imports', async () => {
   const source = await readFile(new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url), 'utf8');
@@ -370,6 +575,11 @@ void test('persists ignored and quarantined classifications as non-claimable fou
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 0,
       retryableFailed: 0, exhaustedFailed: 0,
+      catchUpAdmission: {
+        actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
+        actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },
+        deferredCount: 0, ignoredCount: 1, quarantinedCount: 1,
+      },
     });
   });
 });
@@ -782,6 +992,11 @@ void test('defers untracked trade hints durably without claims, finality, retry 
     });
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0,
+      catchUpAdmission: {
+        actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
+        actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },
+        deferredCount: 1, ignoredCount: 0, quarantinedCount: 0,
+      },
     });
     assert.deepEqual(await row(pool, 'untracked'), stored);
   });
@@ -2435,6 +2650,11 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 2,
       retryableFailed: 1, exhaustedFailed: 0,
+      catchUpAdmission: {
+        actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 0, websocketAndCatchUp: 0 },
+        actionableBacklogByPriority: { normal: 1, launchCandidate: 0, trackedTrade: 0 },
+        deferredCount: 0, ignoredCount: 0, quarantinedCount: 0,
+      },
     });
     const retryAt = new Date(failed.next_attempt_at).getTime();
     assert.equal(await repository.claim(retryAt - 1, 120), null);
@@ -2470,6 +2690,11 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 2,
       retryableFailed: 0, exhaustedFailed: 1,
+      catchUpAdmission: {
+        actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
+        actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },
+        deferredCount: 0, ignoredCount: 0, quarantinedCount: 0,
+      },
     });
 
     await repository.enqueue(notification('unsafe-error-name', 42n));
