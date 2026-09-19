@@ -392,13 +392,16 @@ void test('catch-up admission documentation fixes the restart-only activation an
     'actionableBacklogBySource', 'actionableBacklogByPriority', 'deferredCount',
     'ignoredCount', 'quarantinedCount',
   ]) assert.match(api, new RegExp(`catchUpAdmission[\\s\\S]{0,2000}${field}`, 'u'));
-  assert.match(api, /absence \(champ omis, jamais `null`\) signifie qu'un backend\s+antérieur/iu);
+  assert.match(api, /métrique brute est absente[^.]{0,240}"catchUpAdmission": null/iu);
+  assert.match(api, /réponse plus[\s\S]{0,240}ancienne[^.]{0,240}omettre[^.]{0,240}champ optionnel/iu);
   assert.match(api, /providerId[^.]{0,250}null/iu);
   assert.match(runbook, /Canary Mainnet post-merge[\s\S]{0,100}15 minutes/iu);
   for (const gate of ['zéro HTTP 429', 'backlog', 'RSS', 'p95', 'finalit', 'idempot', 'quatre heures', 'affinit', 'shutdown']) {
     assert.match(runbook, new RegExp(gate, 'iu'));
   }
   assert.match(runbook, /readiness Mainnet[^.]*déclarée avant/iu);
+  assert.match(runbook, /métrique brute[^.]{0,240}omise[^.]{0,240}`heartbeat\.catchUpAdmission: null`/iu);
+  assert.doesNotMatch(runbook, /heartbeat\.catchUpAdmission\.enabled=false/iu);
 });
 
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {

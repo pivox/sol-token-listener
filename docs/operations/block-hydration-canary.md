@@ -71,8 +71,8 @@ activation.
 
 Toute violation est `FAIL`. Pour rollback, remettre
 `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false`, redémarrer la réplique
-et vérifier `heartbeat.catchUpAdmission.enabled=false`,
-`heartbeat.blockHydration.enabled=true`, que la file revient à zéro et que le
-backlog reprend sa tendance de baseline. Ne jamais supprimer checkpoint ou
-donnée durable pour masquer un échec : les receipts historiques restent retenus
-quatre heures.
+et vérifier que la métrique brute `catchUpAdmission` est omise du heartbeat,
+tandis que l'API projette `heartbeat.catchUpAdmission: null` ;
+`heartbeat.blockHydration.enabled=true`, la file revient à zéro et le backlog
+reprend sa tendance de baseline. Ne jamais supprimer checkpoint ou donnée durable
+pour masquer un échec : les receipts historiques restent retenus quatre heures.
