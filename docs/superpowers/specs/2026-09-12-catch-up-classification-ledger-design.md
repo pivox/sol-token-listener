@@ -1,6 +1,6 @@
 # Catch-up Classification Ledger V1 Design
 
-Version: 4 — 2026-09-19
+Version: 5 — 2026-09-19
 
 ## Scope
 
@@ -56,12 +56,18 @@ the compatible `mint -> rows` order. Membership is read while the mint lock is
 held, so an active tracked mint is admitted as `PENDING/TRACKED_TRADE` even when
 the original evidence disposition was `DEFERRED`.
 
-Exact replay is idempotent. The immutable action key compares the original
-CREATE/TRADE/NONE evidence without trusting the mutable current inbox hint.
-Replay unions canonical program IDs, reconciles `confirmed` to `finalized`, and
-preserves normal multi-program convergence of a trade hint to `NONE`. A changed
-action key, version, disposition, reason, mint set, evidence fingerprint or
-classification timestamp is an immutable classification conflict.
+Semantic replay is idempotent even when a later classifier invocation supplies
+new `observedAtMs` and `classifiedAtMs` values. The evidence fingerprint excludes
+observation/classification/blockchain time and confirmation status. The first
+stored `catch_up_classified_at` remains authoritative; replay never rewrites it,
+and terminal replay preserves the first `terminal_at` and `purge_after` instead
+of starting a new four-hour window. The immutable action key compares the
+original CREATE/TRADE/NONE evidence without trusting the mutable current inbox
+hint. Replay unions canonical program IDs, reconciles `confirmed` to
+`finalized`, and preserves normal multi-program convergence of a trade hint to
+`NONE`. A changed action key, version, disposition, reason, mint set or evidence
+fingerprint is an immutable classification conflict. Timestamps and finality
+remain mutable convergence evidence, not classification identity.
 
 When exact finalized evidence arrives after an actionable row was processed at
 `confirmed`, classification replay follows the inbox finality replay lifecycle:
