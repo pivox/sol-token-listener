@@ -3,8 +3,26 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.9
+Version: 1.0.11
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.11 makes the paper claim election independent of the connection's
+default isolation and preserves lease freshness while a claimant waits. Claim
+uses an explicit `READ COMMITTED` transaction. It measures elapsed wall-clock
+time from before transaction start through advisory-lock acquisition, clamps a
+backward clock adjustment to zero, and adds that elapsed duration to the
+caller's logical `nowMs`. The resulting effective time drives eligibility,
+lease expiry and terminal retention without replacing deterministic synthetic
+timestamps used by replay tests.
+
+Revision 1.0.10 serializes only the bounded paper claim election transaction.
+Each claimant acquires a transaction-scoped advisory lock in a distinct SQL
+statement after `BEGIN` and before the finality-preflight CTE. The lock key is
+derived from the resolved `paper_decision_jobs` relation OID, so every replica
+using the same table shares one scheduler while isolated PostgreSQL test schemas
+remain independent. Waiting for the lock completes before the CTE obtains its
+`READ COMMITTED` statement snapshot, preventing a stale claimant from rotating
+the same released sixteen-row batch. Claimed jobs remain processed concurrently.
 
 Revision 1.0.9 adapts the paper activation barrier to issue #63's observable
 background WebSocket recovery. The recurring controller may retry initial
@@ -416,7 +434,15 @@ and paper retries, or paper wins first and `enqueueRevision` waits; the later
 replay can then retract the paper lineage. Barrier failures are fixed and
 redacted and become bounded retryable paper failures, never terminal decisions.
 
-Claim first locks at most sixteen eligible jobs, before any replay join, in
+Claim first begins an explicit `READ COMMITTED` transaction and acquires the
+relation-scoped paper claim scheduler advisory lock in its own statement. Only
+the election transaction is serialized; work performed after a successful
+claim remains parallel. The repository measures wall-clock time immediately
+before transaction start and after lock acquisition, adds the non-negative
+elapsed duration to the caller's logical timestamp, and derives the claim time,
+lease expiry and terminal retention from that effective timestamp. The
+subsequent statement therefore obtains a fresh statement snapshot and locks at
+most sixteen eligible jobs, before any replay join, in
 durable fairness order `(effective_at, claim_scan_generation, created_at,
 job_id)`. `effective_at` is `COALESCE(finality_checked_at, created_at)` for
 pending jobs, the greatest of that value and `next_attempt_at` for retryable
@@ -424,10 +450,12 @@ jobs, and the greatest of it and `lease_expires_at` for processing jobs. The
 batch is materialized once, expired maximum-attempt leases are cancelled only
 inside it, and finality is evaluated at most once for each remaining row. The
 first ready job is claimed; only blocked rows advance `finality_checked_at` and
-take the next value from the durable monotone claim-scan generation. `SKIP
-LOCKED` permits multiple replicas without duplicate inspection, while the
-generation makes a ready job beyond the first batch reachable after restart
-even when every rotation uses the same application timestamp.
+take the next value from the durable monotone claim-scan generation. The
+scheduler lock prevents multiple replicas from evaluating an ordering snapshot
+that predates a concurrent released row lock. `SKIP LOCKED` remains a defense
+inside the bounded query, while the generation makes a ready job beyond the
+first batch reachable after restart even when every rotation uses the same
+application timestamp.
 
 `markProcessed(finalized|orphaned)` writes
 `chain_transaction_finality_replay_receipts` from the final inbox update in the
@@ -555,7 +583,8 @@ advance to 029. No existing transaction, event or projection row is deleted.
   scan, sort or join filter;
 - a 1,000-job claim backlog evaluates no more than sixteen jobs per call,
   rotates blocked jobs durably, reaches a later ready job and remains safe under
-  concurrent `SKIP LOCKED` claimers;
+  concurrent claimers; repository contract tests require the exact
+  `BEGIN -> relation-scoped scheduler lock -> claim CTE -> COMMIT` order;
 - an earlier orphaned raw with pending replay blocks a later aligned source at
   claim, snapshot, stage and paper open; processed orphan replay or its exact
   post-purge receipt resumes work without paper writes during the blocked state;

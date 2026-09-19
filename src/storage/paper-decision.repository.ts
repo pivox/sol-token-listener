@@ -64,6 +64,12 @@ interface Pool { connect(): Promise<Client> }
 
 type Operation = 'enqueue' | 'wake' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
 const MAX_PAPER_FINALITY_PREFLIGHT_JOBS=16;
+const PAPER_DECISION_CLAIM_SCHEDULER_LOCK_SQL = `SELECT pg_advisory_xact_lock(
+  hashtextextended(
+    'paper-decision-claim-scheduler:v1:' || 'paper_decision_jobs'::regclass::oid::text,
+    0
+  )
+)`;
 export type ExecutionIntentEmissionConfig = Readonly<{
   readonly quoteMintAllowlist: readonly string[];
   readonly wsolMint: string;
@@ -251,13 +257,23 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     timestamp(options.nowMs, 'nowMs');
     const client = await this.connect('claim');
     try {
-      await client.query('BEGIN');
-      const now = new Date(options.nowMs);
+      const schedulerWaitStartedAtMs = this.clock();
+      timestamp(schedulerWaitStartedAtMs, 'clock');
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      await client.query(PAPER_DECISION_CLAIM_SCHEDULER_LOCK_SQL);
+      const schedulerWaitFinishedAtMs = this.clock();
+      timestamp(schedulerWaitFinishedAtMs, 'clock');
+      const effectiveNowMs = options.nowMs + Math.max(
+        0,
+        schedulerWaitFinishedAtMs - schedulerWaitStartedAtMs,
+      );
+      timestamp(effectiveNowMs, 'effectiveNowMs');
+      const now = new Date(effectiveNowMs);
       const leaseToken = `paper_lease_${randomUUID()}`;
       const result = await client.query(paperDecisionClaimSql(),[
-        now,leaseToken,new Date(options.nowMs + options.leaseMs),
+        now,leaseToken,new Date(effectiveNowMs + options.leaseMs),
         MAX_PAPER_FINALITY_RAW_ROWS+1,MAX_PAPER_FINALITY_PREFLIGHT_JOBS,
-        new Date(options.nowMs + this.retentionMs),
+        new Date(effectiveNowMs + this.retentionMs),
       ]);
       await client.query('COMMIT');
       const row = result.rows[0];
