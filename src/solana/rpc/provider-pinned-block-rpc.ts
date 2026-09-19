@@ -1,5 +1,6 @@
 import { Connection, type Commitment } from '@solana/web3.js';
-import { isPromise } from 'node:util/types';
+import { isPromise, isProxy } from 'node:util/types';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import type { TransactionBlockRpc } from './transaction-locator.js';
@@ -13,6 +14,10 @@ export interface ProviderPinnedBlockRpc extends TransactionBlockRpc {
 
 export interface ProviderPinnedBlockRpcDependencies {
   readonly createConnection?: (httpUrl: string, commitment: Commitment) => unknown;
+}
+
+export interface ProviderPinnedBlockRpcOptions {
+  readonly requestTimeoutMs: number;
 }
 
 export class ProviderPinnedBlockRpcError extends Error {
@@ -41,12 +46,17 @@ export function createProviderPinnedBlockRpc(
   providerId: RpcProviderId,
   commitment: Commitment,
   dependencies?: ProviderPinnedBlockRpcDependencies,
+  options: ProviderPinnedBlockRpcOptions = { requestTimeoutMs: 30_000 },
 ): ProviderPinnedBlockRpc {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId) || !validCommitment(commitment)) {
     throw failure('CONFIG_INVALID', exposedProviderId);
   }
-  const createConnection = dependencyFactory(dependencies, exposedProviderId);
+  const requestTimeoutMs = readRequestTimeout(options, exposedProviderId);
+  const requestContext = new AsyncLocalStorage<AbortSignal>();
+  const createConnection = dependencies === undefined
+    ? (url: string, selected: Commitment): Connection => createDefaultConnection(url, selected, requestContext)
+    : dependencyFactory(dependencies, exposedProviderId);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const connection = createPinnedConnection(createConnection, httpUrl, commitment, providerId);
 
@@ -55,6 +65,7 @@ export function createProviderPinnedBlockRpc(
     async getBlockTransactions(
       slot: bigint,
       confirmationStatus: Exclude<LegacyConfirmationStatus, 'ORPHANED'>,
+      signal?: AbortSignal,
     ): Promise<unknown> {
       let numericSlot: number;
       try {
@@ -63,25 +74,37 @@ export function createProviderPinnedBlockRpc(
         throw failure('CONFIG_INVALID', providerId);
       }
       const selectedCommitment = confirmationStatus === 'FINALIZED' ? 'finalized' : 'confirmed';
+      const timeout = new AbortController();
+      // The SDK only completes errors that are Error instances. Never forward
+      // caller-owned reasons (including primitives) into its fetch boundary.
+      const abort = (): void => { timeout.abort(); };
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        return await connection.getBlock(numericSlot, Object.freeze({
-          commitment: selectedCommitment,
-          transactionDetails: 'full',
-          maxSupportedTransactionVersion: 0,
-          rewards: false,
-        }));
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted === true) abort();
+        const requestSignal = timeout.signal;
+        requestSignal.throwIfAborted();
+        timer = setTimeout(abort, requestTimeoutMs);
+        timer.unref();
+        return await requestContext.run(requestSignal, () => connection.getBlock(numericSlot, Object.freeze({
+          commitment: selectedCommitment, transactionDetails: 'full',
+          maxSupportedTransactionVersion: 0, rewards: false,
+        })));
       } catch {
         throw failure('BLOCK_UNAVAILABLE', providerId);
+      } finally {
+        // getBlock includes response body consumption; clearing at fetch headers would leave it unbounded.
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
       }
     },
   });
 }
 
 function dependencyFactory(
-  dependencies: ProviderPinnedBlockRpcDependencies | undefined,
+  dependencies: ProviderPinnedBlockRpcDependencies,
   providerId: RpcProviderId | null,
 ): (httpUrl: string, commitment: Commitment) => unknown {
-  if (dependencies === undefined) return createDefaultConnection;
   try {
     if (Array.isArray(dependencies)) throw new TypeError();
     const keys = Reflect.ownKeys(dependencies);
@@ -94,6 +117,15 @@ function dependencyFactory(
   } catch {
     throw failure('CONFIG_INVALID', providerId);
   }
+}
+
+function readRequestTimeout(options: ProviderPinnedBlockRpcOptions, providerId: RpcProviderId | null): number {
+  try {
+    if (isProxy(options) || !plainRecord(options) || Reflect.ownKeys(options).length !== 1) throw new TypeError();
+    const value = dataProperty(options, 'requestTimeoutMs');
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 120_000) throw new TypeError();
+    return value;
+  } catch { throw failure('CONFIG_INVALID', providerId); }
 }
 
 function resolveHttpUrl(catalog: RpcProviderCatalog, providerId: RpcProviderId): string {
@@ -187,8 +219,17 @@ function supportedNativePromise(value: object): boolean {
   }
 }
 
-function createDefaultConnection(httpUrl: string, commitment: Commitment): Connection {
-  return new Connection(httpUrl, { commitment, disableRetryOnRateLimit: true });
+function createDefaultConnection(
+  httpUrl: string, commitment: Commitment, requestContext: AsyncLocalStorage<AbortSignal>,
+): Connection {
+  return new Connection(httpUrl, {
+    commitment, disableRetryOnRateLimit: true,
+    fetch: (input, init): Promise<Response> => {
+      const signal = requestContext.getStore();
+      if (signal === undefined) return Promise.reject(new Error('Block request context is unavailable.'));
+      return fetch(input, { ...init, signal });
+    },
+  });
 }
 
 function numericBlockSlot(value: unknown): number {

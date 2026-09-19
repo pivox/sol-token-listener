@@ -201,7 +201,9 @@ export function createProductionListenerRuntime(
   );
   const hydration = config.listenerPumpFunCatchUpPageAdmissionEnabled
     ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
-      providerId, createProviderPinnedBlockRpc(providers, providerId, config.commitment),
+      providerId, createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
+        requestTimeoutMs: config.listenerShutdownTimeoutMs,
+      }),
     ])), {
       maxEntries: config.listenerBlockHydrationMaxEntries,
       maxBytes: config.listenerBlockHydrationMaxBytes,
@@ -507,7 +509,9 @@ export function createProductionListenerRuntime(
     : lifecycleComponent({
       start: (): Promise<void> => worker.start(),
       close: async (): Promise<void> => {
-        try { await worker.close(); } finally { hydration.close(); }
+        let closing: Promise<void> | null = null;
+        try { closing = worker.close(); } finally { hydration.close(); }
+        await closing;
       },
       get state(): ListenerRuntimeState { return worker.state; },
     });

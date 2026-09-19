@@ -122,12 +122,13 @@ void test('catch-up admission wires identical provider admitters into both scann
   assert.equal(count(source, /new PumpFunCatchUpBlockClassifier\(/gu), 1);
   assert.equal(count(source, /new PumpFunStrictCatchUpPageAdmitter\(/gu), 1);
   assert.match(source, /providers\.ids\.map\([\s\S]*?createProviderPinnedBlockRpc\(providers, providerId,/u);
+  assert.match(source, /requestTimeoutMs:\s*config\.listenerShutdownTimeoutMs/u);
   assert.equal(count(source, /pageAdmitters\.get\(providerId\)/gu), 2);
   assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => coordinator\.run\(scanSignal\), signal\)/u);
   assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => baselineScanner\.scan\(scanSignal\), signal\)/u);
 });
 
-void test('catch-up admission closes provider-affine hydration only after worker settlement, including failure', async (context) => {
+void test('catch-up admission starts worker close then immediately aborts hydration before worker settlement', async (context) => {
   const gate = deferred<undefined>();
   const order: string[] = [];
   context.mock.method(TransactionInboxWorker.prototype, 'close', async () => {
@@ -145,10 +146,10 @@ void test('catch-up admission closes provider-affine hydration only after worker
   }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
   const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
   const closing = dependencies.worker.close();
-  assert.deepEqual(order, ['worker-start']);
+  assert.deepEqual(order, ['worker-start', 'hydration']);
   gate.resolve(undefined);
   await assert.rejects(closing, /worker cleanup failed/u);
-  assert.deepEqual(order, ['worker-start', 'worker-settled', 'hydration']);
+  assert.deepEqual(order, ['worker-start', 'hydration', 'worker-settled']);
 });
 
 void test('production block hydration keeps the exact legacy locator unless explicitly enabled', () => {

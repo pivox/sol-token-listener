@@ -81,7 +81,7 @@ export class ProviderAffineCatchUpHydration {
     const epoch = (): number => this.epoch;
     const rpc: EpochTransactionBlockRpc = {
       get httpTransportEpoch() { return epoch(); },
-      getBlockTransactions: async (slot, status): Promise<unknown> => {
+      getBlockTransactions: async (slot, status, signal): Promise<unknown> => {
         this.assertOpen();
         const scan = this.scanPermit;
         if (scan !== null) {
@@ -100,7 +100,12 @@ export class ProviderAffineCatchUpHydration {
         const provider = this.active === null ? undefined : this.providers.get(this.active.providerId);
         if (provider === undefined) throw retryableFailure();
         this.assertOpen();
-        return provider.getBlockTransactions(slot, status);
+        const requestSignal = AbortSignal.any([
+          this.shutdown.signal,
+          ...(signal === undefined ? [] : [signal]),
+          ...(scan === null ? [] : [scan.signal]),
+        ]);
+        return provider.getBlockTransactions(slot, status, requestSignal);
       },
     };
     try {
@@ -389,7 +394,7 @@ function snapshotProviders(providers: ReadonlyMap<RpcProviderId, TransactionBloc
     if (typeof method !== 'function' || isProxy(method)) throw new TypeError();
     const fetch = method as TransactionBlockRpc['getBlockTransactions'];
     snapshot.set(providerId, Object.freeze({
-      getBlockTransactions: (slot, status): Promise<unknown> => Reflect.apply(fetch, rpc, [slot, status]),
+      getBlockTransactions: (slot, status, signal): Promise<unknown> => Reflect.apply(fetch, rpc, [slot, status, signal]),
     } satisfies TransactionBlockRpc));
   }
   if (snapshot.size === 0) throw new TypeError();

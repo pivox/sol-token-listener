@@ -1,6 +1,6 @@
 # Production Catch-up Admission Activation Design
 
-Version: 1.0.1 — 2026-09-19 — issue #137, sub-task 120-B3b.
+Version: 1.0.2 — 2026-09-19 — issue #137, sub-task 120-B3b.
 
 ## Goal and status
 
@@ -71,6 +71,11 @@ Create `ProviderAffineCatchUpHydration`. It owns:
 The existing cache remains the only source of fetch pacing. Production keeps
 one active fetch and `listenerBlockHydrationFetchIntervalMs >= 250`, therefore no
 more than four fetches start per second across all providers and callers.
+Every provider-pinned `getBlock` continues to use the official `Connection`,
+but its fetch receives the combined cache, scan and shutdown cancellation
+signal. A total request deadline equal to `listenerShutdownTimeoutMs` remains
+active through response-body consumption; timeout and cancellation expose only
+the fixed redacted retryable failure.
 
 ### Worker locate
 
@@ -152,10 +157,12 @@ With the flag on, the factory:
 5. wraps each strict scan with the provider-affine permit;
 6. gives the worker the coordinator locator and claim gate;
 7. exposes the coordinator metrics through the heartbeat;
-8. closes the worker before closing the coordinator/cache.
+8. invokes worker close synchronously to stop new claims, closes the
+   coordinator/cache immediately to abort active hydration, then awaits the
+   worker drain.
 
 Shutdown stops admitting work, rejects queued waiters with redacted retryable
-failures, lets bounded in-flight operations settle under the existing listener
+failures, aborts bounded in-flight hydration under the existing listener
 shutdown deadline, and closes the single cache once. No raw block, URL,
 credential, signature or mint is logged by the coordinator.
 

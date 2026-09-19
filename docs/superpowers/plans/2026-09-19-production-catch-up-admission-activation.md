@@ -464,13 +464,16 @@ Move promoted-selector construction before block hydration. When the flag is
 off, retain `createProductionBlockHydration(config, rpc)`. When on:
 
 1. create the provider-pinned block RPC map;
+   each official SDK `getBlock` must receive cache/scan/shutdown cancellation
+   and a total deadline through body consumption;
 2. create one provider-affine coordinator with the existing cache bounds;
 3. for each provider, create `PumpFunCatchUpBlockClassifier`,
    `PumpFunStrictCatchUpPageAdmitter`, strict scanner and baseline scanner;
 4. give scanner constructors their provider admitter as the fourth argument;
 5. wrap strict scanning through the coordinator permit;
 6. give the worker the coordinator locator and claim gate;
-7. ensure shutdown closes the coordinator only after worker close.
+7. invoke worker close first to stop new claims, close the coordinator
+   immediately to abort hydration I/O, then await the worker drain.
 
 Do not modify the PumpSwap pipeline, finality reconciler or any execution
 component.
