@@ -617,3 +617,75 @@ for (const cancellation of ['abort', 'close'] as const) {
     }
   });
 }
+
+void test('scanner error own __proto__ data cannot inject inherited getter fields', async () => {
+  const h = harness();
+  let getterReads = 0;
+  const original = new Error('Strict catch-up requires a fresh recovery cycle.');
+  Object.setPrototypeOf(original, StrictCatchUpRefreshRequiredError.prototype);
+  Object.assign(original, {
+    name: 'StrictCatchUpRefreshRequiredError', code: 'CATCH_UP_REFRESH_REQUIRED', retryable: true, stage: 'head-refresh',
+  });
+  Object.defineProperty(original, '__proto__', {
+    value: { get providerId(): string { getterReads += 1; throw new Error('https://secret.invalid/?api-key=secret'); } },
+    enumerable: true,
+  });
+  Object.freeze(original);
+  await assert.rejects(h.hydration.runStrictScan('primary', async () => { throw original; }, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderAffineCatchUpHydrationError);
+      assert.equal(Object.isFrozen(error), true);
+      assert.equal(error.message, 'Provider-affine catch-up hydration failed.');
+      assert.doesNotMatch(error.stack ?? '', /secret\.invalid|api-key/u);
+      assert.doesNotMatch(JSON.stringify(error), /secret\.invalid|api-key/u);
+      return true;
+    });
+  assert.equal(getterReads, 0);
+  h.hydration.close();
+});
+
+function closingSelectorHarness(closeAt: number) {
+  let reads = 0;
+  let fetches = 0;
+  const hydration: ProviderAffineCatchUpHydration = new ProviderAffineCatchUpHydration(new Map<RpcProviderId, TransactionBlockRpc>([
+    ['primary', { getBlockTransactions: async () => { fetches += 1; return block(); } }],
+  ]), {
+    currentSelection: () => {
+      reads += 1;
+      if (reads === closeAt) hydration.close();
+      return { providerId: 'primary', revision: 1n };
+    },
+  });
+  return { hydration, fetches: () => fetches, reads: () => reads };
+}
+
+void test('selector reentrant close at provider dispatch prevents every SDK request', async () => {
+  const h = closingSelectorHarness(3);
+  await assert.rejects(h.hydration.workerLocator().locate(target()), retryable);
+  assert.equal(h.reads(), 3);
+  assert.equal(h.fetches(), 0);
+  assert.equal(h.hydration.canWorkerClaim(), false);
+});
+
+void test('selector reentrant close makes the same claim-gate invocation return false', () => {
+  const h = closingSelectorHarness(1);
+  assert.equal(h.hydration.canWorkerClaim(), false);
+  assert.equal(h.fetches(), 0);
+});
+
+void test('selector reentrant close never publishes a provider or claim-ready state', () => {
+  const h = closingSelectorHarness(1);
+  assert.deepEqual(h.hydration.state(), { providerId: null, scanActive: false, workerClaimReady: false });
+  assert.equal(h.fetches(), 0);
+});
+
+void test('selector reentrant close clears published provider state even inside an active scan', async () => {
+  const h = closingSelectorHarness(1);
+  let state: ReturnType<ProviderAffineCatchUpHydration['state']> | undefined;
+  await assert.rejects(h.hydration.runStrictScan('primary', async () => {
+    state = h.hydration.state();
+    return RESULT;
+  }, new AbortController().signal), ProviderAffineCatchUpHydrationError);
+  assert.deepEqual(state, { providerId: null, scanActive: true, workerClaimReady: false });
+  assert.equal(h.fetches(), 0);
+});

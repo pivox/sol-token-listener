@@ -93,11 +93,13 @@ export class ProviderAffineCatchUpHydration {
           if (!admitted) throw retryableFailure();
         } else {
           const selection = this.selection();
+          this.assertOpen();
           if (selection?.providerId === null || selection === null
             || this.active?.token !== `worker:${selection.revision}`) throw retryableFailure();
         }
         const provider = this.active === null ? undefined : this.providers.get(this.active.providerId);
         if (provider === undefined) throw retryableFailure();
+        this.assertOpen();
         return provider.getBlockTransactions(slot, status);
       },
     };
@@ -174,7 +176,7 @@ export class ProviderAffineCatchUpHydration {
 
   public canWorkerClaim(): boolean {
     const selection = this.closed ? null : this.selection();
-    return selection !== null && selection.providerId !== null
+    return !this.closed && selection !== null && selection.providerId !== null
       && this.permitKind !== 'SCAN' && !this.queue.some(({ kind }) => kind === 'SCAN');
   }
 
@@ -186,7 +188,7 @@ export class ProviderAffineCatchUpHydration {
   public state(): Readonly<{ providerId: RpcProviderId | null; scanActive: boolean; workerClaimReady: boolean }> {
     const selection = this.closed ? null : this.selection();
     return Object.freeze({
-      providerId: this.scanPermit?.context.providerId ?? selection?.providerId ?? null,
+      providerId: this.closed ? null : this.scanPermit?.context.providerId ?? selection?.providerId ?? null,
       scanActive: this.scanPermit !== null,
       workerClaimReady: !this.closed && selection?.providerId !== undefined && selection.providerId !== null
         && this.permitKind !== 'SCAN' && !this.queue.some(({ kind }) => kind === 'SCAN'),
@@ -308,6 +310,7 @@ export class ProviderAffineCatchUpHydration {
 
   private assertSelection(expected: PromotedProviderSelection): void {
     const actual = this.selection();
+    this.assertOpen();
     if (actual?.providerId !== expected.providerId || actual.revision !== expected.revision) throw retryableFailure();
   }
 
@@ -315,6 +318,7 @@ export class ProviderAffineCatchUpHydration {
     let result: PromotedProviderSelection | null = null;
     try {
       const value: unknown = this.currentSelection();
+      if (this.closed) return null;
       if (typeof value !== 'object' || value === null || isProxy(value)) throw new TypeError();
       const providerId = Object.getOwnPropertyDescriptor(value, 'providerId');
       const revision = Object.getOwnPropertyDescriptor(value, 'revision');
@@ -324,6 +328,7 @@ export class ProviderAffineCatchUpHydration {
         || typeof revision.value !== 'bigint' || revision.value < 0n) throw new TypeError();
       result = Object.freeze({ providerId: providerId.value as RpcProviderId | null, revision: revision.value });
     } catch { /* A malformed selector is equivalent to no promoted provider. */ }
+    if (this.closed) return null;
     if (this.scanPermit === null && this.active?.token.startsWith('worker:') === true
       && (result?.providerId !== this.active.providerId
         || `worker:${result.revision}` !== this.active.token)) {
@@ -392,12 +397,16 @@ function snapshotProviders(providers: ReadonlyMap<RpcProviderId, TransactionBloc
 }
 
 function safeScannerError(value: unknown): value is Error {
+  try { return inspectScannerError(value); } catch { return false; }
+}
+
+function inspectScannerError(value: unknown): value is Error {
   if (typeof value !== 'object' || value === null || isProxy(value) || !isNativeError(value) || !Object.isFrozen(value)) return false;
   const prototype: unknown = Object.getPrototypeOf(value);
   // Read data descriptors only, including on forged objects with a familiar prototype.
-  const fields: Record<string, unknown> = {};
+  const fields = Object.create(null) as Record<string, unknown>;
   for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== 'string') return false;
+    if (typeof key !== 'string' || key === '__proto__') return false;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     // V8 uses a non-enumerable native accessor for Error.stack on newer Node versions.
     if (key === 'stack' && descriptor?.enumerable === false) continue;
