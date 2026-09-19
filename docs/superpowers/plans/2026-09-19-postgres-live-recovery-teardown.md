@@ -67,3 +67,16 @@
 - [x] Require captured termination results and zero-row assertions for all ten guarded sites.
 - [x] Run the relevant PostgreSQL 16 tests and stress the migration 040 regression.
 - [x] Run build, check, lint, docs and whitespace verification before push.
+
+### Task 6: Make the teardown audit exhaustive and the gate effective
+
+**Files:**
+- Modify: `tests/executor-main.integration.test.ts`
+- Modify: `tests/executor-worker-database-authority.test.ts`
+- Modify: `tests/postgres-backend-drain.test.ts`
+
+- [x] Discover every test SQL `DROP DATABASE IF EXISTS` recursively and compare it to an explicit inventory.
+- [x] Distinguish forced database-name cleanup from two graceful isolated-role cleanups.
+- [x] Add a failing AST audit that requires terminate, zero-row assertion and drop in one callback.
+- [x] Group the two split executor cleanup callbacks so a failed assertion prevents the drop.
+- [x] Re-run structural, PostgreSQL 16, build, check, lint, docs and whitespace verification.

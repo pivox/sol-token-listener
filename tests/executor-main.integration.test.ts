@@ -322,10 +322,6 @@ void test('compiled non-signing executors run under the isolated worker login', 
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
           WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
         assert.equal(terminated.rowCount, 0);
-      }
-    },
-    async () => {
-      if (databaseCreated) {
         await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
       }
     },

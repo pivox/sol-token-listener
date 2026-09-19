@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import type pg from 'pg';
+import ts from 'typescript';
 import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 
 const DRAIN_DELAY_MS = 100;
@@ -116,48 +117,208 @@ void test('gates listener-authority forced cleanup behind the backend drain barr
   );
 });
 
-void test('guards every datname-scoped destructive database cleanup', async () => {
+void test('inventories every destructive database cleanup and guards forced termination', async () => {
   const testsUrl = new URL('./', import.meta.url);
+  const violations: string[] = [];
+  const cleanupCounts: Record<string, number> = {};
   const entries = (await readdir(testsUrl, { recursive: true }))
     .filter((entry) => entry.endsWith('.ts'))
     .sort();
-  const cleanupCounts = new Map<string, number>();
-  const violations: string[] = [];
-  const terminationPattern = /SELECT pg_terminate_backend\(pid\)[\s\S]{0,160}?WHERE datname=\$1 AND pid<>pg_backend_pid\(\)/gu;
   for (const entry of entries) {
     const source = await readFile(new URL(entry, testsUrl), 'utf8');
-    for (const match of source.matchAll(terminationPattern)) {
-      const terminate = match.index;
-      cleanupCounts.set(entry, (cleanupCounts.get(entry) ?? 0) + 1);
-      const precedingDrop = source.lastIndexOf('DROP DATABASE IF EXISTS', terminate);
-      const drain = source.lastIndexOf(
-        'await waitForBackendDrain(maintenance, databaseName)',
-        terminate,
-      );
-      const close = Math.max(
-        source.lastIndexOf('.end()', drain),
-        source.lastIndexOf('.close()', drain),
-      );
-      const capture = source.lastIndexOf('const terminated = await maintenance.query(', terminate);
-      const assertion = source.indexOf('assert.equal(terminated.rowCount, 0)', terminate);
-      const drop = source.indexOf('DROP DATABASE IF EXISTS', terminate);
-      if (!(drain > precedingDrop
-        && close > precedingDrop
-        && close < drain
-        && capture > drain
-        && assertion > terminate
-        && drop > assertion)) {
-        violations.push(`${entry}:${source.slice(0, terminate).split('\n').length}`);
+    const sourceFile = ts.createSourceFile(
+      entry,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+    const drops = sqlQueriesMatching(sourceFile, DROP_DATABASE_SQL)
+      .map((query) => query.arguments[0])
+      .filter((argument): argument is ts.Expression => argument !== undefined);
+    if (drops.length === 0) continue;
+    cleanupCounts[entry] = drops.length;
+    for (const drop of drops) {
+      const guarded = entry in FORCED_DATABASE_CLEANUPS
+        ? hasGuardedCleanupOrder(sourceFile, drop)
+        : entry in GRACEFUL_DATABASE_CLEANUPS
+          ? hasGracefulCleanupOrder(sourceFile, drop)
+          : false;
+      if (!guarded) {
+        const line = sourceFile.getLineAndCharacterOfPosition(drop.getStart(sourceFile)).line + 1;
+        violations.push(`${entry}:${line}`);
       }
     }
   }
-  assert.deepEqual(Object.fromEntries(cleanupCounts), {
+  assert.deepEqual(cleanupCounts, {
     'execution-live.repository.test.ts': 1,
+    'execution-preflight-source-database.test.ts': 1,
     'execution-worker-live-partition-migration.test.ts': 3,
     'executor-main.integration.test.ts': 1,
+    'executor-readiness-database.test.ts': 1,
     'executor-roles-provisioning.test.ts': 2,
     'executor-worker-database-authority.test.ts': 2,
     'listener-database-authority.test.ts': 1,
   });
   assert.deepEqual(violations, []);
 });
+
+const FORCED_DATABASE_CLEANUPS = Object.freeze({
+  'execution-live.repository.test.ts': 1,
+  'execution-worker-live-partition-migration.test.ts': 3,
+  'executor-main.integration.test.ts': 1,
+  'executor-roles-provisioning.test.ts': 2,
+  'executor-worker-database-authority.test.ts': 2,
+  'listener-database-authority.test.ts': 1,
+});
+
+const GRACEFUL_DATABASE_CLEANUPS = Object.freeze({
+  'execution-preflight-source-database.test.ts': 1,
+  'executor-readiness-database.test.ts': 1,
+});
+
+const DROP_DATABASE_SQL = /\bdrop\s+database\s+if\s+exists\b/iu;
+const TERMINATE_DATABASE_SQL = /\bselect\s+pg_terminate_backend\s*\(\s*pid\s*\)[\s\S]*?\bwhere\s+datname\s*=\s*\$1\b[\s\S]*?\bpid\s*<>\s*pg_backend_pid\s*\(\s*\)/iu;
+
+function sqlQueriesMatching(sourceFile: ts.SourceFile, pattern: RegExp): ts.CallExpression[] {
+  const matches: ts.CallExpression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)
+      && ts.isPropertyAccessExpression(node.expression)
+      && node.expression.name.text === 'query'
+      && node.arguments[0] !== undefined
+      && pattern.test(node.arguments[0].getText(sourceFile))) {
+      matches.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return matches;
+}
+
+function hasGracefulCleanupOrder(sourceFile: ts.SourceFile, drop: ts.Expression): boolean {
+  const dropFunction = nearestFunction(drop);
+  if (dropFunction === null) return false;
+  const closes = awaitedCalls(dropFunction, ['close', 'end'], sourceFile);
+  const close = closes.filter((node) => node.getStart(sourceFile) < drop.getStart(sourceFile)).at(-1);
+  return close !== undefined
+    && firstSqlQuery(dropFunction, sourceFile, TERMINATE_DATABASE_SQL) === null;
+}
+
+function hasGuardedCleanupOrder(sourceFile: ts.SourceFile, drop: ts.Expression): boolean {
+  const dropFunction = nearestFunction(drop);
+  if (dropFunction === null) return false;
+  const cleanupScope = nearestCleanupScope(drop, dropFunction, sourceFile);
+  const terminate = firstSqlQuery(dropFunction, sourceFile, TERMINATE_DATABASE_SQL);
+  if (terminate === null || !ts.isAwaitExpression(terminate.parent)) return false;
+  const declaration = terminate.parent.parent;
+  if (!ts.isVariableDeclaration(declaration) || !ts.isIdentifier(declaration.name)) return false;
+  const assertion = zeroRowAssertion(dropFunction, declaration.name.text, sourceFile);
+  if (assertion === null) return false;
+  const closes = awaitedCalls(cleanupScope, ['close', 'end'], sourceFile);
+  const drains = awaitedCalls(cleanupScope, ['waitForBackendDrain'], sourceFile);
+  const close = closes.filter((node) => node.getStart(sourceFile) < drop.getStart(sourceFile)).at(-1);
+  const drain = drains.filter((node) => node.getStart(sourceFile) < drop.getStart(sourceFile)).at(-1);
+  return close !== undefined
+    && drain !== undefined
+    && close.getStart(sourceFile) < drain.getStart(sourceFile)
+    && drain.getStart(sourceFile) < terminate.getStart(sourceFile)
+    && terminate.getStart(sourceFile) < assertion.getStart(sourceFile)
+    && assertion.getStart(sourceFile) < drop.getStart(sourceFile);
+}
+
+function nearestFunction(node: ts.Node): ts.FunctionLikeDeclaration | null {
+  let current: ts.Node | undefined = node.parent;
+  while (current !== undefined) {
+    if (isExecutableFunction(current)) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+function isExecutableFunction(node: ts.Node): node is ts.FunctionLikeDeclaration {
+  return ts.isArrowFunction(node)
+    || ts.isFunctionExpression(node)
+    || ts.isFunctionDeclaration(node)
+    || ts.isMethodDeclaration(node)
+    || ts.isConstructorDeclaration(node)
+    || ts.isGetAccessorDeclaration(node)
+    || ts.isSetAccessorDeclaration(node);
+}
+
+function nearestCleanupScope(
+  node: ts.Node,
+  fallback: ts.FunctionLikeDeclaration,
+  sourceFile: ts.SourceFile,
+): ts.Node {
+  let current: ts.Node | undefined = node.parent;
+  while (current !== undefined) {
+    if (ts.isCallExpression(current)
+      && current.expression.getText(sourceFile) === 'collectCleanupFailures') return current;
+    current = current.parent;
+  }
+  return fallback;
+}
+
+function firstSqlQuery(
+  scope: ts.Node,
+  sourceFile: ts.SourceFile,
+  pattern: RegExp,
+): ts.CallExpression | null {
+  let match: ts.CallExpression | null = null;
+  const visit = (node: ts.Node): void => {
+    if (match !== null) return;
+    if (ts.isCallExpression(node)) {
+      const sql = node.arguments[0];
+      if (sql !== undefined && pattern.test(sql.getText(sourceFile))) {
+        match = node;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(scope);
+  return match;
+}
+
+function zeroRowAssertion(
+  scope: ts.Node,
+  resultName: string,
+  sourceFile: ts.SourceFile,
+): ts.CallExpression | null {
+  let match: ts.CallExpression | null = null;
+  const visit = (node: ts.Node): void => {
+    if (match !== null) return;
+    if (ts.isCallExpression(node)
+      && node.expression.getText(sourceFile).replaceAll(/\s/gu, '') === 'assert.equal'
+      && node.arguments[0]?.getText(sourceFile).replaceAll(/\s/gu, '')
+        === `${resultName}.rowCount`
+      && node.arguments[1]?.getText(sourceFile) === '0') {
+      match = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(scope);
+  return match;
+}
+
+function awaitedCalls(
+  scope: ts.Node,
+  names: readonly string[],
+  sourceFile: ts.SourceFile,
+): ts.CallExpression[] {
+  const matches: ts.CallExpression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isAwaitExpression(node.parent)) {
+      const expression = node.expression;
+      const name = ts.isPropertyAccessExpression(expression)
+        ? expression.name.text
+        : expression.getText(sourceFile);
+      if (names.includes(name)) matches.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(scope);
+  return matches.sort((left, right) => left.getStart(sourceFile) - right.getStart(sourceFile));
+}
