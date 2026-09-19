@@ -940,8 +940,11 @@ fois au démarrage, active le chemin ; ce flag est restart-only et ne connaît p
 de hot reload. Avant toute E/S base ou réseau, cette activation refuse si le
 listener n'est pas activé, si le mode n'est pas `observe`, si le scope n'est pas
 `launchpad-only`, si la policy n'est pas `live-edge`, si l'hydratation bloc n'est
-pas activée, si le genesis n'est pas celui du cluster configuré, ou si une paire
-HTTP/WebSocket provider est invalide.
+pas activée, ou si une paire HTTP/WebSocket provider est invalide. La validation
+pré-E/S ne vérifie localement que l'enveloppe canonique base58 du genesis
+configuré : l'opérateur doit configurer le bon cluster et son hash attendu.
+L'égalité avec chaque provider est vérifiée au runtime par `getGenesisHash` avant
+toute utilisation du catch-up ; une divergence échoue fail-closed.
 
 La factory crée alors un coordinateur provider-affine avec un cache unique,
 une file FIFO commune et un seul fetch actif. Chaque scan strict est épinglé au

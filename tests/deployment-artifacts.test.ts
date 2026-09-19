@@ -387,6 +387,8 @@ void test('catch-up admission documentation fixes the restart-only activation an
   assert.match(all, /provider-affin|affinité fournisseur/iu);
   assert.match(all, /une seule cache|cache unique|global[^.]{0,120}4[^.]{0,40}fetch/iu);
   assert.match(all, /aucun[^.]{0,80}(?:wallet|clé privée|executor|exécuteur|soumission)/iu);
+  assert.match(architecture, /pré-E\/S[^.]{0,240}enveloppe canonique base58/iu);
+  assert.match(architecture, /getGenesisHash[^.]{0,240}catch-up[^.]{0,240}fail-closed/iu);
   for (const field of [
     'version', 'enabled', 'providerId', 'scanActive', 'workerClaimReady',
     'actionableBacklogBySource', 'actionableBacklogByPriority', 'deferredCount',
@@ -402,6 +404,8 @@ void test('catch-up admission documentation fixes the restart-only activation an
   assert.match(runbook, /readiness Mainnet[^.]*déclarée avant/iu);
   assert.match(runbook, /métrique brute[^.]{0,240}omise[^.]{0,240}`heartbeat\.catchUpAdmission: null`/iu);
   assert.doesNotMatch(runbook, /heartbeat\.catchUpAdmission\.enabled=false/iu);
+  assert.match(runbook, /Rollback B3b admission-only[\s\S]{0,500}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false[\s\S]{0,500}LISTENER_BLOCK_HYDRATION_ENABLED=true/iu);
+  assert.match(runbook, /Rollback complet d'hydratation bloc[\s\S]{0,500}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false[\s\S]{0,500}LISTENER_BLOCK_HYDRATION_ENABLED=false[\s\S]{0,300}redémarr/iu);
 });
 
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {

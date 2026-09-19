@@ -69,10 +69,19 @@ activation.
 - le shutdown arrête les nouvelles admissions, draine dans le délai borné et
   laisse le health final propre, sans fuite de file ou de cache.
 
-Toute violation est `FAIL`. Pour rollback, remettre
-`LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false`, redémarrer la réplique
-et vérifier que la métrique brute `catchUpAdmission` est omise du heartbeat,
-tandis que l'API projette `heartbeat.catchUpAdmission: null` ;
-`heartbeat.blockHydration.enabled=true`, la file revient à zéro et le backlog
-reprend sa tendance de baseline. Ne jamais supprimer checkpoint ou donnée durable
-pour masquer un échec : les receipts historiques restent retenus quatre heures.
+Toute violation est `FAIL`. Deux niveaux de rollback existent :
+
+1. **Rollback B3b admission-only.** Remettre
+   `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis redémarrer la
+   réplique. La métrique brute `catchUpAdmission` est alors omise du heartbeat et
+   l'API projette `heartbeat.catchUpAdmission: null`; l'hydratation bloc legacy
+   reste active avec `LISTENER_BLOCK_HYDRATION_ENABLED=true`. Vérifier que la file
+   revient à zéro et que le backlog reprend sa tendance de baseline.
+2. **Rollback complet d'hydratation bloc.** Remettre
+   `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` et
+   `LISTENER_BLOCK_HYDRATION_ENABLED=false`, puis redémarrer la réplique. Vérifier
+   `heartbeat.blockHydration.enabled=false`, la file à zéro et le retour à la
+   baseline legacy.
+
+Ne jamais supprimer checkpoint ou donnée durable pour masquer un échec : les
+receipts historiques restent retenus quatre heures.
