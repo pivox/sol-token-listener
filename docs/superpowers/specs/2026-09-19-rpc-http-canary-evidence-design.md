@@ -1,6 +1,6 @@
 # RPC HTTP Canary Evidence Design
 
-Version: 1.1.0
+Version: 1.1.1 — 2026-09-20 — issue #142, Task 6 clarification
 
 Status: approved for implementation under the standing operator instruction
 
@@ -188,10 +188,20 @@ minutes, and after bounded shutdown. A PASS for the HTTP 429 gate requires:
 - a strictly positive aggregate attempt delta;
 - an aggregate HTTP-429 delta equal to zero.
 
-Any positive 429 delta is FAIL. Overflow, restart, missing evidence, missing
-final snapshot, counter regression, provider-membership drift, or an impossible
-counter relation is INCONCLUSIVE unless an already observed 429 independently
-forces FAIL. A zero-attempt window is INCONCLUSIVE.
+Any positive 429 delta proven by the snapshots is FAIL. Configured-provider
+membership drift, overflow, restart, missing evidence, missing final snapshot,
+counter regression, malformed evidence, or an impossible counter relation is
+INCONCLUSIVE, unless an independently observed positive 429 delta already
+forces FAIL. A zero-attempt window is INCONCLUSIVE. No missing or malformed
+metric may be synthesized as zero.
+
+Version 1.1.1 is an operator clarification of the verdict precedence and does
+not change the implementation contract: membership drift alone is not proof of
+an HTTP 429.
+
+Issue #142 proves only the HTTP 429 gate. It does not prove first-processing
+latency or its p95; issue #143 remains required for first-processing latency and
+its p95.
 
 The latency gate remains unavailable until #143 adds immutable first-processing
 evidence. Therefore #142 alone cannot make the whole canary PASS.

@@ -364,6 +364,96 @@ void test('block hydration canary proves active routing and bounded serialized a
   assert.match(runbook, /Toute autre valeur entraîne\s+`FAIL`/iu);
 });
 
+void test('RPC HTTP canary evidence has a complete redacted snapshot verdict contract', async (context) => {
+  const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
+
+  for (const sample of ['T0', 'T+5', 'T+15', 'final']) {
+    assert.match(runbook, new RegExp(sample.replace('+', '\\+'), 'u'));
+  }
+  assert.match(runbook, /delta [`']?attempts[`']?[^.]{0,120}strictement positif/iu);
+  assert.match(runbook, /delta [`']?HTTP\s*429[`']?[^.]{0,120}(?:exactement|égal à) zéro/iu);
+  assert.match(runbook, /(?:même|identique)[^.]{0,100}startedAt/iu);
+  assert.match(runbook, /membership[^.]{0,100}(?:stable|identique)/iu);
+  assert.match(runbook, /configured[^.]{0,100}(?:stable|identique)/iu);
+  assert.match(runbook, /overflow(?:ed)?[^.]{0,100}(?:false|rejet|inconclusive)/iu);
+
+  for (const outcome of [
+    'restart', 'final[^.]{0,40}(?:manquant|absent)', 'trafic[^.]{0,40}zéro',
+    'métrique[^.]{0,40}(?:absente|malformée)', 'overflow',
+  ]) assert.match(runbook, new RegExp(`${outcome}[\\s\\S]{0,180}INCONCLUSIVE`, 'iu'));
+  assert.match(runbook, /delta[^.]{0,120}HTTP\s*429[^.]{0,120}(?:>\s*0|positif)[\s\S]{0,100}FAIL/iu);
+  assert.match(runbook, /changement de membership[^.]{0,120}INCONCLUSIVE/iu);
+  assert.match(runbook, /429[^.]{0,160}(?:observé|prouvé)[^.]{0,160}FAIL/iu);
+
+  assert.match(runbook, /jq[^\n]*startedAt[^\n]*rpcHttpEvidence/iu);
+  assert.match(runbook, /(?:providerId|configured|attempts|http429Responses)/iu);
+  assert.match(runbook, /artefact séparé[^.]{0,120}preuve HTTP RPC/iu);
+  assert.match(runbook, /autres gates[^.]{0,180}(?:snapshots|artefacts)/iu);
+  assert.doesNotMatch(runbook, /uniquement la projection[^.]{0,120}autres champs sont exclus/iu);
+  assert.doesNotMatch(runbook, /jq[^\n]*(?:\burl\b|\bkey\b|\bsignature\b|\bmint\b|\bbody\b)/iu);
+
+  const jqVersion = spawnSync('jq', ['--version'], { encoding: 'utf8' });
+  if (jqVersion.error !== undefined || jqVersion.status !== 0) {
+    context.skip('jq unavailable: executable filter cases skipped');
+    return;
+  }
+  const filterMatch = /\n\s*jQ?\s+'([^']+)'\s+health\.json/iu.exec(runbook);
+  assert.ok(filterMatch?.[1], 'missing executable jq evidence filter');
+  const filter = filterMatch[1];
+  const runJq = (input: unknown) => spawnSync('jq', ['-c', filter], {
+    encoding: 'utf8', input: JSON.stringify(input),
+  });
+  const startedAt = '2026-09-20T10:00:00.000Z';
+  const valid = {
+    apiVersion: 'v1',
+    meta: { generatedAt: startedAt, nextCursor: null },
+    data: {
+      heartbeat: {
+        startedAt,
+        rpcHttpEvidence: {
+          version: 1,
+          overflowed: false,
+          providers: [
+            { providerId: 'primary', configured: true, attempts: 3, http429Responses: 0 },
+            { providerId: 'fallback-1', configured: false, attempts: 0, http429Responses: 0 },
+            { providerId: 'fallback-2', configured: false, attempts: 0, http429Responses: 0 },
+            { providerId: 'fallback-3', configured: false, attempts: 0, http429Responses: 0 },
+          ],
+        },
+      },
+      SECRET: 'must-not-leak',
+    },
+  };
+  const expectedEvidence = {
+    version: 1,
+    overflowed: false,
+    providers: valid.data.heartbeat.rpcHttpEvidence.providers,
+  };
+  for (const [input, expected] of [
+    [valid, { startedAt, rpcHttpEvidence: expectedEvidence }],
+    [{ apiVersion: 'v1', meta: { generatedAt: startedAt, nextCursor: null }, data: {} }, { startedAt: null, rpcHttpEvidence: null }],
+    [{ apiVersion: 'v1', meta: { generatedAt: startedAt, nextCursor: null }, data: { heartbeat: { startedAt, rpcHttpEvidence: null } } }, { startedAt, rpcHttpEvidence: null }],
+    [{ apiVersion: 'v1', meta: { generatedAt: startedAt, nextCursor: null }, data: { heartbeat: { startedAt, rpcHttpEvidence: { version: 1, malformed: true } } } }, { startedAt, rpcHttpEvidence: null }],
+    [{ apiVersion: 'v1', meta: { generatedAt: startedAt, nextCursor: null }, data: { heartbeat: { startedAt, rpcHttpEvidence: { version: 1, overflowed: false, providers: [
+      { providerId: 'primary', configured: false, attempts: 1, http429Responses: 0 },
+      ...valid.data.heartbeat.rpcHttpEvidence.providers.slice(1),
+    ] } } } }, { startedAt, rpcHttpEvidence: null }],
+  ] as const) {
+    const result = runJq(input);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, '');
+    assert.deepEqual(JSON.parse(result.stdout), expected);
+    assert.doesNotMatch(result.stdout, /SECRET|\burl\b|\bkey\b|\bsignature\b|\bmint\b|\bbody\b/iu);
+  }
+
+});
+
+void test('RPC HTTP canary scope separates #142 from the #143 latency gate', async () => {
+  const design = await readArtifact('docs/superpowers/specs/2026-09-19-rpc-http-canary-evidence-design.md');
+  assert.match(design, /#142[^.]{0,180}(?:only|uniquement|seulement)[^.]{0,180}HTTP.?429/iu);
+  assert.match(design, /#143[^.]{0,180}(?:still|required|nécessaire)[^.]{0,180}(?:latency|latence|p95)/iu);
+});
+
 void test('catch-up admission documentation fixes the restart-only activation and Mainnet gate', async () => {
   const [readme, architecture, api, runbook, design] = await Promise.all([
     readArtifact('README.md'),

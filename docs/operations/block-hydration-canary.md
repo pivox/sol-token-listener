@@ -29,12 +29,31 @@ activation.
    Compose transmet ce flag restart-only uniquement à `app`; contrôler la
    configuration résolue avant le démarrage.
 2. Redémarrer exactement une réplique. Aucun flag n'est modifiable à chaud.
-3. Capturer `/api/v1/health`, backlog/échecs terminaux, RSS et compteurs HTTP du
-   fournisseur à T0, T+5 min et T+15 min.
-4. Classer la fenêtre `PASS`, `FAIL` ou `INCONCLUSIVE`. Un trafic insuffisant
-   pour produire un delta `fetches` strictement positif rend le test
-   `INCONCLUSIVE`, jamais `PASS` implicite.
-5. Pour chaque fenêtre, conserver une preuve RPC publique expurgée de lecture
+3. Capturer l’état health, le backlog/les échecs terminaux et le RSS à T0, T+5
+   min et T+15 min. Capturer ensuite un relevé `final` après l’arrêt borné et
+   la persistance du dernier heartbeat. Les quatre relevés appartiennent au
+   même processus : un redémarrage entre deux relevés invalide la fenêtre.
+   Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
+   projection fixe suivante de la réponse health :
+
+   ```text
+   jq 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)}' health.json
+   ```
+
+   Nommer les quatre fichiers `T0`, `T+5`, `T+15` et `final`. Cette projection
+   ne contient aucune URL, clé, signature, mint ou corps de requête/réponse.
+   Cet artefact est uniquement la preuve HTTP RPC de #142. Les autres gates
+   conservent leurs propres snapshots et artefacts (blockHydration, pipeline,
+   backlog, RSS et métriques de latence); cette projection ne les remplace pas.
+4. Calculer entre T0 et `final` le delta agrégé `attempts` et le delta agrégé
+   `http429Responses`. Le delta `attempts` doit être strictement positif et le
+   delta HTTP 429 doit être exactement égal à zéro. Vérifier à chaque relevé le
+   même `startedAt`, la même membership des providers configurés (identifiants
+   et booléens; état `configured` stable) et `overflowed=false`.
+5. Classer la fenêtre `PASS`, `FAIL` ou `INCONCLUSIVE` avec la matrice ci-dessous.
+   Un trafic insuffisant pour produire un delta `attempts` strictement positif
+   rend le test `INCONCLUSIVE`, jamais `PASS` implicite.
+6. Pour chaque fenêtre, conserver une preuve RPC publique expurgée de lecture
    réussie : slot public, identifiant de provider non sensible (jamais une URL,
    un host privé ou un alias secret), statut HTTP, catégorie RPC, version de
    transaction et nombre agrégé de transactions. Ne jamais conserver d'URL
@@ -45,7 +64,7 @@ activation.
    un bloc public connu et conserver la preuve de succès correspondante. Un
    fixture public expurgé peut seulement compléter la preuve de normalisation
    hors réseau; il ne remplace jamais la preuve RPC.
-6. Rejouer la preuve sur une base fraîche, créée pour cette fenêtre et sans
+7. Rejouer la preuve sur une base fraîche, créée pour cette fenêtre et sans
    checkpoint, inbox, receipt ou cache antérieur. Le replay doit hydrater et
    normaliser les trois versions sans aucune écriture, signature ou soumission
    on-chain, sans wallet. Les écritures PostgreSQL observe-only nécessaires
@@ -54,6 +73,29 @@ activation.
    replay. Archiver ce résultat avec la preuve RPC publique expurgée.
 
 ## Gates PASS
+
+### Verdict de la preuve HTTP RPC
+
+| Observation sur les relevés T0/T+5/T+15/`final` | Verdict |
+| --- | --- |
+| Même `startedAt`, membership/configuration stable, `overflowed=false`, delta `attempts` strictement positif et delta HTTP 429 exactement zéro | `PASS` pour le gate HTTP 429 |
+| Delta HTTP 429 strictement positif prouvé par les relevés | `FAIL` |
+| Redémarrage (restart), relevé `final` manquant, trafic nul (trafic zéro), métrique absente ou malformée, compteur régressif, relation impossible (`http429Responses > attempts`), `overflowed=true` ou changement de membership des providers configurés | `INCONCLUSIVE` |
+
+Le `FAIL` est réservé à un delta HTTP 429 positif prouvé par les relevés. Un
+changement de membership reste `INCONCLUSIVE`, sauf si un delta HTTP 429 positif
+est observé indépendamment et le prouve. Une métrique absente, malformée ou en
+overflow ne devient jamais zéro par défaut. Un `final` absent ne permet jamais
+de conclure `PASS`, même si T+15 est propre. Le delta `attempts` nul est un
+trafic nul et reste `INCONCLUSIVE`.
+Un restart, un `final` manquant, un trafic zéro, une métrique absente ou
+malformée, ou `overflowed=true` classe la fenêtre `INCONCLUSIVE`.
+Un delta HTTP 429 positif entraîne `FAIL`.
+Un changement de membership des providers configurés entraîne
+`INCONCLUSIVE`, sauf lorsqu’un delta HTTP 429 positif est prouvé
+indépendamment.
+Le #142 prouve uniquement le gate HTTP 429; le #143 reste nécessaire pour la
+latence first-processing et son p95.
 
 - zéro HTTP 429 dans les métriques fournisseur ou les logs;
 - `heartbeat.blockHydration.enabled=true`, `version=1` et
@@ -96,7 +138,10 @@ activation.
 - le shutdown arrête les nouvelles admissions, draine dans le délai borné et
   laisse le health final propre, sans fuite de file ou de cache.
 
-Toute violation est `FAIL`. Deux niveaux de rollback existent :
+Pour le gate HTTP 429, seul un delta positif prouvé est `FAIL`; les autres
+observations de la matrice restent `INCONCLUSIVE`. Les gates opérationnels
+distincts ci-dessus conservent leurs propres critères. Deux niveaux de rollback
+existent :
 
 1. **Rollback B3b admission-only.** Remettre
    `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis redémarrer la
