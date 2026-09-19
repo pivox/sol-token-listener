@@ -1,0 +1,555 @@
+import assert from 'node:assert/strict';
+import { isProxy } from 'node:util/types';
+import test from 'node:test';
+import { PublicKey } from '@solana/web3.js';
+import {
+  PumpFunCatchUpBlockClassifier,
+  createPumpFunCatchUpClassificationFromDecoded,
+} from '../src/application/pumpfun-catch-up-block-classifier.js';
+import type { MergedCatchUpDiscovery } from '../src/application/catch-up-discovery.js';
+import type { CatchUpClassification } from '../src/domain/catch-up-classification.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
+import type {
+  DecodedPumpTrade,
+  DecodedPumpTransaction,
+} from '../src/launchpads/pumpfun/types.js';
+import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
+import type { CatchUpClassificationRepository } from '../src/ports/catch-up-classification-repository.js';
+import {
+  internalLocatorError,
+  RpcTransientError,
+  TransactionIndexNotFoundError,
+  TransactionNormalizationError,
+  trustedTransactionLocatorFailure,
+  type TransactionLocationTarget,
+} from '../src/solana/rpc/transaction-locator.js';
+import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { loadMainnetFixture, loadPumpFixture } from './helpers/pumpfun-fixture.js';
+
+type LocatorHandler = (target: TransactionLocationTarget) => Promise<NormalizedTransaction>;
+
+class RecordingLocator {
+  public readonly targets: TransactionLocationTarget[] = [];
+
+  public constructor(private readonly handler: LocatorHandler) {}
+
+  public async locate(target: TransactionLocationTarget): Promise<NormalizedTransaction> {
+    this.targets.push(Object.freeze({ ...target }));
+    return this.handler(target);
+  }
+}
+
+class RecordingRepository implements CatchUpClassificationRepository {
+  public readonly values: CatchUpClassification[] = [];
+
+  public constructor(
+    private readonly beforeRecord: (value: CatchUpClassification) => Promise<void> = async () => {},
+  ) {}
+
+  public async recordCatchUpClassification(value: CatchUpClassification): Promise<void> {
+    await this.beforeRecord(value);
+    this.values.push(value);
+  }
+}
+
+void test('classifies a creation and its initial buy as one actionable launch', async () => {
+  const transaction = await fixtureTransaction('create-v2-current-initial-buy-mainnet.json');
+  const locator = returning(new Map([[transaction.signature, transaction]]));
+  const repository = new RecordingRepository();
+  const classifier = new PumpFunCatchUpBlockClassifier(locator, repository, () => 10_000);
+
+  await classifier.classify(Object.freeze([discovery(transaction)]));
+
+  const value = repository.values[0];
+  assert.ok(value);
+  assert.equal(value.disposition, 'ACTIONABLE');
+  assert.equal(value.reasonCode, 'PUMP_ACTION_SUPPORTED');
+  assert.equal(value.ingestionHint, 'PUMPFUN_CREATE');
+  assert.equal(value.ingestionHintMint, null);
+  assert.equal(value.mints.length, 1);
+  assert.equal(value.observedAtMs, 10_000);
+  assert.equal(value.classifiedAtMs, 10_000);
+  assert.match(value.evidenceFingerprint, /^[0-9a-f]{64}$/u);
+  assert.deepEqual(locator.targets, [{
+    signature: transaction.signature,
+    slot: transaction.slot,
+    confirmationStatus: 'FINALIZED',
+  }]);
+});
+
+void test('classifies mono-mint trades, failed transactions and unsupported transactions', async () => {
+  const trade = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const failed = cloneTransaction(trade, {
+    signature: 'failed-transaction',
+    error: Object.freeze({ InstructionError: Object.freeze([0, 'Custom']) }),
+  });
+  const unsupported = cloneTransaction(trade, {
+    signature: 'unsupported-transaction',
+    instructions: Object.freeze([]),
+  });
+  const locator = returning(new Map([
+    [trade.signature, trade], [failed.signature, failed], [unsupported.signature, unsupported],
+  ]));
+  const repository = new RecordingRepository();
+  const classifier = new PumpFunCatchUpBlockClassifier(locator, repository, () => 20_000);
+
+  await classifier.classify(Object.freeze([
+    discovery(unsupported), discovery(trade), discovery(failed),
+  ]));
+
+  const bySignature = new Map(repository.values.map((value) => [value.signature, value]));
+  const tradeValue = bySignature.get(trade.signature);
+  assert.equal(tradeValue?.disposition, 'DEFERRED');
+  assert.equal(tradeValue?.reasonCode, 'PUMP_TRADE_UNTRACKED');
+  assert.equal(tradeValue?.ingestionHint, 'PUMPFUN_TRADE');
+  assert.equal(tradeValue?.ingestionHintMint, tradeValue?.mints[0]);
+  assert.equal(bySignature.get(failed.signature)?.disposition, 'IGNORED');
+  assert.equal(bySignature.get(failed.signature)?.reasonCode, 'SOLANA_TRANSACTION_FAILED');
+  assert.deepEqual(bySignature.get(failed.signature)?.mints, []);
+  assert.equal(bySignature.get(unsupported.signature)?.disposition, 'IGNORED');
+  assert.equal(bySignature.get(unsupported.signature)?.reasonCode, 'NO_SUPPORTED_PUMP_ACTION');
+});
+
+void test('quarantines trade-only multi-mint evidence and bounds overflow at sixteen mints', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const decoded = decodePumpTransaction(transaction);
+  const two = decodedWithTrades(decoded, 2);
+  const seventeen = decodedWithTrades(decoded, 17);
+  const eighteen = decodedWithTrades(decoded, 18);
+
+  const multi = createPumpFunCatchUpClassificationFromDecoded(
+    discovery(transaction), two, 30_000,
+  );
+  const overflow = createPumpFunCatchUpClassificationFromDecoded(
+    discovery(transaction), seventeen, 30_000,
+  );
+  const largerOverflow = createPumpFunCatchUpClassificationFromDecoded(
+    discovery(transaction), eighteen, 30_000,
+  );
+
+  assert.equal(multi.disposition, 'QUARANTINED');
+  assert.equal(multi.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(multi.mints.length, 2);
+  assert.deepEqual(multi.mints, [...multi.mints].sort());
+  assert.equal(overflow.disposition, 'QUARANTINED');
+  assert.equal(overflow.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.deepEqual(overflow.mints, []);
+  assert.notEqual(overflow.evidenceFingerprint, largerOverflow.evidenceFingerprint);
+});
+
+void test('uses the real decoder for composite multi-mint trades', async () => {
+  const buy = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const sell = await fixtureTransaction('sell-cpi-mainnet.json');
+  const composite = combineBuySell(buy, sell);
+  const decoded = decodePumpTransaction(composite);
+  assert.equal(new Set(decoded.trades.map(({ event }) => event.mint)).size, 2);
+  const repository = new RecordingRepository();
+
+  await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[composite.signature, composite]])), repository, () => 35_000,
+  ).classify(Object.freeze([discovery(composite)]));
+
+  assert.equal(repository.values[0]?.disposition, 'QUARANTINED');
+  assert.equal(repository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(repository.values[0]?.mints.length, 2);
+});
+
+void test('keeps a real migrate_v2 cursor in fingerprint evidence without making it actionable', async () => {
+  const transaction = (await loadMainnetFixture(
+    'pumpswap', 'migrate-v2-create-pool-mainnet.json',
+  )).transaction;
+  const decoded = decodePumpTransaction(transaction);
+  assert.equal(decoded.migrations.length, 1);
+  const empty = Object.freeze({ ...decoded, migrations: Object.freeze([]) });
+  const repository = new RecordingRepository();
+
+  await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])), repository, () => 40_000,
+  ).classify(Object.freeze([discovery(transaction)]));
+  const withoutMigration = createPumpFunCatchUpClassificationFromDecoded(
+    discovery(transaction), empty, 40_000,
+  );
+
+  assert.equal(repository.values[0]?.disposition, 'IGNORED');
+  assert.equal(repository.values[0]?.reasonCode, 'NO_SUPPORTED_PUMP_ACTION');
+  assert.notEqual(repository.values[0]?.evidenceFingerprint, withoutMigration.evidenceFingerprint);
+});
+
+void test('maps exact trusted locator failures once and rejects retryable or untrusted failures', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const cases = [
+    [internalLocatorError(new TransactionIndexNotFoundError()), 'PROVIDER_SIGNATURE_MISSING'],
+    [internalLocatorError(new TransactionNormalizationError()), 'PUMP_SCHEMA_UNSUPPORTED'],
+  ] as const;
+  for (const [failure, reason] of cases) {
+    const locator = new RecordingLocator(async () => { throw failure; });
+    const repository = new RecordingRepository();
+    await new PumpFunCatchUpBlockClassifier(locator, repository, () => 50_000)
+      .classify(Object.freeze([discovery(transaction)]));
+    assert.equal(repository.values[0]?.disposition, 'QUARANTINED');
+    assert.equal(repository.values[0]?.reasonCode, reason);
+    assert.equal(trustedTransactionLocatorFailure(failure), null);
+  }
+
+  const replayRepository = new RecordingRepository();
+  const replayClassifier = new PumpFunCatchUpBlockClassifier(
+    new RecordingLocator(async () => {
+      throw internalLocatorError(new TransactionNormalizationError());
+    }),
+    replayRepository,
+    () => 50_000,
+  );
+  await replayClassifier.classify(Object.freeze([discovery(transaction)]));
+  await replayClassifier.classify(Object.freeze([discovery(transaction)]));
+  assert.equal(replayRepository.values.length, 2);
+  assert.equal(
+    replayRepository.values[0]?.evidenceFingerprint,
+    replayRepository.values[1]?.evidenceFingerprint,
+  );
+
+  for (const failure of [internalLocatorError(new RpcTransientError()), new Error('untrusted')]) {
+    const repository = new RecordingRepository();
+    await assert.rejects(new PumpFunCatchUpBlockClassifier(
+      new RecordingLocator(async () => { throw failure; }), repository, () => 50_000,
+    ).classify(Object.freeze([discovery(transaction)])));
+    assert.equal(repository.values.length, 0);
+  }
+});
+
+void test('quarantines trusted decoder origins with distinct semantic fingerprints', async () => {
+  const transaction = await fixtureTransaction('create-v2-current-initial-buy-mainnet.json');
+  const missingIndex = cloneTransaction(transaction, { transactionIndex: null });
+  const missingStack = cloneTransaction(transaction, {
+    instructions: Object.freeze(transaction.instructions.map((instruction) => Object.freeze({
+      ...instruction,
+      stackHeight: null,
+    }))),
+  });
+  const firstRepository = new RecordingRepository();
+  const secondRepository = new RecordingRepository();
+
+  await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, missingIndex]])), firstRepository, () => 60_000,
+  ).classify(Object.freeze([discovery(transaction)]));
+  await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, missingStack]])), secondRepository, () => 60_000,
+  ).classify(Object.freeze([discovery(transaction)]));
+
+  assert.equal(firstRepository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(secondRepository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.notEqual(
+    firstRepository.values[0]?.evidenceFingerprint,
+    secondRepository.values[0]?.evidenceFingerprint,
+  );
+});
+
+void test('validates and snapshots the complete input before clock, locator or repository effects', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const valid = discovery(transaction);
+  let getterReads = 0;
+  const accessor = Object.freeze(Object.defineProperty({ ...valid }, 'signature', {
+    enumerable: true,
+    get() { getterReads += 1; return valid.signature; },
+  })) as MergedCatchUpDiscovery;
+  const proxy = new Proxy(valid, {});
+  assert.equal(isProxy(proxy), true);
+  const { programIds: _missingProgramIds, ...missingField } = valid;
+  void _missingProgramIds;
+  const invalidValues: readonly unknown[] = [
+    accessor,
+    proxy,
+    Object.freeze({ ...valid, extra: true }),
+    Object.freeze(missingField),
+    Object.freeze({ ...valid, slot: -1n }),
+    Object.freeze({ ...valid, confirmationStatus: 'orphaned' }),
+    Object.freeze({ ...valid, blockTimeMs: -1 }),
+    Object.freeze({ ...valid, programIds: Object.freeze([PUMPSWAP_PROGRAM_ID, PUMP_PROGRAM_ID]) }),
+    Object.freeze({ ...valid, programIds: Object.freeze([PUMP_PROGRAM_ID, PUMP_PROGRAM_ID]) }),
+    Object.freeze({ ...valid, programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]) }),
+  ];
+
+  for (const invalid of invalidValues) {
+    let clockReads = 0;
+    const locator = returning(new Map([[transaction.signature, transaction]]));
+    const repository = new RecordingRepository();
+    await assert.rejects(new PumpFunCatchUpBlockClassifier(
+      locator,
+      repository,
+      () => { clockReads += 1; return 70_000; },
+    ).classify(Object.freeze([invalid]) as readonly MergedCatchUpDiscovery[]));
+    assert.equal(clockReads, 0);
+    assert.equal(locator.targets.length, 0);
+    assert.equal(repository.values.length, 0);
+  }
+  assert.equal(getterReads, 0);
+
+  const locator = returning(new Map([[transaction.signature, transaction]]));
+  const repository = new RecordingRepository();
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(locator, repository, () => 70_000)
+    .classify(Object.freeze([valid, valid])));
+  assert.equal(locator.targets.length, 0);
+  assert.equal(repository.values.length, 0);
+
+  const sparse = new Array<MergedCatchUpDiscovery>(1);
+  const arrayAccessor: MergedCatchUpDiscovery[] = [];
+  Object.defineProperty(arrayAccessor, '0', { enumerable: true, get: () => valid });
+  Object.defineProperty(arrayAccessor, 'length', { value: 1 });
+  const arrayWithExtra = [valid] as MergedCatchUpDiscovery[] & { extra?: boolean };
+  arrayWithExtra.extra = true;
+  const topLevelCases: readonly unknown[] = [
+    new Proxy([valid], {}),
+    sparse,
+    arrayAccessor,
+    arrayWithExtra,
+    Array.from({ length: 100_001 }, () => valid),
+  ];
+  for (const input of topLevelCases) {
+    let clockReads = 0;
+    const topLocator = returning(new Map([[transaction.signature, transaction]]));
+    const topRepository = new RecordingRepository();
+    await assert.rejects(new PumpFunCatchUpBlockClassifier(
+      topLocator,
+      topRepository,
+      () => { clockReads += 1; return 70_000; },
+    ).classify(input as readonly MergedCatchUpDiscovery[]));
+    assert.equal(clockReads, 0);
+    assert.equal(topLocator.targets.length, 0);
+    assert.equal(topRepository.values.length, 0);
+  }
+});
+
+void test('hydrates and decodes every commitment bucket in a slot before its first write', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const confirmed = cloneTransaction(template, { signature: 'z-confirmed', slot: 90n });
+  const finalized = cloneTransaction(template, { signature: 'a-finalized', slot: 90n });
+  const flights = new Map<string, ReturnType<typeof deferred<NormalizedTransaction>>>();
+  const locator = new RecordingLocator(async (target) => {
+    const flight = deferred<NormalizedTransaction>();
+    flights.set(target.signature, flight);
+    return flight.promise;
+  });
+  const repository = new RecordingRepository();
+  const classifier = new PumpFunCatchUpBlockClassifier(locator, repository, () => 80_000);
+  const operation = classifier.classify(Object.freeze([
+    discovery(finalized, 'finalized'),
+    discovery(confirmed, 'processed'),
+  ]));
+
+  await flush();
+  assert.deepEqual(locator.targets.map((target) => [target.signature, target.confirmationStatus]), [
+    ['z-confirmed', 'CONFIRMED'],
+  ]);
+  flights.get('z-confirmed')?.resolve(confirmed);
+  await flush();
+  assert.deepEqual(locator.targets.map((target) => [target.signature, target.confirmationStatus]), [
+    ['z-confirmed', 'CONFIRMED'],
+    ['a-finalized', 'FINALIZED'],
+  ]);
+  assert.equal(repository.values.length, 0);
+  flights.get('a-finalized')?.resolve(finalized);
+  await operation;
+
+  assert.deepEqual(repository.values.map(({ signature, confirmationStatus }) =>
+    [signature, confirmationStatus]), [
+    ['z-confirmed', 'processed'],
+    ['a-finalized', 'finalized'],
+  ]);
+});
+
+void test('rejects a whole slot before writes on late hydration or transaction identity failure', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'first', slot: 91n });
+  const second = cloneTransaction(template, { signature: 'second', slot: 91n });
+  const retryable = internalLocatorError(new RpcTransientError());
+  const retryRepository = new RecordingRepository();
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(
+    new RecordingLocator(async (target) => {
+      if (target.signature === first.signature) return first;
+      throw retryable;
+    }),
+    retryRepository,
+    () => 90_000,
+  ).classify(Object.freeze([discovery(first), discovery(second)])));
+  assert.equal(retryRepository.values.length, 0);
+
+  for (const mismatch of [
+    cloneTransaction(first, { signature: 'wrong' }),
+    cloneTransaction(first, { slot: 92n }),
+  ]) {
+    const repository = new RecordingRepository();
+    await assert.rejects(new PumpFunCatchUpBlockClassifier(
+      returning(new Map([[first.signature, mismatch]])), repository, () => 90_000,
+    ).classify(Object.freeze([discovery(first)])));
+    assert.equal(repository.values.length, 0);
+  }
+});
+
+void test('fingerprint ignores time, finality and program provenance but covers action cursors', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const decoded = decodePumpTransaction(transaction);
+  const first = createPumpFunCatchUpClassificationFromDecoded(
+    discovery(transaction, 'confirmed'), decoded, 100_000,
+  );
+  const second = createPumpFunCatchUpClassificationFromDecoded(
+    Object.freeze({
+      ...discovery(transaction, 'finalized'),
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+    }),
+    decoded,
+    200_000,
+  );
+  const moved = createPumpFunCatchUpClassificationFromDecoded(
+    discovery(transaction, 'confirmed'), moveFirstTrade(decoded), 100_000,
+  );
+
+  assert.equal(first.evidenceFingerprint, second.evidenceFingerprint);
+  assert.notEqual(first.classifiedAtMs, second.classifiedAtMs);
+  assert.notEqual(first.confirmationStatus, second.confirmationStatus);
+  assert.notEqual(first.evidenceFingerprint, moved.evidenceFingerprint);
+});
+
+void test('replays a partially persisted slot with identical semantic fingerprints and order', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'a-first', slot: 101n });
+  const second = cloneTransaction(template, { signature: 'b-second', slot: 101n });
+  let attempt = 0;
+  const repository = new RecordingRepository(async () => {
+    attempt += 1;
+    if (attempt === 2) throw new Error('persistence failed');
+  });
+  const locator = returning(new Map([[first.signature, first], [second.signature, second]]));
+  let now = 110_000;
+  const classifier = new PumpFunCatchUpBlockClassifier(locator, repository, () => now);
+
+  await assert.rejects(classifier.classify(Object.freeze([discovery(second), discovery(first)])));
+  assert.deepEqual(repository.values.map(({ signature }) => signature), ['a-first']);
+  const firstFingerprint = repository.values[0]?.evidenceFingerprint;
+  now = 120_000;
+  await classifier.classify(Object.freeze([discovery(second), discovery(first)]));
+
+  assert.deepEqual(repository.values.map(({ signature }) => signature), [
+    'a-first', 'a-first', 'b-second',
+  ]);
+  assert.equal(repository.values[1]?.evidenceFingerprint, firstFingerprint);
+  assert.equal(repository.values[1]?.classifiedAtMs, 120_000);
+});
+
+async function fixtureTransaction(name: string): Promise<NormalizedTransaction> {
+  return (await loadPumpFixture(name)).transaction;
+}
+
+function returning(values: ReadonlyMap<string, NormalizedTransaction>): RecordingLocator {
+  return new RecordingLocator(async (target) => {
+    const value = values.get(target.signature);
+    assert.ok(value);
+    return value;
+  });
+}
+
+function discovery(
+  transaction: NormalizedTransaction,
+  confirmationStatus: MergedCatchUpDiscovery['confirmationStatus'] = 'finalized',
+): MergedCatchUpDiscovery {
+  return Object.freeze({
+    signature: transaction.signature,
+    slot: transaction.slot,
+    confirmationStatus,
+    blockTimeMs: transaction.blockTimeMs,
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
+  });
+}
+
+function cloneTransaction(
+  transaction: NormalizedTransaction,
+  overrides: Partial<NormalizedTransaction>,
+): NormalizedTransaction {
+  return { ...transaction, ...overrides };
+}
+
+function decodedWithTrades(
+  decoded: DecodedPumpTransaction,
+  count: number,
+): DecodedPumpTransaction {
+  const template = decoded.trades[0];
+  assert.ok(template);
+  const trades = Array.from({ length: count }, (_unused, index) => {
+    const mint = address(index + 1);
+    const instruction = Object.freeze({
+      ...template.action.instruction,
+      instructionIndex: index,
+      innerInstructionIndex: null,
+    });
+    return Object.freeze({
+      ...template,
+      action: Object.freeze({ ...template.action, instruction }),
+      event: Object.freeze({ ...template.event, mint }),
+    }) as DecodedPumpTrade;
+  });
+  return Object.freeze({
+    ...decoded,
+    creations: Object.freeze([]),
+    trades: Object.freeze(trades),
+    migrations: Object.freeze([]),
+  });
+}
+
+function moveFirstTrade(decoded: DecodedPumpTransaction): DecodedPumpTransaction {
+  const first = decoded.trades[0];
+  assert.ok(first);
+  return Object.freeze({
+    ...decoded,
+    trades: Object.freeze([
+      Object.freeze({
+        ...first,
+        action: Object.freeze({
+          ...first.action,
+          instruction: Object.freeze({
+            ...first.action.instruction,
+            instructionIndex: first.action.instruction.instructionIndex + 1,
+          }),
+        }),
+      }),
+    ]),
+  });
+}
+
+function combineBuySell(
+  buy: NormalizedTransaction,
+  sell: NormalizedTransaction,
+): NormalizedTransaction {
+  const offset = 8;
+  const sellInstructions = sell.instructions.map((instruction) => Object.freeze({
+    ...instruction,
+    instructionIndex: instruction.instructionIndex + offset,
+    parentInstructionIndex: instruction.parentInstructionIndex === null
+      ? null
+      : instruction.parentInstructionIndex + offset,
+  }));
+  return cloneTransaction(buy, {
+    signature: 'composite-buy-sell',
+    instructions: Object.freeze([...buy.instructions, ...sellInstructions]),
+    preTokenBalances: Object.freeze([...buy.preTokenBalances, ...sell.preTokenBalances]),
+    postTokenBalances: Object.freeze([...buy.postTokenBalances, ...sell.postTokenBalances]),
+  });
+}
+
+function address(value: number): string {
+  const bytes = new Uint8Array(32);
+  bytes[0] = value;
+  bytes[31] = 255 - value;
+  return new PublicKey(bytes).toBase58();
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
+
+async function flush(): Promise<void> {
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+}
