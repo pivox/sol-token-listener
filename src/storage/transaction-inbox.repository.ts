@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import type { QueryResultRow } from 'pg';
+import { createRuntimeRpcHttpEvidence } from '../domain/rpc-http-evidence.js';
 import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
@@ -1763,6 +1764,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       assertValidRuntimeHeartbeat(value);
       const catchUpAdmission = value.catchUpAdmission === undefined ? undefined
         : snapshotRuntimeCatchUpAdmissionMetrics(value.catchUpAdmission, value.backlogCount);
+      const rpcHttpEvidence = value.rpcHttpEvidence === undefined ? undefined
+        : createRuntimeRpcHttpEvidence(value.rpcHttpEvidence);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
@@ -1810,6 +1813,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(catchUpAdmission === undefined
               ? {}
               : { catchUpAdmission }),
+            ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
           }),
           value.exhaustedCount,
         ],

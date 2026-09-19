@@ -44,10 +44,63 @@ import {
   type TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import { RPC_PROVIDER_IDS, isRpcProviderId } from '../src/domain/rpc-provider.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
+
+void test('heartbeat accepts omitted historical RPC HTTP evidence and the exact fixed provider snapshot', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  const rpcHttpEvidence = createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-2']);
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, rpcHttpEvidence })); });
+});
+
+void test('heartbeat rejects malformed RPC HTTP evidence before generic snapshot normalization', () => {
+  const valid = createRpcHttpEvidenceRecorder().snapshot(['primary']);
+  let accessorReads = 0;
+  const accessor = Object.freeze({ ...valid, get overflowed() { accessorReads += 1; return false; } });
+  const provider = valid.providers[0];
+  for (const rpcHttpEvidence of [
+    undefined, null,
+    Object.freeze({ ...valid, version: 2 }),
+    Object.freeze({ ...valid, endpoint: 'private-secret' }),
+    Object.freeze({ ...valid, providers: Object.freeze([...valid.providers].reverse()) }),
+    Object.freeze({ ...valid, providers: Object.freeze([{ ...provider, attempts: 0, http429Responses: 1 }, ...valid.providers.slice(1)].map(Object.freeze)) }),
+    Object.freeze({ ...valid, providers: Object.freeze([{ ...provider, configured: false, attempts: 1 }, ...valid.providers.slice(1)].map(Object.freeze)) }),
+    Object.freeze({ ...valid, providers: Object.freeze([{ ...provider, endpoint: 'private-secret' }, ...valid.providers.slice(1)].map(Object.freeze)) }),
+    new Proxy(valid, {}),
+    Object.freeze({ ...valid, providers: new Proxy(valid.providers, {}) }),
+    Object.freeze({ ...valid, providers: Object.freeze([new Proxy(provider, {}), ...valid.providers.slice(1)]) }),
+    accessor,
+    Object.freeze({ ...valid, providers: Object.freeze([Object.freeze({ ...provider, get attempts() { accessorReads += 1; return 0; } }), ...valid.providers.slice(1)]) }),
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), rpcHttpEvidence })); }, TypeError);
+  }
+  assert.equal(accessorReads, 0);
+});
+
+function rpcEvidenceHeartbeat(): RuntimeHeartbeat {
+  return Object.freeze({
+    runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+    workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+    updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+    lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0, exhaustedCount: 0,
+  });
+}
+
+void test('heartbeat rejects a proxy envelope without invoking traps on RPC HTTP evidence', () => {
+  let traps = 0;
+  const heartbeat = Object.freeze({ ...rpcEvidenceHeartbeat(),
+    rpcHttpEvidence: createRpcHttpEvidenceRecorder().snapshot(['primary']),
+  });
+  const proxy = new Proxy(heartbeat, {
+    getOwnPropertyDescriptor(target, key) { traps += 1; return Reflect.getOwnPropertyDescriptor(target, key); },
+  });
+  assert.throws(() => { assertValidRuntimeHeartbeat(proxy); }, TypeError);
+  assert.equal(traps, 0);
+});
 const notificationTradeHint: TransactionNotification['ingestionHint'] = 'PUMPFUN_TRADE';
 // @ts-expect-error NONE is parser-only and cannot be persisted in a notification.
 const parserOnlyHint: TransactionNotification['ingestionHint'] = 'NONE';

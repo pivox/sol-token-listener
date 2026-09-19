@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import { PublicKey } from '@solana/web3.js';
 import { assertValidObservedPipelineFailure } from './observed-pipeline-failure.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
 import { assertValidChainCursor, assertValidTransactionCursor } from './cursor.js';
 import { isRpcProviderId, type RpcProviderId } from './rpc-provider.js';
+import {
+  assertValidRuntimeRpcHttpEvidence,
+  type RuntimeRpcHttpEvidenceV1,
+} from './rpc-http-evidence.js';
 import type { ChainConfirmationStatus } from './types.js';
 
 export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
@@ -259,6 +264,7 @@ export interface RuntimeHeartbeat {
   readonly exhaustedCount: number;
   readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
+  readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
 }
 
 export interface RuntimeCatchUpAdmissionMetricsV1 extends CatchUpAdmissionCounts {
@@ -673,6 +679,17 @@ export function assertValidFinalityRevision(
 export function assertValidRuntimeHeartbeat(
   value: unknown,
 ): asserts value is RuntimeHeartbeat {
+  if (isProxy(value)) throw new TypeError('Runtime heartbeat is invalid.');
+  // Validate the original evidence before the generic durable snapshot can normalize proxies.
+  if (typeof value === 'object' && value !== null) {
+    const evidence = Object.getOwnPropertyDescriptor(value, 'rpcHttpEvidence');
+    if (evidence !== undefined) {
+      if (!('value' in evidence) || evidence.enumerable !== true) {
+        throw new TypeError('RPC HTTP evidence is invalid.');
+      }
+      assertValidRuntimeRpcHttpEvidence(evidence.value);
+    }
+  }
   const record = frozenRecord(value, 'Runtime heartbeat');
   for (const field of [
     'runtimeState',

@@ -5,6 +5,10 @@ import {
 } from '../domain/solana-genesis-hash.js';
 import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
 import {
+  createRuntimeRpcHttpEvidence,
+  type RuntimeRpcHttpEvidenceV1,
+} from '../domain/rpc-http-evidence.js';
+import {
   assertValidInboxCounts,
   assertValidRuntimeHeartbeat,
   snapshotRuntimeCatchUpAdmissionMetrics,
@@ -37,6 +41,7 @@ import { createProviderPinnedBlockRpc } from '../solana/rpc/provider-pinned-bloc
 import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-finality-source.js';
 import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
+import { createRpcHttpEvidenceRecorder } from '../solana/rpc/rpc-http-evidence.js';
 import { openWsProgramSession } from '../solana/rpc/ws-program-session.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
@@ -189,7 +194,9 @@ export function createProductionListenerRuntime(
   const providers = createRpcProviderCatalog(config);
   const ingestionPrograms = listenerIngestionPrograms(config.listenerIngestionScope);
   const databasePool = pool ?? getDatabasePool();
+  const recorder = createRpcHttpEvidenceRecorder();
   const rpc = new SolanaRpcClient(config, {
+    recorder,
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
   });
   const inbox = new PostgresTransactionInboxRepository(databasePool, Object.freeze({
@@ -197,13 +204,13 @@ export function createProductionListenerRuntime(
     baseDelayMs: config.rpcRetryBaseDelayMs,
   }));
   const promoted = new PromotedProviderSelector(
-    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId)),
+    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId, undefined, recorder)),
   );
   const hydration = config.listenerPumpFunCatchUpPageAdmissionEnabled
     ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
       providerId, createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
         requestTimeoutMs: config.listenerShutdownTimeoutMs,
-      }),
+      }, recorder),
     ])), {
       maxEntries: config.listenerBlockHydrationMaxEntries,
       maxBytes: config.listenerBlockHydrationMaxBytes,
@@ -242,6 +249,8 @@ export function createProductionListenerRuntime(
         providerId,
         'confirmed',
         expectedGenesisHash,
+        undefined,
+        recorder,
       );
       return [providerId, source] as const;
     }),
@@ -528,6 +537,7 @@ export function createProductionListenerRuntime(
       intervalMs: 5_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
+      rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(providers.ids),
       ...(hydration === null ? {} : {
         catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
           version: 1,
@@ -585,6 +595,7 @@ export interface RecurringListenerOptions {
 export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
+  readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
 }
 
 export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
@@ -828,6 +839,7 @@ export class PersistentListenerHeartbeat {
   private closed = false;
   private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
+  private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository, 'counts' | 'writeHeartbeat'>,
@@ -852,6 +864,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Catch-up admission metrics provider is invalid.');
     }
     this.catchUpAdmissionMetrics = options.catchUpAdmissionMetrics ?? null;
+    if (options.rpcHttpEvidenceMetrics !== undefined
+      && typeof options.rpcHttpEvidenceMetrics !== 'function') {
+      throw new TypeError('RPC HTTP evidence metrics provider is invalid.');
+    }
+    this.rpcHttpEvidenceMetrics = options.rpcHttpEvidenceMetrics ?? null;
   }
 
   public async start(): Promise<void> {
@@ -956,6 +973,14 @@ export class PersistentListenerHeartbeat {
       }
     }
     const blockHydration = this.blockHydrationMetrics?.();
+    let rpcHttpEvidence: RuntimeRpcHttpEvidenceV1 | undefined;
+    if (this.rpcHttpEvidenceMetrics !== null) {
+      try {
+        rpcHttpEvidence = createRuntimeRpcHttpEvidence(this.rpcHttpEvidenceMetrics());
+      } catch {
+        throw new TypeError('RPC HTTP evidence metrics are invalid.');
+      }
+    }
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
       subscriberState: runtimeState === 'STOPPED' ? 'STOPPED' : this.subscriberState(),
@@ -973,6 +998,7 @@ export class PersistentListenerHeartbeat {
       exhaustedCount: this.exhaustedCount,
       ...(blockHydration === undefined ? {} : { blockHydration }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
+      ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
     });
     if (this.catchUpAdmissionMetrics !== null) {
       try { assertValidRuntimeHeartbeat(value); } catch {
