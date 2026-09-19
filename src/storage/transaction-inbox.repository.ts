@@ -240,13 +240,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         programs.sort(lexicalOrder);
         if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
-        if (row !== undefined
-          && (row.catch_up_disposition === 'IGNORED' || row.catch_up_disposition === 'QUARANTINED')) {
+        const terminalCatchUpClassification = row !== undefined
+          && (row.catch_up_disposition === 'IGNORED' || row.catch_up_disposition === 'QUARANTINED');
+        if (terminalCatchUpClassification && row.processing_status === row.catch_up_disposition) {
           if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot) {
             throw internalRepositoryError(new TransactionInboxConflictError('identity'));
-          }
-          if (row.processing_status !== row.catch_up_disposition) {
-            throw new TypeError('Stored terminal catch-up classification is invalid.');
           }
           const sources = discoverySources(row.discovery_sources);
           if (!sources.includes(value.source)) sources.push(value.source);
@@ -265,7 +263,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           requireOne(updated.rowCount);
           return;
         }
-        const decision = convergeIngestion(row, value, tracked, programs);
+        const decision = terminalCatchUpClassification
+          ? storedIngestionDecision(row)
+          : convergeIngestion(row, value, tracked, programs);
         if (row === undefined) {
           if (receipt !== undefined) {
             assertTerminalReceiptAcceptsNotification(receipt, value);
@@ -542,6 +542,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         sources.sort(sourceOrder);
         const status = reconciledStatus(confirmation(row.target_confirmation_status), value.confirmationStatus);
         const currentDecision = storedIngestionDecision(row);
+        const catchUpEnqueued = currentDecision.status === 'DEFERRED' && decision.status === 'PENDING';
+        const catchUpAdmissionPriority = catchUpEnqueued ? decision.priority : null;
         const pristine = isPristineInbox(row);
         const currentStatus = confirmation(row.target_confirmation_status);
         const shouldReplay = currentDecision.status === 'PROCESSED' && status !== currentStatus;
@@ -571,7 +573,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
              catch_up_classification_version=$10,catch_up_disposition=$11,catch_up_reason_code=$12,
              catch_up_action_key=$13,catch_up_mints=$14,catch_up_evidence_fingerprint=$15,
-             catch_up_classified_at=$16,catch_up_enqueued=FALSE,catch_up_admission_priority=NULL,
+             catch_up_classified_at=$16,catch_up_enqueued=$19,catch_up_admission_priority=$20,
              updated_at=GREATEST(updated_at,$16)
            WHERE signature=$1 AND catch_up_classification_version IS NULL`,
           [
@@ -579,10 +581,16 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             decision.hint, decision.mint, terminalAt, value.classificationVersion,
             value.disposition, value.reasonCode, actionKey, value.mints, value.evidenceFingerprint,
             dateFromMs(value.classifiedAtMs), shouldReplay, pristine,
+            catchUpEnqueued, catchUpAdmissionPriority,
           ],
         );
         requireOne(updated.rowCount);
-        return classificationReceipt(value, 'RECORDED', false, decision.priority);
+        return classificationReceipt(
+          value,
+          'RECORDED',
+          catchUpEnqueued,
+          catchUpAdmissionPriority,
+        );
       }, signal);
     });
   }

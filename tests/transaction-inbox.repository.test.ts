@@ -145,6 +145,49 @@ void test('records catch-up evidence on pristine WebSocket work without a second
   });
 });
 
+void test('records catch-up admission when tracked membership promotes existing deferred WebSocket work', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const promotedSignature = 'receipt-websocket-deferred-promotion';
+    await repository.enqueue(tradeNotification(promotedSignature, 1n));
+    assert.equal((await row(pool, promotedSignature)).processing_status, 'DEFERRED');
+    await insertTrackedLaunch(pool);
+    const promotedClassification = createCatchUpClassification({
+      ...catchUpClassificationInput(promotedSignature),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+
+    assert.deepEqual(await repository.recordCatchUpClassification(promotedClassification), {
+      signature: promotedSignature, slot: 1n, disposition: 'DEFERRED',
+      persistence: 'RECORDED', admission: 'ENQUEUED', ingestionPriority: 'TRACKED_TRADE',
+    });
+    const promoted = await row(pool, promotedSignature);
+    assert.equal(promoted.processing_status, 'PENDING');
+    assert.equal(promoted.ingestion_priority, 'TRACKED_TRADE');
+    assert.equal(promoted.catch_up_enqueued, true);
+    assert.equal(promoted.catch_up_admission_priority, 'TRACKED_TRADE');
+    assert.deepEqual(await repository.recordCatchUpClassification(promotedClassification), {
+      signature: promotedSignature, slot: 1n, disposition: 'DEFERRED',
+      persistence: 'REPLAYED', admission: 'ENQUEUED', ingestionPriority: 'TRACKED_TRADE',
+    });
+
+    const pendingSignature = 'receipt-websocket-existing-pending';
+    await repository.enqueue(tradeNotification(pendingSignature, 2n));
+    const pendingClassification = createCatchUpClassification({
+      ...catchUpClassificationInput(pendingSignature), slot: 2n,
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    assert.deepEqual(await repository.recordCatchUpClassification(pendingClassification), {
+      signature: pendingSignature, slot: 2n, disposition: 'DEFERRED',
+      persistence: 'RECORDED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    assert.equal((await row(pool, pendingSignature)).catch_up_enqueued, false);
+    assert.equal((await row(pool, pendingSignature)).catch_up_admission_priority, null);
+  });
+});
+
 void test('annotates non-pristine WebSocket work while preserving its active processing cycle', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -207,6 +250,44 @@ void test('terminal classifications terminalize pristine WebSocket work and pres
     assert.equal(stored.lease_token, claim.leaseToken);
     assert.equal(stored.catch_up_disposition, 'IGNORED');
     assert.equal(stored.catch_up_enqueued, false);
+  });
+});
+
+void test('ordinary finality discovery replays a nonterminal WebSocket lifecycle with terminal catch-up evidence', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'receipt-websocket-terminal-finality-replay';
+    await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'confirmed', 1_000));
+    const claim = await repository.claim(1_001, 30);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 1n));
+    await repository.markProcessed(signature, claim.leaseToken, 'confirmed');
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null, ingestionHintMint: null, mints: [],
+    });
+    await repository.recordCatchUpClassification(classification);
+    assert.equal((await row(pool, signature)).processing_status, 'PROCESSED');
+
+    const finalizedDiscovery = Object.freeze({
+      ...notification(signature, 1n, 'WEBSOCKET', 'finalized', 2_000, 'PUMPFUN_CREATE'),
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+    });
+    await repository.enqueue(finalizedDiscovery);
+    await repository.enqueue(Object.freeze({ ...finalizedDiscovery, observedAtMs: 2_001 }));
+
+    const replayed = await row(pool, signature);
+    assert.equal(replayed.target_confirmation_status, 'finalized');
+    assert.equal(replayed.processing_status, 'PENDING');
+    assert.equal(replayed.processed_at, null);
+    assert.equal(replayed.ingestion_priority, 'NORMAL');
+    assert.equal(replayed.ingestion_hint, 'NONE');
+    assert.equal(replayed.ingestion_hint_mint, null);
+    assert.equal(replayed.catch_up_disposition, 'IGNORED');
+    assert.equal(replayed.catch_up_enqueued, false);
+    assert.deepEqual(replayed.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+    assert.equal((await repository.claim(2_002, 30))?.signature, signature);
   });
 });
 

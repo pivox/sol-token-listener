@@ -17,6 +17,7 @@ void test('049 declares immutable catch-up admission evidence', async () => {
   assert.match(sql, /ADD COLUMN IF NOT EXISTS catch_up_admission_priority\s+chain_transaction_inbox_priority/u);
   assert.match(sql, /catch_up_enqueued IS NULL/u);
   assert.match(sql, /catch_up_admission_priority IS NULL/u);
+  assert.match(sql, /ambiguous historical DEFERRED admission/u);
   assert.match(sql, /catch_up_disposition='ACTIONABLE'\s+THEN TRUE/u);
   assert.match(sql, /catch_up_disposition IN \('IGNORED','QUARANTINED'\)\s+THEN FALSE/u);
   assert.match(sql, /chain_transaction_inbox_catch_up_classification_check/u);
@@ -31,13 +32,6 @@ void test('049 upgrades 048, backfills exact historical admission and replays cl
     await insertClassified(pool, { signature: 'actionable-websocket',
       discovery_sources: ['WEBSOCKET', 'CATCH_UP'], catch_up_disposition: 'ACTIONABLE',
       catch_up_reason_code: 'PUMP_ACTION_SUPPORTED', processing_status: 'PENDING' });
-    await insertClassified(pool, { signature: 'deferred-pending', catch_up_disposition: 'DEFERRED',
-      catch_up_reason_code: 'PUMP_TRADE_UNTRACKED', catch_up_action_key: `PUMPFUN_TRADE:${mint}`,
-      ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: mint, processing_status: 'PENDING' });
-    await insertClassified(pool, { signature: 'deferred-terminal', catch_up_disposition: 'DEFERRED',
-      catch_up_reason_code: 'PUMP_TRADE_UNTRACKED', catch_up_action_key: `PUMPFUN_TRADE:${mint}`,
-      ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: mint, processing_status: 'DEFERRED',
-      terminal_at: observedAt, purge_after: '2026-09-19T14:00:00.000Z' });
     await insertClassified(pool, { signature: 'ignored', catch_up_disposition: 'IGNORED',
       catch_up_reason_code: 'NO_SUPPORTED_PUMP_ACTION', catch_up_action_key: 'NONE', catch_up_mints: [],
       ingestion_hint: 'NONE', ingestion_hint_mint: null,
@@ -49,11 +43,25 @@ void test('049 upgrades 048, backfills exact historical admission and replays cl
       FROM chain_transaction_inbox ORDER BY signature`)).rows, [
       { signature: 'actionable', catch_up_enqueued: true, catch_up_admission_priority: 'NORMAL' },
       { signature: 'actionable-websocket', catch_up_enqueued: false, catch_up_admission_priority: null },
-      { signature: 'deferred-pending', catch_up_enqueued: true, catch_up_admission_priority: 'NORMAL' },
-      { signature: 'deferred-terminal', catch_up_enqueued: false, catch_up_admission_priority: null },
       { signature: 'ignored', catch_up_enqueued: false, catch_up_admission_priority: null },
     ]);
     await pool.query(sql);
+  });
+});
+
+void test('049 rejects ambiguous 048 deferred evidence before adding receipt columns', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await applyThrough048(pool);
+    await insertClassified(pool, {
+      signature: 'deferred-ambiguous', catch_up_disposition: 'DEFERRED',
+      catch_up_reason_code: 'PUMP_TRADE_UNTRACKED', catch_up_action_key: `PUMPFUN_TRADE:${mint}`,
+      ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: mint, processing_status: 'PENDING',
+    });
+
+    await assert.rejects(pool.query(await migrationSql()), { code: '23514' });
+    assert.equal((await pool.query(`SELECT COUNT(*) AS count FROM pg_attribute
+      WHERE attrelid='chain_transaction_inbox'::REGCLASS AND attnum>0 AND NOT attisdropped
+        AND attname IN ('catch_up_enqueued','catch_up_admission_priority')`)).rows[0]?.count, '0');
   });
 });
 

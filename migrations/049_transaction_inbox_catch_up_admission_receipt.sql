@@ -22,6 +22,15 @@ BEGIN
   IF (receipt_columns=0) <> (admission_priority_columns=0) THEN
     RAISE EXCEPTION 'catch-up admission receipt columns are partially installed' USING ERRCODE='23514';
   END IF;
+  -- Migration 048 did not persist whether a deferred trade was actually
+  -- admitted. Its current processing state is mutable evidence and cannot be
+  -- converted into an immutable receipt truthfully.
+  IF receipt_columns=0 AND EXISTS (
+    SELECT 1 FROM chain_transaction_inbox
+    WHERE catch_up_classification_version IS NOT NULL AND catch_up_disposition='DEFERRED'
+  ) THEN
+    RAISE EXCEPTION 'ambiguous historical DEFERRED admission' USING ERRCODE='23514';
+  END IF;
   DROP TABLE IF EXISTS pg_temp.migration_049_preflight;
   CREATE TEMP TABLE pg_temp.migration_049_preflight (replay BOOLEAN NOT NULL) ON COMMIT DROP;
   INSERT INTO pg_temp.migration_049_preflight(replay) VALUES (receipt_columns=1);
@@ -78,17 +87,15 @@ ALTER TABLE chain_transaction_inbox
   ADD COLUMN IF NOT EXISTS catch_up_enqueued BOOLEAN,
   ADD COLUMN IF NOT EXISTS catch_up_admission_priority chain_transaction_inbox_priority;
 
--- Preserve an already durable receipt on replay. Deferred evidence can only be
--- backfilled as admitted while its original row still inhabits the processing
--- lifecycle; later DEFERRED rows are historical non-admissions.
+-- Preserve only admission facts that 048 represented unambiguously. Deferred
+-- rows are rejected by the preflight above rather than inferred from mutable
+-- processing state.
 UPDATE chain_transaction_inbox
 SET catch_up_enqueued = CASE
   WHEN catch_up_classification_version IS NULL THEN NULL
   WHEN catch_up_disposition='ACTIONABLE' AND 'WEBSOCKET'=ANY(discovery_sources) THEN FALSE
   WHEN catch_up_disposition='ACTIONABLE' THEN TRUE
   WHEN catch_up_disposition IN ('IGNORED','QUARANTINED') THEN FALSE
-  WHEN catch_up_disposition='DEFERRED'
-    AND processing_status IN ('PENDING','PROCESSING','PROCESSED','FAILED') THEN TRUE
   ELSE FALSE
 END
 WHERE catch_up_enqueued IS NULL;

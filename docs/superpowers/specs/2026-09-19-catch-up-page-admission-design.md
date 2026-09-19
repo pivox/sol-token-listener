@@ -1,6 +1,6 @@
 # Strict Catch-up Page Admission Design
 
-Version: 1.0.4 — 2026-09-19 — issue #135, sub-task 120-B3a.
+Version: 1.0.5 — 2026-09-19 — issue #135, sub-task 120-B3a.
 
 ## Goal and status
 
@@ -148,8 +148,10 @@ original durable decision; only an admitted row copies its then-current
 
 - `ACTIONABLE` -> true, except for a row already admitted by WebSocket;
 - `IGNORED` / `QUARANTINED` -> false;
-- `DEFERRED` -> true only when the original classified row is still in an
-  admitted processing state, otherwise false.
+- a classified `DEFERRED` row from migration 048 is rejected before any
+  persistent mutation: 048 did not retain whether catch-up actually admitted
+  it, and its current processing state is mutable evidence rather than a
+  recoverable historical fact.
 
 The migration installs exact constraints tying column nullability to the
 classification fields and preserves the four-hour terminal retention rules.
