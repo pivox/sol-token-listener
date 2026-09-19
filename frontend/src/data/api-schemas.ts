@@ -508,6 +508,32 @@ const catchUpAdmissionSchema = z.object({
     && !(value.providerId === null && (value.scanActive || value.workerClaimReady))
     && !(!value.enabled && (value.providerId !== null || value.scanActive || value.workerClaimReady));
 });
+const rpcHttpEvidenceCountSchema = countSchema.refine((value) => !Object.is(value, -0));
+type RpcHttpProviderId = 'primary' | 'fallback-1' | 'fallback-2' | 'fallback-3';
+function rpcHttpProviderEvidenceSchema(providerId: RpcHttpProviderId): z.ZodObject<{
+  providerId: z.ZodLiteral<RpcHttpProviderId>;
+  configured: z.ZodBoolean;
+  attempts: typeof rpcHttpEvidenceCountSchema;
+  http429Responses: typeof rpcHttpEvidenceCountSchema;
+}> {
+  return z.object({
+    providerId: z.literal(providerId),
+    configured: z.boolean(),
+    attempts: rpcHttpEvidenceCountSchema,
+    http429Responses: rpcHttpEvidenceCountSchema,
+  }).strict().refine(({ configured, attempts, http429Responses }) => http429Responses <= attempts
+    && (configured || (attempts === 0 && http429Responses === 0)));
+}
+const rpcHttpEvidenceSchema = z.object({
+  version: z.literal(1),
+  overflowed: z.boolean(),
+  providers: z.tuple([
+    rpcHttpProviderEvidenceSchema('primary'),
+    rpcHttpProviderEvidenceSchema('fallback-1'),
+    rpcHttpProviderEvidenceSchema('fallback-2'),
+    rpcHttpProviderEvidenceSchema('fallback-3'),
+  ]),
+}).strict();
 const healthSchema = z.object({
   status: z.enum(['OK', 'DEGRADED']),
   observedAt: timestampSchema,
@@ -553,6 +579,7 @@ const healthSchema = z.object({
     websocket: websocketHealthSchema.optional(),
     blockHydration: blockHydrationSchema.nullish(),
     catchUpAdmission: catchUpAdmissionSchema.nullish(),
+    rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
   }).loose().refine(({ catchUpAdmission, backlogCount }) => {
     if (catchUpAdmission === undefined || catchUpAdmission === null) return true;
     const source = catchUpAdmission.actionableBacklogBySource;

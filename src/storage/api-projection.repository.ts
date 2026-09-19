@@ -7,6 +7,7 @@ import {
   type ApiHealth,
   type ApiBlockHydrationMetricsV1,
   type ApiCatchUpAdmissionMetricsV1,
+  type ApiRpcHttpEvidenceV1,
   type ApiWebSocketHealth,
   type ApiHolders,
   type ApiHolderSnapshot,
@@ -53,7 +54,7 @@ import {
   SOCIAL_LINK_KINDS,
 } from '../domain/social-evidence.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
-import { isRpcProviderId } from '../domain/rpc-provider.js';
+import { isRpcProviderId, RPC_PROVIDER_IDS } from '../domain/rpc-provider.js';
 import {
   LISTENER_RUNTIME_STATES,
   snapshotRuntimeCatchUpAdmissionMetrics,
@@ -2105,7 +2106,7 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null, catchUpAdmission: null });
+    websocket, blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2191,6 +2192,37 @@ function heartbeatFromRow(
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
+    rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
+  });
+}
+
+function rpcHttpEvidenceFromPayload(value: unknown): ApiRpcHttpEvidenceV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'rpcHttpEvidence');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  const evidence = exactDataRecord(descriptor.value, ['version', 'overflowed', 'providers'], 'RPC HTTP evidence');
+  if (evidence.version !== 1 || typeof evidence.overflowed !== 'boolean') throw invalid();
+  const providers = exactDenseArray(evidence.providers, RPC_PROVIDER_IDS.length, 'RPC HTTP evidence providers');
+  if (providers.length !== RPC_PROVIDER_IDS.length) throw invalid();
+  return freeze({
+    version: 1,
+    overflowed: evidence.overflowed,
+    providers: freeze(providers.map((provider, index) => {
+      const fields = exactDataRecord(provider, ['providerId', 'configured', 'attempts', 'http429Responses'], 'RPC HTTP evidence provider');
+      const attempts = nonNegativeSafeNumber(fields.attempts);
+      const http429Responses = nonNegativeSafeNumber(fields.http429Responses);
+      if (fields.providerId !== RPC_PROVIDER_IDS[index] || typeof fields.configured !== 'boolean'
+        || http429Responses > attempts
+        || (!fields.configured && (attempts !== 0 || http429Responses !== 0))) throw invalid();
+      return freeze({
+        providerId: fields.providerId,
+        configured: fields.configured,
+        attempts,
+        http429Responses,
+      });
+    })) as ApiRpcHttpEvidenceV1['providers'],
   });
 }
 

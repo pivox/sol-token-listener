@@ -8,6 +8,7 @@ import {
   type ApiDomainPayload,
   type ApiFailure,
   type ApiHealth,
+  type ApiRpcHttpEvidenceV1,
   type ApiWebSocketHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
@@ -23,6 +24,24 @@ import {
   toApiJson,
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
+
+void test('RPC HTTP evidence health contract permits optional nullable fixed-provider metrics', () => {
+  const metrics: ApiRpcHttpEvidenceV1 = {
+    version: 1,
+    overflowed: false,
+    providers: [
+      { providerId: 'primary', configured: true, attempts: 3, http429Responses: 1 },
+      { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+      { providerId: 'fallback-2', configured: false, attempts: 0, http429Responses: 0 },
+      { providerId: 'fallback-3', configured: false, attempts: 0, http429Responses: 0 },
+    ],
+  };
+  const omitted: Pick<ApiHealth['heartbeat'], 'rpcHttpEvidence'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'rpcHttpEvidence'> = { rpcHttpEvidence: null };
+  assert.deepEqual(omitted, {});
+  assert.deepEqual(explicitNull, { rpcHttpEvidence: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+});
 
 void test('catch-up admission health contract permits optional V1 bounded JSON metrics', () => {
   const metrics: NonNullable<ApiHealth['heartbeat']['catchUpAdmission']> = {
