@@ -1,6 +1,6 @@
 # Production Catch-up Admission Activation Design
 
-Version: 1.0.0 — 2026-09-19 — issue #137, sub-task 120-B3b.
+Version: 1.0.1 — 2026-09-19 — issue #137, sub-task 120-B3b.
 
 ## Goal and status
 
@@ -103,9 +103,12 @@ of the coordinator. That view is valid only while the matching scan permit is
 active. Calls outside it fail retryably instead of silently selecting another
 provider.
 
-The existing `StrictCatchUpCoordinator` remains outside the hydration permit:
-its single-flight makes concurrent callers join the same scan before one scan
-enters the provider-affine critical section.
+The hydration permit is acquired before invoking the existing
+`StrictCatchUpCoordinator`. It serializes concurrent provider-affine wrapper
+calls; once inside that permit, the coordinator still prevents overlapping
+scanner executions within its own boundary. Concurrent wrappers therefore
+queue at the hydration permit instead of being guaranteed to join one shared
+coordinator flight.
 
 The same page admitter is supplied to both scanner constructions:
 

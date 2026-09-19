@@ -365,11 +365,12 @@ void test('block hydration canary proves active routing and bounded serialized a
 });
 
 void test('catch-up admission documentation fixes the restart-only activation and Mainnet gate', async () => {
-  const [readme, architecture, api, runbook] = await Promise.all([
+  const [readme, architecture, api, runbook, design] = await Promise.all([
     readArtifact('README.md'),
     readArtifact('docs/architecture/pumpfun-v1.md'),
     readArtifact('docs/api/v1.md'),
     readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('docs/superpowers/specs/2026-09-19-production-catch-up-admission-activation-design.md'),
   ]);
   const all = `${readme}\n${architecture}\n${api}\n${runbook}`;
 
@@ -386,6 +387,8 @@ void test('catch-up admission documentation fixes the restart-only activation an
   assert.match(all, /rollback[^.]{0,120}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false/iu);
   assert.match(all, /provider-affin|affinité fournisseur/iu);
   assert.match(all, /une seule cache|cache unique|global[^.]{0,120}4[^.]{0,40}fetch/iu);
+  assert.match(design, /hydration permit[^.]{0,240}before[^.]{0,240}StrictCatchUpCoordinator/iu);
+  assert.doesNotMatch(design, /StrictCatchUpCoordinator[^.]{0,120}remains[^.]{0,80}outside[^.]{0,80}hydration permit/iu);
   assert.match(all, /aucun[^.]{0,80}(?:wallet|clé privée|executor|exécuteur|soumission)/iu);
   assert.match(architecture, /pré-E\/S[^.]{0,240}enveloppe canonique base58/iu);
   assert.match(architecture, /getGenesisHash[^.]{0,240}catch-up[^.]{0,240}fail-closed/iu);
@@ -397,6 +400,7 @@ void test('catch-up admission documentation fixes the restart-only activation an
   assert.match(api, /métrique brute est absente[^.]{0,240}"catchUpAdmission": null/iu);
   assert.match(api, /réponse plus[\s\S]{0,240}ancienne[^.]{0,240}omettre[^.]{0,240}champ optionnel/iu);
   assert.match(api, /providerId[^.]{0,250}null/iu);
+  assert.match(api, /providerId[^.]{0,300}scan actif[^.]{0,180}provider promu/iu);
   assert.match(runbook, /Canary Mainnet post-merge[\s\S]{0,100}15 minutes/iu);
   for (const gate of ['zéro HTTP 429', 'backlog', 'RSS', 'p95', 'finalit', 'idempot', 'quatre heures', 'affinit', 'shutdown']) {
     assert.match(runbook, new RegExp(gate, 'iu'));
