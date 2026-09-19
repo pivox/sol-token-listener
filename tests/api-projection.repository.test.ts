@@ -1720,6 +1720,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: null,
       pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
       blockHydration: blockHydrationMetrics(),
+      catchUpAdmission: null,
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2115,7 +2116,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket: inactiveWebSocketHealth(), blockHydration: null,
+    websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
   });
   assert.equal(health.lagSlots, null);
 });
@@ -2376,6 +2377,107 @@ function joinedHealthSnapshotRow(
     has_unresolved: hasUnresolved,
   };
 }
+
+function catchUpAdmissionMetrics() {
+  return {
+    version: 1, enabled: true, providerId: 'fallback-1', scanActive: true, workerClaimReady: false,
+    actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 3 },
+    actionableBacklogByPriority: { normal: 3, launchCandidate: 2, trackedTrade: 1 },
+    deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
+  };
+}
+
+async function projectCatchUpAdmission(payload: unknown, backlog = 6) {
+  return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow(), false, healthyHeartbeatRow({ payload, pending_transactions: backlog }),
+  ))).getHealth();
+}
+
+void test('catch-up admission projects absent legacy payload as null independently of block hydration', async () => {
+  for (const payload of [null, {}, { blockHydration: blockHydrationMetrics() }]) {
+    const health = await projectCatchUpAdmission(payload);
+    assert.equal(health.status, 'OK');
+    assert.equal(health.heartbeat.catchUpAdmission, null);
+  }
+});
+
+void test('catch-up admission projects exact frozen V1 counts and public provider IDs', async () => {
+  for (const providerId of ['primary', 'fallback-1', 'fallback-2', 'fallback-3', null]) {
+    const metrics = { ...catchUpAdmissionMetrics(), providerId, scanActive: false };
+    const health = await projectCatchUpAdmission({ catchUpAdmission: metrics });
+    assert.equal(health.status, 'OK');
+    assert.deepEqual(health.heartbeat.catchUpAdmission, metrics);
+    assert.ok(Object.isFrozen(health.heartbeat.catchUpAdmission));
+    assert.ok(Object.isFrozen(health.heartbeat.catchUpAdmission?.actionableBacklogBySource));
+    assert.ok(Object.isFrozen(health.heartbeat.catchUpAdmission?.actionableBacklogByPriority));
+    assert.notEqual(health.heartbeat.catchUpAdmission, metrics);
+  }
+  const metrics = { ...catchUpAdmissionMetrics(), enabled: false, providerId: null, scanActive: false };
+  assert.deepEqual((await projectCatchUpAdmission({ catchUpAdmission: metrics })).heartbeat.catchUpAdmission, metrics);
+});
+
+void test('catch-up admission rejects malformed present payload through redacted fail-closed health', async () => {
+  const metrics = catchUpAdmissionMetrics();
+  const invalid: unknown[] = [
+    null, undefined, [], 'https://secret.invalid', { ...metrics, version: 2 },
+    { ...metrics, enabled: 1 }, { ...metrics, scanActive: 'true' }, { ...metrics, workerClaimReady: 0 },
+    { ...metrics, providerId: 'fallback-99' }, { ...metrics, providerId: 'https://secret.invalid' },
+    { ...metrics, providerId: 'secret-signature' }, { ...metrics, providerId: 'secret-mint' },
+    { ...metrics, rpcUrl: 'https://secret.invalid' }, { ...metrics, signature: 'secret-signature' },
+    { ...metrics, mint: 'secret-mint' }, { ...metrics, workerClaimReady: true },
+    { ...metrics, providerId: null }, { ...metrics, enabled: false },
+    { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, extra: 0 } },
+    { ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, mint: 'secret-mint' } },
+    { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, websocketOnly: 2 } },
+    { ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, normal: 4 } },
+    { ...metrics, actionableBacklogBySource: { websocketOnly: Number.MAX_SAFE_INTEGER, catchUpOnly: 1, websocketAndCatchUp: 0 } },
+  ];
+  for (const count of [-1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, '1', 1n]) {
+    for (const field of ['deferredCount', 'ignoredCount', 'quarantinedCount']) invalid.push({ ...metrics, [field]: count });
+    for (const field of ['websocketOnly', 'catchUpOnly', 'websocketAndCatchUp']) {
+      invalid.push({ ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, [field]: count } });
+    }
+    for (const field of ['normal', 'launchCandidate', 'trackedTrade']) {
+      invalid.push({ ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, [field]: count } });
+    }
+  }
+  for (const field of Object.keys(metrics)) {
+    const incomplete = Object.fromEntries(Object.entries(metrics).filter(([key]) => key !== field));
+    invalid.push(incomplete);
+  }
+  for (const candidate of invalid) {
+    const health = await projectCatchUpAdmission({ catchUpAdmission: candidate });
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.equal(health.heartbeat.catchUpAdmission, null);
+    assert.equal(health.heartbeat.backlogCount, null);
+    assert.doesNotMatch(JSON.stringify(health), /secret|https?:\/\//u);
+  }
+  assert.equal((await projectCatchUpAdmission({ catchUpAdmission: metrics }, 7)).status, 'DEGRADED');
+});
+
+void test('catch-up admission does not execute hostile payload accessors or proxy traps', async () => {
+  let calls = 0;
+  const accessor = Object.defineProperty({}, 'catchUpAdmission', {
+    enumerable: true, get() { calls += 1; throw new Error('secret'); },
+  });
+  const proxy = new Proxy(catchUpAdmissionMetrics(), {
+    ownKeys() { calls += 1; throw new Error('secret'); },
+  });
+  const scalarProxy = new Proxy({}, {
+    isExtensible() { calls += 1; throw new Error('secret'); },
+  });
+  const metrics = catchUpAdmissionMetrics();
+  for (const payload of [
+    accessor, { catchUpAdmission: proxy },
+    { catchUpAdmission: { ...metrics, providerId: scalarProxy } },
+    { catchUpAdmission: { ...metrics, deferredCount: scalarProxy } },
+    { catchUpAdmission: { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, websocketOnly: scalarProxy } } },
+  ]) {
+    assert.equal((await projectCatchUpAdmission(payload)).status, 'DEGRADED');
+  }
+  assert.equal(calls, 0);
+});
 
 function blockHydrationMetrics(): Readonly<Record<string, unknown>> {
   return {

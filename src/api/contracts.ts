@@ -543,6 +543,29 @@ export interface ApiHeartbeat {
   readonly websocket: ApiWebSocketHealth;
   /** Optional only during rolling deployment from API V1 implementations predating issue #114. */
   readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
+  /** Optional during rolling deployment; null when admission metrics are absent. */
+  readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
+}
+
+export interface ApiCatchUpAdmissionMetricsV1 {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly providerId: RpcProviderId | null;
+  readonly scanActive: boolean;
+  readonly workerClaimReady: boolean;
+  readonly actionableBacklogBySource: Readonly<{
+    websocketOnly: number;
+    catchUpOnly: number;
+    websocketAndCatchUp: number;
+  }>;
+  readonly actionableBacklogByPriority: Readonly<{
+    normal: number;
+    launchCandidate: number;
+    trackedTrade: number;
+  }>;
+  readonly deferredCount: number;
+  readonly ignoredCount: number;
+  readonly quarantinedCount: number;
 }
 
 export interface ApiBlockHydrationMetricsV1 {

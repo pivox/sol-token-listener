@@ -24,6 +24,20 @@ import {
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
 
+void test('catch-up admission health contract permits optional V1 bounded JSON metrics', () => {
+  const metrics: NonNullable<ApiHealth['heartbeat']['catchUpAdmission']> = {
+    version: 1, enabled: true, providerId: 'primary', scanActive: false, workerClaimReady: true,
+    actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 3 },
+    actionableBacklogByPriority: { normal: 3, launchCandidate: 2, trackedTrade: 1 },
+    deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
+  };
+  const optional: Pick<ApiHealth['heartbeat'], 'catchUpAdmission'> = {};
+  const absent: Pick<ApiHealth['heartbeat'], 'catchUpAdmission'> = { catchUpAdmission: null };
+  assert.deepEqual(optional, {});
+  assert.deepEqual(absent, { catchUpAdmission: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+});
+
 void test('toApiJson converts bigint values recursively and freezes its result', () => {
   const result = toApiJson({
     balance: 42n,
