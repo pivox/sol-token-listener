@@ -165,10 +165,11 @@ rejects before a clock read, locator call or repository call. Return a
 transaction whose signature or slot differs from its discovery and assert the
 entire slot rejects with zero writes.
 
-Use deferred locator promises for two signatures in one slot. Resolve the
-lexically first hydration and assert no repository call occurs until the second
-settles; then assert lexical write order. Provide processed and confirmed rows
-in one slot and finalized in the same slot. Assert the locator receives
+Use deferred locator promises for two signatures in one slot. Assert both
+location calls start before either promise settles. Resolve the lexically first
+hydration and assert no repository call occurs until the second settles; then
+assert lexical write order. Provide processed and confirmed rows in one slot
+and finalized in the same slot. Assert the locator receives
 `CONFIRMED`, `CONFIRMED`, `FINALIZED`, while the three persisted classifications
 retain lowercase `processed`, `confirmed`, `finalized` from their discoveries.
 Resolve both confirmed-bucket hydrations first and assert there is still no
@@ -275,8 +276,13 @@ type HydrationOutcome =
       reasonCode: 'PUMP_SCHEMA_UNSUPPORTED' | 'PROVIDER_SIGNATURE_MISSING' }>;
 ```
 
-For each ascending slot, collect outcomes from both effective commitment
-buckets and build every classification before returning. Verify the located
+For each ascending slot, start all `hydrate(row)` calls from both effective
+commitment buckets, wait for every result through `Promise.allSettled`, and
+select any rejection deterministically only after the full slot has settled.
+Reconstruct fulfilled outcomes in input order and build every classification
+before returning. This concurrency is required so calls sharing a cache key
+join one single-flight even when the first target cannot retain the block.
+Verify the located
 transaction signature and slot exactly equal its discovery before inspecting
 or decoding it; mismatch rejects the slot as an untrusted dependency failure.
 Map only trusted terminal locator
@@ -352,6 +358,11 @@ Use one precise closed marker per outcome: stable failed/no-action markers,
 text and raw payload.
 
 - [ ] **Step 6: Run focused suites GREEN**
+
+Before the command below, add one offline integration case using the real
+`CachedSolanaBlockTransactionLocator`: classify at least two absent signatures
+from the same cold slot and effective commitment, then assert
+`locator.metrics.fetches === 1`, zero repository writes and no pending work.
 
 ```bash
 npx tsx --test tests/pumpfun-catch-up-block-classifier.test.ts

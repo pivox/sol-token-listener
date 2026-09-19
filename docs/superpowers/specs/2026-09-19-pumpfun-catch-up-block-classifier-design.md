@@ -1,6 +1,6 @@
 # Pump.fun Catch-up Block Classifier Design
 
-Version: 1.0.2 — 2026-09-19 — issue #133.
+Version: 1.0.3 — 2026-09-19 — issue #133.
 
 ## Goal and status
 
@@ -63,12 +63,17 @@ order; rows inside a slot are ordered `CONFIRMED` before `FINALIZED`, then
 lexically by signature. Their already canonical `programIds` are retained as
 provenance.
 
-Every location attempt and every decode/classification for both commitment
-buckets of a slot completes before the first repository write for that slot.
-The classifier then persists classifications in effective commitment/signature
-order. This slot-wide barrier prevents a retryable or untrusted failure in the
-`FINALIZED` bucket from leaving the slot's earlier `CONFIRMED` signatures
-durably admitted.
+The classifier starts every location attempt for both commitment buckets of a
+slot before awaiting their settlement. Calls sharing one cache key therefore
+join the same block-cache flight even when a target is absent or its payload is
+unusable and cannot retain the fetched block. It waits for every attempt with
+settled-result semantics, then completes every admissible decode/classification
+before the first repository write for that slot. The classifier persists
+classifications in effective commitment/signature order only when the complete
+slot has no retryable or untrusted failure. This slot-wide barrier prevents a
+late failure in the `FINALIZED` bucket from leaving earlier `CONFIRMED`
+signatures durably admitted and prevents sequential cache misses from
+amplifying block RPC traffic.
 
 Slots are independent. A slot completes only after every classification has
 been recorded. If persistence fails after a prefix was written, the slot
@@ -198,6 +203,11 @@ located identity mismatch, trusted schema/normalization and missing-signature
 quarantine, retryable and untrusted slot rejection, precise failure markers,
 stable fingerprints across time/finality, partial-write replay and
 deterministic persistence order.
+
+An offline integration test composes the classifier with
+`CachedSolanaBlockTransactionLocator` and proves that multiple absent targets
+sharing a cold `(slot, commitment, epoch)` join one fetch, settle without a
+write, and leave no pending locator work.
 
 PostgreSQL 16 repository tests prove that a semantic replay with newer
 `observedAtMs`/`classifiedAtMs` preserves the first classification, terminal and
