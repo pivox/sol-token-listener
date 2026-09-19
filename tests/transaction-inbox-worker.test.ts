@@ -616,6 +616,16 @@ void test('rejects accessor-backed and proxied claim gate options without invoki
   const proxiedOptions = new Proxy(options(), {
     get() { proxyTraps += 1; throw new Error('claim gate option proxy secret'); },
   });
+  let inheritedCalls = 0;
+  const inheritedGate = options();
+  Object.setPrototypeOf(inheritedGate, {
+    canClaim() { inheritedCalls += 1; return true; },
+  });
+  let inheritedAccessorReads = 0;
+  const inheritedAccessor = options();
+  Object.setPrototypeOf(inheritedAccessor, Object.defineProperty({}, 'canClaim', {
+    get() { inheritedAccessorReads += 1; throw new Error('inherited claim gate accessor secret'); },
+  }));
 
   assert.throws(() => new TransactionInboxWorker(
     repositoryWith({}), locator(), pipeline(), options({ canClaim: true }),
@@ -627,8 +637,16 @@ void test('rejects accessor-backed and proxied claim gate options without invoki
   assert.throws(() => new TransactionInboxWorker(
     repositoryWith({}), locator(), pipeline(), proxiedOptions,
   ), TypeError);
+  assert.throws(() => new TransactionInboxWorker(
+    repositoryWith({}), locator(), pipeline(), inheritedGate,
+  ), TypeError);
+  assert.throws(() => new TransactionInboxWorker(
+    repositoryWith({}), locator(), pipeline(), inheritedAccessor,
+  ), TypeError);
   assert.equal(accessorReads, 0);
   assert.equal(proxyTraps, 0);
+  assert.equal(inheritedCalls, 0);
+  assert.equal(inheritedAccessorReads, 0);
 });
 
 void test('preserves ungated claim behavior and polls safely while claims are gated', async () => {

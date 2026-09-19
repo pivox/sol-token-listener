@@ -605,6 +605,8 @@ function validScheduler(value: TransactionInboxWorkerScheduler): boolean {
 
 function readClaimGate(options: TransactionInboxWorkerOptions): (() => boolean) | null {
   if (isProxy(options)) throw new TypeError('Transaction inbox worker claim gate is invalid.');
+  const prototype = Reflect.getPrototypeOf(options);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Transaction inbox worker claim gate is invalid.');
   const descriptor = Object.getOwnPropertyDescriptor(options, 'canClaim');
   if (descriptor === undefined || ('value' in descriptor && descriptor.value === undefined)) return null;
   if (!('value' in descriptor) || typeof descriptor.value !== 'function' || isProxy(descriptor.value)) {
