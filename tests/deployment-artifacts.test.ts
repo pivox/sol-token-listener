@@ -286,6 +286,7 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
+    ['LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_MAX_ENTRIES', '64'],
     ['LISTENER_BLOCK_HYDRATION_MAX_BYTES', '67108864'],
@@ -314,6 +315,39 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   assert.match(localEnvironment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
   assert.equal((compose.match(/^ {6}LISTENER_INGESTION_SCOPE:/gmu) ?? []).length, 1);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
+});
+
+void test('Compose catch-up admission resolves default-off and explicit activation without other service exposure', (context) => {
+  const docker = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 10_000 });
+  if (docker.error !== undefined || docker.status !== 0) {
+    context.skip('Docker Compose unavailable: resolved configuration contract skipped');
+    return;
+  }
+  const name = 'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED';
+  for (const configured of [undefined, 'false', 'true']) {
+    const result = spawnSync('docker', [
+      'compose', '--env-file', '/dev/null', '-f', 'deploy/compose.yaml', 'config', '--format', 'json',
+    ], {
+      cwd: fileURLToPath(root), encoding: 'utf8', timeout: 10_000,
+      env: {
+        PATH: process.env.PATH,
+        POSTGRES_DB: 'compose_contract', POSTGRES_USER: 'compose_contract',
+        POSTGRES_PASSWORD: 'contract-only', POSTGRES_PASSWORD_URI_ENCODED: 'contract-only',
+        BACKEND_IMAGE: 'registry.invalid/backend:test', FRONTEND_IMAGE: 'registry.invalid/frontend:test',
+        SOLANA_HTTP_RPC_URL: 'https://rpc.invalid', SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
+        ...(configured === undefined ? {} : { [name]: configured }),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const resolved = JSON.parse(result.stdout) as {
+      readonly services: Readonly<Record<string, { readonly environment?: Readonly<Record<string, string>> }>>;
+    };
+    assert.equal(resolved.services.app?.environment?.[name], configured ?? 'false');
+    assert.equal(resolved.services.app?.environment?.EXECUTION_MODE, 'observe');
+    for (const service of ['postgres', 'migrate', 'retention', 'frontend']) {
+      assert.equal(resolved.services[service]?.environment?.[name], undefined);
+    }
+  }
 });
 
 void test('block hydration canary proves active routing and bounded serialized admission', async () => {
