@@ -6,7 +6,9 @@ import {
 } from '../domain/confirmation-status.js';
 import {
   assertValidCatchUpClassification,
+  createCatchUpClassificationReceipt,
   type CatchUpClassification,
+  type CatchUpClassificationReceipt,
 } from '../domain/catch-up-classification.js';
 import {
   assertValidClaimedTransaction,
@@ -90,6 +92,8 @@ interface InboxIdentityRow extends QueryResultRow {
   readonly missing_finality_polls: unknown;
   readonly last_missing_finality_provider_id: unknown;
   readonly finality_evidence_version: unknown;
+  readonly catch_up_enqueued: unknown;
+  readonly catch_up_admission_priority: unknown;
 }
 
 interface TerminalReplayReceiptRow extends QueryResultRow {
@@ -371,10 +375,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
-  public async recordCatchUpClassification(value: CatchUpClassification): Promise<void> {
+  public async recordCatchUpClassification(
+    value: CatchUpClassification,
+    signal?: AbortSignal,
+  ): Promise<CatchUpClassificationReceipt> {
     return this.safely(async () => {
       assertValidCatchUpClassification(value);
-      await this.transaction(async (client) => {
+      return this.transaction(async (client) => {
         await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
         let tracked = false;
         if (value.ingestionHint === 'PUMPFUN_TRADE') {
@@ -402,7 +409,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              processing_status, normalized_transaction, immutable_fingerprint, processed_at,
              missing_finality_polls, last_missing_finality_provider_id, finality_evidence_version,
              catch_up_classification_version, catch_up_disposition, catch_up_reason_code,
-             catch_up_action_key, catch_up_mints, catch_up_evidence_fingerprint, catch_up_classified_at
+             catch_up_action_key, catch_up_mints, catch_up_evidence_fingerprint, catch_up_classified_at,
+             catch_up_enqueued, catch_up_admission_priority
            FROM chain_transaction_inbox WHERE signature=$1 FOR UPDATE`,
           [value.signature],
         );
@@ -421,7 +429,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
         if (row === undefined && receipt !== undefined) {
           assertTerminalReceiptAcceptsNotification(receipt, value);
-          return;
+          return createCatchUpClassificationReceipt({
+            signature: value.signature,
+            slot: value.slot,
+            disposition: null,
+            persistence: 'ALREADY_ADMITTED',
+            admission: 'NOT_ENQUEUED',
+            ingestionPriority: null,
+          });
         }
         const programs = row === undefined ? [] : storedProgramIds(row.program_ids);
         for (const programId of value.programIds) if (!programs.includes(programId)) programs.push(programId);
@@ -441,6 +456,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           const currentDecision = storedIngestionDecision(row);
           const pristine = isPristineInbox(row);
           const replayDecision = pristine ? decision : currentDecision;
+          const catchUpEnqueued = storedCatchUpEnqueued(row.catch_up_enqueued);
+          const catchUpAdmissionPriority = storedCatchUpAdmissionPriority(
+            row.catch_up_admission_priority,
+            catchUpEnqueued,
+          );
           const currentStatus = confirmation(row.target_confirmation_status);
           const shouldReplay = currentDecision.status === 'PROCESSED' && status !== currentStatus;
           if (shouldReplay && row.normalized_transaction === null) {
@@ -483,56 +503,87 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ],
           );
           requireOne(updated.rowCount);
-          return;
+          return classificationReceipt(value, 'REPLAYED', catchUpEnqueued, catchUpAdmissionPriority);
         }
         if (row === undefined) {
+          const catchUpEnqueued = decision.status === 'PENDING';
+          const catchUpAdmissionPriority = catchUpEnqueued ? decision.priority : null;
           const inserted = await client.query(
             `INSERT INTO chain_transaction_inbox (
                signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
                processing_status,observed_at,retry_max_attempts,retry_base_delay_ms,
                ingestion_priority,ingestion_hint,ingestion_hint_mint,terminal_at,purge_after,
                catch_up_classification_version,catch_up_disposition,catch_up_reason_code,
-               catch_up_action_key,catch_up_mints,catch_up_evidence_fingerprint,catch_up_classified_at
+               catch_up_action_key,catch_up_mints,catch_up_evidence_fingerprint,catch_up_classified_at,
+               catch_up_enqueued,catch_up_admission_priority
              ) VALUES ($1,$2,ARRAY['CATCH_UP']::TEXT[],$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                CASE WHEN $12::TIMESTAMPTZ IS NULL THEN NULL ELSE $12::TIMESTAMPTZ+INTERVAL '4 hours' END,
-               $13,$14,$15,$16,$17,$18,$19)`,
+               $13,$14,$15,$16,$17,$18,$19,$20,$21)`,
             [
               value.signature, value.slot.toString(), value.programIds, value.confirmationStatus,
               decision.status, dateFromMs(value.observedAtMs), this.retryPolicy.maxAttempts,
               this.retryPolicy.baseDelayMs, decision.priority, decision.hint, decision.mint,
               terminalAt, value.classificationVersion, value.disposition, value.reasonCode,
               actionKey, value.mints, value.evidenceFingerprint, dateFromMs(value.classifiedAtMs),
+              catchUpEnqueued, catchUpAdmissionPriority,
             ],
           );
           requireOne(inserted.rowCount);
-          return;
+          return classificationReceipt(value, 'RECORDED', catchUpEnqueued, catchUpAdmissionPriority);
         }
-        if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot || !isPristineInbox(row)) {
+        if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot) {
           throw internalRepositoryError(new TransactionInboxConflictError('classification'));
         }
         const sources = discoverySources(row.discovery_sources);
+        if (!sources.includes('WEBSOCKET')) {
+          throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+        }
         if (!sources.includes('CATCH_UP')) sources.push('CATCH_UP');
         sources.sort(sourceOrder);
         const status = reconciledStatus(confirmation(row.target_confirmation_status), value.confirmationStatus);
+        const currentDecision = storedIngestionDecision(row);
+        const pristine = isPristineInbox(row);
+        const currentStatus = confirmation(row.target_confirmation_status);
+        const shouldReplay = currentDecision.status === 'PROCESSED' && status !== currentStatus;
+        if (shouldReplay && row.normalized_transaction === null) {
+          throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
+        }
+        if (shouldReplay
+          && finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+        }
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
              discovery_sources=$2,program_ids=$3,target_confirmation_status=$4,
-             processing_status=$5,ingestion_priority=$6::chain_transaction_inbox_priority,
-             ingestion_hint=$7,ingestion_hint_mint=$8,terminal_at=$9,
-             purge_after=CASE WHEN $9::TIMESTAMPTZ IS NULL THEN NULL ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
+             processing_status=CASE WHEN $17 THEN 'PENDING' WHEN $18 THEN $5 ELSE processing_status END,
+             processed_at=CASE WHEN $17 THEN NULL ELSE processed_at END,
+             attempts_in_cycle=CASE WHEN $17 THEN 0 ELSE attempts_in_cycle END,
+             retry_exhausted_at=CASE WHEN $17 THEN NULL ELSE retry_exhausted_at END,
+             missing_finality_polls=CASE WHEN $17 THEN 0 ELSE missing_finality_polls END,
+             last_missing_finality_provider_id=CASE WHEN $17 THEN NULL ELSE last_missing_finality_provider_id END,
+             finality_evidence_version=CASE WHEN $17 THEN finality_evidence_version+1
+               ELSE finality_evidence_version END,
+             ingestion_priority=$6::chain_transaction_inbox_priority,
+             ingestion_hint=$7,ingestion_hint_mint=$8,
+             terminal_at=CASE WHEN $17 THEN NULL WHEN $18 THEN $9 ELSE terminal_at END,
+             purge_after=CASE WHEN $17 THEN NULL WHEN NOT $18 THEN purge_after
+               WHEN $9::TIMESTAMPTZ IS NULL THEN NULL
+               ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
              catch_up_classification_version=$10,catch_up_disposition=$11,catch_up_reason_code=$12,
              catch_up_action_key=$13,catch_up_mints=$14,catch_up_evidence_fingerprint=$15,
-             catch_up_classified_at=$16,updated_at=GREATEST(updated_at,$16)
+             catch_up_classified_at=$16,catch_up_enqueued=FALSE,catch_up_admission_priority=NULL,
+             updated_at=GREATEST(updated_at,$16)
            WHERE signature=$1 AND catch_up_classification_version IS NULL`,
           [
             value.signature, sources, programs, status, decision.status, decision.priority,
             decision.hint, decision.mint, terminalAt, value.classificationVersion,
             value.disposition, value.reasonCode, actionKey, value.mints, value.evidenceFingerprint,
-            dateFromMs(value.classifiedAtMs),
+            dateFromMs(value.classifiedAtMs), shouldReplay, pristine,
           ],
         );
         requireOne(updated.rowCount);
-      });
+        return classificationReceipt(value, 'RECORDED', false, decision.priority);
+      }, signal);
     });
   }
 
@@ -1785,12 +1836,17 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
-  private async transaction<T>(run: (client: InboxClient) => Promise<T>): Promise<T> {
+  private async transaction<T>(
+    run: (client: InboxClient) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    signal?.throwIfAborted();
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       try {
         const value = await run(client);
+        signal?.throwIfAborted();
         await client.query('COMMIT');
         return value;
       } catch (cause) {
@@ -2377,6 +2433,40 @@ interface IngestionDecision {
   readonly priority: TransactionInboxPriority;
   readonly hint: StoredIngestionHint;
   readonly mint: string | null;
+}
+
+function classificationReceipt(
+  value: CatchUpClassification,
+  persistence: 'RECORDED' | 'REPLAYED',
+  enqueued: boolean,
+  priority: TransactionInboxPriority | null,
+): CatchUpClassificationReceipt {
+  return createCatchUpClassificationReceipt({
+    signature: value.signature,
+    slot: value.slot,
+    disposition: value.disposition,
+    persistence,
+    admission: enqueued ? 'ENQUEUED' : 'NOT_ENQUEUED',
+    ingestionPriority: enqueued ? priority : null,
+  });
+}
+
+function storedCatchUpEnqueued(value: unknown): boolean {
+  if (typeof value !== 'boolean') {
+    throw new TypeError('Stored catch-up admission receipt is invalid.');
+  }
+  return value;
+}
+
+function storedCatchUpAdmissionPriority(
+  value: unknown,
+  enqueued: boolean,
+): TransactionInboxPriority | null {
+  if (!enqueued) {
+    if (value !== null) throw new TypeError('Stored catch-up admission priority is invalid.');
+    return null;
+  }
+  return storedInboxPriority(value);
 }
 
 function classificationDecision(

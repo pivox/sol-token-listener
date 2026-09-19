@@ -5,6 +5,7 @@ import {
   type TransactionNotification,
   type TransactionNotificationIngestionHint,
 } from './transaction-ingestion.js';
+import { MAX_STRICT_CATCH_UP_SLOT } from './strict-catch-up.js';
 
 export const CATCH_UP_CLASSIFICATION_VERSION = 1 as const;
 export const CATCH_UP_CLASSIFICATION_DISPOSITIONS = Object.freeze([
@@ -26,6 +27,51 @@ export type CatchUpClassificationDisposition =
   (typeof CATCH_UP_CLASSIFICATION_DISPOSITIONS)[number];
 export type CatchUpClassificationReasonCode =
   (typeof CATCH_UP_CLASSIFICATION_REASON_CODES)[number];
+
+export const CATCH_UP_CLASSIFICATION_PERSISTENCE = Object.freeze([
+  'RECORDED',
+  'REPLAYED',
+  'ALREADY_ADMITTED',
+] as const);
+
+export const CATCH_UP_CLASSIFICATION_ADMISSIONS = Object.freeze([
+  'ENQUEUED',
+  'NOT_ENQUEUED',
+] as const);
+
+export const CATCH_UP_CLASSIFICATION_INGESTION_PRIORITIES = Object.freeze([
+  'NORMAL',
+  'LAUNCH_CANDIDATE',
+  'TRACKED_TRADE',
+] as const);
+
+export type CatchUpClassificationPersistence =
+  (typeof CATCH_UP_CLASSIFICATION_PERSISTENCE)[number];
+export type CatchUpClassificationAdmission =
+  (typeof CATCH_UP_CLASSIFICATION_ADMISSIONS)[number];
+export type CatchUpClassificationIngestionPriority =
+  (typeof CATCH_UP_CLASSIFICATION_INGESTION_PRIORITIES)[number];
+
+/** Immutable, per-write evidence returned by the durable catch-up ledger. */
+interface CatchUpClassificationReceiptIdentity {
+  readonly signature: string;
+  readonly slot: bigint;
+  readonly persistence: CatchUpClassificationPersistence;
+}
+
+export type CatchUpClassificationReceipt =
+  | Readonly<CatchUpClassificationReceiptIdentity & {
+      readonly disposition: CatchUpClassificationDisposition;
+      readonly persistence: 'RECORDED' | 'REPLAYED';
+      readonly admission: CatchUpClassificationAdmission;
+      readonly ingestionPriority: CatchUpClassificationIngestionPriority | null;
+    }>
+  | Readonly<CatchUpClassificationReceiptIdentity & {
+      readonly disposition: null;
+      readonly persistence: 'ALREADY_ADMITTED';
+      readonly admission: 'NOT_ENQUEUED';
+      readonly ingestionPriority: null;
+    }>;
 
 export interface CatchUpClassification {
   readonly signature: string;
@@ -63,6 +109,13 @@ export class CatchUpClassificationValidationError extends TypeError {
   public constructor() {
     super('Invalid catch-up classification.');
     this.name = 'CatchUpClassificationValidationError';
+  }
+}
+
+export class CatchUpClassificationReceiptValidationError extends TypeError {
+  public constructor() {
+    super('Invalid catch-up classification receipt.');
+    this.name = 'CatchUpClassificationReceiptValidationError';
   }
 }
 
@@ -131,6 +184,73 @@ export function assertValidCatchUpClassification(
     );
   } catch {
     throw invalid();
+  }
+}
+
+export function createCatchUpClassificationReceipt(input: unknown): CatchUpClassificationReceipt {
+  try {
+    const record = exactDataRecord(input, [
+      'signature', 'slot', 'disposition', 'persistence', 'admission', 'ingestionPriority',
+    ]);
+    const value = Object.freeze(record.persistence === 'ALREADY_ADMITTED'
+      ? {
+        signature: record.signature,
+        slot: record.slot,
+        disposition: record.disposition,
+        persistence: 'ALREADY_ADMITTED' as const,
+        admission: record.admission,
+        ingestionPriority: record.ingestionPriority,
+      }
+      : {
+        signature: record.signature,
+        slot: record.slot,
+        disposition: record.disposition,
+        persistence: record.persistence,
+        admission: record.admission,
+        ingestionPriority: record.ingestionPriority,
+      });
+    assertValidCatchUpClassificationReceipt(value);
+    return value;
+  } catch {
+    throw invalidReceipt();
+  }
+}
+
+export function assertValidCatchUpClassificationReceipt(
+  value: unknown,
+): asserts value is CatchUpClassificationReceipt {
+  try {
+    if (!isRecord(value) || isProxy(value) || !Object.isFrozen(value)) throw invalidReceipt();
+    const record = exactDataRecord(value, [
+      'signature', 'slot', 'disposition', 'persistence', 'admission', 'ingestionPriority',
+    ]);
+    if (typeof record.signature !== 'string'
+      || record.signature.length === 0
+      || record.signature !== record.signature.trim()
+      || Buffer.byteLength(record.signature, 'utf8') > 128
+      || typeof record.slot !== 'bigint'
+      || record.slot < 0n
+      || record.slot > MAX_STRICT_CATCH_UP_SLOT
+      || !isPersistence(record.persistence)
+      || !isAdmission(record.admission)
+      || !isIngestionPriorityOrNull(record.ingestionPriority)) {
+      throw invalidReceipt();
+    }
+    if (record.persistence === 'ALREADY_ADMITTED') {
+      if (record.disposition !== null || record.admission !== 'NOT_ENQUEUED'
+        || record.ingestionPriority !== null) throw invalidReceipt();
+      return;
+    }
+    if (!isDisposition(record.disposition)) throw invalidReceipt();
+    if (record.admission === 'ENQUEUED') {
+      if (record.ingestionPriority === null
+        || record.disposition === 'IGNORED'
+        || record.disposition === 'QUARANTINED') throw invalidReceipt();
+    } else if (record.ingestionPriority !== null) {
+      throw invalidReceipt();
+    }
+  } catch {
+    throw invalidReceipt();
   }
 }
 
@@ -245,6 +365,23 @@ function isReasonCode(value: unknown): value is CatchUpClassificationReasonCode 
     && (CATCH_UP_CLASSIFICATION_REASON_CODES as readonly string[]).includes(value);
 }
 
+function isPersistence(value: unknown): value is CatchUpClassificationPersistence {
+  return typeof value === 'string'
+    && (CATCH_UP_CLASSIFICATION_PERSISTENCE as readonly string[]).includes(value);
+}
+
+function isAdmission(value: unknown): value is CatchUpClassificationAdmission {
+  return typeof value === 'string'
+    && (CATCH_UP_CLASSIFICATION_ADMISSIONS as readonly string[]).includes(value);
+}
+
+function isIngestionPriorityOrNull(
+  value: unknown,
+): value is CatchUpClassificationIngestionPriority | null {
+  return value === null || (typeof value === 'string'
+    && (CATCH_UP_CLASSIFICATION_INGESTION_PRIORITIES as readonly string[]).includes(value));
+}
+
 function validMilliseconds(value: unknown): value is number {
   return typeof value === 'number'
     && Number.isSafeInteger(value)
@@ -259,4 +396,8 @@ function isRecord(value: unknown): value is object {
 
 function invalid(): CatchUpClassificationValidationError {
   return new CatchUpClassificationValidationError();
+}
+
+function invalidReceipt(): CatchUpClassificationReceiptValidationError {
+  return new CatchUpClassificationReceiptValidationError();
 }

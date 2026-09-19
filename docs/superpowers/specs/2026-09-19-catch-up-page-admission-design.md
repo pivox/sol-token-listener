@@ -1,6 +1,6 @@
 # Strict Catch-up Page Admission Design
 
-Version: 1.0.0 — 2026-09-19 — issue #135, sub-task 120-B3a.
+Version: 1.0.4 — 2026-09-19 — issue #135, sub-task 120-B3a.
 
 ## Goal and status
 
@@ -29,12 +29,16 @@ Every repository write therefore returns an immutable receipt with:
 - admission outcome: catch-up enqueued the row, or it did not;
 - durable ingestion priority when catch-up performed an admission.
 
-`chain_transaction_inbox.catch_up_enqueued` records the immutable admission
-decision made by the first catch-up classification. It is nullable only while
-no catch-up classification exists. Actionable classifications set it to true,
-terminal classifications set it to false, and deferred classifications retain
-the actual tracked-mint decision made atomically by the repository. Later mint
-tracking changes do not rewrite this historical receipt.
+`chain_transaction_inbox.catch_up_enqueued` and
+`chain_transaction_inbox.catch_up_admission_priority` record the immutable
+admission decision made by the first catch-up classification. Both are nullable
+only while no catch-up classification exists; otherwise a true admission has
+one enum priority and a false admission has no priority. New actionable
+catch-up rows set the pair to `true` and their current priority; an actionable
+signature already admitted by WebSocket sets it to `false` and `null`.
+Terminal classifications set it to `false` and `null`, and deferred
+classifications retain the actual tracked-mint decision made atomically by the
+repository. Later mint tracking changes do not rewrite this historical receipt.
 
 This column is necessary because a deferred trade can be admitted while its
 mint is tracked and later return to `DEFERRED`. Deriving the original admission
@@ -139,9 +143,10 @@ cancellation belongs to B3b production composition.
 Migration `049_transaction_inbox_catch_up_admission_receipt.sql` is versioned,
 replayable, compatible with an empty database and fail-closed on a partial or
 incompatible installation. Existing classified rows are backfilled from their
-original durable decision:
+original durable decision; only an admitted row copies its then-current
+`ingestion_priority` into the immutable admission-priority column:
 
-- `ACTIONABLE` -> true;
+- `ACTIONABLE` -> true, except for a row already admitted by WebSocket;
 - `IGNORED` / `QUARANTINED` -> false;
 - `DEFERRED` -> true only when the original classified row is still in an
   admitted processing state, otherwise false.
@@ -150,10 +155,10 @@ The migration installs exact constraints tying column nullability to the
 classification fields and preserves the four-hour terminal retention rules.
 It does not delete or reinterpret raw chain data.
 
-Semantic classification replay must return the stored admission bit even if
-current tracked-mint state or processing status changed. Contradictory
-classification identity, slot, fingerprint or stored receipt remains a typed
-repository conflict.
+Semantic classification replay must return the stored admission bit and stored
+admission priority even if current tracked-mint state or processing status
+changed. Contradictory classification identity, slot, fingerprint or stored
+receipt remains a typed repository conflict.
 
 ## B3a verification
 

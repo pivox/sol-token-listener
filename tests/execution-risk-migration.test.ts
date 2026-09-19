@@ -59,7 +59,7 @@ void test('migration 034 applies on an empty schema and replays cleanly', async 
   await withTemporarySchema(databaseUrl, 'execution_risk_apply', async (pool) => {
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '048_transaction_inbox_catch_up_classification.sql');
+    assert.equal(applied.at(-1), '049_transaction_inbox_catch_up_admission_receipt.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const tables = await pool.query<{ readonly table_name: string }>(`

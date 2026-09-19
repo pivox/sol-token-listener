@@ -4,10 +4,15 @@ import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
 import {
   PumpFunCatchUpBlockClassifier,
+  PumpFunCatchUpBlockClassifierAbortedError,
   createPumpFunCatchUpClassificationFromDecoded,
 } from '../src/application/pumpfun-catch-up-block-classifier.js';
 import type { MergedCatchUpDiscovery } from '../src/application/catch-up-discovery.js';
-import type { CatchUpClassification } from '../src/domain/catch-up-classification.js';
+import {
+  createCatchUpClassificationReceipt,
+  type CatchUpClassification,
+  type CatchUpClassificationReceipt,
+} from '../src/domain/catch-up-classification.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
 import type {
@@ -28,29 +33,48 @@ import {
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { loadMainnetFixture, loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
-type LocatorHandler = (target: TransactionLocationTarget) => Promise<NormalizedTransaction>;
+type LocatorHandler = (
+  target: TransactionLocationTarget,
+  signal: AbortSignal | undefined,
+) => Promise<NormalizedTransaction>;
+const NEVER_ABORTED = new AbortController().signal;
 
 class RecordingLocator {
   public readonly targets: TransactionLocationTarget[] = [];
+  public readonly signals: (AbortSignal | undefined)[] = [];
 
   public constructor(private readonly handler: LocatorHandler) {}
 
-  public async locate(target: TransactionLocationTarget): Promise<NormalizedTransaction> {
+  public async locate(
+    target: TransactionLocationTarget,
+    signal?: AbortSignal,
+  ): Promise<NormalizedTransaction> {
     this.targets.push(Object.freeze({ ...target }));
-    return this.handler(target);
+    this.signals.push(signal);
+    return this.handler(target, signal);
   }
 }
 
 class RecordingRepository implements CatchUpClassificationRepository {
   public readonly values: CatchUpClassification[] = [];
+  public readonly signals: (AbortSignal | undefined)[] = [];
 
   public constructor(
-    private readonly beforeRecord: (value: CatchUpClassification) => Promise<void> = async () => {},
+    private readonly beforeRecord: (
+      value: CatchUpClassification,
+      signal: AbortSignal | undefined,
+    ) => Promise<void> = async () => {},
+    private readonly receiptFor: (value: CatchUpClassification) => CatchUpClassificationReceipt = defaultReceiptFor,
   ) {}
 
-  public async recordCatchUpClassification(value: CatchUpClassification): Promise<void> {
-    await this.beforeRecord(value);
+  public async recordCatchUpClassification(
+    value: CatchUpClassification,
+    signal?: AbortSignal,
+  ): Promise<CatchUpClassificationReceipt> {
+    this.signals.push(signal);
+    await this.beforeRecord(value, signal);
     this.values.push(value);
+    return this.receiptFor(value);
   }
 }
 
@@ -60,7 +84,7 @@ void test('classifies a creation and its initial buy as one actionable launch', 
   const repository = new RecordingRepository();
   const classifier = new PumpFunCatchUpBlockClassifier(locator, repository, () => 10_000);
 
-  await classifier.classify(Object.freeze([discovery(transaction)]));
+  await classifier.classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
 
   const value = repository.values[0];
   assert.ok(value);
@@ -77,6 +101,104 @@ void test('classifies a creation and its initial buy as one actionable launch', 
     slot: transaction.slot,
     confirmationStatus: 'FINALIZED',
   }]);
+});
+
+void test('returns receipt-validated classifications in deterministic persistence order', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const confirmed = cloneTransaction(template, { signature: 'z-confirmed-receipt', slot: 81n });
+  const finalized = cloneTransaction(template, { signature: 'a-finalized-receipt', slot: 81n });
+  const controller = new AbortController();
+  const repository = new RecordingRepository();
+  const locator = returning(new Map([[confirmed.signature, confirmed], [finalized.signature, finalized]]));
+
+  const receipts = await new PumpFunCatchUpBlockClassifier(
+    locator,
+    repository,
+    () => 15_000,
+  ).classify(Object.freeze([
+    discovery(finalized, 'finalized'), discovery(confirmed, 'processed'),
+  ]), controller.signal);
+
+  assert.deepEqual(receipts.map(({ signature, slot, disposition, persistence, admission }) =>
+    [signature, slot, disposition, persistence, admission]), [
+    ['z-confirmed-receipt', 81n, 'DEFERRED', 'RECORDED', 'NOT_ENQUEUED'],
+    ['a-finalized-receipt', 81n, 'DEFERRED', 'RECORDED', 'NOT_ENQUEUED'],
+  ]);
+  assert.deepEqual(locator.signals, [controller.signal, controller.signal]);
+  assert.deepEqual(repository.signals, [controller.signal, controller.signal]);
+  assert.ok(receipts.every(Object.isFrozen));
+});
+
+void test('rejects a durable receipt that does not bind to the classification identity', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const repository = new RecordingRepository(async () => {}, (value) =>
+    createCatchUpClassificationReceipt({
+      ...defaultReceiptFor(value),
+      signature: 'wrong-receipt-signature',
+    }));
+
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])), repository, () => 15_500,
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'PumpFunCatchUpBlockClassifierError');
+    assert.equal(Reflect.get(error, 'code'), 'INVALID_RECEIPT');
+    return true;
+  });
+  assert.deepEqual(repository.values.map(({ signature }) => signature), [transaction.signature]);
+});
+
+void test('aborts before hydration without locator or repository effects', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const controller = new AbortController();
+  controller.abort();
+  const locator = returning(new Map([[transaction.signature, transaction]]));
+  const repository = new RecordingRepository();
+
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(locator, repository, () => 16_000)
+    .classify(Object.freeze([discovery(transaction)]), controller.signal),
+  PumpFunCatchUpBlockClassifierAbortedError);
+  assert.deepEqual(locator.targets, []);
+  assert.deepEqual(repository.values, []);
+});
+
+void test('aborts after hydration settles before the first receipt write', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const flight = deferred<NormalizedTransaction>();
+  const locator = new RecordingLocator(async () => flight.promise);
+  const repository = new RecordingRepository();
+  const controller = new AbortController();
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 17_000)
+    .classify(Object.freeze([discovery(transaction)]), controller.signal);
+
+  await flush();
+  assert.equal(locator.targets.length, 1);
+  controller.abort();
+  flight.resolve(transaction);
+  await assert.rejects(operation, PumpFunCatchUpBlockClassifierAbortedError);
+  assert.deepEqual(repository.values, []);
+});
+
+void test('aborts after a receipt write settles without starting the next write', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'abort-write-first', slot: 82n });
+  const second = cloneTransaction(template, { signature: 'abort-write-second', slot: 82n });
+  const write = deferred<undefined>();
+  const repository = new RecordingRepository(async () => write.promise);
+  const controller = new AbortController();
+  const operation = new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[first.signature, first], [second.signature, second]])),
+    repository,
+    () => 18_000,
+  ).classify(Object.freeze([discovery(second), discovery(first)]), controller.signal);
+
+  await flush();
+  assert.equal(repository.signals.length, 1);
+  controller.abort();
+  write.resolve(undefined);
+  await assert.rejects(operation, PumpFunCatchUpBlockClassifierAbortedError);
+  assert.deepEqual(repository.values.map(({ signature }) => signature), ['abort-write-first']);
+  assert.equal(repository.signals.length, 1);
 });
 
 void test('classifies mono-mint trades, failed transactions and unsupported transactions', async () => {
@@ -97,7 +219,7 @@ void test('classifies mono-mint trades, failed transactions and unsupported tran
 
   await classifier.classify(Object.freeze([
     discovery(unsupported), discovery(trade), discovery(failed),
-  ]));
+  ]), NEVER_ABORTED);
 
   const bySignature = new Map(repository.values.map((value) => [value.signature, value]));
   const tradeValue = bySignature.get(trade.signature);
@@ -149,7 +271,7 @@ void test('uses the real decoder for composite multi-mint trades', async () => {
 
   await new PumpFunCatchUpBlockClassifier(
     returning(new Map([[composite.signature, composite]])), repository, () => 35_000,
-  ).classify(Object.freeze([discovery(composite)]));
+  ).classify(Object.freeze([discovery(composite)]), NEVER_ABORTED);
 
   assert.equal(repository.values[0]?.disposition, 'QUARANTINED');
   assert.equal(repository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
@@ -167,7 +289,7 @@ void test('keeps a real migrate_v2 cursor in fingerprint evidence without making
 
   await new PumpFunCatchUpBlockClassifier(
     returning(new Map([[transaction.signature, transaction]])), repository, () => 40_000,
-  ).classify(Object.freeze([discovery(transaction)]));
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
   const withoutMigration = createPumpFunCatchUpClassificationFromDecoded(
     discovery(transaction), empty, 40_000,
   );
@@ -187,7 +309,7 @@ void test('maps exact trusted locator failures once and rejects retryable or unt
     const locator = new RecordingLocator(async () => { throw failure; });
     const repository = new RecordingRepository();
     await new PumpFunCatchUpBlockClassifier(locator, repository, () => 50_000)
-      .classify(Object.freeze([discovery(transaction)]));
+      .classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
     assert.equal(repository.values[0]?.disposition, 'QUARANTINED');
     assert.equal(repository.values[0]?.reasonCode, reason);
     assert.equal(trustedTransactionLocatorFailure(failure), null);
@@ -201,8 +323,8 @@ void test('maps exact trusted locator failures once and rejects retryable or unt
     replayRepository,
     () => 50_000,
   );
-  await replayClassifier.classify(Object.freeze([discovery(transaction)]));
-  await replayClassifier.classify(Object.freeze([discovery(transaction)]));
+  await replayClassifier.classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
+  await replayClassifier.classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
   assert.equal(replayRepository.values.length, 2);
   assert.equal(
     replayRepository.values[0]?.evidenceFingerprint,
@@ -213,7 +335,7 @@ void test('maps exact trusted locator failures once and rejects retryable or unt
     const repository = new RecordingRepository();
     await assert.rejects(new PumpFunCatchUpBlockClassifier(
       new RecordingLocator(async () => { throw failure; }), repository, () => 50_000,
-    ).classify(Object.freeze([discovery(transaction)])));
+    ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED));
     assert.equal(repository.values.length, 0);
   }
 });
@@ -232,10 +354,10 @@ void test('quarantines trusted decoder origins with distinct semantic fingerprin
 
   await new PumpFunCatchUpBlockClassifier(
     returning(new Map([[transaction.signature, missingIndex]])), firstRepository, () => 60_000,
-  ).classify(Object.freeze([discovery(transaction)]));
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
   await new PumpFunCatchUpBlockClassifier(
     returning(new Map([[transaction.signature, missingStack]])), secondRepository, () => 60_000,
-  ).classify(Object.freeze([discovery(transaction)]));
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
 
   assert.equal(firstRepository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
   assert.equal(secondRepository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
@@ -278,7 +400,7 @@ void test('validates and snapshots the complete input before clock, locator or r
       locator,
       repository,
       () => { clockReads += 1; return 70_000; },
-    ).classify(Object.freeze([invalid]) as readonly MergedCatchUpDiscovery[]));
+    ).classify(Object.freeze([invalid]) as readonly MergedCatchUpDiscovery[], NEVER_ABORTED));
     assert.equal(clockReads, 0);
     assert.equal(locator.targets.length, 0);
     assert.equal(repository.values.length, 0);
@@ -288,7 +410,7 @@ void test('validates and snapshots the complete input before clock, locator or r
   const locator = returning(new Map([[transaction.signature, transaction]]));
   const repository = new RecordingRepository();
   await assert.rejects(new PumpFunCatchUpBlockClassifier(locator, repository, () => 70_000)
-    .classify(Object.freeze([valid, valid])));
+    .classify(Object.freeze([valid, valid]), NEVER_ABORTED));
   assert.equal(locator.targets.length, 0);
   assert.equal(repository.values.length, 0);
 
@@ -313,7 +435,7 @@ void test('validates and snapshots the complete input before clock, locator or r
       topLocator,
       topRepository,
       () => { clockReads += 1; return 70_000; },
-    ).classify(input as readonly MergedCatchUpDiscovery[]));
+    ).classify(input as readonly MergedCatchUpDiscovery[], NEVER_ABORTED));
     assert.equal(clockReads, 0);
     assert.equal(topLocator.targets.length, 0);
     assert.equal(topRepository.values.length, 0);
@@ -335,7 +457,7 @@ void test('hydrates and decodes every commitment bucket in a slot before its fir
   const operation = classifier.classify(Object.freeze([
     discovery(finalized, 'finalized'),
     discovery(confirmed, 'processed'),
-  ]));
+  ]), NEVER_ABORTED);
 
   await flush();
   const targetsBeforeSettlement = locator.targets.map((target) => [
@@ -373,7 +495,7 @@ void test('shares one cached block fetch for missing signatures in one commitmen
   }, { fetchIntervalMs: 1, sleep: async () => {} });
   const repository = new RecordingRepository();
   const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 85_000)
-    .classify(Object.freeze([discovery(first, 'confirmed'), discovery(second, 'confirmed')]));
+    .classify(Object.freeze([discovery(first, 'confirmed'), discovery(second, 'confirmed')]), NEVER_ABORTED);
 
   await flush();
   const locatesBeforeSettlement = locator.metrics.locates;
@@ -404,7 +526,7 @@ void test('rejects a whole slot before writes on late hydration or transaction i
     }),
     retryRepository,
     () => 90_000,
-  ).classify(Object.freeze([discovery(first), discovery(second)])));
+  ).classify(Object.freeze([discovery(first), discovery(second)]), NEVER_ABORTED));
   assert.equal(retryRepository.values.length, 0);
 
   for (const mismatch of [
@@ -414,7 +536,7 @@ void test('rejects a whole slot before writes on late hydration or transaction i
     const repository = new RecordingRepository();
     await assert.rejects(new PumpFunCatchUpBlockClassifier(
       returning(new Map([[first.signature, mismatch]])), repository, () => 90_000,
-    ).classify(Object.freeze([discovery(first)])));
+    ).classify(Object.freeze([discovery(first)]), NEVER_ABORTED));
     assert.equal(repository.values.length, 0);
   }
 });
@@ -456,11 +578,11 @@ void test('replays a partially persisted slot with identical semantic fingerprin
   let now = 110_000;
   const classifier = new PumpFunCatchUpBlockClassifier(locator, repository, () => now);
 
-  await assert.rejects(classifier.classify(Object.freeze([discovery(second), discovery(first)])));
+  await assert.rejects(classifier.classify(Object.freeze([discovery(second), discovery(first)]), NEVER_ABORTED));
   assert.deepEqual(repository.values.map(({ signature }) => signature), ['a-first']);
   const firstFingerprint = repository.values[0]?.evidenceFingerprint;
   now = 120_000;
-  await classifier.classify(Object.freeze([discovery(second), discovery(first)]));
+  await classifier.classify(Object.freeze([discovery(second), discovery(first)]), NEVER_ABORTED);
 
   assert.deepEqual(repository.values.map(({ signature }) => signature), [
     'a-first', 'a-first', 'b-second',
@@ -468,6 +590,17 @@ void test('replays a partially persisted slot with identical semantic fingerprin
   assert.equal(repository.values[1]?.evidenceFingerprint, firstFingerprint);
   assert.equal(repository.values[1]?.classifiedAtMs, 120_000);
 });
+
+function defaultReceiptFor(value: CatchUpClassification): CatchUpClassificationReceipt {
+  return createCatchUpClassificationReceipt({
+    signature: value.signature,
+    slot: value.slot,
+    disposition: value.disposition,
+    persistence: 'RECORDED',
+    admission: 'NOT_ENQUEUED',
+    ingestionPriority: null,
+  });
+}
 
 async function fixtureTransaction(name: string): Promise<NormalizedTransaction> {
   return (await loadPumpFixture(name)).transaction;

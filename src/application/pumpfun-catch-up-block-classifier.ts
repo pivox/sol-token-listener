@@ -3,9 +3,11 @@ import { isProxy } from 'node:util/types';
 import type { MergedCatchUpDiscovery } from './catch-up-discovery.js';
 import {
   createCatchUpClassification,
+  assertValidCatchUpClassificationReceipt,
   type CatchUpClassification,
   type CatchUpClassificationDisposition,
   type CatchUpClassificationReasonCode,
+  type CatchUpClassificationReceipt,
 } from '../domain/catch-up-classification.js';
 import { trustedObservedPipelineOrigin } from '../domain/observed-pipeline-failure.js';
 import {
@@ -43,16 +45,25 @@ type ClassifierErrorCode =
   | 'LOCATOR_UNTRUSTED'
   | 'LOCATOR_UNSUPPORTED_FAILURE'
   | 'TRANSACTION_IDENTITY_MISMATCH'
-  | 'DECODER_UNTRUSTED';
+  | 'DECODER_UNTRUSTED'
+  | 'INVALID_RECEIPT';
 
 export interface PumpFunCatchUpTransactionLocator {
-  locate(target: TransactionLocationTarget): Promise<NormalizedTransaction>;
+  locate(target: TransactionLocationTarget, signal?: AbortSignal): Promise<NormalizedTransaction>;
 }
 
 export class PumpFunCatchUpBlockClassifierError extends Error {
   public constructor(public readonly code: ClassifierErrorCode) {
     super('Pump.fun catch-up block classification failed.');
     this.name = 'PumpFunCatchUpBlockClassifierError';
+  }
+}
+
+export class PumpFunCatchUpBlockClassifierAbortedError extends Error {
+  public constructor() {
+    super('Pump.fun catch-up block classification was aborted.');
+    Object.defineProperty(this, 'name', { value: 'PumpFunCatchUpBlockClassifierAbortedError' });
+    Object.freeze(this);
   }
 }
 
@@ -107,24 +118,35 @@ export class PumpFunCatchUpBlockClassifier {
     private readonly now: () => number = Date.now,
   ) {}
 
-  public async classify(discoveries: readonly MergedCatchUpDiscovery[]): Promise<void> {
+  public async classify(
+    discoveries: readonly MergedCatchUpDiscovery[],
+    signal: AbortSignal,
+  ): Promise<readonly CatchUpClassificationReceipt[]> {
+    assertNotAborted(signal);
     const slots = snapshotAndGroupDiscoveries(discoveries);
-    if (slots.length === 0) return;
+    assertNotAborted(signal);
+    if (slots.length === 0) return Object.freeze([]);
     const classifiedAtMs = this.now();
     assertSafeMilliseconds(classifiedAtMs, 'INVALID_CLOCK');
+    const receipts: CatchUpClassificationReceipt[] = [];
     for (const slot of slots) {
-      const classifications = await this.classifySlot(slot, classifiedAtMs);
+      const classifications = await this.classifySlot(slot, classifiedAtMs, signal);
       for (const classification of classifications) {
-        await this.repository.recordCatchUpClassification(classification);
+        receipts.push(await this.record(classification, signal));
       }
     }
+    assertNotAborted(signal);
+    return Object.freeze(receipts);
   }
 
   private async classifySlot(
     slot: SlotGroup,
     classifiedAtMs: number,
+    signal: AbortSignal,
   ): Promise<readonly CatchUpClassification[]> {
-    const settled = await Promise.allSettled(slot.rows.map(async (row) => this.hydrate(row)));
+    assertNotAborted(signal);
+    const settled = await Promise.allSettled(slot.rows.map(async (row) => this.hydrate(row, signal)));
+    assertNotAborted(signal);
     const firstRejection = settled.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     );
@@ -134,15 +156,17 @@ export class PumpFunCatchUpBlockClassifier {
       classificationForOutcome(outcome, classifiedAtMs)));
   }
 
-  private async hydrate(row: SlotDiscovery): Promise<HydrationOutcome> {
+  private async hydrate(row: SlotDiscovery, signal: AbortSignal): Promise<HydrationOutcome> {
+    assertNotAborted(signal);
     let transaction: NormalizedTransaction;
     try {
-      transaction = await this.locator.locate(Object.freeze({
+      transaction = await this.awaited(signal, () => this.locator.locate(Object.freeze({
         signature: row.discovery.signature,
         slot: row.discovery.slot,
         confirmationStatus: row.commitment,
-      }));
+      }), signal));
     } catch (error) {
+      assertNotAborted(signal);
       const trusted = trustedTransactionLocatorFailure(error);
       if (trusted === null) throw failure('LOCATOR_UNTRUSTED');
       if (trusted.retryable) throw failure('LOCATOR_RETRYABLE');
@@ -176,6 +200,35 @@ export class PumpFunCatchUpBlockClassifier {
       throw failure('TRANSACTION_IDENTITY_MISMATCH');
     }
     return Object.freeze({ kind: 'TRANSACTION', discovery: row.discovery, transaction });
+  }
+
+  private async record(
+    classification: CatchUpClassification,
+    signal: AbortSignal,
+  ): Promise<CatchUpClassificationReceipt> {
+    assertNotAborted(signal);
+    const receipt = await this.awaited(signal,
+      () => this.repository.recordCatchUpClassification(classification, signal));
+    try {
+      assertValidCatchUpClassificationReceipt(receipt);
+      if (receipt.signature !== classification.signature || receipt.slot !== classification.slot
+        || (receipt.persistence !== 'ALREADY_ADMITTED'
+          && receipt.disposition !== classification.disposition)) {
+        throw new TypeError();
+      }
+      return receipt;
+    } catch {
+      throw failure('INVALID_RECEIPT');
+    }
+  }
+
+  private async awaited<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    assertNotAborted(signal);
+    try {
+      return await operation();
+    } finally {
+      assertNotAborted(signal);
+    }
   }
 }
 
@@ -545,6 +598,10 @@ function lexicalOrder(left: string, right: string): number {
 function assertSafeMilliseconds(value: unknown, code: ClassifierErrorCode): asserts value is number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0
     || value > MAX_SAFE_MILLISECONDS || Object.is(value, -0)) throw failure(code);
+}
+
+function assertNotAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new PumpFunCatchUpBlockClassifierAbortedError();
 }
 
 function failure(code: ClassifierErrorCode): PumpFunCatchUpBlockClassifierError {

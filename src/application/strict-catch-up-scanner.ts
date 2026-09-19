@@ -22,6 +22,11 @@ import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
 import type { CatchUpSource } from '../ports/catch-up-source.js';
 import type { ListenerIngestionProgram } from '../ports/listener-ingestion-program.js';
 import type { StrictCatchUpRepository } from '../ports/strict-catch-up-repository.js';
+import type {
+  StrictCatchUpPageAdmissionResult,
+  StrictCatchUpPageAdmitter,
+} from '../ports/strict-catch-up-page-admitter.js';
+import { assertValidCatchUpClassificationReceipt } from '../domain/catch-up-classification.js';
 import {
   MAX_CATCH_UP_PAGE_SIZE,
   snapshotCatchUpSignatures,
@@ -67,6 +72,7 @@ export type StrictCatchUpScannerStage =
   | 'checkpoint-read'
   | 'source'
   | 'enqueue'
+  | 'page-admit'
   | 'checkpoint-cas'
   | 'failure-write'
   | 'failure-resolve'
@@ -207,6 +213,7 @@ export class StrictCatchUpScanner {
     private readonly source: StrictCatchUpSource,
     private readonly repository: StrictCatchUpRepository,
     options: StrictCatchUpScannerOptions,
+    private readonly pageAdmitter?: StrictCatchUpPageAdmitter,
   ) {
     this.providerId = snapshotProviderId(source);
     const { pageSize, maxPages, now, policy, programs } = snapshotOptions(options);
@@ -294,7 +301,7 @@ export class StrictCatchUpScanner {
   }
 
   private async scanProgram(
-    program: CatchUpDiscoveryProgram,
+    program: ListenerIngestionProgram,
     boundaries: StrictCatchUpBoundaries,
     observedAtMs: number,
     discoveries: Map<string, CatchUpSignature>,
@@ -387,21 +394,34 @@ export class StrictCatchUpScanner {
         rows.push(row);
       }
       observedHead ??= rows[0] ?? null;
+      let pageClassifiedCount = 0n;
+      let pageEnqueuedCount = 0n;
       if (!liveEdgeBootstrap) {
-        for (const row of rows) {
-          const notification: TransactionNotification = Object.freeze({
-            signature: row.signature,
-            slot: row.slot,
-            source: 'CATCH_UP',
-            ingestionHint: null,
-            ingestionHintMint: null,
-            programIds: Object.freeze([program.id]),
-            confirmationStatus: row.confirmationStatus,
-            observedAtMs,
-          });
-          await this.operation(signal, 'enqueue', program.key, () => this.repository.enqueue(notification));
+        const pageAdmitter = this.pageAdmitter;
+        if (program.family === 'pumpfun' && pageAdmitter !== undefined && rows.length > 0) {
+          const admitted = await this.operation(signal, 'page-admit', program.key,
+            () => pageAdmitter.admitPage(program, Object.freeze(rows), signal));
+          const counts = snapshotPageAdmission(admitted, rows);
+          pageClassifiedCount = counts.signaturesClassified;
+          pageEnqueuedCount = counts.signaturesEnqueued;
+        } else {
+          for (const row of rows) {
+            const notification: TransactionNotification = Object.freeze({
+              signature: row.signature,
+              slot: row.slot,
+              source: 'CATCH_UP',
+              ingestionHint: null,
+              ingestionHintMint: null,
+              programIds: Object.freeze([program.id]),
+              confirmationStatus: row.confirmationStatus,
+              observedAtMs,
+            });
+            await this.operation(signal, 'enqueue', program.key, () => this.repository.enqueue(notification));
+          }
+          pageClassifiedCount = BigInt(rows.length);
+          pageEnqueuedCount = BigInt(rows.length);
         }
-        enqueuedCount += rows.length;
+        enqueuedCount += Number(pageEnqueuedCount);
       }
       discoveredCount += rows.length;
 
@@ -414,10 +434,8 @@ export class StrictCatchUpScanner {
           const progress = {
             beforeSignature: tail.signature, lastAcceptedSlot: tail.slot,
             pagesScanned: (current?.pagesScanned ?? 0n) + 1n,
-            signaturesEnqueued: (current?.signaturesEnqueued ?? 0n) + BigInt(rows.length),
-            // B1 only adds accounting. Until the classifier is activated,
-            // every legacy-enqueued signature counts as technically classified.
-            signaturesClassified: (current?.signaturesClassified ?? 0n) + BigInt(rows.length),
+            signaturesEnqueued: (current?.signaturesEnqueued ?? 0n) + pageEnqueuedCount,
+            signaturesClassified: (current?.signaturesClassified ?? 0n) + pageClassifiedCount,
             updatedAtMs: observedAtMs,
           };
           if (current === null) {
@@ -578,6 +596,76 @@ export class StrictCatchUpScanner {
   ): StrictCatchUpScannerError {
     return new StrictCatchUpScannerError(stage, this.providerId, checkpointKey, sourceStage);
   }
+}
+
+function snapshotPageAdmission(
+  value: unknown,
+  rows: readonly CatchUpSignature[],
+): Pick<StrictCatchUpPageAdmissionResult, 'signaturesClassified' | 'signaturesEnqueued'> {
+  try {
+    if (typeof value !== 'object' || value === null || isProxy(value)
+      || Array.isArray(value) || !Object.isFrozen(value)) throw new TypeError();
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== 3 || !keys.includes('receipts')
+      || !keys.includes('signaturesClassified') || !keys.includes('signaturesEnqueued')) {
+      throw new TypeError();
+    }
+    const receipts = ownData(value, 'receipts');
+    const signaturesClassified = ownData(value, 'signaturesClassified');
+    const signaturesEnqueued = ownData(value, 'signaturesEnqueued');
+    const rawReceipts = snapshotFrozenReceiptArray(receipts);
+    if (rawReceipts.length !== rows.length
+      || typeof signaturesClassified !== 'bigint'
+      || typeof signaturesEnqueued !== 'bigint'
+      || signaturesClassified < 0n
+      || signaturesEnqueued < 0n
+      || signaturesEnqueued > signaturesClassified) throw new TypeError();
+    const expected = new Map(rows.map((row) => [row.signature, row.slot]));
+    let classified = 0n;
+    let enqueued = 0n;
+    for (const receipt of rawReceipts) {
+      assertValidCatchUpClassificationReceipt(receipt);
+      const slot = expected.get(receipt.signature);
+      if (slot === undefined || slot !== receipt.slot) throw new TypeError();
+      expected.delete(receipt.signature);
+      if (receipt.persistence !== 'ALREADY_ADMITTED') classified += 1n;
+      if (receipt.admission === 'ENQUEUED') enqueued += 1n;
+    }
+    if (expected.size !== 0 || classified !== signaturesClassified || enqueued !== signaturesEnqueued) {
+      throw new TypeError();
+    }
+    return Object.freeze({ signaturesClassified, signaturesEnqueued });
+  } catch {
+    throw new TypeError('Strict catch-up page admission receipt is invalid.');
+  }
+}
+
+function snapshotFrozenReceiptArray(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype
+    || !Object.isFrozen(value)) throw new TypeError();
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined
+    || !('value' in lengthDescriptor)
+    || lengthDescriptor.enumerable
+    || lengthDescriptor.writable
+    || lengthDescriptor.configurable
+    || typeof lengthDescriptor.value !== 'number'
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < 0) throw new TypeError();
+  const length = lengthDescriptor.value;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== length + 1 || !keys.includes('length')) throw new TypeError();
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined
+      || !('value' in descriptor)
+      || !descriptor.enumerable
+      || descriptor.writable
+      || descriptor.configurable) throw new TypeError();
+    snapshot.push(descriptor.value);
+  }
+  return Object.freeze(snapshot);
 }
 
 function assertNotAborted(signal: AbortSignal): void {

@@ -5,10 +5,15 @@ import {
   CATCH_UP_CLASSIFICATION_REASON_CODES,
   CATCH_UP_CLASSIFICATION_VERSION,
   assertValidCatchUpClassification,
+  assertValidCatchUpClassificationReceipt,
   createCatchUpClassification,
+  createCatchUpClassificationReceipt,
   type CatchUpClassification,
+  type CatchUpClassificationAdmission,
   type CatchUpClassificationDisposition,
+  type CatchUpClassificationPersistence,
   type CatchUpClassificationReasonCode,
+  type CatchUpClassificationReceipt,
 } from '../src/domain/catch-up-classification.js';
 
 const pumpProgram = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
@@ -146,9 +151,79 @@ void test('validator rejects mutable, extra-key, accessor and proxy classificati
     /catch-up classification/i);
 });
 
+void test('creates exact immutable catch-up admission receipts', () => {
+  const receipt = createCatchUpClassificationReceipt({
+    signature: 'classified-signature',
+    slot: 42n,
+    disposition: 'ACTIONABLE',
+    persistence: 'RECORDED',
+    admission: 'ENQUEUED',
+    ingestionPriority: 'LAUNCH_CANDIDATE',
+  });
+  assert.deepEqual(receipt, {
+    signature: 'classified-signature',
+    slot: 42n,
+    disposition: 'ACTIONABLE',
+    persistence: 'RECORDED',
+    admission: 'ENQUEUED',
+    ingestionPriority: 'LAUNCH_CANDIDATE',
+  });
+  assert.equal(Object.isFrozen(receipt), true);
+  assert.doesNotThrow(() => { assertValidCatchUpClassificationReceipt(receipt); });
+});
+
+void test('rejects incoherent, mutable and hostile catch-up admission receipts', () => {
+  const baseReceipt = {
+    signature: 'classified-signature',
+    slot: 42n,
+    disposition: 'ACTIONABLE',
+    persistence: 'REPLAYED',
+    admission: 'NOT_ENQUEUED',
+    ingestionPriority: null,
+  } as const;
+  for (const patch of [
+    { admission: 'ENQUEUED', ingestionPriority: null },
+    { admission: 'NOT_ENQUEUED', ingestionPriority: 'NORMAL' },
+    { disposition: 'IGNORED', admission: 'ENQUEUED', ingestionPriority: 'NORMAL' },
+    { persistence: 'ALREADY_ADMITTED', disposition: 'ACTIONABLE' },
+    { persistence: 'UNKNOWN' },
+    { slot: -1n },
+    { signature: ' classified-signature' },
+  ]) {
+    assert.throws(() => createCatchUpClassificationReceipt({ ...baseReceipt, ...patch }),
+      /catch-up classification receipt/i);
+  }
+  const receipt = createCatchUpClassificationReceipt(baseReceipt);
+  assert.throws(() => { assertValidCatchUpClassificationReceipt({ ...receipt }); },
+    /catch-up classification receipt/i);
+  assert.throws(() => { assertValidCatchUpClassificationReceipt(Object.freeze({ ...receipt, extra: true })); },
+    /catch-up classification receipt/i);
+});
+
+void test('models a purged already-admitted receipt without a synthetic classification', () => {
+  const receipt = createCatchUpClassificationReceipt({
+    signature: 'purged-finality-replay',
+    slot: 42n,
+    disposition: null,
+    persistence: 'ALREADY_ADMITTED',
+    admission: 'NOT_ENQUEUED',
+    ingestionPriority: null,
+  });
+  assert.equal(receipt.persistence, 'ALREADY_ADMITTED');
+  assert.equal(receipt.disposition, null);
+  assert.equal(receipt.admission, 'NOT_ENQUEUED');
+  assert.equal(receipt.ingestionPriority, null);
+});
+
 const _classification: CatchUpClassification | null = null;
+const _receipt: CatchUpClassificationReceipt | null = null;
+const _admission: CatchUpClassificationAdmission = 'ENQUEUED';
 const _disposition: CatchUpClassificationDisposition = 'IGNORED';
+const _persistence: CatchUpClassificationPersistence = 'RECORDED';
 const _reason: CatchUpClassificationReasonCode = 'NO_SUPPORTED_PUMP_ACTION';
 void _classification;
+void _receipt;
+void _admission;
 void _disposition;
+void _persistence;
 void _reason;
