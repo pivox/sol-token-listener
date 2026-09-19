@@ -10,6 +10,7 @@ import { failurePipeline, failureTransaction, realPumpPipeline, malformedPumpTra
 import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import { FinalityReconciler } from '../src/application/finality-reconciler.js';
+import { createCatchUpClassification } from '../src/domain/catch-up-classification.js';
 import type {
   IngestionFailure,
   FinalityCandidate,
@@ -50,6 +51,342 @@ const tradeMint = 'So11111111111111111111111111111111111111112';
 void test('keeps durable ingestion independent of launchpad and market adapter imports', async () => {
   const source = await readFile(new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /from ['"][^'"]*(?:launchpads|markets)\//u);
+});
+
+void test('atomically persists an actionable catch-up classification as one inbox row', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = catchUpClassification('classified-actionable');
+    await repository.recordCatchUpClassification(classification);
+    const stored = await row(pool, classification.signature);
+    assert.deepEqual({
+      status: stored.processing_status,
+      source: stored.discovery_sources,
+      hint: stored.ingestion_hint,
+      version: stored.catch_up_classification_version,
+      disposition: stored.catch_up_disposition,
+      reason: stored.catch_up_reason_code,
+      actionKey: stored.catch_up_action_key,
+      mints: stored.catch_up_mints,
+      fingerprint: stored.catch_up_evidence_fingerprint,
+      classifiedAtMs: stored.catch_up_classified_at.getTime(),
+    }, {
+      status: 'PENDING', source: ['CATCH_UP'], hint: 'PUMPFUN_CREATE', version: 1,
+      disposition: 'ACTIONABLE', reason: 'PUMP_ACTION_SUPPORTED',
+      actionKey: 'PUMPFUN_CREATE',
+      mints: [tradeMint], fingerprint: 'a'.repeat(64), classifiedAtMs: 1_001,
+    });
+    assert.equal((await repository.claim(1_001, 30))?.signature, classification.signature);
+  });
+});
+
+void test('persists ignored and quarantined classifications as non-claimable four-hour evidence', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const [signature, disposition, reasonCode] of [
+      ['classified-ignored', 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION'],
+      ['classified-quarantined', 'QUARANTINED', 'PUMP_SCHEMA_UNSUPPORTED'],
+    ] as const) {
+      const classification = createCatchUpClassification({
+        ...catchUpClassificationInput(signature), disposition, reasonCode,
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      });
+      await repository.recordCatchUpClassification(classification);
+      const stored = await row(pool, signature);
+      assert.equal(stored.processing_status, disposition);
+      assert.equal(stored.terminal_at.getTime(), classification.classifiedAtMs);
+      assert.equal(stored.purge_after.getTime() - stored.terminal_at.getTime(), 14_400_000);
+    }
+    assert.equal(await repository.claim(1_001, 30), null);
+    assert.deepEqual(await repository.counts(), {
+      pending: 0, processing: 0, processed: 0, failed: 0,
+      retryableFailed: 0, exhaustedFailed: 0,
+    });
+  });
+});
+
+void test('ordinary discovery converges terminal catch-up evidence without resurrecting it', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const [signature, disposition, reasonCode] of [
+      ['classified-ignored-discovery', 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION'],
+      ['classified-quarantined-discovery', 'QUARANTINED', 'PUMP_SCHEMA_UNSUPPORTED'],
+    ] as const) {
+      const classification = createCatchUpClassification({
+        ...catchUpClassificationInput(signature), disposition, reasonCode,
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      });
+      await repository.recordCatchUpClassification(classification);
+      const before = await row(pool, signature);
+      const discovery = Object.freeze({
+        ...notification(signature, classification.slot, 'WEBSOCKET', 'finalized', 1_002,
+          'PUMPFUN_CREATE'),
+        programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]),
+      });
+
+      await repository.enqueue(discovery);
+      await repository.enqueue(discovery);
+
+      const stored = await row(pool, signature);
+      assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+      assert.deepEqual(stored.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+      assert.equal(stored.target_confirmation_status, 'finalized');
+      assert.equal(stored.processing_status, disposition);
+      assert.equal(stored.ingestion_priority, 'NORMAL');
+      assert.equal(stored.ingestion_hint, 'NONE');
+      assert.equal(stored.ingestion_hint_mint, null);
+      assert.equal(stored.finality_evidence_version, '0');
+      assert.equal(stored.terminal_at.getTime(), before.terminal_at.getTime());
+      assert.equal(stored.purge_after.getTime(), before.purge_after.getTime());
+    }
+    assert.equal(await repository.claim(1_003, 30), null);
+  });
+});
+
+void test('replays exact classification idempotently and rejects every immutable contradiction', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('classified-replay'),
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+      mints: ['11111111111111111111111111111111', tradeMint].sort(),
+    });
+    await repository.recordCatchUpClassification(classification);
+    const before = await row(pool, classification.signature);
+    await repository.recordCatchUpClassification(classification);
+    assert.deepEqual(await row(pool, classification.signature), before);
+    for (const changed of [
+      { evidenceFingerprint: 'b'.repeat(64) },
+      { classifiedAtMs: 1_002 },
+      { disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED' },
+    ]) {
+      const contradictory = createCatchUpClassification({
+        ...catchUpClassificationInput(classification.signature),
+        ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+        mints: ['11111111111111111111111111111111', tradeMint].sort(),
+        ...changed,
+      });
+      await assert.rejects(repository.recordCatchUpClassification(contradictory), (error: unknown) =>
+        error instanceof TransactionInboxConflictError && error.conflict === 'classification');
+    }
+    assert.deepEqual(await row(pool, classification.signature), before);
+  });
+});
+
+void test('classification replay merges admissible programs and advances confirmed evidence to finalized', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const initial = catchUpClassification('classified-convergent-replay');
+    await repository.recordCatchUpClassification(initial);
+    const replay = createCatchUpClassification({
+      ...catchUpClassificationInput(initial.signature),
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+      confirmationStatus: 'finalized',
+    });
+
+    await repository.recordCatchUpClassification(replay);
+
+    const stored = await row(pool, initial.signature);
+    assert.deepEqual(stored.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+    assert.equal(stored.target_confirmation_status, 'finalized');
+    assert.equal(stored.ingestion_hint, 'PUMPFUN_CREATE');
+    assert.equal(stored.ingestion_hint_mint, null);
+
+    await repository.recordCatchUpClassification(initial);
+    const staleReplay = await row(pool, initial.signature);
+    assert.deepEqual(staleReplay.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+    assert.equal(staleReplay.target_confirmation_status, 'finalized');
+  });
+});
+
+void test('classification finality replay reprocesses a confirmed snapshot before projecting finalized', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const initial = catchUpClassification('classified-processed-finality-replay');
+    await repository.recordCatchUpClassification(initial);
+    const firstClaim = await repository.claim(1_001, 30);
+    assert.ok(firstClaim);
+    await repository.saveSnapshot(initial.signature, firstClaim.leaseToken,
+      normalized(initial.signature, initial.slot));
+    await repository.markProcessed(initial.signature, firstClaim.leaseToken, 'confirmed');
+
+    const finalizedReplay = createCatchUpClassification({
+      ...catchUpClassificationInput(initial.signature),
+      confirmationStatus: 'finalized',
+    });
+    await repository.recordCatchUpClassification(finalizedReplay);
+
+    const replayPending = await row(pool, initial.signature);
+    assert.equal(replayPending.target_confirmation_status, 'finalized');
+    assert.equal(replayPending.processing_status, 'PENDING');
+    assert.equal(replayPending.processed_at, null);
+    assert.equal(replayPending.terminal_at, null);
+    assert.equal(replayPending.purge_after, null);
+    assert.equal(replayPending.finality_evidence_version, '1');
+    const secondClaim = await repository.claim(1_003, 30);
+    assert.ok(secondClaim?.normalizedTransaction);
+    assert.equal(secondClaim.confirmationStatus, 'finalized');
+    await repository.saveSnapshot(initial.signature, secondClaim.leaseToken,
+      normalized(initial.signature, initial.slot));
+    await repository.markProcessed(initial.signature, secondClaim.leaseToken, 'finalized');
+    assert.equal((await row(pool, initial.signature)).processing_status, 'PROCESSED');
+    assert.equal(await repository.claim(1_004, 30), null);
+  });
+});
+
+void test('classification replay rejects a changed immutable action hint', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const initial = catchUpClassification('classified-action-contradiction');
+    await repository.recordCatchUpClassification(initial);
+    const contradictory = createCatchUpClassification({
+      ...catchUpClassificationInput(initial.signature),
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+
+    await assert.rejects(repository.recordCatchUpClassification(contradictory), (error: unknown) =>
+      error instanceof TransactionInboxConflictError && error.conflict === 'classification');
+    assert.equal((await row(pool, initial.signature)).ingestion_hint, 'PUMPFUN_CREATE');
+  });
+});
+
+void test('trade classification replay preserves immutable trade evidence after multi-program hint convergence', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('classified-trade-multi-program'),
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    await repository.recordCatchUpClassification(classification);
+    await repository.enqueue(Object.freeze({
+      ...notification(classification.signature, classification.slot, 'CATCH_UP', 'finalized'),
+      programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]),
+    }));
+    assert.deepEqual(ingestionDecision(await row(pool, classification.signature)), {
+      processing_status: 'PENDING', ingestion_priority: 'NORMAL',
+      ingestion_hint: 'NONE', ingestion_hint_mint: null,
+    });
+
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(classification.signature),
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+      confirmationStatus: 'finalized',
+    }));
+    const replayed = await row(pool, classification.signature);
+    assert.deepEqual(replayed.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+    assert.equal(replayed.target_confirmation_status, 'finalized');
+    assert.equal(replayed.ingestion_hint, 'NONE');
+
+    await assert.rejects(repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(classification.signature),
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+      confirmationStatus: 'finalized',
+    })), (error: unknown) =>
+      error instanceof TransactionInboxConflictError && error.conflict === 'classification');
+  });
+});
+
+void test('deferred classification shares the mint lock and admits a concurrently active mint without deadlock', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const blocker = await pool.connect();
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('classified-projection-race'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox-mint:' || $1, 0))",
+        [tradeMint],
+      );
+      const record = repository.recordCatchUpClassification(classification);
+      await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:');
+      await insertTrackedLaunch(pool);
+      const sync = repository.syncTrackedMint(tradeMint);
+      await blocker.query('COMMIT');
+      await Promise.all([record, sync]);
+
+      assert.deepEqual(ingestionDecision(await row(pool, classification.signature)), {
+        processing_status: 'PENDING', ingestion_priority: 'TRACKED_TRADE',
+        ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: tradeMint,
+      });
+      assert.equal((await row(pool, classification.signature)).terminal_at, null);
+    } finally {
+      await blocker.query('ROLLBACK');
+      blocker.release();
+    }
+  });
+});
+
+void test('classification and enqueue use one mint-before-signature lock order for the same trade', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const blocker = await pool.connect();
+    const signature = 'classified-enqueue-lock-order';
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox-mint:' || $1, 0))",
+        [tradeMint],
+      );
+      const record = repository.recordCatchUpClassification(classification);
+      await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:', 1);
+      const enqueue = repository.enqueue(tradeNotification(signature, classification.slot));
+      await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:', 2);
+      await insertTrackedLaunch(pool);
+      await blocker.query('COMMIT');
+      await settlesWithin(Promise.all([record, enqueue]), 2_000);
+
+      assert.deepEqual(ingestionDecision(await row(pool, signature)), {
+        processing_status: 'PENDING', ingestion_priority: 'TRACKED_TRADE',
+        ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: tradeMint,
+      });
+    } finally {
+      await blocker.query('ROLLBACK');
+      blocker.release();
+    }
+  });
+});
+
+void test('adds classification to a pristine discovery atomically and rolls back a rejected write', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = catchUpClassification('classified-existing');
+    await repository.enqueue(notification(classification.signature, classification.slot));
+    await repository.recordCatchUpClassification(classification);
+    assert.deepEqual((await row(pool, classification.signature)).discovery_sources,
+      ['WEBSOCKET', 'CATCH_UP']);
+
+    await pool.query(`CREATE FUNCTION reject_classification_for_test() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.signature='classified-rollback' AND NEW.catch_up_disposition IS NOT NULL
+        THEN RAISE EXCEPTION 'forced'; END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE TRIGGER reject_classification_for_test BEFORE INSERT OR UPDATE
+      ON chain_transaction_inbox FOR EACH ROW EXECUTE FUNCTION reject_classification_for_test()`);
+    await assert.rejects(repository.recordCatchUpClassification(catchUpClassification('classified-rollback')),
+      TransactionInboxRepositoryError);
+    assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature='classified-rollback'"))
+      .rows[0]?.count, '0');
+  });
+});
+
+void test('rejects mutable and non-canonical classification before database access', async () => {
+  let accesses = 0;
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { accesses += 1; throw new Error('must not connect'); },
+    query: async () => { accesses += 1; throw new Error('must not query'); },
+  });
+  const classification = catchUpClassification('classified-invalid');
+  await assert.rejects(repository.recordCatchUpClassification({ ...classification }),
+    TransactionInboxRepositoryError);
+  assert.equal(accesses, 0);
 });
 
 void test('defers untracked trade hints durably without claims, finality, retry or actionable counts', async (context) => {
@@ -1419,6 +1756,54 @@ void test('uses a purged orphaned receipt as a non-resurrectable terminal tombst
   });
 });
 
+void test('uses a purged finalized receipt as a terminal classification tombstone', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'finalized-classification-tombstone';
+    await repository.enqueue(notification(signature, 45n, 'WEBSOCKET', 'finalized'));
+    const claim = await repository.claim(250_000, 120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 45n));
+    await repository.markProcessed(signature, claim.leaseToken, 'finalized');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [signature]);
+
+    const replay = createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 45n, confirmationStatus: 'confirmed',
+    });
+    await repository.recordCatchUpClassification(replay);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1', [signature],
+    )).rows[0]?.count, '0');
+    await assert.rejects(repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 46n, confirmationStatus: 'finalized',
+    })), TransactionInboxConflictError);
+  });
+});
+
+void test('uses a purged orphaned receipt as a non-resurrectable classification tombstone', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'orphaned-classification-tombstone';
+    await repository.enqueue(notification(signature, 46n, 'WEBSOCKET', 'confirmed'));
+    const claim = await repository.claim(260_000, 120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 46n));
+    await pool.query(
+      "UPDATE chain_transaction_inbox SET target_confirmation_status='orphaned' WHERE signature=$1",
+      [signature],
+    );
+    await repository.markProcessed(signature, claim.leaseToken, 'orphaned');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [signature]);
+
+    await assert.rejects(repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 46n, confirmationStatus: 'confirmed',
+    })), TransactionInboxConflictError);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1', [signature],
+    )).rows[0]?.count, '0');
+  });
+});
+
 void test('saturates finality evidence when processing an orphaned terminal revision at the PostgreSQL limit', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -1991,6 +2376,7 @@ void test('persists resumable strict catch-up progress and atomically completes 
       lastAcceptedSlot: 44n,
       pagesScanned: 1n,
       signaturesEnqueued: 2n,
+      signaturesClassified: 2n,
       revision: 0n,
       startedAtMs: 100_000,
       updatedAtMs: 100_001,
@@ -2000,6 +2386,7 @@ void test('persists resumable strict catch-up progress and atomically completes 
       lastAcceptedSlot: 42n,
       pagesScanned: 2n,
       signaturesEnqueued: 4n,
+      signaturesClassified: 4n,
       updatedAtMs: 100_002,
     });
     const completed = terminalizeStrictCatchUpRun(advanced, {
@@ -2019,7 +2406,7 @@ void test('persists resumable strict catch-up progress and atomically completes 
     assert.deepEqual(await strictCatchUpRunRow(pool, completed.runId), {
       state: 'COMPLETED', revision: '2', previous_slot: '40',
       observed_head_slot: '44', last_accepted_slot: '42', pages_scanned: '2',
-      signatures_enqueued: '4',
+      signatures_enqueued: '4', signatures_classified: '4',
       updated_at_ms: '100003', completed_at_ms: '100003', purge_after_ms: '14500003',
     });
   });
@@ -2083,7 +2470,7 @@ void test('rejects obsolete strict progress and failure after the checkpoint adv
     const run = strictCatchUpRun(previous, 'primary', 350_001);
     const advancedRun = advanceStrictCatchUpRun(run, {
       beforeSignature: 'checkpoint-first-cursor', lastAcceptedSlot: 77n,
-      pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 350_002,
+      pagesScanned: 2n, signaturesEnqueued: 3n, signaturesClassified: 3n, updatedAtMs: 350_002,
     });
     const failedRun = terminalizeStrictCatchUpRun(run, {
       state: 'FAILED', terminalReason: 'CATCH_UP_WINDOW_EXCEEDED', completedAtMs: 350_003,
@@ -2113,11 +2500,11 @@ void test('allows only one concurrent strict run progress writer', async (contex
     const run = strictCatchUpRun(previous, 'primary', 400_001);
     const first = advanceStrictCatchUpRun(run, {
       beforeSignature: 'concurrent-first-cursor', lastAcceptedSlot: 82n,
-      pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 400_002,
+      pagesScanned: 2n, signaturesEnqueued: 3n, signaturesClassified: 3n, updatedAtMs: 400_002,
     });
     const second = advanceStrictCatchUpRun(run, {
       beforeSignature: 'concurrent-second-cursor', lastAcceptedSlot: 81n,
-      pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 400_003,
+      pagesScanned: 2n, signaturesEnqueued: 3n, signaturesClassified: 3n, updatedAtMs: 400_003,
     });
     await repository.compareAndSwapCheckpoint(null, previous);
     await repository.createStrictCatchUpRun(run);
@@ -2238,7 +2625,7 @@ void test('rejects skipped and regressed strict progress revisions before databa
   const run = strictCatchUpRun(checkpoint('launchpad', 140n, 'revision-previous', 1_000_000), 'primary', 1_000_001);
   const successor = advanceStrictCatchUpRun(run, {
     beforeSignature: 'revision-next-cursor', lastAcceptedSlot: 142n,
-    pagesScanned: 2n, signaturesEnqueued: 3n, updatedAtMs: 1_000_002,
+    pagesScanned: 2n, signaturesEnqueued: 3n, signaturesClassified: 3n, updatedAtMs: 1_000_002,
   });
   const skipped = Object.freeze({ ...successor, revision: 2n });
   const regressed = Object.freeze({ ...successor, revision: 0n });
@@ -3117,6 +3504,35 @@ async function withDatabase(
   }
 }
 
+async function waitForActiveAdvisoryWait(
+  pool: InstanceType<typeof pg.Pool>,
+  queryFragment: string,
+  minimumCount = 1,
+): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const result = await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM pg_stat_activity
+      WHERE state='active' AND wait_event_type='Lock' AND wait_event='advisory'
+        AND query LIKE '%' || $1 || '%'`, [queryFragment]);
+    if ((result.rows[0] as { readonly count?: unknown } | undefined)?.count === minimumCount) return;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+  }
+  throw new Error('Expected a bounded advisory-lock wait.');
+}
+
+async function settlesWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        handle = setTimeout(() => { reject(new Error('Concurrent operation exceeded its bound.')); }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (handle !== undefined) clearTimeout(handle);
+  }
+}
+
 function notification(
   signature: string,
   slot: bigint,
@@ -3147,6 +3563,21 @@ function pumpCatchUpNotification(signature: string, slot: bigint,
   return Object.freeze({ ...notification(signature, slot, 'CATCH_UP', confirmationStatus),
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
   });
+}
+
+function catchUpClassificationInput(signature: string) {
+  return {
+    signature, slot: 1n, programIds: Object.freeze([PUMP_PROGRAM_ID]),
+    confirmationStatus: 'confirmed' as const, observedAtMs: 1_000,
+    ingestionHint: 'PUMPFUN_CREATE' as const, ingestionHintMint: null,
+    classificationVersion: 1 as const, disposition: 'ACTIONABLE' as const,
+    reasonCode: 'PUMP_ACTION_SUPPORTED' as const, mints: Object.freeze([tradeMint]),
+    evidenceFingerprint: 'a'.repeat(64), classifiedAtMs: 1_001,
+  };
+}
+
+function catchUpClassification(signature: string) {
+  return createCatchUpClassification(catchUpClassificationInput(signature));
 }
 
 function ingestionDecision(stored: Record<string, unknown>): Record<string, unknown> {
@@ -3188,6 +3619,7 @@ function strictCatchUpRun(
     lastAcceptedSlot: previous.slot + 4n,
     pagesScanned: 1n,
     signaturesEnqueued: 2n,
+    signaturesClassified: 2n,
     revision: 0n,
     startedAtMs: updatedAtMs,
     updatedAtMs,
@@ -3297,7 +3729,7 @@ async function strictCatchUpRunRow(
   runId: string,
 ): Promise<object> {
   const result = await pool.query(`SELECT state, revision, previous_slot, observed_head_slot,
-    last_accepted_slot, pages_scanned, signatures_enqueued,
+    last_accepted_slot, pages_scanned, signatures_enqueued, signatures_classified,
     (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_ms,
     (EXTRACT(EPOCH FROM completed_at) * 1000)::bigint AS completed_at_ms,
     (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms

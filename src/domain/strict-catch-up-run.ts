@@ -40,6 +40,7 @@ export interface StrictCatchUpRun {
   readonly lastAcceptedSlot: bigint;
   readonly pagesScanned: bigint;
   readonly signaturesEnqueued: bigint;
+  readonly signaturesClassified: bigint;
   readonly revision: bigint;
   readonly state: StrictCatchUpRunState;
   readonly terminalReason: StrictCatchUpRunTerminalReason | null;
@@ -67,6 +68,7 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
       'lastAcceptedSlot',
       'pagesScanned',
       'signaturesEnqueued',
+      'signaturesClassified',
       'revision',
       'startedAtMs',
       'updatedAtMs',
@@ -79,13 +81,15 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
     const lastAcceptedSlot = slotFrom(record.lastAcceptedSlot);
     const pagesScanned = positiveCounterFrom(record.pagesScanned);
     const signaturesEnqueued = counterFrom(record.signaturesEnqueued);
+    const signaturesClassified = counterFrom(record.signaturesClassified);
     const revision = counterFrom(record.revision);
     const startedAtMs = millisecondsFrom(record.startedAtMs);
     const updatedAtMs = millisecondsFrom(record.updatedAtMs);
     const initialSingleRowHead = beforeSignature === observedHead.signature
       && lastAcceptedSlot === observedHead.slot
       && pagesScanned === 1n
-      && signaturesEnqueued === 1n
+      && signaturesClassified === 1n
+      && signaturesEnqueued <= signaturesClassified
       && revision === 0n;
     if (
       previous.updatedAtMs > startedAtMs
@@ -95,6 +99,7 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
       || beforeSignature === previous.signature
       || (beforeSignature === observedHead.signature && !initialSingleRowHead)
       || lastAcceptedSlot > observedHead.slot
+      || signaturesClassified < signaturesEnqueued
     ) throw invalid();
 
     const result: StrictCatchUpRun = Object.freeze({
@@ -107,6 +112,7 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
       lastAcceptedSlot,
       pagesScanned,
       signaturesEnqueued,
+      signaturesClassified,
       revision,
       state: 'ACTIVE',
       terminalReason: null,
@@ -136,12 +142,14 @@ export function advanceStrictCatchUpRun(
       'lastAcceptedSlot',
       'pagesScanned',
       'signaturesEnqueued',
+      'signaturesClassified',
       'updatedAtMs',
     ]);
     const beforeSignature = signatureFrom(record.beforeSignature);
     const lastAcceptedSlot = slotFrom(record.lastAcceptedSlot);
     const pagesScanned = positiveCounterFrom(record.pagesScanned);
     const signaturesEnqueued = counterFrom(record.signaturesEnqueued);
+    const signaturesClassified = counterFrom(record.signaturesClassified);
     const updatedAtMs = millisecondsFrom(record.updatedAtMs);
     if (
       beforeSignature === current.beforeSignature
@@ -151,6 +159,8 @@ export function advanceStrictCatchUpRun(
       || lastAcceptedSlot > current.lastAcceptedSlot
       || pagesScanned <= current.pagesScanned
       || signaturesEnqueued < current.signaturesEnqueued
+      || signaturesClassified < current.signaturesClassified
+      || signaturesClassified < signaturesEnqueued
       || updatedAtMs < current.updatedAtMs
     ) throw invalid();
 
@@ -160,6 +170,7 @@ export function advanceStrictCatchUpRun(
       lastAcceptedSlot,
       pagesScanned,
       signaturesEnqueued,
+      signaturesClassified,
       revision: current.revision + 1n,
       updatedAtMs,
     });
@@ -223,6 +234,7 @@ export function assertValidStrictCatchUpRun(
       'lastAcceptedSlot',
       'pagesScanned',
       'signaturesEnqueued',
+      'signaturesClassified',
       'revision',
       'state',
       'terminalReason',
@@ -239,6 +251,7 @@ export function assertValidStrictCatchUpRun(
     const lastAcceptedSlot = slotFrom(record.lastAcceptedSlot);
     const pagesScanned = positiveCounterFrom(record.pagesScanned);
     const signaturesEnqueued = counterFrom(record.signaturesEnqueued);
+    const signaturesClassified = counterFrom(record.signaturesClassified);
     const revision = counterFrom(record.revision);
     const state = stateFrom(record.state);
     const terminalReason = terminalReasonFrom(record.terminalReason);
@@ -249,7 +262,8 @@ export function assertValidStrictCatchUpRun(
     const initialSingleRowHead = beforeSignature === observedHead.signature
       && lastAcceptedSlot === observedHead.slot
       && pagesScanned === 1n
-      && signaturesEnqueued === 1n
+      && signaturesClassified === 1n
+      && signaturesEnqueued <= signaturesClassified
       && ((state === 'ACTIVE' && revision === 0n)
         || (state !== 'ACTIVE' && revision === 1n));
     if (
@@ -262,6 +276,7 @@ export function assertValidStrictCatchUpRun(
       || beforeSignature === previous.signature
       || (beforeSignature === observedHead.signature && !initialSingleRowHead)
       || lastAcceptedSlot > observedHead.slot
+      || signaturesClassified < signaturesEnqueued
     ) throw invalid();
 
     if (state === 'ACTIVE') {
