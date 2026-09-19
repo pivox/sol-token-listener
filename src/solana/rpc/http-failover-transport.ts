@@ -1,5 +1,6 @@
 import type { FetchFn } from '@solana/web3.js';
 import type { RpcProviderId } from './rpc-provider-catalog.js';
+import type { RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 type FetchInit = Parameters<FetchFn>[1];
@@ -31,12 +32,13 @@ export type RpcHttpFailoverEvent =
     attemptedEndpointIds: readonly RpcHttpEndpointId[];
   }>;
 
-type RpcHttpFailoverFetchOptions = Readonly<{
+export type RpcHttpFailoverFetchOptions = Readonly<{
   endpoints: readonly Readonly<{ id: RpcHttpEndpointId; url: string }>[];
   fetch?: FetchFn;
   now?: () => number;
   onEvent?: (event: RpcHttpFailoverEvent) => void;
   onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void;
+  recorder?: RpcHttpEvidenceRecorder;
 }>;
 
 interface EndpointState {
@@ -81,6 +83,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
   const fetch = validated.fetch ?? globalThis.fetch;
   const now = validated.now ?? Date.now;
   const onEvent = validated.onEvent;
+  const recorder = validated.recorder;
   let stickyIndex = 0;
 
   return async (input, init): Promise<Response> => {
@@ -121,6 +124,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       const rewrittenInput = rewriteInput(input, endpoint.url);
       let response: Response;
       throwIfAborted(signal);
+      recordAttempt(recorder, endpoint.id);
       try {
         response = await fetch(rewrittenInput, init);
       } catch (error) {
@@ -130,12 +134,14 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
         lastFailure = { endpointId: endpoint.id, reason };
         continue;
       }
+      const responseStatus = response.status;
+      if (responseStatus === 429) recordHttp429(recorder, endpoint.id);
       if (signal?.aborted === true) {
         cancelResponse(response);
         throwIfAborted(signal);
       }
 
-      const reason = transientReason(response.status);
+      const reason = transientReason(responseStatus);
       if (reason === undefined) {
         stickyIndex = response.ok ? endpointIndex : 0;
         return response;
@@ -207,13 +213,24 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
   if (candidate.onEndpointSelected !== undefined && typeof candidate.onEndpointSelected !== 'function') {
     throw new TypeError('HTTP RPC endpoint callback is invalid.');
   }
+  if (candidate.recorder !== undefined && !validRecorder(candidate.recorder)) {
+    throw new TypeError('HTTP RPC evidence recorder is invalid.');
+  }
   return Object.freeze({
     endpoints: Object.freeze(endpoints),
     ...(candidate.fetch === undefined ? {} : { fetch: candidate.fetch }),
     ...(candidate.now === undefined ? {} : { now: candidate.now }),
     ...(candidate.onEvent === undefined ? {} : { onEvent: candidate.onEvent }),
     ...(candidate.onEndpointSelected === undefined ? {} : { onEndpointSelected: candidate.onEndpointSelected }),
+    ...(candidate.recorder === undefined ? {} : { recorder: candidate.recorder }),
   });
+}
+
+function validRecorder(value: unknown): value is RpcHttpEvidenceRecorder {
+  return typeof value === 'object' && value !== null
+    && typeof (value as Partial<RpcHttpEvidenceRecorder>).recordAttempt === 'function'
+    && typeof (value as Partial<RpcHttpEvidenceRecorder>).recordHttp429 === 'function'
+    && typeof (value as Partial<RpcHttpEvidenceRecorder>).snapshot === 'function';
 }
 
 function hasUrlFragment(value: string): boolean {
@@ -326,6 +343,22 @@ function cancelResponse(response: Response): void {
     if (cancellation !== undefined) void cancellation.catch(() => undefined);
   } catch {
     // A discarded provider body is never allowed to corrupt failover.
+  }
+}
+
+function recordAttempt(recorder: RpcHttpEvidenceRecorder | undefined, providerId: RpcHttpEndpointId): void {
+  try {
+    recorder?.recordAttempt(providerId);
+  } catch {
+    // Instrumentation never changes the outcome of the physical RPC fetch.
+  }
+}
+
+function recordHttp429(recorder: RpcHttpEvidenceRecorder | undefined, providerId: RpcHttpEndpointId): void {
+  try {
+    recorder?.recordHttp429(providerId);
+  } catch {
+    // Instrumentation never changes the outcome of the physical RPC fetch.
   }
 }
 

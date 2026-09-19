@@ -8,6 +8,7 @@ import {
   type RpcHttpFailoverEvent,
   type RpcHttpFailureReason,
 } from '../src/solana/rpc/http-failover-transport.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 
@@ -16,6 +17,114 @@ const endpoints = Object.freeze([
   Object.freeze({ id: 'fallback-1' as const, url: 'https://user:fallback-secret@fallback.invalid/rpc-key' }),
   Object.freeze({ id: 'fallback-2' as const, url: 'https://third.invalid/private-token' }),
 ] as const);
+
+void test('records one physical attempt per provider for a primary HTTP 429 failover', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  let calls = 0;
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    recorder,
+    fetch: async () => (++calls === 1 ? reply(429) : reply(200)),
+  });
+
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.equal(calls, 2);
+  assert.deepEqual(recorder.snapshot(['primary', 'fallback-1']).providers.slice(0, 2), [
+    { providerId: 'primary', configured: true, attempts: 1, http429Responses: 1 },
+    { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+  ]);
+});
+
+void test('records a network rejection as a physical attempt before failover', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    recorder,
+    fetch: async (input) => {
+      if (inputUrl(input) === endpoints[0].url) throw new Error('network failure');
+      return reply(200);
+    },
+  });
+
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.deepEqual(recorder.snapshot(['primary', 'fallback-1']).providers.slice(0, 2), [
+    { providerId: 'primary', configured: true, attempts: 1, http429Responses: 0 },
+    { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+  ]);
+});
+
+void test('does not record an already aborted failover request', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  const controller = new AbortController();
+  controller.abort();
+  let fetchCalls = 0;
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    recorder,
+    fetch: async () => {
+      fetchCalls += 1;
+      return reply(200);
+    },
+  });
+
+  await assert.rejects(fetch(endpoints[0].url, { signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(recorder.snapshot(['primary', 'fallback-1']).providers.slice(0, 2), [
+    { providerId: 'primary', configured: true, attempts: 0, http429Responses: 0 },
+    { providerId: 'fallback-1', configured: true, attempts: 0, http429Responses: 0 },
+  ]);
+});
+
+void test('retains a returned HTTP 429 before hostile discarded-body cancellation', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  let calls = 0;
+  let cancelCalls = 0;
+  const limited = {
+    status: 429,
+    headers: new Headers(),
+    body: {
+      cancel: (): Promise<void> => {
+        cancelCalls += 1;
+        throw new Error('hostile cancellation');
+      },
+    },
+  } as unknown as Response;
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    recorder,
+    fetch: async () => (++calls === 1 ? limited : reply(200)),
+  });
+
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.equal(cancelCalls, 1);
+  assert.deepEqual(recorder.snapshot(['primary', 'fallback-1']).providers.slice(0, 2), [
+    { providerId: 'primary', configured: true, attempts: 1, http429Responses: 1 },
+    { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+  ]);
+});
+
+void test('captures a sequential response status once for the failover decision without a recorder', async () => {
+  let statusReads = 0;
+  let calls = 0;
+  const sequentialStatus = {
+    get status(): number {
+      statusReads += 1;
+      return statusReads === 1 ? 429 : 200;
+    },
+    headers: new Headers(),
+    body: null,
+    ok: false,
+  } as unknown as Response;
+  const expected = reply(200);
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async () => (++calls === 1 ? sequentialStatus : expected),
+  });
+
+  assert.strictEqual(await fetch(endpoints[0].url), expected);
+  assert.equal(calls, 2);
+  assert.equal(statusReads, 1);
+});
 
 void test('starts at the sticky healthy endpoint and rotates in circular order', async () => {
   const calls: string[] = [];

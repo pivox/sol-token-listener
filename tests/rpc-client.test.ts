@@ -7,8 +7,29 @@ import {
   type SolanaRpcClientDependencies,
 } from '../src/solana/rpc/rpc-client.js';
 import type { RpcHttpFailoverEvent } from '../src/solana/rpc/http-failover-transport.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
+
+void test('counts one mono-endpoint physical attempt and returned HTTP 429 with a recorder', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  const limited = new Response('limited', { status: 429 });
+  const config = createSolanaConnectionConfig({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze([]),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+  }, {
+    recorder,
+    fetch: async () => limited,
+  });
+  if (config.fetch === undefined) throw new Error('Observed mono-endpoint fetch is unavailable.');
+
+  assert.strictEqual(await config.fetch('https://primary.invalid/rpc'), limited);
+  assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+    providerId: 'primary', configured: true, attempts: 1, http429Responses: 1,
+  });
+});
 
 void test('configures the mono-endpoint Connection exactly without injecting a custom fetch', () => {
   const injectedFetch: FetchFn = async () => {
@@ -106,6 +127,7 @@ void test('fails over real client calls in order and shares the sticky HTTP tran
 void test('forwards web3 RequestInit and attempts a rate-limited primary exactly once', async () => {
   const primaryUrl = 'https://primary.invalid/rpc';
   const fallbackUrl = 'https://fallback.invalid/rpc';
+  const recorder = createRpcHttpEvidenceRecorder();
   const calls: { readonly url: string; readonly init: Parameters<FetchFn>[1] }[] = [];
   const fetch: FetchFn = async (input, init) => {
     const url = inputUrl(input);
@@ -122,11 +144,15 @@ void test('forwards web3 RequestInit and attempts a rate-limited primary exactly
     wsRpcUrl: 'wss://websocket.invalid/rpc',
     commitment: 'confirmed',
     finality: 'finalized',
-  }, { fetch, now: () => 100 });
+  }, { fetch, now: () => 100, recorder });
 
   assert.equal(await rpc.getSlot(), 7n);
   assert.deepEqual(calls.map(({ url }) => url), [primaryUrl, fallbackUrl]);
   assert.equal(calls.filter(({ url }) => url === primaryUrl).length, 1);
+  assert.deepEqual(recorder.snapshot(['primary', 'fallback-1']).providers.slice(0, 2), [
+    { providerId: 'primary', configured: true, attempts: 1, http429Responses: 1 },
+    { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+  ]);
   for (const { init } of calls) {
     assert.equal(init?.method, 'POST');
     assert.equal(new Headers(init?.headers).get('content-type'), 'application/json');
