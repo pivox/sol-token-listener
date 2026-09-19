@@ -43,6 +43,7 @@ import { PostgresExecutionSimulationRepository } from '../src/storage/execution-
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
@@ -2738,11 +2739,13 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
       try {
         if (recoveryDatabase !== undefined) await recoveryDatabase.close();
         if (isolated !== undefined) await isolated.end();
-        await maintenance.query(
+        await waitForBackendDrain(maintenance, databaseName);
+        const terminated = await maintenance.query(
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
            WHERE datname=$1 AND pid<>pg_backend_pid()`,
           [databaseName],
         );
+        assert.equal(terminated.rowCount, 0);
         await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
       } finally {

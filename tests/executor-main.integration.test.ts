@@ -16,6 +16,7 @@ import {
   startScriptedPumpFunBuyRpc,
 } from './helpers/executor-simulation-rpc.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -313,13 +314,14 @@ void test('compiled non-signing executors run under the isolated worker login', 
     async () => { if (loginPool !== undefined) await loginPool.end(); },
     async () => { if (isolated !== undefined) await isolated.end(); },
     async () => {
-      if (databaseCreated) {
-        await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-          WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
-      }
+      if (databaseCreated) await waitForBackendDrain(maintenance, databaseName);
     },
     async () => {
       if (databaseCreated) {
+        const terminated = await maintenance.query(
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+        assert.equal(terminated.rowCount, 0);
         await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
       }
     },

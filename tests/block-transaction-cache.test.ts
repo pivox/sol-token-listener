@@ -33,6 +33,18 @@ function block(signatures = ['one', 'two'], slot = 42n) {
   return { blockhash: KEY.toBase58(), previousBlockhash: KEY.toBase58(), parentSlot: Number(slot - 1n),
     blockTime: null, transactions: signatures.map((signature) => entry(signature)) };
 }
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+async function flushMicrotasks(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
 function harness(options: { maxEntries?: number; maxBytes?: number; maxEntryBytes?: number; confirmedTtlMs?: number } = {}) {
   let now = 0;
   let epoch = 0;
@@ -143,7 +155,7 @@ void test('metrics expose FIFO queue delay and epoch invalidations without ident
     { length: 4 },
     (_unused, index) => h.locator.locate(target('one', BigInt(42 + index))),
   ));
-  assert.deepEqual(h.locator.metrics.queueDelayMs, { last: 500, maximum: 500 });
+  assert.deepEqual(h.locator.metrics.queueDelayMs, { last: 750, maximum: 750 });
   assert.equal(h.locator.metrics.fetches, 4);
 
   h.setEpoch(1);
@@ -227,17 +239,97 @@ void test('FIFO pacing spaces all cold/refresh fetch starts by at least 250ms', 
   assert.deepEqual(h.calls.map(({ time }) => time), [0, 250, 500, 750, 1000, 1250, 1500, 1750]);
 });
 
+void test('FIFO admission keeps exactly one slow block fetch active', async () => {
+  const h = harness();
+  const pending = new Map<bigint, ReturnType<typeof deferred<unknown>>>();
+  let active = 0;
+  let maximumActive = 0;
+  h.setFetch(async (slot) => {
+    const flight = deferred<unknown>();
+    pending.set(slot, flight);
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    try {
+      return await flight.promise;
+    } finally {
+      active -= 1;
+    }
+  });
+
+  const first = h.locator.locate(target('one', 42n));
+  const second = h.locator.locate(target('one', 43n));
+  await flushMicrotasks();
+
+  assert.deepEqual(h.calls.map(({ slot }) => slot), [42n]);
+  assert.equal(h.locator.metrics.inFlightFetches, 1);
+  assert.equal(h.locator.metrics.queuedFetches, 1);
+  const firstFlight = pending.get(42n);
+  assert.ok(firstFlight);
+  firstFlight.resolve(block(['one'], 42n));
+  assert.equal((await first).slot, 42n);
+  await flushMicrotasks();
+
+  assert.deepEqual(h.calls.map(({ slot }) => slot), [42n, 43n]);
+  assert.deepEqual(h.calls.map(({ time }) => time), [0, 250]);
+  assert.equal(h.locator.metrics.inFlightFetches, 1);
+  const secondFlight = pending.get(43n);
+  assert.ok(secondFlight);
+  secondFlight.resolve(block(['one'], 43n));
+  assert.equal((await second).slot, 43n);
+  assert.equal(maximumActive, 1);
+});
+
+void test('a failed admitted fetch releases the next FIFO admission', async () => {
+  const h = harness();
+  const pending = new Map<bigint, ReturnType<typeof deferred<unknown>>>();
+  let active = 0;
+  let maximumActive = 0;
+  h.setFetch(async (slot) => {
+    const flight = deferred<unknown>();
+    pending.set(slot, flight);
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    try {
+      return await flight.promise;
+    } finally {
+      active -= 1;
+    }
+  });
+
+  const first = h.locator.locate(target('one', 42n));
+  const second = h.locator.locate(target('one', 43n));
+  await flushMicrotasks();
+  assert.deepEqual(h.calls.map(({ slot }) => slot), [42n]);
+
+  const firstFlight = pending.get(42n);
+  assert.ok(firstFlight);
+  firstFlight.reject(new Error('provider unavailable'));
+  await assert.rejects(first, RpcTransientError);
+  await flushMicrotasks();
+  assert.deepEqual(h.calls.map(({ slot }) => slot), [42n, 43n]);
+  const secondFlight = pending.get(43n);
+  assert.ok(secondFlight);
+  secondFlight.resolve(block(['one'], 43n));
+  assert.equal((await second).slot, 43n);
+  assert.equal(maximumActive, 1);
+});
+
 void test('epoch changes invalidate cached entries and old in-flight responses cannot be retained', async () => {
   const h = harness();
   let release!: (value: unknown) => void;
   h.setFetch(async () => new Promise((resolve) => { release = resolve; }));
   const old = h.locator.locate(target());
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await flushMicrotasks();
   h.setEpoch(1);
   h.setFetch(async () => block());
-  await h.locator.locate(target('two'));
+  const fresh = h.locator.locate(target('two'));
+  await flushMicrotasks();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.locator.metrics.inFlightFetches, 1);
+  assert.equal(h.locator.metrics.queuedFetches, 1);
   release(block());
   await old;
+  await fresh;
   assert.equal(h.locator.stats.entries, 1);
   assert.equal(h.locator.stats.inFlight, 0);
   await h.locator.locate(target());

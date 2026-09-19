@@ -56,7 +56,7 @@ interface CacheEntry {
 
 interface Admission {
   readonly enqueuedAt: number;
-  readonly start: () => void;
+  readonly start: () => Promise<void>;
   readonly reject: (error: Error) => void;
 }
 
@@ -231,16 +231,21 @@ export class CachedSolanaBlockTransactionLocator {
       this.queue.push({
         enqueuedAt,
         reject,
-        start: () => {
+        start: async () => {
           if (epoch !== this.rpc.httpTransportEpoch || generation !== this.generation) {
             reject(internalLocatorError(new RpcTransientError()));
             return;
           }
           this.fetches = increment(this.fetches);
           this.activeFetches += 1;
-          void this.fetchSnapshot(target).then(
-            (snapshot) => { resolve({ snapshot, fetchedAt: this.now(), epoch, generation, ttlMs }); }, reject,
-          ).finally(() => { this.activeFetches -= 1; });
+          try {
+            const snapshot = await this.fetchSnapshot(target);
+            resolve({ snapshot, fetchedAt: this.now(), epoch, generation, ttlMs });
+          } catch (error) {
+            reject(error instanceof Error ? error : internalLocatorError(new RpcTransientError()));
+          } finally {
+            this.activeFetches -= 1;
+          }
         },
       });
     }).finally(() => {
@@ -287,7 +292,7 @@ export class CachedSolanaBlockTransactionLocator {
         const startedAt = this.now();
         this.recordQueueDelay(startedAt - admission.enqueuedAt);
         this.nextStart = startedAt + this.fetchIntervalMs;
-        admission.start();
+        await admission.start();
       }
     } catch {
       for (const admission of this.queue.splice(0)) admission.reject(internalLocatorError(new RpcTransientError()));
