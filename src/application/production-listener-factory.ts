@@ -7,6 +7,7 @@ import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
 import {
   assertValidInboxCounts,
   assertValidRuntimeHeartbeat,
+  snapshotRuntimeCatchUpAdmissionMetrics,
   type CatchUpGap,
   type InboxCounts,
   type ListenerRuntimeState,
@@ -943,9 +944,9 @@ export class PersistentListenerHeartbeat {
     if (this.catchUpAdmissionMetrics !== null) {
       try {
         assertValidInboxCounts(counts);
-        const metrics: unknown = this.catchUpAdmissionMetrics(counts);
-        if (typeof metrics !== 'object' || metrics === null) throw new TypeError();
-        catchUpAdmission = metrics as RuntimeCatchUpAdmissionMetricsV1;
+        catchUpAdmission = snapshotRuntimeCatchUpAdmissionMetrics(
+          this.catchUpAdmissionMetrics(counts), this.backlogCount,
+        );
       } catch {
         throw new TypeError('Catch-up admission metrics are invalid.');
       }

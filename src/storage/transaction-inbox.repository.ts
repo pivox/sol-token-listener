@@ -21,6 +21,7 @@ import {
   assertValidIngestionFailure,
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
+  snapshotRuntimeCatchUpAdmissionMetrics,
   assertValidTransactionNotification,
   createDurableTransactionSnapshot,
   isCanonicalSolanaProgramId,
@@ -1760,6 +1761,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   public async writeHeartbeat(value: RuntimeHeartbeat): Promise<void> {
     return this.safely(async () => {
       assertValidRuntimeHeartbeat(value);
+      const catchUpAdmission = value.catchUpAdmission === undefined ? undefined
+        : snapshotRuntimeCatchUpAdmissionMetrics(value.catchUpAdmission, value.backlogCount);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
@@ -1804,9 +1807,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(value.blockHydration === undefined
               ? {}
               : { blockHydration: value.blockHydration }),
-            ...(value.catchUpAdmission === undefined
+            ...(catchUpAdmission === undefined
               ? {}
-              : { catchUpAdmission: value.catchUpAdmission }),
+              : { catchUpAdmission }),
           }),
           value.exhaustedCount,
         ],

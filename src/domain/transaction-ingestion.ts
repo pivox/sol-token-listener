@@ -704,7 +704,17 @@ export function assertValidRuntimeHeartbeat(
     assertValidRuntimeBlockHydrationMetrics(record.blockHydration);
   }
   if (record.catchUpAdmission !== undefined) {
-    const metrics = frozenRecord(record.catchUpAdmission, 'Runtime heartbeat catch-up admission');
+    snapshotRuntimeCatchUpAdmissionMetrics(record.catchUpAdmission, record.backlogCount);
+  }
+}
+
+/** Detach validated metrics from callback-owned objects before JSON serialization. */
+export function snapshotRuntimeCatchUpAdmissionMetrics(
+  value: unknown,
+  backlogCount: number,
+): RuntimeCatchUpAdmissionMetricsV1 {
+  try {
+    const metrics = frozenRecord(value, 'Runtime heartbeat catch-up admission');
     assertExactKeys(metrics, [
       'version', 'enabled', 'providerId', 'scanActive', 'workerClaimReady',
       'actionableBacklogBySource', 'actionableBacklogByPriority',
@@ -724,7 +734,10 @@ export function assertValidRuntimeHeartbeat(
       deferredCount: metrics.deferredCount,
       ignoredCount: metrics.ignoredCount,
       quarantinedCount: metrics.quarantinedCount,
-    }), record.backlogCount);
+    }), backlogCount);
+    return metrics as unknown as RuntimeCatchUpAdmissionMetricsV1;
+  } catch {
+    throw new TypeError('Runtime heartbeat catch-up admission metrics are invalid.');
   }
 }
 

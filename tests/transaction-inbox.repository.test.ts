@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
+import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { createPumpDecodingError, PUMP_DECODING_ERROR_CODES } from '../src/launchpads/pumpfun/errors.js';
 import { createPumpSwapDecodingError, PUMPSWAP_DECODING_ERROR_CODES } from '../src/markets/pumpswap/errors.js';
 import { failurePipeline, failureTransaction, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
@@ -142,6 +143,79 @@ void test('persists optional catch-up admission heartbeat metrics and rejects in
     });
   });
 });
+
+for (const [location, boundary] of [
+  ['metrics', 'callback'], ['metrics', 'repository'],
+  ['source', 'callback'], ['source', 'repository'],
+  ['priority', 'callback'], ['priority', 'repository'],
+] as const) {
+  void test(`${boundary} canonicalizes catch-up admission ${location} proxies before PostgreSQL serialization`, async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool);
+      const counts = await repository.counts();
+      const expected = Object.freeze({ version: 1 as const, enabled: true,
+        providerId: 'primary' as const, scanActive: false, workerClaimReady: true,
+        ...counts.catchUpAdmission,
+      });
+      let serializationReads = 0;
+      const handler: ProxyHandler<object> = {
+        get(target, key, receiver) {
+          if (key === 'toJSON') {
+            serializationReads += 1;
+            return () => ({ endpoint: 'https://private-proxy-secret.invalid' });
+          }
+          return Reflect.get(target, key, receiver) as unknown;
+        },
+      };
+      const metrics = location === 'metrics' ? new Proxy<typeof expected>(expected, handler) : Object.freeze({
+        ...expected,
+        ...(location === 'source'
+          ? { actionableBacklogBySource: new Proxy<typeof expected.actionableBacklogBySource>(expected.actionableBacklogBySource, handler) }
+          : { actionableBacklogByPriority: new Proxy<typeof expected.actionableBacklogByPriority>(expected.actionableBacklogByPriority, handler) }),
+      });
+      if (boundary === 'repository') {
+        await repository.writeHeartbeat(Object.freeze({
+          runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+          workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+          updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+          lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0,
+          exhaustedCount: 0, catchUpAdmission: metrics,
+        }));
+        const payload: unknown = (await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload;
+        assert.deepEqual(payload, { startedAt: '1970-01-01T00:00:01.000Z', catchUpAdmission: expected });
+        assert.equal(serializationReads, 0);
+        assert.doesNotMatch(JSON.stringify(payload), /private-proxy-secret/u);
+        return;
+      }
+      let written: RuntimeHeartbeat | undefined;
+      const heartbeat = new PersistentListenerHeartbeat({
+        counts: () => repository.counts(),
+        async writeHeartbeat(value) { written = value; await repository.writeHeartbeat(value); },
+      }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+      () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+        intervalMs: 5, shutdownTimeoutMs: 100,
+        scheduler: { schedule: () => 0, cancel: () => undefined },
+        catchUpAdmissionMetrics: () => metrics,
+      });
+      try {
+        await heartbeat.start();
+        const payload: unknown = (await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload;
+        assert.ok(written);
+        assert.deepEqual(payload, {
+          startedAt: new Date(written.startedAtMs).toISOString(), catchUpAdmission: expected,
+        });
+        assert.equal(serializationReads, 0);
+        assert.notEqual(written.catchUpAdmission, metrics);
+        assert.notEqual(written.catchUpAdmission?.actionableBacklogBySource, metrics.actionableBacklogBySource);
+        assert.notEqual(written.catchUpAdmission?.actionableBacklogByPriority, metrics.actionableBacklogByPriority);
+        assert.ok(Object.isFrozen(written.catchUpAdmission));
+        assert.ok(Object.isFrozen(written.catchUpAdmission?.actionableBacklogBySource));
+        assert.ok(Object.isFrozen(written.catchUpAdmission?.actionableBacklogByPriority));
+        assert.doesNotMatch(JSON.stringify(payload), /private-proxy-secret/u);
+      } finally { await heartbeat.stop(); }
+    });
+  });
+}
 
 void test('catch-up admission counts reject malformed PostgreSQL values and inconsistent dimensions', async () => {
   const valid = {
