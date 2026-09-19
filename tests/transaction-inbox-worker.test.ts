@@ -626,6 +626,12 @@ void test('rejects accessor-backed and proxied claim gate options without invoki
   Object.setPrototypeOf(inheritedAccessor, Object.defineProperty({}, 'canClaim', {
     get() { inheritedAccessorReads += 1; throw new Error('inherited claim gate accessor secret'); },
   }));
+  const proxiedPrototype = new Proxy({}, {
+    getOwnPropertyDescriptor() { proxyTraps += 1; throw new Error('claim gate prototype proxy secret'); },
+    getPrototypeOf() { proxyTraps += 1; throw new Error('claim gate prototype proxy secret'); },
+  });
+  const proxyPrototypeOptions = options();
+  Object.setPrototypeOf(proxyPrototypeOptions, proxiedPrototype);
 
   assert.throws(() => new TransactionInboxWorker(
     repositoryWith({}), locator(), pipeline(), options({ canClaim: true }),
@@ -643,10 +649,29 @@ void test('rejects accessor-backed and proxied claim gate options without invoki
   assert.throws(() => new TransactionInboxWorker(
     repositoryWith({}), locator(), pipeline(), inheritedAccessor,
   ), TypeError);
+  assert.throws(() => new TransactionInboxWorker(
+    repositoryWith({}), locator(), pipeline(), proxyPrototypeOptions,
+  ), TypeError);
   assert.equal(accessorReads, 0);
   assert.equal(proxyTraps, 0);
   assert.equal(inheritedCalls, 0);
   assert.equal(inheritedAccessorReads, 0);
+});
+
+void test('preserves ungated class-instance option behavior', async () => {
+  class UngatedOptions {
+    public readonly leaseSeconds = 10;
+    public readonly renewalIntervalMs = 1_000;
+    public readonly idlePollMs = 250;
+    public readonly now = () => 1_000;
+  }
+  let claims = 0;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { claims += 1; return null; },
+  }), locator(), pipeline(), new UngatedOptions());
+
+  assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
+  assert.equal(claims, 1);
 });
 
 void test('preserves ungated claim behavior and polls safely while claims are gated', async () => {

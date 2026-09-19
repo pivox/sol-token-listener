@@ -605,14 +605,23 @@ function validScheduler(value: TransactionInboxWorkerScheduler): boolean {
 
 function readClaimGate(options: TransactionInboxWorkerOptions): (() => boolean) | null {
   if (isProxy(options)) throw new TypeError('Transaction inbox worker claim gate is invalid.');
-  const prototype = Reflect.getPrototypeOf(options);
-  if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Transaction inbox worker claim gate is invalid.');
   const descriptor = Object.getOwnPropertyDescriptor(options, 'canClaim');
-  if (descriptor === undefined || ('value' in descriptor && descriptor.value === undefined)) return null;
-  if (!('value' in descriptor) || typeof descriptor.value !== 'function' || isProxy(descriptor.value)) {
-    throw new TypeError('Transaction inbox worker claim gate is invalid.');
+  let gate: (() => boolean) | null = null;
+  if (descriptor !== undefined) {
+    if (!('value' in descriptor)) throw new TypeError('Transaction inbox worker claim gate is invalid.');
+    if (descriptor.value !== undefined) {
+      if (typeof descriptor.value !== 'function' || isProxy(descriptor.value)) {
+        throw new TypeError('Transaction inbox worker claim gate is invalid.');
+      }
+      gate = descriptor.value as () => boolean;
+    }
   }
-  return descriptor.value as () => boolean;
+  for (let prototype = Reflect.getPrototypeOf(options); prototype !== null; prototype = Reflect.getPrototypeOf(prototype)) {
+    if (isProxy(prototype) || Object.getOwnPropertyDescriptor(prototype, 'canClaim') !== undefined) {
+      throw new TypeError('Transaction inbox worker claim gate is invalid.');
+    }
+  }
+  return gate;
 }
 
 function safeAdd(left: number, right: number): number {
