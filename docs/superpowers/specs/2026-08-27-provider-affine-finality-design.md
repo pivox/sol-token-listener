@@ -3,8 +3,17 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.10
+Version: 1.0.11
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.11 makes the paper claim election independent of the connection's
+default isolation and preserves lease freshness while a claimant waits. Claim
+uses an explicit `READ COMMITTED` transaction. It measures elapsed wall-clock
+time from before transaction start through advisory-lock acquisition, clamps a
+backward clock adjustment to zero, and adds that elapsed duration to the
+caller's logical `nowMs`. The resulting effective time drives eligibility,
+lease expiry and terminal retention without replacing deterministic synthetic
+timestamps used by replay tests.
 
 Revision 1.0.10 serializes only the bounded paper claim election transaction.
 Each claimant acquires a transaction-scoped advisory lock in a distinct SQL
@@ -425,10 +434,14 @@ and paper retries, or paper wins first and `enqueueRevision` waits; the later
 replay can then retract the paper lineage. Barrier failures are fixed and
 redacted and become bounded retryable paper failures, never terminal decisions.
 
-Claim first begins a transaction and acquires the relation-scoped paper claim
-scheduler advisory lock in its own statement. Only the election transaction is
-serialized; work performed after a successful claim remains parallel. The
-subsequent statement obtains a fresh `READ COMMITTED` snapshot, then locks at
+Claim first begins an explicit `READ COMMITTED` transaction and acquires the
+relation-scoped paper claim scheduler advisory lock in its own statement. Only
+the election transaction is serialized; work performed after a successful
+claim remains parallel. The repository measures wall-clock time immediately
+before transaction start and after lock acquisition, adds the non-negative
+elapsed duration to the caller's logical timestamp, and derives the claim time,
+lease expiry and terminal retention from that effective timestamp. The
+subsequent statement therefore obtains a fresh statement snapshot and locks at
 most sixteen eligible jobs, before any replay join, in
 durable fairness order `(effective_at, claim_scan_generation, created_at,
 job_id)`. `effective_at` is `COALESCE(finality_checked_at, created_at)` for

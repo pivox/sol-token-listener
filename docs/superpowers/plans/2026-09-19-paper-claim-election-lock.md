@@ -4,7 +4,7 @@
 
 **Goal:** Prevent concurrent paper finality-preflight claimers from rotating the same released sixteen-job batch.
 
-**Architecture:** Serialize only the short claim election transaction with a PostgreSQL transaction-scoped advisory lock. Acquire it in a separate statement after `BEGIN`, scope its stable key with the resolved `paper_decision_jobs` relation OID, and run the existing bounded CTE only after the wait has produced a fresh `READ COMMITTED` statement snapshot.
+**Architecture:** Serialize only the short claim election transaction with a PostgreSQL transaction-scoped advisory lock. Acquire it in a separate statement after an explicit `BEGIN ISOLATION LEVEL READ COMMITTED`, scope its stable key with the resolved `paper_decision_jobs` relation OID, and run the existing bounded CTE only after the wait has produced a fresh statement snapshot. Measure the elapsed lock wait with the injectable clock and shift the caller's logical timestamp by that non-negative duration so deterministic replay time is preserved without issuing a stale lease.
 
 **Tech Stack:** TypeScript strict ESM, Node test runner, PostgreSQL 16, `pg`.
 
@@ -50,3 +50,17 @@
 - [x] Run `npm run build`, `npm run check`, `npm run lint`, `npm run docs:check` and `git diff --check`.
 - [x] Run the backend suite without PostgreSQL and confirm no regression.
 - [x] Commit, push and open one pull request closing issue #131 without requesting review or merging.
+
+### Task 5: Close the review findings
+
+**Files:**
+- Modify: `src/storage/paper-decision.repository.ts`
+- Modify: `tests/paper-decision-claim-election.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md`
+
+- [x] Observe the exact transaction-order contract fail while claim still uses plain `BEGIN`.
+- [x] Observe the deterministic delayed-clock contract fail while claim ignores advisory-lock wait time.
+- [x] Begin claim at explicit `READ COMMITTED` isolation before acquiring the scheduler lock.
+- [x] Derive claim, lease-expiry and retention timestamps from logical `nowMs` plus non-negative elapsed lock wait.
+- [x] Run focused PostgreSQL 16 concurrency tests and all static validation gates.
+- [x] Push the correction, reply to both inline review threads, and resolve them without requesting another review cycle.
