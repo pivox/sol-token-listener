@@ -1,4 +1,4 @@
-import { Connection, type Commitment } from '@solana/web3.js';
+import { Connection, type Commitment, type FetchFn } from '@solana/web3.js';
 import { canonicalSolanaGenesisHash } from '../../domain/solana-genesis-hash.js';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { CatchUpSource } from '../../ports/catch-up-source.js';
@@ -7,6 +7,7 @@ import {
   type SignaturesForAddressRpc,
 } from './catch-up-source.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 
 export type ProviderPinnedCatchUpSourceErrorReason =
   | 'CONFIG_INVALID'
@@ -50,6 +51,7 @@ export function createProviderPinnedCatchUpSource(
   commitment: Commitment,
   expectedGenesisHash: string,
   dependencies?: ProviderPinnedCatchUpSourceDependencies,
+  recorder?: RpcHttpEvidenceRecorder,
 ): ProviderPinnedCatchUpSource {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)
@@ -58,7 +60,7 @@ export function createProviderPinnedCatchUpSource(
     throw failure('CONFIG_INVALID', exposedProviderId);
   }
 
-  const createRpc = dependencyFactory(dependencies, exposedProviderId);
+  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const rpc = createPinnedRpc(createRpc, httpUrl, commitment, providerId);
   const source = new SolanaCatchUpSource(rpc, commitment);
@@ -185,8 +187,16 @@ function abortError(): DOMException {
 function dependencyFactory(
   dependencies: ProviderPinnedCatchUpSourceDependencies | undefined,
   providerId: RpcProviderId | null,
+  selectedProviderId: RpcProviderId,
+  recorder: RpcHttpEvidenceRecorder | undefined,
 ): (httpUrl: string, commitment: Commitment) => unknown {
-  if (dependencies === undefined) return createDefaultRpc;
+  if (dependencies === undefined) {
+    if (recorder === undefined) return createDefaultRpc;
+    const observedFetch = createObservedRpcFetch(selectedProviderId, recorder);
+    return (httpUrl: string, commitment: Commitment): PinnedCatchUpRpc => (
+      createDefaultRpc(httpUrl, commitment, observedFetch)
+    );
+  }
   try {
     if (Array.isArray(dependencies)) {
       throw new TypeError();
@@ -242,12 +252,18 @@ function createPinnedRpc(
   }
 }
 
-function createDefaultRpc(httpUrl: string, commitment: Commitment): PinnedCatchUpRpc {
-  const connection = new Connection(httpUrl, { commitment, disableRetryOnRateLimit: true });
+function createDefaultRpc(
+  httpUrl: string,
+  commitment: Commitment,
+  observedFetch?: FetchFn,
+): PinnedCatchUpRpc {
+  const connection = observedFetch === undefined
+    ? new Connection(httpUrl, { commitment, disableRetryOnRateLimit: true })
+    : new Connection(httpUrl, { commitment, disableRetryOnRateLimit: true, fetch: observedFetch });
   const listSignatures = dataMethod(connection, 'getSignaturesForAddress');
   return Object.freeze({
     getGenesisHash(signal: AbortSignal): Promise<unknown> {
-      return fetchGenesisHash(httpUrl, signal);
+      return fetchGenesisHash(httpUrl, signal, observedFetch);
     },
     getSignaturesForAddress(
       ...parameters: Parameters<SignaturesForAddressRpc['getSignaturesForAddress']>
@@ -265,8 +281,12 @@ function createDefaultRpc(httpUrl: string, commitment: Commitment): PinnedCatchU
   });
 }
 
-async function fetchGenesisHash(httpUrl: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(httpUrl, {
+async function fetchGenesisHash(
+  httpUrl: string,
+  signal: AbortSignal,
+  observedFetch?: FetchFn,
+): Promise<unknown> {
+  const request: RequestInit = {
     method: 'POST',
     headers: Object.freeze({ 'content-type': 'application/json' }),
     body: JSON.stringify(Object.freeze({
@@ -277,7 +297,10 @@ async function fetchGenesisHash(httpUrl: string, signal: AbortSignal): Promise<u
     })),
     redirect: 'error',
     signal,
-  });
+  };
+  const response = observedFetch === undefined
+    ? await fetch(httpUrl, request)
+    : await observedFetch(httpUrl, request);
   if (!response.ok) throw new Error('Genesis RPC request failed.');
   const payload: unknown = await response.json();
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {

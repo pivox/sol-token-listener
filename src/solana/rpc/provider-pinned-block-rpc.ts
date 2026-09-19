@@ -1,10 +1,11 @@
-import { Connection, type Commitment } from '@solana/web3.js';
+import { Connection, type Commitment, type FetchFn } from '@solana/web3.js';
 import { isPromise, isProxy } from 'node:util/types';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import type { TransactionBlockRpc } from './transaction-locator.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
 export type ProviderPinnedBlockRpcErrorReason = 'CONFIG_INVALID' | 'BLOCK_UNAVAILABLE';
@@ -48,6 +49,7 @@ export function createProviderPinnedBlockRpc(
   commitment: Commitment,
   dependencies?: ProviderPinnedBlockRpcDependencies,
   options: ProviderPinnedBlockRpcOptions = { requestTimeoutMs: 30_000 },
+  recorder?: RpcHttpEvidenceRecorder,
 ): ProviderPinnedBlockRpc {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId) || !validCommitment(commitment)) {
@@ -55,8 +57,13 @@ export function createProviderPinnedBlockRpc(
   }
   const requestTimeoutMs = readRequestTimeout(options, exposedProviderId);
   const requestContext = new AsyncLocalStorage<AbortSignal>();
+  const observedFetch = dependencies === undefined && recorder !== undefined
+    ? createObservedRpcFetch(providerId, recorder)
+    : undefined;
   const createConnection = dependencies === undefined
-    ? (url: string, selected: Commitment): Connection => createDefaultConnection(url, selected, requestContext)
+    ? (url: string, selected: Commitment): Connection => (
+      createDefaultConnection(url, selected, requestContext, observedFetch)
+    )
     : dependencyFactory(dependencies, exposedProviderId);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const connection = createPinnedConnection(createConnection, httpUrl, commitment, providerId);
@@ -221,14 +228,18 @@ function supportedNativePromise(value: object): boolean {
 }
 
 function createDefaultConnection(
-  httpUrl: string, commitment: Commitment, requestContext: AsyncLocalStorage<AbortSignal>,
+  httpUrl: string,
+  commitment: Commitment,
+  requestContext: AsyncLocalStorage<AbortSignal>,
+  observedFetch: FetchFn | undefined,
 ): Connection {
   return new Connection(httpUrl, {
     commitment, disableRetryOnRateLimit: true,
     fetch: (input, init): Promise<Response> => {
       const signal = requestContext.getStore();
       if (signal === undefined) return Promise.reject(new Error('Block request context is unavailable.'));
-      return fetch(input, { ...init, signal });
+      if (observedFetch === undefined) return fetch(input, { ...init, signal });
+      return observedFetch(input, { ...init, signal });
     },
   });
 }

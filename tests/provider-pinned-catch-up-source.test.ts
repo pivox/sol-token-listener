@@ -13,6 +13,7 @@ import {
   createProviderPinnedCatchUpSource,
   type ProviderPinnedCatchUpSourceDependencies,
 } from '../src/solana/rpc/provider-pinned-catch-up-source.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
 import type { CatchUpSource as LegacyCatchUpSource } from '../src/application/catch-up-scanner.js';
 import type { CatchUpSource as CanonicalCatchUpSource } from '../src/ports/catch-up-source.js';
@@ -286,6 +287,96 @@ void test('default genesis HTTP transport propagates abort and settles before it
   } finally {
     if (originalFetch === undefined) Reflect.deleteProperty(globalThis, 'fetch');
     else Object.defineProperty(globalThis, 'fetch', originalFetch);
+  }
+});
+
+void test('records a returned genesis HTTP 429 even when its body is invalid', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  let requests = 0;
+  const provider = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(429, { 'content-type': 'application/json' });
+    response.end('{not-valid-json');
+  });
+  try {
+    await listenOnLoopback(provider);
+    const address = provider.address();
+    assert.ok(address !== null && typeof address !== 'string');
+    const source = createProviderPinnedCatchUpSource(
+      catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', 'confirmed', EXPECTED_GENESIS,
+      undefined, recorder,
+    );
+
+    await assert.rejects(source.verifyGenesis(), (error: unknown) => invalid(error, 'GENESIS_UNAVAILABLE', 'primary'));
+    assert.equal(requests, 1);
+    assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+      providerId: 'primary', configured: true, attempts: 1, http429Responses: 1,
+    });
+  } finally {
+    await closeServer(provider);
+  }
+});
+
+void test('records a successful genesis HTTP response before invalid JSON body parsing fails', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  let requests = 0;
+  const provider = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{not-valid-json');
+  });
+  try {
+    await listenOnLoopback(provider);
+    const address = provider.address();
+    assert.ok(address !== null && typeof address !== 'string');
+    const source = createProviderPinnedCatchUpSource(
+      catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', 'confirmed', EXPECTED_GENESIS,
+      undefined, recorder,
+    );
+
+    await assert.rejects(source.verifyGenesis(), (error: unknown) => invalid(error, 'GENESIS_UNAVAILABLE', 'primary'));
+    assert.equal(requests, 1);
+    assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+      providerId: 'primary', configured: true, attempts: 1, http429Responses: 0,
+    });
+  } finally {
+    await closeServer(provider);
+  }
+});
+
+void test('records one returned HTTP 429 for the default provider-pinned catch-up page fetch', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  let requests = 0;
+  const provider = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+    request.once('end', () => {
+      requests += 1;
+      const rpcRequest = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { method: string; id: number };
+      if (rpcRequest.method === 'getGenesisHash') {
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: rpcRequest.id, result: EXPECTED_GENESIS }));
+        return;
+      }
+      response.writeHead(429);
+      response.end('limited');
+    });
+  });
+  try {
+    await listenOnLoopback(provider);
+    const address = provider.address();
+    assert.ok(address !== null && typeof address !== 'string');
+    const source = createProviderPinnedCatchUpSource(
+      catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', 'confirmed', EXPECTED_GENESIS,
+      undefined, recorder,
+    );
+
+    await assert.rejects(source.list(PROGRAM, undefined, 1));
+    assert.equal(requests, 2);
+    assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+      providerId: 'primary', configured: true, attempts: 2, http429Responses: 1,
+    });
+  } finally {
+    await closeServer(provider);
   }
 });
 

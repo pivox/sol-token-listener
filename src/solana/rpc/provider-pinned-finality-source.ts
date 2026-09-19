@@ -1,8 +1,9 @@
-import { Connection } from '@solana/web3.js';
+import { Connection, type FetchFn } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { FinalityProviderPass } from '../../ports/finality-provider-pass.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 
 export type ProviderPinnedFinalityErrorReason =
   | 'CONFIG_INVALID'
@@ -47,10 +48,11 @@ export function createProviderPinnedFinalityPass(
   catalog: RpcProviderCatalog,
   providerId: RpcProviderId,
   dependencies?: ProviderPinnedFinalityDependencies,
+  recorder?: RpcHttpEvidenceRecorder,
 ): FinalityProviderPass {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)) throw failure('CONFIG_INVALID', exposedProviderId);
-  const createRpc = dependencyFactory(dependencies, exposedProviderId);
+  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const calls = createPinnedCalls(createRpc, httpUrl, providerId);
 
@@ -96,8 +98,14 @@ export function createProviderPinnedFinalityPass(
 function dependencyFactory(
   dependencies: ProviderPinnedFinalityDependencies | undefined,
   providerId: RpcProviderId | null,
+  selectedProviderId: RpcProviderId,
+  recorder: RpcHttpEvidenceRecorder | undefined,
 ): (httpUrl: string) => unknown {
-  if (dependencies === undefined) return createDefaultRpc;
+  if (dependencies === undefined) {
+    if (recorder === undefined) return createDefaultRpc;
+    const observedFetch = createObservedRpcFetch(selectedProviderId, recorder);
+    return (httpUrl: string): Connection => createDefaultRpc(httpUrl, observedFetch);
+  }
   try {
     if (Array.isArray(dependencies)) throw new TypeError();
     const keys = Reflect.ownKeys(dependencies);
@@ -156,8 +164,9 @@ function createPinnedCalls(
   }
 }
 
-function createDefaultRpc(httpUrl: string): Connection {
-  return new Connection(httpUrl, { disableRetryOnRateLimit: true });
+function createDefaultRpc(httpUrl: string, observedFetch?: FetchFn): Connection {
+  if (observedFetch === undefined) return new Connection(httpUrl, { disableRetryOnRateLimit: true });
+  return new Connection(httpUrl, { disableRetryOnRateLimit: true, fetch: observedFetch });
 }
 
 function snapshotHistoryRequest(value: readonly string[]): string[] {
