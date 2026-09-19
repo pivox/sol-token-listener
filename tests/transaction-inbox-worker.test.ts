@@ -536,6 +536,128 @@ void test('serializes overlapping runOnce calls and claims at most one row per c
   assert.equal(maximum, 1);
 });
 
+void test('gates claims until permission is granted without touching claim dependencies', async () => {
+  let permitted = false;
+  let gates = 0;
+  let clocks = 0;
+  let claims = 0;
+  let locates = 0;
+  let pipelines = 0;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { claims += 1; return null; },
+  }), { async locate() { locates += 1; return normalized(); } }, {
+    async process() { pipelines += 1; },
+  }, options({
+    now: () => { clocks += 1; return 1_000; },
+    canClaim: () => { gates += 1; return permitted; },
+  }));
+
+  const gatedResult = await worker.runOnce();
+  assert.deepEqual(gatedResult, { kind: 'idle' });
+  assert.ok(Object.isFrozen(gatedResult));
+  assert.equal(gates, 1);
+  assert.equal(clocks, 0);
+  assert.equal(claims, 0);
+  assert.equal(locates, 0);
+  assert.equal(pipelines, 0);
+
+  permitted = true;
+  assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
+  assert.equal(gates, 2);
+  assert.equal(clocks, 1);
+  assert.equal(claims, 1);
+});
+
+void test('fails closed and redacts throwing or non-boolean claim gates', async () => {
+  for (const canClaim of [
+    () => { throw new Error('claim gate secret'); },
+    () => 'not-a-boolean',
+  ]) {
+    let clocks = 0;
+    let claims = 0;
+    let locates = 0;
+    let pipelines = 0;
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() { claims += 1; return null; },
+    }), { async locate() { locates += 1; return normalized(); } }, {
+      async process() { pipelines += 1; },
+    }, options({
+      now: () => { clocks += 1; return 1_000; },
+      canClaim,
+    }));
+
+    await assert.rejects(worker.runOnce(), (error: unknown) => {
+      assert.ok(error instanceof TransactionInboxWorkerError);
+      assert.equal(error.stage, 'claim-gate');
+      assert.equal(error.message, 'Transaction inbox worker operation failed.');
+      assert.equal(Object.hasOwn(error, 'cause'), false);
+      assert.ok(Object.isFrozen(error));
+      return true;
+    });
+    assert.equal(worker.state, 'DEGRADED');
+    assert.equal(clocks, 0);
+    assert.equal(claims, 0);
+    assert.equal(locates, 0);
+    assert.equal(pipelines, 0);
+  }
+});
+
+void test('rejects accessor-backed and proxied claim gate options without invoking them', () => {
+  let accessorReads = 0;
+  const accessor = options();
+  Object.defineProperty(accessor, 'canClaim', {
+    enumerable: true,
+    get() { accessorReads += 1; throw new Error('claim gate accessor secret'); },
+  });
+  let proxyTraps = 0;
+  const proxiedGate = new Proxy(() => true, {
+    apply() { proxyTraps += 1; throw new Error('claim gate proxy secret'); },
+  });
+  const proxiedOptions = new Proxy(options(), {
+    get() { proxyTraps += 1; throw new Error('claim gate option proxy secret'); },
+  });
+
+  assert.throws(() => new TransactionInboxWorker(
+    repositoryWith({}), locator(), pipeline(), options({ canClaim: true }),
+  ), TypeError);
+  assert.throws(() => new TransactionInboxWorker(repositoryWith({}), locator(), pipeline(), accessor), TypeError);
+  assert.throws(() => new TransactionInboxWorker(
+    repositoryWith({}), locator(), pipeline(), options({ canClaim: proxiedGate }),
+  ), TypeError);
+  assert.throws(() => new TransactionInboxWorker(
+    repositoryWith({}), locator(), pipeline(), proxiedOptions,
+  ), TypeError);
+  assert.equal(accessorReads, 0);
+  assert.equal(proxyTraps, 0);
+});
+
+void test('preserves ungated claim behavior and polls safely while claims are gated', async () => {
+  let claims = 0;
+  const ungated = new TransactionInboxWorker(repositoryWith({
+    async claim() { claims += 1; return null; },
+  }), locator(), pipeline(), options());
+  assert.deepEqual(await ungated.runOnce(), { kind: 'idle' });
+  assert.equal(claims, 1);
+
+  const scheduler = new ManualScheduler();
+  let gates = 0;
+  const gated = new TransactionInboxWorker(repositoryWith({
+    async claim() { throw new Error('claim must remain gated'); },
+  }), locator(), pipeline(), options({
+    scheduler,
+    canClaim: () => { gates += 1; return false; },
+  }));
+  await gated.start();
+  await scheduler.waitForScheduled();
+  assert.equal(gates, 1);
+  assert.equal(scheduler.activeCount, 1);
+  await scheduler.fire();
+  await eventually(() => gates === 2 && scheduler.activeCount === 1);
+  await gated.close();
+  assert.equal(gated.state, 'STOPPED');
+  assert.equal(scheduler.activeCount, 0);
+});
+
 void test('start idles without a busy loop and concurrent close cancels wait', async () => {
   const scheduler = new ManualScheduler();
   let claims = 0;

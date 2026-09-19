@@ -5,6 +5,7 @@ import {
   type ClaimedTransaction,
   type IngestionFailure,
 } from '../domain/transaction-ingestion.js';
+import { isProxy } from 'node:util/types';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import {
@@ -23,6 +24,7 @@ export type TransactionInboxWorkerState =
   | 'STOPPED';
 
 export type TransactionInboxWorkerErrorStage =
+  | 'claim-gate'
   | 'claim'
   | 'save-snapshot'
   | 'mark-failed'
@@ -60,6 +62,7 @@ export interface TransactionInboxWorkerOptions {
   readonly idlePollMs: number;
   readonly now?: () => number;
   readonly scheduler?: TransactionInboxWorkerScheduler;
+  readonly canClaim?: () => boolean;
 }
 
 export class TransactionInboxWorkerError extends Error {
@@ -86,6 +89,7 @@ export class TransactionInboxWorker {
   private readonly idlePollMs: number;
   private readonly now: () => number;
   private readonly scheduler: TransactionInboxWorkerScheduler;
+  private readonly canClaim: (() => boolean) | null;
   private currentState: TransactionInboxWorkerState = 'STOPPED';
   private runTail: Promise<void> = Promise.resolve();
   private loopPromise: Promise<void> | null = null;
@@ -102,6 +106,7 @@ export class TransactionInboxWorker {
     private readonly pipeline: TransactionInboxWorkerPipeline,
     options: TransactionInboxWorkerOptions,
   ) {
+    const canClaim = readClaimGate(options);
     if (!positiveSafeInteger(options.leaseSeconds)
       || !positiveTimer(options.renewalIntervalMs)
       || !positiveTimer(options.idlePollMs)) {
@@ -124,6 +129,7 @@ export class TransactionInboxWorker {
     this.idlePollMs = options.idlePollMs;
     this.now = options.now ?? Date.now;
     this.scheduler = options.scheduler ?? systemScheduler;
+    this.canClaim = canClaim;
   }
 
   public get state(): TransactionInboxWorkerState {
@@ -181,6 +187,7 @@ export class TransactionInboxWorker {
 
   private async performRunOnce(): Promise<TransactionInboxRunResult> {
     if (this.permanentlyClosed) return frozenResult({ kind: 'closed' });
+    if (!this.canClaimNow()) return frozenResult({ kind: 'idle' });
     let claimed: ClaimedTransaction | null;
     try {
       claimed = await this.repository.claim(this.readNow(), this.leaseSeconds);
@@ -342,6 +349,22 @@ export class TransactionInboxWorker {
     if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) {
       this.reportDegraded();
       throw new TransactionInboxWorkerError('clock');
+    }
+    return value;
+  }
+
+  private canClaimNow(): boolean {
+    if (this.canClaim === null) return true;
+    let value: boolean;
+    try {
+      value = this.canClaim();
+    } catch {
+      this.reportDegraded();
+      throw new TransactionInboxWorkerError('claim-gate');
+    }
+    if (typeof value !== 'boolean') {
+      this.reportDegraded();
+      throw new TransactionInboxWorkerError('claim-gate');
     }
     return value;
   }
@@ -578,6 +601,16 @@ function positiveTimer(value: number): boolean {
 
 function validScheduler(value: TransactionInboxWorkerScheduler): boolean {
   return typeof value.schedule === 'function' && typeof value.cancel === 'function';
+}
+
+function readClaimGate(options: TransactionInboxWorkerOptions): (() => boolean) | null {
+  if (isProxy(options)) throw new TypeError('Transaction inbox worker claim gate is invalid.');
+  const descriptor = Object.getOwnPropertyDescriptor(options, 'canClaim');
+  if (descriptor === undefined || ('value' in descriptor && descriptor.value === undefined)) return null;
+  if (!('value' in descriptor) || typeof descriptor.value !== 'function' || isProxy(descriptor.value)) {
+    throw new TypeError('Transaction inbox worker claim gate is invalid.');
+  }
+  return descriptor.value as () => boolean;
 }
 
 function safeAdd(left: number, right: number): number {
