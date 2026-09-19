@@ -19,10 +19,18 @@ import type {
   ProcessingCheckpointKey,
   TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
+import {
+  createCatchUpClassificationReceipt,
+  type CatchUpClassificationReceipt,
+} from '../src/domain/catch-up-classification.js';
 import { TRANSACTION_INGESTION_ERROR_CODES } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type { StrictCatchUpRepository } from '../src/ports/strict-catch-up-repository.js';
+import type {
+  StrictCatchUpPageAdmissionResult,
+  StrictCatchUpPageAdmitter,
+} from '../src/ports/strict-catch-up-page-admitter.js';
 import {
   CatchUpSourceError,
   MAX_CATCH_UP_PAGE_SIZE,
@@ -183,6 +191,171 @@ void test('replays page enqueues idempotently when run progress persistence cras
   assert.equal(repository.runs[0]?.beforeSignature, 'tail');
   assert.equal(repository.runs[0]?.pagesScanned, 2n);
   assert.equal(repository.runs[0]?.signaturesEnqueued, 4n);
+});
+
+void test('admits a complete Pump.fun page before run progress and uses its exact receipt counters', async () => {
+  const events: string[] = [];
+  const previous = checkpoint('launchpad', 'boundary', 10);
+  const repository = new FakeRepository({ launchpad: previous }, events);
+  const admitter = new FakePageAdmitter(events, Object.freeze({
+    receipts: Object.freeze([
+      classificationReceipt('head', 12, 'ACTIONABLE', 'ENQUEUED'),
+      classificationReceipt('tail', 11, 'IGNORED', 'NOT_ENQUEUED'),
+    ]),
+    signaturesClassified: 2n,
+    signaturesEnqueued: 1n,
+  }));
+
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }, 'primary', events), repository, {
+    programs: LAUNCHPAD_ONLY, maxPages: 1, pageAdmitter: admitter,
+  }).scan(NEVER_ABORTED), { name: 'StrictCatchUpPausedError' });
+
+  assert.deepEqual(events, [
+    'read:launchpad', 'run-read:launchpad', 'run-history:launchpad',
+    `source:${PUMP_PROGRAM_ID}:head`, 'admit:head,tail', 'run-create:launchpad',
+  ]);
+  assert.deepEqual(repository.enqueued, []);
+  assert.equal(repository.runs[0]?.signaturesClassified, 2n);
+  assert.equal(repository.runs[0]?.signaturesEnqueued, 1n);
+  assert.deepEqual(admitter.calls.map(({ program, rows }) => [
+    program.key, program.family, rows.map(({ signature }) => signature),
+  ]), [['launchpad', 'pumpfun', ['head', 'tail']]]);
+});
+
+void test('does not advance a run or checkpoint when Pump.fun page admission fails', async () => {
+  const previous = checkpoint('launchpad', 'boundary', 10);
+  const repository = new FakeRepository({ launchpad: previous });
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([]), signaturesClassified: 0n, signaturesEnqueued: 0n,
+  }));
+  admitter.failure = new Error('classification-secret');
+
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }), repository, {
+    programs: LAUNCHPAD_ONLY, maxPages: 1, pageAdmitter: admitter,
+  }).scan(NEVER_ABORTED), (error: unknown) => scannerFailure(error, 'page-admit', 'launchpad'));
+
+  assert.deepEqual(repository.runs, []);
+  assert.deepEqual(repository.cas, []);
+  assert.deepEqual(repository.enqueued, []);
+});
+
+void test('rejects non-canonical frozen page-admission receipt arrays before run progress', async () => {
+  const first = classificationReceipt('head', 12, 'ACTIONABLE', 'ENQUEUED');
+  const second = classificationReceipt('tail', 11, 'IGNORED', 'NOT_ENQUEUED');
+  const extra = [first, second];
+  Object.defineProperty(extra, 'extra', { value: true });
+  const symbol = [first, second];
+  Object.defineProperty(symbol, Symbol('receipt'), { value: true });
+  const foreignPrototype = [first, second];
+  Object.setPrototypeOf(foreignPrototype, null);
+  let getterCalls = 0;
+  const accessor = [first, second];
+  Object.defineProperty(accessor, '0', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error('receipt accessor must not run');
+    },
+  });
+
+  for (const receipts of [extra, symbol, foreignPrototype, accessor]) {
+    const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+    const admitter = new FakePageAdmitter([], Object.freeze({
+      receipts: Object.freeze(receipts) as readonly CatchUpClassificationReceipt[],
+      signaturesClassified: 2n,
+      signaturesEnqueued: 1n,
+    }));
+    await assert.rejects(scanner(new FakeSource({
+      [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+    }), repository, {
+      programs: LAUNCHPAD_ONLY, maxPages: 1, pageAdmitter: admitter,
+    }).scan(NEVER_ABORTED), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, 'Strict catch-up page admission receipt is invalid.');
+      return true;
+    });
+    assert.deepEqual(repository.runs, []);
+    assert.deepEqual(repository.cas, []);
+  }
+  assert.equal(getterCalls, 0);
+});
+
+void test('keeps PumpSwap on legacy enqueue when the Pump.fun page admitter is present', async () => {
+  const repository = new FakeRepository();
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([
+      classificationReceipt('launch', 2, 'ACTIONABLE', 'ENQUEUED'),
+    ]),
+    signaturesClassified: 1n,
+    signaturesEnqueued: 1n,
+  }));
+
+  const result = await scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 2)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 3)]],
+  }), repository, { pageAdmitter: admitter }).scan(NEVER_ABORTED);
+
+  assert.deepEqual(admitter.calls.map(({ program }) => program.key), ['launchpad']);
+  assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['market']);
+  assert.equal(result.enqueuedCount, 2);
+});
+
+void test('supports a one-row page already admitted durably without synthetic counters', async () => {
+  const previous = checkpoint('launchpad', 'boundary', 10);
+  const repository = new FakeRepository({ launchpad: previous });
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([createCatchUpClassificationReceipt({
+      signature: 'head', slot: 12n, disposition: null,
+      persistence: 'ALREADY_ADMITTED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    })]),
+    signaturesClassified: 0n,
+    signaturesEnqueued: 0n,
+  }));
+
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12)]],
+  }), repository, {
+    pageSize: 1, maxPages: 1, programs: LAUNCHPAD_ONLY, pageAdmitter: admitter,
+  }).scan(NEVER_ABORTED), { name: 'StrictCatchUpPausedError' });
+
+  assert.equal(repository.runs[0]?.beforeSignature, 'head');
+  assert.equal(repository.runs[0]?.signaturesClassified, 0n);
+  assert.equal(repository.runs[0]?.signaturesEnqueued, 0n);
+});
+
+void test('cancellation after page admission settlement prevents run progress', async () => {
+  const previous = checkpoint('launchpad', 'boundary', 10);
+  const repository = new FakeRepository({ launchpad: previous });
+  const pending = deferred<StrictCatchUpPageAdmissionResult>();
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([]), signaturesClassified: 0n, signaturesEnqueued: 0n,
+  }));
+  admitter.next = pending.promise;
+  const controller = new AbortController();
+  const operation = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }), repository, {
+    programs: LAUNCHPAD_ONLY, maxPages: 1, pageAdmitter: admitter,
+  }).scan(controller.signal);
+  await waitFor(() => admitter.calls.length === 1);
+  controller.abort();
+  pending.resolve(Object.freeze({
+    receipts: Object.freeze([
+      classificationReceipt('head', 12, 'ACTIONABLE', 'ENQUEUED'),
+      classificationReceipt('tail', 11, 'IGNORED', 'NOT_ENQUEUED'),
+    ]),
+    signaturesClassified: 2n,
+    signaturesEnqueued: 1n,
+  }));
+
+  await assert.rejects(operation, abortedScan);
+  assert.deepEqual(repository.runs, []);
+  assert.deepEqual(repository.cas, []);
 });
 
 void test('rejects a different provider before source access or durable writes', async () => {
@@ -1314,6 +1487,7 @@ function scanner(
       readonly family: 'pumpfun' | 'pumpswap';
       readonly id: string;
     }>[];
+    readonly pageAdmitter?: StrictCatchUpPageAdmitter;
   } = {},
 ): StrictCatchUpScanner {
   return new StrictCatchUpScanner(source, repository, {
@@ -1322,6 +1496,52 @@ function scanner(
     now: overrides.now ?? (() => 9_000),
     ...(overrides.policy === undefined ? {} : { policy: overrides.policy }),
     ...(overrides.programs === undefined ? {} : { programs: overrides.programs }),
+  }, overrides.pageAdmitter);
+}
+
+class FakePageAdmitter implements StrictCatchUpPageAdmitter {
+  readonly calls: { readonly program: Readonly<{
+    readonly key: ProcessingCheckpointKey;
+    readonly family: 'pumpfun' | 'pumpswap';
+    readonly id: string;
+  }>; readonly rows: readonly CatchUpSignature[] }[] = [];
+  failure: Error | null = null;
+  next: Promise<StrictCatchUpPageAdmissionResult> | null = null;
+
+  public constructor(
+    private readonly events: string[],
+    private readonly result: StrictCatchUpPageAdmissionResult,
+  ) {}
+
+  public async admitPage(
+    program: Readonly<{
+      readonly key: ProcessingCheckpointKey;
+      readonly family: 'pumpfun' | 'pumpswap';
+      readonly id: string;
+    }>,
+    rows: readonly CatchUpSignature[],
+    _signal: AbortSignal,
+  ): Promise<StrictCatchUpPageAdmissionResult> {
+    this.calls.push({ program, rows });
+    this.events.push(`admit:${rows.map(({ signature }) => signature).join(',')}`);
+    if (this.failure !== null) throw this.failure;
+    return this.next ?? this.result;
+  }
+}
+
+function classificationReceipt(
+  signature: string,
+  slot: number,
+  disposition: 'ACTIONABLE' | 'IGNORED',
+  admission: 'ENQUEUED' | 'NOT_ENQUEUED',
+): CatchUpClassificationReceipt {
+  return createCatchUpClassificationReceipt({
+    signature,
+    slot: BigInt(slot),
+    disposition,
+    persistence: 'RECORDED',
+    admission,
+    ingestionPriority: admission === 'ENQUEUED' ? 'LAUNCH_CANDIDATE' : null,
   });
 }
 

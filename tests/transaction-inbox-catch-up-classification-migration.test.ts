@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
 import pg from 'pg';
-import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const migrationName = '048_transaction_inbox_catch_up_classification.sql';
@@ -54,12 +54,12 @@ void test('048 upgrades 047 without rewriting inbox evidence and replays exactly
   });
 });
 
-void test('048 is the empty-database head and migrateDatabase remains idempotent', async (context) => {
+void test('048 applies above 047 and remains directly replayable', async (context) => {
   await withDatabase(context, async (pool) => {
-    const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
-    assert.deepEqual(await migrateDatabase({ pool }), []);
-    await pool.query(await migrationSql());
+    await applyThrough047(pool);
+    const sql = await migrationSql();
+    await pool.query(sql);
+    await pool.query(sql);
     assert.equal((await pool.query(`SELECT COUNT(*) FROM information_schema.columns
       WHERE table_schema=current_schema() AND table_name='chain_transaction_inbox'
         AND column_name LIKE 'catch_up_%'`)).rows[0]?.count, '7');
@@ -77,7 +77,8 @@ void test('048 rejects weakened inbox and strict-run constraints on direct repla
   ] as const;
   for (const [label, mutation] of cases) {
     await withDatabase(context, async (pool) => {
-      await migrateDatabase({ pool });
+      await applyThrough047(pool);
+      await pool.query(await migrationSql());
       await pool.query(mutation);
       await assert.rejects(pool.query(await migrationSql()),
         (error: unknown) => error instanceof pg.DatabaseError
@@ -89,7 +90,8 @@ void test('048 rejects weakened inbox and strict-run constraints on direct repla
 
 void test('048 replay rejects rows admitted through a weakened public-key helper', async (context) => {
   await withDatabase(context, async (pool) => {
-    await migrateDatabase({ pool });
+    await applyThrough047(pool);
+    await pool.query(await migrationSql());
     await pool.query(`CREATE OR REPLACE FUNCTION transaction_inbox_solana_public_key_valid(value TEXT)
       RETURNS BOOLEAN LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT TRUE $$`);
     await insertInbox(pool, classified({
@@ -198,7 +200,8 @@ void test('048 requires classified signatures to cover every enqueued strict sig
 
 void test('ignored and quarantined classifications purge after exactly four hours', async (context) => {
   await withDatabase(context, async (pool) => {
-    await migrateDatabase({ pool });
+    await applyThrough047(pool);
+    await pool.query(await migrationSql());
     const oldTerminal = new Date(Date.now() - 14_400_001).toISOString();
     const oldPurge = new Date(new Date(oldTerminal).getTime() + 14_400_000).toISOString();
     for (const [signature, disposition, reason] of [

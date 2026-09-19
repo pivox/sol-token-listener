@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '042_execution_preflight_intent_preparation.sql';
-const migrationHeadName = '048_transaction_inbox_catch_up_classification.sql';
+const migrationHeadName = '049_transaction_inbox_catch_up_admission_receipt.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 042 declares the bounded preparation-run authority', async () => {

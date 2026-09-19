@@ -88,7 +88,7 @@ export function createStrictCatchUpRun(input: unknown): StrictCatchUpRun {
     const initialSingleRowHead = beforeSignature === observedHead.signature
       && lastAcceptedSlot === observedHead.slot
       && pagesScanned === 1n
-      && signaturesClassified === 1n
+      && signaturesClassified <= 1n
       && signaturesEnqueued <= signaturesClassified
       && revision === 0n;
     if (
@@ -262,7 +262,7 @@ export function assertValidStrictCatchUpRun(
     const initialSingleRowHead = beforeSignature === observedHead.signature
       && lastAcceptedSlot === observedHead.slot
       && pagesScanned === 1n
-      && signaturesClassified === 1n
+      && signaturesClassified <= 1n
       && signaturesEnqueued <= signaturesClassified
       && ((state === 'ACTIVE' && revision === 0n)
         || (state !== 'ACTIVE' && revision === 1n));

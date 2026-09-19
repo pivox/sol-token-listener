@@ -53,6 +53,275 @@ void test('keeps durable ingestion independent of launchpad and market adapter i
   assert.doesNotMatch(source, /from ['"][^'"]*(?:launchpads|markets)\//u);
 });
 
+void test('returns exact fresh receipts for actionable, deferred and terminal classifications', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const actionable = catchUpClassification('receipt-fresh-actionable');
+    const deferred = createCatchUpClassification({
+      ...catchUpClassificationInput('receipt-fresh-deferred'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    const ignored = createCatchUpClassification({
+      ...catchUpClassificationInput('receipt-fresh-ignored'),
+      disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null, ingestionHintMint: null, mints: [],
+    });
+
+    assert.deepEqual(await repository.recordCatchUpClassification(actionable), {
+      signature: actionable.signature, slot: actionable.slot, disposition: 'ACTIONABLE',
+      persistence: 'RECORDED', admission: 'ENQUEUED', ingestionPriority: 'LAUNCH_CANDIDATE',
+    });
+    assert.deepEqual(await repository.recordCatchUpClassification(deferred), {
+      signature: deferred.signature, slot: deferred.slot, disposition: 'DEFERRED',
+      persistence: 'RECORDED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    assert.deepEqual(await repository.recordCatchUpClassification(ignored), {
+      signature: ignored.signature, slot: ignored.slot, disposition: 'IGNORED',
+      persistence: 'RECORDED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    assert.equal((await row(pool, actionable.signature)).catch_up_enqueued, true);
+    assert.equal((await row(pool, actionable.signature)).catch_up_admission_priority, 'LAUNCH_CANDIDATE');
+    assert.equal((await row(pool, deferred.signature)).catch_up_enqueued, false);
+    assert.equal((await row(pool, deferred.signature)).catch_up_admission_priority, null);
+    assert.equal((await row(pool, ignored.signature)).catch_up_enqueued, false);
+    assert.equal((await row(pool, ignored.signature)).catch_up_admission_priority, null);
+  });
+});
+
+void test('returns semantic replay receipts without rewriting historical catch-up admission', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await insertTrackedLaunch(pool);
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('receipt-replayed-tracked-deferred'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    const recorded = await repository.recordCatchUpClassification(classification);
+    assert.deepEqual(recorded, {
+      signature: classification.signature, slot: classification.slot, disposition: 'DEFERRED',
+      persistence: 'RECORDED', admission: 'ENQUEUED', ingestionPriority: 'TRACKED_TRADE',
+    });
+
+    await pool.query('UPDATE token_launches SET terminal_at=clock_timestamp() WHERE mint=$1', [tradeMint]);
+    await repository.syncTrackedMint(tradeMint);
+    const replayed = await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...classification, observedAtMs: 2_000, classifiedAtMs: 2_001,
+    }));
+
+    assert.equal(replayed.persistence, 'REPLAYED');
+    assert.equal(replayed.admission, 'ENQUEUED');
+    assert.equal(replayed.ingestionPriority, 'TRACKED_TRADE');
+    const stored = await row(pool, classification.signature);
+    assert.equal(stored.catch_up_enqueued, true);
+    assert.equal(stored.catch_up_admission_priority, 'TRACKED_TRADE');
+    assert.equal(stored.ingestion_priority, 'NORMAL');
+    assert.equal(stored.processing_status, 'DEFERRED');
+  });
+});
+
+void test('records catch-up evidence on pristine WebSocket work without a second admission', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = catchUpClassification('receipt-websocket-pristine');
+    await repository.enqueue(notification(
+      classification.signature, classification.slot, 'WEBSOCKET', 'processed', 1_000,
+      'PUMPFUN_CREATE',
+    ));
+
+    const receipt = await repository.recordCatchUpClassification(classification);
+
+    assert.deepEqual(receipt, {
+      signature: classification.signature, slot: classification.slot, disposition: 'ACTIONABLE',
+      persistence: 'RECORDED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    const stored = await row(pool, classification.signature);
+    assert.equal(stored.catch_up_enqueued, false);
+    assert.equal(stored.catch_up_admission_priority, null);
+    assert.equal(stored.processing_status, 'PENDING');
+    assert.equal(stored.ingestion_priority, 'LAUNCH_CANDIDATE');
+    assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+  });
+});
+
+void test('records catch-up admission when tracked membership promotes existing deferred WebSocket work', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const promotedSignature = 'receipt-websocket-deferred-promotion';
+    await repository.enqueue(tradeNotification(promotedSignature, 1n));
+    assert.equal((await row(pool, promotedSignature)).processing_status, 'DEFERRED');
+    await insertTrackedLaunch(pool);
+    const promotedClassification = createCatchUpClassification({
+      ...catchUpClassificationInput(promotedSignature),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+
+    assert.deepEqual(await repository.recordCatchUpClassification(promotedClassification), {
+      signature: promotedSignature, slot: 1n, disposition: 'DEFERRED',
+      persistence: 'RECORDED', admission: 'ENQUEUED', ingestionPriority: 'TRACKED_TRADE',
+    });
+    const promoted = await row(pool, promotedSignature);
+    assert.equal(promoted.processing_status, 'PENDING');
+    assert.equal(promoted.ingestion_priority, 'TRACKED_TRADE');
+    assert.equal(promoted.catch_up_enqueued, true);
+    assert.equal(promoted.catch_up_admission_priority, 'TRACKED_TRADE');
+    assert.deepEqual(await repository.recordCatchUpClassification(promotedClassification), {
+      signature: promotedSignature, slot: 1n, disposition: 'DEFERRED',
+      persistence: 'REPLAYED', admission: 'ENQUEUED', ingestionPriority: 'TRACKED_TRADE',
+    });
+
+    const pendingSignature = 'receipt-websocket-existing-pending';
+    await repository.enqueue(tradeNotification(pendingSignature, 2n));
+    const pendingClassification = createCatchUpClassification({
+      ...catchUpClassificationInput(pendingSignature), slot: 2n,
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    assert.deepEqual(await repository.recordCatchUpClassification(pendingClassification), {
+      signature: pendingSignature, slot: 2n, disposition: 'DEFERRED',
+      persistence: 'RECORDED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    assert.equal((await row(pool, pendingSignature)).catch_up_enqueued, false);
+    assert.equal((await row(pool, pendingSignature)).catch_up_admission_priority, null);
+  });
+});
+
+void test('annotates non-pristine WebSocket work while preserving its active processing cycle', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = catchUpClassification('receipt-websocket-processing');
+    await repository.enqueue(notification(
+      classification.signature, classification.slot, 'WEBSOCKET', 'processed', 1_000,
+      'PUMPFUN_CREATE',
+    ));
+    const claim = await repository.claim(1_001, 30);
+    assert.equal(claim?.signature, classification.signature);
+
+    const receipt = await repository.recordCatchUpClassification(classification);
+
+    assert.equal(receipt.persistence, 'RECORDED');
+    assert.equal(receipt.admission, 'NOT_ENQUEUED');
+    const stored = await row(pool, classification.signature);
+    assert.equal(stored.processing_status, 'PROCESSING');
+    assert.equal(stored.lease_token, claim.leaseToken);
+    assert.equal(stored.attempts, 1);
+    assert.equal(stored.catch_up_enqueued, false);
+    assert.equal(stored.catch_up_disposition, 'ACTIONABLE');
+  });
+});
+
+void test('terminal classifications terminalize pristine WebSocket work and preserve active lifecycle state', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const pristineSignature = 'receipt-websocket-terminal-pristine';
+    await repository.enqueue(notification(pristineSignature, 1n, 'WEBSOCKET', 'processed', 1_000));
+    const pristineClassification = createCatchUpClassification({
+      ...catchUpClassificationInput(pristineSignature),
+      disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null, ingestionHintMint: null, mints: [],
+    });
+    assert.equal((await repository.recordCatchUpClassification(pristineClassification)).admission,
+      'NOT_ENQUEUED');
+    const pristine = await row(pool, pristineSignature);
+    assert.equal(pristine.processing_status, 'IGNORED');
+    assert.equal(pristine.catch_up_enqueued, false);
+    assert.equal(pristine.terminal_at.getTime(), pristineClassification.classifiedAtMs);
+
+    const signature = 'receipt-websocket-terminal-processing';
+    await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'processed', 1_000));
+    const claim = await repository.claim(1_001, 30);
+    assert.equal(claim?.signature, signature);
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null, ingestionHintMint: null, mints: [],
+    });
+
+    const receipt = await repository.recordCatchUpClassification(classification);
+
+    assert.deepEqual(receipt, {
+      signature, slot: 1n, disposition: 'IGNORED', persistence: 'RECORDED',
+      admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    const stored = await row(pool, signature);
+    assert.equal(stored.processing_status, 'PROCESSING');
+    assert.equal(stored.lease_token, claim.leaseToken);
+    assert.equal(stored.catch_up_disposition, 'IGNORED');
+    assert.equal(stored.catch_up_enqueued, false);
+  });
+});
+
+void test('ordinary finality discovery replays a nonterminal WebSocket lifecycle with terminal catch-up evidence', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'receipt-websocket-terminal-finality-replay';
+    await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'confirmed', 1_000));
+    const claim = await repository.claim(1_001, 30);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 1n));
+    await repository.markProcessed(signature, claim.leaseToken, 'confirmed');
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null, ingestionHintMint: null, mints: [],
+    });
+    await repository.recordCatchUpClassification(classification);
+    assert.equal((await row(pool, signature)).processing_status, 'PROCESSED');
+
+    const finalizedDiscovery = Object.freeze({
+      ...notification(signature, 1n, 'WEBSOCKET', 'finalized', 2_000, 'PUMPFUN_CREATE'),
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+    });
+    await repository.enqueue(finalizedDiscovery);
+    await repository.enqueue(Object.freeze({ ...finalizedDiscovery, observedAtMs: 2_001 }));
+
+    const replayed = await row(pool, signature);
+    assert.equal(replayed.target_confirmation_status, 'finalized');
+    assert.equal(replayed.processing_status, 'PENDING');
+    assert.equal(replayed.processed_at, null);
+    assert.equal(replayed.ingestion_priority, 'NORMAL');
+    assert.equal(replayed.ingestion_hint, 'NONE');
+    assert.equal(replayed.ingestion_hint_mint, null);
+    assert.equal(replayed.catch_up_disposition, 'IGNORED');
+    assert.equal(replayed.catch_up_enqueued, false);
+    assert.deepEqual(replayed.program_ids, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort());
+    assert.equal((await repository.claim(2_002, 30))?.signature, signature);
+  });
+});
+
+void test('reopens confirmed WebSocket work for finalized replay while recording no catch-up admission', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'receipt-websocket-confirmed-finalized';
+    await repository.enqueue(notification(
+      signature, 1n, 'WEBSOCKET', 'confirmed', 1_000, 'PUMPFUN_CREATE',
+    ));
+    const claim = await repository.claim(1_001, 30);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 1n));
+    await repository.markProcessed(signature, claim.leaseToken, 'confirmed');
+    const finalized = createCatchUpClassification({
+      ...catchUpClassificationInput(signature), confirmationStatus: 'finalized',
+      observedAtMs: 2_000, classifiedAtMs: 2_001,
+    });
+
+    const receipt = await repository.recordCatchUpClassification(finalized);
+
+    assert.deepEqual(receipt, {
+      signature, slot: 1n, disposition: 'ACTIONABLE', persistence: 'RECORDED',
+      admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
+    const stored = await row(pool, signature);
+    assert.equal(stored.target_confirmation_status, 'finalized');
+    assert.equal(stored.processing_status, 'PENDING');
+    assert.equal(stored.processed_at, null);
+    assert.equal(stored.finality_evidence_version, '1');
+    assert.equal(stored.catch_up_enqueued, false);
+  });
+});
+
 void test('atomically persists an actionable catch-up classification as one inbox row', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -1877,7 +2146,10 @@ void test('uses a purged finalized receipt as a terminal classification tombston
     const replay = createCatchUpClassification({
       ...catchUpClassificationInput(signature), slot: 45n, confirmationStatus: 'confirmed',
     });
-    await repository.recordCatchUpClassification(replay);
+    assert.deepEqual(await repository.recordCatchUpClassification(replay), {
+      signature, slot: 45n, disposition: null, persistence: 'ALREADY_ADMITTED',
+      admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    });
     assert.equal((await pool.query(
       'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1', [signature],
     )).rows[0]?.count, '0');
@@ -3300,6 +3572,41 @@ void test('rolls back and releases a checked-out client after a database failure
   assert.deepEqual(queries, ['BEGIN',
     "SELECT pg_advisory_xact_lock_shared(hashtextextended('foundation-retention-fence:v1', 0))",
     'ROLLBACK']);
+  assert.equal(released, true);
+});
+
+void test('checks the optional classification signal after durable writes and before commit', async () => {
+  const queries: string[] = [];
+  let released = false;
+  const controller = new AbortController();
+  const client = {
+    query: async (text: string) => {
+      queries.push(text);
+      if (text.includes('FROM chain_transaction_inbox WHERE signature=$1 FOR UPDATE')) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (text.includes('FROM chain_transaction_finality_replay_receipts')) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (text.includes('INSERT INTO chain_transaction_inbox')) {
+        controller.abort();
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => { released = true; },
+  };
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => client,
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+
+  await assert.rejects(
+    repository.recordCatchUpClassification(catchUpClassification('classification-abort'), controller.signal),
+    TransactionInboxRepositoryError,
+  );
+  assert.equal(queries.includes('COMMIT'), false);
+  assert.equal(queries.at(-1), 'ROLLBACK');
   assert.equal(released, true);
 });
 

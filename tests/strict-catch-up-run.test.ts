@@ -141,7 +141,13 @@ void test('permits only the exact initial one-row head cursor and advances beyon
   };
   const initial = createStrictCatchUpRun(initialInput);
 
+  const alreadyAdmitted = createStrictCatchUpRun({
+    ...initialInput,
+    signaturesClassified: 0n,
+  });
+
   assert.doesNotThrow(() => { assertValidStrictCatchUpRun(initial); });
+  assert.doesNotThrow(() => { assertValidStrictCatchUpRun(alreadyAdmitted); });
   const advanced = advanceStrictCatchUpRun(initial, {
     beforeSignature: 'next-tail',
     lastAcceptedSlot: 20n,
