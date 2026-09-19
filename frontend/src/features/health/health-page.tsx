@@ -27,11 +27,26 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
         <HealthCard title="Hydratation des blocs"><BlockHydrationDiagnostic value={health.heartbeat.blockHydration} /></HealthCard>
         <HealthCard title="Admission catch-up"><CatchUpAdmissionDiagnostic value={health.heartbeat.catchUpAdmission} /></HealthCard>
+        <HealthCard title="HTTP RPC"><RpcHttpEvidenceDiagnostic value={health.heartbeat.rpcHttpEvidence} /></HealthCard>
         <HealthCard title="WebSocket Solana"><WebSocketDiagnostic websocket={health.heartbeat.websocket} /></HealthCard>
         <HealthCard title="Checkpoints"><p>Launchpad : {health.checkpoints.launchpad ?? 'Indisponible'}</p><p>Marché : {health.checkpoints.market ?? 'Indisponible'}</p><p>Retard : {health.lagSlots ?? 'Indisponible'} slot(s)</p></HealthCard>
       </div>
     </section>
   );
+}
+
+function RpcHttpEvidenceDiagnostic({
+  value,
+}: {
+  readonly value: ApiHealth['heartbeat']['rpcHttpEvidence'];
+}): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  return <>
+    <p>Disponible</p>
+    <p>Overflow : {value.overflowed ? 'Oui' : 'Non'}</p>
+    {value.providers.map((provider) => <p key={provider.providerId}>{provider.providerId} — configuré : {provider.configured ? 'Oui' : 'Non'} ; tentatives : {provider.attempts} ; 429 : {provider.http429Responses}</p>)}
+  </>;
 }
 
 function CatchUpAdmissionDiagnostic({

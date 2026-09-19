@@ -1721,6 +1721,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
       blockHydration: blockHydrationMetrics(),
       catchUpAdmission: null,
+      rpcHttpEvidence: null,
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2116,7 +2117,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
+    websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null,
   });
   assert.equal(health.lagSlots, null);
 });
@@ -2489,6 +2490,88 @@ function blockHydrationMetrics(): Readonly<Record<string, unknown>> {
     queueDelayMs: { last: 250, maximum: 500 },
   };
 }
+
+interface RpcHttpEvidenceTestProvider {
+  readonly providerId: 'primary' | 'fallback-1' | 'fallback-2' | 'fallback-3';
+  readonly configured: boolean;
+  readonly attempts: number;
+  readonly http429Responses: number;
+}
+
+interface RpcHttpEvidenceTestMetrics {
+  readonly version: 1;
+  readonly overflowed: boolean;
+  readonly providers: readonly RpcHttpEvidenceTestProvider[];
+}
+
+function rpcHttpEvidenceMetrics(overflowed = false): RpcHttpEvidenceTestMetrics {
+  return {
+    version: 1,
+    overflowed,
+    providers: [
+      { providerId: 'primary', configured: true, attempts: 3, http429Responses: 1 },
+      { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+      { providerId: 'fallback-2', configured: false, attempts: 0, http429Responses: 0 },
+      { providerId: 'fallback-3', configured: false, attempts: 0, http429Responses: 0 },
+    ],
+  };
+}
+
+async function projectRpcHttpEvidence(payload: unknown) {
+  return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow(), false, healthyHeartbeatRow({ payload }),
+  ))).getHealth();
+}
+
+void test('RPC HTTP evidence projects exact frozen four-provider snapshots and overflow', async () => {
+  for (const overflowed of [false, true]) {
+    const metrics = rpcHttpEvidenceMetrics(overflowed);
+    const health = await projectRpcHttpEvidence({ rpcHttpEvidence: metrics });
+    assert.equal(health.status, 'OK');
+    assert.deepEqual(health.heartbeat.rpcHttpEvidence, metrics);
+    assert.ok(Object.isFrozen(health.heartbeat.rpcHttpEvidence));
+    assert.ok(Object.isFrozen(health.heartbeat.rpcHttpEvidence?.providers));
+    assert.ok(health.heartbeat.rpcHttpEvidence?.providers.every(Object.isFrozen));
+    assert.notEqual(health.heartbeat.rpcHttpEvidence, metrics);
+  }
+});
+
+void test('RPC HTTP evidence treats omitted legacy payload as unavailable and rejects explicit null or malformed data', async () => {
+  for (const payload of [null, {}, { blockHydration: blockHydrationMetrics() }]) {
+    const health = await projectRpcHttpEvidence(payload);
+    assert.equal(health.status, 'OK');
+    assert.equal(health.heartbeat.rpcHttpEvidence, null);
+  }
+
+  const metrics = rpcHttpEvidenceMetrics();
+  const invalid: unknown[] = [
+    null,
+    { ...metrics, overflowed: 'false' },
+    { ...metrics, providers: [...metrics.providers].reverse() },
+    { ...metrics, providers: metrics.providers.map((provider, index) => index === 0
+      ? { ...provider, http429Responses: provider.attempts + 1 }
+      : provider) },
+    { ...metrics, providers: metrics.providers.map((provider, index) => index === 2
+      ? { ...provider, attempts: 1 }
+      : provider) },
+    { ...metrics, providers: metrics.providers.map((provider, index) => index === 0
+      ? { ...provider, attempts: Number.MAX_SAFE_INTEGER + 1 }
+      : provider) },
+    { ...metrics, providers: metrics.providers.map((provider, index) => index === 0
+      ? { ...provider, http429Responses: -0 }
+      : provider) },
+    { ...metrics, rpcUrl: 'https://secret.invalid' },
+    { ...metrics, providers: metrics.providers.map((provider, index) => index === 0
+      ? { ...provider, method: 'secret' }
+      : provider) },
+  ];
+  for (const candidate of invalid) {
+    const health = await projectRpcHttpEvidence({ rpcHttpEvidence: candidate });
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.heartbeat.rpcHttpEvidence, null);
+    assert.doesNotMatch(JSON.stringify(health), /secret|https?:\/\//u);
+  }
+});
 
 function heartbeatRowFromSnapshot(
   snapshot: Readonly<Record<string, unknown>>,

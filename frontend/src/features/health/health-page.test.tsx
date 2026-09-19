@@ -43,6 +43,55 @@ function renderHealth(value: ApiHealth): ReturnType<typeof vi.fn<ApiClient['getH
 }
 
 describe('technical health page', () => {
+  it('renders bounded RPC HTTP evidence without endpoint information', async () => {
+    const rpcHttpEvidence = {
+      version: 1,
+      overflowed: true,
+      providers: [
+        { providerId: 'primary', configured: true, attempts: 3, http429Responses: 1 },
+        { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+        { providerId: 'fallback-2', configured: false, attempts: 0, http429Responses: 0 },
+        { providerId: 'fallback-3', configured: false, attempts: 0, http429Responses: 0 },
+      ],
+    };
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: { ...health.heartbeat, rpcHttpEvidence },
+    })).data);
+    const card = (await screen.findByRole('heading', { name: 'HTTP RPC' })).closest('section');
+    const diagnostic = within(card!);
+    expect(diagnostic.getByText('Disponible')).toBeVisible();
+    expect(diagnostic.getByText('Overflow : Oui')).toBeVisible();
+    expect(diagnostic.getByText('primary — configuré : Oui ; tentatives : 3 ; 429 : 1')).toBeVisible();
+    expect(diagnostic.getByText('fallback-1 — configuré : Oui ; tentatives : 1 ; 429 : 0')).toBeVisible();
+    expect(diagnostic.getByText('fallback-2 — configuré : Non ; tentatives : 0 ; 429 : 0')).toBeVisible();
+    expect(diagnostic.getByText('fallback-3 — configuré : Non ; tentatives : 0 ; 429 : 0')).toBeVisible();
+    expect(document.body).not.toHaveTextContent('https://');
+    expect(document.body).not.toHaveTextContent('signature');
+    expect(document.body).not.toHaveTextContent('mint');
+  });
+
+  it('strictly rejects malformed RPC HTTP evidence while accepting an explicit null', () => {
+    const valid = success({ ...health, heartbeat: { ...health.heartbeat, rpcHttpEvidence: null } });
+    expect(apiHealthEnvelopeSchema.safeParse(valid).success).toBe(true);
+    const malformed = success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        rpcHttpEvidence: {
+          version: 1, overflowed: false,
+          providers: [
+            { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+            { providerId: 'primary', configured: true, attempts: 1, http429Responses: 0 },
+            { providerId: 'fallback-2', configured: false, attempts: 0, http429Responses: 0 },
+            { providerId: 'fallback-3', configured: false, attempts: 0, http429Responses: 0 },
+          ],
+        },
+      },
+    });
+    expect(apiHealthEnvelopeSchema.safeParse(malformed).success).toBe(false);
+  });
+
   it('renders catch-up admission states and every disjoint count', async () => {
     renderHealth(apiHealthEnvelopeSchema.parse(success({
       ...health,

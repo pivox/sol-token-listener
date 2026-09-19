@@ -545,6 +545,26 @@ export interface ApiHeartbeat {
   readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
   /** Optional during rolling deployment; null when admission metrics are absent. */
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
+  /** Optional during rolling deployment; null when RPC HTTP evidence is absent. */
+  readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
+}
+
+export interface ApiRpcHttpEvidenceV1 {
+  readonly version: 1;
+  readonly overflowed: boolean;
+  readonly providers: readonly [
+    ApiRpcHttpProviderEvidenceV1,
+    ApiRpcHttpProviderEvidenceV1,
+    ApiRpcHttpProviderEvidenceV1,
+    ApiRpcHttpProviderEvidenceV1,
+  ];
+}
+
+export interface ApiRpcHttpProviderEvidenceV1 {
+  readonly providerId: RpcProviderId;
+  readonly configured: boolean;
+  readonly attempts: number;
+  readonly http429Responses: number;
 }
 
 export interface ApiCatchUpAdmissionMetricsV1 {

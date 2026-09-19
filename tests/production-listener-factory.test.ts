@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
+import type { RuntimeRpcHttpEvidenceV1 } from '../src/domain/rpc-http-evidence.js';
+import { RPC_PROVIDER_IDS } from '../src/domain/rpc-provider.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import {
   ALL_INGESTION_PROGRAMS,
   LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
@@ -45,6 +48,148 @@ import { TransactionInboxWorker } from '../src/application/transaction-inbox-wor
 import type { ListenerRuntimeDependencies } from '../src/application/listener-runtime.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+void test('production shares exactly one RPC HTTP recorder across every transport factory and heartbeat', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.equal(count(source, /createRpcHttpEvidenceRecorder\(\)/gu), 1);
+  assert.match(source, /new SolanaRpcClient\(config,\s*\{\s*recorder,/u);
+  assert.match(source, /createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder\)/u);
+  assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*config\.listenerShutdownTimeoutMs,?\s*\}, recorder\)/u);
+  assert.match(source, /createProviderPinnedCatchUpSource\(\s*providers,\s*providerId,\s*'confirmed',\s*expectedGenesisHash,\s*undefined,\s*recorder,/u);
+  assert.match(source, /rpcHttpEvidenceMetrics:\s*\(\).*?=> recorder\.snapshot\(configuredRpcHttpProviderIds\)/u);
+  for (const name of ['createProviderPinnedFinalityPass', 'createProviderPinnedBlockRpc', 'createProviderPinnedCatchUpSource']) {
+    assert.equal(count(source, new RegExp(`${name}\\(`, 'gu')), 1);
+  }
+  assert.ok(source.indexOf('const recorder =') < source.indexOf('const rpc = new SolanaRpcClient'));
+  for (const enabled of [false, true]) {
+    const runtime = createProductionListenerRuntime(config({
+      LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: String(enabled),
+      LISTENER_BLOCK_HYDRATION_ENABLED: String(enabled),
+      LISTENER_INGESTION_SCOPE: 'launchpad-only',
+      LISTENER_CATCH_UP_POLICY: 'live-edge',
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://127.0.0.1:8898',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'ws://127.0.0.1:8897',
+    }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+    const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+    const metrics = (dependencies.heartbeat as unknown as { rpcHttpEvidenceMetrics: () => RuntimeRpcHttpEvidenceV1 }).rpcHttpEvidenceMetrics;
+    assert.deepEqual(metrics(), createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-1']));
+    await dependencies.worker.close();
+  }
+});
+
+void test('RPC HTTP evidence includes an HTTP-only fallback absent from the WebSocket catalog', async () => {
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'false',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'false',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://127.0.0.1:8898',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  const metrics = (dependencies.heartbeat as unknown as {
+    rpcHttpEvidenceMetrics: () => RuntimeRpcHttpEvidenceV1;
+  }).rpcHttpEvidenceMetrics;
+
+  assert.deepEqual(metrics(), createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-1']));
+  await dependencies.worker.close();
+});
+
+void test('heartbeat detaches and freezes fresh RPC HTTP evidence for every RUNNING and STOPPED write', async () => {
+  const owned = { version: 1 as const, overflowed: false,
+    providers: RPC_PROVIDER_IDS.map((providerId) => ({ providerId, configured: providerId === 'primary', attempts: 0, http429Responses: 0 })),
+  };
+  const writes: RuntimeHeartbeat[] = [];
+  const primary = owned.providers[0];
+  assert.ok(primary);
+  let callbacks = 0;
+  const scheduler = new ManualScheduler();
+  const heartbeat = new PersistentListenerHeartbeat({
+    counts: heartbeatCounts,
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler,
+    rpcHttpEvidenceMetrics: () => {
+      callbacks += 1;
+      primary.attempts = callbacks;
+      return owned as unknown as RuntimeRpcHttpEvidenceV1;
+    },
+  });
+  await heartbeat.start();
+  scheduler.fireScheduled();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  await heartbeat.stop();
+  assert.equal(callbacks, 3);
+  assert.deepEqual(writes.map(({ runtimeState }) => runtimeState), ['RUNNING', 'RUNNING', 'STOPPED']);
+  for (const [index, write] of writes.entries()) {
+    const evidence = write.rpcHttpEvidence;
+    assert.ok(evidence);
+    assert.deepEqual(Object.keys(evidence), ['version', 'overflowed', 'providers']);
+    assert.deepEqual(evidence.providers.map(({ providerId }) => providerId), RPC_PROVIDER_IDS);
+    assert.notEqual(evidence, owned);
+    assert.notEqual(evidence.providers, owned.providers);
+    assert.ok(Object.isFrozen(evidence));
+    assert.ok(Object.isFrozen(evidence.providers));
+    for (const [providerIndex, provider] of evidence.providers.entries()) {
+      assert.deepEqual(Object.keys(provider), ['providerId', 'configured', 'attempts', 'http429Responses']);
+      assert.ok(Object.isFrozen(provider));
+      assert.notEqual(provider, owned.providers[providerIndex]);
+    }
+    assert.equal(evidence.providers[0].attempts, index + 1);
+  }
+  primary.attempts = 100;
+  assert.equal(writes[0]?.rpcHttpEvidence?.providers[0].attempts, 1);
+});
+
+void test('heartbeat RPC HTTP evidence omission remains absent from both writes', async () => {
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = new PersistentListenerHeartbeat({ counts: heartbeatCounts,
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+  });
+  await heartbeat.start();
+  await heartbeat.stop();
+  assert.equal(writes.length, 2);
+  assert.ok(writes.every((write) => !Object.hasOwn(write, 'rpcHttpEvidence')));
+});
+
+void test('heartbeat fails closed and redacts malformed or throwing RPC HTTP callbacks at RUNNING and STOPPED', async () => {
+  const valid = createRpcHttpEvidenceRecorder().snapshot(['primary']);
+  for (const invalid of [undefined, null, { ...valid, secret: 'private-secret' }, new Proxy(valid, {})]) {
+    for (const failsOnStop of [false, true]) {
+      let writes = 0;
+      let invalidNow = !failsOnStop;
+      const heartbeat = new PersistentListenerHeartbeat({ counts: heartbeatCounts,
+        async writeHeartbeat() { writes += 1; },
+      }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+      () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+        intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+        rpcHttpEvidenceMetrics: () => (invalidNow ? invalid : valid) as unknown as RuntimeRpcHttpEvidenceV1,
+      });
+      if (failsOnStop) { await heartbeat.start(); invalidNow = true; }
+      await assert.rejects(failsOnStop ? heartbeat.stop() : heartbeat.start(), (error: unknown) => {
+        assert.ok(error instanceof (failsOnStop ? ListenerControllerCloseError : TypeError));
+        assert.doesNotMatch(String(error), /private-secret/u);
+        return true;
+      });
+      assert.equal(writes, failsOnStop ? 1 : 0);
+    }
+  }
+  const heartbeat = new PersistentListenerHeartbeat({ counts: heartbeatCounts,
+    async writeHeartbeat() { assert.fail('Invalid evidence must not be written.'); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    rpcHttpEvidenceMetrics: () => { throw new Error('private-secret'); },
+  });
+  await assert.rejects(heartbeat.start(), (error: unknown) => {
+    assert.ok(error instanceof TypeError);
+    assert.doesNotMatch(String(error), /private-secret/u);
+    return true;
+  });
+});
 
 function admissionCounts(backlog = 0) {
   return Object.freeze({
@@ -317,7 +462,7 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
 
   assert.match(
     source,
-    /new SolanaRpcClient\(config,\s*\{\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,\s*\}\)/u,
+    /new SolanaRpcClient\(config,\s*\{\s*recorder,\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,\s*\}\)/u,
   );
   const sink = /function logRpcHttpFailoverEvent\([\s\S]*?\n\}/u.exec(source)?.[0];
   assert.ok(sink);
@@ -338,7 +483,7 @@ void test('production binds finality to immutable passes selected by the promote
   assert.match(factory, /import\s*\{[^}]*\bcreateRpcProviderCatalog\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/rpc-provider-catalog\.js['"]/u);
   assert.match(factory, /import\s*\{[^}]*\bcreateProviderPinnedFinalityPass\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/provider-pinned-finality-source\.js['"]/u);
   assert.match(factory, /const providers = createRpcProviderCatalog\(config\);/u);
-  assert.match(factory, /providers\.ids\.map\(\(providerId\)[\s\S]*?createProviderPinnedFinalityPass\(providers, providerId\)/u);
+  assert.match(factory, /providers\.ids\.map\(\(providerId\)[\s\S]*?createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder\)/u);
   assert.match(factory, /new PromotedProviderSelector\(/u);
   assert.match(factory, /new FinalityReconciler\(promoted, inbox,/u);
   assert.match(factory, /initialFailureMode:\s*'DEGRADED_RETRY'/u);

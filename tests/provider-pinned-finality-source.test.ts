@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import test from 'node:test';
 import bs58 from 'bs58';
 import {
@@ -7,6 +8,7 @@ import {
   createProviderPinnedFinalityPass,
   type ProviderPinnedFinalityDependencies,
 } from '../src/solana/rpc/provider-pinned-finality-source.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
 import type { FinalityProviderPass } from '../src/ports/finality-provider-pass.js';
 
@@ -300,6 +302,34 @@ void test('does not import failover or execution boundaries and does not expose 
   assert.doesNotMatch(JSON.stringify(pass), /url-secret|rpc/i);
 });
 
+void test('records one returned HTTP 429 for each default provider-pinned finality boundary', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  let requests = 0;
+  const provider = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(429);
+    response.end('limited');
+  });
+  try {
+    await listenOnLoopback(provider);
+    const address = provider.address();
+    assert.ok(address !== null && typeof address !== 'string');
+    const pass = createProviderPinnedFinalityPass(
+      catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', undefined, recorder,
+    );
+
+    await assert.rejects(pass.getHistoryStatuses(Object.freeze([SIGNATURE])), (error: unknown) => invalid(error, 'HISTORY_UNAVAILABLE'));
+    await assert.rejects(pass.getFinalizedSlot(), (error: unknown) => invalid(error, 'ROOT_UNAVAILABLE'));
+    await assert.rejects(pass.getFinalizedBlockSignatures(42n), (error: unknown) => invalid(error, 'BLOCK_UNAVAILABLE'));
+    assert.equal(requests, 3);
+    assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+      providerId: 'primary', configured: true, attempts: 3, http429Responses: 3,
+    });
+  } finally {
+    await closeServer(provider);
+  }
+});
+
 function dependencies(createRpc: (httpUrl: string) => unknown): ProviderPinnedFinalityDependencies {
   return Object.freeze({ createRpc });
 }
@@ -354,4 +384,25 @@ function invalid(error: unknown, reason: string): boolean {
   assert.equal(Object.isFrozen(error), true);
   assert.deepEqual(Object.keys(error), ['reason', 'providerId']);
   return true;
+}
+
+function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const failed = (error: Error): void => { reject(error); };
+    server.once('error', failed);
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', failed);
+      resolve();
+    });
+  });
+}
+
+function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error === undefined) resolve();
+      else reject(error);
+    });
+  });
 }

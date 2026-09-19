@@ -5,6 +5,7 @@ import { inspect } from 'node:util';
 import test from 'node:test';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import { createPumpDecodingError, PUMP_DECODING_ERROR_CODES } from '../src/launchpads/pumpfun/errors.js';
 import { createPumpSwapDecodingError, PUMPSWAP_DECODING_ERROR_CODES } from '../src/markets/pumpswap/errors.js';
 import { failurePipeline, failureTransaction, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
@@ -48,6 +49,77 @@ import {
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
+
+void test('RPC HTTP heartbeat persistence serializes only detached fixed evidence fields', async () => {
+  const recorder = createRpcHttpEvidenceRecorder();
+  recorder.recordAttempt('primary');
+  recorder.recordHttp429('primary');
+  const rpcHttpEvidence = recorder.snapshot(['primary']);
+  const heartbeat = rpcEvidenceHeartbeat();
+  let payload: unknown;
+  const repository = new PostgresTransactionInboxRepository({
+    async connect() { throw new Error('No connection needed.'); },
+    async query(_sql, values) { payload = values?.[14]; return { rows: [], rowCount: 1 }; },
+  });
+  await repository.writeHeartbeat(Object.freeze({ ...heartbeat, rpcHttpEvidence }));
+  assert.deepEqual(payload, { startedAt: '1970-01-01T00:00:01.000Z', rpcHttpEvidence });
+  assert.notEqual((payload as { rpcHttpEvidence: unknown }).rpcHttpEvidence, rpcHttpEvidence);
+});
+
+void test('RPC HTTP heartbeat persistence rejects present malformed evidence before querying', async () => {
+  const valid = createRpcHttpEvidenceRecorder().snapshot(['primary']);
+  let queries = 0;
+  let accessorReads = 0;
+  const repository = new PostgresTransactionInboxRepository({
+    async connect() { throw new Error('No connection needed.'); },
+    async query() { queries += 1; return { rows: [], rowCount: 1 }; },
+  });
+  for (const rpcHttpEvidence of [undefined, null, new Proxy(valid, {}),
+    Object.freeze({ ...valid, providers: new Proxy(valid.providers, {}) }),
+    Object.freeze({ ...valid, endpoint: 'private-secret' }),
+    Object.freeze({ ...valid, get overflowed() { accessorReads += 1; return false; } }),
+  ]) {
+    await assert.rejects(repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), rpcHttpEvidence }) as RuntimeHeartbeat),
+      (error: unknown) => {
+        assert.ok(error instanceof TransactionInboxRepositoryError);
+        assert.doesNotMatch(String(error), /private-secret/u);
+        return true;
+      });
+  }
+  assert.equal(queries, 0);
+  assert.equal(accessorReads, 0);
+});
+
+void test('persists RPC HTTP evidence in RUNNING and STOPPED heartbeat JSON and supports historical omission', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const recorder = createRpcHttpEvidenceRecorder();
+    const heartbeat = rpcEvidenceHeartbeat();
+    for (const [index, runtimeState] of (['RUNNING', 'STOPPED'] as const).entries()) {
+      recorder.recordAttempt('primary');
+      if (runtimeState === 'STOPPED') recorder.recordHttp429('primary');
+      const rpcHttpEvidence = recorder.snapshot(['primary']);
+      await repository.writeHeartbeat(Object.freeze({ ...heartbeat, runtimeState,
+        updatedAtMs: 2_000 + index * 1_000, rpcHttpEvidence,
+      }));
+      const row = (await pool.query('SELECT runtime_state, payload FROM listener_heartbeats')).rows[0];
+      assert.equal(row?.runtime_state, runtimeState);
+      assert.deepEqual(row?.payload, { startedAt: '1970-01-01T00:00:01.000Z', rpcHttpEvidence });
+    }
+    await repository.writeHeartbeat(Object.freeze({ ...heartbeat, updatedAtMs: 4_000 }));
+    assert.deepEqual((await pool.query('SELECT payload FROM listener_heartbeats')).rows[0]?.payload,
+      { startedAt: '1970-01-01T00:00:01.000Z' });
+  });
+});
+
+function rpcEvidenceHeartbeat(): RuntimeHeartbeat {
+  return Object.freeze({
+    runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+    workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+    updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+    lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0, exhaustedCount: 0,
+  });
+}
 
 void test('catch-up admission counts partition actionable work by source and priority in one query', async (context) => {
   await withDatabase(context, async (pool) => {

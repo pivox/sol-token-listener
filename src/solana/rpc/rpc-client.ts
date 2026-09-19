@@ -12,6 +12,7 @@ import {
   type RpcHttpEndpointId,
   type RpcHttpFailoverEvent,
 } from './http-failover-transport.js';
+import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
@@ -25,6 +26,7 @@ export interface SolanaRpcClientDependencies {
   readonly fetch?: FetchFn;
   readonly now?: () => number;
   readonly onHttpFailoverEvent?: (event: RpcHttpFailoverEvent) => void;
+  readonly recorder?: RpcHttpEvidenceRecorder;
 }
 
 type SolanaConnectionConfig = Pick<
@@ -41,6 +43,9 @@ export function createSolanaConnectionConfig(
     return {
       commitment: config.commitment,
       wsEndpoint: config.wsRpcUrl,
+      ...(dependencies.recorder === undefined
+        ? {}
+        : { fetch: createObservedRpcFetch('primary', dependencies.recorder, dependencies.fetch) }),
       disableRetryOnRateLimit: true,
     };
   }
@@ -59,6 +64,7 @@ export function createSolanaConnectionConfig(
       endpoints,
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
       ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+      ...(dependencies.recorder === undefined ? {} : { recorder: dependencies.recorder }),
       ...(onEndpointSelected === undefined ? {} : { onEndpointSelected }),
       ...(dependencies.onHttpFailoverEvent === undefined
         ? {}

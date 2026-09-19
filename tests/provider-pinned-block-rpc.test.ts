@@ -6,6 +6,7 @@ import {
   createProviderPinnedBlockRpc,
   type ProviderPinnedBlockRpcDependencies,
 } from '../src/solana/rpc/provider-pinned-block-rpc.js';
+import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
 
 void test('pins complete-block reads to the selected provider HTTP URL and maps commitments exactly', async () => {
@@ -187,6 +188,83 @@ void test('captures descriptor methods and maps hostile RPC failures to a fixed 
 
   await assert.rejects(source.getBlockTransactions(7n, 'CONFIRMED'), (error: unknown) => invalid(error, 'BLOCK_UNAVAILABLE', 'secret'));
   assert.equal(callGetterReads, 0);
+});
+
+void test('records one returned HTTP 429 for the default pinned block fetch', async () => {
+  const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+  const recorder = createRpcHttpEvidenceRecorder();
+  let fetchCalls = 0;
+  try {
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: async (): Promise<Response> => {
+        fetchCalls += 1;
+        return new Response('limited', { status: 429 });
+      },
+    });
+    const source = createProviderPinnedBlockRpc(
+      catalog(), 'primary', 'confirmed', undefined, undefined, recorder,
+    );
+
+    await assert.rejects(source.getBlockTransactions(42n, 'CONFIRMED'), (error: unknown) => (
+      invalid(error, 'BLOCK_UNAVAILABLE')
+    ));
+    assert.equal(fetchCalls, 1);
+    assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+      providerId: 'primary', configured: true, attempts: 1, http429Responses: 1,
+    });
+  } finally {
+    if (originalFetch === undefined) Reflect.deleteProperty(globalThis, 'fetch');
+    else Object.defineProperty(globalThis, 'fetch', originalFetch);
+  }
+});
+
+void test('keeps deadline and shutdown abort effective while recording one pinned block attempt', async () => {
+  const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+  const recorder = createRpcHttpEvidenceRecorder();
+  const signals: AbortSignal[] = [];
+  try {
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: async (_input: unknown, init?: RequestInit): Promise<Response> => {
+        const signal = init?.signal;
+        assert.ok(signal instanceof AbortSignal);
+        signals.push(signal);
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener('abort', () => {
+            reject(new DOMException('Fetch aborted.', 'AbortError'));
+          }, { once: true });
+        });
+      },
+    });
+
+    const deadline = createProviderPinnedBlockRpc(
+      catalog(), 'primary', 'confirmed', undefined, { requestTimeoutMs: 1 }, recorder,
+    );
+    await assert.rejects(deadline.getBlockTransactions(42n, 'CONFIRMED'), (error: unknown) => (
+      invalid(error, 'BLOCK_UNAVAILABLE')
+    ));
+
+    const shutdown = createProviderPinnedBlockRpc(
+      catalog(), 'primary', 'confirmed', undefined, { requestTimeoutMs: 10_000 }, recorder,
+    );
+    const controller = new AbortController();
+    const pending = shutdown.getBlockTransactions(43n, 'CONFIRMED', controller.signal);
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => invalid(error, 'BLOCK_UNAVAILABLE'));
+
+    assert.equal(signals.length, 2);
+    assert.equal(signals.every((signal) => signal.aborted), true);
+    assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
+      providerId: 'primary', configured: true, attempts: 2, http429Responses: 0,
+    });
+  } finally {
+    if (originalFetch === undefined) Reflect.deleteProperty(globalThis, 'fetch');
+    else Object.defineProperty(globalThis, 'fetch', originalFetch);
+  }
 });
 
 function catalog(resolve: (id: 'primary' | 'fallback-1') => unknown = (id) => pair(id, 'https://provider.invalid/rpc')): RpcProviderCatalog {
