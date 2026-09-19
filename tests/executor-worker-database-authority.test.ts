@@ -6,62 +6,10 @@ import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const WORKER_ROLE = 'sol_token_executor_worker';
-const BACKEND_DRAIN_DELAY_MS = 100;
-const BACKEND_DRAIN_TIMEOUT_MS = 5_000;
-
-void test('waits for database backends to close before destructive test cleanup', async () => {
-  const counts = ['1', '0'];
-  const queryCalls: BackendDrainQuery[] = [];
-  const delays: number[] = [];
-  let now = 0;
-  const maintenance = Object.freeze({
-    async query(query: BackendDrainQuery) {
-      queryCalls.push(query);
-      return Object.freeze({ rows: Object.freeze([{ count: counts.shift() ?? '0' }]) });
-    },
-  }) as unknown as Pick<InstanceType<typeof pg.Pool>, 'query'>;
-
-  await waitForBackendDrain(
-    maintenance, 'isolated_database', {
-      now: () => now,
-      wait: async (delayMs) => { delays.push(delayMs); now += delayMs; },
-    },
-  );
-
-  assert.equal(queryCalls.length, 2);
-  assert.deepEqual(queryCalls[0]?.values, ['isolated_database']);
-  assert.match(queryCalls[0]?.text ?? '', /pg_stat_activity/u);
-  assert.equal(queryCalls[0]?.query_timeout, BACKEND_DRAIN_TIMEOUT_MS);
-  assert.deepEqual(delays, [BACKEND_DRAIN_DELAY_MS]);
-});
-
-void test('bounds the database-backend drain barrier before cleanup can continue', async () => {
-  let queryCount = 0;
-  let delayCount = 0;
-  let now = 0;
-  const maintenance = Object.freeze({
-    async query(query: BackendDrainQuery) {
-      queryCount += 1;
-      assert.equal(query.query_timeout, BACKEND_DRAIN_TIMEOUT_MS - now);
-      return Object.freeze({ rows: Object.freeze([{ count: '1' }]) });
-    },
-  }) as unknown as Pick<InstanceType<typeof pg.Pool>, 'query'>;
-
-  await assert.rejects(
-    waitForBackendDrain(
-      maintenance, 'isolated_database', {
-        now: () => now,
-        wait: async (delayMs) => { delayCount += 1; now += delayMs; },
-      },
-    ),
-    /Database backends did not close before forced teardown/u,
-  );
-  assert.equal(queryCount, BACKEND_DRAIN_TIMEOUT_MS / BACKEND_DRAIN_DELAY_MS);
-  assert.equal(delayCount, queryCount);
-});
 
 void test('preserves the original cleanup failure as a diagnostic cause', async () => {
   const cause = new Error('backend drain failed');
@@ -517,8 +465,10 @@ void test('PostgreSQL 16 provisioning replay revokes a stale worker policy targe
       },
       async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          assert.equal(terminated.rowCount, 0);
           await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         }
       },
@@ -836,12 +786,10 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       },
       async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
-        }
-      },
-      async () => {
-        if (databaseCreated) {
+          assert.equal(terminated.rowCount, 0);
           await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         }
       },
@@ -1422,60 +1370,6 @@ async function waitForLock(
     await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
   }
   assert.fail('Concurrent live promotion did not wait for the child writer parent lock.');
-}
-
-type BackendDrainQuery = pg.QueryConfig & Readonly<{ query_timeout: number }>;
-
-type BackendDrainDependencies = Readonly<{
-  now?: () => number;
-  wait?: (delayMs: number) => Promise<void>;
-}>;
-
-async function waitForBackendDrain(
-  maintenance: Pick<InstanceType<typeof pg.Pool>, 'query'>,
-  databaseName: string,
-  dependencies: BackendDrainDependencies = {},
-): Promise<void> {
-  const now = dependencies.now ?? performance.now.bind(performance);
-  const wait = dependencies.wait ?? (async (delayMs) => new Promise<void>(
-    (resolve) => { setTimeout(resolve, delayMs); },
-  ));
-  const deadline = now() + BACKEND_DRAIN_TIMEOUT_MS;
-  for (;;) {
-    const remainingMs = Math.ceil(deadline - now());
-    if (remainingMs <= 0) break;
-    const query: BackendDrainQuery = {
-      text: `SELECT COUNT(*)::TEXT AS count FROM pg_stat_activity
-        WHERE datname=$1`,
-      values: [databaseName],
-      query_timeout: remainingMs,
-    };
-    const activeCount = (await settleBeforeDeadline(
-      maintenance.query<{ readonly count: string }>(query), remainingMs,
-    )).rows[0]?.count;
-    if (activeCount === '0') return;
-    const delayMs = Math.min(BACKEND_DRAIN_DELAY_MS, Math.max(0, deadline - now()));
-    if (delayMs <= 0) break;
-    await wait(delayMs);
-  }
-  throw new Error('Database backends did not close before forced teardown.');
-}
-
-async function settleBeforeDeadline<TResult>(operation: Promise<TResult>, timeoutMs: number): Promise<TResult> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      operation,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(
-          () => { reject(new Error('Database backend drain query exceeded its deadline.')); },
-          timeoutMs,
-        );
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }
 
 function quoteIdentifier(value: string): string {

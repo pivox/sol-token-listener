@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 
 const migrationName = '040_execution_worker_live_partition.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -163,9 +164,14 @@ void test('PostgreSQL 16 migration 040 backfills only live parents and enables n
     const cleanupFailures = await collectCleanupFailures([
       async () => { if (isolated !== undefined) await isolated.end(); },
       async () => {
+        if (databaseCreated) await waitForBackendDrain(maintenance, databaseName);
+      },
+      async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          assert.equal(terminated.rowCount, 0);
           await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         }
       },
@@ -277,9 +283,14 @@ void test('PostgreSQL 16 migration 040 rejects a malformed pre-existing live_res
     const cleanupFailures = await collectCleanupFailures([
       async () => { if (isolated !== undefined) await isolated.end(); },
       async () => {
+        if (databaseCreated) await waitForBackendDrain(maintenance, databaseName);
+      },
+      async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          assert.equal(terminated.rowCount, 0);
           await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         }
       },
@@ -398,9 +409,14 @@ void test('PostgreSQL 16 migration 040 rejects a stale worker OID before policy 
     const cleanupFailures = await collectCleanupFailures([
       async () => { if (isolated !== undefined) await isolated.end(); },
       async () => {
+        if (databaseCreated) await waitForBackendDrain(maintenance, databaseName);
+      },
+      async () => {
         if (databaseCreated) {
-          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          const terminated = await maintenance.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
             WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          assert.equal(terminated.rowCount, 0);
           await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         }
       },
