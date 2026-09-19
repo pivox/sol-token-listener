@@ -66,6 +66,11 @@ export function createObservedRpcFetch(
 `recordHttp429` immediately after a returned `Response` with `status === 429`.
 It must not inspect or retain input, URL, headers, method, or body.
 
+Before `recordAttempt`, select `init.signal` when defined, otherwise the signal
+of a `Request` input, then apply the same `throwIfAborted` behavior as the
+failover transport. Add separate tests for both already-aborted forms; neither
+may increment a counter or call the underlying fetch.
+
 Use safe integers. Increment until `Number.MAX_SAFE_INTEGER`; later increments
 leave the saturated value and permanently set `overflowed=true`. Snapshot the
 four `RPC_PROVIDER_IDS` in their canonical order and freeze every object/array.
@@ -199,6 +204,13 @@ When the recorder is absent, keep the existing connection configuration.
 Genesis must use the same provider-bound wrapper around its direct fetch. Do
 not wrap test-provided RPC objects because they represent an already-defined
 dependency boundary rather than a production physical transport.
+
+For `provider-pinned-block-rpc.ts`, do not replace its existing
+`AsyncLocalStorage` fetch wrapper. Create the provider-bound observed fetch
+once, then make the existing wrapper call it with `{ ...init, signal }` after
+retrieving the mandatory request-context signal. Extend the cancellation tests
+to prove the deadline/shutdown abort remains effective and exactly one attempt
+is counted.
 
 - [ ] **Step 4: Verify pinned transports**
 

@@ -1,6 +1,6 @@
 # RPC HTTP Canary Evidence Design
 
-Version: 1.0.0
+Version: 1.1.0
 
 Status: approved for implementation under the standing operator instruction
 
@@ -131,9 +131,20 @@ redaction. A body that later blocks or fails cannot erase the 429 evidence.
 An abort before fetch records nothing. An abort after a response records the
 attempt and records the 429 when applicable.
 
+For mono-provider wrappers, `init.signal` has priority when present; otherwise
+a `Request` input contributes its signal. The selected signal is checked before
+`recordAttempt`, using the platform abort reason when available. Both already
+aborted forms are covered by tests and must produce zero attempts.
+
 The failover transport records directly inside its physical-attempt loop. Its
 underlying fetch is not wrapped by the mono-provider wrapper. Provider-pinned
 and no-fallback connections use the provider-bound wrapper exactly once.
+
+Provider-pinned block hydration already injects its bounded deadline and
+shutdown signal from `AsyncLocalStorage`. Instrumentation composes underneath
+that wrapper: the existing wrapper obtains the required signal and calls the
+provider-bound observed fetch with `{ ...init, signal }`. Replacing or bypassing
+the request-context wrapper is forbidden.
 
 ## Wiring
 
@@ -205,6 +216,9 @@ Tests must prove:
 - abort before fetch records nothing;
 - a 429 is retained when body consumption or cancellation later fails;
 - block, catch-up page, genesis, and finality transports share the recorder;
+- both `init.signal` and `Request.signal` abort before counting;
+- block instrumentation preserves request timeout and shutdown cancellation
+  while counting exactly one physical attempt;
 - heartbeat storage snapshots rather than retaining caller-owned data;
 - old heartbeat payloads still decode and project evidence as unavailable;
 - API and frontend reject extra/high-cardinality fields and expose no secret;
