@@ -72,6 +72,16 @@ void test('gates live-recovery forced cleanup behind the backend drain barrier',
   const isolatedEnd = body.indexOf('await isolated.end()');
   const drain = body.indexOf('await waitForBackendDrain(maintenance, databaseName)');
   const terminate = body.indexOf('SELECT pg_terminate_backend(pid)');
-  assert.ok(close >= 0 && isolatedEnd > close && drain > isolatedEnd && terminate > drain);
-  assert.match(body, /assert\.equal\(terminated\.rowCount, 0/u);
+  const terminationAssertion = body.indexOf('assert.equal(terminated.rowCount, 0)');
+  const dropDatabase = body.indexOf('DROP DATABASE IF EXISTS');
+  const dropRole = body.indexOf('DROP ROLE IF EXISTS');
+  assert.ok(
+    close >= 0
+      && isolatedEnd > close
+      && drain > isolatedEnd
+      && terminate > drain
+      && terminationAssertion > terminate
+      && dropDatabase > terminationAssertion
+      && dropRole > dropDatabase,
+  );
 });

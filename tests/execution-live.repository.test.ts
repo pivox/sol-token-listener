@@ -2745,9 +2745,9 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
            WHERE datname=$1 AND pid<>pg_backend_pid()`,
           [databaseName],
         );
+        assert.equal(terminated.rowCount, 0);
         await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
-        assert.equal(terminated.rowCount, 0);
       } finally {
         try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
       }
