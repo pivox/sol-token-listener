@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import bs58 from 'bs58';
-import { Connection } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import pg from 'pg';
 import { PromotedProviderSelector } from '../src/application/promoted-provider-selector.js';
 import { StrictCatchUpCoordinator } from '../src/application/strict-catch-up-coordinator.js';
@@ -43,6 +43,14 @@ import {
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresTransactionInboxRepository, TransactionInboxConflictError } from '../src/storage/transaction-inbox.repository.js';
 import { PostgresWebSocketHealthRepository } from '../src/storage/websocket-health.repository.js';
+import { ProviderAffineCatchUpHydration } from '../src/application/provider-affine-catch-up-hydration.js';
+import { PumpFunCatchUpBlockClassifier } from '../src/application/pumpfun-catch-up-block-classifier.js';
+import { PumpFunStrictCatchUpPageAdmitter } from '../src/application/pumpfun-strict-catch-up-page-admitter.js';
+import { LAUNCHPAD_ONLY_INGESTION_PROGRAMS } from '../src/application/listener-ingestion-programs.js';
+import { FinalityReconciler } from '../src/application/finality-reconciler.js';
+import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
+import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const SHARED_SIGNATURE = '1'.repeat(64);
@@ -52,6 +60,193 @@ const STRICT_WINDOW_LAUNCHPAD_SIGNATURE = bs58.encode(Buffer.alloc(64, 4));
 const STRICT_WINDOW_MARKET_SIGNATURE = bs58.encode(Buffer.alloc(64, 5));
 const STRICT_WINDOW_HEAD_SIGNATURE = bs58.encode(Buffer.alloc(64, 6));
 const STRICT_WINDOW_HEAD_SLOT = 43n;
+
+void test('provider-affine catch-up admission recovers an offline restart gap, overlap, replay and failover with finality', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const inbox = new PostgresTransactionInboxRepository(pool);
+    const health = new PostgresWebSocketHealthRepository(pool);
+    const create = (await loadPumpFixture('create-v2-current-initial-buy-mainnet.json')).transaction;
+    const buy = (await loadPumpFixture('buy-exact-quote-v2-cpi-mainnet.json')).transaction;
+    const sell = (await loadPumpFixture('sell-cpi-mainnet.json')).transaction;
+    const trackedMint = decodePumpTransaction(buy).trades[0]?.event.mint;
+    assert.ok(trackedMint);
+    const buyInstruction = decodePumpTransaction(buy).trades[0]?.action.instruction;
+    assert.ok(buyInstruction);
+    assert.notEqual(decodePumpTransaction(sell).trades[0]?.event.mint, trackedMint);
+    await pool.query(`INSERT INTO token_launches (
+      mint, launchpad, program_id, creator, token_program, current_state, created_signature,
+      created_slot, created_transaction_index, created_instruction_index, detected_at, updated_at
+    ) VALUES ($1,'pumpfun',$2,$1,$2,'OBSERVING','tracked-launch',1,0,0,clock_timestamp(),clock_timestamp())`,
+    [trackedMint, PUMP_PROGRAM_ID]);
+    const transactions = [create, buy, sell, buy, buy].map((template, index): NormalizedTransaction => Object.freeze({
+      ...template, signature: bs58.encode(Buffer.alloc(64, 20 + index)), slot: 20n,
+      transactionIndex: index, confirmationStatus: 'CONFIRMED', blockTimeMs: null,
+      ...(index === 3 ? { instructions: Object.freeze([]) } : {}),
+      ...(index === 4 ? { instructions: Object.freeze([Object.freeze({
+        programId: PUMP_PROGRAM_ID, accounts: Object.freeze([]), data: buyInstruction.data.slice(0, 8),
+        instructionIndex: 0, innerInstructionIndex: null, parentInstructionIndex: null, stackHeight: null,
+      })]) } : {}),
+    }));
+    const created = transactions[0];
+    const tracked = transactions[1];
+    const untracked = transactions[2];
+    const ignored = transactions[3];
+    const head = transactions[4];
+    assert.ok(created && tracked && untracked && ignored && head);
+    const baseline: CatchUpSignature = Object.freeze({
+      signature: SHARED_SIGNATURE, slot: 10n, confirmationStatus: 'confirmed', blockTimeMs: null,
+    });
+    let rows: readonly CatchUpSignature[] = Object.freeze([baseline]);
+    let primaryUnavailable = false;
+    const fetches: { providerId: RpcProviderId; slot: bigint }[] = [];
+    const blocks = new Map<bigint, unknown>([[20n, admissionFixtureBlock(transactions)]]);
+    const promoted = new PromotedProviderSelector(['primary', 'fallback-1'].map((providerId) => Object.freeze({
+      providerId: providerId as RpcProviderId,
+      async getHistoryStatuses(signatures: readonly string[]) {
+        return signatures.map((signature) => signature === tracked.signature
+          ? null : Object.freeze({ slot: signature === created.signature ? 20n : 21n, confirmationStatus: 'finalized' as const }));
+      },
+      async getFinalizedSlot() { return 100n; },
+      async getFinalizedBlockSignatures() { return Object.freeze([]); },
+    })));
+    let clock = Date.now();
+    const makeHydration = (): ProviderAffineCatchUpHydration => new ProviderAffineCatchUpHydration(new Map(
+      (['primary', 'fallback-1'] as const).map((providerId) => [providerId, {
+        async getBlockTransactions(slot: bigint) {
+          fetches.push({ providerId, slot });
+          assert.equal(primaryUnavailable && providerId === 'primary', false);
+          return blocks.get(slot);
+        },
+      }]),
+    ), { currentSelection: () => promoted.selection(), now: () => clock, sleep: async (ms) => { clock += ms; } });
+    let hydration = makeHydration();
+    const admitters = new Map<RpcProviderId, PumpFunStrictCatchUpPageAdmitter>();
+    const scanner = (providerId: RpcProviderId, policy: 'strict' | 'live-edge'): StrictCatchUpScanner => {
+      let admitter = admitters.get(providerId);
+      if (admitter === undefined) {
+        admitter = new PumpFunStrictCatchUpPageAdmitter(new PumpFunCatchUpBlockClassifier(
+          hydration.classifierLocator(providerId), inbox,
+        ));
+        admitters.set(providerId, admitter);
+      }
+      return new StrictCatchUpScanner({
+        providerId,
+        async list(programId, before) {
+          assert.equal(programId, PUMP_PROGRAM_ID);
+          if (primaryUnavailable && providerId === 'primary') throw new Error('offline primary failure');
+          return before === undefined ? rows : Object.freeze([]);
+        },
+      }, inbox, { pageSize: 10, maxPages: 2, policy, programs: LAUNCHPAD_ONLY_INGESTION_PROGRAMS }, admitter);
+    };
+    const signal = new AbortController().signal;
+    await hydration.runStrictScan('primary', (scanSignal) => scanner('primary', 'live-edge').scan(scanSignal), signal);
+    assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, baseline.signature);
+    assert.deepEqual(fetches, []);
+    assert.equal((await pool.query('SELECT COUNT(*)::int AS count FROM chain_transaction_inbox')).rows[0]?.count, 0);
+    // A fresh coordinator resumes the persisted live-edge checkpoint after an offline gap.
+    hydration.close();
+    hydration = makeHydration();
+    admitters.clear();
+    rows = Object.freeze([...transactions].reverse().map((transaction): CatchUpSignature => Object.freeze({
+      signature: transaction.signature, slot: transaction.slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+    })).concat(baseline));
+    await inbox.enqueue(Object.freeze({
+      signature: created.signature, slot: 20n, source: 'WEBSOCKET',
+      ingestionHint: 'PUMPFUN_CREATE', ingestionHintMint: null,
+      programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'confirmed', observedAtMs: Date.now(),
+    }));
+    const scheduler = new ManualScheduler();
+    const sessions = new SessionFactory();
+    const coordinators = new Map<RpcProviderId, StrictCatchUpCoordinator>((['primary', 'fallback-1'] as const).map((providerId) => [
+      providerId, new StrictCatchUpCoordinator(scanner(providerId, 'strict'), inbox, ['launchpad']),
+    ]));
+    const coordinatorFor = (providerId: RpcProviderId): StrictCatchUpCoordinator => {
+      const coordinator = coordinators.get(providerId);
+      assert.ok(coordinator);
+      return coordinator;
+    };
+    const supervisor = new WebSocketFailoverSupervisor({
+      providers: new TestCatalog(['primary', 'fallback-1']), health, reporter: reporterFor(inbox, health), promoted,
+      verifyProviderGenesis: async () => undefined,
+      readPinnedProviderId: (scanSignal) => coordinatorFor('primary').readPinnedProviderId(scanSignal),
+      prepareInitialFrontier: async (providerId, scanSignal) => {
+        await hydration.runStrictScan(providerId, (boundSignal) => scanner(providerId, 'live-edge').scan(boundSignal), scanSignal);
+      },
+      openSession: sessions.open,
+      runStrictScan: (providerId, scanSignal) => hydration.runStrictScan(providerId,
+        (boundSignal) => coordinatorFor(providerId).run(boundSignal), scanSignal),
+    }, { now: Date.now, random: () => 0, scheduler: Object.freeze({
+      schedule: (callback: () => void, delayMs: number) => scheduler.schedule(callback, delayMs),
+      cancel: (handle: unknown) => { scheduler.cancel(handle); },
+    }) });
+    try {
+      await supervisor.start();
+      scheduler.fire(0);
+      await waitForProvider(supervisor, 'primary');
+      assert.deepEqual(fetches, [{ providerId: 'primary', slot: 20n }]);
+      const checkpoint = await inbox.readCheckpoint('launchpad');
+      assert.equal(checkpoint?.signature, head.signature);
+      assert.equal(checkpoint?.slot, 20n);
+      assert.equal(await inbox.readCheckpoint('market'), null);
+      const stored = await pool.query<{
+        signature: string; processing_status: string; ingestion_priority: string; discovery_sources: string[];
+      }>('SELECT signature, processing_status, ingestion_priority, discovery_sources FROM chain_transaction_inbox ORDER BY signature');
+      const bySignature = new Map(stored.rows.map((row) => [row.signature, row]));
+      assert.equal(bySignature.size, 5);
+      assert.deepEqual(bySignature.get(created.signature)?.discovery_sources.sort(), ['CATCH_UP', 'WEBSOCKET']);
+      assert.equal(bySignature.get(created.signature)?.ingestion_priority, 'LAUNCH_CANDIDATE');
+      assert.equal(bySignature.get(tracked.signature)?.ingestion_priority, 'TRACKED_TRADE');
+      assert.equal(bySignature.get(untracked.signature)?.processing_status, 'DEFERRED');
+      assert.equal(bySignature.get(ignored.signature)?.processing_status, 'IGNORED');
+      assert.equal(bySignature.get(head.signature)?.processing_status, 'QUARANTINED');
+      await hydration.runStrictScan('primary', (scanSignal) => scanner('primary', 'strict').scan(scanSignal), signal);
+      assert.deepEqual(await inbox.readCheckpoint('launchpad'), checkpoint);
+      assert.equal(fetches.length, 1);
+
+      const fallbackCreate = Object.freeze({ ...created, signature: bs58.encode(Buffer.alloc(64, 30)), slot: 21n, transactionIndex: 0 });
+      blocks.set(21n, admissionFixtureBlock([fallbackCreate]));
+      rows = Object.freeze([Object.freeze({
+        signature: fallbackCreate.signature, slot: 21n, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+      }), ...rows]);
+      primaryUnavailable = true;
+      scheduler.fire(30_000);
+      await waitForPhase(health, 'DEGRADED');
+      scheduler.fire(0);
+      await waitForProvider(supervisor, 'fallback-1');
+      assert.deepEqual(fetches, [{ providerId: 'primary', slot: 20n }, { providerId: 'fallback-1', slot: 21n }]);
+      assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, fallbackCreate.signature);
+      assert.equal(sessions.at(0).closeCalls, 1);
+      const actionable = new Map([created, tracked, fallbackCreate].map((transaction) => [transaction.signature, transaction]));
+      for (let index = 0; index < 3; index += 1) {
+        const claim = await inbox.claim(Date.now(), 120);
+        assert.ok(claim);
+        const transaction = actionable.get(claim.signature);
+        assert.ok(transaction);
+        const normalized = await hydration.workerLocator().locate({
+          signature: transaction.signature, slot: transaction.slot, confirmationStatus: 'CONFIRMED',
+        });
+        await inbox.saveSnapshot(claim.signature, claim.leaseToken, normalized);
+        await inbox.markProcessed(claim.signature, claim.leaseToken, 'confirmed');
+      }
+      assert.equal(await inbox.claim(Date.now(), 120), null);
+      const finality = new FinalityReconciler(promoted, inbox, { limit: 10, missingPollThreshold: 2 });
+      await finality.runOnce();
+      await finality.runOnce();
+      const revisions: string[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        const claim = await inbox.claim(Date.now(), 120);
+        assert.ok(claim?.normalizedTransaction);
+        revisions.push(claim.confirmationStatus);
+        await inbox.markProcessed(claim.signature, claim.leaseToken, claim.confirmationStatus);
+      }
+      assert.deepEqual(revisions.sort(), ['finalized', 'finalized', 'orphaned']);
+      assert.deepEqual(await inbox.listForFinality(10), []);
+    } finally {
+      await supervisor.close();
+      hydration.close();
+    }
+  });
+});
 
 void test('merges one signature from incumbent and candidate WS plus strict HTTP before the old session closes', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -1406,6 +1601,54 @@ async function withDatabase(context: TestContext, action: (pool: pg.Pool) => Pro
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
     await admin.end();
   }
+}
+
+function admissionFixtureBlock(transactions: readonly NormalizedTransaction[]): unknown {
+  return {
+    blockhash: PUMP_PROGRAM_ID, previousBlockhash: PUMP_PROGRAM_ID,
+    parentSlot: Number((transactions[0]?.slot ?? 1n) - 1n), blockTime: null,
+    transactions: transactions.map((transaction) => {
+      const keys = [...new Set([
+        PUMP_PROGRAM_ID,
+        ...transaction.instructions.flatMap((instruction) => [instruction.programId, ...instruction.accounts]),
+        ...transaction.preTokenBalances.map((balance) => balance.account),
+        ...transaction.postTokenBalances.map((balance) => balance.account),
+      ])];
+      const instruction = (value: NormalizedTransaction['instructions'][number]) => ({
+        programIdIndex: keys.indexOf(value.programId), accountKeyIndexes: value.accounts.map((account) => keys.indexOf(account)),
+        data: value.data, stackHeight: value.stackHeight,
+      });
+      const balance = (value: NormalizedTransaction['preTokenBalances'][number]) => ({
+        accountIndex: keys.indexOf(value.account), mint: value.mint, owner: value.owner, programId: value.tokenProgram,
+        uiTokenAmount: { amount: value.amountRaw.toString(), decimals: value.decimals, uiAmount: null },
+      });
+      const parents = [...new Set(transaction.instructions.filter((value) => value.innerInstructionIndex !== null)
+        .map((value) => value.parentInstructionIndex))];
+      return {
+        version: 'legacy',
+        transaction: {
+          signatures: [transaction.signature], message: {
+            header: { numRequiredSignatures: 1, numReadonlySignedAccounts: 0, numReadonlyUnsignedAccounts: 0 },
+            accountKeys: keys.map((key) => new PublicKey(key)),
+            compiledInstructions: transaction.instructions.filter((value) => value.innerInstructionIndex === null).map(instruction),
+          },
+        },
+        meta: {
+          fee: Number(transaction.feeLamports), err: null,
+          preBalances: keys.map(() => 0), postBalances: keys.map(() => 0),
+          preTokenBalances: transaction.preTokenBalances.map(balance), postTokenBalances: transaction.postTokenBalances.map(balance),
+          innerInstructions: parents.map((parent) => ({ index: parent,
+            instructions: transaction.instructions.filter((value) => value.innerInstructionIndex !== null
+              && value.parentInstructionIndex === parent).map((value) => ({
+                programIdIndex: keys.indexOf(value.programId), accounts: value.accounts.map((account) => keys.indexOf(account)),
+                data: bs58.encode(value.data), stackHeight: value.stackHeight,
+              })),
+          })),
+          loadedAddresses: { writable: [], readonly: [] },
+        },
+      };
+    }),
+  };
 }
 
 function quoteIdentifier(value: string): string {

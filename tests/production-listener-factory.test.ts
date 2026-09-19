@@ -38,8 +38,100 @@ import {
 } from '../src/application/production-listener-factory.js';
 import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import { SolanaTransactionLocator } from '../src/solana/rpc/transaction-locator.js';
+import { ProviderAffineCatchUpHydration } from '../src/application/provider-affine-catch-up-hydration.js';
+import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
+import type { ListenerRuntimeDependencies } from '../src/application/listener-runtime.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+void test('catch-up admission flag off creates no provider-affine locators and retains market ingestion', async (context) => {
+  const classifiers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'classifierLocator');
+  const workers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'workerLocator');
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  for (const blockHydrationEnabled of ['false', 'true']) {
+    const runtime = createProductionListenerRuntime(config({
+      LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'false',
+      LISTENER_BLOCK_HYDRATION_ENABLED: blockHydrationEnabled,
+      LISTENER_INGESTION_SCOPE: 'launchpad-and-market',
+    }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+    const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+    await dependencies.worker.start();
+    const worker = starts.mock.calls.at(-1)?.this as unknown as { locator: unknown; canClaim: unknown };
+    assert.ok(worker.locator instanceof (blockHydrationEnabled === 'true'
+      ? CachedSolanaBlockTransactionLocator : SolanaTransactionLocator));
+    assert.equal(worker.canClaim, null);
+    assert.equal(runtime.pipelineState().pumpswap, 'STOPPED');
+    await dependencies.worker.close();
+  }
+  assert.equal(classifiers.mock.callCount(), 0);
+  assert.equal(workers.mock.callCount(), 0);
+});
+
+void test('catch-up admission uses one provider-affine coordinator for each catalog provider and gates worker claims', async (context) => {
+  const classifiers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'classifierLocator');
+  const workers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'workerLocator');
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://127.0.0.1:8898',
+    SOLANA_WS_RPC_FALLBACK_URLS: 'ws://127.0.0.1:8897',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  assert.deepEqual(classifiers.mock.calls.map(({ arguments: args }) => args[0]), ['primary', 'fallback-1']);
+  assert.equal(workers.mock.callCount(), 1);
+  const hydration = workers.mock.calls[0]?.this;
+  assert.ok(hydration instanceof ProviderAffineCatchUpHydration);
+  assert.ok(classifiers.mock.calls.every((call) => call.this === hydration));
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  await dependencies.worker.start();
+  const worker = starts.mock.calls[0]?.this as unknown as {
+    locator: unknown; canClaim: () => boolean; runOnce: () => Promise<unknown>;
+  };
+  assert.equal(worker.locator, workers.mock.calls[0]?.result);
+  assert.equal(worker.canClaim(), false);
+  assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
+  assert.equal(runtime.pipelineState().pumpswap, 'IDLE');
+  await dependencies.worker.close();
+  assert.equal(hydration.canWorkerClaim(), false);
+});
+
+void test('catch-up admission wires identical provider admitters into both scanner paths and pins scan permits', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.match(source, /config\.listenerPumpFunCatchUpPageAdmissionEnabled/u);
+  assert.equal(count(source, /new ProviderAffineCatchUpHydration\(/gu), 1);
+  assert.equal(count(source, /new PumpFunCatchUpBlockClassifier\(/gu), 1);
+  assert.equal(count(source, /new PumpFunStrictCatchUpPageAdmitter\(/gu), 1);
+  assert.match(source, /providers\.ids\.map\([\s\S]*?createProviderPinnedBlockRpc\(providers, providerId,/u);
+  assert.equal(count(source, /pageAdmitters\.get\(providerId\)/gu), 2);
+  assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => coordinator\.run\(scanSignal\), signal\)/u);
+  assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => baselineScanner\.scan\(scanSignal\), signal\)/u);
+});
+
+void test('catch-up admission closes provider-affine hydration only after worker settlement, including failure', async (context) => {
+  const gate = deferred<undefined>();
+  const order: string[] = [];
+  context.mock.method(TransactionInboxWorker.prototype, 'close', async () => {
+    order.push('worker-start');
+    await gate.promise;
+    order.push('worker-settled');
+    throw new Error('worker cleanup failed');
+  });
+  context.mock.method(ProviderAffineCatchUpHydration.prototype, 'close', () => { order.push('hydration'); });
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  const closing = dependencies.worker.close();
+  assert.deepEqual(order, ['worker-start']);
+  gate.resolve(undefined);
+  await assert.rejects(closing, /worker cleanup failed/u);
+  assert.deepEqual(order, ['worker-start', 'worker-settled', 'hydration']);
+});
 
 void test('production block hydration keeps the exact legacy locator unless explicitly enabled', () => {
   const rpc = Object.freeze({
