@@ -4,11 +4,15 @@ import {
   SolanaGenesisHashError,
 } from '../domain/solana-genesis-hash.js';
 import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
-import type {
-  CatchUpGap,
-  ListenerRuntimeState,
-  RuntimeHeartbeat,
-  RuntimeBlockHydrationMetricsV1,
+import {
+  assertValidInboxCounts,
+  assertValidRuntimeHeartbeat,
+  type CatchUpGap,
+  type InboxCounts,
+  type ListenerRuntimeState,
+  type RuntimeHeartbeat,
+  type RuntimeBlockHydrationMetricsV1,
+  type RuntimeCatchUpAdmissionMetricsV1,
 } from '../domain/transaction-ingestion.js';
 import {
   PumpFunLaunchpadAdapter,
@@ -519,6 +523,14 @@ export function createProductionListenerRuntime(
       intervalMs: 5_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
+      ...(hydration === null ? {} : {
+        catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
+          version: 1,
+          enabled: true,
+          ...hydration.state(),
+          ...counts.catchUpAdmission,
+        }),
+      }),
     },
   );
 
@@ -567,6 +579,7 @@ export interface RecurringListenerOptions {
 
 export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
+  readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
 }
 
 export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
@@ -809,6 +822,7 @@ export class PersistentListenerHeartbeat {
   private stopPromise: Promise<void> | null = null;
   private closed = false;
   private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
+  private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository, 'counts' | 'writeHeartbeat'>,
@@ -828,6 +842,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Block hydration metrics provider is invalid.');
     }
     this.blockHydrationMetrics = options.blockHydrationMetrics ?? null;
+    if (options.catchUpAdmissionMetrics !== undefined
+      && typeof options.catchUpAdmissionMetrics !== 'function') {
+      throw new TypeError('Catch-up admission metrics provider is invalid.');
+    }
+    this.catchUpAdmissionMetrics = options.catchUpAdmissionMetrics ?? null;
   }
 
   public async start(): Promise<void> {
@@ -905,29 +924,31 @@ export class PersistentListenerHeartbeat {
   }
 
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
+    let counts: InboxCounts;
     if (runtimeState === 'RUNNING') {
-      const [counts, slots] = await Promise.all([
+      const [currentCounts, slots] = await Promise.all([
         this.inbox.counts(),
         Promise.all([this.rpc.getSlot(), this.rpc.getFinalizedSlot()]),
       ]);
+      counts = currentCounts;
       this.lastHttpSlot = slots[0];
       this.lastFinalizedSlot = slots[1];
-      this.backlogCount = safeInboxBacklog(
-        counts.pending,
-        counts.processing,
-        counts.retryableFailed,
-      );
-      this.leasedCount = counts.processing;
-      this.exhaustedCount = counts.exhaustedFailed;
     } else {
-      const counts = await this.inbox.counts();
-      this.backlogCount = safeInboxBacklog(
-        counts.pending,
-        counts.processing,
-        counts.retryableFailed,
-      );
-      this.leasedCount = counts.processing;
-      this.exhaustedCount = counts.exhaustedFailed;
+      counts = await this.inbox.counts();
+    }
+    this.backlogCount = safeInboxBacklog(counts.pending, counts.processing, counts.retryableFailed);
+    this.leasedCount = counts.processing;
+    this.exhaustedCount = counts.exhaustedFailed;
+    let catchUpAdmission: RuntimeCatchUpAdmissionMetricsV1 | undefined;
+    if (this.catchUpAdmissionMetrics !== null) {
+      try {
+        assertValidInboxCounts(counts);
+        const metrics: unknown = this.catchUpAdmissionMetrics(counts);
+        if (typeof metrics !== 'object' || metrics === null) throw new TypeError();
+        catchUpAdmission = metrics as RuntimeCatchUpAdmissionMetricsV1;
+      } catch {
+        throw new TypeError('Catch-up admission metrics are invalid.');
+      }
     }
     const blockHydration = this.blockHydrationMetrics?.();
     const value: RuntimeHeartbeat = Object.freeze({
@@ -946,7 +967,13 @@ export class PersistentListenerHeartbeat {
       leasedCount: this.leasedCount,
       exhaustedCount: this.exhaustedCount,
       ...(blockHydration === undefined ? {} : { blockHydration }),
+      ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
     });
+    if (this.catchUpAdmissionMetrics !== null) {
+      try { assertValidRuntimeHeartbeat(value); } catch {
+        throw new TypeError('Catch-up admission metrics are invalid.');
+      }
+    }
     await this.inbox.writeHeartbeat(value);
   }
 }

@@ -680,6 +680,11 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     failed: 2,
     retryableFailed: 1,
     exhaustedFailed: 1,
+    catchUpAdmission: Object.freeze({
+      actionableBacklogBySource: Object.freeze({ websocketOnly: 1, catchUpOnly: 0, websocketAndCatchUp: 0 }),
+      actionableBacklogByPriority: Object.freeze({ normal: 1, launchCandidate: 0, trackedTrade: 0 }),
+      deferredCount: 0, ignoredCount: 0, quarantinedCount: 0,
+    }),
   });
   assert.doesNotThrow(() => { assertValidInboxCounts(counts); });
   assert.throws(
@@ -696,6 +701,29 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     })); },
     /exhaustedCount/u,
   );
+});
+
+void test('InboxCounts validates exact frozen catch-up admission counts and both backlog sums', () => {
+  const admission = Object.freeze({
+    actionableBacklogBySource: Object.freeze({ websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 3 }),
+    actionableBacklogByPriority: Object.freeze({ normal: 3, launchCandidate: 2, trackedTrade: 1 }),
+    deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
+  });
+  const counts = Object.freeze({ pending: 2, processing: 1, processed: 7, failed: 4,
+    retryableFailed: 3, exhaustedFailed: 1, catchUpAdmission: admission });
+  assert.doesNotThrow(() => { assertValidInboxCounts(counts); });
+  for (const catchUpAdmission of [
+    undefined,
+    { ...admission },
+    Object.freeze({ ...admission, secret: 'private-secret' }),
+    Object.freeze({ ...admission, actionableBacklogBySource: { ...admission.actionableBacklogBySource } }),
+    Object.freeze({ ...admission, actionableBacklogBySource: Object.freeze({ ...admission.actionableBacklogBySource, catchUpOnly: 3 }) }),
+    Object.freeze({ ...admission, actionableBacklogByPriority: Object.freeze({ ...admission.actionableBacklogByPriority, normal: 4 }) }),
+    ...[-1, -0, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, '1'].map((deferredCount) => Object.freeze({ ...admission, deferredCount })),
+  ]) {
+    assert.throws(() => { assertValidInboxCounts(Object.freeze({ ...counts, catchUpAdmission })); }, TypeError);
+  }
+  assert.throws(() => { assertValidInboxCounts(Object.freeze({ ...counts, pending: Number.MAX_SAFE_INTEGER })); }, TypeError);
 });
 
 void test('rejects incoherent, unproven and accessor-backed finality evidence', () => {

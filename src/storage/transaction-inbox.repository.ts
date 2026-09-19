@@ -1804,6 +1804,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(value.blockHydration === undefined
               ? {}
               : { blockHydration: value.blockHydration }),
+            ...(value.catchUpAdmission === undefined
+              ? {}
+              : { catchUpAdmission: value.catchUpAdmission }),
           }),
           value.exhaustedCount,
         ],
@@ -1814,6 +1817,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
 
   public async counts(): Promise<InboxCounts> {
     return this.safely(async () => {
+      const retryable = `processing_status = 'FAILED' AND error_retryable = TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at IS NOT NULL`;
+      const actionable = `(processing_status IN ('PENDING', 'PROCESSING') OR (${retryable}))`;
       const result = await this.pool.query(
         `SELECT
            COUNT(*) FILTER (WHERE processing_status = 'PENDING') AS pending,
@@ -1821,13 +1827,30 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            COUNT(*) FILTER (WHERE processing_status = 'PROCESSED') AS processed,
            COUNT(*) FILTER (WHERE processing_status = 'FAILED') AS failed,
            COUNT(*) FILTER (
-             WHERE processing_status = 'FAILED' AND error_retryable = TRUE
-               AND retry_exhausted_at IS NULL AND next_attempt_at IS NOT NULL
+             WHERE ${retryable}
            ) AS retryable_failed,
            COUNT(*) FILTER (
              WHERE processing_status = 'FAILED' AND error_retryable = TRUE
                AND retry_exhausted_at IS NOT NULL
-           ) AS exhausted_failed
+           ) AS exhausted_failed,
+           COUNT(*) FILTER (WHERE ${actionable}
+             AND 'WEBSOCKET' = ANY(discovery_sources)
+             AND NOT ('CATCH_UP' = ANY(discovery_sources))) AS websocket_only,
+           COUNT(*) FILTER (WHERE ${actionable}
+             AND 'CATCH_UP' = ANY(discovery_sources)
+             AND NOT ('WEBSOCKET' = ANY(discovery_sources))) AS catch_up_only,
+           COUNT(*) FILTER (WHERE ${actionable}
+             AND 'WEBSOCKET' = ANY(discovery_sources)
+             AND 'CATCH_UP' = ANY(discovery_sources)) AS websocket_and_catch_up,
+           COUNT(*) FILTER (WHERE ${actionable}
+             AND ingestion_priority = 'NORMAL') AS normal,
+           COUNT(*) FILTER (WHERE ${actionable}
+             AND ingestion_priority = 'LAUNCH_CANDIDATE') AS launch_candidate,
+           COUNT(*) FILTER (WHERE ${actionable}
+             AND ingestion_priority = 'TRACKED_TRADE') AS tracked_trade,
+           COUNT(*) FILTER (WHERE processing_status = 'DEFERRED') AS deferred,
+           COUNT(*) FILTER (WHERE processing_status = 'IGNORED') AS ignored,
+           COUNT(*) FILTER (WHERE processing_status = 'QUARANTINED') AS quarantined
          FROM chain_transaction_inbox`,
       );
       const row = requiredRow(result.rows[0]);
@@ -1838,6 +1861,21 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         failed: safeCount(row.failed, 'failed count'),
         retryableFailed: safeCount(row.retryable_failed, 'retryable failed count'),
         exhaustedFailed: safeCount(row.exhausted_failed, 'exhausted failed count'),
+        catchUpAdmission: Object.freeze({
+          actionableBacklogBySource: Object.freeze({
+            websocketOnly: safeCount(row.websocket_only, 'websocket only count'),
+            catchUpOnly: safeCount(row.catch_up_only, 'catch-up only count'),
+            websocketAndCatchUp: safeCount(row.websocket_and_catch_up, 'combined source count'),
+          }),
+          actionableBacklogByPriority: Object.freeze({
+            normal: safeCount(row.normal, 'normal priority count'),
+            launchCandidate: safeCount(row.launch_candidate, 'launch candidate count'),
+            trackedTrade: safeCount(row.tracked_trade, 'tracked trade count'),
+          }),
+          deferredCount: safeCount(row.deferred, 'deferred count'),
+          ignoredCount: safeCount(row.ignored, 'ignored count'),
+          quarantinedCount: safeCount(row.quarantined, 'quarantined count'),
+        }),
       });
       assertValidInboxCounts(counts);
       return counts;

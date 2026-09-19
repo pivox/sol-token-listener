@@ -14,6 +14,8 @@ import type {
   FinalityPollObservation,
   FinalityRevision,
   RuntimeHeartbeat,
+  RuntimeCatchUpAdmissionMetricsV1,
+  InboxCounts,
 } from '../src/domain/transaction-ingestion.js';
 import type { TokenLaunch } from '../src/domain/types.js';
 import type {
@@ -44,6 +46,14 @@ import type { ListenerRuntimeDependencies } from '../src/application/listener-ru
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
+function admissionCounts(backlog = 0) {
+  return Object.freeze({
+    actionableBacklogBySource: Object.freeze({ websocketOnly: backlog, catchUpOnly: 0, websocketAndCatchUp: 0 }),
+    actionableBacklogByPriority: Object.freeze({ normal: backlog, launchCandidate: 0, trackedTrade: 0 }),
+    deferredCount: 0, ignoredCount: 0, quarantinedCount: 0,
+  });
+}
+
 void test('catch-up admission flag off creates no provider-affine locators and retains market ingestion', async (context) => {
   const classifiers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'classifierLocator');
   const workers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'workerLocator');
@@ -55,6 +65,7 @@ void test('catch-up admission flag off creates no provider-affine locators and r
       LISTENER_INGESTION_SCOPE: 'launchpad-and-market',
     }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
     const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+    assert.equal((dependencies.heartbeat as unknown as { catchUpAdmissionMetrics: unknown }).catchUpAdmissionMetrics, null);
     await dependencies.worker.start();
     const worker = starts.mock.calls.at(-1)?.this as unknown as { locator: unknown; canClaim: unknown };
     assert.ok(worker.locator instanceof (blockHydrationEnabled === 'true'
@@ -85,6 +96,13 @@ void test('catch-up admission uses one provider-affine coordinator for each cata
   assert.ok(hydration instanceof ProviderAffineCatchUpHydration);
   assert.ok(classifiers.mock.calls.every((call) => call.this === hydration));
   const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  const metrics = (dependencies.heartbeat as unknown as {
+    catchUpAdmissionMetrics: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
+  }).catchUpAdmissionMetrics;
+  assert.deepEqual(metrics(await heartbeatCounts()), {
+    version: 1, enabled: true, providerId: null, scanActive: false, workerClaimReady: false,
+    ...admissionCounts(1),
+  });
   await dependencies.worker.start();
   const worker = starts.mock.calls[0]?.this as unknown as {
     locator: unknown; canClaim: () => boolean; runOnce: () => Promise<unknown>;
@@ -453,6 +471,7 @@ void test('heartbeat stop fences an in-flight RUNNING write before durable STOPP
         return {
           pending: 0, processing: 0, processed: 0, failed: 0,
           retryableFailed: 0, exhaustedFailed: 0,
+          catchUpAdmission: admissionCounts(),
         };
       },
       async writeHeartbeat(value) {
@@ -498,6 +517,7 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
         return {
           pending: 2, processing: 1, processed: 4, failed: 3,
           retryableFailed: 2, exhaustedFailed: 1,
+          catchUpAdmission: admissionCounts(5),
         };
       },
       async writeHeartbeat(value) {
@@ -531,7 +551,7 @@ void test('heartbeat publishes one bounded block hydration snapshot without iden
   });
   const heartbeat = new PersistentListenerHeartbeat(
     {
-      async counts() { return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0 }; },
+      async counts() { return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0, catchUpAdmission: admissionCounts() }; },
       async writeHeartbeat(value) { writes.push(value); },
     },
     { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
@@ -542,6 +562,103 @@ void test('heartbeat publishes one bounded block hydration snapshot without iden
   await heartbeat.stop();
   assert.deepEqual(writes.map(({ blockHydration }) => blockHydration), [metrics, metrics]);
   assert.doesNotMatch(JSON.stringify(metrics), /signature|slot|https?:|wss?:/iu);
+});
+
+void test('heartbeat catch-up admission snapshots use the same count read and remain optional', async () => {
+  for (const enabled of [false, true]) {
+    const writes: RuntimeHeartbeat[] = [];
+    let reads = 0;
+    let callbacks = 0;
+    const heartbeat = new PersistentListenerHeartbeat({
+      async counts() {
+        reads += 1;
+        return Object.freeze({ pending: reads, processing: 0, processed: 0, failed: 0,
+          retryableFailed: 0, exhaustedFailed: 0, catchUpAdmission: admissionCounts(reads) });
+      },
+      async writeHeartbeat(value) { writes.push(value); },
+    }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+      intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+      ...(enabled ? { catchUpAdmissionMetrics: (counts: InboxCounts) => {
+        callbacks += 1;
+        return Object.freeze({ version: 1 as const, enabled: true, providerId: 'primary' as const,
+          scanActive: false, workerClaimReady: true, ...counts.catchUpAdmission });
+      } } : {}),
+    });
+    await heartbeat.start();
+    await heartbeat.stop();
+    assert.equal(reads, 2);
+    assert.equal(callbacks, enabled ? 2 : 0);
+    for (const [index, write] of writes.entries()) {
+      if (!enabled) { assert.equal(Object.hasOwn(write, 'catchUpAdmission'), false); continue; }
+      assert.deepEqual(write.catchUpAdmission, { version: 1, enabled: true, providerId: 'primary',
+        scanActive: false, workerClaimReady: true, ...admissionCounts(index + 1) });
+      assert.ok(Object.isFrozen(write.catchUpAdmission));
+      assert.ok(Object.isFrozen(write.catchUpAdmission?.actionableBacklogBySource));
+      assert.ok(Object.isFrozen(write.catchUpAdmission?.actionableBacklogByPriority));
+    }
+  }
+});
+
+async function heartbeatCounts() {
+  return Object.freeze({ pending: 1, processing: 0, processed: 0, failed: 0,
+    retryableFailed: 0, exhaustedFailed: 0, catchUpAdmission: admissionCounts(1) });
+}
+
+void test('heartbeat catch-up admission rejects invalid state and sums before a redacted write', async () => {
+  const valid = Object.freeze({ version: 1, enabled: true, providerId: 'primary',
+    scanActive: false, workerClaimReady: true, ...admissionCounts(1) });
+  for (const metrics of [
+    undefined,
+    null,
+    Object.freeze({ ...valid, version: 2 }),
+    Object.freeze({ ...valid, providerId: 'https://private-secret.invalid' }),
+    Object.freeze({ ...valid, providerId: null }),
+    Object.freeze({ ...valid, scanActive: true }),
+    Object.freeze({ ...valid, workerClaimReady: 'private-secret' }),
+    Object.freeze({ ...valid, enabled: false }),
+    Object.freeze({ ...valid, enabled: 'private-secret' }),
+    Object.freeze({ ...valid, scanActive: 'private-secret' }),
+    Object.freeze({ ...valid, ...admissionCounts(2) }),
+    Object.freeze({ ...valid, signature: 'private-secret' }),
+    Object.freeze({ ...valid, actionableBacklogBySource: Object.freeze({ websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 }) }),
+    Object.freeze({ ...valid, actionableBacklogByPriority: Object.freeze({ normal: 0, launchCandidate: 0, trackedTrade: 0 }) }),
+    Object.freeze({ ...valid, deferredCount: -1 }),
+    Object.freeze({ ...valid, ignoredCount: Number.MAX_SAFE_INTEGER + 1 }),
+    Object.freeze({ ...valid, actionableBacklogBySource: { ...valid.actionableBacklogBySource } }),
+  ]) {
+    let writes = 0;
+    const heartbeat = new PersistentListenerHeartbeat({
+      counts: heartbeatCounts,
+      async writeHeartbeat() { writes += 1; },
+    }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+      intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+      catchUpAdmissionMetrics: () => metrics as unknown as RuntimeCatchUpAdmissionMetricsV1,
+    });
+    await assert.rejects(heartbeat.start(), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.doesNotMatch(String(error), /private-secret|https?:/u);
+      return true;
+    });
+    assert.equal(writes, 0);
+  }
+});
+
+void test('heartbeat catch-up admission redacts throwing metric providers', async () => {
+  const heartbeat = new PersistentListenerHeartbeat({
+    counts: heartbeatCounts,
+    async writeHeartbeat() { assert.fail('Invalid metrics must not be written.'); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    catchUpAdmissionMetrics: () => { throw new Error('private-secret'); },
+  });
+  await assert.rejects(heartbeat.start(), (error: unknown) => {
+    assert.ok(error instanceof TypeError);
+    assert.doesNotMatch(String(error), /private-secret/u);
+    return true;
+  });
 });
 
 void test('heartbeat refreshes post-drain counts without another shutdown RPC read', async () => {
@@ -562,10 +679,12 @@ void test('heartbeat refreshes post-drain counts without another shutdown RPC re
           ? {
             pending: 4, processing: 1, processed: 0, failed: 0,
             retryableFailed: 0, exhaustedFailed: 0,
+            catchUpAdmission: admissionCounts(5),
           }
           : {
             pending: 2, processing: 0, processed: 3, failed: 2,
             retryableFailed: 1, exhaustedFailed: 1,
+            catchUpAdmission: admissionCounts(3),
           };
       },
       async writeHeartbeat(value) { writes.push(value); },
@@ -609,6 +728,7 @@ void test('heartbeat refuses a stale STOPPED snapshot when the final count read 
         return {
           pending: 1, processing: 1, processed: 0, failed: 0,
           retryableFailed: 0, exhaustedFailed: 0,
+          catchUpAdmission: admissionCounts(2),
         };
       },
       async writeHeartbeat(value) { writes.push(value.runtimeState); },
