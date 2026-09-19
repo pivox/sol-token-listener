@@ -450,9 +450,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             && finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
             throw internalRepositoryError(new TransactionInboxConflictError('finality'));
           }
+          const storedTerminalAt = nullableDateFromMs(nullableDateMs(
+            row.terminal_at,
+            'classification replay terminal at',
+          ));
           const replayTerminalAt = shouldReplay || replayDecision.status === 'PENDING'
             ? null
-            : nullableDateFromMs(nullableDateMs(row.terminal_at, 'classification replay terminal at'));
+            : storedTerminalAt ?? (pristine && replayDecision.status === 'DEFERRED'
+              ? dateFromMs(value.classifiedAtMs)
+              : null);
           const updated = await client.query(
             `UPDATE chain_transaction_inbox SET
                discovery_sources=$2,program_ids=$3,target_confirmation_status=$4,

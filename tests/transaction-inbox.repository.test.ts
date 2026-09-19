@@ -234,6 +234,48 @@ void test('semantic deferred replay clears its original retention only when the 
   });
 });
 
+void test('semantic deferred replay starts retention when an unsynchronized mint becomes inactive', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('classified-deferred-replay-demotion'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    await insertTrackedLaunch(pool);
+    await repository.recordCatchUpClassification(classification);
+    const admitted = await row(pool, classification.signature);
+    assert.equal(admitted.processing_status, 'PENDING');
+    assert.equal(admitted.terminal_at, null);
+    assert.equal(admitted.purge_after, null);
+
+    await pool.query('UPDATE token_launches SET terminal_at=clock_timestamp() WHERE mint=$1', [tradeMint]);
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...classification,
+      observedAtMs: 2_000,
+      classifiedAtMs: 2_001,
+    }));
+
+    const deferred = await row(pool, classification.signature);
+    assert.equal(deferred.processing_status, 'DEFERRED');
+    assert.equal(deferred.ingestion_priority, 'NORMAL');
+    assert.equal(deferred.terminal_at.getTime(), 2_001);
+    assert.equal(deferred.purge_after.getTime(), 2_001 + 14_400_000);
+    assert.equal(deferred.observed_at.getTime(), classification.observedAtMs);
+    assert.equal(deferred.catch_up_classified_at.getTime(), classification.classifiedAtMs);
+
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...classification,
+      observedAtMs: 3_000,
+      classifiedAtMs: 3_001,
+    }));
+    const replayed = await row(pool, classification.signature);
+    assert.equal(replayed.terminal_at.getTime(), deferred.terminal_at.getTime());
+    assert.equal(replayed.purge_after.getTime(), deferred.purge_after.getTime());
+    assert.equal(replayed.catch_up_classified_at.getTime(), classification.classifiedAtMs);
+  });
+});
+
 void test('classification replay merges admissible programs and advances confirmed evidence to finalized', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
