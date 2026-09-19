@@ -1,16 +1,16 @@
 # Cache cohérent de blocs normalisés
 
-Version : 1.0.0 — 2026-09-12 — issue #112.
+Version : 1.1.0 — 2026-09-19 — issues #112, #127.
 
 ## Statut et périmètre
 
-`CachedSolanaBlockTransactionLocator` est un consommateur expérimental explicite
-de `TransactionBlockRpc` enrichi de `httpTransportEpoch`. Il n'est instancié par
-aucune factory de production. `SolanaTransactionLocator`, le locator direct
-`SolanaBlockTransactionLocator`, les scans catch-up stricts et la réconciliation
-de finalité conservent leur comportement. Aucun paramètre d'environnement,
-heartbeat, lease, admission worker ou changement de persistance n'est introduit.
-L'activation et les réglages opérationnels appartiennent aux issues #113/#114.
+`CachedSolanaBlockTransactionLocator` est un consommateur explicite de
+`TransactionBlockRpc` enrichi de `httpTransportEpoch`. La factory de production
+peut l'activer uniquement au redémarrage ; il reste désactivé par défaut.
+`SolanaTransactionLocator`, le locator direct `SolanaBlockTransactionLocator`,
+les scans catch-up stricts et la réconciliation de finalité conservent leur
+comportement. La sérialisation #127 n'ajoute aucun paramètre d'environnement,
+wiring de factory, heartbeat, lease, classifier ou changement de persistance.
 
 Cette étape prolonge la
 [source cohérente par slot v1.0.0](2026-09-12-coherent-slot-block-hydration-design.md).
@@ -95,29 +95,38 @@ défaut. Un hit ne prolonge pas le TTL. L'expiration est paresseuse à l'accès 
 
 Une seule file FIFO par instance partagée couvre tous les slots, commitments,
 misses et rafraîchissements. Les départs sont espacés d'au moins 250 ms, soit au
-plus quatre départs dans toute fenêtre semi-ouverte d'une seconde. Les réponses
-ne sont pas sérialisées : plusieurs fetches peuvent rester en vol. Les hits et
-callers rejoignant un single-flight ne consomment pas un nouveau départ.
+plus quatre départs dans toute fenêtre semi-ouverte d'une seconde. Une admission
+attend aussi la fin de l'admission précédente : il existe donc au plus un
+`getBlockTransactions` actif par instance. Pour deux admissions FIFO A puis B,
+le départ de B est postérieur ou égal à la fois à la fin de A et au départ de A
+augmenté de l'intervalle minimal. Les hits et callers rejoignant un
+single-flight ne consomment pas un nouveau départ. Une erreur de A rejette
+uniquement ses callers puis libère B ; elle ne vide pas la file.
+
 Cette cadence concerne les appels logiques de cette source, pas les tentatives
-HTTP internes de failover ni les autres consommateurs RPC. Une activation
-future doit partager cette instance pour conserver ce plafond global.
+HTTP internes de failover ni les autres consommateurs RPC. Le débit est borné
+par le minimum entre quatre départs par seconde et l'inverse de la latence RPC.
+Cette sérialisation assume volontairement le head-of-line blocking : #127
+n'introduit ni timeout ni annulation d'un appel SDK déjà parti.
 
 `clear()` supprime valeurs et références single-flight et avance une génération
 locale : une réponse commencée avant ce nettoyage ne peut plus être retenue.
 Les admissions encore en file sont rejetées immédiatement et ne consomment pas
 les créneaux de pacing du nouvel epoch ; un fetch déjà démarré conserve toutefois
-son créneau passé.
+son créneau passé. Comme cet appel SDK ne peut pas être annulé, une admission du
+nouvel epoch attend sa fin avant de partir ; son ancienne réponse ne peut pas
+être retenue.
 `close()` est idempotent, annule le timer de pacing et rejette les admissions
 restantes; aucun nouveau caller n'est accepté. Les requêtes SDK déjà parties
 peuvent se terminer pour leurs callers, mais sans rétention. Les promesses en
 échec sont retirées par identité, afin qu'un ancien fetch ne supprime pas une
 nouvelle génération.
 
-La file d'admission et les fetches démarrés ne reçoivent volontairement aucun
-plafond dans ce composant encore inactif. L'activation #114 doit garantir une
-concurrence appelante bornée, l'exposer dans la télémétrie et la vérifier en
-canary ; sinon elle devra ajouter un rejet retryable au-delà d'une limite
-explicite avant d'activer la source.
+La profondeur de la file d'admission ne reçoit volontairement aucun plafond
+supplémentaire dans #127. La concurrence RPC active est strictement bornée à un,
+exposée par `inFlightFetches`; `queuedFetches` et `queueDelayMs` rendent visible
+le head-of-line blocking. Les limites de concurrence appelante et le canary
+opérationnel restent ceux de l'activation #114.
 
 ## Epoch HTTP
 
@@ -140,7 +149,8 @@ de catch-up ou de finalité.
 
 Les tests déterministes couvrent single-flight et hits séquentiels, commitments,
 TTL distincts, LRU octets/entrées, oversize global/par bloc, résultats négatifs,
-rafraîchissement unique, FIFO, mutations caller/fournisseur, changements d'epoch
-avant et pendant un fetch, nettoyage et annulation d'admission, classification
-trusted par caller, legacy/v0/ALT et entrée non ciblée non normalisable. Les
-tests du locator direct, du client RPC et du transport restent exécutés.
+rafraîchissement unique, FIFO, latence et erreur sous concurrence strictement
+unitaire, mutations caller/fournisseur, changements d'epoch avant et pendant un
+fetch, nettoyage et annulation d'admission, classification trusted par caller,
+legacy/v0/ALT et entrée non ciblée non normalisable. Les tests du locator direct,
+du client RPC et du transport restent exécutés.
