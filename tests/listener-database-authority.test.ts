@@ -14,6 +14,7 @@ import { createExecutionPreflightIntentPairInTransaction } from
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 import { seedCanonicalV2Source } from './helpers/execution-preflight-v2-source-fixture.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 
@@ -409,8 +410,11 @@ void test('PostgreSQL 16 listener login can write business projections but no li
     } finally {
       if (listener !== undefined) await listener.end();
       if (isolated !== undefined) await isolated.end();
-      await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+      await waitForBackendDrain(maintenance, databaseName);
+      const terminated = await maintenance.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
         WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+      assert.equal(terminated.rowCount, 0);
       await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
       await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
       try { await release(); } finally { await maintenance.end(); }

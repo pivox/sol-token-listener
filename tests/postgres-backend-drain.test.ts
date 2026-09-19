@@ -85,3 +85,33 @@ void test('gates live-recovery forced cleanup behind the backend drain barrier',
       && dropRole > dropDatabase,
   );
 });
+
+void test('gates listener-authority forced cleanup behind the backend drain barrier', async () => {
+  const source = await readFile(
+    new URL('./listener-database-authority.test.ts', import.meta.url),
+    'utf8',
+  );
+  const testStart = source.indexOf(
+    "void test('PostgreSQL 16 listener login can write business projections but no live state'",
+  );
+  assert.notEqual(testStart, -1);
+  const testEnd = source.indexOf('\n  });\n\nfunction quoteIdentifier', testStart);
+  assert.notEqual(testEnd, -1);
+  const body = source.slice(testStart, testEnd);
+  const listenerEnd = body.indexOf('await listener.end()');
+  const isolatedEnd = body.indexOf('await isolated.end()');
+  const drain = body.indexOf('await waitForBackendDrain(maintenance, databaseName)');
+  const terminate = body.indexOf('SELECT pg_terminate_backend(pid)');
+  const terminationAssertion = body.indexOf('assert.equal(terminated.rowCount, 0)');
+  const dropDatabase = body.indexOf('DROP DATABASE IF EXISTS');
+  const dropRole = body.indexOf('DROP ROLE IF EXISTS');
+  assert.ok(
+    listenerEnd >= 0
+      && isolatedEnd > listenerEnd
+      && drain > isolatedEnd
+      && terminate > drain
+      && terminationAssertion > terminate
+      && dropDatabase > terminationAssertion
+      && dropRole > dropDatabase,
+  );
+});

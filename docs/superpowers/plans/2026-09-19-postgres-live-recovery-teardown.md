@@ -40,3 +40,14 @@
 - [x] Run `npm run build`, `npm run check`, `npm run lint` and `git diff --check`.
 - [x] Review the diff and prove no file under `src/` changed.
 - [x] Commit, push and open one PR referencing #128 without requesting review or merging.
+
+### Task 4: Extend the barrier to listener-authority cleanup
+
+**Files:**
+- Modify: `tests/listener-database-authority.test.ts`
+- Modify: `tests/postgres-backend-drain.test.ts`
+
+- [x] Add a failing structural test for close, drain, zero-termination assertion and drop order.
+- [x] Reuse the shared barrier after both listener-authority pools close.
+- [x] Assert the termination safety net affects zero rows before dropping the database and role.
+- [x] Repeat the PostgreSQL 16 listener-authority test ten times sequentially.
