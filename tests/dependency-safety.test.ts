@@ -118,7 +118,7 @@ void test('locks the reviewed runtime graph without overrides or the unused Rayd
     '@pump-fun/pump-sdk': '1.36.0',
     '@pump-fun/pump-swap-sdk': '1.19.0',
     '@solana/spl-token': '0.4.15',
-    '@solana/web3.js': '1.98.4',
+    '@solana/web3.js': '1.99.0',
     'bn.js': '5.2.5',
     parse5: '8.0.1',
     pg: '8.23.0',

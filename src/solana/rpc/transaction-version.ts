@@ -1,0 +1,1 @@
+export const MAX_SUPPORTED_TRANSACTION_VERSION = 1 as const;

@@ -3,6 +3,7 @@ import bs58 from 'bs58';
 import { PublicKey, VersionedTransaction } from '@solana/web3.js';
 import type { ExecutionReconciliationGateway, FinalizedWalletDeltasV1, ObservedExecutionTransactionV1, WalletDeltaRequestV1 } from '../ports/execution-reconciliation-gateway.js';
 import type { LiveConfirmationGateway, LiveSignatureObservationV1 } from '../ports/execution-confirmation-gateway.js';
+import { MAX_SUPPORTED_TRANSACTION_VERSION } from '../solana/rpc/transaction-version.js';
 
 export type LiveRecoveryRpcErrorCode =
   | 'INVALID_INPUT'
@@ -243,7 +244,7 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
     signal: AbortSignal,
   ): Promise<FinalizedTransactionObservation | null> {
     const raw = await this.dispatch('getTransaction', [signature, Object.freeze({
-      commitment: 'finalized', encoding: 'base64', maxSupportedTransactionVersion: 0,
+      commitment: 'finalized', encoding: 'base64', maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
     })], signal);
     if (raw === null) return null;
     try {
@@ -289,7 +290,7 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         observedAtMs: timestamp(this.#clock()),
         signature: observedSignature,
         blockhash: publicKeyValue(transaction.message.recentBlockhash),
-        messageHash: createHash('sha256').update(transaction.message.serialize()).digest('hex'),
+        messageHash: createHash('sha256').update(serializedMessage(bytes, transaction)).digest('hex'),
         accountKeys: Object.freeze(accountKeys),
         feeLamports: unsignedInteger(meta.fee),
         preBalances,
@@ -427,18 +428,31 @@ function balanceArray(value: unknown): readonly bigint[] {
   return Object.freeze(value.map(unsignedInteger));
 }
 
-function transactionVersion(value: unknown): 'legacy' | 0 {
-  if (value === 'legacy' || value === 0) return value;
+function serializedMessage(bytes: Uint8Array, transaction: VersionedTransaction): Uint8Array {
+  if (transaction.message.version !== MAX_SUPPORTED_TRANSACTION_VERSION) {
+    return transaction.message.serialize();
+  }
+  const messageLength = bytes.length - transaction.signatures.length * 64;
+  if (!Number.isSafeInteger(messageLength) || messageLength < 1 || bytes[0] !== 0x81) {
+    return invalidResponse();
+  }
+  return bytes.subarray(0, messageLength);
+}
+
+type SupportedTransactionVersion = 'legacy' | 0 | typeof MAX_SUPPORTED_TRANSACTION_VERSION;
+
+function transactionVersion(value: unknown): SupportedTransactionVersion {
+  if (value === 'legacy' || value === 0 || value === MAX_SUPPORTED_TRANSACTION_VERSION) return value;
   return invalidResponse();
 }
 
 function transactionLoadedAddresses(
   value: unknown,
-  version: 'legacy' | 0,
+  version: SupportedTransactionVersion,
   expected: Readonly<{ readonly writable: number; readonly readonly: number }>,
 ): Readonly<{ readonly writable: readonly string[]; readonly readonly: readonly string[] }> {
   if (value === undefined) {
-    if (version !== 'legacy') invalidResponse();
+    if (version === 0) invalidResponse();
     return Object.freeze({ writable: Object.freeze([]), readonly: Object.freeze([]) });
   }
   const addresses = record(value);
@@ -456,7 +470,7 @@ function transactionLoadedAddresses(
 function transactionLoadedAddressCounts(
   transaction: VersionedTransaction,
 ): Readonly<{ readonly writable: number; readonly readonly: number }> {
-  if (transaction.message.version === 'legacy') {
+  if (transaction.message.version !== 0) {
     return Object.freeze({ writable: 0, readonly: 0 });
   }
   let writable = 0;

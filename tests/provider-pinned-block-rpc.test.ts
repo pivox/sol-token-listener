@@ -37,9 +37,9 @@ void test('pins complete-block reads to the selected provider HTTP URL and maps 
   assert.deepEqual(await source.getBlockTransactions(14n, 'PROCESSED'), { transactions: [] });
   assert.equal(created, 1);
   assert.deepEqual(calls, [
-    [12, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false }],
-    [13, { commitment: 'finalized', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false }],
-    [14, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false }],
+    [12, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 1, rewards: false }],
+    [13, { commitment: 'finalized', transactionDetails: 'full', maxSupportedTransactionVersion: 1, rewards: false }],
+    [14, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 1, rewards: false }],
   ]);
 });
 
@@ -178,7 +178,7 @@ void test('captures descriptor methods and maps hostile RPC failures to a fixed 
   const getBlock = function getBlock(this: unknown, slot: number, options: unknown): unknown {
     assert.equal(this, rpc);
     assert.equal(slot, 7);
-    assert.deepEqual(options, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 0, rewards: false });
+    assert.deepEqual(options, { commitment: 'confirmed', transactionDetails: 'full', maxSupportedTransactionVersion: 1, rewards: false });
     throw new Error('https://rpc-secret.invalid/token');
   };
   Object.defineProperty(getBlock, 'call', { get() { callGetterReads += 1; throw new Error('call-secret'); } });
