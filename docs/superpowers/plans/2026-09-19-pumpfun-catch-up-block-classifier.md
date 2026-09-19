@@ -362,7 +362,9 @@ text and raw payload.
 Before the command below, add one offline integration case using the real
 `CachedSolanaBlockTransactionLocator`: classify at least two absent signatures
 from the same cold slot and effective commitment, then assert
-`locator.metrics.fetches === 1`, zero repository writes and no pending work.
+`locator.metrics.fetches === 1`, zero repository writes while the shared flight
+is pending, then one deterministic `PROVIDER_SIGNATURE_MISSING` quarantine per
+signature and no pending work.
 
 ```bash
 npx tsx --test tests/pumpfun-catch-up-block-classifier.test.ts

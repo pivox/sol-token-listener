@@ -1,6 +1,6 @@
 # Pump.fun Catch-up Block Classifier Design
 
-Version: 1.0.3 — 2026-09-19 — issue #133.
+Version: 1.0.4 — 2026-09-19 — issue #133.
 
 ## Goal and status
 
@@ -206,8 +206,9 @@ deterministic persistence order.
 
 An offline integration test composes the classifier with
 `CachedSolanaBlockTransactionLocator` and proves that multiple absent targets
-sharing a cold `(slot, commitment, epoch)` join one fetch, settle without a
-write, and leave no pending locator work.
+sharing a cold `(slot, commitment, epoch)` join one fetch, produce their
+deterministic `PROVIDER_SIGNATURE_MISSING` quarantines only after the shared
+flight settles, and leave no pending locator work.
 
 PostgreSQL 16 repository tests prove that a semantic replay with newer
 `observedAtMs`/`classifiedAtMs` preserves the first classification, terminal and
