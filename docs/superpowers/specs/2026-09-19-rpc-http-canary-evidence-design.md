@@ -1,7 +1,9 @@
 # RPC HTTP Canary Evidence Design
 
-Version: 1.0.0  
-Status: approved for implementation under the standing operator instruction  
+Version: 1.0.0
+
+Status: approved for implementation under the standing operator instruction
+
 Issue: #142, part 1 of #140
 
 ## Goal
