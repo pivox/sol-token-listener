@@ -450,9 +450,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             && finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
             throw internalRepositoryError(new TransactionInboxConflictError('finality'));
           }
-          const replayTerminalAt = shouldReplay ? null : pristine
-            ? (replayDecision.status === 'PENDING' ? null : dateFromMs(value.classifiedAtMs))
-            : nullableDateFromMs(nullableDateMs(row.terminal_at, 'classification replay terminal at'));
+          const storedTerminalAt = nullableDateFromMs(nullableDateMs(
+            row.terminal_at,
+            'classification replay terminal at',
+          ));
+          const replayTerminalAt = shouldReplay || replayDecision.status === 'PENDING'
+            ? null
+            : storedTerminalAt ?? (pristine && replayDecision.status === 'DEFERRED'
+              ? dateFromMs(value.classifiedAtMs)
+              : null);
           const updated = await client.query(
             `UPDATE chain_transaction_inbox SET
                discovery_sources=$2,program_ids=$3,target_confirmation_status=$4,
@@ -2419,8 +2425,8 @@ function storedClassificationMatches(
     || row.catch_up_reason_code !== value.reasonCode
     || row.catch_up_action_key !== actionKey
     || row.catch_up_evidence_fingerprint !== value.evidenceFingerprint
-    || dateMs(row.catch_up_classified_at, 'catch-up classified at') !== value.classifiedAtMs
     || !discoverySources(row.discovery_sources).includes('CATCH_UP')) return false;
+  dateMs(row.catch_up_classified_at, 'catch-up classified at');
   const storedMints = storedCatchUpMints(row.catch_up_mints);
   if (storedMints.length !== value.mints.length
     || storedMints.some((mint, index) => mint !== value.mints[index])) return false;
