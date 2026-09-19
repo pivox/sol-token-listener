@@ -143,21 +143,51 @@ void test('ordinary discovery converges terminal catch-up evidence without resur
   });
 });
 
-void test('replays exact classification idempotently and rejects every immutable contradiction', async (context) => {
+void test('replays semantic classification with a newer clock without extending durable timestamps', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const [signature, disposition, reasonCode, ingestionHint, ingestionHintMint] of [
+      ['classified-replay-actionable', 'ACTIONABLE', 'PUMP_ACTION_SUPPORTED', 'PUMPFUN_CREATE', null],
+      ['classified-replay-deferred', 'DEFERRED', 'PUMP_TRADE_UNTRACKED', 'PUMPFUN_TRADE', tradeMint],
+      ['classified-replay-ignored', 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION', null, null],
+      ['classified-replay-quarantined', 'QUARANTINED', 'PUMP_SCHEMA_UNSUPPORTED', null, null],
+    ] as const) {
+      const classification = createCatchUpClassification({
+        ...catchUpClassificationInput(signature),
+        disposition, reasonCode, ingestionHint, ingestionHintMint,
+        mints: disposition === 'IGNORED' || disposition === 'QUARANTINED'
+          ? Object.freeze([]) : Object.freeze([tradeMint]),
+      });
+      await repository.recordCatchUpClassification(classification);
+      const before = await row(pool, classification.signature);
+
+      await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...classification,
+        observedAtMs: 2_000,
+        classifiedAtMs: 2_001,
+      }));
+
+      const replayed = await row(pool, classification.signature);
+      assert.equal(replayed.observed_at.getTime(), before.observed_at.getTime());
+      assert.equal(replayed.catch_up_classified_at.getTime(), before.catch_up_classified_at.getTime());
+      assert.equal(replayed.terminal_at?.getTime() ?? null, before.terminal_at?.getTime() ?? null);
+      assert.equal(replayed.purge_after?.getTime() ?? null, before.purge_after?.getTime() ?? null);
+    }
+  });
+});
+
+void test('semantic classification replay still rejects immutable contradictions', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
     const classification = createCatchUpClassification({
-      ...catchUpClassificationInput('classified-replay'),
+      ...catchUpClassificationInput('classified-replay-contradiction'),
       ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
       mints: ['11111111111111111111111111111111', tradeMint].sort(),
     });
     await repository.recordCatchUpClassification(classification);
     const before = await row(pool, classification.signature);
-    await repository.recordCatchUpClassification(classification);
-    assert.deepEqual(await row(pool, classification.signature), before);
     for (const changed of [
       { evidenceFingerprint: 'b'.repeat(64) },
-      { classifiedAtMs: 1_002 },
       { disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED' },
     ]) {
       const contradictory = createCatchUpClassification({
@@ -170,6 +200,37 @@ void test('replays exact classification idempotently and rejects every immutable
         error instanceof TransactionInboxConflictError && error.conflict === 'classification');
     }
     assert.deepEqual(await row(pool, classification.signature), before);
+  });
+});
+
+void test('semantic deferred replay clears its original retention only when the mint becomes active', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('classified-deferred-replay-promotion'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    });
+    await repository.recordCatchUpClassification(classification);
+    const before = await row(pool, classification.signature);
+    assert.equal(before.processing_status, 'DEFERRED');
+    assert.equal(before.terminal_at.getTime(), classification.classifiedAtMs);
+    assert.equal(before.purge_after.getTime(), classification.classifiedAtMs + 14_400_000);
+
+    await insertTrackedLaunch(pool);
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...classification,
+      observedAtMs: 2_000,
+      classifiedAtMs: 2_001,
+    }));
+
+    const promoted = await row(pool, classification.signature);
+    assert.equal(promoted.processing_status, 'PENDING');
+    assert.equal(promoted.ingestion_priority, 'TRACKED_TRADE');
+    assert.equal(promoted.terminal_at, null);
+    assert.equal(promoted.purge_after, null);
+    assert.equal(promoted.observed_at.getTime(), before.observed_at.getTime());
+    assert.equal(promoted.catch_up_classified_at.getTime(), before.catch_up_classified_at.getTime());
   });
 });
 
@@ -213,6 +274,8 @@ void test('classification finality replay reprocesses a confirmed snapshot befor
     const finalizedReplay = createCatchUpClassification({
       ...catchUpClassificationInput(initial.signature),
       confirmationStatus: 'finalized',
+      observedAtMs: 2_000,
+      classifiedAtMs: 2_001,
     });
     await repository.recordCatchUpClassification(finalizedReplay);
 
@@ -223,6 +286,8 @@ void test('classification finality replay reprocesses a confirmed snapshot befor
     assert.equal(replayPending.terminal_at, null);
     assert.equal(replayPending.purge_after, null);
     assert.equal(replayPending.finality_evidence_version, '1');
+    assert.equal(replayPending.observed_at.getTime(), initial.observedAtMs);
+    assert.equal(replayPending.catch_up_classified_at.getTime(), initial.classifiedAtMs);
     const secondClaim = await repository.claim(1_003, 30);
     assert.ok(secondClaim?.normalizedTransaction);
     assert.equal(secondClaim.confirmationStatus, 'finalized');
