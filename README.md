@@ -517,6 +517,45 @@ tête jusqu'à l'ancienne tête figée avant toute promotion `RUNNING`.
 Ce bootstrap réduit uniquement l'historique d'une base fraîche ; il ne suffit
 pas à lui seul à garantir les seuils backlog/RSS du canary Mainnet de 15 minutes.
 
+### Admission de pages Pump.fun au rattrapage (canary observe-only)
+
+L'admission de pages classifiées Pump.fun est désactivée par défaut avec
+`LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false`. Sa seule activation
+possible est un redémarrage explicite : il n'existe ni hot reload ni bascule à
+chaud. Le profil de canary est strictement le suivant :
+
+```dotenv
+EXECUTION_MODE=observe
+LISTENER_ENABLED=true
+LISTENER_INGESTION_SCOPE=launchpad-only
+LISTENER_CATCH_UP_POLICY=live-edge
+LISTENER_BLOCK_HYDRATION_ENABLED=true
+LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true
+```
+
+Il requiert aussi le hash genesis canonique du cluster et une paire HTTP/WebSocket
+valide pour chaque provider configuré. Compose transmet ce dernier flag au seul
+service `app`, avec la valeur sûre `false` par défaut ; les services migration,
+rétention et frontend ne le reçoivent pas. Le chemin reste uniquement
+d'observation : il ne lit aucun wallet ni clé privée, ne compose aucun executor,
+ne signe ni ne soumet de transaction.
+
+Une page stricte reste liée au provider qui l'a fournie. Un cache unique partagé
+par les workers et les scans impose le pacing global : une seule récupération
+active, `LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS >= 250` et donc au plus
+quatre fetches démarrés par seconde, tous providers confondus. Tout changement de
+promotion invalide l'époque de cache ; aucun résultat d'un ancien provider ne
+peut être réutilisé. Le rollback est de remettre
+`LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis de redémarrer. Les
+receipts de classification/admission restent une preuve historique et expirent
+selon leur rétention de quatre heures.
+
+Cette livraison ne déclare aucune readiness Mainnet. Après merge seulement, le
+canary Mainnet observe-only séparé de 15 minutes doit valider zéro HTTP 429, le
+backlog et le RSS bornés, p95, finalité, idempotence, rétention quatre heures,
+affinité provider et arrêt propre ; voir le
+[runbook d'hydratation](docs/operations/block-hydration-canary.md).
+
 Une panne retryable est replanifiée avec un
 délai exponentiel piloté par `RPC_RETRY_BASE_DELAY_MS` et plafonné à 60 s.
 `RPC_RETRY_MAX_ATTEMPTS` compte les prises de lease d'un cycle, première

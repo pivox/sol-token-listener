@@ -932,6 +932,31 @@ pacing FIFO. Les réglages stricts et les métriques de l’activation sont
 versionnés dans la [spécification #114](../superpowers/specs/2026-09-12-block-hydration-activation-design.md).
 Les leases, le catch-up strict et la réconciliation de finalité restent inchangés.
 
+### Admission de page Pump.fun provider-affine (canary B3b)
+
+`LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` conserve exactement la
+composition legacy et reste le défaut. Seul le texte canonique `true`, lu une
+fois au démarrage, active le chemin ; ce flag est restart-only et ne connaît pas
+de hot reload. Avant toute E/S base ou réseau, cette activation refuse si le
+listener n'est pas activé, si le mode n'est pas `observe`, si le scope n'est pas
+`launchpad-only`, si la policy n'est pas `live-edge`, si l'hydratation bloc n'est
+pas activée, si le genesis n'est pas celui du cluster configuré, ou si une paire
+HTTP/WebSocket provider est invalide.
+
+La factory crée alors un coordinateur provider-affine avec un cache unique,
+une file FIFO commune et un seul fetch actif. Chaque scan strict est épinglé au
+provider de sa page ; le worker attend les scans puis relit la promotion avant de
+retourner un résultat. Un changement de provider incrémente l'époque, évacue le
+cache et empêche tout résultat ancien d'être conservé ou renvoyé. Le cache reste
+l'autorité de pacing globale : avec un intervalle de fetch d'au moins 250 ms,
+aucun appelant ni provider ne peut démarrer plus de quatre fetches par seconde.
+
+Les métriques `catchUpAdmission` sont additives au heartbeat, sans payload,
+signature, URL ou secret. La factory ferme d'abord le worker, puis le
+coordinateur/cache ; l'arrêt refuse les nouvelles admissions et laisse les
+opérations bornées déjà actives se terminer. Aucun wallet, clé privée, executor,
+armement ou soumission de transaction ne fait partie de cette composition.
+
 ## Console opérateur indépendante
 
 Le frontend React est un consommateur externe des ports HTTP/SSE : il n’importe

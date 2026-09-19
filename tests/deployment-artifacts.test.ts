@@ -364,6 +364,43 @@ void test('block hydration canary proves active routing and bounded serialized a
   assert.match(runbook, /Toute autre valeur entraîne\s+`FAIL`/iu);
 });
 
+void test('catch-up admission documentation fixes the restart-only activation and Mainnet gate', async () => {
+  const [readme, architecture, api, runbook] = await Promise.all([
+    readArtifact('README.md'),
+    readArtifact('docs/architecture/pumpfun-v1.md'),
+    readArtifact('docs/api/v1.md'),
+    readArtifact('docs/operations/block-hydration-canary.md'),
+  ]);
+  const all = `${readme}\n${architecture}\n${api}\n${runbook}`;
+
+  assert.match(all, /LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false/u);
+  for (const setting of [
+    'EXECUTION_MODE=observe',
+    'LISTENER_ENABLED=true',
+    'LISTENER_INGESTION_SCOPE=launchpad-only',
+    'LISTENER_CATCH_UP_POLICY=live-edge',
+    'LISTENER_BLOCK_HYDRATION_ENABLED=true',
+    'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true',
+  ]) assert.match(all, new RegExp(setting, 'u'));
+  assert.match(all, /redémarr/iu);
+  assert.match(all, /rollback[^.]{0,120}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false/iu);
+  assert.match(all, /provider-affin|affinité fournisseur/iu);
+  assert.match(all, /une seule cache|cache unique|global[^.]{0,120}4[^.]{0,40}fetch/iu);
+  assert.match(all, /aucun[^.]{0,80}(?:wallet|clé privée|executor|exécuteur|soumission)/iu);
+  for (const field of [
+    'version', 'enabled', 'providerId', 'scanActive', 'workerClaimReady',
+    'actionableBacklogBySource', 'actionableBacklogByPriority', 'deferredCount',
+    'ignoredCount', 'quarantinedCount',
+  ]) assert.match(api, new RegExp(`catchUpAdmission[\\s\\S]{0,2000}${field}`, 'u'));
+  assert.match(api, /absence \(champ omis, jamais `null`\) signifie qu'un backend\s+antérieur/iu);
+  assert.match(api, /providerId[^.]{0,250}null/iu);
+  assert.match(runbook, /Canary Mainnet post-merge[\s\S]{0,100}15 minutes/iu);
+  for (const gate of ['zéro HTTP 429', 'backlog', 'RSS', 'p95', 'finalit', 'idempot', 'quatre heures', 'affinit', 'shutdown']) {
+    assert.match(runbook, new RegExp(gate, 'iu'));
+  }
+  assert.match(runbook, /readiness Mainnet[^.]*déclarée avant/iu);
+});
+
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {
   const vite = await readArtifact('frontend/vite.config.ts');
   const readme = await readArtifact('frontend/README.md');

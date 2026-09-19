@@ -40,7 +40,7 @@ export class PumpFunStrictCatchUpPageAdmitterError extends Error {
   }
 }
 
-/** Inactive B3a adapter. The production factory does not construct it yet. */
+/** B3b composes this adapter for provider-affine Pump.fun strict scans when the restart-only flag is enabled. */
 export class PumpFunStrictCatchUpPageAdmitter implements StrictCatchUpPageAdmitter {
   public constructor(private readonly classifier: PumpFunCatchUpPageClassifier) {}
 
