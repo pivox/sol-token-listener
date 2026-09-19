@@ -312,7 +312,8 @@ function activeRun(key: ProcessingCheckpointKey = 'launchpad'): StrictCatchUpRun
   return createStrictCatchUpRun({
     checkpointKey: key, previous: checkpoint(key, 'boundary', 10), providerId: 'primary',
     observedHead: { signature: 'head', slot: 14n }, beforeSignature: 'cursor', lastAcceptedSlot: 13n,
-    pagesScanned: 1n, signaturesEnqueued: 2n, revision: 0n, startedAtMs: 1_000, updatedAtMs: 1_000,
+    pagesScanned: 1n, signaturesEnqueued: 2n, signaturesClassified: 2n,
+    revision: 0n, startedAtMs: 1_000, updatedAtMs: 1_000,
   });
 }
 

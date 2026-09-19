@@ -415,6 +415,9 @@ export class StrictCatchUpScanner {
             beforeSignature: tail.signature, lastAcceptedSlot: tail.slot,
             pagesScanned: (current?.pagesScanned ?? 0n) + 1n,
             signaturesEnqueued: (current?.signaturesEnqueued ?? 0n) + BigInt(rows.length),
+            // B1 only adds accounting. Until the classifier is activated,
+            // every legacy-enqueued signature counts as technically classified.
+            signaturesClassified: (current?.signaturesClassified ?? 0n) + BigInt(rows.length),
             updatedAtMs: observedAtMs,
           };
           if (current === null) {

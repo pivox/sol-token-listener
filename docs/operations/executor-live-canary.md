@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.17.7 — 2026-09-12
+**Version :** 1.17.8 — 2026-09-12
 
 La version 1.17.7 ajoute la migration 047. Le hint fermé `PUMPFUN_TRADE`
 transporte uniquement un mint public ; PostgreSQL le classe `TRACKED_TRADE` si
@@ -77,7 +77,7 @@ aucune procédure ni frontière de sécurité.
 
 H2k-b reste disponible mais désactivé par défaut : son
 runner one-shot prépare une paire target/probe exacte et H2h v2 l'exporte par
-`preparationRunId`. Le head de migration est 047. Aucune clé n'est chargée,
+`preparationRunId`. Le head de migration est 048. Aucune clé n'est chargée,
 aucune transaction n'est signée, armée ou soumise par H2k-b, et le canary
 reste non démarré.
 

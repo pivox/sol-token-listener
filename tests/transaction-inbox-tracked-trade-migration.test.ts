@@ -76,12 +76,13 @@ void test('047 upgrades 001..046 without losing rows, backfills hints and replay
   });
 });
 
-void test('047 is the clean-database head and the migration runner remains idempotent', async (context) => {
+void test('047 remains installed beneath the clean-database head and the runner is idempotent', async (context) => {
   await withDatabase(context, async (pool) => {
     await migrationSql();
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
-    assert.equal(applied.length, 47);
+    assert.equal(applied.includes(migrationName), true);
+    assert.equal(applied.at(-1), '048_transaction_inbox_catch_up_classification.sql');
+    assert.equal(applied.length, 48);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.deepEqual((await pool.query(`SELECT scheduler_key, consecutive_urgent_claims
       FROM chain_transaction_inbox_claim_scheduler`)).rows, [{ scheduler_key: 'global', consecutive_urgent_claims: 0 }]);
