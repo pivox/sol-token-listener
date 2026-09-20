@@ -534,6 +534,85 @@ const rpcHttpEvidenceSchema = z.object({
     rpcHttpProviderEvidenceSchema('fallback-3'),
   ]),
 }).strict();
+const FIRST_PROCESSING_THRESHOLD_MS = 45_000;
+const FIRST_PROCESSING_COHORT_DURATION_MS = 900_000;
+const FIRST_PROCESSING_COHORT_CAPACITY = 50_000;
+const firstProcessingIntegerSchema = z.number().int().nonnegative().refine(
+  (value) => Number.isSafeInteger(value) && !Object.is(value, -0),
+);
+const firstProcessingCanarySchema = z.object({
+  version: z.literal(1),
+  thresholdMs: z.literal(FIRST_PROCESSING_THRESHOLD_MS),
+  cohortCapacity: z.literal(FIRST_PROCESSING_COHORT_CAPACITY),
+  cohortStartedAtMs: firstProcessingIntegerSchema,
+  cohortEndsAtMs: firstProcessingIntegerSchema,
+  sampledAtMs: firstProcessingIntegerSchema,
+  overflowed: z.boolean(),
+  eligibleCount: firstProcessingIntegerSchema,
+  completedCount: firstProcessingIntegerSchema,
+  underThresholdCount: firstProcessingIntegerSchema,
+  atOrAboveThresholdCount: firstProcessingIntegerSchema,
+  pendingCount: firstProcessingIntegerSchema,
+  rightCensoredCount: firstProcessingIntegerSchema,
+  tailCensoredCount: firstProcessingIntegerSchema,
+  terminalCount: firstProcessingIntegerSchema,
+  unavailableCount: firstProcessingIntegerSchema,
+  invalidDurationCount: firstProcessingIntegerSchema,
+  p95Ms: firstProcessingIntegerSchema.nullable(),
+  verdict: z.enum(['PASS', 'FAIL', 'INCONCLUSIVE']),
+}).strict().refine((value) => {
+  const cohortEndsAtMs = safeIntegerSum([
+    value.cohortStartedAtMs, FIRST_PROCESSING_COHORT_DURATION_MS,
+  ]);
+  const verdictDeadlineMs = cohortEndsAtMs === null
+    ? null
+    : safeIntegerSum([cohortEndsAtMs, FIRST_PROCESSING_THRESHOLD_MS]);
+  const pendingCount = safeIntegerSum([
+    value.rightCensoredCount, value.tailCensoredCount,
+  ]);
+  const completedCount = safeIntegerSum([
+    value.underThresholdCount, value.atOrAboveThresholdCount,
+  ]);
+  const eligibleCount = safeIntegerSum([
+    value.completedCount, value.pendingCount, value.terminalCount,
+    value.unavailableCount, value.invalidDurationCount,
+  ]);
+  if (cohortEndsAtMs === null || verdictDeadlineMs === null
+    || value.cohortEndsAtMs !== cohortEndsAtMs
+    || value.sampledAtMs < value.cohortStartedAtMs
+    || value.eligibleCount > FIRST_PROCESSING_COHORT_CAPACITY
+    || (value.overflowed && value.eligibleCount !== FIRST_PROCESSING_COHORT_CAPACITY)
+    || pendingCount !== value.pendingCount
+    || completedCount !== value.completedCount
+    || eligibleCount !== value.eligibleCount) return false;
+  if (value.p95Ms === null) {
+    if (value.completedCount !== 0) return false;
+  } else {
+    if (value.completedCount === 0) return false;
+    const rank = (95n * BigInt(value.completedCount) + 99n) / 100n;
+    if ((rank <= BigInt(value.underThresholdCount)
+      && value.p95Ms >= FIRST_PROCESSING_THRESHOLD_MS)
+      || (rank > BigInt(value.underThresholdCount)
+      && value.p95Ms < FIRST_PROCESSING_THRESHOLD_MS)) return false;
+  }
+  const fail = value.invalidDurationCount > 0
+    || (value.p95Ms !== null && value.p95Ms >= FIRST_PROCESSING_THRESHOLD_MS);
+  const incomplete = value.sampledAtMs < verdictDeadlineMs
+    || value.eligibleCount === 0 || value.overflowed || value.pendingCount > 0
+    || value.terminalCount > 0 || value.unavailableCount > 0;
+  const expectedVerdict = fail ? 'FAIL' : incomplete ? 'INCONCLUSIVE' : 'PASS';
+  return value.verdict === expectedVerdict;
+});
+
+function safeIntegerSum(values: readonly number[]): number | null {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
 const healthSchema = z.object({
   status: z.enum(['OK', 'DEGRADED']),
   observedAt: timestampSchema,
@@ -580,6 +659,7 @@ const healthSchema = z.object({
     blockHydration: blockHydrationSchema.nullish(),
     catchUpAdmission: catchUpAdmissionSchema.nullish(),
     rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
+    firstProcessingCanary: firstProcessingCanarySchema.nullish(),
   }).loose().refine(({ catchUpAdmission, backlogCount }) => {
     if (catchUpAdmission === undefined || catchUpAdmission === null) return true;
     const source = catchUpAdmission.actionableBacklogBySource;

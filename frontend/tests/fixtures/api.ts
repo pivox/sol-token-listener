@@ -239,6 +239,28 @@ export const paperPosition = {
   reasonCodes: ['EXTERNAL_BUY_TARGET_REACHED'],
 } as const;
 
+export const firstProcessingCanary = {
+  version: 1,
+  thresholdMs: 45_000,
+  cohortCapacity: 50_000,
+  cohortStartedAtMs: 1_000_000,
+  cohortEndsAtMs: 1_900_000,
+  sampledAtMs: 1_945_000,
+  overflowed: false,
+  eligibleCount: 3,
+  completedCount: 3,
+  underThresholdCount: 3,
+  atOrAboveThresholdCount: 0,
+  pendingCount: 0,
+  rightCensoredCount: 0,
+  tailCensoredCount: 0,
+  terminalCount: 0,
+  unavailableCount: 0,
+  invalidDurationCount: 0,
+  p95Ms: 44_999,
+  verdict: 'PASS',
+} as const;
+
 export const health = {
   status: 'DEGRADED',
   observedAt: NOW,
@@ -260,6 +282,7 @@ export const health = {
     leasedCount: 0, exhaustedCount: 0, startedAt: NOW, updatedAt: NOW,
     lastHttpSlot: '100', lastWebsocketSlot: '100', lastFinalizedSlot: '99',
     lastSignature: null, pendingTransactions: 1, activeSessions: 1,
+    firstProcessingCanary,
     blockHydration: {
       version: 1, enabled: true, callerConcurrency: 1,
       locates: 10, hits: 6, misses: 4, inFlightJoins: 0, fetches: 4,

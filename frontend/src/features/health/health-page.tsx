@@ -28,11 +28,32 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Hydratation des blocs"><BlockHydrationDiagnostic value={health.heartbeat.blockHydration} /></HealthCard>
         <HealthCard title="Admission catch-up"><CatchUpAdmissionDiagnostic value={health.heartbeat.catchUpAdmission} /></HealthCard>
         <HealthCard title="HTTP RPC"><RpcHttpEvidenceDiagnostic value={health.heartbeat.rpcHttpEvidence} /></HealthCard>
+        <HealthCard title="Premier traitement"><FirstProcessingCanaryDiagnostic value={health.heartbeat.firstProcessingCanary} /></HealthCard>
         <HealthCard title="WebSocket Solana"><WebSocketDiagnostic websocket={health.heartbeat.websocket} /></HealthCard>
         <HealthCard title="Checkpoints"><p>Launchpad : {health.checkpoints.launchpad ?? 'Indisponible'}</p><p>Marché : {health.checkpoints.market ?? 'Indisponible'}</p><p>Retard : {health.lagSlots ?? 'Indisponible'} slot(s)</p></HealthCard>
       </div>
     </section>
   );
+}
+
+function FirstProcessingCanaryDiagnostic({
+  value,
+}: {
+  readonly value: ApiHealth['heartbeat']['firstProcessingCanary'];
+}): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  const drainComplete = value.sampledAtMs >= value.cohortEndsAtMs + 45_000;
+  return <>
+    <p>Verdict : <strong>{value.verdict}</strong></p>
+    <p>p95 : {value.p95Ms === null ? 'Indisponible' : `${String(value.p95Ms)} ms`}</p>
+    <p>Sous 45 s : {value.underThresholdCount} ; à partir de 45 s : {value.atOrAboveThresholdCount}</p>
+    <p>Éligibles : {value.eligibleCount} ; terminés : {value.completedCount} ; en attente : {value.pendingCount}</p>
+    <p>Censure droite : {value.rightCensoredCount} ; censure de queue : {value.tailCensoredCount}</p>
+    <p>Terminaux : {value.terminalCount} ; indisponibles : {value.unavailableCount} ; durées invalides : {value.invalidDurationCount}</p>
+    <p>Overflow : {value.overflowed ? 'Oui' : 'Non'}</p>
+    <p>Drain : {drainComplete ? 'Terminé' : 'En cours'}</p>
+  </>;
 }
 
 function RpcHttpEvidenceDiagnostic({
