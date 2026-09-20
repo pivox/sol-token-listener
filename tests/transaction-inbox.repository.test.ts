@@ -870,6 +870,28 @@ void test('leaves finality advancement uncovered and fails closed on coverage id
   });
 });
 
+void test('covers WebSocket provenance after mutable trade routing converges to NONE', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const candidate = catchUpCoverageCandidate('coverage-trade-hint-converged', 86n, 'processed');
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(candidate.signature), slot: candidate.slot,
+      confirmationStatus: candidate.confirmationStatus,
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint, mints: [tradeMint],
+    }));
+    await repository.enqueue(notification(
+      candidate.signature, candidate.slot, 'WEBSOCKET', candidate.confirmationStatus,
+    ));
+    const stored = await row(pool, candidate.signature);
+    assert.equal(stored.ingestion_hint, 'NONE');
+    assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.deepEqual(await repository.readExistingCatchUpCoverage(
+      [candidate], new AbortController().signal,
+    ), [catchUpCoverageReceipt(candidate)]);
+  });
+});
+
 void test('fails closed on success and failed-transaction outcome contradictions in both arrival orders', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);

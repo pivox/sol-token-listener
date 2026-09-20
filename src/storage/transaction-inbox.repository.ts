@@ -816,8 +816,6 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            inbox.program_ids AS inbox_program_ids,
            inbox.target_confirmation_status AS inbox_confirmation_status,
            inbox.observed_at AS inbox_observed_at,
-           inbox.ingestion_hint AS inbox_ingestion_hint,
-           inbox.ingestion_hint_mint AS inbox_ingestion_hint_mint,
            inbox.finality_evidence_version AS inbox_finality_evidence_version,
            inbox.immutable_fingerprint AS inbox_immutable_fingerprint,
            inbox.processed_at AS inbox_processed_at,
@@ -2802,8 +2800,8 @@ function validateStoredCoverageClassification(
   }
   if (!sources.includes('CATCH_UP')) throw new TypeError('Stored catch-up classification is invalid.');
   const mints = storedCatchUpMints(row.catch_up_mints);
-  const storedHint: unknown = row.inbox_ingestion_hint;
-  const storedHintMint: unknown = row.inbox_ingestion_hint_mint;
+  const actionKey = requiredTextValue(row.catch_up_action_key, 'catch-up action key');
+  const action = classificationActionFromKey(actionKey);
   const disposition: unknown = row.catch_up_disposition;
   const reasonCode: unknown = row.catch_up_reason_code;
   const classification = createCatchUpClassification({
@@ -2812,8 +2810,8 @@ function validateStoredCoverageClassification(
     programIds,
     confirmationStatus,
     observedAtMs: dateMs(row.inbox_observed_at, 'catch-up observed at'),
-    ingestionHint: storedHint === 'NONE' ? null : storedHint,
-    ingestionHintMint: storedHintMint,
+    ingestionHint: action.hint,
+    ingestionHintMint: action.mint,
     classificationVersion: safeCount(
       row.catch_up_classification_version,
       'catch-up classification version',
@@ -2824,14 +2822,28 @@ function validateStoredCoverageClassification(
     evidenceFingerprint: requiredFingerprint(row.catch_up_evidence_fingerprint),
     classifiedAtMs: dateMs(row.catch_up_classified_at, 'catch-up classified at'),
   });
-  if (requiredTextValue(row.catch_up_action_key, 'catch-up action key')
-      !== catchUpActionKey(classification)) {
+  if (actionKey !== catchUpActionKey(classification)) {
     throw new TypeError('Stored catch-up action key is invalid.');
   }
   if (classification.reasonCode === 'SOLANA_TRANSACTION_FAILED') {
     throw internalRepositoryError(new TransactionInboxConflictError('classification'));
   }
   return true;
+}
+
+function classificationActionFromKey(actionKey: string): Readonly<{
+  hint: CatchUpClassification['ingestionHint'];
+  mint: string | null;
+}> {
+  if (actionKey === 'NONE') return Object.freeze({ hint: null, mint: null });
+  if (actionKey === 'PUMPFUN_CREATE') {
+    return Object.freeze({ hint: 'PUMPFUN_CREATE' as const, mint: null });
+  }
+  const prefix = 'PUMPFUN_TRADE:';
+  if (!actionKey.startsWith(prefix)) throw new TypeError('Stored catch-up action key is invalid.');
+  const mint = actionKey.slice(prefix.length);
+  assertCanonicalMint(mint);
+  return Object.freeze({ hint: 'PUMPFUN_TRADE' as const, mint });
 }
 
 function requiredTextValue(value: unknown, name: string): string {

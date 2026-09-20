@@ -1,7 +1,7 @@
 # Durable catch-up coverage fast path
 
 Status: approved for implementation
-Version: 1.0.4
+Version: 1.0.5
 Issue: #146
 Parent incident: #120
 Scope: Pump.fun observe-only catch-up admission; no wallet, signer, executor,
@@ -22,6 +22,8 @@ Revision history:
   make both success/failure arrival orders fail closed in persistence.
 - 1.0.4: require bounded own-index array snapshots at the coverage boundary so
   custom iterators, accessors and oversized batches cannot bypass page limits.
+- 1.0.5: validate persisted classification identity from its immutable action
+  key rather than the inbox's mutable routing hint after source convergence.
 
 ## Context
 
