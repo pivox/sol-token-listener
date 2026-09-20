@@ -642,6 +642,7 @@ for (const [location, boundary] of [
         assert.ok(written);
         assert.deepEqual(payload, {
           startedAt: new Date(written.startedAtMs).toISOString(), catchUpAdmission: expected,
+          firstProcessingCanary: written.firstProcessingCanary,
         });
         assert.equal(serializationReads, 0);
         assert.notEqual(written.catchUpAdmission, metrics);
