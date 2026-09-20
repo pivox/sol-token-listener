@@ -37,6 +37,7 @@ import {
   type StrictCatchUpRun,
 } from '../src/domain/strict-catch-up-run.js';
 import type { StrictCatchUpRepository } from '../src/ports/strict-catch-up-repository.js';
+import type { CatchUpAdmissionCoverageCandidate } from '../src/ports/catch-up-admission-coverage-repository.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
@@ -819,6 +820,82 @@ void test('catch-up admission counts reject malformed PostgreSQL values and inco
 void test('keeps durable ingestion independent of launchpad and market adapter imports', async () => {
   const source = await readFile(new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /from ['"][^'"]*(?:launchpads|markets)\//u);
+});
+
+void test('reads existing WebSocket, classified and terminal catch-up coverage without mutation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const websocket = catchUpCoverageCandidate('coverage-websocket', 81n, 'processed');
+    const classified = catchUpCoverageCandidate('coverage-classified', 82n, 'confirmed');
+    const terminal = catchUpCoverageCandidate('coverage-terminal', 83n, 'confirmed');
+    const missing = catchUpCoverageCandidate('coverage-missing', 84n, 'processed');
+    await repository.enqueue(notification(terminal.signature, terminal.slot, 'WEBSOCKET', 'finalized'));
+    const claim = await repository.claim(Date.now(), 30);
+    assert.equal(claim?.signature, terminal.signature);
+    if (claim === null) throw new Error('Expected terminal coverage claim.');
+    await repository.saveSnapshot(terminal.signature, claim.leaseToken,
+      normalized(terminal.signature, terminal.slot));
+    await repository.markProcessed(terminal.signature, claim.leaseToken, 'finalized');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [terminal.signature]);
+    await repository.enqueue(notification(websocket.signature, websocket.slot, 'WEBSOCKET', 'processed'));
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(classified.signature), slot: classified.slot,
+      confirmationStatus: classified.confirmationStatus,
+    }));
+    const before = await row(pool, websocket.signature);
+
+    assert.deepEqual(await repository.readExistingCatchUpCoverage(
+      [websocket, classified, terminal, missing], new AbortController().signal,
+    ), [
+      catchUpCoverageReceipt(websocket),
+      catchUpCoverageReceipt(classified),
+      catchUpCoverageReceipt(terminal),
+    ]);
+    assert.deepEqual(await row(pool, websocket.signature), before);
+    assert.deepEqual((await row(pool, websocket.signature)).discovery_sources, ['WEBSOCKET']);
+  });
+});
+
+void test('leaves finality advancement uncovered and fails closed on coverage identity conflicts', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const processed = catchUpCoverageCandidate('coverage-finality-advance', 85n, 'processed');
+    await repository.enqueue(notification(processed.signature, processed.slot, 'WEBSOCKET', 'processed'));
+    assert.deepEqual(await repository.readExistingCatchUpCoverage([
+      catchUpCoverageCandidate(processed.signature, processed.slot, 'confirmed'),
+    ], new AbortController().signal), []);
+    await assert.rejects(repository.readExistingCatchUpCoverage([
+      catchUpCoverageCandidate(processed.signature, 86n, 'processed'),
+    ], new AbortController().signal), TransactionInboxConflictError);
+  });
+});
+
+void test('fails closed on success and failed-transaction outcome contradictions in both arrival orders', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const terminal = failedCatchUpClassification('coverage-terminal-failed-conflict', 89n);
+    await repository.enqueue(notification(terminal.signature, terminal.slot, 'WEBSOCKET', 'finalized'));
+    const claim = await repository.claim(Date.now(), 30);
+    assert.equal(claim?.signature, terminal.signature);
+    if (claim === null) throw new Error('Expected terminal conflict claim.');
+    await repository.saveSnapshot(terminal.signature, claim.leaseToken,
+      normalized(terminal.signature, terminal.slot));
+    await repository.markProcessed(terminal.signature, claim.leaseToken, 'finalized');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [terminal.signature]);
+    await assert.rejects(repository.recordCatchUpClassification(terminal), TransactionInboxConflictError);
+
+    const successFirst = failedCatchUpClassification('coverage-success-first', 87n);
+    await repository.enqueue(notification(successFirst.signature, successFirst.slot, 'WEBSOCKET', 'processed'));
+    await assert.rejects(repository.recordCatchUpClassification(successFirst), TransactionInboxConflictError);
+
+    const failedFirst = failedCatchUpClassification('coverage-failed-first', 88n);
+    assert.equal((await repository.recordCatchUpClassification(failedFirst)).persistence, 'RECORDED');
+    assert.equal((await repository.recordCatchUpClassification(failedFirst)).persistence, 'REPLAYED');
+    await assert.rejects(
+      repository.enqueue(notification(failedFirst.signature, failedFirst.slot, 'WEBSOCKET', 'processed')),
+      TransactionInboxConflictError,
+    );
+  });
 });
 
 void test('returns exact fresh receipts for actionable, deferred and terminal classifications', async (context) => {
@@ -2012,7 +2089,7 @@ void test('processes a catch-up row at scan time when blockchain time is in the 
         if (programId === PUMP_PROGRAM_ID) {
           return [Object.freeze({
             signature: 'future-block-time', slot: 9n, confirmationStatus: 'confirmed' as const,
-            blockTimeMs: futureBlockTimeMs,
+            blockTimeMs: futureBlockTimeMs, transactionFailed: false,
           })];
         }
         assert.equal(programId, PUMPSWAP_PROGRAM_ID);
@@ -4928,6 +5005,29 @@ async function finalityRowTuple(
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
   return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
+}
+
+function catchUpCoverageCandidate(
+  signature: string,
+  slot: bigint,
+  confirmationStatus: 'processed' | 'confirmed' | 'finalized',
+): CatchUpAdmissionCoverageCandidate {
+  return Object.freeze({ signature, slot, confirmationStatus,
+    programIds: Object.freeze([PUMP_PROGRAM_ID]) });
+}
+
+function catchUpCoverageReceipt(value: CatchUpAdmissionCoverageCandidate) {
+  return Object.freeze({ signature: value.signature, slot: value.slot, disposition: null,
+    persistence: 'ALREADY_ADMITTED' as const, admission: 'NOT_ENQUEUED' as const,
+    ingestionPriority: null });
+}
+
+function failedCatchUpClassification(signature: string, slot: bigint) {
+  return createCatchUpClassification({
+    ...catchUpClassificationInput(signature), slot,
+    disposition: 'IGNORED', reasonCode: 'SOLANA_TRANSACTION_FAILED',
+    ingestionHint: null, ingestionHintMint: null, mints: [],
+  });
 }
 
 async function insertCanaryInboxRow(
