@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.1.0 — 2026-09-20 — issues #114, #142 et #143.
+Version : 1.1.1 — 2026-09-20 — issues #114, #142 et #143.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -59,7 +59,7 @@ activation.
      type == "object"
      and (keys | sort == ["atOrAboveThresholdCount", "cohortCapacity", "cohortEndsAtMs", "cohortStartedAtMs", "completedCount", "eligibleCount", "invalidDurationCount", "overflowed", "p95Ms", "pendingCount", "rightCensoredCount", "sampledAtMs", "tailCensoredCount", "terminalCount", "thresholdMs", "unavailableCount", "underThresholdCount", "verdict", "version"])
      and .version == 1 and .thresholdMs == 45000 and .cohortCapacity == 50000
-     and (.cohortStartedAtMs | integer) and .cohortStartedAtMs <= 9007199253795991
+     and (.cohortStartedAtMs | integer) and .cohortStartedAtMs <= 9007199240340991
      and (.cohortEndsAtMs | integer) and .cohortEndsAtMs == (.cohortStartedAtMs + 900000)
      and (.sampledAtMs | integer) and .sampledAtMs >= .cohortStartedAtMs
      and (.overflowed | type == "boolean")
@@ -79,7 +79,7 @@ activation.
          | (($rank <= .underThresholdCount and .p95Ms < .thresholdMs)
            or ($rank > .underThresholdCount and .p95Ms >= .thresholdMs)))
      end)
-     and (.verdict == (if (.invalidDurationCount > 0 or (.p95Ms != null and .p95Ms >= .thresholdMs)) then "FAIL" elif (.sampledAtMs < (.cohortEndsAtMs + .thresholdMs) or .eligibleCount == 0 or .overflowed or .pendingCount > 0 or .terminalCount > 0 or .unavailableCount > 0) then "INCONCLUSIVE" else "PASS" end));
+     and (.verdict == (if (.invalidDurationCount > 0 or (.p95Ms != null and .p95Ms >= .thresholdMs)) then "FAIL" elif (.sampledAtMs >= (.cohortStartedAtMs + 14400000) or .sampledAtMs < (.cohortEndsAtMs + .thresholdMs) or .eligibleCount == 0 or .overflowed or .pendingCount > 0 or .terminalCount > 0 or .unavailableCount > 0) then "INCONCLUSIVE" else "PASS" end));
    . as $root
    | {startedAt: (try $root.data.heartbeat.startedAt catch null), firstProcessingCanary: (try ($root.data.heartbeat.firstProcessingCanary | if evidence then {version, thresholdMs, cohortCapacity, cohortStartedAtMs, cohortEndsAtMs, sampledAtMs, overflowed, eligibleCount, completedCount, underThresholdCount, atOrAboveThresholdCount, pendingCount, rightCensoredCount, tailCensoredCount, terminalCount, unavailableCount, invalidDurationCount, p95Ms, verdict} else null end) catch null)}' health.json > first-processing
    ```
@@ -127,7 +127,7 @@ activation.
      type == "object"
      and (keys | sort == ["atOrAboveThresholdCount", "cohortCapacity", "cohortEndsAtMs", "cohortStartedAtMs", "completedCount", "eligibleCount", "invalidDurationCount", "overflowed", "p95Ms", "pendingCount", "rightCensoredCount", "sampledAtMs", "tailCensoredCount", "terminalCount", "thresholdMs", "unavailableCount", "underThresholdCount", "verdict", "version"])
      and .version == 1 and .thresholdMs == 45000 and .cohortCapacity == 50000
-     and (.cohortStartedAtMs | integer) and .cohortStartedAtMs <= 9007199253795991
+     and (.cohortStartedAtMs | integer) and .cohortStartedAtMs <= 9007199240340991
      and (.cohortEndsAtMs | integer) and .cohortEndsAtMs == (.cohortStartedAtMs + 900000)
      and (.sampledAtMs | integer) and .sampledAtMs >= .cohortStartedAtMs
      and (.overflowed | type == "boolean")
@@ -147,7 +147,7 @@ activation.
          | (($rank <= .underThresholdCount and .p95Ms < .thresholdMs)
            or ($rank > .underThresholdCount and .p95Ms >= .thresholdMs)))
      end)
-     and (.verdict == (if (.invalidDurationCount > 0 or (.p95Ms != null and .p95Ms >= .thresholdMs)) then "FAIL" elif (.sampledAtMs < (.cohortEndsAtMs + .thresholdMs) or .eligibleCount == 0 or .overflowed or .pendingCount > 0 or .terminalCount > 0 or .unavailableCount > 0) then "INCONCLUSIVE" else "PASS" end));
+     and (.verdict == (if (.invalidDurationCount > 0 or (.p95Ms != null and .p95Ms >= .thresholdMs)) then "FAIL" elif (.sampledAtMs >= (.cohortStartedAtMs + 14400000) or .sampledAtMs < (.cohortEndsAtMs + .thresholdMs) or .eligibleCount == 0 or .overflowed or .pendingCount > 0 or .terminalCount > 0 or .unavailableCount > 0) then "INCONCLUSIVE" else "PASS" end));
    . as $root
    | {startedAt: (try $root.data.heartbeat.startedAt catch null), firstProcessingCanary: (try ($root.data.heartbeat.firstProcessingCanary | if evidence then {version, thresholdMs, cohortCapacity, cohortStartedAtMs, cohortEndsAtMs, sampledAtMs, overflowed, eligibleCount, completedCount, underThresholdCount, atOrAboveThresholdCount, pendingCount, rightCensoredCount, tailCensoredCount, terminalCount, unavailableCount, invalidDurationCount, p95Ms, verdict} else null end) catch null)}
    | select(.startedAt != null and .firstProcessingCanary != null)' "$final_source" > final.firstProcessingCanary
@@ -232,6 +232,7 @@ exactement celui-ci :
 | Après fermeture et drain, cohorte non vide et non overflowée, toutes les lignes complétées, aucun censored/terminal/unavailable/invalide, p95 de 44 999 ms au plus | `PASS` |
 | p95 de 45 000 ms exactement ou davantage, ou durée invalide | `FAIL` |
 | Ligne right-censored ou tail-censored, cohorte vide, overflow, restart, `final` manquant/absent, preuve absente ou malformée, cohorte ou `startedAt` changé | `INCONCLUSIVE` |
+| `sampledAtMs` atteint le premier instant de purge, exactement quatre heures après `cohortStartedAtMs` | `INCONCLUSIVE` |
 
 Une ligne censored n'est jamais assimilée à une réussite :
 `pendingCount = rightCensoredCount + tailCensoredCount` doit rester nul pour
@@ -241,7 +242,10 @@ ou malformée, un overflow ou une cohorte sans trafic restent fail-closed en
 produit `FAIL`; ce `FAIL` est prioritaire et précède `INCONCLUSIVE` même si une
 autre catégorie rend aussi la cohorte incomplète. Un résultat interne `PASS`
 ne sauve jamais une fenêtre où l'un des quatre snapshots prouve un restart ou
-où le heartbeat final n'est pas postérieur à T+15 avec la même cohorte.
+où le heartbeat final n'est pas postérieur à T+15 avec la même cohorte. Dès le
+premier instant de purge possible, à quatre heures du début de cohorte, une
+suppression partielle peut avoir amputé l'échantillon : le verdict devient donc
+`INCONCLUSIVE`. Un p95 en échec ou une durée invalide reste toutefois `FAIL`.
 
 Le gate HTTP 429 reste indépendant et distinct du gate de latence
 first-processing : l'un ne peut compenser l'autre. Les autres gates backlog,

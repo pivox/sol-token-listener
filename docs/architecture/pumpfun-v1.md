@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.7 — 2026-09-13
+**Version :** 1.1.8 — 2026-09-20
 
 ## Périmètre produit
 
@@ -738,7 +738,9 @@ même cohorte. `PASS` exige une cohorte non vide, complète, sans overflow ni
 censure et un p95 strictement inférieur à 45 000 ms. Un p95 à partir de
 45 000 ms ou une durée invalide est `FAIL`; une preuve absente, malformée,
 censored, terminale, historique, vide, overflowée ou interrompue par un restart
-est `INCONCLUSIVE`. Le gate HTTP 429 et les autres gates opérationnels restent
+est `INCONCLUSIVE`. La preuve devient aussi `INCONCLUSIVE` dès
+`cohortStartedAtMs + 4 heures`, premier instant où une purge partielle peut
+avoir retiré des lignes; `FAIL` garde la priorité. Le gate HTTP 429 et les autres gates opérationnels restent
 indépendants. Le statut terrain demeure `CANARY_NOT_STARTED` tant que la
 procédure post-merge n'a pas produit ses quatre artefacts.
 

@@ -27,6 +27,17 @@ void test('migration 050 canonicalizes definition rendering transaction-locally'
   assert.match(sql, /set_config\('DateStyle','ISO, YMD',true\)/u);
   assert.match(sql, /md5\(pg_get_constraintdef\(constraint_row\.oid\)\)='95c31f205c07bc3759fae65d280159b8'/u);
   assert.doesNotMatch(sql, /constraint_row\.conbin/u);
+  assert.match(sql, /attribute\.atttypmod<>-1/u);
+});
+
+void test('migration 050 rejects timestamp precision typmods on either evidence column', async (context) => {
+  for (const column of ['first_detected_at', 'first_processed_at'] as const) {
+    await withMigration050Database(context, async (pool) => {
+      await pool.query(`ALTER TABLE chain_transaction_inbox
+        ALTER COLUMN ${column} TYPE TIMESTAMPTZ(0)`);
+      await assert.rejects(pool.query(await readFile(migrationUrl, 'utf8')), { code: '23514' });
+    });
+  }
 });
 
 void test('migration 050 classifies all legacy inbox rows unavailable without inventing evidence', async (context) => {

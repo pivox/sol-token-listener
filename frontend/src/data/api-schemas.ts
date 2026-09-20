@@ -537,6 +537,7 @@ const rpcHttpEvidenceSchema = z.object({
 const FIRST_PROCESSING_THRESHOLD_MS = 45_000;
 const FIRST_PROCESSING_COHORT_DURATION_MS = 900_000;
 const FIRST_PROCESSING_COHORT_CAPACITY = 50_000;
+const FIRST_PROCESSING_EVIDENCE_RETENTION_MS = 14_400_000;
 const firstProcessingIntegerSchema = z.number().int().nonnegative().refine(
   (value) => Number.isSafeInteger(value) && !Object.is(value, -0),
 );
@@ -567,6 +568,9 @@ const firstProcessingCanarySchema = z.object({
   const verdictDeadlineMs = cohortEndsAtMs === null
     ? null
     : safeIntegerSum([cohortEndsAtMs, FIRST_PROCESSING_THRESHOLD_MS]);
+  const retentionDeadlineMs = safeIntegerSum([
+    value.cohortStartedAtMs, FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
+  ]);
   const pendingCount = safeIntegerSum([
     value.rightCensoredCount, value.tailCensoredCount,
   ]);
@@ -577,7 +581,7 @@ const firstProcessingCanarySchema = z.object({
     value.completedCount, value.pendingCount, value.terminalCount,
     value.unavailableCount, value.invalidDurationCount,
   ]);
-  if (cohortEndsAtMs === null || verdictDeadlineMs === null
+  if (cohortEndsAtMs === null || verdictDeadlineMs === null || retentionDeadlineMs === null
     || value.cohortEndsAtMs !== cohortEndsAtMs
     || value.sampledAtMs < value.cohortStartedAtMs
     || value.eligibleCount > FIRST_PROCESSING_COHORT_CAPACITY
@@ -598,6 +602,7 @@ const firstProcessingCanarySchema = z.object({
   const fail = value.invalidDurationCount > 0
     || (value.p95Ms !== null && value.p95Ms >= FIRST_PROCESSING_THRESHOLD_MS);
   const incomplete = value.sampledAtMs < verdictDeadlineMs
+    || value.sampledAtMs >= retentionDeadlineMs
     || value.eligibleCount === 0 || value.overflowed || value.pendingCount > 0
     || value.terminalCount > 0 || value.unavailableCount > 0;
   const expectedVerdict = fail ? 'FAIL' : incomplete ? 'INCONCLUSIVE' : 'PASS';

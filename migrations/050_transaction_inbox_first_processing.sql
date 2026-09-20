@@ -19,12 +19,14 @@ BEGIN
     WHERE attribute.attrelid='chain_transaction_inbox'::REGCLASS AND attribute.attnum>0
       AND NOT attribute.attisdropped AND (
         (attribute.attname='first_detected_at'
-          AND (attribute.atttypid<>'timestamp with time zone'::REGTYPE OR attribute.attnotnull
+          AND (attribute.atttypid<>'timestamp with time zone'::REGTYPE OR attribute.atttypmod<>-1
+            OR attribute.attnotnull
             OR attribute.attgenerated<>'' OR attribute.attidentity<>''
             OR pg_get_expr(attribute_default.adbin,attribute_default.adrelid)
               IS DISTINCT FROM 'date_trunc(''milliseconds''::text, clock_timestamp())'))
         OR (attribute.attname='first_processed_at'
-          AND (attribute.atttypid<>'timestamp with time zone'::REGTYPE OR attribute.attnotnull
+          AND (attribute.atttypid<>'timestamp with time zone'::REGTYPE OR attribute.atttypmod<>-1
+            OR attribute.attnotnull
             OR attribute.attgenerated<>'' OR attribute.attidentity<>''
             OR pg_get_expr(attribute_default.adbin,attribute_default.adrelid) IS NOT NULL))
         OR (attribute.attname='first_processing_evidence_unavailable'
@@ -168,6 +170,10 @@ BEGIN
     AND default_value.adnum=attribute.attnum
   WHERE attribute.attrelid='chain_transaction_inbox'::REGCLASS AND attribute.attname='first_detected_at';
   IF first_detected_default IS DISTINCT FROM 'date_trunc(''milliseconds''::text, clock_timestamp())'
+    OR EXISTS (SELECT 1 FROM pg_attribute attribute
+      WHERE attribute.attrelid='chain_transaction_inbox'::REGCLASS
+        AND attribute.attname IN ('first_detected_at','first_processed_at')
+        AND (attribute.atttypid<>'timestamp with time zone'::REGTYPE OR attribute.atttypmod<>-1))
     OR NOT EXISTS (SELECT 1 FROM pg_constraint constraint_row
       WHERE constraint_row.conrelid='chain_transaction_inbox'::REGCLASS
         AND constraint_row.conname='chain_transaction_inbox_first_processing_evidence_check'

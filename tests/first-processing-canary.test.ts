@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   FIRST_PROCESSING_COHORT_CAPACITY,
   FIRST_PROCESSING_COHORT_DURATION_MS,
+  FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
   FIRST_PROCESSING_THRESHOLD_MS,
   assertValidFirstProcessingCanaryEvidence,
   createFirstProcessingCanaryEvidence,
@@ -133,6 +134,30 @@ void test('derives verdicts for small nearest-rank samples and every incomplete 
       assert.equal(createFirstProcessingCanaryEvidence(input).verdict, verdict);
     }
   }
+});
+
+void test('expires the aggregate at the first possible four-hour purge while preserving failure precedence', () => {
+  assert.equal(FIRST_PROCESSING_EVIDENCE_RETENTION_MS, 14_400_000);
+  assert.equal(createFirstProcessingCanaryEvidence(evidence({
+    sampledAtMs: start + FIRST_PROCESSING_EVIDENCE_RETENTION_MS - 1,
+  })).verdict, 'PASS');
+  assert.equal(createFirstProcessingCanaryEvidence(evidence({
+    sampledAtMs: start + FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
+    verdict: 'INCONCLUSIVE',
+  })).verdict, 'INCONCLUSIVE');
+  assert.equal(createFirstProcessingCanaryEvidence(evidence({
+    sampledAtMs: start + FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
+    invalidDurationCount: 1,
+    eligibleCount: 2,
+    verdict: 'FAIL',
+  })).verdict, 'FAIL');
+  assert.throws(() => createFirstProcessingCanaryEvidence(evidence({
+    cohortStartedAtMs: Number.MAX_SAFE_INTEGER - FIRST_PROCESSING_EVIDENCE_RETENTION_MS + 1,
+    cohortEndsAtMs: Number.MAX_SAFE_INTEGER - FIRST_PROCESSING_EVIDENCE_RETENTION_MS
+      + FIRST_PROCESSING_COHORT_DURATION_MS + 1,
+    sampledAtMs: Number.MAX_SAFE_INTEGER,
+    verdict: 'INCONCLUSIVE',
+  })), /invalid/i);
 });
 
 function zeroWithP95(): Record<string, unknown> {

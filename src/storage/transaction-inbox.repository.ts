@@ -6,6 +6,7 @@ import {
   createFirstProcessingCanaryEvidence,
   FIRST_PROCESSING_COHORT_CAPACITY,
   FIRST_PROCESSING_COHORT_DURATION_MS,
+  FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
   FIRST_PROCESSING_THRESHOLD_MS,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from '../domain/first-processing-canary.js';
@@ -319,11 +320,23 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         'first processing invalid duration count');
       const p95Ms = row.p95_ms === null ? null : safeCount(row.p95_ms, 'first processing p95');
       const sampledAtMs = safeCount(row.sampled_at_ms, 'first processing sample time');
+      const cohortStartedAtResultMs = safeCount(
+        row.cohort_started_at_ms,
+        'first processing cohort start',
+      );
       const cohortEndsAtResultMs = safeCount(row.cohort_ends_at_ms, 'first processing cohort end');
+      const verdictDeadlineMs = safeTimestampSum(
+        cohortEndsAtResultMs,
+        FIRST_PROCESSING_THRESHOLD_MS,
+      );
+      const retentionDeadlineMs = safeTimestampSum(
+        cohortStartedAtResultMs,
+        FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
+      );
       const verdict = invalidDurationCount > 0
         || (p95Ms !== null && p95Ms >= FIRST_PROCESSING_THRESHOLD_MS)
         ? 'FAIL'
-        : sampledAtMs < cohortEndsAtResultMs + FIRST_PROCESSING_THRESHOLD_MS
+        : sampledAtMs < verdictDeadlineMs || sampledAtMs >= retentionDeadlineMs
           || eligibleCount === 0 || row.overflowed || rightCensoredCount + tailCensoredCount > 0
           || terminalCount > 0 || unavailableCount > 0
           ? 'INCONCLUSIVE'
@@ -332,7 +345,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         version: 1,
         thresholdMs: FIRST_PROCESSING_THRESHOLD_MS,
         cohortCapacity: FIRST_PROCESSING_COHORT_CAPACITY,
-        cohortStartedAtMs: safeCount(row.cohort_started_at_ms, 'first processing cohort start'),
+        cohortStartedAtMs: cohortStartedAtResultMs,
         cohortEndsAtMs: safeCount(row.cohort_ends_at_ms, 'first processing cohort end'),
         sampledAtMs,
         overflowed: row.overflowed,
@@ -1048,7 +1061,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                    THEN finality_evidence_version + 1
                  ELSE finality_evidence_version
                END,
-               updated_at = completed.completed_at
+               updated_at = GREATEST(updated_at, completed.completed_at)
              FROM completed
              WHERE signature = $1 AND lease_token = $2
                AND processing_status = 'PROCESSING'
@@ -2957,6 +2970,12 @@ function safeCount(value: unknown, name: string): number {
     : typeof value === 'string' && /^(?:0|[1-9]\d*)$/u.test(value) ? Number(value) : Number.NaN;
   if (!Number.isSafeInteger(parsed) || parsed < 0) throw new TypeError(`Stored ${name} is invalid.`);
   return parsed;
+}
+
+function safeTimestampSum(left: number, right: number): number {
+  const total = left + right;
+  if (!Number.isSafeInteger(total)) throw new TypeError('Stored first processing timing is invalid.');
+  return total;
 }
 
 function dateFromMs(value: number): Date {

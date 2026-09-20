@@ -79,6 +79,18 @@ describe('frontend-owned API V1 schemas', () => {
       sampledAtMs: firstProcessingCanary.cohortEndsAtMs,
       verdict: 'INCONCLUSIVE',
     })?.verdict).toBe('INCONCLUSIVE');
+    expect(parseFirstProcessingCanary({
+      ...firstProcessingCanary,
+      sampledAtMs: firstProcessingCanary.cohortStartedAtMs + 14_400_000,
+      verdict: 'INCONCLUSIVE',
+    })?.verdict).toBe('INCONCLUSIVE');
+    expect(parseFirstProcessingCanary({
+      ...firstProcessingCanary,
+      sampledAtMs: firstProcessingCanary.cohortStartedAtMs + 14_400_000,
+      eligibleCount: 4,
+      invalidDurationCount: 1,
+      verdict: 'FAIL',
+    })?.verdict).toBe('FAIL');
   });
 
   it('keeps omitted first-processing evidence undefined and explicit absence null', () => {
@@ -106,6 +118,13 @@ describe('frontend-owned API V1 schemas', () => {
       { ...firstProcessingCanary, p95Ms: null },
       { ...firstProcessingCanary, p95Ms: 45_000 },
       { ...firstProcessingCanary, verdict: 'FAIL' },
+      {
+        ...firstProcessingCanary,
+        cohortStartedAtMs: Number.MAX_SAFE_INTEGER - 14_400_000 + 1,
+        cohortEndsAtMs: Number.MAX_SAFE_INTEGER - 14_400_000 + 900_001,
+        sampledAtMs: Number.MAX_SAFE_INTEGER,
+        verdict: 'INCONCLUSIVE',
+      },
       { ...firstProcessingCanary, overflowed: true },
     ];
     for (const field of Object.keys(firstProcessingCanary)) {

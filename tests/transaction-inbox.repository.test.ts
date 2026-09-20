@@ -217,6 +217,69 @@ void test('first processing time survives lease loss, finality replay, orphaning
   });
 });
 
+void test('markProcessed preserves a microsecond updated_at later within the completion millisecond', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'first-processing-microsecond-updated-at';
+    await repository.enqueue(notification(signature, 805n, 'WEBSOCKET', 'confirmed'));
+    const claim = await repository.claim(Date.now(), 30);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 805n));
+
+    const schema = (await pool.query<{ readonly schema_name: unknown }>(
+      'SELECT current_schema() AS schema_name',
+    )).rows[0]?.schema_name;
+    assert.equal(typeof schema, 'string');
+    if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+    const completedAtMs = Date.now() + 60_000;
+    const completedAt = new Date(completedAtMs).toISOString();
+    const updatedAt = `${completedAt.slice(0, -1).replace(/\.\d{3}$/u, `.${String(completedAtMs % 1_000).padStart(3, '0')}500`)}Z`;
+    await pool.query(`UPDATE chain_transaction_inbox SET updated_at=$2::TIMESTAMPTZ
+      WHERE signature=$1`, [signature, updatedAt]);
+    await pool.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+      RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+      AS $$ SELECT TIMESTAMPTZ '${completedAt}' $$`);
+    await pool.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
+
+    await repository.markProcessed(signature, claim.leaseToken, 'confirmed');
+    const stored = (await pool.query(`SELECT
+      to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
+      to_char(processed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS processed_at,
+      to_char(first_processed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS first_processed_at
+      FROM chain_transaction_inbox WHERE signature=$1`, [signature])).rows[0];
+    const expectedCompleted = `${completedAt.slice(0, -1).replace(/\.(\d{3})$/u, '.$1000')}Z`;
+    assert.deepEqual(stored, { updated_at: updatedAt, processed_at: expectedCompleted,
+      first_processed_at: expectedCompleted });
+  });
+});
+
+void test('a partially purged four-hour cohort can never recover a PASS', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 14_400_000 - 1_000;
+    await insertCanaryInboxRow(pool, 'canary-purged', startedAtMs, startedAtMs + 1_000, 'PROCESSED');
+    await insertCanaryInboxRow(pool, 'canary-retained', startedAtMs + 1, startedAtMs + 1_001, 'PROCESSED');
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      target_confirmation_status='finalized', terminal_at=processed_at,
+      purge_after=processed_at+INTERVAL '4 hours'
+      WHERE signature='canary-purged'`);
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature, observed_slot, confirmation_status, finality_evidence_version,
+      immutable_fingerprint, replay_completed_at
+    ) SELECT signature, observed_slot, target_confirmation_status,
+      finality_evidence_version, immutable_fingerprint, processed_at
+      FROM chain_transaction_inbox WHERE signature='canary-purged'`);
+
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.transactionInbox, 1);
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.completedCount, 1);
+    assert.equal(evidence.p95Ms, 1_000);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
 void test('aggregates a bounded first-processing cohort with PostgreSQL timing and no identifiers', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);

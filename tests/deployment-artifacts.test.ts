@@ -602,6 +602,8 @@ void test('first-processing canary runbook fails closed across the fixed cohort 
   ]) assert.match(runbook, new RegExp(`${condition}[\\s\\S]{0,220}INCONCLUSIVE`, 'iu'));
   assert.match(runbook, /durée invalide[^.]{0,180}FAIL/iu);
   assert.match(runbook, /FAIL[^.]{0,180}(?:prioritaire|précède)[^.]{0,120}INCONCLUSIVE/iu);
+  assert.match(all, /(?:quatre|4) heures[^.]{0,220}(?:premier instant|purge)[^.]{0,220}INCONCLUSIVE/iu);
+  assert.match(runbook, /14400000/u);
   assert.match(runbook, /HTTP\s*429[^.]{0,180}(?:indépendant|distinct)[^.]{0,180}(?:first-processing|latence)/iu);
   assert.match(runbook, /(?:autres gates|backlog)[^.]{0,240}(?:indépendants|indépendantes|distincts|distinctes)/iu);
   assert.match(all, /observe-only[^.]{0,240}(?:aucun|aucune)[^.]{0,120}wallet[^.]{0,120}(?:sign|soumission|submit)/iu);
@@ -632,6 +634,13 @@ void test('first-processing canary runbook fails closed across the fixed cohort 
   assert.equal(valid.status, 0, valid.stderr);
   assert.deepEqual(JSON.parse(valid.stdout), { startedAt, firstProcessingCanary: evidence });
   assert.doesNotMatch(valid.stdout, /secret|signature|mint|wallet/iu);
+  const retainedTooLong = runJq({
+    ...evidence,
+    sampledAtMs: evidence.cohortStartedAtMs + 14_400_000,
+    verdict: 'INCONCLUSIVE',
+  });
+  assert.equal(retainedTooLong.status, 0, retainedTooLong.stderr);
+  assert.equal(JSON.parse(retainedTooLong.stdout).firstProcessingCanary.verdict, 'INCONCLUSIVE');
 
   for (const malformed of [
     undefined,
@@ -649,6 +658,7 @@ void test('first-processing canary runbook fails closed across the fixed cohort 
       verdict: 'FAIL',
     },
     { ...evidence, signature: 'must-not-leak' },
+    { ...evidence, sampledAtMs: evidence.cohortStartedAtMs + 14_400_000, verdict: 'PASS' },
   ]) {
     const result = runJq(malformed);
     assert.equal(result.status, 0, result.stderr);

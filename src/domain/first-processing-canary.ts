@@ -3,6 +3,7 @@ import { types } from 'node:util';
 export const FIRST_PROCESSING_THRESHOLD_MS = 45_000;
 export const FIRST_PROCESSING_COHORT_DURATION_MS = 900_000;
 export const FIRST_PROCESSING_COHORT_CAPACITY = 50_000;
+export const FIRST_PROCESSING_EVIDENCE_RETENTION_MS = 14_400_000;
 
 const EVIDENCE_FIELDS = [
   'version', 'thresholdMs', 'cohortCapacity', 'cohortStartedAtMs', 'cohortEndsAtMs',
@@ -62,7 +63,12 @@ export function assertValidFirstProcessingCanaryEvidence(
   }
   const expectedEnd = safeAdd(evidence.cohortStartedAtMs, FIRST_PROCESSING_COHORT_DURATION_MS);
   const verdictDeadline = expectedEnd === null ? null : safeAdd(expectedEnd, FIRST_PROCESSING_THRESHOLD_MS);
-  if (expectedEnd === null || verdictDeadline === null || evidence.cohortEndsAtMs !== expectedEnd
+  const retentionDeadline = safeAdd(
+    evidence.cohortStartedAtMs,
+    FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
+  );
+  if (expectedEnd === null || verdictDeadline === null || retentionDeadline === null
+    || evidence.cohortEndsAtMs !== expectedEnd
     || evidence.sampledAtMs < evidence.cohortStartedAtMs
     || evidence.eligibleCount > FIRST_PROCESSING_COHORT_CAPACITY
     || (evidence.overflowed && evidence.eligibleCount !== FIRST_PROCESSING_COHORT_CAPACITY)
@@ -138,7 +144,13 @@ function fields(value: unknown): Record<EvidenceField, unknown> {
 function derivedVerdict(value: RuntimeFirstProcessingCanaryEvidenceV1): FirstProcessingCanaryVerdict {
   if (value.invalidDurationCount > 0
     || (value.p95Ms !== null && value.p95Ms >= FIRST_PROCESSING_THRESHOLD_MS)) return 'FAIL';
-  if (value.sampledAtMs < value.cohortEndsAtMs + FIRST_PROCESSING_THRESHOLD_MS
+  const verdictDeadline = safeAdd(value.cohortEndsAtMs, FIRST_PROCESSING_THRESHOLD_MS);
+  const retentionDeadline = safeAdd(
+    value.cohortStartedAtMs,
+    FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
+  );
+  if (verdictDeadline === null || retentionDeadline === null
+    || value.sampledAtMs < verdictDeadline || value.sampledAtMs >= retentionDeadline
     || value.eligibleCount === 0 || value.overflowed || value.pendingCount > 0
     || value.terminalCount > 0 || value.unavailableCount > 0) return 'INCONCLUSIVE';
   return 'PASS';
