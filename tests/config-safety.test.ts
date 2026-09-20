@@ -51,6 +51,32 @@ void test('Pump.fun catch-up page admission requires the complete safe observati
   }
 });
 
+void test('Pump.fun durable catch-up coverage is strict, false by default and requires page admission', () => {
+  assert.equal(parseConfig(base).listenerPumpFunCatchUpCoverageFastPathEnabled, false);
+  for (const value of ['TRUE', '1', ' true', 'true ', ' ', '']) {
+    assert.throws(
+      () => parseConfig({ ...base, LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED: value }),
+      /LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED must be true or false\./u,
+    );
+  }
+  const enabled = {
+    ...base,
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+    LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+    EXECUTION_MODE: 'observe',
+  };
+  assert.equal(parseConfig(enabled).listenerPumpFunCatchUpCoverageFastPathEnabled, true);
+  for (const override of [
+    { LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'false' },
+    { EXECUTION_MODE: 'paper' },
+    { LISTENER_INGESTION_SCOPE: 'launchpad-and-market' },
+  ]) assert.throws(() => parseConfig({ ...enabled, ...override }),
+    /LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED requires/u);
+});
+
 void test('block hydration is restart-only opt-in with bounded production defaults', () => {
   const config = parseConfig(base);
   assert.deepEqual({

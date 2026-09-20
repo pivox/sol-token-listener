@@ -25,6 +25,7 @@ activation.
    LISTENER_CATCH_UP_POLICY=live-edge
    LISTENER_BLOCK_HYDRATION_ENABLED=true
    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true
+   LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=true
    ```
 
    Compose transmet ce flag restart-only uniquement à `app`; contrôler la
@@ -302,7 +303,10 @@ eux aussi indépendants, avec leurs snapshots et critères propres.
 Pour le gate HTTP 429, seul un delta positif prouvé est `FAIL`; les autres
 observations de la matrice restent `INCONCLUSIVE`. Les gates opérationnels
 distincts ci-dessus conservent leurs propres critères. Deux niveaux de rollback
-existent :
+existent. Avant ces deux niveaux, le rollback isolé #146 consiste à remettre
+`LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=false` puis redémarrer :
+l'admission B3b reste active et toutes les signatures reprennent le chemin
+d'hydratation complet.
 
 1. **Rollback B3b admission-only.** Remettre
    `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis redémarrer la

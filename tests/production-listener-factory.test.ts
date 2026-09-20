@@ -397,6 +397,8 @@ void test('catch-up admission uses one provider-affine coordinator for each cata
 void test('catch-up admission wires identical provider admitters into both scanner paths and pins scan permits', async () => {
   const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
   assert.match(source, /config\.listenerPumpFunCatchUpPageAdmissionEnabled/u);
+  assert.match(source, /config\.listenerPumpFunCatchUpCoverageFastPathEnabled/u);
+  assert.match(source, /coverageRepository:[^\n]*\? inbox : null/u);
   assert.equal(count(source, /new ProviderAffineCatchUpHydration\(/gu), 1);
   assert.equal(count(source, /new PumpFunCatchUpBlockClassifier\(/gu), 1);
   assert.equal(count(source, /new PumpFunStrictCatchUpPageAdmitter\(/gu), 1);

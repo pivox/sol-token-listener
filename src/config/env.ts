@@ -8,6 +8,8 @@ const DEFAULT_RAYDIUM_CPMM_PROGRAM_ID = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5
 const MAX_RECONCILE_SECONDS = 2_147_483;
 const PUMPFUN_CATCH_UP_PAGE_ADMISSION_ERROR =
   'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED requires a safe observation envelope.';
+const PUMPFUN_CATCH_UP_COVERAGE_ERROR =
+  'LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED requires observe-only launchpad page admission.';
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
@@ -56,6 +58,7 @@ export interface AppConfig {
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
   readonly listenerPumpFunCatchUpPageAdmissionEnabled: boolean;
+  readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
   readonly expectedGenesisHash: string | null;
   readonly listenerWorkerLeaseSeconds: number;
@@ -176,6 +179,11 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     false,
     'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED',
   );
+  const listenerPumpFunCatchUpCoverageFastPathEnabled = parseStrictBoolean(
+    environment.LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED,
+    false,
+    'LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED',
+  );
   if (listenerPumpFunCatchUpPageAdmissionEnabled
     && listenerEnabled
     && !hasValue(environment.SOLANA_EXPECTED_GENESIS_HASH)) {
@@ -234,6 +242,11 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     'LISTENER_CATCH_UP_POLICY',
     ['live-edge', 'strict'],
   );
+  if (listenerPumpFunCatchUpCoverageFastPathEnabled && (
+    !listenerPumpFunCatchUpPageAdmissionEnabled
+    || executionMode !== 'observe'
+    || listenerIngestionScope !== 'launchpad-only'
+  )) throw new Error(PUMPFUN_CATCH_UP_COVERAGE_ERROR);
   if (listenerPumpFunCatchUpPageAdmissionEnabled && (
     !listenerEnabled
     || executionMode !== 'observe'
@@ -305,6 +318,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
     listenerEnabled,
     listenerPumpFunCatchUpPageAdmissionEnabled,
+    listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,
     expectedGenesisHash,
     listenerWorkerLeaseSeconds: parseInteger(

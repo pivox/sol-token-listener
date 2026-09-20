@@ -996,6 +996,16 @@ coordinateur/cache ; l'arrêt refuse les nouvelles admissions et laisse les
 opérations bornées déjà actives se terminer. Aucun wallet, clé privée, executor,
 armement ou soumission de transaction ne fait partie de cette composition.
 
+Le fast path restart-only
+`LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=false` est une optimisation
+supplémentaire, elle aussi inactive par défaut. Son activation exige le mode
+`observe`, le scope `launchpad-only` et l'admission de page active. Une unique
+lecture PostgreSQL bornée, sans verrou ni mutation, couvre seulement les
+identités exactes déjà durables dont la finalité n'avance pas. Les autres
+signatures gardent l'hydratation et la classification existantes. Les erreurs de
+transaction Solana sont réduites à un booléen et classées sans conserver le
+payload d'erreur. Toute contradiction d'issue ou de finalité échoue fermée.
+
 ## Console opérateur indépendante
 
 Le frontend React est un consommateur externe des ports HTTP/SSE : il n’importe
