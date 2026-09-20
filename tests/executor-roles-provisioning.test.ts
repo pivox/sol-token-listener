@@ -793,9 +793,11 @@ void test('provisioned retention role runs the complete purge without reading si
     [trackedMint]);
     await isolated.query(`INSERT INTO chain_transaction_inbox (
       signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
-      processing_status,ingestion_hint,ingestion_hint_mint,observed_at,terminal_at,purge_after
+      processing_status,ingestion_hint,ingestion_hint_mint,observed_at,first_detected_at,
+      terminal_at,purge_after
     ) SELECT signature,1,ARRAY['WEBSOCKET'],ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],
       'processed','DEFERRED','PUMPFUN_TRADE',mint,TIMESTAMPTZ '2020-01-01T00:00:00Z',
+      TIMESTAMPTZ '2020-01-01T00:00:00Z',
       TIMESTAMPTZ '2020-01-01T00:00:00Z',TIMESTAMPTZ '2020-01-01T04:00:00Z'
       FROM (VALUES ('active-deferred',$1),('inactive-deferred',$2)) AS seeds(signature,mint)`,
     [trackedMint, '11111111111111111111111111111111']);

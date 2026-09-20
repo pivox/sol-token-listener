@@ -54,18 +54,23 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 void test('purges deferred decisions after four hours without recovering or purging actionable work', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
-    for (const signature of ['expired-deferred', 'retained-deferred']) {
-      await repository.enqueue(Object.freeze({
-        signature, slot: 1n, source: 'WEBSOCKET', ingestionHint: 'PUMPFUN_TRADE',
-        ingestionHintMint: 'So11111111111111111111111111111111111111112',
-        programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'processed', observedAtMs: 1000,
-      }));
-    }
+    await pool.query(`WITH decision_clock AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp()-INTERVAL '5 hours') AS at
+    ) INSERT INTO chain_transaction_inbox (
+      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+      processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+      first_detected_at,terminal_at,purge_after
+    ) SELECT 'expired-deferred',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+      'DEFERRED','NORMAL','PUMPFUN_TRADE',$2,to_timestamp(1),
+      decision_clock.at,decision_clock.at,decision_clock.at+INTERVAL '4 hours'
+      FROM decision_clock`,
+    [PUMP_PROGRAM_ID, 'So11111111111111111111111111111111111111112']);
+    await repository.enqueue(Object.freeze({
+      signature: 'retained-deferred', slot: 1n, source: 'WEBSOCKET', ingestionHint: 'PUMPFUN_TRADE',
+      ingestionHintMint: 'So11111111111111111111111111111111111111112',
+      programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'processed', observedAtMs: 1000,
+    }));
     assert.equal((await inboxRow(pool, 'expired-deferred')).processing_status, 'DEFERRED');
-    await pool.query(`WITH decision_clock AS (SELECT clock_timestamp() - INTERVAL '5 hours' AS at)
-      UPDATE chain_transaction_inbox SET terminal_at=decision_clock.at,
-        purge_after=decision_clock.at + INTERVAL '4 hours'
-      FROM decision_clock WHERE signature='expired-deferred'`);
     await repository.enqueue(Object.freeze({
       signature: 'retained-normal', slot: 2n, source: 'CATCH_UP', ingestionHint: null,
       ingestionHintMint: null, programIds: Object.freeze([PUMP_PROGRAM_ID]),
@@ -1063,11 +1068,12 @@ async function insertProcessed(
   await pool.query(
     `INSERT INTO chain_transaction_inbox (
        signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-       processing_status, normalized_transaction, immutable_fingerprint, observed_at, processed_at
+       processing_status, normalized_transaction, immutable_fingerprint, observed_at,
+       processed_at, first_detected_at, first_processing_evidence_unavailable
      ) VALUES ($1, 1, ARRAY['WEBSOCKET'],
        ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], $2, 'PROCESSED',
        '{}'::jsonb, $3, clock_timestamp() - ($4 * INTERVAL '1 hour'),
-       clock_timestamp() - ($4 * INTERVAL '1 hour'))`,
+       clock_timestamp() - ($4 * INTERVAL '1 hour'),NULL,TRUE)`,
     [signature, confirmationStatus, 'a'.repeat(64), ageHours],
   );
   if (confirmationStatus === 'finalized') {

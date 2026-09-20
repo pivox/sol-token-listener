@@ -1222,11 +1222,7 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
 
     await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
     const inbox=new PostgresTransactionInboxRepository(pool);
-    await inbox.enqueue(Object.freeze({
-      signature:'signature',slot:10n,source:'WEBSOCKET' as const,ingestionHint:null,ingestionHintMint:null,
-      programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
-      confirmationStatus:'finalized' as const,observedAtMs:1_000,
-    }));
+    await insertHistoricalPendingInbox(pool,'finalized');
     const replay=await inbox.claim(2_000,120);
     assert.ok(replay);
     await inbox.saveSnapshot('signature',replay.leaseToken,paperNormalizedTransaction());
@@ -1294,11 +1290,7 @@ void test('orphan retraction survives terminal inbox retention and a paper-worke
 
     await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
     const inbox=new PostgresTransactionInboxRepository(pool);
-    await inbox.enqueue(Object.freeze({
-      signature:'signature',slot:10n,source:'WEBSOCKET' as const,ingestionHint:null,ingestionHintMint:null,
-      programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
-      confirmationStatus:'confirmed' as const,observedAtMs:2_100,
-    }));
+    await insertHistoricalPendingInbox(pool,'confirmed');
     const confirmed=await inbox.claim(2_101,120);
     assert.ok(confirmed);
     await inbox.saveSnapshot('signature',confirmed.leaseToken,paperNormalizedTransaction());
@@ -2562,6 +2554,19 @@ async function seedProcessedInbox(
     'f'.repeat(64),new Date(1_000),terminal?new Date(1_000):null,
     terminal?new Date(1_000+14_400_000):null,
   ]);
+}
+
+async function insertHistoricalPendingInbox(
+  pool:InstanceType<typeof pg.Pool>,
+  confirmationStatus:'confirmed'|'finalized',
+):Promise<void>{
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,observed_at,first_detected_at
+  ) VALUES ('signature',10,ARRAY['WEBSOCKET'],
+    ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],$1,'PENDING',
+    to_timestamp(1),to_timestamp(1))`,
+  [confirmationStatus]);
 }
 
 async function setInboxState(

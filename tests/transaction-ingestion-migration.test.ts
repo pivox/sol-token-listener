@@ -792,6 +792,7 @@ interface InboxInsert {
   readonly processedAt: string | null;
   readonly terminalAt: string | null;
   readonly purgeAfter: string | null;
+  readonly firstDetectedAt: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -813,7 +814,7 @@ function inboxValue(
   overrides: Partial<InboxInsert> = {},
   timestamps: Partial<InboxInsert> = {},
 ): InboxInsert {
-  return {
+  const value = {
     signature,
     observedSlot: '42',
     discoverySources: ['WEBSOCKET'],
@@ -835,10 +836,15 @@ function inboxValue(
     processedAt: null,
     terminalAt: null,
     purgeAfter: null,
+    firstDetectedAt: '2025-01-01T00:00:00.000Z',
     createdAt: '2025-01-01T00:00:00.000Z',
     updatedAt: '2025-01-01T00:00:00.000Z',
     ...overrides,
     ...timestamps,
+  };
+  return {
+    ...value,
+    firstDetectedAt: timestamps.firstDetectedAt ?? overrides.firstDetectedAt ?? value.createdAt,
   };
 }
 
@@ -910,10 +916,10 @@ async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
     processing_status, attempts, missing_finality_polls, lease_token, lease_expires_at,
     next_attempt_at, normalized_transaction, immutable_fingerprint, error_code, error_name,
     error_retryable, blockchain_time, observed_at, processed_at, terminal_at, purge_after,
-    created_at, updated_at
+    first_detected_at, created_at, updated_at
   ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22, $23
+    $17, $18, $19, $20, $21, $22, $23, $24
   )`, [
     value.signature, value.observedSlot, value.discoverySources, value.programIds,
     value.targetConfirmationStatus, value.processingStatus, value.attempts,
@@ -923,7 +929,7 @@ async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
     value.immutableFingerprint,
     value.errorCode, value.errorName, value.errorRetryable, value.blockchainTime,
     value.observedAt, value.processedAt, value.terminalAt, value.purgeAfter,
-    value.createdAt, value.updatedAt,
+    value.firstDetectedAt, value.createdAt, value.updatedAt,
   ]);
 }
 
