@@ -376,7 +376,7 @@ void test('retains unresolved and unexpired strict failure evidence in PostgreSQ
   }
 });
 
-void test('applies migrations 001-050 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-051 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -392,7 +392,7 @@ void test('applies migrations 001-050 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '050_transaction_inbox_first_processing.sql');
+    assert.equal(applied.at(-1), '051_transaction_inbox_decoder_quarantine_recovery.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
