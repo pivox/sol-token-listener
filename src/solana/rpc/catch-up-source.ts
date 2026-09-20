@@ -12,6 +12,7 @@ export interface CatchUpSignature {
   readonly slot: bigint;
   readonly confirmationStatus: CatchUpConfirmationStatus;
   readonly blockTimeMs: number | null;
+  readonly transactionFailed: boolean;
 }
 
 export interface SignaturesForAddressRpc {
@@ -126,6 +127,7 @@ function snapshotRow(value: unknown): CatchUpSignature {
   const slot = dataProperty(value, 'slot');
   const confirmationStatus = dataProperty(value, 'confirmationStatus');
   const blockTime = dataProperty(value, 'blockTime');
+  const transactionError = dataProperty(value, 'err');
   if (!validSignature(signature)) {
     throw new CatchUpSourceError('response');
   }
@@ -139,6 +141,7 @@ function snapshotRow(value: unknown): CatchUpSignature {
     slot: BigInt(slot),
     confirmationStatus,
     blockTimeMs,
+    transactionFailed: transactionError !== null,
   });
 }
 
@@ -150,6 +153,7 @@ function snapshotTrustedRow(value: unknown): CatchUpSignature {
   const slot = dataProperty(value, 'slot');
   const confirmationStatus = dataProperty(value, 'confirmationStatus');
   const blockTimeMs = dataProperty(value, 'blockTimeMs');
+  const transactionFailed = dataProperty(value, 'transactionFailed');
   if (!validSignature(signature)) {
     throw new CatchUpSourceError('response');
   }
@@ -161,7 +165,8 @@ function snapshotTrustedRow(value: unknown): CatchUpSignature {
     || blockTimeMs < 0
     || Object.is(blockTimeMs, -0)
   )) throw new CatchUpSourceError('response');
-  return Object.freeze({ signature, slot, confirmationStatus, blockTimeMs });
+  if (typeof transactionFailed !== 'boolean') throw new CatchUpSourceError('response');
+  return Object.freeze({ signature, slot, confirmationStatus, blockTimeMs, transactionFailed });
 }
 
 function dataProperty(value: object, key: string): unknown {

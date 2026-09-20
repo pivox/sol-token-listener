@@ -33,7 +33,7 @@ const MAX_PROGRAM_IDS = 16;
 const MAX_CLASSIFICATION_MINTS = 16;
 const MAX_SAFE_MILLISECONDS = 8_640_000_000_000_000;
 const DISCOVERY_KEYS = Object.freeze([
-  'signature', 'slot', 'confirmationStatus', 'blockTimeMs', 'programIds',
+  'signature', 'slot', 'confirmationStatus', 'blockTimeMs', 'transactionFailed', 'programIds',
 ] as const);
 const trustedPumpCodes = new Set<string>(PUMP_DECODING_ERROR_CODES);
 
@@ -507,12 +507,14 @@ function snapshotDiscovery(value: unknown): MergedCatchUpDiscovery {
   const slot = record.slot;
   const confirmationStatus = record.confirmationStatus;
   const blockTimeMs = record.blockTimeMs;
+  const transactionFailed = record.transactionFailed;
   if (typeof signature !== 'string' || signature.length === 0
     || signature !== signature.trim() || Buffer.byteLength(signature, 'utf8') > 128
     || typeof slot !== 'bigint' || slot < 0n || slot > BigInt(Number.MAX_SAFE_INTEGER)
     || (confirmationStatus !== 'processed'
       && confirmationStatus !== 'confirmed'
       && confirmationStatus !== 'finalized')
+    || typeof transactionFailed !== 'boolean'
     || (blockTimeMs !== null && (!Number.isSafeInteger(blockTimeMs)
       || (blockTimeMs as number) < 0 || Object.is(blockTimeMs, -0)))) {
     throw failure('INVALID_INPUT');
@@ -524,6 +526,7 @@ function snapshotDiscovery(value: unknown): MergedCatchUpDiscovery {
     slot,
     confirmationStatus,
     blockTimeMs: blockTimeMs as number | null,
+    transactionFailed,
     programIds,
   });
 }

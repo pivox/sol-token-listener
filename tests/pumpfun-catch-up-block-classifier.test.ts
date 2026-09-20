@@ -623,6 +623,7 @@ function discovery(
     slot: transaction.slot,
     confirmationStatus,
     blockTimeMs: transaction.blockTimeMs,
+    transactionFailed: transaction.error !== null,
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
   });
 }
