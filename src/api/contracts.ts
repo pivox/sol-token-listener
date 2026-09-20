@@ -547,6 +547,30 @@ export interface ApiHeartbeat {
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when RPC HTTP evidence is absent. */
   readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
+  /** Optional during rolling deployment; null when first-processing evidence is absent. */
+  readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
+}
+
+export interface ApiFirstProcessingCanaryEvidenceV1 {
+  readonly version: 1;
+  readonly thresholdMs: 45_000;
+  readonly cohortCapacity: 50_000;
+  readonly cohortStartedAtMs: number;
+  readonly cohortEndsAtMs: number;
+  readonly sampledAtMs: number;
+  readonly overflowed: boolean;
+  readonly eligibleCount: number;
+  readonly completedCount: number;
+  readonly underThresholdCount: number;
+  readonly atOrAboveThresholdCount: number;
+  readonly pendingCount: number;
+  readonly rightCensoredCount: number;
+  readonly tailCensoredCount: number;
+  readonly terminalCount: number;
+  readonly unavailableCount: number;
+  readonly invalidDurationCount: number;
+  readonly p95Ms: number | null;
+  readonly verdict: 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 }
 
 export interface ApiRpcHttpEvidenceV1 {

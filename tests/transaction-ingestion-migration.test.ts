@@ -291,6 +291,7 @@ void test('purges only expired resolved strict failures and exposes their count'
   );
   assert.match(source, /readonly transactionInbox: number;/u);
   assert.match(source, /DELETE FROM chain_transaction_inbox[\s\S]*terminal_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u);
+  assert.match(source, /first_detected_at IS NULL[\s\S]{0,160}first_detected_at \+ INTERVAL '4 hours'[\s\S]{0,80}<= clock_timestamp\(\)/u);
   const deletion = /DELETE FROM chain_transaction_inbox[\s\S]*?purge_after <= clock_timestamp\(\)/u
     .exec(source)?.[0] ?? '';
   assert.doesNotMatch(deletion, /processing_status = 'PROCESSED'/u);
@@ -375,7 +376,7 @@ void test('retains unresolved and unexpired strict failure evidence in PostgreSQ
   }
 });
 
-void test('applies migrations 001-049 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-050 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -391,7 +392,7 @@ void test('applies migrations 001-049 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '049_transaction_inbox_catch_up_admission_receipt.sql');
+    assert.equal(applied.at(-1), '050_transaction_inbox_first_processing.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
@@ -791,6 +792,7 @@ interface InboxInsert {
   readonly processedAt: string | null;
   readonly terminalAt: string | null;
   readonly purgeAfter: string | null;
+  readonly firstDetectedAt: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -812,7 +814,7 @@ function inboxValue(
   overrides: Partial<InboxInsert> = {},
   timestamps: Partial<InboxInsert> = {},
 ): InboxInsert {
-  return {
+  const value = {
     signature,
     observedSlot: '42',
     discoverySources: ['WEBSOCKET'],
@@ -834,10 +836,15 @@ function inboxValue(
     processedAt: null,
     terminalAt: null,
     purgeAfter: null,
+    firstDetectedAt: '2025-01-01T00:00:00.000Z',
     createdAt: '2025-01-01T00:00:00.000Z',
     updatedAt: '2025-01-01T00:00:00.000Z',
     ...overrides,
     ...timestamps,
+  };
+  return {
+    ...value,
+    firstDetectedAt: timestamps.firstDetectedAt ?? overrides.firstDetectedAt ?? value.createdAt,
   };
 }
 
@@ -909,10 +916,10 @@ async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
     processing_status, attempts, missing_finality_polls, lease_token, lease_expires_at,
     next_attempt_at, normalized_transaction, immutable_fingerprint, error_code, error_name,
     error_retryable, blockchain_time, observed_at, processed_at, terminal_at, purge_after,
-    created_at, updated_at
+    first_detected_at, created_at, updated_at
   ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22, $23
+    $17, $18, $19, $20, $21, $22, $23, $24
   )`, [
     value.signature, value.observedSlot, value.discoverySources, value.programIds,
     value.targetConfirmationStatus, value.processingStatus, value.attempts,
@@ -922,7 +929,7 @@ async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
     value.immutableFingerprint,
     value.errorCode, value.errorName, value.errorRetryable, value.blockchainTime,
     value.observedAt, value.processedAt, value.terminalAt, value.purgeAfter,
-    value.createdAt, value.updatedAt,
+    value.firstDetectedAt, value.createdAt, value.updatedAt,
   ]);
 }
 

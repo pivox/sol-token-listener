@@ -11,10 +11,13 @@ import type {
   RuntimeHeartbeat,
   TransactionNotification,
 } from '../domain/transaction-ingestion.js';
+import type { RuntimeFirstProcessingCanaryEvidenceV1 } from '../domain/first-processing-canary.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 
 export interface TransactionInboxRepository {
+  beginFirstProcessingCanary(): Promise<number>;
+  firstProcessingCanary(cohortStartedAtMs: number): Promise<RuntimeFirstProcessingCanaryEvidenceV1>;
   enqueue(value: TransactionNotification): Promise<void>;
   syncTrackedMint(mint: string): Promise<void>;
   claim(nowMs: number, leaseSeconds: number): Promise<ClaimedTransaction | null>;

@@ -1722,6 +1722,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       blockHydration: blockHydrationMetrics(),
       catchUpAdmission: null,
       rpcHttpEvidence: null,
+      firstProcessingCanary: null,
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2117,7 +2118,8 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null,
+    websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
+    rpcHttpEvidence: null, firstProcessingCanary: null,
   });
   assert.equal(health.lagSlots, null);
 });
@@ -2522,6 +2524,87 @@ async function projectRpcHttpEvidence(payload: unknown) {
     websocketRow(), false, healthyHeartbeatRow({ payload }),
   ))).getHealth();
 }
+
+function firstProcessingCanaryEvidence() {
+  return {
+    version: 1,
+    thresholdMs: 45_000,
+    cohortCapacity: 50_000,
+    cohortStartedAtMs: 1_000_000,
+    cohortEndsAtMs: 1_900_000,
+    sampledAtMs: 1_945_000,
+    overflowed: false,
+    eligibleCount: 3,
+    completedCount: 3,
+    underThresholdCount: 3,
+    atOrAboveThresholdCount: 0,
+    pendingCount: 0,
+    rightCensoredCount: 0,
+    tailCensoredCount: 0,
+    terminalCount: 0,
+    unavailableCount: 0,
+    invalidDurationCount: 0,
+    p95Ms: 44_999,
+    verdict: 'PASS',
+  } as const;
+}
+
+async function projectFirstProcessingCanary(payload: unknown) {
+  return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow(), false, healthyHeartbeatRow({ payload }),
+  ))).getHealth();
+}
+
+void test('first-processing canary projects a detached deeply frozen fixed snapshot', async () => {
+  const evidence = firstProcessingCanaryEvidence();
+  const health = await projectFirstProcessingCanary({ firstProcessingCanary: evidence });
+
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.firstProcessingCanary, evidence);
+  assert.ok(Object.isFrozen(health.heartbeat.firstProcessingCanary));
+  assert.notEqual(health.heartbeat.firstProcessingCanary, evidence);
+});
+
+void test('first-processing canary projects missing legacy evidence and an empty heartbeat as null', async () => {
+  for (const payload of [null, {}, { blockHydration: blockHydrationMetrics() }]) {
+    const health = await projectFirstProcessingCanary(payload);
+    assert.equal(health.status, 'OK');
+    assert.equal(health.heartbeat.firstProcessingCanary, null);
+  }
+});
+
+void test('first-processing canary rejects malformed or identifying evidence without leaking it', async () => {
+  const evidence = firstProcessingCanaryEvidence();
+  const invalid: unknown[] = [
+    null,
+    { ...evidence, version: 2 },
+    { ...evidence, thresholdMs: 44_999 },
+    { ...evidence, cohortCapacity: 49_999 },
+    { ...evidence, cohortEndsAtMs: evidence.cohortEndsAtMs + 1 },
+    { ...evidence, sampledAtMs: evidence.cohortStartedAtMs - 1 },
+    { ...evidence, eligibleCount: -0 },
+    { ...evidence, completedCount: Number.MAX_SAFE_INTEGER + 1 },
+    { ...evidence, eligibleCount: 4 },
+    { ...evidence, completedCount: 2 },
+    { ...evidence, pendingCount: 1 },
+    { ...evidence, p95Ms: null },
+    { ...evidence, p95Ms: 45_000 },
+    { ...evidence, verdict: 'FAIL' },
+    { ...evidence, signature: 'secret-signature' },
+    { ...evidence, mint: 'secret-mint' },
+  ];
+  for (const field of Object.keys(evidence)) {
+    invalid.push(Object.fromEntries(Object.entries(evidence).filter(([key]) => key !== field)));
+  }
+
+  for (const candidate of invalid) {
+    const health = await projectFirstProcessingCanary({ firstProcessingCanary: candidate });
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.equal(health.heartbeat.firstProcessingCanary, null);
+    assert.doesNotMatch(JSON.stringify(health), /secret-signature|secret-mint/u);
+  }
+});
 
 void test('RPC HTTP evidence projects exact frozen four-provider snapshots and overflow', async () => {
   for (const overflowed of [false, true]) {

@@ -46,9 +46,497 @@ import {
   TransactionInboxLeaseError,
   TransactionInboxRepositoryError,
 } from '../src/storage/transaction-inbox.repository.js';
+import {
+  FIRST_PROCESSING_COHORT_CAPACITY,
+  FIRST_PROCESSING_COHORT_DURATION_MS,
+  FIRST_PROCESSING_THRESHOLD_MS,
+  createFirstProcessingCanaryEvidence,
+} from '../src/domain/first-processing-canary.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
+
+void test('heartbeat persists a detached first processing canary snapshot and rejects malformed evidence before I/O', async () => {
+  const queryCalls: unknown[][] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      queryCalls.push(values === undefined ? [] : [...values]);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const owned = Object.freeze({ ...firstProcessingHeartbeatEvidence() });
+  const heartbeat: RuntimeHeartbeat = Object.freeze({
+    runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+    workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+    updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+    lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0,
+    exhaustedCount: 0, firstProcessingCanary: owned,
+  });
+  await repository.writeHeartbeat(heartbeat);
+  assert.equal(queryCalls.length, 1);
+  assert.deepEqual(queryCalls[0]?.[14], {
+    startedAt: '1970-01-01T00:00:01.000Z',
+    firstProcessingCanary: firstProcessingHeartbeatEvidence(),
+  });
+  const { firstProcessingCanary: omitted, ...legacy } = heartbeat;
+  assert.ok(omitted);
+  await repository.writeHeartbeat(Object.freeze({ ...legacy, updatedAtMs: 3_000 }));
+  assert.deepEqual(queryCalls[1]?.[14], { startedAt: '1970-01-01T00:00:01.000Z' });
+  await assert.rejects(repository.writeHeartbeat(Object.freeze({
+    ...heartbeat,
+    updatedAtMs: 4_000,
+    firstProcessingCanary: new Proxy(firstProcessingHeartbeatEvidence(), {}),
+  })), TransactionInboxRepositoryError);
+  assert.equal(queryCalls.length, 2);
+});
+
+function firstProcessingHeartbeatEvidence() {
+  return createFirstProcessingCanaryEvidence({
+    version: 1, thresholdMs: 45_000, cohortCapacity: 50_000,
+    cohortStartedAtMs: 1_000, cohortEndsAtMs: 901_000, sampledAtMs: 946_000,
+    overflowed: false, eligibleCount: 0, completedCount: 0, underThresholdCount: 0,
+    atOrAboveThresholdCount: 0, pendingCount: 0, rightCensoredCount: 0, tailCensoredCount: 0,
+    terminalCount: 0, unavailableCount: 0, invalidDurationCount: 0, p95Ms: null,
+    verdict: 'INCONCLUSIVE',
+  });
+}
+
+void test('first processing time survives lease loss, finality replay, orphaning, and exhausted recovery', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 1, baseDelayMs: 500,
+    }));
+    const signature = 'first-processing-finality';
+    await repository.enqueue(notification(signature, 801n, 'WEBSOCKET', 'confirmed'));
+    const initial = await repository.claim(Date.now(), 30);
+    assert.ok(initial);
+    await assert.rejects(repository.markProcessed(signature, 'lost-lease', 'confirmed'), TransactionInboxLeaseError);
+    assert.equal((await row(pool, signature)).first_processed_at, null);
+    await repository.saveSnapshot(signature, initial.leaseToken, normalized(signature, 801n));
+    await repository.markProcessed(signature, initial.leaseToken, 'confirmed');
+    const firstCompleted = new Date((await row(pool, signature)).first_processed_at).getTime();
+    const completed = new Date((await row(pool, signature)).processed_at).getTime();
+    assert.equal(firstCompleted, completed);
+    assert.equal(Number.isSafeInteger(firstCompleted), true);
+
+    await repository.enqueueRevision(Object.freeze({
+      signature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 1,
+    }));
+    const finalityReplay = await repository.claim(Date.now() + 2, 30);
+    assert.ok(finalityReplay);
+    await repository.markProcessed(signature, finalityReplay.leaseToken, 'finalized');
+    assert.equal(new Date((await row(pool, signature)).first_processed_at).getTime(), firstCompleted);
+
+    const orphanSignature = 'first-processing-orphan';
+    await repository.enqueue(notification(orphanSignature, 803n, 'WEBSOCKET', 'confirmed'));
+    const orphanInitial = await repository.claim(Date.now() + 3, 30);
+    assert.ok(orphanInitial);
+    await repository.saveSnapshot(orphanSignature, orphanInitial.leaseToken, normalized(orphanSignature, 803n));
+    await repository.markProcessed(orphanSignature, orphanInitial.leaseToken, 'confirmed');
+    const orphanFirstCompleted = new Date((await row(pool, orphanSignature)).first_processed_at).getTime();
+    const orphanProof = await repository.recordFinalityPoll(Object.freeze({
+      signature: orphanSignature, confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 0n, observedAtMs: Date.now() + 4,
+    }));
+    if (orphanProof.lastMissingFinalityProviderId === null) throw new Error('Expected orphan proof provider.');
+    await repository.enqueueRevision(Object.freeze({
+      signature: orphanSignature, confirmationStatus: 'orphaned' as const,
+      expectedConfirmationStatus: orphanProof.confirmationStatus,
+      expectedMissingFinalityPolls: orphanProof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: orphanProof.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: orphanProof.finalityEvidenceVersion,
+      observedAtMs: Date.now() + 5,
+    }));
+    assert.equal(new Date((await row(pool, orphanSignature)).first_processed_at).getTime(), orphanFirstCompleted);
+    const orphanReplay = await repository.claim(Date.now() + 6, 30);
+    assert.ok(orphanReplay);
+    await repository.markProcessed(orphanSignature, orphanReplay.leaseToken, 'orphaned');
+    assert.equal(new Date((await row(pool, orphanSignature)).first_processed_at).getTime(), orphanFirstCompleted);
+
+    const recoverySignature = 'first-processing-recovery';
+    await repository.enqueue(notification(recoverySignature, 802n, 'WEBSOCKET', 'confirmed'));
+    const recoveryInitial = await repository.claim(Date.now() + 3, 30);
+    assert.ok(recoveryInitial);
+    await repository.saveSnapshot(recoverySignature, recoveryInitial.leaseToken, normalized(recoverySignature, 802n));
+    await repository.markProcessed(recoverySignature, recoveryInitial.leaseToken, 'confirmed');
+    const recoveryFirstCompleted = new Date((await row(pool, recoverySignature)).first_processed_at).getTime();
+    await repository.enqueueRevision(Object.freeze({
+      signature: recoverySignature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 4,
+    }));
+    const failedReplay = await repository.claim(Date.now() + 5, 30);
+    assert.ok(failedReplay);
+    await repository.markFailed(recoverySignature, failedReplay.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    assert.deepEqual(await repository.recoverExhausted(recoverySignature), {
+      code: 'RECOVERY_SCHEDULED', signature: recoverySignature,
+    });
+    assert.equal((await row(pool, recoverySignature)).processed_at, null);
+    assert.equal(new Date((await row(pool, recoverySignature)).first_processed_at).getTime(), recoveryFirstCompleted);
+    const recovered = await repository.claim(Date.now() + 6, 30);
+    assert.ok(recovered);
+    if (recovered.normalizedTransaction === null) {
+      await repository.saveSnapshot(recoverySignature, recovered.leaseToken, normalized(recoverySignature, 802n));
+    }
+    await repository.markProcessed(recoverySignature, recovered.leaseToken, 'finalized');
+    assert.equal(new Date((await row(pool, recoverySignature)).first_processed_at).getTime(), recoveryFirstCompleted);
+
+    const automaticRetryRepository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 2, baseDelayMs: 1,
+    }));
+    const automaticRetrySignature = 'first-processing-automatic-retry';
+    await automaticRetryRepository.enqueue(notification(automaticRetrySignature, 804n, 'WEBSOCKET', 'confirmed'));
+    const automaticInitial = await automaticRetryRepository.claim(Date.now() + 7, 30);
+    assert.ok(automaticInitial);
+    await automaticRetryRepository.saveSnapshot(
+      automaticRetrySignature, automaticInitial.leaseToken, normalized(automaticRetrySignature, 804n),
+    );
+    await automaticRetryRepository.markProcessed(automaticRetrySignature, automaticInitial.leaseToken, 'confirmed');
+    const automaticFirstCompleted = new Date((await row(pool, automaticRetrySignature)).first_processed_at).getTime();
+    await automaticRetryRepository.enqueueRevision(Object.freeze({
+      signature: automaticRetrySignature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 8,
+    }));
+    const automaticFailedReplay = await automaticRetryRepository.claim(Date.now() + 9, 30);
+    assert.ok(automaticFailedReplay);
+    await automaticRetryRepository.markFailed(automaticRetrySignature, automaticFailedReplay.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    const automaticRetryAt = new Date((await row(pool, automaticRetrySignature)).next_attempt_at).getTime();
+    const automaticRetry = await automaticRetryRepository.claim(automaticRetryAt + 1, 30);
+    assert.ok(automaticRetry);
+    if (automaticRetry.normalizedTransaction === null) {
+      await automaticRetryRepository.saveSnapshot(
+        automaticRetrySignature, automaticRetry.leaseToken, normalized(automaticRetrySignature, 804n),
+      );
+    }
+    await automaticRetryRepository.markProcessed(automaticRetrySignature, automaticRetry.leaseToken, 'finalized');
+    const automaticRetryStored = await row(pool, automaticRetrySignature);
+    assert.equal(new Date(automaticRetryStored.first_processed_at).getTime(), automaticFirstCompleted);
+  });
+});
+
+void test('markProcessed preserves a microsecond updated_at later within the completion millisecond', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'first-processing-microsecond-updated-at';
+    await repository.enqueue(notification(signature, 805n, 'WEBSOCKET', 'confirmed'));
+    const claim = await repository.claim(Date.now(), 30);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 805n));
+
+    const schema = (await pool.query<{ readonly schema_name: unknown }>(
+      'SELECT current_schema() AS schema_name',
+    )).rows[0]?.schema_name;
+    assert.equal(typeof schema, 'string');
+    if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+    const completedAtMs = Date.now() + 60_000;
+    const completedAt = new Date(completedAtMs).toISOString();
+    const updatedAt = `${completedAt.slice(0, -1).replace(/\.\d{3}$/u, `.${String(completedAtMs % 1_000).padStart(3, '0')}500`)}Z`;
+    await pool.query(`UPDATE chain_transaction_inbox SET updated_at=$2::TIMESTAMPTZ
+      WHERE signature=$1`, [signature, updatedAt]);
+    await pool.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+      RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+      AS $$ SELECT TIMESTAMPTZ '${completedAt}' $$`);
+    await pool.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
+
+    await repository.markProcessed(signature, claim.leaseToken, 'confirmed');
+    const stored = (await pool.query(`SELECT
+      to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
+      to_char(processed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS processed_at,
+      to_char(first_processed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS first_processed_at
+      FROM chain_transaction_inbox WHERE signature=$1`, [signature])).rows[0];
+    const expectedCompleted = `${completedAt.slice(0, -1).replace(/\.(\d{3})$/u, '.$1000')}Z`;
+    assert.deepEqual(stored, { updated_at: updatedAt, processed_at: expectedCompleted,
+      first_processed_at: expectedCompleted });
+  });
+});
+
+void test('a partially purged four-hour cohort can never recover a PASS', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 14_400_000 - 1_000;
+    await insertCanaryInboxRow(pool, 'canary-purged', startedAtMs, startedAtMs + 1_000, 'PROCESSED');
+    await insertCanaryInboxRow(pool, 'canary-retained', startedAtMs + 1, startedAtMs + 1_001, 'PROCESSED');
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      target_confirmation_status='finalized', terminal_at=processed_at,
+      purge_after=processed_at+INTERVAL '4 hours'
+      WHERE signature='canary-purged'`);
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature, observed_slot, confirmation_status, finality_evidence_version,
+      immutable_fingerprint, replay_completed_at
+    ) SELECT signature, observed_slot, target_confirmation_status,
+      finality_evidence_version, immutable_fingerprint, processed_at
+      FROM chain_transaction_inbox WHERE signature='canary-purged'`);
+
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.transactionInbox, 1);
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.completedCount, 1);
+    assert.equal(evidence.p95Ms, 1_000);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('retention anchors post-migration classifications to durable detection time', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classifiedAtMs = Date.now() - 14_400_001;
+    const cohortStartedAtMs = await repository.beginFirstProcessingCanary();
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('canary-detection-anchored-retention'),
+      observedAtMs: classifiedAtMs,
+      classifiedAtMs,
+      disposition: 'IGNORED',
+      reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null,
+      ingestionHintMint: null,
+      mints: [],
+    });
+    await repository.recordCatchUpClassification(classification);
+    const before = (await pool.query<{
+      readonly first_detected_at: Date;
+      readonly catch_up_classified_at: Date;
+      readonly purge_after: Date;
+    }>(`SELECT first_detected_at,catch_up_classified_at,purge_after
+      FROM chain_transaction_inbox WHERE signature=$1`, [classification.signature])).rows[0];
+    assert.ok(before);
+    assert.ok(before.first_detected_at instanceof Date);
+    assert.ok(before.first_detected_at.getTime() >= cohortStartedAtMs);
+    assert.ok(before.catch_up_classified_at.getTime() < cohortStartedAtMs);
+    assert.ok(before.purge_after.getTime() <= Date.now());
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at, error_code, error_name,
+      error_retryable, terminal_at, purge_after
+    ) VALUES ('legacy-null-detection-retention', 2, ARRAY['CATCH_UP'], ARRAY[$1],
+      'confirmed', 'FAILED', to_timestamp($2::BIGINT / 1000.0), NULL,
+      'NORMALIZATION_FAILED', 'LegacyFailure', FALSE,
+      to_timestamp($2::BIGINT / 1000.0), to_timestamp($2::BIGINT / 1000.0)+INTERVAL '4 hours')`,
+    [PUMP_PROGRAM_ID, classifiedAtMs]);
+
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature=$1`, [classification.signature])).rows[0]?.count, '1');
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature='legacy-null-detection-retention'`)).rows[0]?.count, '0');
+
+    const schema = (await pool.query<{ readonly schema_name: unknown }>(
+      'SELECT current_schema() AS schema_name',
+    )).rows[0]?.schema_name;
+    assert.equal(typeof schema, 'string');
+    if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+    const deletionAt = new Date(before.first_detected_at.getTime() + 14_400_000).toISOString();
+    await pool.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+      RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+      AS $$ SELECT TIMESTAMPTZ '${deletionAt}' $$`);
+    await pool.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
+
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature=$1`, [classification.signature])).rows[0]?.count, '0');
+  });
+});
+
+void test('aggregates a bounded first-processing cohort with PostgreSQL timing and no identifiers', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    const databaseClockSql = `SELECT
+      (EXTRACT(EPOCH FROM date_trunc('milliseconds', clock_timestamp())) * 1000)::BIGINT
+        AS now_ms`;
+    const databaseBeforeMs = Number((await pool.query(databaseClockSql)).rows[0]?.now_ms);
+    const databaseStartedAtMs = await repository.beginFirstProcessingCanary();
+    const databaseAfterMs = Number((await pool.query(databaseClockSql)).rows[0]?.now_ms);
+    assert.equal(Number.isSafeInteger(databaseBeforeMs), true);
+    assert.equal(Number.isSafeInteger(databaseStartedAtMs), true);
+    assert.equal(Number.isSafeInteger(databaseAfterMs), true);
+    assert.ok(databaseStartedAtMs >= databaseBeforeMs);
+    assert.ok(databaseStartedAtMs <= databaseAfterMs);
+
+    await insertCanaryInboxRow(pool, 'canary-under', startedAtMs + 1, startedAtMs + 45_000);
+    await insertCanaryInboxRow(pool, 'canary-at', startedAtMs + 2, startedAtMs + 45_002);
+    await insertCanaryInboxRow(pool, 'canary-invalid', startedAtMs + 4, startedAtMs + 3);
+    await insertCanaryInboxRow(pool, 'canary-unavailable', startedAtMs + 5, null, 'PENDING', true);
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable-a', startedAtMs + 6, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable-b', startedAtMs + 7, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable-c', startedAtMs + 8, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed', startedAtMs + 9, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-exhausted', startedAtMs + 10, null, 'FAILED', false, true);
+    await insertCanaryInboxRow(pool, 'canary-tail', startedAtMs + 11, null);
+    await insertCanaryInboxRow(pool, 'canary-upper-bound', startedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS, null);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.deepEqual(evidence, {
+      version: 1, thresholdMs: FIRST_PROCESSING_THRESHOLD_MS,
+      cohortCapacity: FIRST_PROCESSING_COHORT_CAPACITY,
+      cohortStartedAtMs: startedAtMs,
+      cohortEndsAtMs: startedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS,
+      sampledAtMs: evidence.sampledAtMs, overflowed: false,
+      eligibleCount: 10, completedCount: 2, underThresholdCount: 1,
+      atOrAboveThresholdCount: 1, pendingCount: 1, rightCensoredCount: 0,
+      tailCensoredCount: 1, terminalCount: 5, unavailableCount: 1,
+      invalidDurationCount: 1, p95Ms: 45_000, verdict: 'FAIL',
+    });
+    assert.equal(evidence.sampledAtMs >= startedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS,
+      true);
+    assert.equal('signature' in evidence, false);
+    assert.equal('mint' in evidence, false);
+    assert.equal('programId' in evidence, false);
+  });
+});
+
+void test('uses a 50,001st deterministic overflow probe without counting it in the cohort', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at
+    ) SELECT 'canary-cap-' || LPAD(series::TEXT, 5, '0'), series, ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
+      to_timestamp(($1::BIGINT - 3600000) / 1000.0), to_timestamp($1::BIGINT / 1000.0)
+      FROM generate_series(1, $2) AS series`, [startedAtMs, FIRST_PROCESSING_COHORT_CAPACITY + 1]);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.overflowed, true);
+    assert.equal(evidence.eligibleCount, FIRST_PROCESSING_COHORT_CAPACITY);
+    assert.equal(evidence.tailCensoredCount, FIRST_PROCESSING_COHORT_CAPACITY);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('classifies an incomplete fresh cohort as right-censored', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 10;
+    await insertCanaryInboxRow(pool, 'canary-right-censored', startedAtMs, null);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.pendingCount, 1);
+    assert.equal(evidence.rightCensoredCount, 1);
+    assert.equal(evidence.tailCensoredCount, 0);
+    assert.equal(evidence.p95Ms, null);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('counts one completed duration, excludes pre-cohort and historical rows', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    await insertCanaryInboxRow(pool, 'canary-single-completed', startedAtMs, startedAtMs + 44_999);
+    await insertCanaryInboxRow(pool, 'canary-before-start', startedAtMs - 1, startedAtMs + 44_998);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at, first_processing_evidence_unavailable
+    ) VALUES ('canary-historical', 2, ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
+      to_timestamp($1::BIGINT / 1000.0), NULL, TRUE)`, [startedAtMs]);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.completedCount, 1);
+    assert.equal(evidence.p95Ms, 44_999);
+    assert.equal(evidence.verdict, 'PASS');
+  });
+});
+
+void test('classifies valid DEFERRED, IGNORED, and QUARANTINED repository rows as terminal', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const terminalRows = [
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-deferred-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 1,
+        disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+        ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint, mints: [tradeMint],
+      }),
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-ignored-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 2,
+        disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      }),
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-quarantined-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 3,
+        disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      }),
+    ];
+    for (const classification of terminalRows) await repository.recordCatchUpClassification(classification);
+
+    assert.equal((await row(pool, 'canary-deferred-valid')).processing_status, 'DEFERRED');
+    assert.equal((await row(pool, 'canary-ignored-valid')).processing_status, 'IGNORED');
+    assert.equal((await row(pool, 'canary-quarantined-valid')).processing_status, 'QUARANTINED');
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 3);
+    assert.equal(evidence.terminalCount, 3);
+    assert.equal(evidence.pendingCount, 0);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('classifies valid nonretryable and exhausted FAILED rows before their required terminal timestamps', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable', startedAtMs, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-exhausted', startedAtMs + 1, null,
+      'FAILED', false, true);
+
+    const nonretryable = await row(pool, 'canary-failed-nonretryable');
+    const exhausted = await row(pool, 'canary-failed-exhausted');
+    assert.equal(nonretryable.error_retryable, false);
+    assert.equal(nonretryable.retry_exhausted_at, null);
+    assert.notEqual(nonretryable.terminal_at, null);
+    assert.equal(exhausted.error_retryable, true);
+    assert.notEqual(exhausted.retry_exhausted_at, null);
+    assert.notEqual(exhausted.terminal_at, null);
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 2);
+    assert.equal(evidence.terminalCount, 2);
+  });
+});
+
+void test('classifies the 44,999/45,000 right/tail boundary through the repository', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const sampledAtMs = Date.parse('2026-01-01T00:00:45.000Z');
+    const startedAtMs = sampledAtMs - 60_000;
+    await insertCanaryInboxRow(pool, 'canary-right-boundary', sampledAtMs - 44_999, null);
+    await insertCanaryInboxRow(pool, 'canary-tail-boundary', sampledAtMs - 45_000, null);
+
+    const client = await pool.connect();
+    try {
+      const schema = (await client.query<{ readonly schema_name: unknown }>(
+        'SELECT current_schema() AS schema_name',
+      )).rows[0]?.schema_name;
+      assert.equal(typeof schema, 'string');
+      if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+      await client.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+        RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+        AS $$ SELECT to_timestamp(${sampledAtMs} / 1000.0) $$`);
+      await client.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
+      const repository = new PostgresTransactionInboxRepository({
+        async query(text, values) {
+          return client.query(text, values === undefined ? undefined : [...values]);
+        },
+        async connect() { throw new Error('No connection needed.'); },
+      });
+
+      const evidence = await repository.firstProcessingCanary(startedAtMs);
+      assert.equal(evidence.sampledAtMs, sampledAtMs);
+      assert.equal(evidence.eligibleCount, 2);
+      assert.equal(evidence.pendingCount, 2);
+      assert.equal(evidence.rightCensoredCount, 1);
+      assert.equal(evidence.tailCensoredCount, 1);
+    } finally {
+      client.release();
+    }
+  });
+});
 
 void test('RPC HTTP heartbeat persistence serializes only detached fixed evidence fields', async () => {
   const recorder = createRpcHttpEvidenceRecorder();
@@ -262,6 +750,8 @@ for (const [location, boundary] of [
       let written: RuntimeHeartbeat | undefined;
       const heartbeat = new PersistentListenerHeartbeat({
         counts: () => repository.counts(),
+        beginFirstProcessingCanary: () => repository.beginFirstProcessingCanary(),
+        firstProcessingCanary: (cohortStartedAtMs) => repository.firstProcessingCanary(cohortStartedAtMs),
         async writeHeartbeat(value) { written = value; await repository.writeHeartbeat(value); },
       }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
       () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
@@ -275,6 +765,7 @@ for (const [location, boundary] of [
         assert.ok(written);
         assert.deepEqual(payload, {
           startedAt: new Date(written.startedAtMs).toISOString(), catchUpAdmission: expected,
+          firstProcessingCanary: written.firstProcessingCanary,
         });
         assert.equal(serializationReads, 0);
         assert.notEqual(written.catchUpAdmission, metrics);
@@ -2918,7 +3409,11 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
 
     await insertTerminal(pool, 'purge-me', new Date(Date.now() - 1_000));
     await insertTerminal(pool, 'keep-me', new Date(Date.now() + 60_000));
-    await repository.enqueue(notification('failed-purge-me', 51n));
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at
+    ) VALUES ('failed-purge-me', 51, ARRAY['WEBSOCKET'], ARRAY[$1],
+      'processed', 'PENDING', clock_timestamp(), NULL)`, [PUMP_PROGRAM_ID]);
     const failedClaim = await repository.claim(Date.now(), 120);
     assert.equal(failedClaim?.signature, 'failed-purge-me');
     await repository.markFailed('failed-purge-me', failedClaim.leaseToken, Object.freeze({
@@ -4435,6 +4930,35 @@ async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promi
   return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
 }
 
+async function insertCanaryInboxRow(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+  detectedAtMs: number,
+  processedAtMs: number | null,
+  processingStatus = 'PENDING',
+  unavailable = false,
+  exhausted = false,
+): Promise<void> {
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+    processing_status, normalized_transaction, immutable_fingerprint, observed_at,
+    processed_at, first_detected_at, first_processed_at, first_processing_evidence_unavailable,
+    terminal_at, purge_after, error_code, error_name, error_retryable, retry_exhausted_at
+  ) VALUES (
+    $1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
+    $4, CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE '{}'::JSONB END,
+    CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE $7 END, to_timestamp(($2::BIGINT - 3600000) / 1000.0),
+    CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE to_timestamp($3::BIGINT / 1000.0) END,
+    to_timestamp($2::BIGINT / 1000.0), CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE to_timestamp($3::BIGINT / 1000.0) END,
+    $5::BOOLEAN, CASE WHEN $4::TEXT='FAILED' THEN to_timestamp($2::BIGINT / 1000.0) END,
+    CASE WHEN $4::TEXT='FAILED' THEN to_timestamp($2::BIGINT / 1000.0) + INTERVAL '4 hours' END,
+    CASE WHEN $4::TEXT='FAILED' THEN 'RPC_TRANSIENT' END,
+    CASE WHEN $4::TEXT='FAILED' THEN 'CanaryFailure' END,
+    CASE WHEN $4::TEXT='FAILED' THEN $6::BOOLEAN ELSE NULL END,
+    CASE WHEN $6::BOOLEAN THEN to_timestamp(($2::BIGINT + 1) / 1000.0) ELSE NULL END
+  )`, [signature, detectedAtMs, processedAtMs, processingStatus, unavailable, exhausted, 'a'.repeat(64)]);
+}
+
 async function strictCatchUpRunRow(
   pool: InstanceType<typeof pg.Pool>,
   runId: string,
@@ -4458,10 +4982,10 @@ async function insertTerminal(
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, normalized_transaction, immutable_fingerprint, observed_at,
-    processed_at, terminal_at, purge_after
+    processed_at, terminal_at, purge_after, first_detected_at
   ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'finalized', 'PROCESSED', $2, $3,
     $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
-    $4::TIMESTAMPTZ + INTERVAL '4 hours')`, [signature, snapshot, 'a'.repeat(64), completedAt]);
+    $4::TIMESTAMPTZ + INTERVAL '4 hours', NULL)`, [signature, snapshot, 'a'.repeat(64), completedAt]);
   await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
     signature,observed_slot,confirmation_status,finality_evidence_version,
     immutable_fingerprint,replay_completed_at

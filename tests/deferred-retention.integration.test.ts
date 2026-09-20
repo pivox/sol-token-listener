@@ -190,11 +190,14 @@ function notification() {
 }
 
 async function seedExpiredTrade(pool: Pool): Promise<void> {
-  await new PostgresTransactionInboxRepository(pool).enqueue(notification());
-  await pool.query(`UPDATE chain_transaction_inbox
-    SET terminal_at=TIMESTAMPTZ '2020-01-01T00:00:00Z',
-      purge_after=TIMESTAMPTZ '2020-01-01T04:00:00Z'
-    WHERE signature='expired-trade'`);
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+    first_detected_at,terminal_at,purge_after
+  ) VALUES ('expired-trade',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+    'DEFERRED','NORMAL','PUMPFUN_TRADE',$2,to_timestamp(1),
+    TIMESTAMPTZ '2020-01-01T00:00:00Z',TIMESTAMPTZ '2020-01-01T00:00:00Z',
+    TIMESTAMPTZ '2020-01-01T04:00:00Z')`, [PUMP_PROGRAM_ID, mint]);
 }
 
 async function trade(pool: Pool) {

@@ -9,6 +9,10 @@ import {
   type RuntimeRpcHttpEvidenceV1,
 } from '../domain/rpc-http-evidence.js';
 import {
+  createFirstProcessingCanaryEvidence,
+  type RuntimeFirstProcessingCanaryEvidenceV1,
+} from '../domain/first-processing-canary.js';
+import {
   assertValidInboxCounts,
   assertValidRuntimeHeartbeat,
   snapshotRuntimeCatchUpAdmissionMetrics,
@@ -828,6 +832,7 @@ function sameProviderSelection(
 export class PersistentListenerHeartbeat {
   private currentState: ListenerRuntimeState = 'STOPPED';
   private startedAtMs = 0;
+  private firstProcessingCanaryCohort: Promise<number> | null = null;
   private lastHttpSlot: bigint | null = null;
   private lastFinalizedSlot: bigint | null = null;
   private backlogCount = 0;
@@ -845,7 +850,8 @@ export class PersistentListenerHeartbeat {
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
 
   public constructor(
-    private readonly inbox: Pick<TransactionInboxRepository, 'counts' | 'writeHeartbeat'>,
+    private readonly inbox: Pick<TransactionInboxRepository,
+      'counts' | 'writeHeartbeat' | 'beginFirstProcessingCanary' | 'firstProcessingCanary'>,
     private readonly rpc: Pick<SolanaRpcClient, 'getSlot' | 'getFinalizedSlot'>,
     private readonly subscriberState: () => ListenerRuntimeState,
     private readonly scannerState: () => ListenerRuntimeState,
@@ -875,10 +881,19 @@ export class PersistentListenerHeartbeat {
   }
 
   public async start(): Promise<void> {
-    if (this.closed) return;
+    if (this.hasClosed()) return;
     this.currentState = 'RUNNING';
-    this.startedAtMs = Date.now();
-    await this.write('RUNNING');
+    this.ensureStartedAtMs();
+    await this.firstProcessingCanaryCohortStartedAtMs();
+    if (this.hasClosed()) return;
+    const initialWrite = this.write('RUNNING');
+    this.inFlight = initialWrite;
+    try {
+      await initialWrite;
+    } finally {
+      if (this.inFlight === initialWrite) this.inFlight = null;
+    }
+    if (this.closed) return;
     this.schedule();
   }
 
@@ -894,6 +909,10 @@ export class PersistentListenerHeartbeat {
 
   public state(): ListenerRuntimeState {
     return this.currentState;
+  }
+
+  private hasClosed(): boolean {
+    return this.closed;
   }
 
   private schedule(): void {
@@ -949,17 +968,27 @@ export class PersistentListenerHeartbeat {
   }
 
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
+    this.ensureStartedAtMs();
+    const cohortStartedAtMs = await this.firstProcessingCanaryCohortStartedAtMs();
     let counts: InboxCounts;
+    let firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
     if (runtimeState === 'RUNNING') {
-      const [currentCounts, slots] = await Promise.all([
+      const [currentCounts, evidence, slots] = await Promise.all([
         this.inbox.counts(),
+        this.inbox.firstProcessingCanary(cohortStartedAtMs),
         Promise.all([this.rpc.getSlot(), this.rpc.getFinalizedSlot()]),
       ]);
       counts = currentCounts;
+      firstProcessingCanary = createFirstProcessingCanaryEvidence(evidence);
       this.lastHttpSlot = slots[0];
       this.lastFinalizedSlot = slots[1];
     } else {
-      counts = await this.inbox.counts();
+      const [currentCounts, evidence] = await Promise.all([
+        this.inbox.counts(),
+        this.inbox.firstProcessingCanary(cohortStartedAtMs),
+      ]);
+      counts = currentCounts;
+      firstProcessingCanary = createFirstProcessingCanaryEvidence(evidence);
     }
     this.backlogCount = safeInboxBacklog(counts.pending, counts.processing, counts.retryableFailed);
     this.leasedCount = counts.processing;
@@ -999,6 +1028,7 @@ export class PersistentListenerHeartbeat {
       backlogCount: this.backlogCount,
       leasedCount: this.leasedCount,
       exhaustedCount: this.exhaustedCount,
+      firstProcessingCanary,
       ...(blockHydration === undefined ? {} : { blockHydration }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
@@ -1009,6 +1039,19 @@ export class PersistentListenerHeartbeat {
       }
     }
     await this.inbox.writeHeartbeat(value);
+  }
+
+  private ensureStartedAtMs(): void {
+    if (this.startedAtMs === 0) this.startedAtMs = Date.now();
+  }
+
+  private firstProcessingCanaryCohortStartedAtMs(): Promise<number> {
+    return this.firstProcessingCanaryCohort ??= this.inbox.beginFirstProcessingCanary().then((value) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new TypeError('First processing canary cohort start is invalid.');
+      }
+      return value;
+    });
   }
 }
 

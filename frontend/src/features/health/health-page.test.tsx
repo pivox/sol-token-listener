@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import { health, success } from '../../../tests/fixtures/api.js';
+import { firstProcessingCanary, health, success } from '../../../tests/fixtures/api.js';
 import type { ApiClient } from '../../data/api-client.js';
 import { apiHealthEnvelopeSchema, type ApiHealth } from '../../data/api-schemas.js';
 import { ApiClientProvider } from '../../data/api-provider.js';
@@ -43,6 +43,48 @@ function renderHealth(value: ApiHealth): ReturnType<typeof vi.fn<ApiClient['getH
 }
 
 describe('technical health page', () => {
+  it('renders fixed first-processing evidence, overflow and completed drain without identifiers', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        signature: 'secret-signature',
+        mint: 'secret-mint',
+        firstProcessingCanary,
+      },
+    })).data);
+
+    const card = (await screen.findByRole('heading', { name: 'Premier traitement' })).closest('section');
+    const diagnostic = within(card!);
+    const verdict = diagnostic.getByText('PASS');
+    expect(verdict.tagName).toBe('STRONG');
+    expect(verdict.closest('p')).toHaveTextContent('Verdict : PASS');
+    expect(diagnostic.getByText('p95 : 44999 ms')).toBeVisible();
+    expect(diagnostic.getByText('Sous 45 s : 3 ; à partir de 45 s : 0')).toBeVisible();
+    expect(diagnostic.getByText('Éligibles : 3 ; terminés : 3 ; en attente : 0')).toBeVisible();
+    expect(diagnostic.getByText('Censure droite : 0 ; censure de queue : 0')).toBeVisible();
+    expect(diagnostic.getByText('Terminaux : 0 ; indisponibles : 0 ; durées invalides : 0')).toBeVisible();
+    expect(diagnostic.getByText('Overflow : Non')).toBeVisible();
+    expect(diagnostic.getByText('Drain : Terminé')).toBeVisible();
+    expect(document.body).not.toHaveTextContent('secret-signature');
+    expect(document.body).not.toHaveTextContent('secret-mint');
+  });
+
+  it.each([
+    [undefined, 'Non disponible — backend antérieur'],
+    [null, 'Non disponible — heartbeat antérieur ou invalide'],
+  ] as const)('renders the explicit first-processing unavailable state for %s', async (value, message) => {
+    const heartbeat: Record<string, unknown> = {
+      ...health.heartbeat,
+      firstProcessingCanary: value,
+    };
+    if (value === undefined) delete heartbeat.firstProcessingCanary;
+    renderHealth(apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat })).data);
+
+    const card = (await screen.findByRole('heading', { name: 'Premier traitement' })).closest('section');
+    expect(within(card!).getByText(message)).toBeVisible();
+  });
+
   it('renders bounded RPC HTTP evidence without endpoint information', async () => {
     const rpcHttpEvidence = {
       version: 1,

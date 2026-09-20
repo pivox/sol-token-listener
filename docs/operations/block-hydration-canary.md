@@ -1,10 +1,11 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.0.1 — 2026-09-20 — issues #114 et #142.
+Version : 1.1.2 — 2026-09-20 — issues #114, #142 et #143.
 
-Cette procédure post-merge est opérateur-only et observe-only. Elle ne connecte
-ni ne lit aucun wallet ou clé privée, ne compose aucun executor, n'arme, ne
-signe et ne soumet aucune transaction. Elle est séparée de ce merge : aucune
+Cette procédure post-merge est opérateur-only et observe-only et ne confère
+aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
+wallet ou clé privée, ne compose aucun executor, n'arme, ne signe et ne soumet
+aucune transaction. Elle est séparée de ce merge : aucune
 readiness Mainnet n'est déclarée avant que cette fenêtre ait passé. Utiliser une
 seule réplique avec `LISTENER_INGESTION_SCOPE=launchpad-only`, en mode `observe`.
 Archiver le health, les compteurs inbox, le RSS et le tableau fournisseur avant
@@ -43,24 +44,75 @@ activation.
    jq 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)}' health.json
    ```
 
-   Après T+15, arrêter uniquement `app`, laisser PostgreSQL actif, puis extraire
+   Pour l'artefact first-processing séparé, appliquer à chacun des trois health
+   API le filtre fermé ci-dessous. Il reconstruit exclusivement les champs V1
+   autorisés et transforme toute absence, clé supplémentaire, entier dangereux,
+   total incohérent ou verdict impossible en `null`; il ne fabrique jamais un
+   zéro passant. Répéter la commande en remplaçant `health.json`, puis archiver
+   exactement `T0.firstProcessingCanary`, `T+5.firstProcessingCanary` et
+   `T+15.firstProcessingCanary`; l'extraction PostgreSQL produira ensuite
+   `final.firstProcessingCanary` avec le même filtre.
+
+   ```text
+   jq 'def integer: type == "number" and . >= 0 and floor == . and . <= 9007199254740991 and tostring != "-0";
+   def evidence:
+     type == "object"
+     and (keys | sort == ["atOrAboveThresholdCount", "cohortCapacity", "cohortEndsAtMs", "cohortStartedAtMs", "completedCount", "eligibleCount", "invalidDurationCount", "overflowed", "p95Ms", "pendingCount", "rightCensoredCount", "sampledAtMs", "tailCensoredCount", "terminalCount", "thresholdMs", "unavailableCount", "underThresholdCount", "verdict", "version"])
+     and .version == 1 and .thresholdMs == 45000 and .cohortCapacity == 50000
+     and (.cohortStartedAtMs | integer) and .cohortStartedAtMs <= 9007199240340991
+     and (.cohortEndsAtMs | integer) and .cohortEndsAtMs == (.cohortStartedAtMs + 900000)
+     and (.sampledAtMs | integer) and .sampledAtMs >= .cohortStartedAtMs
+     and (.overflowed | type == "boolean")
+     and (.eligibleCount | integer) and .eligibleCount <= .cohortCapacity
+     and ((.overflowed | not) or .eligibleCount == .cohortCapacity)
+     and (.completedCount | integer) and (.underThresholdCount | integer)
+     and (.atOrAboveThresholdCount | integer) and (.pendingCount | integer)
+     and (.rightCensoredCount | integer) and (.tailCensoredCount | integer)
+     and (.terminalCount | integer) and (.unavailableCount | integer)
+     and (.invalidDurationCount | integer)
+     and (.completedCount == (.underThresholdCount + .atOrAboveThresholdCount))
+     and (.pendingCount == (.rightCensoredCount + .tailCensoredCount))
+     and (.eligibleCount == (.completedCount + .pendingCount + .terminalCount + .unavailableCount + .invalidDurationCount))
+     and (if .p95Ms == null then .completedCount == 0 else
+       (.p95Ms | integer) and .completedCount > 0
+       and (((95 * .completedCount + 99) / 100 | floor) as $rank
+         | (($rank <= .underThresholdCount and .p95Ms < .thresholdMs)
+           or ($rank > .underThresholdCount and .p95Ms >= .thresholdMs)))
+     end)
+     and (.verdict == (if (.invalidDurationCount > 0 or (.p95Ms != null and .p95Ms >= .thresholdMs)) then "FAIL" elif (.sampledAtMs >= (.cohortStartedAtMs + 14400000) or .sampledAtMs < (.cohortEndsAtMs + .thresholdMs) or .eligibleCount == 0 or .overflowed or .pendingCount > 0 or .terminalCount > 0 or .unavailableCount > 0) then "INCONCLUSIVE" else "PASS" end));
+   . as $root
+   | {startedAt: (try $root.data.heartbeat.startedAt catch null), firstProcessingCanary: (try ($root.data.heartbeat.firstProcessingCanary | if evidence then {version, thresholdMs, cohortCapacity, cohortStartedAtMs, cohortEndsAtMs, sampledAtMs, overflowed, eligibleCount, completedCount, underThresholdCount, atOrAboveThresholdCount, pendingCount, rightCensoredCount, tailCensoredCount, terminalCount, unavailableCount, invalidDurationCount, p95Ms, verdict} else null end) catch null)}' health.json > first-processing
+   ```
+
+   Vérifier que les trois projections portent le même `startedAt` et le même
+   `cohortStartedAtMs`. Attendre que le relevé T+15 prouve
+   `sampledAtMs >= cohortEndsAtMs` : la cohorte fixe se ferme naturellement à
+   T+15. Aucune nouvelle ligne n'est admise dans cette cohorte pendant le drain,
+   même si l'application continue à observer et traiter du trafic ultérieur.
+
+   Après cette fermeture naturelle à T+15, attendre le drain complet de 45
+   secondes, arrêter uniquement `app`, laisser PostgreSQL actif, puis extraire
    exactement la ligne `STOPPED` persistée. La requête fabrique une enveloppe
-   temporaire limitée à `startedAt` et `rpcHttpEvidence`; le même filtre fermé
-   valide ensuite la preuve. Une ligne absente, multiple ou invalide fait
-   échouer la commande et interdit un verdict `PASS` :
+   temporaire limitée à `startedAt`, `rpcHttpEvidence` et
+   `firstProcessingCanary`; les mêmes filtres fermés valident ensuite les deux
+   preuves indépendantes. Une ligne absente, multiple ou invalide fait échouer
+   la commande et interdit un verdict `PASS`. Le heartbeat `STOPPED` doit être
+   plus récent que T+15 et porter exactement la même cohorte :
 
    ```bash
    set -euo pipefail
    : "${DEPLOY_ENV:?DEPLOY_ENV must reference the external operator environment file}"
    final_source="$(mktemp)"
    trap 'rm -f "$final_source"' EXIT
+   sleep 45
    docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 app
    docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T postgres sh -c 'exec psql --no-psqlrc --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --set=ON_ERROR_STOP=1 --tuples-only --no-align' <<'SQL' > "$final_source"
    SELECT jsonb_build_object(
      'data', jsonb_build_object(
        'heartbeat', jsonb_build_object(
          'startedAt', to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-         'rpcHttpEvidence', payload -> 'rpcHttpEvidence'
+         'rpcHttpEvidence', payload -> 'rpcHttpEvidence',
+         'firstProcessingCanary', payload -> 'firstProcessingCanary'
        )
      )
    )
@@ -70,12 +122,46 @@ activation.
    SQL
    test "$(wc -l < "$final_source")" -eq 1
    jq -e 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)} | select(.startedAt != null and .rpcHttpEvidence != null)' "$final_source" > final
+   jq -e 'def integer: type == "number" and . >= 0 and floor == . and . <= 9007199254740991 and tostring != "-0";
+   def evidence:
+     type == "object"
+     and (keys | sort == ["atOrAboveThresholdCount", "cohortCapacity", "cohortEndsAtMs", "cohortStartedAtMs", "completedCount", "eligibleCount", "invalidDurationCount", "overflowed", "p95Ms", "pendingCount", "rightCensoredCount", "sampledAtMs", "tailCensoredCount", "terminalCount", "thresholdMs", "unavailableCount", "underThresholdCount", "verdict", "version"])
+     and .version == 1 and .thresholdMs == 45000 and .cohortCapacity == 50000
+     and (.cohortStartedAtMs | integer) and .cohortStartedAtMs <= 9007199240340991
+     and (.cohortEndsAtMs | integer) and .cohortEndsAtMs == (.cohortStartedAtMs + 900000)
+     and (.sampledAtMs | integer) and .sampledAtMs >= .cohortStartedAtMs
+     and (.overflowed | type == "boolean")
+     and (.eligibleCount | integer) and .eligibleCount <= .cohortCapacity
+     and ((.overflowed | not) or .eligibleCount == .cohortCapacity)
+     and (.completedCount | integer) and (.underThresholdCount | integer)
+     and (.atOrAboveThresholdCount | integer) and (.pendingCount | integer)
+     and (.rightCensoredCount | integer) and (.tailCensoredCount | integer)
+     and (.terminalCount | integer) and (.unavailableCount | integer)
+     and (.invalidDurationCount | integer)
+     and (.completedCount == (.underThresholdCount + .atOrAboveThresholdCount))
+     and (.pendingCount == (.rightCensoredCount + .tailCensoredCount))
+     and (.eligibleCount == (.completedCount + .pendingCount + .terminalCount + .unavailableCount + .invalidDurationCount))
+     and (if .p95Ms == null then .completedCount == 0 else
+       (.p95Ms | integer) and .completedCount > 0
+       and (((95 * .completedCount + 99) / 100 | floor) as $rank
+         | (($rank <= .underThresholdCount and .p95Ms < .thresholdMs)
+           or ($rank > .underThresholdCount and .p95Ms >= .thresholdMs)))
+     end)
+     and (.verdict == (if (.invalidDurationCount > 0 or (.p95Ms != null and .p95Ms >= .thresholdMs)) then "FAIL" elif (.sampledAtMs >= (.cohortStartedAtMs + 14400000) or .sampledAtMs < (.cohortEndsAtMs + .thresholdMs) or .eligibleCount == 0 or .overflowed or .pendingCount > 0 or .terminalCount > 0 or .unavailableCount > 0) then "INCONCLUSIVE" else "PASS" end));
+   . as $root
+   | {startedAt: (try $root.data.heartbeat.startedAt catch null), firstProcessingCanary: (try ($root.data.heartbeat.firstProcessingCanary | if evidence then {version, thresholdMs, cohortCapacity, cohortStartedAtMs, cohortEndsAtMs, sampledAtMs, overflowed, eligibleCount, completedCount, underThresholdCount, atOrAboveThresholdCount, pendingCount, rightCensoredCount, tailCensoredCount, terminalCount, unavailableCount, invalidDurationCount, p95Ms, verdict} else null end) catch null)}
+   | select(.startedAt != null and .firstProcessingCanary != null)' "$final_source" > final.firstProcessingCanary
    test -s final
+   test -s final.firstProcessingCanary
+   jq -e --slurpfile t15 T+15.firstProcessingCanary '($t15 | length == 1) and (.startedAt == $t15[0].startedAt) and (.firstProcessingCanary.cohortStartedAtMs == $t15[0].firstProcessingCanary.cohortStartedAtMs) and (.firstProcessingCanary.sampledAtMs > $t15[0].firstProcessingCanary.sampledAtMs)' final.firstProcessingCanary > /dev/null
    rm -f "$final_source"
    trap - EXIT
    ```
 
-   Nommer les quatre fichiers `T0`, `T+5`, `T+15` et `final`. Cette projection
+   Nommer les quatre fichiers HTTP `T0`, `T+5`, `T+15` et `final`, et les quatre
+   fichiers de latence `T0.firstProcessingCanary`,
+   `T+5.firstProcessingCanary`, `T+15.firstProcessingCanary` et
+   `final.firstProcessingCanary`. Cette projection
    ne contient aucune URL, clé, signature, mint ou corps de requête/réponse.
    Cet artefact est uniquement la preuve HTTP RPC de #142. Les autres gates
    conservent leurs propres snapshots et artefacts (blockHydration, pipeline,
@@ -131,6 +217,46 @@ Un changement de membership des providers configurés entraîne
 indépendamment.
 Le #142 prouve uniquement le gate HTTP 429; le #143 reste nécessaire pour la
 latence first-processing et son p95.
+
+### Verdict de latence first-processing
+
+Le verdict du gate de latence se lit uniquement dans le
+`firstProcessingCanary` du heartbeat PostgreSQL `STOPPED`, après contrôle des
+quatre snapshots. Le `startedAt` et le `cohortStartedAtMs` doivent être
+identiques dans T0, T+5, T+15 et `final`; la valeur finale
+`sampledAtMs` doit être strictement supérieure à celle de T+15. Le verdict est
+exactement celui-ci :
+
+| Observation first-processing finale | Verdict |
+| --- | --- |
+| Après fermeture et drain, cohorte non vide et non overflowée, toutes les lignes complétées, aucun censored/terminal/unavailable/invalide, p95 de 44 999 ms au plus | `PASS` |
+| p95 de 45 000 ms exactement ou davantage, ou durée invalide | `FAIL` |
+| Ligne right-censored ou tail-censored, cohorte vide, overflow, restart, `final` manquant/absent, preuve absente ou malformée, cohorte ou `startedAt` changé | `INCONCLUSIVE` |
+| `sampledAtMs` atteint le premier instant de purge, exactement quatre heures après `cohortStartedAtMs` | `INCONCLUSIVE` |
+
+Une ligne censored n'est jamais assimilée à une réussite :
+`pendingCount = rightCensoredCount + tailCensoredCount` doit rester nul pour
+passer. Un terminal, une preuve historique `unavailable`, une métrique manquante
+ou malformée, un overflow ou une cohorte sans trafic restent fail-closed en
+`INCONCLUSIVE`. Un `invalidDurationCount > 0` ou un p95 à partir de 45 000 ms
+produit `FAIL`; ce `FAIL` est prioritaire et précède `INCONCLUSIVE` même si une
+autre catégorie rend aussi la cohorte incomplète. Un résultat interne `PASS`
+ne sauve jamais une fenêtre où l'un des quatre snapshots prouve un restart ou
+où le heartbeat final n'est pas postérieur à T+15 avec la même cohorte. Dès le
+premier instant de purge possible, à quatre heures du début de cohorte, une
+suppression partielle peut avoir amputé l'échantillon : le verdict devient donc
+`INCONCLUSIVE`. Un p95 en échec ou une durée invalide reste toutefois `FAIL`.
+Le purgeur conserve toute ligne post-migration depuis son `first_detected_at`
+durable pendant au moins quatre heures avant suppression, même si
+`classifiedAtMs` et `purge_after` sont antérieurs. Les lignes historiques où
+`first_detected_at` est `NULL` conservent la règle `purge_after` existante.
+Cette protection borne le premier instant de purge sans remplacer le verdict
+fail-closed ci-dessus.
+
+Le gate HTTP 429 reste indépendant et distinct du gate de latence
+first-processing : l'un ne peut compenser l'autre. Les autres gates backlog,
+RSS, finalité, idempotence, rétention, affinité provider et shutdown restent
+eux aussi indépendants, avec leurs snapshots et critères propres.
 
 - zéro HTTP 429 dans les métriques fournisseur ou les logs;
 - `heartbeat.blockHydration.enabled=true`, `version=1` et

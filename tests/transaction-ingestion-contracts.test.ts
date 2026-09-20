@@ -44,6 +44,7 @@ import {
   type TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import { RPC_PROVIDER_IDS, isRpcProviderId } from '../src/domain/rpc-provider.js';
+import { createFirstProcessingCanaryEvidence } from '../src/domain/first-processing-canary.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
@@ -56,6 +57,58 @@ void test('heartbeat accepts omitted historical RPC HTTP evidence and the exact 
   const rpcHttpEvidence = createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-2']);
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, rpcHttpEvidence })); });
 });
+
+void test('heartbeat accepts an omitted legacy first processing canary and only an exact frozen canary snapshot', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const valid = firstProcessingCanaryEvidence();
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, firstProcessingCanary: valid }));
+  });
+
+  let accessorReads = 0;
+  const accessor = Object.freeze({
+    ...valid,
+    get verdict() { accessorReads += 1; return 'INCONCLUSIVE'; },
+  });
+  for (const firstProcessingCanary of [
+    null,
+    Object.freeze({ ...valid, privateDetail: 'must-not-persist' }),
+    new Proxy(valid, {}),
+    accessor,
+    Object.freeze({ ...valid, verdict: 'PASS' }),
+    Object.freeze({ ...valid, eligibleCount: 1 }),
+  ]) {
+    assert.throws(() => {
+      assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, firstProcessingCanary }));
+    }, TypeError);
+  }
+  assert.equal(accessorReads, 0);
+});
+
+function firstProcessingCanaryEvidence() {
+  return createFirstProcessingCanaryEvidence({
+    version: 1,
+    thresholdMs: 45_000,
+    cohortCapacity: 50_000,
+    cohortStartedAtMs: 1_000,
+    cohortEndsAtMs: 901_000,
+    sampledAtMs: 946_000,
+    overflowed: false,
+    eligibleCount: 0,
+    completedCount: 0,
+    underThresholdCount: 0,
+    atOrAboveThresholdCount: 0,
+    pendingCount: 0,
+    rightCensoredCount: 0,
+    tailCensoredCount: 0,
+    terminalCount: 0,
+    unavailableCount: 0,
+    invalidDurationCount: 0,
+    p95Ms: null,
+    verdict: 'INCONCLUSIVE',
+  });
+}
 
 void test('heartbeat rejects malformed RPC HTTP evidence before generic snapshot normalization', () => {
   const valid = createRpcHttpEvidenceRecorder().snapshot(['primary']);

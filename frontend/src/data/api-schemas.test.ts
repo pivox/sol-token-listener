@@ -15,6 +15,7 @@ import {
   domainEventTypeSchema,
 } from './api-schemas.js';
 import {
+  firstProcessingCanary,
   health,
   holdersAvailable,
   holdersUnavailable,
@@ -44,6 +45,13 @@ function parseCatchUpAdmission(catchUpAdmission: unknown, backlogCount = 6) {
   })).data;
 }
 
+function parseFirstProcessingCanary(value: unknown) {
+  return apiHealthEnvelopeSchema.parse(success({
+    ...health,
+    heartbeat: { ...health.heartbeat, firstProcessingCanary: value },
+  })).data.heartbeat.firstProcessingCanary;
+}
+
 const DOMAIN_EVENT_TYPES = [
   'TokenLaunchDetected', 'TokenMetadataResolved', 'TokenMetadataFailed',
   'SocialEvidenceCollected', 'CreatorProfileUpdated', 'HolderDistributionUpdated',
@@ -55,6 +63,81 @@ const DOMAIN_EVENT_TYPES = [
 ] as const;
 
 describe('frontend-owned API V1 schemas', () => {
+  it('accepts PASS, FAIL and INCONCLUSIVE first-processing canary evidence', () => {
+    expect(parseFirstProcessingCanary(firstProcessingCanary)?.verdict).toBe('PASS');
+    expect(parseFirstProcessingCanary({
+      ...firstProcessingCanary,
+      eligibleCount: 1,
+      completedCount: 1,
+      underThresholdCount: 0,
+      atOrAboveThresholdCount: 1,
+      p95Ms: 45_000,
+      verdict: 'FAIL',
+    })?.verdict).toBe('FAIL');
+    expect(parseFirstProcessingCanary({
+      ...firstProcessingCanary,
+      sampledAtMs: firstProcessingCanary.cohortEndsAtMs,
+      verdict: 'INCONCLUSIVE',
+    })?.verdict).toBe('INCONCLUSIVE');
+    expect(parseFirstProcessingCanary({
+      ...firstProcessingCanary,
+      sampledAtMs: firstProcessingCanary.cohortStartedAtMs + 14_400_000,
+      verdict: 'INCONCLUSIVE',
+    })?.verdict).toBe('INCONCLUSIVE');
+    expect(parseFirstProcessingCanary({
+      ...firstProcessingCanary,
+      sampledAtMs: firstProcessingCanary.cohortStartedAtMs + 14_400_000,
+      eligibleCount: 4,
+      invalidDurationCount: 1,
+      verdict: 'FAIL',
+    })?.verdict).toBe('FAIL');
+  });
+
+  it('keeps omitted first-processing evidence undefined and explicit absence null', () => {
+    const heartbeat: Record<string, unknown> = { ...health.heartbeat };
+    delete heartbeat.firstProcessingCanary;
+    const legacy = apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat })).data;
+
+    expect(legacy.heartbeat.firstProcessingCanary).toBeUndefined();
+    expect(parseFirstProcessingCanary(null)).toBeNull();
+  });
+
+  it('rejects hostile first-processing fields, totals and impossible verdicts', () => {
+    const invalid: unknown[] = [
+      { ...firstProcessingCanary, signature: 'secret-signature' },
+      { ...firstProcessingCanary, mint: 'secret-mint' },
+      { ...firstProcessingCanary, thresholdMs: 44_999 },
+      { ...firstProcessingCanary, cohortCapacity: 49_999 },
+      { ...firstProcessingCanary, cohortEndsAtMs: firstProcessingCanary.cohortEndsAtMs + 1 },
+      { ...firstProcessingCanary, sampledAtMs: firstProcessingCanary.cohortStartedAtMs - 1 },
+      { ...firstProcessingCanary, eligibleCount: -0 },
+      { ...firstProcessingCanary, eligibleCount: Number.MAX_SAFE_INTEGER + 1 },
+      { ...firstProcessingCanary, eligibleCount: 4 },
+      { ...firstProcessingCanary, completedCount: 2 },
+      { ...firstProcessingCanary, pendingCount: 1 },
+      { ...firstProcessingCanary, p95Ms: null },
+      { ...firstProcessingCanary, p95Ms: 45_000 },
+      { ...firstProcessingCanary, verdict: 'FAIL' },
+      {
+        ...firstProcessingCanary,
+        cohortStartedAtMs: Number.MAX_SAFE_INTEGER - 14_400_000 + 1,
+        cohortEndsAtMs: Number.MAX_SAFE_INTEGER - 14_400_000 + 900_001,
+        sampledAtMs: Number.MAX_SAFE_INTEGER,
+        verdict: 'INCONCLUSIVE',
+      },
+      { ...firstProcessingCanary, overflowed: true },
+    ];
+    for (const field of Object.keys(firstProcessingCanary)) {
+      invalid.push(Object.fromEntries(
+        Object.entries(firstProcessingCanary).filter(([key]) => key !== field),
+      ));
+    }
+
+    for (const candidate of invalid) {
+      expect(() => parseFirstProcessingCanary(candidate)).toThrow();
+    }
+  });
+
   it('accepts every complete public projection fixture', () => {
     expect(apiLaunchListEnvelopeSchema.parse(success([launchSummary], 'cursor-a')).data).toHaveLength(1);
     expect(apiLaunchDetailEnvelopeSchema.parse(success(launchDetail)).data.mint).toBe(launchDetail.mint);

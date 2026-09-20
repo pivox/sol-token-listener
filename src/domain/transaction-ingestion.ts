@@ -10,6 +10,10 @@ import {
   assertValidRuntimeRpcHttpEvidence,
   type RuntimeRpcHttpEvidenceV1,
 } from './rpc-http-evidence.js';
+import {
+  assertValidFirstProcessingCanaryEvidence,
+  type RuntimeFirstProcessingCanaryEvidenceV1,
+} from './first-processing-canary.js';
 import type { ChainConfirmationStatus } from './types.js';
 
 export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
@@ -265,6 +269,7 @@ export interface RuntimeHeartbeat {
   readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
+  readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
 }
 
 export interface RuntimeCatchUpAdmissionMetricsV1 extends CatchUpAdmissionCounts {
@@ -688,6 +693,13 @@ export function assertValidRuntimeHeartbeat(
         throw new TypeError('RPC HTTP evidence is invalid.');
       }
       assertValidRuntimeRpcHttpEvidence(evidence.value);
+    }
+    const firstProcessingCanary = Object.getOwnPropertyDescriptor(value, 'firstProcessingCanary');
+    if (firstProcessingCanary !== undefined) {
+      if (!('value' in firstProcessingCanary) || firstProcessingCanary.enumerable !== true) {
+        throw new TypeError('First processing canary is invalid.');
+      }
+      assertValidFirstProcessingCanaryEvidence(firstProcessingCanary.value);
     }
   }
   const record = frozenRecord(value, 'Runtime heartbeat');

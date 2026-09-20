@@ -7,6 +7,7 @@ import {
   type ApiHealth,
   type ApiBlockHydrationMetricsV1,
   type ApiCatchUpAdmissionMetricsV1,
+  type ApiFirstProcessingCanaryEvidenceV1,
   type ApiRpcHttpEvidenceV1,
   type ApiWebSocketHealth,
   type ApiHolders,
@@ -47,6 +48,7 @@ import {
   type TimelinePagePosition,
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
+import { createFirstProcessingCanaryEvidence } from '../domain/first-processing-canary.js';
 import {
   SOCIAL_COLLECTION_STATUSES,
   SOCIAL_EVIDENCE_OUTCOMES,
@@ -2106,7 +2108,8 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null });
+    websocket, blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null,
+    firstProcessingCanary: null });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2193,7 +2196,23 @@ function heartbeatFromRow(
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
+    firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
   });
+}
+
+function firstProcessingCanaryFromPayload(
+  value: unknown,
+): ApiFirstProcessingCanaryEvidenceV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'firstProcessingCanary');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  try {
+    return createFirstProcessingCanaryEvidence(descriptor.value);
+  } catch {
+    throw invalid();
+  }
 }
 
 function rpcHttpEvidenceFromPayload(value: unknown): ApiRpcHttpEvidenceV1 | null {

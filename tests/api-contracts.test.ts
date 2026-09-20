@@ -7,6 +7,7 @@ import {
   type ApiAvailability,
   type ApiDomainPayload,
   type ApiFailure,
+  type ApiFirstProcessingCanaryEvidenceV1,
   type ApiHealth,
   type ApiRpcHttpEvidenceV1,
   type ApiWebSocketHealth,
@@ -24,6 +25,38 @@ import {
   toApiJson,
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
+
+void test('first-processing canary health contract permits optional nullable fixed evidence', () => {
+  const evidence: ApiFirstProcessingCanaryEvidenceV1 = {
+    version: 1,
+    thresholdMs: 45_000,
+    cohortCapacity: 50_000,
+    cohortStartedAtMs: 1_000_000,
+    cohortEndsAtMs: 1_900_000,
+    sampledAtMs: 1_945_000,
+    overflowed: false,
+    eligibleCount: 3,
+    completedCount: 3,
+    underThresholdCount: 3,
+    atOrAboveThresholdCount: 0,
+    pendingCount: 0,
+    rightCensoredCount: 0,
+    tailCensoredCount: 0,
+    terminalCount: 0,
+    unavailableCount: 0,
+    invalidDurationCount: 0,
+    p95Ms: 44_999,
+    verdict: 'PASS',
+  };
+  const omitted: Pick<ApiHealth['heartbeat'], 'firstProcessingCanary'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'firstProcessingCanary'> = {
+    firstProcessingCanary: null,
+  };
+
+  assert.deepEqual(omitted, {});
+  assert.deepEqual(explicitNull, { firstProcessingCanary: null });
+  assert.deepEqual(toApiJson(evidence), evidence);
+});
 
 void test('RPC HTTP evidence health contract permits optional nullable fixed-provider metrics', () => {
   const metrics: ApiRpcHttpEvidenceV1 = {
