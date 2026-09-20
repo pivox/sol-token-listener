@@ -493,9 +493,23 @@ case " $* " in
   *) exit 64 ;;
 esac
 `, { encoding: 'utf8', mode: 0o700 });
+    await writeFile(join(directory, 'sleep'), `#!/usr/bin/env bash
+set -euo pipefail
+test "$#" -eq 1
+test "$1" = 45
+`, { encoding: 'utf8', mode: 0o700 });
     const provider = (providerId: string, configured = false) => ({
       providerId, configured, attempts: configured ? 3 : 0, http429Responses: 0,
     });
+    const firstProcessingCanary = {
+      version: 1, thresholdMs: 45_000, cohortCapacity: 50_000,
+      cohortStartedAtMs: 1_795_000_000_000, cohortEndsAtMs: 1_795_000_900_000,
+      sampledAtMs: 1_795_000_945_001, overflowed: false, eligibleCount: 1,
+      completedCount: 1, underThresholdCount: 1, atOrAboveThresholdCount: 0,
+      pendingCount: 0, rightCensoredCount: 0, tailCensoredCount: 0,
+      terminalCount: 0, unavailableCount: 0, invalidDurationCount: 0,
+      p95Ms: 44_999, verdict: 'PASS',
+    };
     const validSource = `${JSON.stringify({ data: { heartbeat: {
       startedAt: '2026-09-20T10:00:00.000Z',
       rpcHttpEvidence: {
@@ -504,7 +518,16 @@ esac
           provider('fallback-2'), provider('fallback-3'),
         ],
       },
+      firstProcessingCanary,
     } } })}\n`;
+    await writeFile(join(directory, 'T+15.firstProcessingCanary'), JSON.stringify({
+      startedAt: '2026-09-20T10:00:00.000Z',
+      firstProcessingCanary: {
+        ...firstProcessingCanary,
+        sampledAtMs: firstProcessingCanary.cohortEndsAtMs,
+        verdict: 'INCONCLUSIVE',
+      },
+    }), 'utf8');
     const run = (mode: string, output: string) => spawnSync('bash', ['-c', finalBlock], {
       cwd: directory,
       encoding: 'utf8',
@@ -537,6 +560,99 @@ esac
     }
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('first-processing canary runbook fails closed across the fixed cohort and final heartbeat', async (context) => {
+  const [runbook, architecture, overview] = await Promise.all([
+    readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('docs/architecture/pumpfun-v1.md'),
+    readArtifact('docs/system-overview.html'),
+  ]);
+  const all = `${runbook}\n${architecture}\n${overview}`;
+  const stopCommand = 'docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 app';
+  const sleepAt = runbook.indexOf('sleep 45');
+  const stopAt = runbook.indexOf(stopCommand);
+
+  for (const sample of ['T0', 'T+5', 'T+15', 'final']) {
+    assert.match(runbook, new RegExp(`${sample.replace('+', '\\+')}[^\\n]{0,160}firstProcessingCanary`, 'iu'));
+  }
+  assert.match(runbook, /jq\s+'def integer:[\s\S]{0,6000}startedAt[\s\S]{0,1000}firstProcessingCanary/iu);
+  for (const field of [
+    'version', 'thresholdMs', 'cohortCapacity', 'cohortStartedAtMs', 'cohortEndsAtMs',
+    'sampledAtMs', 'overflowed', 'eligibleCount', 'completedCount', 'underThresholdCount',
+    'atOrAboveThresholdCount', 'pendingCount', 'rightCensoredCount', 'tailCensoredCount',
+    'terminalCount', 'unavailableCount', 'invalidDurationCount', 'p95Ms', 'verdict',
+  ]) assert.match(runbook, new RegExp(field, 'u'));
+  assert.match(runbook, /(?:même|identique)[^.]{0,160}startedAt[^.]{0,160}cohortStartedAtMs/iu);
+  assert.match(runbook, /cohorte[^.]{0,180}(?:se ferme|fermée)[^.]{0,80}T\+15/iu);
+  assert.match(runbook, /aucune nouvelle ligne[^.]{0,180}(?:admise|incluse)[^.]{0,100}(?:drain|cohorte)/iu);
+  assert.ok(sleepAt >= 0, 'the runbook must wait 45 seconds for the latency drain');
+  assert.ok(stopAt > sleepAt, 'the 45-second drain must happen before bounded app shutdown');
+  assert.match(runbook, /STOPPED[^.]{0,180}(?:plus récent|postérieur)[^.]{0,100}T\+15/iu);
+  assert.match(runbook, /STOPPED[^.]{0,180}(?:même|identique)[^.]{0,100}cohorte/iu);
+  assert.match(runbook, /runtime_state = 'STOPPED'/u);
+  assert.match(runbook, /payload\s*->\s*'firstProcessingCanary'/u);
+
+  assert.match(runbook, /44\s?999\s*ms[^.]{0,160}PASS/iu);
+  assert.match(runbook, /45\s?000\s*ms[^.]{0,160}FAIL/iu);
+  for (const condition of [
+    'right-censored', 'tail-censored', 'cohorte vide', 'overflow', 'restart',
+    'final[^.]{0,50}(?:manquant|absent)', '(?:preuve|métrique)[^.]{0,50}(?:absente|malformée)',
+  ]) assert.match(runbook, new RegExp(`${condition}[\\s\\S]{0,220}INCONCLUSIVE`, 'iu'));
+  assert.match(runbook, /durée invalide[^.]{0,180}FAIL/iu);
+  assert.match(runbook, /FAIL[^.]{0,180}(?:prioritaire|précède)[^.]{0,120}INCONCLUSIVE/iu);
+  assert.match(runbook, /HTTP\s*429[^.]{0,180}(?:indépendant|distinct)[^.]{0,180}(?:first-processing|latence)/iu);
+  assert.match(runbook, /(?:autres gates|backlog)[^.]{0,240}(?:indépendants|indépendantes|distincts|distinctes)/iu);
+  assert.match(all, /observe-only[^.]{0,240}(?:aucun|aucune)[^.]{0,120}wallet[^.]{0,120}(?:sign|soumission|submit)/iu);
+
+  const jqVersion = spawnSync('jq', ['--version'], { encoding: 'utf8' });
+  if (jqVersion.error !== undefined || jqVersion.status !== 0) {
+    context.skip('jq unavailable: executable first-processing filter cases skipped');
+    return;
+  }
+  const filterMatch = /\n\s*jq\s+'(def integer:[\s\S]*?)'\s+health\.json\s*>\s*first-processing/iu.exec(runbook);
+  assert.ok(filterMatch?.[1], 'missing executable fixed-field first-processing jq filter');
+  const filter = filterMatch[1];
+  const startedAt = '2026-09-20T10:00:00.000Z';
+  const evidence = {
+    version: 1, thresholdMs: 45_000, cohortCapacity: 50_000,
+    cohortStartedAtMs: 1_795_000_000_000, cohortEndsAtMs: 1_795_000_900_000,
+    sampledAtMs: 1_795_000_945_000, overflowed: false, eligibleCount: 1,
+    completedCount: 1, underThresholdCount: 1, atOrAboveThresholdCount: 0,
+    pendingCount: 0, rightCensoredCount: 0, tailCensoredCount: 0,
+    terminalCount: 0, unavailableCount: 0, invalidDurationCount: 0,
+    p95Ms: 44_999, verdict: 'PASS',
+  };
+  const runJq = (firstProcessingCanary: unknown) => spawnSync('jq', ['-c', filter], {
+    encoding: 'utf8',
+    input: JSON.stringify({ data: { heartbeat: { startedAt, firstProcessingCanary }, secret: 'must-not-leak' } }),
+  });
+  const valid = runJq(evidence);
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.deepEqual(JSON.parse(valid.stdout), { startedAt, firstProcessingCanary: evidence });
+  assert.doesNotMatch(valid.stdout, /secret|signature|mint|wallet/iu);
+
+  for (const malformed of [
+    undefined,
+    { ...evidence, overflowed: true, verdict: 'PASS' },
+    { ...evidence, pendingCount: 1, rightCensoredCount: 1, verdict: 'PASS' },
+    { ...evidence, eligibleCount: 50_001, completedCount: 50_001, underThresholdCount: 50_001 },
+    { ...evidence, overflowed: true, verdict: 'INCONCLUSIVE' },
+    {
+      ...evidence,
+      eligibleCount: 20,
+      completedCount: 20,
+      underThresholdCount: 19,
+      atOrAboveThresholdCount: 1,
+      p95Ms: 45_000,
+      verdict: 'FAIL',
+    },
+    { ...evidence, signature: 'must-not-leak' },
+  ]) {
+    const result = runJq(malformed);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { startedAt, firstProcessingCanary: null });
   }
 });
 
