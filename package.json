@@ -61,7 +61,6 @@
     "tx:diagnose": "tsx scripts/diagnose-transaction.ts",
     "fixture:capture": "tsx scripts/capture-fixture.ts",
     "inbox:recover": "tsx scripts/recover-inbox.ts",
-    "inbox:recover-decoder": "tsx scripts/recover-decoder-quarantine.ts",
     "pumpfun:generate": "tsx scripts/generate-pumpfun-idl.ts",
     "pumpfun:check-generated": "tsx scripts/generate-pumpfun-idl.ts --check",
     "pumpswap:generate": "tsx scripts/generate-pumpswap-idl.ts",
