@@ -1,7 +1,7 @@
 # Durable catch-up coverage fast path
 
 Status: approved for implementation
-Version: 1.0.2
+Version: 1.0.3
 Issue: #146
 Parent incident: #120
 Scope: Pump.fun observe-only catch-up admission; no wallet, signer, executor,
@@ -17,6 +17,9 @@ Revision history:
 - 1.0.2: use a neutral coverage DTO, reject outcome-unknown terminal receipts
   on the direct-failure path, preserve compatible source reconciliation and
   clarify deterministic ordering and non-synthetic provenance.
+- 1.0.3: require an exact canonical program-ID set for read-only coverage,
+  define covered receipts as an ordered subset of successful candidates and
+  make both success/failure arrival orders fail closed in persistence.
 
 ## Context
 
@@ -144,7 +147,9 @@ replay receipt. Coverage does not add `CATCH_UP` provenance and does not change 
 attempts, lease, immutable snapshot, finality evidence, terminal timestamps or
 paper state. The strict-run page cursor is the durable proof that catch-up
 encountered an already admitted signature; the row remains correctly attributed
-to the source that admitted it. For a terminal receipt it performs no mutation. It returns the existing canonical
+to the source that admitted it. The canonical program-ID sets must match exactly;
+otherwise the candidate remains uncovered so the existing path can merge the
+new provenance. For a terminal receipt it performs no mutation. It returns the existing canonical
 `ALREADY_ADMITTED / NOT_ENQUEUED / null` receipt.
 
 A successful discovery must not cover a stored catch-up classification whose
@@ -196,6 +201,10 @@ With the flag enabled, `PumpFunCatchUpBlockClassifier.classify`:
 6. validates every returned receipt against the original signature and slot;
 7. emits one receipt per discovery in the deterministic classifier-input order
    established by `mergeCatchUpDiscoveries`.
+
+Coverage receipts form a duplicate-free ordered subset of the successful
+candidate batch. Any reordered, duplicate, extra or non-`ALREADY_ADMITTED`
+receipt fails the page before missing signatures are hydrated.
 
 Receipt cardinality, duplicate signatures, missing results, extra results and
 hostile return objects remain fail-closed. Cancellation is checked before and
