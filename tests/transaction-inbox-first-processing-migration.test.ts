@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
+import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const migrationUrl = new URL('../migrations/050_transaction_inbox_first_processing.sql', import.meta.url);
@@ -35,14 +36,18 @@ void test('migration 050 classifies all legacy inbox rows unavailable without in
       .filter((name) => /^0(?:0[1-9]|[1-4][0-9])_/u.test(name)).sort();
     assert.equal(legacyNames.at(-1), '049_transaction_inbox_catch_up_admission_receipt.sql');
     for (const name of legacyNames) await pool.query(await readFile(new URL(name, migrationsUrl), 'utf8'));
-    await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at, processed_at, normalized_transaction, immutable_fingerprint
-    ) VALUES
-      ('legacy-processed', 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],
-       'confirmed', 'PROCESSED', NOW(), NOW(), '{}'::JSONB, repeat('a',64)),
-      ('legacy-reopened', 2, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],
-       'confirmed', 'PENDING', NOW(), NULL, NULL, NULL)`);
+    const legacyRepository = new PostgresTransactionInboxRepository(pool);
+    for (const [signature, slot] of [['legacy-processed', 1n], ['legacy-reopened', 2n]] as const) {
+      await legacyRepository.enqueue(legacyNotification(signature, slot));
+      const claim = await legacyRepository.claim(Date.now(), 30);
+      assert.ok(claim);
+      await legacyRepository.saveSnapshot(signature, claim.leaseToken, legacyNormalized(signature, slot));
+      await pool.query(`UPDATE chain_transaction_inbox SET
+        processing_status=CASE WHEN $1='legacy-processed' THEN 'PROCESSED' ELSE 'PENDING' END,
+        lease_token=NULL, lease_expires_at=NULL,
+        processed_at=CASE WHEN $1='legacy-processed' THEN clock_timestamp() ELSE NULL END
+        WHERE signature=$1`, [signature]);
+    }
     await pool.query(await readFile(migrationUrl, 'utf8'));
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const legacy = await pool.query(`SELECT signature, first_detected_at, first_processed_at,
@@ -53,16 +58,16 @@ void test('migration 050 classifies all legacy inbox rows unavailable without in
       { signature: 'legacy-reopened', first_detected_at: null, first_processed_at: null,
         first_processing_evidence_unavailable: true },
     ]);
-    const repository = new PostgresTransactionInboxRepository(pool);
-    for (const signature of ['legacy-processed', 'legacy-reopened']) {
-      await repository.enqueue(Object.freeze({
-        signature, slot: signature === 'legacy-processed' ? 1n : 2n,
-        source: 'WEBSOCKET' as const,
-        programIds: Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
-        confirmationStatus: 'confirmed' as const, observedAtMs: 1_000,
-        ingestionHint: null, ingestionHintMint: null,
-      }));
-    }
+    await legacyRepository.enqueueRevision(Object.freeze({
+      signature: 'legacy-processed', confirmationStatus: 'finalized', observedAtMs: Date.now(),
+    }));
+    const processedReplay = await legacyRepository.claim(Date.now() + 1, 30);
+    assert.ok(processedReplay);
+    await legacyRepository.markProcessed('legacy-processed', processedReplay.leaseToken, 'finalized');
+    const reopenedReplay = await legacyRepository.claim(Date.now() + 2, 30);
+    assert.ok(reopenedReplay);
+    assert.equal(reopenedReplay.signature, 'legacy-reopened');
+    await legacyRepository.markProcessed('legacy-reopened', reopenedReplay.leaseToken, 'confirmed');
     assert.deepEqual((await pool.query(`SELECT signature, first_detected_at, first_processed_at,
       first_processing_evidence_unavailable FROM chain_transaction_inbox
       WHERE signature IN ('legacy-processed','legacy-reopened') ORDER BY signature`)).rows, legacy.rows);
@@ -174,4 +179,28 @@ async function withMigration050Database(
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
+}
+
+function legacyNotification(signature: string, slot: bigint) {
+  return Object.freeze({
+    signature, slot, source: 'WEBSOCKET' as const,
+    programIds: Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+    confirmationStatus: 'confirmed' as const, observedAtMs: 1_000,
+    ingestionHint: null, ingestionHintMint: null,
+  });
+}
+
+function legacyNormalized(signature: string, slot: bigint): NormalizedTransaction {
+  return {
+    signature, slot, transactionIndex: 0, confirmationStatus: 'PROCESSED', version: 'legacy',
+    blockTimeMs: 999, accountKeys: ['account'], signerKeys: ['account'],
+    instructions: [{
+      programId: 'program', accounts: ['account'], data: Uint8Array.from([0, 1, 255]),
+      instructionIndex: 0, innerInstructionIndex: null, parentInstructionIndex: null,
+      stackHeight: null,
+    }],
+    preTokenBalances: [], postTokenBalances: [],
+    preBalancesLamports: [9_007_199_254_740_994n], postBalancesLamports: [9_007_199_254_740_993n],
+    feeLamports: 9_007_199_254_740_995n, computeUnits: 123n, logs: ['ok'], error: null,
+  };
 }

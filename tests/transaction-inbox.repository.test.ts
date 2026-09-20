@@ -123,6 +123,45 @@ void test('first processing time survives lease loss, finality replay, orphaning
     });
     assert.equal((await row(pool, recoverySignature)).processed_at, null);
     assert.equal(new Date((await row(pool, recoverySignature)).first_processed_at).getTime(), recoveryFirstCompleted);
+    const recovered = await repository.claim(Date.now() + 6, 30);
+    assert.ok(recovered);
+    if (recovered.normalizedTransaction === null) {
+      await repository.saveSnapshot(recoverySignature, recovered.leaseToken, normalized(recoverySignature, 802n));
+    }
+    await repository.markProcessed(recoverySignature, recovered.leaseToken, 'finalized');
+    assert.equal(new Date((await row(pool, recoverySignature)).first_processed_at).getTime(), recoveryFirstCompleted);
+
+    const automaticRetryRepository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 2, baseDelayMs: 1,
+    }));
+    const automaticRetrySignature = 'first-processing-automatic-retry';
+    await automaticRetryRepository.enqueue(notification(automaticRetrySignature, 804n, 'WEBSOCKET', 'confirmed'));
+    const automaticInitial = await automaticRetryRepository.claim(Date.now() + 7, 30);
+    assert.ok(automaticInitial);
+    await automaticRetryRepository.saveSnapshot(
+      automaticRetrySignature, automaticInitial.leaseToken, normalized(automaticRetrySignature, 804n),
+    );
+    await automaticRetryRepository.markProcessed(automaticRetrySignature, automaticInitial.leaseToken, 'confirmed');
+    const automaticFirstCompleted = new Date((await row(pool, automaticRetrySignature)).first_processed_at).getTime();
+    await automaticRetryRepository.enqueueRevision(Object.freeze({
+      signature: automaticRetrySignature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 8,
+    }));
+    const automaticFailedReplay = await automaticRetryRepository.claim(Date.now() + 9, 30);
+    assert.ok(automaticFailedReplay);
+    await automaticRetryRepository.markFailed(automaticRetrySignature, automaticFailedReplay.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    const automaticRetryAt = new Date((await row(pool, automaticRetrySignature)).next_attempt_at).getTime();
+    const automaticRetry = await automaticRetryRepository.claim(automaticRetryAt + 1, 30);
+    assert.ok(automaticRetry);
+    if (automaticRetry.normalizedTransaction === null) {
+      await automaticRetryRepository.saveSnapshot(
+        automaticRetrySignature, automaticRetry.leaseToken, normalized(automaticRetrySignature, 804n),
+      );
+    }
+    await automaticRetryRepository.markProcessed(automaticRetrySignature, automaticRetry.leaseToken, 'finalized');
+    const automaticRetryStored = await row(pool, automaticRetrySignature);
+    assert.equal(new Date(automaticRetryStored.first_processed_at).getTime(), automaticFirstCompleted);
   });
 });
 
