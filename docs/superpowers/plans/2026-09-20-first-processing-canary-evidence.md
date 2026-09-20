@@ -1,5 +1,7 @@
 # First-Processing Canary Evidence Implementation Plan
 
+Version: 1.0.1 — 2026-09-20 — issue #143
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Persist the first successful inbox processing time once and expose a bounded, redacted 15-minute canary cohort with an exact integer p95 and fail-closed verdict.
@@ -71,6 +73,8 @@ SQLSTATE `23514` and the stable message
 `chain_transaction_inbox.first_processed_at is immutable`. Preflight must
 verify exact existing columns, defaults, constraints, index, function, and trigger
 definitions before treating a replay as successful.
+Require `pg_attribute.atttypmod = -1` for both timestamp columns so replay
+rejects precision-bearing alternatives such as `TIMESTAMPTZ(0)`.
 
 - [ ] **Step 4: Write RED repository lifecycle tests**
 
@@ -97,7 +101,8 @@ UPDATE chain_transaction_inbox SET
     WHEN first_processing_evidence_unavailable THEN NULL
     ELSE COALESCE(first_processed_at, completed.completed_at)
   END,
-  processed_at = completed.completed_at
+  processed_at = completed.completed_at,
+  updated_at = GREATEST(updated_at, completed.completed_at)
 ```
 
 Do not mention `first_processed_at` in retry, replay, finality, orphan, or
@@ -179,6 +184,7 @@ derive verdict with this precedence:
 const fail = invalidDurationCount > 0
   || (p95Ms !== null && p95Ms >= FIRST_PROCESSING_THRESHOLD_MS);
 const incomplete = sampledAtMs < cohortEndsAtMs + FIRST_PROCESSING_THRESHOLD_MS
+  || sampledAtMs >= cohortStartedAtMs + FIRST_PROCESSING_EVIDENCE_RETENTION_MS
   || eligibleCount === 0 || overflowed || pendingCount > 0
   || terminalCount > 0 || unavailableCount > 0;
 const verdict = fail ? 'FAIL' : incomplete ? 'INCONCLUSIVE' : 'PASS';
@@ -188,6 +194,9 @@ Require `pendingCount === rightCensoredCount + tailCensoredCount`,
 `completedCount === underThresholdCount + atOrAboveThresholdCount`, and
 `eligibleCount === completedCount + pendingCount + terminalCount +
 unavailableCount + invalidDurationCount`.
+Export `FIRST_PROCESSING_EVIDENCE_RETENTION_MS = 14_400_000`; validate both
+deadline additions with safe integer addition. The retention boundary is
+inclusive and `FAIL` remains prioritaire.
 
 - [ ] **Step 4: Write RED repository aggregate tests**
 
@@ -401,6 +410,9 @@ Require a fixed-field `jq` extraction for `firstProcessingCanary`, identical
 wait of at least 45 seconds before shutdown, final PostgreSQL extraction newer
 than T+15, and verdict rules where censored/missing/overflowed evidence cannot
 pass.
+Require both jq filters and documentation to classify evidence sampled at or
+after `cohortStartedAtMs + 14_400_000` as `INCONCLUSIVE`, unless the independent
+failure condition already requires `FAIL`.
 
 - [ ] **Step 2: Update the runbook and architecture status**
 

@@ -1,6 +1,6 @@
 # First-Processing Canary Evidence Design
 
-Version: 1.0.0 — 2026-09-20 — issue #143
+Version: 1.0.1 — 2026-09-20 — issue #143
 
 Status: approved for implementation under the standing operator instruction
 
@@ -83,6 +83,11 @@ first_processed_at = CASE
 END
 ```
 
+Because another update in the same millisecond may already have retained
+microsecond precision in `updated_at`, completion uses
+`updated_at = GREATEST(updated_at, completed_at)`. The evidence timestamps stay
+millisecond-precise while the general row clock never regresses.
+
 The first successful call therefore records the database time atomically. A
 lease failure records nothing. Later success, retry, replay, finality,
 orphaning, and manual recovery preserve the original timestamp.
@@ -107,6 +112,9 @@ cannot be cleared. The trigger raises SQLSTATE `23514`. The migration is
 replayable and fails closed when an existing column, constraint, function,
 trigger, or index has an incompatible definition. Historical rows remain
 `NULL` through retry, replay, finality, orphaning, and manual recovery.
+The canonical timestamp column definition is unbounded `TIMESTAMPTZ`
+(`pg_attribute.atttypmod = -1`); a replay rejects precision-bearing variants
+such as `TIMESTAMPTZ(0)` even though they share the same type OID.
 
 `observed_at` remains the original notification time for compatibility and
 ordering semantics. Canary membership and latency use only
@@ -196,11 +204,14 @@ The latency proof is fail closed:
   invalid duration is detected;
 - `INCONCLUSIVE` while the cohort window is open, until the 45-second drain has
   elapsed, when the cohort is empty or overflowed, or when any censored,
-  terminal, or unavailable row remains;
+  terminal, or unavailable row remains, and from
+  `cohortStartedAtMs + 14_400_000` inclusive because this is the first instant
+  at which four-hour inbox retention can have partially removed the cohort;
 - `PASS` only after `cohortEndsAtMs + 45_000`, with at least one completed
   sample, no incomplete category, no overflow, and `p95Ms < 45_000`.
 
-`FAIL` evidence takes precedence over incompleteness. Missing or malformed
+All deadline additions are checked as safe integers. `FAIL` evidence takes
+precedence over incompleteness, including after the retention deadline. Missing or malformed
 evidence is projected as unavailable and never synthesized as a passing zero.
 
 ## Runtime, persistence, and public projection
@@ -275,6 +286,8 @@ Tests must prove:
 - retry, replay, finality, orphaning, and manual recovery preserve it;
 - direct replacement or clearing is rejected by PostgreSQL;
 - normal four-hour inbox retention still deletes the whole row;
+- a partially purged cohort is `INCONCLUSIVE` from its first possible purge
+  instant and cannot recover a misleading `PASS`;
 - the cohort excludes pre-start and post-window rows and caps at 50,000;
 - 44,999 and 45,000 ms fall into different buckets;
 - nearest-rank p95 works for one-row and other small samples;
