@@ -22,6 +22,10 @@ import type {
   PumpInstructionFamily,
 } from '../launchpads/pumpfun/types.js';
 import type { CatchUpClassificationRepository } from '../ports/catch-up-classification-repository.js';
+import type {
+  CatchUpAdmissionCoverageCandidate,
+  CatchUpAdmissionCoverageRepository,
+} from '../ports/catch-up-admission-coverage-repository.js';
 import {
   trustedTransactionLocatorFailure,
   type TransactionLocationTarget,
@@ -110,13 +114,29 @@ interface ClassificationDecision {
   readonly actions: readonly SemanticAction[];
 }
 
+export interface PumpFunCatchUpBlockClassifierOptions {
+  readonly coverageFastPathEnabled: boolean;
+  readonly coverageRepository: CatchUpAdmissionCoverageRepository | null;
+}
+
 /** B3b composes this service for provider-affine Pump.fun strict scans when the restart-only flag is enabled. */
 export class PumpFunCatchUpBlockClassifier {
+  private readonly coverageFastPathEnabled: boolean;
+  private readonly coverageRepository: CatchUpAdmissionCoverageRepository | null;
+
   public constructor(
     private readonly locator: PumpFunCatchUpTransactionLocator,
     private readonly repository: CatchUpClassificationRepository,
     private readonly now: () => number = Date.now,
-  ) {}
+    options?: PumpFunCatchUpBlockClassifierOptions,
+  ) {
+    this.coverageFastPathEnabled = options?.coverageFastPathEnabled ?? false;
+    this.coverageRepository = options?.coverageRepository ?? null;
+    if (typeof this.coverageFastPathEnabled !== 'boolean'
+      || (this.coverageFastPathEnabled && this.coverageRepository === null)) {
+      throw new TypeError('Pump.fun catch-up coverage configuration is invalid.');
+    }
+  }
 
   public async classify(
     discoveries: readonly MergedCatchUpDiscovery[],
@@ -128,6 +148,9 @@ export class PumpFunCatchUpBlockClassifier {
     if (slots.length === 0) return Object.freeze([]);
     const classifiedAtMs = this.now();
     assertSafeMilliseconds(classifiedAtMs, 'INVALID_CLOCK');
+    if (this.coverageFastPathEnabled) {
+      return this.classifyWithCoverage(slots, classifiedAtMs, signal);
+    }
     const receipts: CatchUpClassificationReceipt[] = [];
     for (const slot of slots) {
       const classifications = await this.classifySlot(slot, classifiedAtMs, signal);
@@ -137,6 +160,53 @@ export class PumpFunCatchUpBlockClassifier {
     }
     assertNotAborted(signal);
     return Object.freeze(receipts);
+  }
+
+  private async classifyWithCoverage(
+    slots: readonly SlotGroup[],
+    classifiedAtMs: number,
+    signal: AbortSignal,
+  ): Promise<readonly CatchUpClassificationReceipt[]> {
+    const coverageRepository = this.coverageRepository;
+    if (coverageRepository === null) throw failure('INVALID_INPUT');
+    const ordered = slots.flatMap(({ rows }) => rows);
+    const receipts = new Map<string, CatchUpClassificationReceipt>();
+    for (const row of ordered) {
+      if (!row.discovery.transactionFailed) continue;
+      const classification = failedTransactionClassification(row.discovery, classifiedAtMs);
+      receipts.set(row.discovery.signature, await this.record(classification, signal));
+    }
+    assertNotAborted(signal);
+    const successful = ordered.filter(({ discovery }) => !discovery.transactionFailed);
+    const candidates = Object.freeze(successful.map(({ discovery }) => Object.freeze({
+      signature: discovery.signature,
+      slot: discovery.slot,
+      confirmationStatus: discovery.confirmationStatus,
+      programIds: discovery.programIds,
+    } satisfies CatchUpAdmissionCoverageCandidate)));
+    if (candidates.length > 0) {
+      const covered = await this.awaited(signal,
+        () => coverageRepository.readExistingCatchUpCoverage(candidates, signal));
+      for (const receipt of validateCoverageReceipts(covered, candidates)) {
+        receipts.set(receipt.signature, receipt);
+      }
+    }
+    for (const slot of slots) {
+      const missing = slot.rows.filter(({ discovery }) =>
+        !discovery.transactionFailed && !receipts.has(discovery.signature));
+      if (missing.length === 0) continue;
+      const classifications = await this.classifySlot(Object.freeze({
+        slot: slot.slot,
+        rows: Object.freeze(missing),
+      }), classifiedAtMs, signal);
+      for (const classification of classifications) {
+        receipts.set(classification.signature, await this.record(classification, signal));
+      }
+    }
+    assertNotAborted(signal);
+    const orderedReceipts = ordered.map(({ discovery }) => receipts.get(discovery.signature));
+    if (orderedReceipts.some((receipt) => receipt === undefined)) throw failure('INVALID_RECEIPT');
+    return Object.freeze(orderedReceipts as CatchUpClassificationReceipt[]);
   }
 
   private async classifySlot(
@@ -299,6 +369,21 @@ function classificationForOutcome(
     decoded,
     classifiedAtMs,
   );
+}
+
+function failedTransactionClassification(
+  discovery: MergedCatchUpDiscovery,
+  classifiedAtMs: number,
+): CatchUpClassification {
+  return classificationFromDecision(discovery, Object.freeze({
+    disposition: 'IGNORED',
+    reasonCode: 'SOLANA_TRANSACTION_FAILED',
+    ingestionHint: null,
+    ingestionHintMint: null,
+    mints: Object.freeze([]),
+    marker: 'SOLANA_TRANSACTION_FAILED',
+    actions: Object.freeze([]),
+  }), classifiedAtMs);
 }
 
 function decisionFromDecoded(decoded: DecodedPumpTransaction): ClassificationDecision {
@@ -474,6 +559,45 @@ function snapshotAndGroupDiscoveries(value: unknown): readonly SlotGroup[] {
   }));
   slots.sort((left, right) => left.slot === right.slot ? 0 : left.slot < right.slot ? -1 : 1);
   return Object.freeze(slots);
+}
+
+function validateCoverageReceipts(
+  value: unknown,
+  candidates: readonly CatchUpAdmissionCoverageCandidate[],
+): readonly CatchUpClassificationReceipt[] {
+  try {
+    if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+      throw new TypeError();
+    }
+    const length = Object.getOwnPropertyDescriptor(value, 'length')?.value as unknown;
+    if (!Number.isSafeInteger(length) || (length as number) < 0
+      || (length as number) > candidates.length
+      || Reflect.ownKeys(value).length !== (length as number) + 1) throw new TypeError();
+    const bySignature = new Map(candidates.map((candidate, index) =>
+      [candidate.signature, Object.freeze({ candidate, index })]));
+    const seen = new Set<string>();
+    const receipts: CatchUpClassificationReceipt[] = [];
+    let previousIndex = -1;
+    for (let index = 0; index < (length as number); index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        throw new TypeError();
+      }
+      const receipt: unknown = descriptor.value;
+      assertValidCatchUpClassificationReceipt(receipt);
+      const expected = bySignature.get(receipt.signature);
+      const expectedIndex = expected?.index;
+      if (receipt.persistence !== 'ALREADY_ADMITTED') throw new TypeError();
+      if (receipt.slot !== expected?.candidate.slot || seen.has(receipt.signature)
+        || expectedIndex === undefined || expectedIndex <= previousIndex) throw new TypeError();
+      seen.add(receipt.signature);
+      previousIndex = expectedIndex;
+      receipts.push(receipt);
+    }
+    return Object.freeze(receipts);
+  } catch {
+    throw failure('INVALID_RECEIPT');
+  }
 }
 
 function snapshotDiscoveryArray(value: unknown): readonly MergedCatchUpDiscovery[] {
