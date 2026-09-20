@@ -36,7 +36,7 @@ BEGIN
   IF evidence_columns=3 AND (
     NOT EXISTS (SELECT 1 FROM pg_constraint constraint_row WHERE conrelid='chain_transaction_inbox'::REGCLASS
       AND conname='chain_transaction_inbox_first_processing_evidence_check' AND convalidated
-      AND md5(pg_get_constraintdef(constraint_row.oid))='356124000df96715acd94b9508e098ae')
+      AND md5(constraint_row.conbin::TEXT)='9a924cb6fcc7c1b9d5801c5a07dac32f')
     OR NOT EXISTS (SELECT 1 FROM pg_class index_class
       WHERE index_class.relname='chain_transaction_inbox_first_processing_cohort_idx'
         AND index_class.relnamespace=current_schema()::REGNAMESPACE
@@ -168,7 +168,7 @@ BEGIN
       WHERE constraint_row.conrelid='chain_transaction_inbox'::REGCLASS
         AND constraint_row.conname='chain_transaction_inbox_first_processing_evidence_check'
         AND constraint_row.convalidated
-        AND md5(pg_get_constraintdef(constraint_row.oid))='356124000df96715acd94b9508e098ae')
+        AND md5(constraint_row.conbin::TEXT)='9a924cb6fcc7c1b9d5801c5a07dac32f')
     OR NOT EXISTS (SELECT 1 FROM pg_class index_class
       WHERE index_class.relname='chain_transaction_inbox_first_processing_cohort_idx'
         AND index_class.relnamespace=current_schema()::REGNAMESPACE

@@ -152,9 +152,31 @@ void test('migration 050 fails closed on an incompatible installed evidence colu
   });
 });
 
+void test('migration 050 fails closed on a weakened installed evidence constraint', async (context) => {
+  await withMigration050Database(context, async (pool) => {
+    await pool.query(`ALTER TABLE chain_transaction_inbox
+      DROP CONSTRAINT chain_transaction_inbox_first_processing_evidence_check,
+      ADD CONSTRAINT chain_transaction_inbox_first_processing_evidence_check CHECK (TRUE)`);
+    await assert.rejects(pool.query(await readFile(migrationUrl, 'utf8')), { code: '23514' });
+  });
+});
+
+void test('migration 050 installs and replays independently of PostgreSQL TimeZone and DateStyle', async (context) => {
+  for (const [timeZone, dateStyle] of [
+    ['UTC', 'ISO, YMD'],
+    ['Europe/Paris', 'SQL, DMY'],
+  ] as const) {
+    await withMigration050Database(context, async (pool) => {
+      await pool.query(await readFile(migrationUrl, 'utf8'));
+    }, timeZone, dateStyle);
+  }
+});
+
 async function withMigration050Database(
   context: { skip(message?: string): void },
   run: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+  timeZone?: 'UTC' | 'Europe/Paris',
+  dateStyle?: 'ISO, YMD' | 'SQL, DMY',
 ): Promise<void> {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -166,6 +188,8 @@ async function withMigration050Database(
   const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    if (timeZone !== undefined) await pool.query(`SET TIME ZONE '${timeZone}'`);
+    if (dateStyle !== undefined) await pool.query(`SET DateStyle TO '${dateStyle}'`);
     for (const name of (await readdir(migrationsUrl)).sort()) {
       await pool.query(await readFile(new URL(name, migrationsUrl), 'utf8'));
     }
