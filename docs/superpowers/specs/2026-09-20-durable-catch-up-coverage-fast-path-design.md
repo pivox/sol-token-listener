@@ -1,7 +1,7 @@
 # Durable catch-up coverage fast path
 
 Status: approved for implementation
-Version: 1.0.3
+Version: 1.0.4
 Issue: #146
 Parent incident: #120
 Scope: Pump.fun observe-only catch-up admission; no wallet, signer, executor,
@@ -20,6 +20,8 @@ Revision history:
 - 1.0.3: require an exact canonical program-ID set for read-only coverage,
   define covered receipts as an ordered subset of successful candidates and
   make both success/failure arrival orders fail closed in persistence.
+- 1.0.4: require bounded own-index array snapshots at the coverage boundary so
+  custom iterators, accessors and oversized batches cannot bypass page limits.
 
 ## Context
 

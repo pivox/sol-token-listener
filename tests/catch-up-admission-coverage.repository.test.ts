@@ -91,6 +91,44 @@ void test('rejects duplicate candidates before I/O and cancellation after the bo
   assert.equal(calls, 1);
 });
 
+void test('rejects custom and oversized candidate arrays without invoking iterators or database I/O', async () => {
+  let calls = 0;
+  let iteratorCalls = 0;
+  const repository = new PostgresTransactionInboxRepository(fakePool(async () => {
+    calls += 1;
+    return { rows: [], rowCount: 0 };
+  }));
+  const custom = [candidate('custom-array', 8n)];
+  Object.defineProperty(custom, Symbol.iterator, {
+    enumerable: false,
+    value: () => {
+      iteratorCalls += 1;
+      return [][Symbol.iterator]();
+    },
+  });
+  await assert.rejects(repository.readExistingCatchUpCoverage(
+    custom, new AbortController().signal,
+  ), TransactionInboxRepositoryError);
+  const customPrograms = [PUMP_PROGRAM_ID];
+  Object.defineProperty(customPrograms, Symbol.iterator, {
+    enumerable: false,
+    value: () => {
+      iteratorCalls += 1;
+      return [][Symbol.iterator]();
+    },
+  });
+  await assert.rejects(repository.readExistingCatchUpCoverage([Object.freeze({
+    ...candidate('custom-programs', 9n), programIds: customPrograms,
+  })], new AbortController().signal), TransactionInboxRepositoryError);
+  const oversized = Array.from({ length: 1_001 }, (_unused, index) =>
+    candidate(`oversized-${String(index)}`, BigInt(index)));
+  await assert.rejects(repository.readExistingCatchUpCoverage(
+    oversized, new AbortController().signal,
+  ), TransactionInboxRepositoryError);
+  assert.equal(iteratorCalls, 0);
+  assert.equal(calls, 0);
+});
+
 function candidate(
   signature: string,
   slot: bigint,
@@ -108,6 +146,7 @@ function baseRow(value: CatchUpAdmissionCoverageCandidate): Record<string, unkno
     candidate_program_ids: [...value.programIds],
     inbox_signature: null, inbox_observed_slot: null, inbox_discovery_sources: null,
     inbox_program_ids: null, inbox_confirmation_status: null,
+    inbox_observed_at: null, inbox_ingestion_hint: null, inbox_ingestion_hint_mint: null,
     inbox_finality_evidence_version: null, inbox_immutable_fingerprint: null,
     inbox_processed_at: null,
     catch_up_classification_version: null, catch_up_disposition: null,
@@ -123,7 +162,8 @@ function websocketRow(value: CatchUpAdmissionCoverageCandidate): Record<string, 
   return {
     ...baseRow(value), inbox_signature: value.signature, inbox_observed_slot: value.slot.toString(),
     inbox_discovery_sources: ['WEBSOCKET'], inbox_program_ids: [...value.programIds],
-    inbox_confirmation_status: value.confirmationStatus,
+    inbox_confirmation_status: value.confirmationStatus, inbox_observed_at: new Date(1_000),
+    inbox_ingestion_hint: 'NONE', inbox_ingestion_hint_mint: null,
   };
 }
 

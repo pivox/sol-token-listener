@@ -14,10 +14,8 @@ import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
 import {
-  CATCH_UP_CLASSIFICATION_DISPOSITIONS,
-  CATCH_UP_CLASSIFICATION_REASON_CODES,
-  CATCH_UP_CLASSIFICATION_VERSION,
   assertValidCatchUpClassification,
+  createCatchUpClassification,
   createCatchUpClassificationReceipt,
   type CatchUpClassification,
   type CatchUpClassificationReceipt,
@@ -817,6 +815,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            inbox.discovery_sources AS inbox_discovery_sources,
            inbox.program_ids AS inbox_program_ids,
            inbox.target_confirmation_status AS inbox_confirmation_status,
+           inbox.observed_at AS inbox_observed_at,
+           inbox.ingestion_hint AS inbox_ingestion_hint,
+           inbox.ingestion_hint_mint AS inbox_ingestion_hint_mint,
            inbox.finality_evidence_version AS inbox_finality_evidence_version,
            inbox.immutable_fingerprint AS inbox_immutable_fingerprint,
            inbox.processed_at AS inbox_processed_at,
@@ -2636,12 +2637,14 @@ function matchesCheckpointBoundary(
 function snapshotCoverageCandidates(
   value: readonly CatchUpAdmissionCoverageCandidate[],
 ): readonly CatchUpAdmissionCoverageCandidate[] {
-  if (!Array.isArray(value) || isProxy(value) || value.length > 1_000) {
+  if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     throw new TypeError('Catch-up coverage candidates are invalid.');
   }
+  const length = exactArrayLength(value, 1_000, 'Catch-up coverage candidates');
   const signatures = new Set<string>();
   const snapshot: CatchUpAdmissionCoverageCandidate[] = [];
-  for (const candidate of value) {
+  for (let index = 0; index < length; index += 1) {
+    const candidate = ownArrayValue(value, index, 'Catch-up coverage candidate');
     if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)
       || isProxy(candidate)) throw new TypeError('Catch-up coverage candidate is invalid.');
     const descriptors = Object.getOwnPropertyDescriptors(candidate);
@@ -2664,12 +2667,25 @@ function snapshotCoverageCandidates(
       || (confirmationStatus !== 'processed' && confirmationStatus !== 'confirmed'
         && confirmationStatus !== 'finalized')
       || !Array.isArray(programIdsValue) || isProxy(programIdsValue)
-      || programIdsValue.length === 0 || programIdsValue.length > 16) {
+      || Object.getPrototypeOf(programIdsValue) !== Array.prototype) {
       throw new TypeError('Catch-up coverage candidate identity is invalid.');
+    }
+    const programIdsLength = exactArrayLength(
+      programIdsValue,
+      16,
+      'Catch-up coverage candidate program IDs',
+    );
+    if (programIdsLength === 0) {
+      throw new TypeError('Catch-up coverage candidate program IDs are invalid.');
     }
     const programIds: string[] = [];
     let previous: string | null = null;
-    for (const programId of programIdsValue as readonly unknown[]) {
+    for (let programIndex = 0; programIndex < programIdsLength; programIndex += 1) {
+      const programId = ownArrayValue(
+        programIdsValue,
+        programIndex,
+        'Catch-up coverage candidate program ID',
+      );
       if (typeof programId !== 'string' || !isCanonicalSolanaProgramId(programId)
         || (previous !== null && programId <= previous)) {
         throw new TypeError('Catch-up coverage candidate program IDs are invalid.');
@@ -2686,6 +2702,25 @@ function snapshotCoverageCandidates(
     }));
   }
   return Object.freeze(snapshot);
+}
+
+function exactArrayLength(value: readonly unknown[], maximum: number, name: string): number {
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  const length: unknown = descriptor !== undefined && 'value' in descriptor
+    ? descriptor.value : undefined;
+  if (!Number.isSafeInteger(length) || (length as number) < 0 || (length as number) > maximum
+    || Reflect.ownKeys(value).length !== (length as number) + 1) {
+    throw new TypeError(`${name} are invalid.`);
+  }
+  return length as number;
+}
+
+function ownArrayValue(value: readonly unknown[], index: number, name: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+  if (descriptor?.enumerable !== true || !Object.hasOwn(descriptor, 'value')) {
+    throw new TypeError(`${name} is invalid.`);
+  }
+  return descriptor.value as unknown;
 }
 
 function descriptorValue(descriptor: PropertyDescriptor | undefined): unknown {
@@ -2709,12 +2744,14 @@ function assertAndReadCoverage(
     }
     const sources = discoverySources(row.inbox_discovery_sources);
     const storedPrograms = storedProgramIds(row.inbox_program_ids);
-    const hasClassification = validateStoredCoverageClassification(row, sources);
+    const storedStatus = confirmation(row.inbox_confirmation_status);
+    const hasClassification = validateStoredCoverageClassification(
+      row, sources, candidate, storedPrograms, storedStatus,
+    );
     if (!sources.includes('WEBSOCKET') && !hasClassification) {
       throw internalRepositoryError(new TransactionInboxConflictError('classification'));
     }
     if (!sameProgramIds(storedPrograms, candidate.programIds)) return false;
-    const storedStatus = confirmation(row.inbox_confirmation_status);
     try {
       inboxAdvances = reconcileConfirmationStatus(storedStatus, candidate.confirmationStatus) === 'update';
     } catch {
@@ -2751,6 +2788,9 @@ function assertAndReadCoverage(
 function validateStoredCoverageClassification(
   row: QueryResultRow,
   sources: readonly TransactionNotification['source'][],
+  candidate: CatchUpAdmissionCoverageCandidate,
+  programIds: readonly string[],
+  confirmationStatus: ChainConfirmationStatus,
 ): boolean {
   const values = [row.catch_up_disposition, row.catch_up_reason_code, row.catch_up_action_key,
     row.catch_up_mints, row.catch_up_evidence_fingerprint, row.catch_up_classified_at];
@@ -2760,31 +2800,36 @@ function validateStoredCoverageClassification(
     }
     return false;
   }
-  if (safeCount(row.catch_up_classification_version, 'catch-up classification version')
-      !== CATCH_UP_CLASSIFICATION_VERSION
-    || !sources.includes('CATCH_UP')
-    || typeof row.catch_up_disposition !== 'string'
-    || !(CATCH_UP_CLASSIFICATION_DISPOSITIONS as readonly string[]).includes(row.catch_up_disposition)
-    || typeof row.catch_up_reason_code !== 'string'
-    || !(CATCH_UP_CLASSIFICATION_REASON_CODES as readonly string[]).includes(row.catch_up_reason_code)) {
-    throw new TypeError('Stored catch-up classification is invalid.');
-  }
-  const actionKey = requiredTextValue(row.catch_up_action_key, 'catch-up action key');
+  if (!sources.includes('CATCH_UP')) throw new TypeError('Stored catch-up classification is invalid.');
   const mints = storedCatchUpMints(row.catch_up_mints);
-  requiredFingerprint(row.catch_up_evidence_fingerprint);
-  dateMs(row.catch_up_classified_at, 'catch-up classified at');
-  if (row.catch_up_reason_code === 'SOLANA_TRANSACTION_FAILED') {
-    throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+  const storedHint: unknown = row.inbox_ingestion_hint;
+  const storedHintMint: unknown = row.inbox_ingestion_hint_mint;
+  const disposition: unknown = row.catch_up_disposition;
+  const reasonCode: unknown = row.catch_up_reason_code;
+  const classification = createCatchUpClassification({
+    signature: candidate.signature,
+    slot: candidate.slot,
+    programIds,
+    confirmationStatus,
+    observedAtMs: dateMs(row.inbox_observed_at, 'catch-up observed at'),
+    ingestionHint: storedHint === 'NONE' ? null : storedHint,
+    ingestionHintMint: storedHintMint,
+    classificationVersion: safeCount(
+      row.catch_up_classification_version,
+      'catch-up classification version',
+    ),
+    disposition,
+    reasonCode,
+    mints,
+    evidenceFingerprint: requiredFingerprint(row.catch_up_evidence_fingerprint),
+    classifiedAtMs: dateMs(row.catch_up_classified_at, 'catch-up classified at'),
+  });
+  if (requiredTextValue(row.catch_up_action_key, 'catch-up action key')
+      !== catchUpActionKey(classification)) {
+    throw new TypeError('Stored catch-up action key is invalid.');
   }
-  if (row.catch_up_reason_code === 'NO_SUPPORTED_PUMP_ACTION'
-    || row.catch_up_reason_code === 'PUMP_SCHEMA_UNSUPPORTED'
-    || row.catch_up_reason_code === 'PROVIDER_SIGNATURE_MISSING') {
-    if (actionKey !== 'NONE' || mints.length !== 0) {
-      throw new TypeError('Stored terminal catch-up classification is invalid.');
-    }
-  } else if (mints.length === 0 || (actionKey !== 'PUMPFUN_CREATE'
-    && !actionKey.startsWith('PUMPFUN_TRADE:'))) {
-    throw new TypeError('Stored actionable catch-up classification is invalid.');
+  if (classification.reasonCode === 'SOLANA_TRANSACTION_FAILED') {
+    throw internalRepositoryError(new TransactionInboxConflictError('classification'));
   }
   return true;
 }
