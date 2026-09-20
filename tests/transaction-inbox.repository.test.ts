@@ -50,10 +50,57 @@ import {
   FIRST_PROCESSING_COHORT_CAPACITY,
   FIRST_PROCESSING_COHORT_DURATION_MS,
   FIRST_PROCESSING_THRESHOLD_MS,
+  createFirstProcessingCanaryEvidence,
 } from '../src/domain/first-processing-canary.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
+
+void test('heartbeat persists a detached first processing canary snapshot and rejects malformed evidence before I/O', async () => {
+  const queryCalls: unknown[][] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      queryCalls.push(values === undefined ? [] : [...values]);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const owned = Object.freeze({ ...firstProcessingHeartbeatEvidence() });
+  const heartbeat: RuntimeHeartbeat = Object.freeze({
+    runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+    workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 1_000,
+    updatedAtMs: 2_000, lastHttpSlot: null, lastWebsocketSlot: null,
+    lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0,
+    exhaustedCount: 0, firstProcessingCanary: owned,
+  });
+  await repository.writeHeartbeat(heartbeat);
+  assert.equal(queryCalls.length, 1);
+  assert.deepEqual(queryCalls[0]?.[14], {
+    startedAt: '1970-01-01T00:00:01.000Z',
+    firstProcessingCanary: firstProcessingHeartbeatEvidence(),
+  });
+  const { firstProcessingCanary: omitted, ...legacy } = heartbeat;
+  assert.ok(omitted);
+  await repository.writeHeartbeat(Object.freeze({ ...legacy, updatedAtMs: 3_000 }));
+  assert.deepEqual(queryCalls[1]?.[14], { startedAt: '1970-01-01T00:00:01.000Z' });
+  await assert.rejects(repository.writeHeartbeat(Object.freeze({
+    ...heartbeat,
+    updatedAtMs: 4_000,
+    firstProcessingCanary: new Proxy(firstProcessingHeartbeatEvidence(), {}),
+  })), TransactionInboxRepositoryError);
+  assert.equal(queryCalls.length, 2);
+});
+
+function firstProcessingHeartbeatEvidence() {
+  return createFirstProcessingCanaryEvidence({
+    version: 1, thresholdMs: 45_000, cohortCapacity: 50_000,
+    cohortStartedAtMs: 1_000, cohortEndsAtMs: 901_000, sampledAtMs: 946_000,
+    overflowed: false, eligibleCount: 0, completedCount: 0, underThresholdCount: 0,
+    atOrAboveThresholdCount: 0, pendingCount: 0, rightCensoredCount: 0, tailCensoredCount: 0,
+    terminalCount: 0, unavailableCount: 0, invalidDurationCount: 0, p95Ms: null,
+    verdict: 'INCONCLUSIVE',
+  });
+}
 
 void test('first processing time survives lease loss, finality replay, orphaning, and exhausted recovery', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -553,6 +600,8 @@ for (const [location, boundary] of [
       let written: RuntimeHeartbeat | undefined;
       const heartbeat = new PersistentListenerHeartbeat({
         counts: () => repository.counts(),
+        beginFirstProcessingCanary: () => repository.beginFirstProcessingCanary(),
+        firstProcessingCanary: (cohortStartedAtMs) => repository.firstProcessingCanary(cohortStartedAtMs),
         async writeHeartbeat(value) { written = value; await repository.writeHeartbeat(value); },
       }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
       () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {

@@ -1933,6 +1933,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : snapshotRuntimeCatchUpAdmissionMetrics(value.catchUpAdmission, value.backlogCount);
       const rpcHttpEvidence = value.rpcHttpEvidence === undefined ? undefined
         : createRuntimeRpcHttpEvidence(value.rpcHttpEvidence);
+      const firstProcessingCanary = value.firstProcessingCanary === undefined ? undefined
+        : createFirstProcessingCanaryEvidence(value.firstProcessingCanary);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
@@ -1981,6 +1983,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               ? {}
               : { catchUpAdmission }),
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
+            ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
           }),
           value.exhaustedCount,
         ],
