@@ -221,10 +221,17 @@ void test('aggregates a bounded first-processing cohort with PostgreSQL timing a
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
     const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
-    const sampledBefore = Date.now();
+    const databaseClockSql = `SELECT
+      (EXTRACT(EPOCH FROM date_trunc('milliseconds', clock_timestamp())) * 1000)::BIGINT
+        AS now_ms`;
+    const databaseBeforeMs = Number((await pool.query(databaseClockSql)).rows[0]?.now_ms);
     const databaseStartedAtMs = await repository.beginFirstProcessingCanary();
+    const databaseAfterMs = Number((await pool.query(databaseClockSql)).rows[0]?.now_ms);
+    assert.equal(Number.isSafeInteger(databaseBeforeMs), true);
     assert.equal(Number.isSafeInteger(databaseStartedAtMs), true);
-    assert.ok(databaseStartedAtMs >= sampledBefore);
+    assert.equal(Number.isSafeInteger(databaseAfterMs), true);
+    assert.ok(databaseStartedAtMs >= databaseBeforeMs);
+    assert.ok(databaseStartedAtMs <= databaseAfterMs);
 
     await insertCanaryInboxRow(pool, 'canary-under', startedAtMs + 1, startedAtMs + 45_000);
     await insertCanaryInboxRow(pool, 'canary-at', startedAtMs + 2, startedAtMs + 45_002);
@@ -371,20 +378,40 @@ void test('classifies valid nonretryable and exhausted FAILED rows before their 
   });
 });
 
-void test('uses PostgreSQL strict right-censoring boundaries at 44,999 and 45,000 milliseconds', async (context) => {
+void test('classifies the 44,999/45,000 right/tail boundary through the repository', async (context) => {
   await withDatabase(context, async (pool) => {
-    const result = await pool.query(`WITH sampled AS (
-      SELECT TIMESTAMPTZ '2026-01-01 00:00:45+00' AS sampled_at
-    ), rows AS (
-      SELECT sampled_at - ($1::BIGINT * INTERVAL '1 millisecond') AS first_detected_at FROM sampled
-      UNION ALL
-      SELECT sampled_at - ($2::BIGINT * INTERVAL '1 millisecond') FROM sampled
-    ) SELECT COUNT(*) FILTER (WHERE sampled_at - first_detected_at < ($2::BIGINT * INTERVAL '1 millisecond'))
-        AS right_censored_count,
-      COUNT(*) FILTER (WHERE sampled_at - first_detected_at >= ($2::BIGINT * INTERVAL '1 millisecond'))
-        AS tail_censored_count
-      FROM rows CROSS JOIN sampled`, [FIRST_PROCESSING_THRESHOLD_MS - 1, FIRST_PROCESSING_THRESHOLD_MS]);
-    assert.deepEqual(result.rows[0], { right_censored_count: '1', tail_censored_count: '1' });
+    const sampledAtMs = Date.parse('2026-01-01T00:00:45.000Z');
+    const startedAtMs = sampledAtMs - 60_000;
+    await insertCanaryInboxRow(pool, 'canary-right-boundary', sampledAtMs - 44_999, null);
+    await insertCanaryInboxRow(pool, 'canary-tail-boundary', sampledAtMs - 45_000, null);
+
+    const client = await pool.connect();
+    try {
+      const schema = (await client.query<{ readonly schema_name: unknown }>(
+        'SELECT current_schema() AS schema_name',
+      )).rows[0]?.schema_name;
+      assert.equal(typeof schema, 'string');
+      if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+      await client.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+        RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+        AS $$ SELECT to_timestamp(${sampledAtMs} / 1000.0) $$`);
+      await client.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
+      const repository = new PostgresTransactionInboxRepository({
+        async query(text, values) {
+          return client.query(text, values === undefined ? undefined : [...values]);
+        },
+        async connect() { throw new Error('No connection needed.'); },
+      });
+
+      const evidence = await repository.firstProcessingCanary(startedAtMs);
+      assert.equal(evidence.sampledAtMs, sampledAtMs);
+      assert.equal(evidence.eligibleCount, 2);
+      assert.equal(evidence.pendingCount, 2);
+      assert.equal(evidence.rightCensoredCount, 1);
+      assert.equal(evidence.tailCensoredCount, 1);
+    } finally {
+      client.release();
+    }
   });
 });
 
