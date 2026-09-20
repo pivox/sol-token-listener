@@ -287,6 +287,7 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   const settings = Object.freeze([
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
     ['LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED', 'false'],
+    ['LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_MAX_ENTRIES', '64'],
     ['LISTENER_BLOCK_HYDRATION_MAX_BYTES', '67108864'],

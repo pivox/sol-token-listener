@@ -21,6 +21,10 @@ import type {
 } from '../src/launchpads/pumpfun/types.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type { CatchUpClassificationRepository } from '../src/ports/catch-up-classification-repository.js';
+import type {
+  CatchUpAdmissionCoverageCandidate,
+  CatchUpAdmissionCoverageRepository,
+} from '../src/ports/catch-up-admission-coverage-repository.js';
 import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import {
   internalLocatorError,
@@ -77,6 +81,116 @@ class RecordingRepository implements CatchUpClassificationRepository {
     return this.receiptFor(value);
   }
 }
+
+class RecordingCoverageRepository implements CatchUpAdmissionCoverageRepository {
+  public readonly batches: readonly CatchUpAdmissionCoverageCandidate[][] = [];
+
+  public constructor(
+    private readonly handler: (
+      candidates: readonly CatchUpAdmissionCoverageCandidate[],
+      signal: AbortSignal,
+    ) => Promise<readonly CatchUpClassificationReceipt[]>,
+  ) {}
+
+  public async readExistingCatchUpCoverage(
+    candidates: readonly CatchUpAdmissionCoverageCandidate[],
+    signal: AbortSignal,
+  ): Promise<readonly CatchUpClassificationReceipt[]> {
+    (this.batches as CatchUpAdmissionCoverageCandidate[][]).push([...candidates]);
+    return this.handler(candidates, signal);
+  }
+}
+
+void test('keeps the coverage fast path inactive unless explicitly enabled', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const locator = returning(new Map([[transaction.signature, transaction]]));
+  const repository = new RecordingRepository();
+  const coverage = new RecordingCoverageRepository(async () => {
+    throw new Error('coverage must stay inactive');
+  });
+
+  await new PumpFunCatchUpBlockClassifier(locator, repository, () => 9_000, {
+    coverageFastPathEnabled: false, coverageRepository: coverage,
+  }).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
+
+  assert.equal(locator.targets.length, 1);
+  assert.equal(repository.values.length, 1);
+  assert.deepEqual(coverage.batches, []);
+});
+
+void test('records failed discoveries directly, covers durable successes and hydrates only missing work', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const failed = cloneTransaction(template, { signature: 'a-fast-failed', slot: 79n,
+    error: Object.freeze({ InstructionError: Object.freeze([0, 'Custom']) }) });
+  const covered = cloneTransaction(template, { signature: 'b-fast-covered', slot: 79n });
+  const uncovered = cloneTransaction(template, { signature: 'c-fast-uncovered', slot: 79n });
+  const repository = new RecordingRepository();
+  const coverage = new RecordingCoverageRepository(async (candidates) => Object.freeze([
+    createCatchUpClassificationReceipt({
+      signature: candidates[0]?.signature, slot: candidates[0]?.slot, disposition: null,
+      persistence: 'ALREADY_ADMITTED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    }),
+  ]));
+  const locator = returning(new Map([[uncovered.signature, uncovered]]));
+
+  const receipts = await new PumpFunCatchUpBlockClassifier(locator, repository, () => 9_500, {
+    coverageFastPathEnabled: true, coverageRepository: coverage,
+  }).classify(Object.freeze([discovery(uncovered), discovery(failed), discovery(covered)]), NEVER_ABORTED);
+
+  assert.deepEqual(coverage.batches.map((batch) => batch.map(({ signature }) => signature)), [[
+    covered.signature, uncovered.signature,
+  ]]);
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [uncovered.signature]);
+  assert.deepEqual(repository.values.map(({ signature, reasonCode }) => [signature, reasonCode]), [
+    [failed.signature, 'SOLANA_TRANSACTION_FAILED'],
+    [uncovered.signature, 'PUMP_TRADE_UNTRACKED'],
+  ]);
+  assert.deepEqual(receipts.map(({ signature }) => signature), [
+    failed.signature, covered.signature, uncovered.signature,
+  ]);
+});
+
+void test('rejects a source-success discovery when hydrated block evidence reports failure', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const transaction = cloneTransaction(template, {
+    signature: 'source-success-block-failure',
+    error: Object.freeze({ InstructionError: Object.freeze([0, 'Custom']) }),
+  });
+  const repository = new RecordingRepository();
+  const coverage = new RecordingCoverageRepository(async () => Object.freeze([]));
+  const sourceSuccess = Object.freeze({ ...discovery(transaction), transactionFailed: false });
+
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])), repository, () => 9_625, {
+      coverageFastPathEnabled: true, coverageRepository: coverage,
+    },
+  ).classify(Object.freeze([sourceSuccess]), NEVER_ABORTED), (error: unknown) => {
+    assert.equal(Reflect.get(error as object, 'code'), 'TRANSACTION_OUTCOME_MISMATCH');
+    return true;
+  });
+  assert.deepEqual(repository.values, []);
+});
+
+void test('fails closed on hostile or contradictory coverage receipts before hydration', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const locator = returning(new Map([[transaction.signature, transaction]]));
+  const repository = new RecordingRepository();
+  const coverage = new RecordingCoverageRepository(async () => Object.freeze([
+    createCatchUpClassificationReceipt({
+      signature: 'unexpected-covered-signature', slot: transaction.slot, disposition: null,
+      persistence: 'ALREADY_ADMITTED', admission: 'NOT_ENQUEUED', ingestionPriority: null,
+    }),
+  ]));
+
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(locator, repository, () => 9_750, {
+    coverageFastPathEnabled: true, coverageRepository: coverage,
+  }).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED), (error: unknown) => {
+    assert.equal(Reflect.get(error as object, 'code'), 'INVALID_RECEIPT');
+    return true;
+  });
+  assert.deepEqual(locator.targets, []);
+  assert.deepEqual(repository.values, []);
+});
 
 void test('classifies a creation and its initial buy as one actionable launch', async () => {
   const transaction = await fixtureTransaction('create-v2-current-initial-buy-mainnet.json');
@@ -623,6 +737,7 @@ function discovery(
     slot: transaction.slot,
     confirmationStatus,
     blockTimeMs: transaction.blockTimeMs,
+    transactionFailed: transaction.error !== null,
     programIds: Object.freeze([PUMP_PROGRAM_ID]),
   });
 }

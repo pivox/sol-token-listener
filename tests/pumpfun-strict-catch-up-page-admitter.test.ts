@@ -140,7 +140,10 @@ void test('observes cancellation before and after classifier settlement', async 
 });
 
 function row(signature: string, slot: number): CatchUpSignature {
-  return Object.freeze({ signature, slot: BigInt(slot), confirmationStatus: 'confirmed', blockTimeMs: 1_000 });
+  return Object.freeze({
+    signature, slot: BigInt(slot), confirmationStatus: 'confirmed', blockTimeMs: 1_000,
+    transactionFailed: false,
+  });
 }
 
 function receipt(

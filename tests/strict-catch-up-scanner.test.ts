@@ -1551,7 +1551,9 @@ function sig(
   confirmationStatus: CatchUpSignature['confirmationStatus'] = 'confirmed',
   blockTimeMs: number | null = 1_000,
 ): CatchUpSignature {
-  return Object.freeze({ signature, slot: BigInt(slot), confirmationStatus, blockTimeMs });
+  return Object.freeze({
+    signature, slot: BigInt(slot), confirmationStatus, blockTimeMs, transactionFailed: false,
+  });
 }
 
 function checkpoint(

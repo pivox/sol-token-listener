@@ -237,7 +237,10 @@ export function createProductionListenerRuntime(
   const pageAdmitters = new Map(hydration === null ? [] : providers.ids.map((providerId) => [
     providerId,
     new PumpFunStrictCatchUpPageAdmitter(new PumpFunCatchUpBlockClassifier(
-      hydration.classifierLocator(providerId), inbox,
+      hydration.classifierLocator(providerId), inbox, Date.now, Object.freeze({
+        coverageFastPathEnabled: config.listenerPumpFunCatchUpCoverageFastPathEnabled,
+        coverageRepository: config.listenerPumpFunCatchUpCoverageFastPathEnabled ? inbox : null,
+      }),
     )),
   ] as const));
   const websocketHealth = new PostgresWebSocketHealthRepository(databasePool);

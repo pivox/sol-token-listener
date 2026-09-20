@@ -531,6 +531,7 @@ LISTENER_INGESTION_SCOPE=launchpad-only
 LISTENER_CATCH_UP_POLICY=live-edge
 LISTENER_BLOCK_HYDRATION_ENABLED=true
 LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true
+LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=true
 ```
 
 Il requiert aussi le hash genesis canonique du cluster et une paire HTTP/WebSocket
@@ -549,6 +550,14 @@ peut être réutilisé. Le rollback est de remettre
 `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis de redémarrer. Les
 receipts de classification/admission restent une preuve historique et expirent
 selon leur rétention de quatre heures.
+
+Le fast path de couverture durable reste indépendamment désactivé par défaut.
+Lorsqu'il est activé dans cette même enveloppe observe-only, les transactions
+déjà admises par WebSocket ne sont pas réhydratées, les transactions dont
+`getSignaturesForAddress.err` est non nul sont classées sans télécharger le
+bloc, et toutes les identités ambiguës retombent sur le chemin complet ou
+échouent de façon fermée. Il ne modifie aucune ligne couverte et n'ajoute aucune
+provenance synthétique.
 
 Cette livraison ne déclare aucune readiness Mainnet. Après merge seulement, le
 canary Mainnet observe-only séparé de 15 minutes doit valider zéro HTTP 429, le

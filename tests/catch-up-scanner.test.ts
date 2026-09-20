@@ -347,6 +347,45 @@ void test('maps RPC commitment/status/time explicitly and freezes captured rows'
   assert.ok(Object.isFrozen(rows[0]));
 });
 
+void test('reduces the official signature error to a boolean without traversing its content', async () => {
+  let traps = 0;
+  const hostileError = new Proxy({ InstructionError: [0, { Custom: 7 }] }, {
+    get() { traps += 1; throw new Error('transaction error body must stay opaque'); },
+    ownKeys() { traps += 1; throw new Error('transaction error body must stay opaque'); },
+    getOwnPropertyDescriptor() { traps += 1; throw new Error('transaction error body must stay opaque'); },
+  });
+  const source = new SolanaCatchUpSource({
+    async getSignaturesForAddress() {
+      return [
+        rpcSig('success', 42, 'confirmed', 3, null),
+        rpcSig('failed', 41, 'confirmed', 2, hostileError),
+      ];
+    },
+  }, 'confirmed');
+
+  assert.deepEqual(await source.list(PUMP_PROGRAM_ID, undefined, 2), [
+    sig('success', 42, 'confirmed', 3_000, false),
+    sig('failed', 41, 'confirmed', 2_000, true),
+  ]);
+  assert.equal(traps, 0);
+});
+
+void test('rejects oversized string errors before scanning their UTF-8 byte length', async (context) => {
+  const oversizedError = 'x'.repeat(16_385);
+  const source = new SolanaCatchUpSource({
+    async getSignaturesForAddress() {
+      return [rpcSig('oversized-error', 42, 'confirmed', 3, oversizedError)];
+    },
+  }, 'confirmed');
+  const byteLength = context.mock.method(Buffer, 'byteLength');
+
+  await assert.rejects(source.list(PUMP_PROGRAM_ID, undefined, 1), CatchUpSourceError);
+
+  const oversizedScans = byteLength.mock.calls.filter(({ arguments: args }) => args[0] === oversizedError);
+  byteLength.mock.restore();
+  assert.equal(oversizedScans.length, 0);
+});
+
 void test('rejects malformed, accessor-backed, unsafe, and over-limit RPC responses with redacted errors', async () => {
   const hostileUrl = 'https://secret.invalid/?token=do-not-leak';
   const cases: unknown[] = [
@@ -357,11 +396,26 @@ void test('rejects malformed, accessor-backed, unsafe, and over-limit RPC respon
     [rpcSig('x', 1, 'processed', Number.MAX_SAFE_INTEGER)],
     [rpcSig('x', 1, 'mystery')],
     [rpcSig('x', 1, 'processed')],
+    [{ signature: 'x', slot: 1, memo: null, blockTime: 1, confirmationStatus: 'confirmed' }],
+    [{ ...rpcSig('x', 1), err: undefined }],
+    [rpcSig('x', 1, 'confirmed', 1, false)],
+    [rpcSig('x', 1, 'confirmed', 1, 1)],
+    [rpcSig('x', 1, 'confirmed', 1, 1n)],
+    [rpcSig('x', 1, 'confirmed', 1, Symbol('invalid'))],
+    [rpcSig('x', 1, 'confirmed', 1, () => undefined)],
+    [rpcSig('x', 1, 'confirmed', 1, [])],
+    [rpcSig('x', 1, 'confirmed', 1, '')],
     [rpcSig('x', 1), rpcSig('y', 2)],
   ];
   const accessor: Record<string, unknown> = rpcSig('x', 1);
   Object.defineProperty(accessor, 'slot', { enumerable: true, get: () => { throw new Error(hostileUrl); } });
   cases.push([accessor]);
+  const errorAccessor: Record<string, unknown> = rpcSig('x', 1);
+  Object.defineProperty(errorAccessor, 'err', {
+    enumerable: true,
+    get: () => { throw new Error(hostileUrl); },
+  });
+  cases.push([errorAccessor]);
 
   for (const value of cases) {
     const source = new SolanaCatchUpSource({ async getSignaturesForAddress() { return value; } }, 'confirmed');
@@ -483,12 +537,19 @@ function sig(
   slot: number,
   confirmationStatus: CatchUpSignature['confirmationStatus'] = 'confirmed',
   blockTimeMs: number | null = 1_000,
+  transactionFailed = false,
 ): CatchUpSignature {
-  return Object.freeze({ signature, slot: BigInt(slot), confirmationStatus, blockTimeMs });
+  return Object.freeze({ signature, slot: BigInt(slot), confirmationStatus, blockTimeMs, transactionFailed });
 }
 
-function rpcSig(signature: string, slot: number, confirmationStatus = 'confirmed', blockTime: number | null = 1) {
-  return { signature, slot, err: null, memo: null, blockTime, confirmationStatus };
+function rpcSig(
+  signature: string,
+  slot: number,
+  confirmationStatus = 'confirmed',
+  blockTime: number | null = 1,
+  err: unknown = null,
+) {
+  return { signature, slot, err, memo: null, blockTime, confirmationStatus };
 }
 
 function checkpoint(

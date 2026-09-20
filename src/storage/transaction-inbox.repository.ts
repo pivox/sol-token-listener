@@ -15,6 +15,7 @@ import {
 } from '../domain/confirmation-status.js';
 import {
   assertValidCatchUpClassification,
+  createCatchUpClassification,
   createCatchUpClassificationReceipt,
   type CatchUpClassification,
   type CatchUpClassificationReceipt,
@@ -63,6 +64,10 @@ import {
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { StrictCatchUpRepository } from '../ports/strict-catch-up-repository.js';
 import type { CatchUpClassificationRepository } from '../ports/catch-up-classification-repository.js';
+import type {
+  CatchUpAdmissionCoverageCandidate,
+  CatchUpAdmissionCoverageRepository,
+} from '../ports/catch-up-admission-coverage-repository.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
@@ -205,7 +210,7 @@ export class TransactionInboxLeaseError extends TransactionInboxRepositoryError 
 }
 
 export class PostgresTransactionInboxRepository implements TransactionInboxRepository,
-  StrictCatchUpRepository, CatchUpClassificationRepository {
+  StrictCatchUpRepository, CatchUpClassificationRepository, CatchUpAdmissionCoverageRepository {
   private readonly retryPolicy: TransactionInboxRetryPolicy;
 
   public constructor(
@@ -399,7 +404,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              processing_status, normalized_transaction, immutable_fingerprint, processed_at,
              missing_finality_polls,
              last_missing_finality_provider_id, finality_evidence_version,
-             catch_up_disposition
+             catch_up_disposition, catch_up_reason_code
            FROM chain_transaction_inbox WHERE signature = $1 FOR UPDATE`,
           [value.signature],
         );
@@ -421,6 +426,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const terminalCatchUpClassification = row !== undefined
           && (row.catch_up_disposition === 'IGNORED' || row.catch_up_disposition === 'QUARANTINED');
         if (terminalCatchUpClassification && row.processing_status === row.catch_up_disposition) {
+          if (value.source === 'WEBSOCKET'
+            && row.catch_up_reason_code === 'SOLANA_TRANSACTION_FAILED') {
+            throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+          }
           if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot) {
             throw internalRepositoryError(new TransactionInboxConflictError('identity'));
           }
@@ -605,6 +614,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [value.signature],
         );
         const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
+        if (value.reasonCode === 'SOLANA_TRANSACTION_FAILED') {
+          if (receipt !== undefined) {
+            throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+          }
+          if (row !== undefined && discoverySources(row.discovery_sources).includes('WEBSOCKET')) {
+            throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+          }
+        }
         if (row === undefined && receipt !== undefined) {
           assertTerminalReceiptAcceptsNotification(receipt, value);
           return createCatchUpClassificationReceipt({
@@ -770,6 +787,88 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           catchUpAdmissionPriority,
         );
       }, signal);
+    });
+  }
+
+  public async readExistingCatchUpCoverage(
+    candidates: readonly CatchUpAdmissionCoverageCandidate[],
+    signal: AbortSignal,
+  ): Promise<readonly CatchUpClassificationReceipt[]> {
+    return this.safely(async () => {
+      signal.throwIfAborted();
+      const snapshot = snapshotCoverageCandidates(candidates);
+      if (snapshot.length === 0) return Object.freeze([]);
+      const selected = await this.pool.query(
+        `WITH candidates AS MATERIALIZED (
+           SELECT candidate.value->>'signature' AS signature,
+             (candidate.value->>'slot')::NUMERIC AS slot,
+             candidate.value->>'confirmationStatus' AS confirmation_status,
+             ARRAY(SELECT jsonb_array_elements_text(candidate.value->'programIds')) AS program_ids,
+             candidate.ordinality
+           FROM jsonb_array_elements($1::JSONB) WITH ORDINALITY AS candidate(value, ordinality)
+         )
+         SELECT candidate.ordinality, candidate.signature AS candidate_signature,
+           candidate.slot AS candidate_slot,
+           candidate.confirmation_status AS candidate_confirmation_status,
+           candidate.program_ids AS candidate_program_ids,
+           inbox.signature AS inbox_signature, inbox.observed_slot AS inbox_observed_slot,
+           inbox.discovery_sources AS inbox_discovery_sources,
+           inbox.program_ids AS inbox_program_ids,
+           inbox.target_confirmation_status AS inbox_confirmation_status,
+           inbox.observed_at AS inbox_observed_at,
+           inbox.finality_evidence_version AS inbox_finality_evidence_version,
+           inbox.immutable_fingerprint AS inbox_immutable_fingerprint,
+           inbox.processed_at AS inbox_processed_at,
+           inbox.catch_up_classification_version, inbox.catch_up_disposition,
+           inbox.catch_up_reason_code, inbox.catch_up_action_key, inbox.catch_up_mints,
+           inbox.catch_up_evidence_fingerprint, inbox.catch_up_classified_at,
+           receipt.signature AS receipt_signature, receipt.observed_slot AS receipt_observed_slot,
+           receipt.confirmation_status AS receipt_confirmation_status,
+           receipt.finality_evidence_version AS receipt_finality_evidence_version,
+           receipt.immutable_fingerprint AS receipt_immutable_fingerprint,
+           receipt.replay_completed_at AS receipt_replay_completed_at
+         FROM candidates AS candidate
+         LEFT JOIN chain_transaction_inbox AS inbox USING (signature)
+         LEFT JOIN chain_transaction_finality_replay_receipts AS receipt USING (signature)
+         ORDER BY candidate.ordinality`,
+        [stringifyJson(snapshot.map((candidate) => ({
+          signature: candidate.signature,
+          slot: candidate.slot.toString(),
+          confirmationStatus: candidate.confirmationStatus,
+          programIds: [...candidate.programIds],
+        })))],
+      );
+      signal.throwIfAborted();
+      if (selected.rowCount !== snapshot.length || selected.rows.length !== snapshot.length) {
+        throw new TypeError('Catch-up coverage query returned an invalid row count.');
+      }
+      const receipts: CatchUpClassificationReceipt[] = [];
+      for (let index = 0; index < snapshot.length; index += 1) {
+        const row = requiredRow(selected.rows[index]);
+        const candidate = snapshot[index];
+        if (candidate === undefined) throw new TypeError('Catch-up coverage candidate is missing.');
+        const ordinality = safeCount(row.ordinality, 'catch-up coverage ordinality');
+        if (ordinality !== index + 1
+          || row.candidate_signature !== candidate.signature
+          || numericBigInt(row.candidate_slot, 'catch-up coverage candidate slot') !== candidate.slot
+          || confirmation(row.candidate_confirmation_status) !== candidate.confirmationStatus
+          || !sameProgramIds(storedProgramIds(row.candidate_program_ids), candidate.programIds)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+        }
+        const covered = assertAndReadCoverage(row, candidate);
+        if (covered) {
+          receipts.push(createCatchUpClassificationReceipt({
+            signature: candidate.signature,
+            slot: candidate.slot,
+            disposition: null,
+            persistence: 'ALREADY_ADMITTED',
+            admission: 'NOT_ENQUEUED',
+            ingestionPriority: null,
+          }));
+        }
+      }
+      signal.throwIfAborted();
+      return Object.freeze(receipts);
     });
   }
 
@@ -2531,6 +2630,229 @@ function matchesCheckpointBoundary(
   return current.key === previous.key
     && current.slot === previous.slot
     && current.signature === previous.signature;
+}
+
+function snapshotCoverageCandidates(
+  value: readonly CatchUpAdmissionCoverageCandidate[],
+): readonly CatchUpAdmissionCoverageCandidate[] {
+  if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError('Catch-up coverage candidates are invalid.');
+  }
+  const length = exactArrayLength(value, 1_000, 'Catch-up coverage candidates');
+  const signatures = new Set<string>();
+  const snapshot: CatchUpAdmissionCoverageCandidate[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const candidate = ownArrayValue(value, index, 'Catch-up coverage candidate');
+    if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)
+      || isProxy(candidate)) throw new TypeError('Catch-up coverage candidate is invalid.');
+    const descriptors = Object.getOwnPropertyDescriptors(candidate);
+    const keys = Object.keys(descriptors).sort();
+    if (keys.length !== 4 || keys[0] !== 'confirmationStatus' || keys[1] !== 'programIds'
+      || keys[2] !== 'signature' || keys[3] !== 'slot'
+      || keys.some((key) => {
+        const descriptor = descriptors[key];
+        return descriptor?.enumerable !== true || !Object.hasOwn(descriptor, 'value');
+      })) {
+      throw new TypeError('Catch-up coverage candidate fields are invalid.');
+    }
+    const signature = descriptorValue(descriptors.signature);
+    const slot = descriptorValue(descriptors.slot);
+    const confirmationStatus = descriptorValue(descriptors.confirmationStatus);
+    const programIdsValue = descriptorValue(descriptors.programIds);
+    if (typeof signature !== 'string' || signature.length === 0 || signature !== signature.trim()
+      || Buffer.byteLength(signature, 'utf8') > 128 || signatures.has(signature)
+      || typeof slot !== 'bigint' || slot < 0n || slot > MAX_STRICT_CATCH_UP_SLOT
+      || (confirmationStatus !== 'processed' && confirmationStatus !== 'confirmed'
+        && confirmationStatus !== 'finalized')
+      || !Array.isArray(programIdsValue) || isProxy(programIdsValue)
+      || Object.getPrototypeOf(programIdsValue) !== Array.prototype) {
+      throw new TypeError('Catch-up coverage candidate identity is invalid.');
+    }
+    const programIdsLength = exactArrayLength(
+      programIdsValue,
+      16,
+      'Catch-up coverage candidate program IDs',
+    );
+    if (programIdsLength === 0) {
+      throw new TypeError('Catch-up coverage candidate program IDs are invalid.');
+    }
+    const programIds: string[] = [];
+    let previous: string | null = null;
+    for (let programIndex = 0; programIndex < programIdsLength; programIndex += 1) {
+      const programId = ownArrayValue(
+        programIdsValue,
+        programIndex,
+        'Catch-up coverage candidate program ID',
+      );
+      if (typeof programId !== 'string' || !isCanonicalSolanaProgramId(programId)
+        || (previous !== null && programId <= previous)) {
+        throw new TypeError('Catch-up coverage candidate program IDs are invalid.');
+      }
+      programIds.push(programId);
+      previous = programId;
+    }
+    signatures.add(signature);
+    snapshot.push(Object.freeze({
+      signature,
+      slot,
+      confirmationStatus,
+      programIds: Object.freeze(programIds),
+    }));
+  }
+  return Object.freeze(snapshot);
+}
+
+function exactArrayLength(value: readonly unknown[], maximum: number, name: string): number {
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  const length: unknown = descriptor !== undefined && 'value' in descriptor
+    ? descriptor.value : undefined;
+  if (!Number.isSafeInteger(length) || (length as number) < 0 || (length as number) > maximum
+    || Reflect.ownKeys(value).length !== (length as number) + 1) {
+    throw new TypeError(`${name} are invalid.`);
+  }
+  return length as number;
+}
+
+function ownArrayValue(value: readonly unknown[], index: number, name: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+  if (descriptor?.enumerable !== true || !Object.hasOwn(descriptor, 'value')) {
+    throw new TypeError(`${name} is invalid.`);
+  }
+  return descriptor.value as unknown;
+}
+
+function descriptorValue(descriptor: PropertyDescriptor | undefined): unknown {
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value as unknown : undefined;
+}
+
+function assertAndReadCoverage(
+  row: QueryResultRow,
+  candidate: CatchUpAdmissionCoverageCandidate,
+): boolean {
+  const hasInbox = row.inbox_signature !== null;
+  const hasReceipt = row.receipt_signature !== null;
+  if (!hasInbox && !hasReceipt) return false;
+
+  let inbox: InboxIdentityRow | undefined;
+  let inboxAdvances = false;
+  if (hasInbox) {
+    if (row.inbox_signature !== candidate.signature
+      || numericBigInt(row.inbox_observed_slot, 'catch-up coverage inbox slot') !== candidate.slot) {
+      throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+    }
+    const sources = discoverySources(row.inbox_discovery_sources);
+    const storedPrograms = storedProgramIds(row.inbox_program_ids);
+    const storedStatus = confirmation(row.inbox_confirmation_status);
+    const hasClassification = validateStoredCoverageClassification(
+      row, sources, candidate, storedPrograms, storedStatus,
+    );
+    if (!sources.includes('WEBSOCKET') && !hasClassification) {
+      throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+    }
+    if (!sameProgramIds(storedPrograms, candidate.programIds)) return false;
+    try {
+      inboxAdvances = reconcileConfirmationStatus(storedStatus, candidate.confirmationStatus) === 'update';
+    } catch {
+      throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+    }
+    inbox = {
+      observed_slot: row.inbox_observed_slot,
+      discovery_sources: row.inbox_discovery_sources,
+      program_ids: row.inbox_program_ids,
+      target_confirmation_status: row.inbox_confirmation_status,
+      finality_evidence_version: row.inbox_finality_evidence_version,
+      immutable_fingerprint: row.inbox_immutable_fingerprint,
+      processed_at: row.inbox_processed_at,
+    } as InboxIdentityRow;
+  }
+
+  if (hasReceipt) {
+    if (row.receipt_signature !== candidate.signature) {
+      throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+    }
+    const receipt = {
+      observed_slot: row.receipt_observed_slot,
+      confirmation_status: row.receipt_confirmation_status,
+      finality_evidence_version: row.receipt_finality_evidence_version,
+      immutable_fingerprint: row.receipt_immutable_fingerprint,
+      replay_completed_at: row.receipt_replay_completed_at,
+    } as TerminalReplayReceiptRow;
+    assertTerminalReceiptAcceptsNotification(receipt, candidate);
+    if (inbox !== undefined) assertTerminalReceiptMatchesInbox(receipt, inbox);
+  }
+  return !inboxAdvances;
+}
+
+function validateStoredCoverageClassification(
+  row: QueryResultRow,
+  sources: readonly TransactionNotification['source'][],
+  candidate: CatchUpAdmissionCoverageCandidate,
+  programIds: readonly string[],
+  confirmationStatus: ChainConfirmationStatus,
+): boolean {
+  const values = [row.catch_up_disposition, row.catch_up_reason_code, row.catch_up_action_key,
+    row.catch_up_mints, row.catch_up_evidence_fingerprint, row.catch_up_classified_at];
+  if (row.catch_up_classification_version === null) {
+    if (values.some((value) => value !== null)) {
+      throw new TypeError('Stored catch-up classification is incomplete.');
+    }
+    return false;
+  }
+  if (!sources.includes('CATCH_UP')) throw new TypeError('Stored catch-up classification is invalid.');
+  const mints = storedCatchUpMints(row.catch_up_mints);
+  const actionKey = requiredTextValue(row.catch_up_action_key, 'catch-up action key');
+  const action = classificationActionFromKey(actionKey);
+  const disposition: unknown = row.catch_up_disposition;
+  const reasonCode: unknown = row.catch_up_reason_code;
+  const classification = createCatchUpClassification({
+    signature: candidate.signature,
+    slot: candidate.slot,
+    programIds,
+    confirmationStatus,
+    observedAtMs: dateMs(row.inbox_observed_at, 'catch-up observed at'),
+    ingestionHint: action.hint,
+    ingestionHintMint: action.mint,
+    classificationVersion: safeCount(
+      row.catch_up_classification_version,
+      'catch-up classification version',
+    ),
+    disposition,
+    reasonCode,
+    mints,
+    evidenceFingerprint: requiredFingerprint(row.catch_up_evidence_fingerprint),
+    classifiedAtMs: dateMs(row.catch_up_classified_at, 'catch-up classified at'),
+  });
+  if (actionKey !== catchUpActionKey(classification)) {
+    throw new TypeError('Stored catch-up action key is invalid.');
+  }
+  if (classification.reasonCode === 'SOLANA_TRANSACTION_FAILED') {
+    throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+  }
+  return true;
+}
+
+function classificationActionFromKey(actionKey: string): Readonly<{
+  hint: CatchUpClassification['ingestionHint'];
+  mint: string | null;
+}> {
+  if (actionKey === 'NONE') return Object.freeze({ hint: null, mint: null });
+  if (actionKey === 'PUMPFUN_CREATE') {
+    return Object.freeze({ hint: 'PUMPFUN_CREATE' as const, mint: null });
+  }
+  const prefix = 'PUMPFUN_TRADE:';
+  if (!actionKey.startsWith(prefix)) throw new TypeError('Stored catch-up action key is invalid.');
+  const mint = actionKey.slice(prefix.length);
+  assertCanonicalMint(mint);
+  return Object.freeze({ hint: 'PUMPFUN_TRADE' as const, mint });
+}
+
+function requiredTextValue(value: unknown, name: string): string {
+  requireText(value, name);
+  return value;
+}
+
+function sameProgramIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 async function resolveStrictCatchUpFailuresAt(

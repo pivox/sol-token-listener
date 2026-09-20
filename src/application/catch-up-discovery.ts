@@ -55,6 +55,9 @@ function reconcileDiscovery(
     && current.blockTimeMs !== incoming.blockTimeMs) {
     throw new CatchUpSourceError('response', program);
   }
+  if (current.transactionFailed !== incoming.transactionFailed) {
+    throw new CatchUpSourceError('response', program);
+  }
   const confirmationStatus = reconcileConfirmationStatus(
     current.confirmationStatus,
     incoming.confirmationStatus,
@@ -64,6 +67,7 @@ function reconcileDiscovery(
     slot: current.slot,
     confirmationStatus,
     blockTimeMs: current.blockTimeMs ?? incoming.blockTimeMs,
+    transactionFailed: current.transactionFailed,
   });
 }
 

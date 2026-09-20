@@ -95,6 +95,7 @@ void test('provider-affine catch-up admission recovers an offline restart gap, o
     assert.ok(created && tracked && untracked && ignored && head);
     const baseline: CatchUpSignature = Object.freeze({
       signature: SHARED_SIGNATURE, slot: 10n, confirmationStatus: 'confirmed', blockTimeMs: null,
+      transactionFailed: false,
     });
     let rows: readonly CatchUpSignature[] = Object.freeze([baseline]);
     let primaryUnavailable = false;
@@ -149,6 +150,7 @@ void test('provider-affine catch-up admission recovers an offline restart gap, o
     admitters.clear();
     rows = Object.freeze([...transactions].reverse().map((transaction): CatchUpSignature => Object.freeze({
       signature: transaction.signature, slot: transaction.slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+      transactionFailed: transaction.error !== null,
     })).concat(baseline));
     await inbox.enqueue(Object.freeze({
       signature: created.signature, slot: 20n, source: 'WEBSOCKET',
@@ -207,6 +209,7 @@ void test('provider-affine catch-up admission recovers an offline restart gap, o
       blocks.set(21n, admissionFixtureBlock([fallbackCreate]));
       rows = Object.freeze([Object.freeze({
         signature: fallbackCreate.signature, slot: 21n, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       }), ...rows]);
       primaryUnavailable = true;
       scheduler.fire(30_000);
@@ -724,7 +727,10 @@ void test('restarts a paused fallback run, then bridges its frozen H1 to H2 befo
           : before === SHARED_SIGNATURE
             ? [[STRICT_WINDOW_HEAD_SIGNATURE, 43n], [STRICT_WINDOW_LAUNCHPAD_SIGNATURE, 42n]]
             : [[MULTI_PAGE_BOUNDARY_SIGNATURE, 41n]];
-        return rows.map(([signature, slot]) => Object.freeze({ signature, slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null }));
+        return rows.map(([signature, slot]) => Object.freeze({
+          signature, slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+          transactionFailed: false,
+        }));
       },
     }, inbox, {
       pageSize: 2, maxPages: 1, now: () => 10_000,
@@ -791,7 +797,7 @@ void test('active market completes before failed launchpad and releases the prov
       Object.freeze({ key: 'market', family: 'pumpswap', id: PUMPSWAP_PROGRAM_ID } as const),
     ]);
     const row = (signature: string, slot: bigint): CatchUpSignature => Object.freeze({
-      signature, slot, confirmationStatus: 'confirmed', blockTimeMs: null,
+      signature, slot, confirmationStatus: 'confirmed', blockTimeMs: null, transactionFailed: false,
     });
     for (const program of programs) {
       const previous = Object.freeze({
@@ -1045,7 +1051,10 @@ class AbortBoundarySource implements CatchUpSource {
     this.listCalls += 1;
     if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
     const page = before === undefined
-      ? [Object.freeze({ signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const, blockTimeMs: null })]
+      ? [Object.freeze({
+        signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const,
+        blockTimeMs: null, transactionFailed: false,
+      })]
       : [];
     if (this.boundary === 'page' && !this.#held) {
       this.#held = true;
@@ -1278,7 +1287,10 @@ function strictScanner(providerId: RpcProviderId, inbox: StrictCatchUpRepository
     async list(programId: string, before: string | undefined) {
       if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
       if (before !== undefined) return [];
-      return [Object.freeze({ signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const, blockTimeMs: null })];
+      return [Object.freeze({
+        signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const,
+        blockTimeMs: null, transactionFailed: false,
+      })];
     },
   });
   return new StrictCatchUpScanner(source, inbox, { pageSize: 10, maxPages: 2, now: () => 10_000 });
@@ -1312,6 +1324,7 @@ function strictWindowScanner(
         slot: STRICT_WINDOW_HEAD_SLOT,
         confirmationStatus: 'confirmed' as const,
         blockTimeMs: null,
+        transactionFailed: false,
       })];
     },
   });
@@ -1328,13 +1341,16 @@ function multiPageStrictScanner(
       if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
       if (before === undefined) return [Object.freeze({
         signature: MULTI_PAGE_SIGNATURE, slot: 43n, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       })];
       if (before === MULTI_PAGE_SIGNATURE) return [Object.freeze({
         signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       })];
       if (before === SHARED_SIGNATURE) return [Object.freeze({
         signature: MULTI_PAGE_BOUNDARY_SIGNATURE, slot: 41n,
         confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       })];
       return [];
     },

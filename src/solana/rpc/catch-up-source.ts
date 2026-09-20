@@ -12,6 +12,7 @@ export interface CatchUpSignature {
   readonly slot: bigint;
   readonly confirmationStatus: CatchUpConfirmationStatus;
   readonly blockTimeMs: number | null;
+  readonly transactionFailed: boolean;
 }
 
 export interface SignaturesForAddressRpc {
@@ -126,6 +127,7 @@ function snapshotRow(value: unknown): CatchUpSignature {
   const slot = dataProperty(value, 'slot');
   const confirmationStatus = dataProperty(value, 'confirmationStatus');
   const blockTime = dataProperty(value, 'blockTime');
+  const transactionError = dataProperty(value, 'err');
   if (!validSignature(signature)) {
     throw new CatchUpSourceError('response');
   }
@@ -133,13 +135,24 @@ function snapshotRow(value: unknown): CatchUpSignature {
     throw new CatchUpSourceError('response');
   }
   if (!isConfirmationStatus(confirmationStatus)) throw new CatchUpSourceError('response');
+  if (!validTransactionError(transactionError)) throw new CatchUpSourceError('response');
   const blockTimeMs = milliseconds(blockTime);
   return Object.freeze({
     signature,
     slot: BigInt(slot),
     confirmationStatus,
     blockTimeMs,
+    transactionFailed: transactionError !== null,
   });
+}
+
+function validTransactionError(value: unknown): boolean {
+  if (value === null) return true;
+  if (typeof value === 'string') {
+    return value.length > 0 && value.length <= 16_384
+      && Buffer.byteLength(value, 'utf8') <= 16_384;
+  }
+  return typeof value === 'object' && !Array.isArray(value);
 }
 
 function snapshotTrustedRow(value: unknown): CatchUpSignature {
@@ -150,6 +163,7 @@ function snapshotTrustedRow(value: unknown): CatchUpSignature {
   const slot = dataProperty(value, 'slot');
   const confirmationStatus = dataProperty(value, 'confirmationStatus');
   const blockTimeMs = dataProperty(value, 'blockTimeMs');
+  const transactionFailed = dataProperty(value, 'transactionFailed');
   if (!validSignature(signature)) {
     throw new CatchUpSourceError('response');
   }
@@ -161,7 +175,8 @@ function snapshotTrustedRow(value: unknown): CatchUpSignature {
     || blockTimeMs < 0
     || Object.is(blockTimeMs, -0)
   )) throw new CatchUpSourceError('response');
-  return Object.freeze({ signature, slot, confirmationStatus, blockTimeMs });
+  if (typeof transactionFailed !== 'boolean') throw new CatchUpSourceError('response');
+  return Object.freeze({ signature, slot, confirmationStatus, blockTimeMs, transactionFailed });
 }
 
 function dataProperty(value: object, key: string): unknown {
