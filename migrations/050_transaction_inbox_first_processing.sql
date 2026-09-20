@@ -45,13 +45,19 @@ BEGIN
           'chain_transaction_inbox_first_processing_cohort_idx',current_schema()))
     OR NOT EXISTS (SELECT 1 FROM pg_proc routine
       WHERE routine.proname='transaction_inbox_first_processing_guard'
+        AND routine.pronamespace=current_schema()::REGNAMESPACE
+        AND routine.pronargs=0 AND routine.prorettype='trigger'::REGTYPE
         AND md5(routine.prosrc)='e6f6758351b3701892f22e3fe6fb8373')
-    OR NOT EXISTS (SELECT 1 FROM pg_trigger trigger_row
+    OR NOT EXISTS (SELECT 1 FROM pg_trigger trigger_row JOIN pg_proc routine
+      ON routine.oid=trigger_row.tgfoid
       WHERE trigger_row.tgrelid='chain_transaction_inbox'::REGCLASS
         AND trigger_row.tgname='chain_transaction_inbox_first_processing_guard'
-        AND trigger_row.tgfoid IN (SELECT oid FROM pg_proc
-          WHERE proname='transaction_inbox_first_processing_guard')
-        AND trigger_row.tgtype=19)
+        AND trigger_row.tgtype=19 AND trigger_row.tgenabled='O'
+        AND trigger_row.tgattr=''::INT2VECTOR AND trigger_row.tgqual IS NULL
+        AND routine.proname='transaction_inbox_first_processing_guard'
+        AND routine.pronamespace=current_schema()::REGNAMESPACE
+        AND routine.pronargs=0 AND routine.prorettype='trigger'::REGTYPE
+        AND md5(routine.prosrc)='e6f6758351b3701892f22e3fe6fb8373')
   ) THEN
     RAISE EXCEPTION 'first processing evidence definition is incompatible' USING ERRCODE='23514';
   END IF;
@@ -171,13 +177,19 @@ BEGIN
           'chain_transaction_inbox_first_processing_cohort_idx',current_schema()))
     OR NOT EXISTS (SELECT 1 FROM pg_proc routine
       WHERE routine.proname='transaction_inbox_first_processing_guard'
+        AND routine.pronamespace=current_schema()::REGNAMESPACE
+        AND routine.pronargs=0 AND routine.prorettype='trigger'::REGTYPE
         AND md5(routine.prosrc)='e6f6758351b3701892f22e3fe6fb8373')
-    OR NOT EXISTS (SELECT 1 FROM pg_trigger trigger_row
+    OR NOT EXISTS (SELECT 1 FROM pg_trigger trigger_row JOIN pg_proc routine
+      ON routine.oid=trigger_row.tgfoid
       WHERE trigger_row.tgrelid='chain_transaction_inbox'::REGCLASS
         AND trigger_row.tgname='chain_transaction_inbox_first_processing_guard'
-        AND trigger_row.tgfoid IN (SELECT oid FROM pg_proc
-          WHERE proname='transaction_inbox_first_processing_guard')
-        AND trigger_row.tgtype=19) THEN
+        AND trigger_row.tgtype=19 AND trigger_row.tgenabled='O'
+        AND trigger_row.tgattr=''::INT2VECTOR AND trigger_row.tgqual IS NULL
+        AND routine.proname='transaction_inbox_first_processing_guard'
+        AND routine.pronamespace=current_schema()::REGNAMESPACE
+        AND routine.pronargs=0 AND routine.prorettype='trigger'::REGTYPE
+        AND md5(routine.prosrc)='e6f6758351b3701892f22e3fe6fb8373') THEN
     RAISE EXCEPTION 'first processing evidence definition is incompatible' USING ERRCODE='23514';
   END IF;
 END;

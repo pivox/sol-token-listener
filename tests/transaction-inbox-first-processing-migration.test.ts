@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
+import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
 
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const migrationUrl = new URL('../migrations/050_transaction_inbox_first_processing.sql', import.meta.url);
@@ -52,6 +53,19 @@ void test('migration 050 classifies all legacy inbox rows unavailable without in
       { signature: 'legacy-reopened', first_detected_at: null, first_processed_at: null,
         first_processing_evidence_unavailable: true },
     ]);
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const signature of ['legacy-processed', 'legacy-reopened']) {
+      await repository.enqueue(Object.freeze({
+        signature, slot: signature === 'legacy-processed' ? 1n : 2n,
+        source: 'WEBSOCKET' as const,
+        programIds: Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+        confirmationStatus: 'confirmed' as const, observedAtMs: 1_000,
+        ingestionHint: null, ingestionHintMint: null,
+      }));
+    }
+    assert.deepEqual((await pool.query(`SELECT signature, first_detected_at, first_processed_at,
+      first_processing_evidence_unavailable FROM chain_transaction_inbox
+      WHERE signature IN ('legacy-processed','legacy-reopened') ORDER BY signature`)).rows, legacy.rows);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, observed_at
@@ -107,6 +121,56 @@ void test('migration 050 classifies all legacy inbox rows unavailable without in
     await admin.end();
   }
 });
+
+void test('migration 050 fails closed when its immutable evidence trigger is disabled', async (context) => {
+  await withMigration050Database(context, async (pool) => {
+    await pool.query('ALTER TABLE chain_transaction_inbox DISABLE TRIGGER chain_transaction_inbox_first_processing_guard');
+    await assert.rejects(pool.query(await readFile(migrationUrl, 'utf8')), { code: '23514' });
+  });
+});
+
+void test('migration 050 fails closed when its trigger has UPDATE OF or WHEN restrictions', async (context) => {
+  await withMigration050Database(context, async (pool) => {
+    await pool.query('DROP TRIGGER chain_transaction_inbox_first_processing_guard ON chain_transaction_inbox');
+    await pool.query(`CREATE TRIGGER chain_transaction_inbox_first_processing_guard
+      BEFORE UPDATE OF processed_at ON chain_transaction_inbox
+      FOR EACH ROW WHEN (NEW.first_processed_at IS NULL)
+      EXECUTE FUNCTION transaction_inbox_first_processing_guard()`);
+    await assert.rejects(pool.query(await readFile(migrationUrl, 'utf8')), { code: '23514' });
+  });
+});
+
+void test('migration 050 fails closed on an incompatible installed evidence column', async (context) => {
+  await withMigration050Database(context, async (pool) => {
+    await pool.query('ALTER TABLE chain_transaction_inbox ALTER COLUMN first_processed_at SET DEFAULT clock_timestamp()');
+    await assert.rejects(pool.query(await readFile(migrationUrl, 'utf8')), { code: '23514' });
+  });
+});
+
+async function withMigration050Database(
+  context: { skip(message?: string): void },
+  run: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+): Promise<void> {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL first-processing migration test skipped');
+    return;
+  }
+  const schema = `first_processing_guard_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    for (const name of (await readdir(migrationsUrl)).sort()) {
+      await pool.query(await readFile(new URL(name, migrationsUrl), 'utf8'));
+    }
+    await run(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+}
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;

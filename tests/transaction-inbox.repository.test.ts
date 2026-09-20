@@ -50,12 +50,80 @@ import {
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
-void test('markProcessed records the immutable first completion from the PostgreSQL clock', async () => {
-  const source = await readFile(new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url), 'utf8');
-  const markProcessed = source.slice(source.indexOf('public async markProcessed('), source.indexOf('public async markFailed('));
-  assert.match(markProcessed, /date_trunc\('milliseconds', clock_timestamp\(\)\) AS completed_at/u);
-  assert.match(markProcessed, /first_processed_at\s*=\s*CASE[\s\S]*?first_processing_evidence_unavailable[\s\S]*?COALESCE\(first_processed_at, completed\.completed_at\)/u);
-  assert.match(markProcessed, /processed_at\s*=\s*completed\.completed_at/u);
+void test('first processing time survives lease loss, finality replay, orphaning, and exhausted recovery', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 1, baseDelayMs: 500,
+    }));
+    const signature = 'first-processing-finality';
+    await repository.enqueue(notification(signature, 801n, 'WEBSOCKET', 'confirmed'));
+    const initial = await repository.claim(Date.now(), 30);
+    assert.ok(initial);
+    await assert.rejects(repository.markProcessed(signature, 'lost-lease', 'confirmed'), TransactionInboxLeaseError);
+    assert.equal((await row(pool, signature)).first_processed_at, null);
+    await repository.saveSnapshot(signature, initial.leaseToken, normalized(signature, 801n));
+    await repository.markProcessed(signature, initial.leaseToken, 'confirmed');
+    const firstCompleted = new Date((await row(pool, signature)).first_processed_at).getTime();
+    const completed = new Date((await row(pool, signature)).processed_at).getTime();
+    assert.equal(firstCompleted, completed);
+    assert.equal(Number.isSafeInteger(firstCompleted), true);
+
+    await repository.enqueueRevision(Object.freeze({
+      signature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 1,
+    }));
+    const finalityReplay = await repository.claim(Date.now() + 2, 30);
+    assert.ok(finalityReplay);
+    await repository.markProcessed(signature, finalityReplay.leaseToken, 'finalized');
+    assert.equal(new Date((await row(pool, signature)).first_processed_at).getTime(), firstCompleted);
+
+    const orphanSignature = 'first-processing-orphan';
+    await repository.enqueue(notification(orphanSignature, 803n, 'WEBSOCKET', 'confirmed'));
+    const orphanInitial = await repository.claim(Date.now() + 3, 30);
+    assert.ok(orphanInitial);
+    await repository.saveSnapshot(orphanSignature, orphanInitial.leaseToken, normalized(orphanSignature, 803n));
+    await repository.markProcessed(orphanSignature, orphanInitial.leaseToken, 'confirmed');
+    const orphanFirstCompleted = new Date((await row(pool, orphanSignature)).first_processed_at).getTime();
+    const orphanProof = await repository.recordFinalityPoll(Object.freeze({
+      signature: orphanSignature, confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 0n, observedAtMs: Date.now() + 4,
+    }));
+    if (orphanProof.lastMissingFinalityProviderId === null) throw new Error('Expected orphan proof provider.');
+    await repository.enqueueRevision(Object.freeze({
+      signature: orphanSignature, confirmationStatus: 'orphaned' as const,
+      expectedConfirmationStatus: orphanProof.confirmationStatus,
+      expectedMissingFinalityPolls: orphanProof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: orphanProof.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: orphanProof.finalityEvidenceVersion,
+      observedAtMs: Date.now() + 5,
+    }));
+    assert.equal(new Date((await row(pool, orphanSignature)).first_processed_at).getTime(), orphanFirstCompleted);
+    const orphanReplay = await repository.claim(Date.now() + 6, 30);
+    assert.ok(orphanReplay);
+    await repository.markProcessed(orphanSignature, orphanReplay.leaseToken, 'orphaned');
+    assert.equal(new Date((await row(pool, orphanSignature)).first_processed_at).getTime(), orphanFirstCompleted);
+
+    const recoverySignature = 'first-processing-recovery';
+    await repository.enqueue(notification(recoverySignature, 802n, 'WEBSOCKET', 'confirmed'));
+    const recoveryInitial = await repository.claim(Date.now() + 3, 30);
+    assert.ok(recoveryInitial);
+    await repository.saveSnapshot(recoverySignature, recoveryInitial.leaseToken, normalized(recoverySignature, 802n));
+    await repository.markProcessed(recoverySignature, recoveryInitial.leaseToken, 'confirmed');
+    const recoveryFirstCompleted = new Date((await row(pool, recoverySignature)).first_processed_at).getTime();
+    await repository.enqueueRevision(Object.freeze({
+      signature: recoverySignature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 4,
+    }));
+    const failedReplay = await repository.claim(Date.now() + 5, 30);
+    assert.ok(failedReplay);
+    await repository.markFailed(recoverySignature, failedReplay.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    assert.deepEqual(await repository.recoverExhausted(recoverySignature), {
+      code: 'RECOVERY_SCHEDULED', signature: recoverySignature,
+    });
+    assert.equal((await row(pool, recoverySignature)).processed_at, null);
+    assert.equal(new Date((await row(pool, recoverySignature)).first_processed_at).getTime(), recoveryFirstCompleted);
+  });
 });
 
 void test('RPC HTTP heartbeat persistence serializes only detached fixed evidence fields', async () => {
