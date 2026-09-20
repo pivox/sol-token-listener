@@ -21,6 +21,14 @@ void test('migration 050 defines durable database-clock first-processing evidenc
   ]) assert.ok(sql.includes(fragment), `missing migration fragment: ${fragment}`);
 });
 
+void test('migration 050 canonicalizes definition rendering transaction-locally', async () => {
+  const sql = await readFile(migrationUrl, 'utf8');
+  assert.match(sql, /set_config\('TimeZone','UTC',true\)/u);
+  assert.match(sql, /set_config\('DateStyle','ISO, YMD',true\)/u);
+  assert.match(sql, /md5\(pg_get_constraintdef\(constraint_row\.oid\)\)='95c31f205c07bc3759fae65d280159b8'/u);
+  assert.doesNotMatch(sql, /constraint_row\.conbin/u);
+});
+
 void test('migration 050 classifies all legacy inbox rows unavailable without inventing evidence', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -167,7 +175,11 @@ void test('migration 050 installs and replays independently of PostgreSQL TimeZo
     ['Europe/Paris', 'SQL, DMY'],
   ] as const) {
     await withMigration050Database(context, async (pool) => {
+      const before = (await pool.query(`SELECT current_setting('TimeZone') AS timezone,
+        current_setting('DateStyle') AS datestyle`)).rows;
       await pool.query(await readFile(migrationUrl, 'utf8'));
+      assert.deepEqual((await pool.query(`SELECT current_setting('TimeZone') AS timezone,
+        current_setting('DateStyle') AS datestyle`)).rows, before);
     }, timeZone, dateStyle);
   }
 });

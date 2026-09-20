@@ -3,6 +3,8 @@
 DO $migration_050_preflight$
 DECLARE evidence_columns INTEGER;
 BEGIN
+  PERFORM set_config('TimeZone','UTC',true);
+  PERFORM set_config('DateStyle','ISO, YMD',true);
   LOCK TABLE chain_transaction_inbox IN ACCESS EXCLUSIVE MODE;
   SELECT COUNT(*) INTO evidence_columns FROM pg_attribute
   WHERE attrelid='chain_transaction_inbox'::REGCLASS AND attnum>0 AND NOT attisdropped
@@ -36,7 +38,7 @@ BEGIN
   IF evidence_columns=3 AND (
     NOT EXISTS (SELECT 1 FROM pg_constraint constraint_row WHERE conrelid='chain_transaction_inbox'::REGCLASS
       AND conname='chain_transaction_inbox_first_processing_evidence_check' AND convalidated
-      AND md5(constraint_row.conbin::TEXT)='9a924cb6fcc7c1b9d5801c5a07dac32f')
+      AND md5(pg_get_constraintdef(constraint_row.oid))='95c31f205c07bc3759fae65d280159b8')
     OR NOT EXISTS (SELECT 1 FROM pg_class index_class
       WHERE index_class.relname='chain_transaction_inbox_first_processing_cohort_idx'
         AND index_class.relnamespace=current_schema()::REGNAMESPACE
@@ -159,6 +161,8 @@ $migration_050_install_trigger$;
 DO $migration_050_verify$
 DECLARE first_detected_default TEXT;
 BEGIN
+  PERFORM set_config('TimeZone','UTC',true);
+  PERFORM set_config('DateStyle','ISO, YMD',true);
   SELECT pg_get_expr(default_value.adbin,default_value.adrelid) INTO first_detected_default
   FROM pg_attribute attribute JOIN pg_attrdef default_value ON default_value.adrelid=attribute.attrelid
     AND default_value.adnum=attribute.attnum
@@ -168,7 +172,7 @@ BEGIN
       WHERE constraint_row.conrelid='chain_transaction_inbox'::REGCLASS
         AND constraint_row.conname='chain_transaction_inbox_first_processing_evidence_check'
         AND constraint_row.convalidated
-        AND md5(constraint_row.conbin::TEXT)='9a924cb6fcc7c1b9d5801c5a07dac32f')
+        AND md5(pg_get_constraintdef(constraint_row.oid))='95c31f205c07bc3759fae65d280159b8')
     OR NOT EXISTS (SELECT 1 FROM pg_class index_class
       WHERE index_class.relname='chain_transaction_inbox_first_processing_cohort_idx'
         AND index_class.relnamespace=current_schema()::REGNAMESPACE
