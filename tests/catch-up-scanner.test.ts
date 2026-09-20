@@ -381,6 +381,14 @@ void test('rejects malformed, accessor-backed, unsafe, and over-limit RPC respon
     [rpcSig('x', 1, 'mystery')],
     [rpcSig('x', 1, 'processed')],
     [{ signature: 'x', slot: 1, memo: null, blockTime: 1, confirmationStatus: 'confirmed' }],
+    [{ ...rpcSig('x', 1), err: undefined }],
+    [rpcSig('x', 1, 'confirmed', 1, false)],
+    [rpcSig('x', 1, 'confirmed', 1, 1)],
+    [rpcSig('x', 1, 'confirmed', 1, 1n)],
+    [rpcSig('x', 1, 'confirmed', 1, Symbol('invalid'))],
+    [rpcSig('x', 1, 'confirmed', 1, () => undefined)],
+    [rpcSig('x', 1, 'confirmed', 1, [])],
+    [rpcSig('x', 1, 'confirmed', 1, '')],
     [rpcSig('x', 1), rpcSig('y', 2)],
   ];
   const accessor: Record<string, unknown> = rpcSig('x', 1);

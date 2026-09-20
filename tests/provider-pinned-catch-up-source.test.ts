@@ -676,11 +676,16 @@ function genesis(byte: number): string {
 }
 
 function signature(value: string) {
-  return Object.freeze({ signature: value, slot: 1n, confirmationStatus: 'confirmed' as const, blockTimeMs: 1_000 });
+  return Object.freeze({
+    signature: value, slot: 1n, confirmationStatus: 'confirmed' as const,
+    blockTimeMs: 1_000, transactionFailed: false,
+  });
 }
 
 function page(value: string) {
-  return Object.freeze([{ signature: value, slot: 1, confirmationStatus: 'confirmed', blockTime: 1 }]);
+  return Object.freeze([{
+    signature: value, slot: 1, err: null, confirmationStatus: 'confirmed', blockTime: 1,
+  }]);
 }
 
 class FakeRpc {

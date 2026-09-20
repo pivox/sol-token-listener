@@ -1284,7 +1284,10 @@ function strictScanner(providerId: RpcProviderId, inbox: StrictCatchUpRepository
     async list(programId: string, before: string | undefined) {
       if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
       if (before !== undefined) return [];
-      return [Object.freeze({ signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const, blockTimeMs: null })];
+      return [Object.freeze({
+        signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const,
+        blockTimeMs: null, transactionFailed: false,
+      })];
     },
   });
   return new StrictCatchUpScanner(source, inbox, { pageSize: 10, maxPages: 2, now: () => 10_000 });
@@ -1334,13 +1337,16 @@ function multiPageStrictScanner(
       if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
       if (before === undefined) return [Object.freeze({
         signature: MULTI_PAGE_SIGNATURE, slot: 43n, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       })];
       if (before === MULTI_PAGE_SIGNATURE) return [Object.freeze({
         signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       })];
       if (before === SHARED_SIGNATURE) return [Object.freeze({
         signature: MULTI_PAGE_BOUNDARY_SIGNATURE, slot: 41n,
         confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+        transactionFailed: false,
       })];
       return [];
     },

@@ -135,6 +135,7 @@ function snapshotRow(value: unknown): CatchUpSignature {
     throw new CatchUpSourceError('response');
   }
   if (!isConfirmationStatus(confirmationStatus)) throw new CatchUpSourceError('response');
+  if (!validTransactionError(transactionError)) throw new CatchUpSourceError('response');
   const blockTimeMs = milliseconds(blockTime);
   return Object.freeze({
     signature,
@@ -143,6 +144,14 @@ function snapshotRow(value: unknown): CatchUpSignature {
     blockTimeMs,
     transactionFailed: transactionError !== null,
   });
+}
+
+function validTransactionError(value: unknown): boolean {
+  if (value === null) return true;
+  if (typeof value === 'string') {
+    return value.length > 0 && Buffer.byteLength(value, 'utf8') <= 16_384;
+  }
+  return typeof value === 'object' && !Array.isArray(value);
 }
 
 function snapshotTrustedRow(value: unknown): CatchUpSignature {
