@@ -727,7 +727,10 @@ void test('restarts a paused fallback run, then bridges its frozen H1 to H2 befo
           : before === SHARED_SIGNATURE
             ? [[STRICT_WINDOW_HEAD_SIGNATURE, 43n], [STRICT_WINDOW_LAUNCHPAD_SIGNATURE, 42n]]
             : [[MULTI_PAGE_BOUNDARY_SIGNATURE, 41n]];
-        return rows.map(([signature, slot]) => Object.freeze({ signature, slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null }));
+        return rows.map(([signature, slot]) => Object.freeze({
+          signature, slot, confirmationStatus: 'confirmed' as const, blockTimeMs: null,
+          transactionFailed: false,
+        }));
       },
     }, inbox, {
       pageSize: 2, maxPages: 1, now: () => 10_000,
@@ -1321,6 +1324,7 @@ function strictWindowScanner(
         slot: STRICT_WINDOW_HEAD_SLOT,
         confirmationStatus: 'confirmed' as const,
         blockTimeMs: null,
+        transactionFailed: false,
       })];
     },
   });
