@@ -3,6 +3,13 @@ import { isProxy } from 'node:util/types';
 import type { QueryResultRow } from 'pg';
 import { createRuntimeRpcHttpEvidence } from '../domain/rpc-http-evidence.js';
 import {
+  createFirstProcessingCanaryEvidence,
+  FIRST_PROCESSING_COHORT_CAPACITY,
+  FIRST_PROCESSING_COHORT_DURATION_MS,
+  FIRST_PROCESSING_THRESHOLD_MS,
+  type RuntimeFirstProcessingCanaryEvidenceV1,
+} from '../domain/first-processing-canary.js';
+import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
 import {
@@ -98,6 +105,23 @@ interface InboxIdentityRow extends QueryResultRow {
   readonly catch_up_admission_priority: unknown;
 }
 
+interface FirstProcessingCanaryRow extends QueryResultRow {
+  readonly cohort_started_at_ms: unknown;
+  readonly cohort_ends_at_ms: unknown;
+  readonly sampled_at_ms: unknown;
+  readonly overflowed: unknown;
+  readonly eligible_count: unknown;
+  readonly completed_count: unknown;
+  readonly under_threshold_count: unknown;
+  readonly at_or_above_threshold_count: unknown;
+  readonly right_censored_count: unknown;
+  readonly tail_censored_count: unknown;
+  readonly terminal_count: unknown;
+  readonly unavailable_count: unknown;
+  readonly invalid_duration_count: unknown;
+  readonly p95_ms: unknown;
+}
+
 interface TerminalReplayReceiptRow extends QueryResultRow {
   readonly observed_slot: unknown;
   readonly confirmation_status: unknown;
@@ -188,6 +212,144 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     retryPolicy: TransactionInboxRetryPolicy = DEFAULT_RETRY_POLICY,
   ) {
     this.retryPolicy = snapshotRetryPolicy(retryPolicy);
+  }
+
+  public async beginFirstProcessingCanary(): Promise<number> {
+    return this.safely(async () => {
+      const result = await this.pool.query(
+        `SELECT (EXTRACT(EPOCH FROM date_trunc('milliseconds', clock_timestamp())) * 1000)::BIGINT
+          AS cohort_started_at_ms`,
+      );
+      return safeCount(requiredRow(result.rows[0]).cohort_started_at_ms, 'first processing cohort start');
+    });
+  }
+
+  public async firstProcessingCanary(
+    cohortStartedAtMs: number,
+  ): Promise<RuntimeFirstProcessingCanaryEvidenceV1> {
+    return this.safely(async () => {
+      dateFromMs(cohortStartedAtMs);
+      if (Object.is(cohortStartedAtMs, -0)) {
+        throw new TypeError('First processing cohort start is invalid.');
+      }
+      const cohortEndsAtMs = cohortStartedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS;
+      if (!Number.isSafeInteger(cohortEndsAtMs)) {
+        throw new TypeError('First processing cohort end is invalid.');
+      }
+      const result = await this.pool.query(
+        `WITH sampled AS MATERIALIZED (
+           SELECT date_trunc('milliseconds', clock_timestamp()) AS sampled_at
+         ), ordered AS MATERIALIZED (
+           SELECT inbox.first_detected_at, inbox.first_processed_at,
+             inbox.first_processing_evidence_unavailable, inbox.terminal_at,
+             inbox.processing_status, inbox.error_retryable, inbox.retry_exhausted_at,
+             sampled.sampled_at,
+             ROW_NUMBER() OVER (ORDER BY inbox.first_detected_at, inbox.signature) AS ordinal
+           FROM chain_transaction_inbox AS inbox
+           CROSS JOIN sampled
+           WHERE inbox.first_detected_at >= to_timestamp($1 / 1000.0)
+             AND inbox.first_detected_at < LEAST(sampled.sampled_at, to_timestamp($2 / 1000.0))
+           ORDER BY inbox.first_detected_at, inbox.signature
+           LIMIT $3
+         ), classified AS MATERIALIZED (
+           SELECT ordinal, CASE
+             WHEN first_processed_at IS NOT NULL AND (
+               EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000 < 0
+               OR EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000
+                 <> TRUNC(EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000)
+             ) THEN 'invalid'
+             WHEN first_processed_at IS NOT NULL THEN 'completed'
+             WHEN first_processing_evidence_unavailable THEN 'unavailable'
+             WHEN terminal_at IS NOT NULL OR processing_status IN ('IGNORED', 'QUARANTINED', 'DEFERRED')
+               OR (processing_status='FAILED'
+                 AND (error_retryable=FALSE OR retry_exhausted_at IS NOT NULL)) THEN 'terminal'
+             WHEN sampled_at - first_detected_at < ($4::BIGINT * INTERVAL '1 millisecond') THEN 'right'
+             ELSE 'tail'
+           END AS category,
+           CASE WHEN first_processed_at IS NOT NULL
+             AND EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000 >= 0
+             AND EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000
+               = TRUNC(EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000)
+             THEN (EXTRACT(EPOCH FROM first_processed_at - first_detected_at) * 1000)::BIGINT
+             ELSE NULL END AS duration_ms
+           FROM ordered
+         ), bounded AS MATERIALIZED (
+           SELECT * FROM classified WHERE ordinal <= $5
+         ), aggregate AS (
+           SELECT
+             EXISTS (SELECT 1 FROM classified WHERE ordinal > $5) AS overflowed,
+             COUNT(*) FILTER (WHERE category='completed') AS completed_count,
+             COUNT(*) FILTER (WHERE category='completed' AND duration_ms < $4) AS under_threshold_count,
+             COUNT(*) FILTER (WHERE category='completed' AND duration_ms >= $4) AS at_or_above_threshold_count,
+             COUNT(*) FILTER (WHERE category='right') AS right_censored_count,
+             COUNT(*) FILTER (WHERE category='tail') AS tail_censored_count,
+             COUNT(*) FILTER (WHERE category='terminal') AS terminal_count,
+             COUNT(*) FILTER (WHERE category='unavailable') AS unavailable_count,
+             COUNT(*) FILTER (WHERE category='invalid') AS invalid_duration_count,
+             percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_ms)
+               FILTER (WHERE category='completed') AS p95_ms
+           FROM bounded
+         )
+         SELECT $1::BIGINT AS cohort_started_at_ms, $2::BIGINT AS cohort_ends_at_ms,
+           (EXTRACT(EPOCH FROM sampled.sampled_at) * 1000)::BIGINT AS sampled_at_ms,
+           aggregate.overflowed,
+           (aggregate.completed_count + aggregate.right_censored_count + aggregate.tail_censored_count
+             + aggregate.terminal_count + aggregate.unavailable_count
+             + aggregate.invalid_duration_count) AS eligible_count,
+           aggregate.completed_count, aggregate.under_threshold_count,
+           aggregate.at_or_above_threshold_count, aggregate.right_censored_count,
+           aggregate.tail_censored_count, aggregate.terminal_count, aggregate.unavailable_count,
+           aggregate.invalid_duration_count, aggregate.p95_ms
+         FROM sampled CROSS JOIN aggregate`,
+        [cohortStartedAtMs, cohortEndsAtMs, FIRST_PROCESSING_COHORT_CAPACITY + 1,
+          FIRST_PROCESSING_THRESHOLD_MS, FIRST_PROCESSING_COHORT_CAPACITY],
+      );
+      const row = requiredRow(result.rows[0]) as FirstProcessingCanaryRow;
+      if (typeof row.overflowed !== 'boolean') {
+        throw new TypeError('Stored first processing overflow state is invalid.');
+      }
+      const completedCount = safeCount(row.completed_count, 'first processing completed count');
+      const rightCensoredCount = safeCount(row.right_censored_count, 'first processing right censored count');
+      const tailCensoredCount = safeCount(row.tail_censored_count, 'first processing tail censored count');
+      const eligibleCount = safeCount(row.eligible_count, 'first processing eligible count');
+      const terminalCount = safeCount(row.terminal_count, 'first processing terminal count');
+      const unavailableCount = safeCount(row.unavailable_count, 'first processing unavailable count');
+      const invalidDurationCount = safeCount(row.invalid_duration_count,
+        'first processing invalid duration count');
+      const p95Ms = row.p95_ms === null ? null : safeCount(row.p95_ms, 'first processing p95');
+      const sampledAtMs = safeCount(row.sampled_at_ms, 'first processing sample time');
+      const cohortEndsAtResultMs = safeCount(row.cohort_ends_at_ms, 'first processing cohort end');
+      const verdict = invalidDurationCount > 0
+        || (p95Ms !== null && p95Ms >= FIRST_PROCESSING_THRESHOLD_MS)
+        ? 'FAIL'
+        : sampledAtMs < cohortEndsAtResultMs + FIRST_PROCESSING_THRESHOLD_MS
+          || eligibleCount === 0 || row.overflowed || rightCensoredCount + tailCensoredCount > 0
+          || terminalCount > 0 || unavailableCount > 0
+          ? 'INCONCLUSIVE'
+          : 'PASS';
+      return createFirstProcessingCanaryEvidence({
+        version: 1,
+        thresholdMs: FIRST_PROCESSING_THRESHOLD_MS,
+        cohortCapacity: FIRST_PROCESSING_COHORT_CAPACITY,
+        cohortStartedAtMs: safeCount(row.cohort_started_at_ms, 'first processing cohort start'),
+        cohortEndsAtMs: safeCount(row.cohort_ends_at_ms, 'first processing cohort end'),
+        sampledAtMs,
+        overflowed: row.overflowed,
+        eligibleCount,
+        completedCount,
+        underThresholdCount: safeCount(row.under_threshold_count, 'first processing under threshold count'),
+        atOrAboveThresholdCount: safeCount(row.at_or_above_threshold_count,
+          'first processing at or above threshold count'),
+        pendingCount: rightCensoredCount + tailCensoredCount,
+        rightCensoredCount,
+        tailCensoredCount,
+        terminalCount,
+        unavailableCount,
+        invalidDurationCount,
+        p95Ms,
+        verdict,
+      });
+    });
   }
 
   public async enqueue(value: TransactionNotification): Promise<void> {

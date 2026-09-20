@@ -46,6 +46,11 @@ import {
   TransactionInboxLeaseError,
   TransactionInboxRepositoryError,
 } from '../src/storage/transaction-inbox.repository.js';
+import {
+  FIRST_PROCESSING_COHORT_CAPACITY,
+  FIRST_PROCESSING_COHORT_DURATION_MS,
+  FIRST_PROCESSING_THRESHOLD_MS,
+} from '../src/domain/first-processing-canary.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
@@ -162,6 +167,83 @@ void test('first processing time survives lease loss, finality replay, orphaning
     await automaticRetryRepository.markProcessed(automaticRetrySignature, automaticRetry.leaseToken, 'finalized');
     const automaticRetryStored = await row(pool, automaticRetrySignature);
     assert.equal(new Date(automaticRetryStored.first_processed_at).getTime(), automaticFirstCompleted);
+  });
+});
+
+void test('aggregates a bounded first-processing cohort with PostgreSQL timing and no identifiers', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    const sampledBefore = Date.now();
+    const databaseStartedAtMs = await repository.beginFirstProcessingCanary();
+    assert.equal(Number.isSafeInteger(databaseStartedAtMs), true);
+    assert.ok(databaseStartedAtMs >= sampledBefore);
+
+    await insertCanaryInboxRow(pool, 'canary-under', startedAtMs + 1, startedAtMs + 45_000);
+    await insertCanaryInboxRow(pool, 'canary-at', startedAtMs + 2, startedAtMs + 45_002);
+    await insertCanaryInboxRow(pool, 'canary-invalid', startedAtMs + 4, startedAtMs + 3);
+    await insertCanaryInboxRow(pool, 'canary-unavailable', startedAtMs + 5, null, 'PENDING', true);
+    await insertCanaryInboxRow(pool, 'canary-ignored-status', startedAtMs + 6, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-quarantined-status', startedAtMs + 7, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-deferred-status', startedAtMs + 8, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed', startedAtMs + 9, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-exhausted', startedAtMs + 10, null, 'FAILED', false, true);
+    await insertCanaryInboxRow(pool, 'canary-tail', startedAtMs + 11, null);
+    await insertCanaryInboxRow(pool, 'canary-upper-bound', startedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS, null);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.deepEqual(evidence, {
+      version: 1, thresholdMs: FIRST_PROCESSING_THRESHOLD_MS,
+      cohortCapacity: FIRST_PROCESSING_COHORT_CAPACITY,
+      cohortStartedAtMs: startedAtMs,
+      cohortEndsAtMs: startedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS,
+      sampledAtMs: evidence.sampledAtMs, overflowed: false,
+      eligibleCount: 10, completedCount: 2, underThresholdCount: 1,
+      atOrAboveThresholdCount: 1, pendingCount: 1, rightCensoredCount: 0,
+      tailCensoredCount: 1, terminalCount: 5, unavailableCount: 1,
+      invalidDurationCount: 1, p95Ms: 45_000, verdict: 'FAIL',
+    });
+    assert.equal(evidence.sampledAtMs >= startedAtMs + FIRST_PROCESSING_COHORT_DURATION_MS,
+      true);
+    assert.equal('signature' in evidence, false);
+    assert.equal('mint' in evidence, false);
+    assert.equal('programId' in evidence, false);
+  });
+});
+
+void test('uses a 50,001st deterministic overflow probe without counting it in the cohort', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at
+    ) SELECT 'canary-cap-' || LPAD(series::TEXT, 5, '0'), series, ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
+      to_timestamp(($1::BIGINT - 3600000) / 1000.0), to_timestamp($1::BIGINT / 1000.0)
+      FROM generate_series(1, $2) AS series`, [startedAtMs, FIRST_PROCESSING_COHORT_CAPACITY + 1]);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.overflowed, true);
+    assert.equal(evidence.eligibleCount, FIRST_PROCESSING_COHORT_CAPACITY);
+    assert.equal(evidence.tailCensoredCount, FIRST_PROCESSING_COHORT_CAPACITY);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('classifies an incomplete fresh cohort as right-censored', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 10;
+    await insertCanaryInboxRow(pool, 'canary-right-censored', startedAtMs, null);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.pendingCount, 1);
+    assert.equal(evidence.rightCensoredCount, 1);
+    assert.equal(evidence.tailCensoredCount, 0);
+    assert.equal(evidence.p95Ms, null);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
   });
 });
 
@@ -4548,6 +4630,35 @@ async function finalityRowTuple(
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
   return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
+}
+
+async function insertCanaryInboxRow(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+  detectedAtMs: number,
+  processedAtMs: number | null,
+  processingStatus = 'PENDING',
+  unavailable = false,
+  exhausted = false,
+): Promise<void> {
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+    processing_status, normalized_transaction, immutable_fingerprint, observed_at,
+    processed_at, first_detected_at, first_processed_at, first_processing_evidence_unavailable,
+    terminal_at, purge_after, error_code, error_name, error_retryable, retry_exhausted_at
+  ) VALUES (
+    $1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
+    $4, CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE '{}'::JSONB END,
+    CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE $7 END, to_timestamp(($2::BIGINT - 3600000) / 1000.0),
+    CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE to_timestamp($3::BIGINT / 1000.0) END,
+    to_timestamp($2::BIGINT / 1000.0), CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE to_timestamp($3::BIGINT / 1000.0) END,
+    $5::BOOLEAN, CASE WHEN $4::TEXT='FAILED' THEN to_timestamp($2::BIGINT / 1000.0) END,
+    CASE WHEN $4::TEXT='FAILED' THEN to_timestamp($2::BIGINT / 1000.0) + INTERVAL '4 hours' END,
+    CASE WHEN $4::TEXT='FAILED' THEN 'RPC_TRANSIENT' END,
+    CASE WHEN $4::TEXT='FAILED' THEN 'CanaryFailure' END,
+    CASE WHEN $4::TEXT='FAILED' THEN $6::BOOLEAN ELSE NULL END,
+    CASE WHEN $6::BOOLEAN THEN to_timestamp(($2::BIGINT + 1) / 1000.0) ELSE NULL END
+  )`, [signature, detectedAtMs, processedAtMs, processingStatus, unavailable, exhausted, 'a'.repeat(64)]);
 }
 
 async function strictCatchUpRunRow(
