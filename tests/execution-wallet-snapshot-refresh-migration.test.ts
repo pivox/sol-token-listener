@@ -57,6 +57,7 @@ void test('migration 045 upgrades 044 so a superseded same-revision snapshot can
       migrationName, '046_listener_strict_catch_up_runs.sql',
       '047_transaction_inbox_tracked_trade_priority.sql',
       '048_transaction_inbox_catch_up_classification.sql',
+      '049_transaction_inbox_catch_up_admission_receipt.sql',
       '050_transaction_inbox_first_processing.sql',
     ]);
     await assertSnapshotIndexes(pool);

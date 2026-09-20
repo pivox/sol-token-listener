@@ -309,6 +309,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '046_listener_strict_catch_up_runs.sql',
       '047_transaction_inbox_tracked_trade_priority.sql',
       '048_transaction_inbox_catch_up_classification.sql',
+      '049_transaction_inbox_catch_up_admission_receipt.sql',
       '050_transaction_inbox_first_processing.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);

@@ -308,7 +308,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
     'runbook version',
   );
   assert.match(runbook, /Le head de migration est 048\./u);
-  assert.match(systemOverview, /La migration 048 est le head/u);
+  assert.match(systemOverview, /La migration 050 est le head/u);
   assertContainsExactlyOnce(
     pumpFunArchitecture,
     '**Version :** 1.1.7 — 2026-09-13',
