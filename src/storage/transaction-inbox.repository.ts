@@ -260,9 +260,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              ) THEN 'invalid'
              WHEN first_processed_at IS NOT NULL THEN 'completed'
              WHEN first_processing_evidence_unavailable THEN 'unavailable'
-             WHEN terminal_at IS NOT NULL OR processing_status IN ('IGNORED', 'QUARANTINED', 'DEFERRED')
-               OR (processing_status='FAILED'
-                 AND (error_retryable=FALSE OR retry_exhausted_at IS NOT NULL)) THEN 'terminal'
+             WHEN processing_status IN ('IGNORED', 'QUARANTINED', 'DEFERRED') THEN 'terminal'
+             WHEN processing_status='FAILED'
+               AND (error_retryable=FALSE OR retry_exhausted_at IS NOT NULL) THEN 'terminal'
+             WHEN terminal_at IS NOT NULL THEN 'terminal'
              WHEN sampled_at - first_detected_at < ($4::BIGINT * INTERVAL '1 millisecond') THEN 'right'
              ELSE 'tail'
            END AS category,

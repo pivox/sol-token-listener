@@ -64,6 +64,8 @@ export function assertValidFirstProcessingCanaryEvidence(
   const verdictDeadline = expectedEnd === null ? null : safeAdd(expectedEnd, FIRST_PROCESSING_THRESHOLD_MS);
   if (expectedEnd === null || verdictDeadline === null || evidence.cohortEndsAtMs !== expectedEnd
     || evidence.sampledAtMs < evidence.cohortStartedAtMs
+    || evidence.eligibleCount > FIRST_PROCESSING_COHORT_CAPACITY
+    || (evidence.overflowed && evidence.eligibleCount !== FIRST_PROCESSING_COHORT_CAPACITY)
     || safeAdd(evidence.rightCensoredCount, evidence.tailCensoredCount) !== evidence.pendingCount
     || safeAdd(evidence.underThresholdCount, evidence.atOrAboveThresholdCount) !== evidence.completedCount
     || sum([evidence.completedCount, evidence.pendingCount, evidence.terminalCount,

@@ -81,6 +81,10 @@ void test('rejects invalid cohort timing and mismatched totals', () => {
     evidence({ pendingCount: 1 }),
     evidence({ completedCount: 2 }),
     evidence({ eligibleCount: 2 }),
+    evidence({ eligibleCount: FIRST_PROCESSING_COHORT_CAPACITY + 1,
+      completedCount: FIRST_PROCESSING_COHORT_CAPACITY + 1,
+      underThresholdCount: FIRST_PROCESSING_COHORT_CAPACITY + 1 }),
+    evidence({ overflowed: true, verdict: 'INCONCLUSIVE' }),
   ]) {
     assert.throws(() => { createFirstProcessingCanaryEvidence(value); }, /invalid/i);
   }
@@ -110,7 +114,9 @@ void test('derives verdicts for small nearest-rank samples and every incomplete 
     [evidence({ eligibleCount: 2, completedCount: 2, underThresholdCount: 1,
       atOrAboveThresholdCount: 1, p95Ms: 45_000, verdict: 'FAIL' }), 'FAIL'],
     [evidence({ sampledAtMs: end + FIRST_PROCESSING_THRESHOLD_MS - 1, verdict: 'INCONCLUSIVE' }), 'INCONCLUSIVE'],
-    [evidence({ overflowed: true, verdict: 'INCONCLUSIVE' }), 'INCONCLUSIVE'],
+    [evidence({ overflowed: true, eligibleCount: FIRST_PROCESSING_COHORT_CAPACITY,
+      completedCount: FIRST_PROCESSING_COHORT_CAPACITY,
+      underThresholdCount: FIRST_PROCESSING_COHORT_CAPACITY, verdict: 'INCONCLUSIVE' }), 'INCONCLUSIVE'],
     [evidence({ eligibleCount: 2, completedCount: 1, underThresholdCount: 1,
       pendingCount: 1, rightCensoredCount: 1, verdict: 'INCONCLUSIVE' }), 'INCONCLUSIVE'],
     [evidence({ eligibleCount: 2, completedCount: 1, underThresholdCount: 1,

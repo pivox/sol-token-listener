@@ -183,9 +183,9 @@ void test('aggregates a bounded first-processing cohort with PostgreSQL timing a
     await insertCanaryInboxRow(pool, 'canary-at', startedAtMs + 2, startedAtMs + 45_002);
     await insertCanaryInboxRow(pool, 'canary-invalid', startedAtMs + 4, startedAtMs + 3);
     await insertCanaryInboxRow(pool, 'canary-unavailable', startedAtMs + 5, null, 'PENDING', true);
-    await insertCanaryInboxRow(pool, 'canary-ignored-status', startedAtMs + 6, null, 'FAILED');
-    await insertCanaryInboxRow(pool, 'canary-quarantined-status', startedAtMs + 7, null, 'FAILED');
-    await insertCanaryInboxRow(pool, 'canary-deferred-status', startedAtMs + 8, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable-a', startedAtMs + 6, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable-b', startedAtMs + 7, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable-c', startedAtMs + 8, null, 'FAILED');
     await insertCanaryInboxRow(pool, 'canary-failed', startedAtMs + 9, null, 'FAILED');
     await insertCanaryInboxRow(pool, 'canary-exhausted', startedAtMs + 10, null, 'FAILED', false, true);
     await insertCanaryInboxRow(pool, 'canary-tail', startedAtMs + 11, null);
@@ -244,6 +244,100 @@ void test('classifies an incomplete fresh cohort as right-censored', async (cont
     assert.equal(evidence.tailCensoredCount, 0);
     assert.equal(evidence.p95Ms, null);
     assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('counts one completed duration, excludes pre-cohort and historical rows', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    await insertCanaryInboxRow(pool, 'canary-single-completed', startedAtMs, startedAtMs + 44_999);
+    await insertCanaryInboxRow(pool, 'canary-before-start', startedAtMs - 1, startedAtMs + 44_998);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at, first_processing_evidence_unavailable
+    ) VALUES ('canary-historical', 2, ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
+      to_timestamp($1::BIGINT / 1000.0), NULL, TRUE)`, [startedAtMs]);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.completedCount, 1);
+    assert.equal(evidence.p95Ms, 44_999);
+    assert.equal(evidence.verdict, 'PASS');
+  });
+});
+
+void test('classifies valid DEFERRED, IGNORED, and QUARANTINED repository rows as terminal', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const terminalRows = [
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-deferred-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 1,
+        disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+        ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint, mints: [tradeMint],
+      }),
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-ignored-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 2,
+        disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      }),
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-quarantined-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 3,
+        disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      }),
+    ];
+    for (const classification of terminalRows) await repository.recordCatchUpClassification(classification);
+
+    assert.equal((await row(pool, 'canary-deferred-valid')).processing_status, 'DEFERRED');
+    assert.equal((await row(pool, 'canary-ignored-valid')).processing_status, 'IGNORED');
+    assert.equal((await row(pool, 'canary-quarantined-valid')).processing_status, 'QUARANTINED');
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 3);
+    assert.equal(evidence.terminalCount, 3);
+    assert.equal(evidence.pendingCount, 0);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('classifies valid nonretryable and exhausted FAILED rows before their required terminal timestamps', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    await insertCanaryInboxRow(pool, 'canary-failed-nonretryable', startedAtMs, null, 'FAILED');
+    await insertCanaryInboxRow(pool, 'canary-failed-exhausted', startedAtMs + 1, null,
+      'FAILED', false, true);
+
+    const nonretryable = await row(pool, 'canary-failed-nonretryable');
+    const exhausted = await row(pool, 'canary-failed-exhausted');
+    assert.equal(nonretryable.error_retryable, false);
+    assert.equal(nonretryable.retry_exhausted_at, null);
+    assert.notEqual(nonretryable.terminal_at, null);
+    assert.equal(exhausted.error_retryable, true);
+    assert.notEqual(exhausted.retry_exhausted_at, null);
+    assert.notEqual(exhausted.terminal_at, null);
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 2);
+    assert.equal(evidence.terminalCount, 2);
+  });
+});
+
+void test('uses PostgreSQL strict right-censoring boundaries at 44,999 and 45,000 milliseconds', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const result = await pool.query(`WITH sampled AS (
+      SELECT TIMESTAMPTZ '2026-01-01 00:00:45+00' AS sampled_at
+    ), rows AS (
+      SELECT sampled_at - ($1::BIGINT * INTERVAL '1 millisecond') AS first_detected_at FROM sampled
+      UNION ALL
+      SELECT sampled_at - ($2::BIGINT * INTERVAL '1 millisecond') FROM sampled
+    ) SELECT COUNT(*) FILTER (WHERE sampled_at - first_detected_at < ($2::BIGINT * INTERVAL '1 millisecond'))
+        AS right_censored_count,
+      COUNT(*) FILTER (WHERE sampled_at - first_detected_at >= ($2::BIGINT * INTERVAL '1 millisecond'))
+        AS tail_censored_count
+      FROM rows CROSS JOIN sampled`, [FIRST_PROCESSING_THRESHOLD_MS - 1, FIRST_PROCESSING_THRESHOLD_MS]);
+    assert.deepEqual(result.rows[0], { right_censored_count: '1', tail_censored_count: '1' });
   });
 });
 
