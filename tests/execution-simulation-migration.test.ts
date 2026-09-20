@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '049_transaction_inbox_catch_up_admission_receipt.sql';
+const latestMigrationName = '050_transaction_inbox_first_processing.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);

@@ -863,13 +863,17 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const terminal = next === 'finalized' || next === 'orphaned';
         const result = await client.query(
           `WITH completed AS MATERIALIZED (
-             SELECT clock_timestamp() AS completed_at
+             SELECT date_trunc('milliseconds', clock_timestamp()) AS completed_at
            ), updated_inbox AS (
              UPDATE chain_transaction_inbox SET
                target_confirmation_status = $3, processing_status = 'PROCESSED',
                lease_token = NULL, lease_expires_at = NULL, next_attempt_at = NULL,
                error_code = NULL, error_name = NULL, error_retryable = NULL,
                processed_at = completed.completed_at,
+               first_processed_at = CASE
+                 WHEN first_processing_evidence_unavailable THEN NULL
+                 ELSE COALESCE(first_processed_at, completed.completed_at)
+               END,
                terminal_at = CASE WHEN $4 THEN completed.completed_at ELSE NULL END,
                purge_after = CASE WHEN $4 THEN
                  completed.completed_at + INTERVAL '4 hours' ELSE NULL END,

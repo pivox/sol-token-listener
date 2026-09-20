@@ -50,6 +50,14 @@ import {
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
+void test('markProcessed records the immutable first completion from the PostgreSQL clock', async () => {
+  const source = await readFile(new URL('../src/storage/transaction-inbox.repository.ts', import.meta.url), 'utf8');
+  const markProcessed = source.slice(source.indexOf('public async markProcessed('), source.indexOf('public async markFailed('));
+  assert.match(markProcessed, /date_trunc\('milliseconds', clock_timestamp\(\)\) AS completed_at/u);
+  assert.match(markProcessed, /first_processed_at\s*=\s*CASE[\s\S]*?first_processing_evidence_unavailable[\s\S]*?COALESCE\(first_processed_at, completed\.completed_at\)/u);
+  assert.match(markProcessed, /processed_at\s*=\s*completed\.completed_at/u);
+});
+
 void test('RPC HTTP heartbeat persistence serializes only detached fixed evidence fields', async () => {
   const recorder = createRpcHttpEvidenceRecorder();
   recorder.recordAttempt('primary');
