@@ -50,6 +50,14 @@ export const TRANSACTION_INBOX_RECOVERY_RESULT_CODES = Object.freeze([
   'RECOVERY_NOT_FOUND',
 ] as const);
 
+export const DECODER_RECOVERY_RESULT_CODES = Object.freeze([
+  'DECODER_RECOVERY_SCHEDULED',
+  'DECODER_RECOVERY_ALREADY_SCHEDULED',
+  'DECODER_RECOVERY_NOT_FOUND',
+  'DECODER_RECOVERY_EXPIRED',
+  'DECODER_RECOVERY_NOT_ELIGIBLE',
+] as const);
+
 export const TRANSACTION_INGESTION_HINTS = Object.freeze([
   'NONE',
   'PUMPFUN_CREATE',
@@ -77,6 +85,7 @@ export type TransactionNotificationIngestionHint = Exclude<TransactionIngestionH
 export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
 export type InboxRecoveryResultCode =
   (typeof TRANSACTION_INBOX_RECOVERY_RESULT_CODES)[number];
+export type DecoderRecoveryResultCode = (typeof DECODER_RECOVERY_RESULT_CODES)[number];
 export type ProcessingCheckpointKey = 'launchpad' | 'market';
 export type DurableSnapshotValue =
   | null
@@ -330,6 +339,11 @@ export interface InboxCounts {
 
 export interface InboxRecoveryResult {
   readonly code: InboxRecoveryResultCode;
+  readonly signature: string;
+}
+
+export interface DecoderRecoveryResult {
+  readonly code: DecoderRecoveryResultCode;
   readonly signature: string;
 }
 
@@ -871,6 +885,23 @@ export function assertValidInboxRecoveryResult(
     throw new TypeError('Inbox recovery result code is invalid.');
   }
   assertText(record.signature, 'Inbox recovery result signature');
+}
+
+export function assertValidDecoderRecoveryResult(
+  value: unknown,
+): asserts value is DecoderRecoveryResult {
+  if (typeof value === 'object' && value !== null && isProxy(value)) {
+    throw new TypeError('Decoder recovery result is invalid.');
+  }
+  const record = frozenRecord(value, 'Decoder recovery result');
+  assertExactKeys(record, ['code', 'signature'], 'Decoder recovery result');
+  if (!DECODER_RECOVERY_RESULT_CODES.includes(record.code as DecoderRecoveryResultCode)) {
+    throw new TypeError('Decoder recovery result code is invalid.');
+  }
+  assertText(record.signature, 'Decoder recovery result signature');
+  if (record.signature.length === 0) {
+    throw new TypeError('Decoder recovery result signature must not be empty.');
+  }
 }
 
 function frozenRecord(value: unknown, name: string): Readonly<Record<string, unknown>> {

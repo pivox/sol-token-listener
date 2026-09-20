@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ObservedPipelineError } from '../src/application/observed-transaction-pipeline.js';
-import { OBSERVED_PIPELINE_ORIGIN_CODES, OBSERVED_PIPELINE_STAGES } from '../src/domain/observed-pipeline-failure.js';
+import {
+  isDecoderQuarantineFailure,
+  OBSERVED_PIPELINE_ORIGIN_CODES,
+  OBSERVED_PIPELINE_STAGES,
+} from '../src/domain/observed-pipeline-failure.js';
 import { LaunchpadObservationError } from '../src/application/launchpad-observation-errors.js';
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { PumpFunLaunchpadAdapter } from '../src/launchpads/pumpfun/pumpfun-launchpad.adapter.js';
@@ -34,6 +38,83 @@ const invalidDurableFailures = [
   ['ObservedPipelineFailure.v1.unclassified.PUMP_BORSH_INVALID', false],
   ['ObservedPipelineFailure.v1.unclassified.UNKNOWN.secret', true],
 ] as const;
+
+void test('recognizes only the two exact frozen Pump.fun decoder quarantine failures', () => {
+  for (const code of ['PUMP_SCHEMA_UNSUPPORTED', 'PUMP_BORSH_TRUNCATED'] as const) {
+    const failure = Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED' as const,
+      errorName: `ObservedPipelineFailure.v1.launchpad_observation.${code}`,
+      retryable: false,
+    });
+    assertValidIngestionFailure(failure);
+    assert.equal(isDecoderQuarantineFailure(failure), true);
+  }
+});
+
+void test('rejects adjacent taxonomy, retry variants, public lookalikes, proxies and extra keys', () => {
+  const ineligible = [
+    Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED' as const,
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_INVALID',
+      retryable: false,
+    }),
+    Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED' as const,
+      errorName: 'ObservedPipelineFailure.v1.pumpswap_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+    }),
+    Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED' as const,
+      errorName: 'ObservedPipelineFailure.v1.pumpswap_observation.PUMPSWAP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+    }),
+    Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED' as const,
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: true,
+    }),
+    Object.freeze({
+      code: 'RPC_TRANSIENT' as const,
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+    }),
+    Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED' as const,
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+      privateDetail: 'must-not-persist',
+    }),
+  ];
+  for (const failure of ineligible) {
+    assert.equal(isDecoderQuarantineFailure(failure as IngestionFailure), false);
+  }
+
+  class PublicLookalike {
+    public readonly code = 'PIPELINE_STAGE_FAILED' as const;
+    public readonly errorName =
+      'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED';
+    public readonly retryable = false;
+  }
+  assert.equal(
+    isDecoderQuarantineFailure(Object.freeze(new PublicLookalike()) as IngestionFailure),
+    false,
+  );
+
+  let traps = 0;
+  const trap = (): never => { traps += 1; throw new Error('secret trap'); };
+  const proxy = new Proxy(Object.freeze({
+    code: 'PIPELINE_STAGE_FAILED' as const,
+    errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+    retryable: false,
+  }), {
+    get: trap,
+    getPrototypeOf: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+  });
+  assert.equal(isDecoderQuarantineFailure(proxy), false);
+  assert.equal(traps, 0);
+});
 
 void test('rejects noncanonical pipeline taxonomy and retry decisions before any PostgreSQL I/O', async () => {
   let calls = 0;

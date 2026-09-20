@@ -9,6 +9,7 @@ import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import {
   LISTENER_RUNTIME_STATES,
   MAX_FINALITY_EVIDENCE_VERSION,
+  DECODER_RECOVERY_RESULT_CODES,
   TRANSACTION_INBOX_RECOVERY_RESULT_CODES,
   MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH,
   MAX_TRANSACTION_SNAPSHOT_DEPTH,
@@ -24,6 +25,7 @@ import {
   assertValidFinalityPollObservation,
   assertValidFinalityRevision,
   assertValidIngestionFailure,
+  assertValidDecoderRecoveryResult,
   assertValidInboxCounts,
   assertValidInboxRecoveryResult,
   assertValidProcessingCheckpoint,
@@ -38,6 +40,7 @@ import {
   type FinalityPollObservation,
   type FinalityRevision,
   type IngestionFailure,
+  type DecoderRecoveryResult,
   type InboxRecoveryResult,
   type ProcessingCheckpoint,
   type RuntimeHeartbeat,
@@ -233,8 +236,48 @@ void test('publishes exact frozen ingestion status constants', () => {
     'RECOVERY_NOT_FOUND',
   ]);
   assert.ok(Object.isFrozen(TRANSACTION_INBOX_RECOVERY_RESULT_CODES));
+  assert.deepEqual(DECODER_RECOVERY_RESULT_CODES, [
+    'DECODER_RECOVERY_SCHEDULED',
+    'DECODER_RECOVERY_ALREADY_SCHEDULED',
+    'DECODER_RECOVERY_NOT_FOUND',
+    'DECODER_RECOVERY_EXPIRED',
+    'DECODER_RECOVERY_NOT_ELIGIBLE',
+  ]);
+  assert.ok(Object.isFrozen(DECODER_RECOVERY_RESULT_CODES));
   assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE']);
   assert.ok(Object.isFrozen(TRANSACTION_INGESTION_HINTS));
+});
+
+void test('accepts every exact frozen decoder recovery result', () => {
+  for (const code of DECODER_RECOVERY_RESULT_CODES) {
+    const result: DecoderRecoveryResult = Object.freeze({ code, signature: 'signature' });
+    assert.doesNotThrow(() => { assertValidDecoderRecoveryResult(result); });
+  }
+});
+
+void test('rejects non-exact decoder recovery results without inspecting proxies', () => {
+  let traps = 0;
+  const trap = (): never => { traps += 1; throw new Error('secret trap'); };
+  const valid = Object.freeze({
+    code: 'DECODER_RECOVERY_SCHEDULED' as const,
+    signature: 'signature',
+  });
+  const proxy = new Proxy(valid, {
+    get: trap,
+    getPrototypeOf: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+  });
+  for (const value of [
+    { ...valid },
+    Object.freeze({ ...valid, privateDetail: 'must-not-persist' }),
+    Object.freeze({ ...valid, code: 'RECOVERY_SCHEDULED' }),
+    Object.freeze({ ...valid, signature: '' }),
+    proxy,
+  ]) {
+    assert.throws(() => { assertValidDecoderRecoveryResult(value); }, TypeError);
+  }
+  assert.equal(traps, 0);
 });
 
 void test('accepts canonical frozen ingestion contracts with bigint slots and integer milliseconds', () => {
