@@ -149,7 +149,8 @@ function snapshotRow(value: unknown): CatchUpSignature {
 function validTransactionError(value: unknown): boolean {
   if (value === null) return true;
   if (typeof value === 'string') {
-    return value.length > 0 && Buffer.byteLength(value, 'utf8') <= 16_384;
+    return value.length > 0 && value.length <= 16_384
+      && Buffer.byteLength(value, 'utf8') <= 16_384;
   }
   return typeof value === 'object' && !Array.isArray(value);
 }

@@ -150,6 +150,27 @@ void test('records failed discoveries directly, covers durable successes and hyd
   ]);
 });
 
+void test('rejects a source-success discovery when hydrated block evidence reports failure', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const transaction = cloneTransaction(template, {
+    signature: 'source-success-block-failure',
+    error: Object.freeze({ InstructionError: Object.freeze([0, 'Custom']) }),
+  });
+  const repository = new RecordingRepository();
+  const coverage = new RecordingCoverageRepository(async () => Object.freeze([]));
+  const sourceSuccess = Object.freeze({ ...discovery(transaction), transactionFailed: false });
+
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])), repository, () => 9_625, {
+      coverageFastPathEnabled: true, coverageRepository: coverage,
+    },
+  ).classify(Object.freeze([sourceSuccess]), NEVER_ABORTED), (error: unknown) => {
+    assert.equal(Reflect.get(error as object, 'code'), 'TRANSACTION_OUTCOME_MISMATCH');
+    return true;
+  });
+  assert.deepEqual(repository.values, []);
+});
+
 void test('fails closed on hostile or contradictory coverage receipts before hydration', async () => {
   const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
   const locator = returning(new Map([[transaction.signature, transaction]]));

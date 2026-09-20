@@ -49,6 +49,7 @@ type ClassifierErrorCode =
   | 'LOCATOR_UNTRUSTED'
   | 'LOCATOR_UNSUPPORTED_FAILURE'
   | 'TRANSACTION_IDENTITY_MISMATCH'
+  | 'TRANSACTION_OUTCOME_MISMATCH'
   | 'DECODER_UNTRUSTED'
   | 'INVALID_RECEIPT';
 
@@ -334,6 +335,9 @@ function classificationForOutcome(
       marker: outcome.marker,
       actions: Object.freeze([]),
     }), classifiedAtMs);
+  }
+  if (!outcome.discovery.transactionFailed && outcome.transaction.error !== null) {
+    throw failure('TRANSACTION_OUTCOME_MISMATCH');
   }
   if (outcome.transaction.error !== null) {
     return classificationFromDecision(outcome.discovery, Object.freeze({

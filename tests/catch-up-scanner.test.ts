@@ -370,6 +370,22 @@ void test('reduces the official signature error to a boolean without traversing 
   assert.equal(traps, 0);
 });
 
+void test('rejects oversized string errors before scanning their UTF-8 byte length', async (context) => {
+  const oversizedError = 'x'.repeat(16_385);
+  const source = new SolanaCatchUpSource({
+    async getSignaturesForAddress() {
+      return [rpcSig('oversized-error', 42, 'confirmed', 3, oversizedError)];
+    },
+  }, 'confirmed');
+  const byteLength = context.mock.method(Buffer, 'byteLength');
+
+  await assert.rejects(source.list(PUMP_PROGRAM_ID, undefined, 1), CatchUpSourceError);
+
+  const oversizedScans = byteLength.mock.calls.filter(({ arguments: args }) => args[0] === oversizedError);
+  byteLength.mock.restore();
+  assert.equal(oversizedScans.length, 0);
+});
+
 void test('rejects malformed, accessor-backed, unsafe, and over-limit RPC responses with redacted errors', async () => {
   const hostileUrl = 'https://secret.invalid/?token=do-not-leak';
   const cases: unknown[] = [

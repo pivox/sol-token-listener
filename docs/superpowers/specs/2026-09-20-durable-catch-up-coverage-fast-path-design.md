@@ -1,7 +1,7 @@
 # Durable catch-up coverage fast path
 
 Status: approved for implementation
-Version: 1.0.5
+Version: 1.0.6
 Issue: #146
 Parent incident: #120
 Scope: Pump.fun observe-only catch-up admission; no wallet, signer, executor,
@@ -24,6 +24,8 @@ Revision history:
   custom iterators, accessors and oversized batches cannot bypass page limits.
 - 1.0.5: validate persisted classification identity from its immutable action
   key rather than the inbox's mutable routing hint after source convergence.
+- 1.0.6: reject oversized string errors before UTF-8 scanning and fail closed
+  when a source-success discovery hydrates to a failed transaction.
 
 ## Context
 
@@ -99,6 +101,10 @@ value is observed exactly once and reduced immediately:
 - `null` -> `transactionFailed=false`;
 - a non-empty bounded string variant or non-null non-array object variant ->
   `transactionFailed=true`.
+
+A string is rejected by a cheap 16,384 UTF-16-code-unit ceiling before its
+UTF-8 byte length is measured; the UTF-8 representation is independently
+bounded to 16,384 bytes.
 
 The value is never traversed, serialized, logged or persisted. Missing,
 `undefined`, primitive non-string, array, symbol, bigint, function or
@@ -192,6 +198,10 @@ WebSocket or terminal-success identity exists, the repository must fail closed;
 it must not silently turn previously admitted successful work into ignored
 work. Replaying the same failed classification remains idempotent.
 
+Conversely, after a source-success discovery is hydrated, a non-null error in
+the normalized transaction contradicts the source result. The classifier must
+reject the whole page before recording any classification for that discovery.
+
 ## Page algorithm and ordering
 
 With the flag enabled, `PumpFunCatchUpBlockClassifier.classify`:
@@ -256,7 +266,8 @@ as ignored evidence, never as a processed launch or trade.
 
 ## Tests and acceptance
 
-- strict RPC snapshots require `err` and reduce it without traversing content;
+- strict RPC snapshots require `err`, bound strings before UTF-8 scanning and
+  reduce it without traversing content;
 - merge rejects contradictory execution outcomes;
 - flag defaults false and rejects every unsafe activation envelope;
 - flag off preserves locator calls and receipts;
@@ -264,7 +275,8 @@ as ignored evidence, never as a processed launch or trade.
 - exact terminal receipt coverage is accepted;
 - absent successful rows are hydrated;
 - failed rows are recorded without locator calls;
-- failed/source-success contradictions fail closed;
+- failed/source-success contradictions, including source-success versus a
+  failed hydrated transaction, fail closed before persistence;
 - mixed pages preserve input receipt order and exact cardinality;
 - cancellation, replay, slot conflict and hostile repository results fail
   closed;
