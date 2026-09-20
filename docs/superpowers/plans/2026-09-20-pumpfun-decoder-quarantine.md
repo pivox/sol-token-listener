@@ -1,6 +1,6 @@
 # Pump.fun Decoder Quarantine and Replay Implementation Plan
 
-Version: 1.0.1 — 2026-09-20 — issue #148
+Version: 1.0.2 — 2026-09-20 — issue #148
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -17,7 +17,6 @@ Version: 1.0.1 — 2026-09-20 — issue #148
 **Files:**
 - Modify: `src/domain/observed-pipeline-failure.ts`
 - Modify: `src/domain/transaction-ingestion.ts`
-- Modify: `src/ports/transaction-inbox-repository.ts`
 - Create: `scripts/recover-decoder-quarantine.ts`
 - Modify: `package.json`
 - Modify: `tests/observed-pipeline-failure.test.ts`
@@ -47,12 +46,15 @@ arguments, mismatches, eligible success codes, ineligible/expired results,
 redacted dependency errors, and source absence of wallet/signing/network-server
 capabilities.
 
-- [ ] **Step 4: Implement the local CLI and port**
+- [ ] **Step 4: Implement the local CLI boundary**
 
-Add `recoverDecoderQuarantine(signature)` to the repository port and expose
-`npm run inbox:recover-decoder`. The command opens only PostgreSQL, emits one
-bounded JSON line, and never loads RPC, a wallet, signer, executor, HTTP server
-or submission dependency.
+Define a required narrow repository interface local to the CLI around
+`recoverDecoderQuarantine(signature)` and expose the testable CLI runner. Do not
+make the global repository port optional merely to satisfy intermediate
+sequencing. The production bootstrap and package command become active in Task
+3 with the concrete repository method. The command emits one bounded JSON line
+and never loads RPC, a wallet, signer, executor, HTTP server or submission
+dependency.
 
 - [ ] **Step 5: Verify Task 1**
 
@@ -106,6 +108,7 @@ temporary database immediately. Commit migration/catalogue changes separately.
 ### Task 3: Atomic, idempotent repository recovery
 
 **Files:**
+- Modify: `src/ports/transaction-inbox-repository.ts`
 - Modify: `src/storage/transaction-inbox.repository.ts`
 - Modify: `src/storage/database.ts`
 - Modify: `tests/transaction-inbox.repository.test.ts`
@@ -136,6 +139,9 @@ original deadline unless recovery commits.
 
 - [ ] **Step 4: Implement one locked transaction**
 
+Add the required `recoverDecoderQuarantine(signature)` method to
+`TransactionInboxRepository`, the PostgreSQL implementation and the CLI
+production bootstrap/package script; no optional port or cast is allowed.
 Use the existing per-signature advisory lock plus `SELECT ... FOR UPDATE`.
 Validate the worker form, retention and exact evidence. Insert the
 receipt and update the inbox in one transaction. Preserve first-detection,
