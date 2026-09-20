@@ -1,7 +1,7 @@
 # Durable catch-up coverage fast path
 
 Status: approved for implementation
-Version: 1.0.1
+Version: 1.0.2
 Issue: #146
 Parent incident: #120
 Scope: Pump.fun observe-only catch-up admission; no wallet, signer, executor,
@@ -14,6 +14,9 @@ Revision history:
   make coverage a lock-free read-only batch compatible with tracked-mint
   synchronization, and fail closed on both directions of execution-outcome
   contradiction.
+- 1.0.2: use a neutral coverage DTO, reject outcome-unknown terminal receipts
+  on the direct-failure path, preserve compatible source reconciliation and
+  clarify deterministic ordering and non-synthetic provenance.
 
 ## Context
 
@@ -74,8 +77,9 @@ The new configuration key is
 - changing the value requires restart;
 - no live execution setting is read or enabled.
 
-Flag-off behavior remains byte-for-byte compatible: the classifier hydrates all
-discoveries as it does today.
+Flag-off hydration, classification and receipt behavior remains compatible: the
+classifier hydrates all discoveries as it does today. The internal source DTO
+does gain the explicit immutable execution-outcome boolean.
 
 ## Source contract
 
@@ -86,12 +90,15 @@ The external RPC snapshot requires an own enumerable `err` data property. Its
 value is observed exactly once and reduced immediately:
 
 - `null` -> `transactionFailed=false`;
-- any non-null JSON value -> `transactionFailed=true`.
+- a non-empty bounded string variant or non-null non-array object variant ->
+  `transactionFailed=true`.
 
-The value is never traversed, serialized, logged or persisted. A missing or
-accessor-backed `err` field rejects the source response. Duplicate discoveries
-for the same signature must agree on slot, confirmation status, block time and
-execution outcome; disagreement is a pagination/source failure.
+The value is never traversed, serialized, logged or persisted. Missing,
+`undefined`, primitive non-string, array, symbol, bigint, function or
+accessor-backed `err` values reject the source response. Duplicate discoveries
+for the same signature must agree on slot and execution outcome. Confirmation
+status and nullable block time retain the existing compatible reconciliation
+rules; incompatible values remain a pagination/source failure.
 
 Existing trusted fixtures must provide the boolean explicitly. This prevents
 old tests or internal callers from silently defaulting an unknown outcome to
@@ -104,14 +111,17 @@ Add a neutral batch port used only by the Pump.fun page classifier:
 ```ts
 interface CatchUpAdmissionCoverageRepository {
   readExistingCatchUpCoverage(
-    discoveries: readonly MergedCatchUpDiscovery[],
+    candidates: readonly CatchUpAdmissionCoverageCandidate[],
     signal: AbortSignal,
   ): Promise<readonly CatchUpClassificationReceipt[]>;
 }
 ```
 
-The method accepts successful discoveries only and returns receipts only for
-durably covered identities. The caller derives the missing set by signature.
+The neutral port DTO contains only signature, slot, confirmation status and the
+canonical program-ID set. It does not import the application-layer merged
+discovery, block time or execution outcome. The method accepts successful
+candidates only and returns receipts only for durably covered identities. The
+caller derives the missing set by signature.
 
 The PostgreSQL implementation uses one bounded read-only query for at most one
 page. It acquires no advisory, mint or row lock and performs no update. This is
@@ -140,8 +150,13 @@ to the source that admitted it. For a terminal receipt it performs no mutation. 
 A successful discovery must not cover a stored catch-up classification whose
 reason is `SOLANA_TRANSACTION_FAILED`. That inverse outcome contradiction fails
 the whole batch rather than bypassing the immutable classification mismatch.
-Likewise, the direct failed path rejects an existing WebSocket or terminal
-success identity. Same-outcome failed replays remain idempotent.
+Likewise, the direct failed path rejects an existing WebSocket identity and
+rejects every terminal replay receipt: the current terminal receipt schema does
+not retain transaction outcome, so it cannot prove a compatible failure.
+Same-outcome failed classifications remain idempotent. A later WebSocket
+notification is proof of `err=null`; enqueue must reject a previously terminal
+`SOLANA_TRANSACTION_FAILED` classification rather than silently retain
+`IGNORED` and lose the successful observation.
 
 An absent identity is not an error and yields no receipt. A slot conflict,
 incompatible confirmation transition, malformed stored row, duplicate result,
@@ -179,7 +194,8 @@ With the flag enabled, `PumpFunCatchUpBlockClassifier.classify`:
 5. hydrates only uncovered successful identities, retaining the existing
    per-slot single-flight behavior;
 6. validates every returned receipt against the original signature and slot;
-7. emits one receipt per input discovery in the original order.
+7. emits one receipt per discovery in the deterministic classifier-input order
+   established by `mergeCatchUpDiscoveries`.
 
 Receipt cardinality, duplicate signatures, missing results, extra results and
 hostile return objects remain fail-closed. Cancellation is checked before and
@@ -192,7 +208,9 @@ The existing bounded counters provide the canary proof:
 
 - catch-up dispositions show failed transactions becoming `IGNORED`;
 - block hydration `locates`, `fetches`, hits and misses show the avoided work;
-- source/provenance backlog shows WebSocket/catch-up convergence;
+- strict-run page/cursor progress proves the bridge convergence; per-signature
+  source metrics continue to report the source that actually admitted work and
+  do not claim synthetic catch-up provenance;
 - `scanActive`, `workerClaimReady`, provider state and first-processing evidence
   show whether the bridge finishes.
 
@@ -241,7 +259,8 @@ as ignored evidence, never as a processed launch or trade.
   idempotent replay, finality compatibility, finalized-upgrade fallback to the
   existing replay path and no mutation of provenance/priority/status/finality
   evidence, including concurrency with `syncTrackedMint` and both directions of
-  failed/success outcome contradiction;
+  failed/success outcome contradiction, terminal-receipt rejection on the
+  failed path, and WebSocket-after-failed-classification rejection;
 - build, strict checks, lint, unit tests, PostgreSQL integration tests,
   documentation checks and deployment contracts pass;
 - a separate post-merge Mainnet observe-only canary must prove the operational

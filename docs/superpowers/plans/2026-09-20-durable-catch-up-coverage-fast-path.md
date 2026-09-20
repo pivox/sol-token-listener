@@ -20,7 +20,9 @@ Review budget: two GitHub cycles maximum
   terminal receipt coverage, absence, slot/finality contradiction,
   finalized-upgrade fallback, cancellation and preservation of
   status/priority/hint/lease/snapshot/finality evidence, plus failed-first versus
-  success-second and success-first versus failed-second contradictions.
+  success-second and success-first versus failed-second contradictions, direct
+  failure against a terminal receipt, and WebSocket arrival after a persisted
+  failed classification.
 - Implement one bounded read-only batch query with no advisory, mint or row
   locks; add a concurrency regression against `syncTrackedMint`.
 - Keep the port uncomposed in production.
