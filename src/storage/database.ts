@@ -979,6 +979,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `DELETE FROM chain_transaction_inbox
        WHERE terminal_at IS NOT NULL
          AND purge_after <= clock_timestamp()
+         AND (first_detected_at IS NULL
+           OR first_detected_at + INTERVAL '4 hours' <= clock_timestamp())
          AND NOT (
            processing_status='DEFERRED'
            AND ingestion_hint='PUMPFUN_TRADE'

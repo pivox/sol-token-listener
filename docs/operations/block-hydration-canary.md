@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.1.1 — 2026-09-20 — issues #114, #142 et #143.
+Version : 1.1.2 — 2026-09-20 — issues #114, #142 et #143.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -246,6 +246,12 @@ où le heartbeat final n'est pas postérieur à T+15 avec la même cohorte. Dès
 premier instant de purge possible, à quatre heures du début de cohorte, une
 suppression partielle peut avoir amputé l'échantillon : le verdict devient donc
 `INCONCLUSIVE`. Un p95 en échec ou une durée invalide reste toutefois `FAIL`.
+Le purgeur conserve toute ligne post-migration depuis son `first_detected_at`
+durable pendant au moins quatre heures avant suppression, même si
+`classifiedAtMs` et `purge_after` sont antérieurs. Les lignes historiques où
+`first_detected_at` est `NULL` conservent la règle `purge_after` existante.
+Cette protection borne le premier instant de purge sans remplacer le verdict
+fail-closed ci-dessus.
 
 Le gate HTTP 429 reste indépendant et distinct du gate de latence
 first-processing : l'un ne peut compenser l'autre. Les autres gates backlog,

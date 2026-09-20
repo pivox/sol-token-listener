@@ -214,6 +214,18 @@ void test('ignored and quarantined classifications purge after exactly four hour
         observed_at: oldTerminal, terminal_at: oldTerminal, purge_after: oldPurge,
         catch_up_classified_at: oldTerminal }));
     }
+    await pool.query(await readFile(
+      new URL('049_transaction_inbox_catch_up_admission_receipt.sql', migrationsDirectory),
+      'utf8',
+    ));
+    await pool.query(await readFile(
+      new URL('050_transaction_inbox_first_processing.sql', migrationsDirectory),
+      'utf8',
+    ));
+    assert.deepEqual((await pool.query(`SELECT first_detected_at FROM chain_transaction_inbox
+      WHERE signature LIKE 'purge-%' ORDER BY signature`)).rows, [
+      { first_detected_at: null }, { first_detected_at: null },
+    ]);
     const purged = await purgeExpiredFoundationData(pool);
     assert.equal(purged.transactionInbox, 2);
     assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature LIKE 'purge-%'")).rows[0]?.count, '0');

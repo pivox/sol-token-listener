@@ -1,6 +1,6 @@
 # Architecture Pump.fun V1
 
-**Version :** 1.1.8 — 2026-09-20
+**Version :** 1.1.9 — 2026-09-20
 
 ## Périmètre produit
 
@@ -743,6 +743,13 @@ est `INCONCLUSIVE`. La preuve devient aussi `INCONCLUSIVE` dès
 avoir retiré des lignes; `FAIL` garde la priorité. Le gate HTTP 429 et les autres gates opérationnels restent
 indépendants. Le statut terrain demeure `CANARY_NOT_STARTED` tant que la
 procédure post-merge n'a pas produit ses quatre artefacts.
+
+Le purgeur inbox conserve son prédicat indexé sur `purge_after`, puis protège
+les lignes post-migration par une borne résiduelle : lorsque
+`first_detected_at` est renseigné, aucune suppression n'est possible avant
+`first_detected_at + 4 heures`. Un `classifiedAtMs` antérieur à l'insertion ne
+peut donc pas raccourcir la preuve. Les lignes historiques où
+`first_detected_at IS NULL` conservent leur comportement de purge antérieur.
 
 Cette instrumentation est observe-only et ne donne aucune autorité wallet,
 signer ou submit : aucun chargement de clé, aucune signature et aucune

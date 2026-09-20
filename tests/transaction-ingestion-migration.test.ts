@@ -291,6 +291,7 @@ void test('purges only expired resolved strict failures and exposes their count'
   );
   assert.match(source, /readonly transactionInbox: number;/u);
   assert.match(source, /DELETE FROM chain_transaction_inbox[\s\S]*terminal_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u);
+  assert.match(source, /first_detected_at IS NULL[\s\S]{0,160}first_detected_at \+ INTERVAL '4 hours'[\s\S]{0,80}<= clock_timestamp\(\)/u);
   const deletion = /DELETE FROM chain_transaction_inbox[\s\S]*?purge_after <= clock_timestamp\(\)/u
     .exec(source)?.[0] ?? '';
   assert.doesNotMatch(deletion, /processing_status = 'PROCESSED'/u);

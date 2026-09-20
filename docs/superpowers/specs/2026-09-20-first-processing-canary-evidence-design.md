@@ -1,6 +1,6 @@
 # First-Processing Canary Evidence Design
 
-Version: 1.0.1 — 2026-09-20 — issue #143
+Version: 1.0.2 — 2026-09-20 — issue #143
 
 Status: approved for implementation under the standing operator instruction
 
@@ -125,6 +125,12 @@ non-integer aggregate duration is still classified as invalid and cannot pass.
 The two timestamps and unavailable marker are part of the inbox row and follow
 its existing four-hour deletion. No separate identifying evidence table or
 retention path is introduced.
+The shared inbox purge still selects through the existing `purge_after` index,
+then applies a residual safety bound: a post-migration row with a non-null
+`first_detected_at` is not deleted before `first_detected_at + 4 hours`.
+This prevents a caller-supplied classification time earlier than durable
+detection from shortening canary evidence. Legacy rows whose
+`first_detected_at` is `NULL` keep their prior `purge_after` behavior.
 
 ## Bounded cohort
 
@@ -286,6 +292,8 @@ Tests must prove:
 - retry, replay, finality, orphaning, and manual recovery preserve it;
 - direct replacement or clearing is rejected by PostgreSQL;
 - normal four-hour inbox retention still deletes the whole row;
+- post-migration deletion waits four hours from durable `first_detected_at`,
+  while legacy `NULL` evidence retains its prior deletion behavior;
 - a partially purged cohort is `INCONCLUSIVE` from its first possible purge
   instant and cannot recover a misleading `PASS`;
 - the cohort excludes pre-start and post-window rows and caps at 50,000;

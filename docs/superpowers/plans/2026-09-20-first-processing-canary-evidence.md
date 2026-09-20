@@ -1,6 +1,6 @@
 # First-Processing Canary Evidence Implementation Plan
 
-Version: 1.0.1 — 2026-09-20 — issue #143
+Version: 1.0.2 — 2026-09-20 — issue #143
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -197,6 +197,13 @@ unavailableCount + invalidDurationCount`.
 Export `FIRST_PROCESSING_EVIDENCE_RETENTION_MS = 14_400_000`; validate both
 deadline additions with safe integer addition. The retention boundary is
 inclusive and `FAIL` remains prioritaire.
+In the shared retention delete, keep the indexed `purge_after` predicate and
+add the residual condition `first_detected_at IS NULL OR first_detected_at +
+INTERVAL '4 hours' <= clock_timestamp()`. Add a source-contract test and a real
+PostgreSQL classification regression where `classifiedAtMs` is before
+`cohortStartedAtMs`, which is no later than `firstDetectedAtMs`; prove deletion
+is blocked before and allowed exactly at the durable-detection boundary.
+Preserve prior behavior for legacy `NULL` rows.
 
 - [ ] **Step 4: Write RED repository aggregate tests**
 

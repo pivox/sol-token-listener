@@ -603,6 +603,7 @@ void test('first-processing canary runbook fails closed across the fixed cohort 
   assert.match(runbook, /durée invalide[^.]{0,180}FAIL/iu);
   assert.match(runbook, /FAIL[^.]{0,180}(?:prioritaire|précède)[^.]{0,120}INCONCLUSIVE/iu);
   assert.match(all, /(?:quatre|4) heures[^.]{0,220}(?:premier instant|purge)[^.]{0,220}INCONCLUSIVE/iu);
+  assert.match(all, /first_detected_at[^.]{0,240}(?:quatre|4) heures[^.]{0,240}(?:purge|suppression)/iu);
   assert.match(runbook, /14400000/u);
   assert.match(runbook, /HTTP\s*429[^.]{0,180}(?:indépendant|distinct)[^.]{0,180}(?:first-processing|latence)/iu);
   assert.match(runbook, /(?:autres gates|backlog)[^.]{0,240}(?:indépendants|indépendantes|distincts|distinctes)/iu);

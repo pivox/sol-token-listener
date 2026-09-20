@@ -280,6 +280,66 @@ void test('a partially purged four-hour cohort can never recover a PASS', async 
   });
 });
 
+void test('retention anchors post-migration classifications to durable detection time', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const classifiedAtMs = Date.now() - 14_400_001;
+    const cohortStartedAtMs = await repository.beginFirstProcessingCanary();
+    const classification = createCatchUpClassification({
+      ...catchUpClassificationInput('canary-detection-anchored-retention'),
+      observedAtMs: classifiedAtMs,
+      classifiedAtMs,
+      disposition: 'IGNORED',
+      reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null,
+      ingestionHintMint: null,
+      mints: [],
+    });
+    await repository.recordCatchUpClassification(classification);
+    const before = (await pool.query<{
+      readonly first_detected_at: Date;
+      readonly catch_up_classified_at: Date;
+      readonly purge_after: Date;
+    }>(`SELECT first_detected_at,catch_up_classified_at,purge_after
+      FROM chain_transaction_inbox WHERE signature=$1`, [classification.signature])).rows[0];
+    assert.ok(before);
+    assert.ok(before.first_detected_at instanceof Date);
+    assert.ok(before.first_detected_at.getTime() >= cohortStartedAtMs);
+    assert.ok(before.catch_up_classified_at.getTime() < cohortStartedAtMs);
+    assert.ok(before.purge_after.getTime() <= Date.now());
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at, error_code, error_name,
+      error_retryable, terminal_at, purge_after
+    ) VALUES ('legacy-null-detection-retention', 2, ARRAY['CATCH_UP'], ARRAY[$1],
+      'confirmed', 'FAILED', to_timestamp($2::BIGINT / 1000.0), NULL,
+      'NORMALIZATION_FAILED', 'LegacyFailure', FALSE,
+      to_timestamp($2::BIGINT / 1000.0), to_timestamp($2::BIGINT / 1000.0)+INTERVAL '4 hours')`,
+    [PUMP_PROGRAM_ID, classifiedAtMs]);
+
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature=$1`, [classification.signature])).rows[0]?.count, '1');
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature='legacy-null-detection-retention'`)).rows[0]?.count, '0');
+
+    const schema = (await pool.query<{ readonly schema_name: unknown }>(
+      'SELECT current_schema() AS schema_name',
+    )).rows[0]?.schema_name;
+    assert.equal(typeof schema, 'string');
+    if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+    const deletionAt = new Date(before.first_detected_at.getTime() + 14_400_000).toISOString();
+    await pool.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+      RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+      AS $$ SELECT TIMESTAMPTZ '${deletionAt}' $$`);
+    await pool.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
+
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature=$1`, [classification.signature])).rows[0]?.count, '0');
+  });
+});
+
 void test('aggregates a bounded first-processing cohort with PostgreSQL timing and no identifiers', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -3349,7 +3409,11 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
 
     await insertTerminal(pool, 'purge-me', new Date(Date.now() - 1_000));
     await insertTerminal(pool, 'keep-me', new Date(Date.now() + 60_000));
-    await repository.enqueue(notification('failed-purge-me', 51n));
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at
+    ) VALUES ('failed-purge-me', 51, ARRAY['WEBSOCKET'], ARRAY[$1],
+      'processed', 'PENDING', clock_timestamp(), NULL)`, [PUMP_PROGRAM_ID]);
     const failedClaim = await repository.claim(Date.now(), 120);
     assert.equal(failedClaim?.signature, 'failed-purge-me');
     await repository.markFailed('failed-purge-me', failedClaim.leaseToken, Object.freeze({
@@ -4918,10 +4982,10 @@ async function insertTerminal(
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, normalized_transaction, immutable_fingerprint, observed_at,
-    processed_at, terminal_at, purge_after
+    processed_at, terminal_at, purge_after, first_detected_at
   ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'finalized', 'PROCESSED', $2, $3,
     $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
-    $4::TIMESTAMPTZ + INTERVAL '4 hours')`, [signature, snapshot, 'a'.repeat(64), completedAt]);
+    $4::TIMESTAMPTZ + INTERVAL '4 hours', NULL)`, [signature, snapshot, 'a'.repeat(64), completedAt]);
   await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
     signature,observed_slot,confirmation_status,finality_evidence_version,
     immutable_fingerprint,replay_completed_at
