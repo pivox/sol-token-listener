@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.1.2 — 2026-09-20 — issues #114, #142 et #143.
+Version : 1.1.3 — 2026-09-20 — issues #114, #142, #143 et #146.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
