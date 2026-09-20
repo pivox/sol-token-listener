@@ -18,8 +18,11 @@ Review budget: two GitHub cycles maximum
 - Define the bounded batch port and exact receipt validation.
 - Add PostgreSQL RED tests for WebSocket coverage, classified replay coverage,
   terminal receipt coverage, absence, slot/finality contradiction,
-  cancellation and preservation of status/priority/hint/lease/snapshot.
-- Implement one transaction with the retention fence and deterministic locks.
+  finalized-upgrade fallback, cancellation and preservation of
+  status/priority/hint/lease/snapshot/finality evidence, plus failed-first versus
+  success-second and success-first versus failed-second contradictions.
+- Implement one bounded read-only batch query with no advisory, mint or row
+  locks; add a concurrency regression against `syncTrackedMint`.
 - Keep the port uncomposed in production.
 
 ## Task 3 — Add the classifier fast path in RED
@@ -53,4 +56,3 @@ Review budget: two GitHub cycles maximum
 - Merge only with green CI and no blocking thread, then verify post-merge CI.
 - Do not run the Mainnet canary, H2e, H2c, wallet validation or any trade in this
   PR; the canary is the next separate roadmap step.
-

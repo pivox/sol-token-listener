@@ -1,11 +1,19 @@
 # Durable catch-up coverage fast path
 
 Status: approved for implementation
-Version: 1.0.0
+Version: 1.0.1
 Issue: #146
 Parent incident: #120
 Scope: Pump.fun observe-only catch-up admission; no wallet, signer, executor,
 armament, simulation or submission
+
+Revision history:
+
+- 1.0.0: initial coverage and failed-transaction fast-path design.
+- 1.0.1: keep confirmation advancement on the existing finality replay path,
+  make coverage a lock-free read-only batch compatible with tracked-mint
+  synchronization, and fail closed on both directions of execution-outcome
+  contradiction.
 
 ## Context
 
@@ -95,7 +103,7 @@ Add a neutral batch port used only by the Pump.fun page classifier:
 
 ```ts
 interface CatchUpAdmissionCoverageRepository {
-  recordExistingCatchUpCoverage(
+  readExistingCatchUpCoverage(
     discoveries: readonly MergedCatchUpDiscovery[],
     signal: AbortSignal,
   ): Promise<readonly CatchUpClassificationReceipt[]>;
@@ -105,27 +113,42 @@ interface CatchUpAdmissionCoverageRepository {
 The method accepts successful discoveries only and returns receipts only for
 durably covered identities. The caller derives the missing set by signature.
 
-The PostgreSQL implementation uses one bounded transaction for at most one
-page. It acquires the existing retention shared fence, locks signature advisory
-keys in lexical order, then verifies exact signature and slot against:
+The PostgreSQL implementation uses one bounded read-only query for at most one
+page. It acquires no advisory, mint or row lock and performs no update. This is
+deliberate: `syncTrackedMint` owns the existing mint -> row order, and a batch
+that held multiple row locks could deadlock with that writer. The query verifies
+exact signature and slot against:
 
 - `chain_transaction_inbox`, when the row has WebSocket provenance or an
   already persisted catch-up classification; or
 - `chain_transaction_finality_replay_receipts`, when the terminal receipt is
   compatible.
 
-For an inbox row, it merges `CATCH_UP` provenance and a compatible target
-confirmation status without changing processing status, priority, hint,
-attempts, lease, immutable snapshot, terminal timestamps or paper state. For a
-terminal receipt it performs no mutation. It returns the existing canonical
+For an inbox row, coverage is accepted only when WebSocket provenance or a
+persisted catch-up classification already proves durable admission and the
+incoming confirmation does not advance the stored target. A discovery that would advance
+`processed -> confirmed`, `confirmed -> finalized`, or any other target is
+reported as uncovered and follows the existing full classification/replay path;
+the fast path must never create a `PROCESSED/finalized` row without its finality
+replay receipt. Coverage does not add `CATCH_UP` provenance and does not change processing status, priority, hint,
+attempts, lease, immutable snapshot, finality evidence, terminal timestamps or
+paper state. The strict-run page cursor is the durable proof that catch-up
+encountered an already admitted signature; the row remains correctly attributed
+to the source that admitted it. For a terminal receipt it performs no mutation. It returns the existing canonical
 `ALREADY_ADMITTED / NOT_ENQUEUED / null` receipt.
+
+A successful discovery must not cover a stored catch-up classification whose
+reason is `SOLANA_TRANSACTION_FAILED`. That inverse outcome contradiction fails
+the whole batch rather than bypassing the immutable classification mismatch.
+Likewise, the direct failed path rejects an existing WebSocket or terminal
+success identity. Same-outcome failed replays remain idempotent.
 
 An absent identity is not an error and yields no receipt. A slot conflict,
 incompatible confirmation transition, malformed stored row, duplicate result,
 unexpected source, or cancellation fails the entire batch. No partial page can
 be reported as covered.
 
-The method never inserts a new inbox row. Consequently an absent or ambiguous
+The method never inserts or updates an inbox row. Consequently an absent or ambiguous
 successful signature always continues to full block hydration.
 
 ## Failed-transaction fast path
@@ -214,10 +237,12 @@ as ignored evidence, never as a processed launch or trade.
 - mixed pages preserve input receipt order and exact cardinality;
 - cancellation, replay, slot conflict and hostile repository results fail
   closed;
-- PostgreSQL integration proves one bounded batch, provenance convergence,
-  idempotent replay, finality compatibility and no mutation of priority/status;
+- PostgreSQL integration proves one bounded read-only batch, no row/mint lock,
+  idempotent replay, finality compatibility, finalized-upgrade fallback to the
+  existing replay path and no mutation of provenance/priority/status/finality
+  evidence, including concurrency with `syncTrackedMint` and both directions of
+  failed/success outcome contradiction;
 - build, strict checks, lint, unit tests, PostgreSQL integration tests,
   documentation checks and deployment contracts pass;
 - a separate post-merge Mainnet observe-only canary must prove the operational
   backlog and latency gates before H2e, H2c or any wallet access.
-
