@@ -11,7 +11,12 @@ import {
   LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
   listenerIngestionPrograms,
 } from '../src/application/listener-ingestion-programs.js';
-import { FinalityReconciler } from '../src/application/finality-reconciler.js';
+import {
+  FinalityReconciler,
+  FinalityReconcilerError,
+  type FinalityReconcilerErrorStage,
+} from '../src/application/finality-reconciler.js';
+import type { FinalityReconcilerDiagnosticV1 } from '../src/domain/finality-reconciler-diagnostic.js';
 import { PromotedProviderSelector } from '../src/application/promoted-provider-selector.js';
 import type {
   FinalityCandidate,
@@ -1377,6 +1382,280 @@ void test('finality startup fails closed by default without scheduling a retry',
   }
 });
 
+void test('finality diagnostics classify every trusted inner stage and reject lookalikes', async () => {
+  const expected = new Map<FinalityReconcilerErrorStage, string>([
+    ['list', 'FINALITY_LIST'],
+    ['pass', 'FINALITY_PASS'],
+    ['history', 'FINALITY_HISTORY'],
+    ['root', 'FINALITY_ROOT'],
+    ['poll', 'FINALITY_POLL'],
+    ['block', 'FINALITY_BLOCK'],
+    ['revision', 'FINALITY_REVISION'],
+    ['clock', 'FINALITY_CLOCK'],
+    ['finality-contradiction', 'FINALITY_CONTRADICTION'],
+  ]);
+  for (const [stage, reasonCode] of expected) {
+    assert.equal(await diagnosticReasonForRejectedPass(new FinalityReconcilerError(stage)), reasonCode);
+  }
+
+  const hostile = new Proxy({}, {
+    getPrototypeOf() { throw new Error('must stay private'); },
+  });
+  for (const rejection of [
+    'primitive failure',
+    { name: 'FinalityReconcilerError', stage: 'list' },
+    hostile,
+    new FinalityReconcilerError('bogus' as never),
+  ]) {
+    assert.equal(await diagnosticReasonForRejectedPass(rejection), 'UNKNOWN');
+  }
+});
+
+void test('finality diagnostics classify provider unavailable and changed without message matching', async () => {
+  const unavailable: FinalityReconcilerDiagnosticV1[] = [];
+  const unavailableController = new RecurringFinalityReconciler(
+    { async runOnce() { throw new Error('must not run'); } },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      currentSelection: () => Object.freeze({ providerId: null, revision: 0n }),
+      diagnosticNow: () => 1_000,
+      diagnosticSink: (diagnostic) => { unavailable.push(diagnostic); },
+    },
+  );
+  await assert.rejects(unavailableController.start(), /unavailable/u);
+  assert.equal(unavailable[0]?.reasonCode, 'PROVIDER_UNAVAILABLE');
+
+  let reads = 0;
+  const changed: FinalityReconcilerDiagnosticV1[] = [];
+  const changedController = new RecurringFinalityReconciler(
+    { async runOnce() { return undefined; } },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      currentSelection: () => Object.freeze({ providerId: 'primary', revision: BigInt(reads++) }),
+      diagnosticNow: () => 2_000,
+      diagnosticSink: (diagnostic) => { changed.push(diagnostic); },
+    },
+  );
+  await assert.rejects(changedController.start(), /changed/u);
+  assert.equal(changed[0]?.reasonCode, 'PROVIDER_CHANGED');
+});
+
+void test('fail-start offers degradation before rethrow and a later explicit start recovers once', async () => {
+  const scheduler = new ManualScheduler();
+  const diagnostics: FinalityReconcilerDiagnosticV1[] = [];
+  const times = [1_000, 1_050];
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (runs === 1) throw new FinalityReconcilerError('poll');
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      diagnosticNow: () => times.shift() ?? 1_050,
+      diagnosticSink: (diagnostic) => { diagnostics.push(diagnostic); },
+    },
+  );
+
+  await assert.rejects(recurring.start(), FinalityReconcilerError);
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.deepEqual(diagnostics.map(({ phase }) => phase), ['DEGRADED']);
+  assert.throws(() => { scheduler.fireScheduled(); }, /No callback is scheduled/u);
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(diagnostics, [
+    {
+      version: 1,
+      phase: 'DEGRADED',
+      reasonCode: 'FINALITY_POLL',
+      degradedAtMs: 1_000,
+      observedAtMs: 1_000,
+      durationMs: 0,
+      consecutiveFailures: 1,
+      suppressedFailures: 0,
+    },
+    {
+      version: 1,
+      phase: 'RECOVERED',
+      reasonCode: null,
+      degradedAtMs: 1_000,
+      observedAtMs: 1_050,
+      durationMs: 50,
+      consecutiveFailures: 1,
+      suppressedFailures: 0,
+    },
+  ]);
+  await recurring.close();
+});
+
+void test('degraded retry emits scheduled recovery without changing retry or readiness', async () => {
+  const scheduler = new ManualScheduler();
+  const diagnostics: FinalityReconcilerDiagnosticV1[] = [];
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (runs === 1) throw new FinalityReconcilerError('history');
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+      currentSelection: () => Object.freeze({ providerId: 'primary', revision: 0n }),
+      diagnosticNow: () => 4_000 + runs,
+      diagnosticSink: (diagnostic) => { diagnostics.push(diagnostic); },
+    },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(recurring.readyProviderId(), null);
+
+  const rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(recurring.readyProviderId(), 'primary');
+  assert.deepEqual(diagnostics.map(({ phase }) => phase), ['DEGRADED', 'RECOVERED']);
+  await recurring.close();
+});
+
+void test('a scheduled failure degrades and the next scheduled pass recovers exactly once', async () => {
+  const scheduler = new ManualScheduler();
+  const diagnostics: FinalityReconcilerDiagnosticV1[] = [];
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (runs === 2) throw new FinalityReconcilerError('block');
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      diagnosticNow: () => 6_000 + runs,
+      diagnosticSink: (diagnostic) => { diagnostics.push(diagnostic); },
+    },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(diagnostics, []);
+
+  let rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.deepEqual(diagnostics.map(({ phase, reasonCode }) => ({ phase, reasonCode })), [
+    { phase: 'DEGRADED', reasonCode: 'FINALITY_BLOCK' },
+  ]);
+
+  rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(diagnostics.map(({ phase }) => phase), ['DEGRADED', 'RECOVERED']);
+  await recurring.close();
+});
+
+void test('diagnostic clock and sink failures cannot alter reconciler state or retry scheduling', async () => {
+  const scheduler = new ManualScheduler();
+  let clockCalls = 0;
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (runs === 1) throw new Error('pass failed');
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+      diagnosticNow: () => {
+        clockCalls += 1;
+        if (clockCalls === 1) throw new Error('clock failed');
+        return Number.NaN;
+      },
+      diagnosticSink: () => { throw new Error('sink failed'); },
+    },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'DEGRADED');
+  const rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(runs, 2);
+  assert.equal(clockCalls, 2);
+  await recurring.close();
+});
+
+void test('close fences in-flight diagnostics and close timeout is not a pass failure', async () => {
+  const scheduler = new ManualScheduler();
+  const diagnostics: FinalityReconcilerDiagnosticV1[] = [];
+  const inFlight = deferred<undefined>();
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (runs > 1) {
+          await inFlight.promise;
+          throw new FinalityReconcilerError('root');
+        }
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      diagnosticSink: (diagnostic) => { diagnostics.push(diagnostic); },
+    },
+  );
+
+  await recurring.start();
+  scheduler.fireScheduled();
+  await Promise.resolve();
+  const closing = recurring.close();
+  inFlight.resolve(undefined);
+  await closing;
+  assert.deepEqual(diagnostics, []);
+  assert.equal(recurring.state(), 'STOPPED');
+
+  const stuck = deferred<undefined>();
+  const timeoutDiagnostics: FinalityReconcilerDiagnosticV1[] = [];
+  const timingOut = new RecurringFinalityReconciler(
+    { async runOnce() { await stuck.promise; } },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 1,
+      diagnosticSink: (diagnostic) => { timeoutDiagnostics.push(diagnostic); },
+    },
+  );
+  const starting = timingOut.start();
+  await Promise.resolve();
+  await assert.rejects(timingOut.close(), ListenerControllerCloseError);
+  assert.deepEqual(timeoutDiagnostics, []);
+  stuck.resolve(undefined);
+  await starting;
+});
+
 void test('finality recurrence degrades on an unavailable block then returns to RUNNING with a fresh proof', async () => {
   const scheduler = new ManualScheduler();
   const candidate: FinalityCandidate = Object.freeze({
@@ -1536,6 +1815,35 @@ function pass(providerId: 'primary' | 'fallback-1'): FinalityProviderPass {
     async getFinalizedSlot() { return 0n; },
     async getFinalizedBlockSignatures() { return Object.freeze([]); },
   });
+}
+
+async function diagnosticReasonForRejectedPass(
+  rejection: unknown,
+): Promise<FinalityReconcilerDiagnosticV1['reasonCode']> {
+  const diagnostics: FinalityReconcilerDiagnosticV1[] = [];
+  const recurring = new RecurringFinalityReconciler(
+    {
+      runOnce() {
+        // Deliberately models a hostile dependency that violates Error-only rejection conventions.
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+        return new Promise<never>((_resolve, reject) => { reject(rejection); });
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      diagnosticNow: () => 1_000,
+      diagnosticSink: (diagnostic) => { diagnostics.push(diagnostic); },
+    },
+  );
+  try {
+    await recurring.start();
+    assert.fail('The rejected finality pass unexpectedly succeeded.');
+  } catch {
+    assert.equal(recurring.state(), 'DEGRADED');
+  }
+  assert.equal(diagnostics.length, 1);
+  return diagnostics[0]?.reasonCode ?? null;
 }
 
 function count(source: string, pattern: RegExp): number {
