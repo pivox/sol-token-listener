@@ -1,6 +1,6 @@
 # Finality Reconciler Diagnostics Design
 
-Version: 1.0.2 — 2026-09-24 — issue #151
+Version: 1.0.3 — 2026-09-24 — issue #151
 
 Status: approved under the standing operator instruction to use the recommended
 safe option without pausing for resolvable questions
@@ -134,6 +134,12 @@ therefore reports zero suppressed failures; a summary at failure 12 reports
 ten suppressed failures because failures 2 through 11 were suppressed. Both
 counts are retained on the recovery diagnostic and reset only after it has
 been offered to the sink.
+
+The public diagnostic factory enforces this suppression invariant exactly for
+every unsaturated total. At the saturated total it requires at least the
+mathematical baseline reached on the first saturated failure; every higher
+suppression value up to saturation is reachable even though cadence is no
+longer represented in the public diagnostic.
 
 With `FAIL_START`, the first `DEGRADED` diagnostic is offered before the
 original startup failure is rethrown; no retry is scheduled. On the first

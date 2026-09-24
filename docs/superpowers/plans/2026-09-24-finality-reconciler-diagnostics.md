@@ -1,6 +1,6 @@
 # Bounded Finality Reconciler Diagnostics Implementation Plan
 
-Version: 1.0.5 — 2026-09-24 — issue #151
+Version: 1.0.7 — 2026-09-24 — issue #151
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development or superpowers:executing-plans and
@@ -32,7 +32,10 @@ Markdown operator documentation.
 
 Assert the exact closed reason vocabulary, exact own enumerable keys, frozen
 objects, non-negative safe integer bounds, phase/reason invariants and rejection
-of extra keys. Cover saturation at and below `Number.MAX_SAFE_INTEGER`.
+of extra keys. For every unsaturated total require
+`suppressedFailures === failures - 1 - floor(failures / 12)`; at total
+saturation require at least the first-reach suppression baseline. Cover the
+first failure, summary boundaries, saturation and recovery diagnostics.
 
 - [ ] **Step 2: Implement the minimal domain factory**
 
@@ -188,7 +191,7 @@ Commit composition and documentation separately.
 
 - [ ] **Step 1: Independent local review**
 
-Check the diff against issue #151 and design v1.0.2. Reject behavior changes,
+Check the diff against issue #151 and design v1.0.3. Reject behavior changes,
 unbounded logs, external values, API/storage widening, wallet/signing/submission
 imports and any raw error logging. Apply only findings reproduced by tests.
 
