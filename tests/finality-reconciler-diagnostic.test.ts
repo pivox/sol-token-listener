@@ -131,6 +131,73 @@ void test('enforces non-negative safe integer bounds and coherent incident timin
   assert.equal(boundary.suppressedFailures, Number.MAX_SAFE_INTEGER);
 });
 
+void test('enforces the reachable suppression count before total saturation for every phase', () => {
+  for (const phase of ['DEGRADED', 'RECOVERED'] as const) {
+    for (const [consecutiveFailures, suppressedFailures] of [
+      [1, 0],
+      [11, 10],
+      [12, 10],
+      [24, 21],
+    ] as const) {
+      const valid = diagnosticForPhase(phase, consecutiveFailures, suppressedFailures);
+      assert.equal(
+        createFinalityReconcilerDiagnostic(valid).suppressedFailures,
+        suppressedFailures,
+      );
+      assert.throws(
+        () => createFinalityReconcilerDiagnostic(diagnosticForPhase(
+          phase,
+          consecutiveFailures,
+          suppressedFailures + 1,
+        )),
+        isDiagnosticError,
+      );
+      if (suppressedFailures > 0) {
+        assert.throws(
+          () => createFinalityReconcilerDiagnostic(diagnosticForPhase(
+            phase,
+            consecutiveFailures,
+            suppressedFailures - 1,
+          )),
+          isDiagnosticError,
+        );
+      }
+    }
+  }
+});
+
+void test('requires the first-reach suppression baseline after total saturation for every phase', () => {
+  const total = Number.MAX_SAFE_INTEGER;
+  const baseline = total - 1 - Math.floor(total / 12);
+
+  for (const phase of ['DEGRADED', 'RECOVERED'] as const) {
+    assert.throws(
+      () => createFinalityReconcilerDiagnostic(diagnosticForPhase(
+        phase,
+        total,
+        baseline - 1,
+      )),
+      isDiagnosticError,
+    );
+    assert.equal(
+      createFinalityReconcilerDiagnostic(diagnosticForPhase(
+        phase,
+        total,
+        baseline,
+      )).suppressedFailures,
+      baseline,
+    );
+    assert.equal(
+      createFinalityReconcilerDiagnostic(diagnosticForPhase(
+        phase,
+        total,
+        Number.MAX_SAFE_INTEGER,
+      )).suppressedFailures,
+      Number.MAX_SAFE_INTEGER,
+    );
+  }
+});
+
 void test('increments valid counters and saturates at Number.MAX_SAFE_INTEGER', () => {
   assert.equal(saturatingDiagnosticIncrement(0), 1);
   assert.equal(
@@ -159,6 +226,19 @@ function validDiagnostic(overrides: Record<string, unknown> = {}): Record<string
     suppressedFailures: 0,
     ...overrides,
   };
+}
+
+function diagnosticForPhase(
+  phase: 'DEGRADED' | 'RECOVERED',
+  consecutiveFailures: number,
+  suppressedFailures: number,
+): Record<string, unknown> {
+  return validDiagnostic({
+    phase,
+    reasonCode: phase === 'DEGRADED' ? 'FINALITY_POLL' : null,
+    consecutiveFailures,
+    suppressedFailures,
+  });
 }
 
 function isDiagnosticError(error: unknown): boolean {

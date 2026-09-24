@@ -55,6 +55,10 @@ export function createFinalityReconcilerDiagnostic(
     || !isSafeNonNegativeInteger(fields.suppressedFailures)
     || fields.consecutiveFailures < 1
     || fields.suppressedFailures > fields.consecutiveFailures
+    || !isReachableSuppressionCount(
+      fields.consecutiveFailures,
+      fields.suppressedFailures,
+    )
     || fields.observedAtMs < fields.degradedAtMs
     || fields.durationMs !== fields.observedAtMs - fields.degradedAtMs) {
     invalid();
@@ -131,6 +135,18 @@ function isSafeNonNegativeInteger(value: unknown): value is number {
     && Number.isSafeInteger(value)
     && value >= 0
     && !Object.is(value, -0);
+}
+
+function isReachableSuppressionCount(
+  consecutiveFailures: number,
+  suppressedFailures: number,
+): boolean {
+  const firstSaturatedSuppressionCount = consecutiveFailures
+    - 1
+    - Math.floor(consecutiveFailures / 12);
+  return consecutiveFailures === Number.MAX_SAFE_INTEGER
+    ? suppressedFailures >= firstSaturatedSuppressionCount
+    : suppressedFailures === firstSaturatedSuppressionCount;
 }
 
 function invalid(): never {
