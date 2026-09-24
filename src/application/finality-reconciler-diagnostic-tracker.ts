@@ -32,9 +32,11 @@ const TRACKER_FIELDS = Object.freeze([
 
 type TrackerField = (typeof TRACKER_FIELDS)[number];
 
-const SATURATED_SUPPRESSION_BASELINE = Number.MAX_SAFE_INTEGER
-  - 1
-  - Math.floor(Number.MAX_SAFE_INTEGER / 12);
+const SATURATED_FAILURES = BigInt(Number.MAX_SAFE_INTEGER);
+const SATURATED_SUPPRESSION_BASELINE = SATURATED_FAILURES
+  - 1n
+  - SATURATED_FAILURES / 12n;
+const SATURATED_BASE_CADENCE = SATURATED_FAILURES % 12n;
 
 export function createFinalityDiagnosticTrackerState(
   seed?: unknown,
@@ -243,8 +245,16 @@ function coherentIncidentCounters(
   cadencePosition: number,
 ): boolean {
   if (consecutiveFailures === Number.MAX_SAFE_INTEGER) {
-    return suppressedFailures >= SATURATED_SUPPRESSION_BASELINE
-      && suppressedFailures <= Number.MAX_SAFE_INTEGER;
+    if (suppressedFailures === Number.MAX_SAFE_INTEGER) return true;
+    const suppressionDelta = BigInt(suppressedFailures)
+      - SATURATED_SUPPRESSION_BASELINE;
+    if (suppressionDelta < 0n) return false;
+    const cadence = BigInt(cadencePosition);
+    const failureOffset = (cadence - SATURATED_BASE_CADENCE + 12n) % 12n;
+    const summariesCrossed = (SATURATED_BASE_CADENCE + failureOffset) / 12n;
+    const suppressionAtOffset = failureOffset - summariesCrossed;
+    return suppressionDelta >= suppressionAtOffset
+      && (suppressionDelta - suppressionAtOffset) % 11n === 0n;
   }
   return cadencePosition === consecutiveFailures % 12
     && suppressedFailures === consecutiveFailures

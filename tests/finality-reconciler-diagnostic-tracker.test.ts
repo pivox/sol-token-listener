@@ -133,6 +133,41 @@ void test('saturates incident totals without stopping the independent cadence', 
   assert.equal(state.cadencePosition, 0);
 });
 
+void test('accepts only reachable cadence and suppression pairs after failure saturation', () => {
+  const maximum = BigInt(Number.MAX_SAFE_INTEGER);
+  const baseline = maximum - 1n - maximum / 12n;
+  const baseCadence = maximum % 12n;
+  const saturatedSeed = {
+    degradedAtMs: 3_000,
+    lastObservedAtMs: 3_010,
+    consecutiveFailures: Number.MAX_SAFE_INTEGER,
+    latestReasonCode: 'FINALITY_ROOT',
+  } as const;
+
+  assert.throws(() => createFinalityDiagnosticTrackerState({
+    ...saturatedSeed,
+    suppressedFailures: Number(baseline),
+    cadencePosition: 0,
+  }), TypeError);
+
+  for (let cadencePosition = 0; cadencePosition < 12; cadencePosition += 1) {
+    const cadence = BigInt(cadencePosition);
+    const offset = (cadence - baseCadence + 12n) % 12n;
+    const crossedSummaries = (baseCadence + offset) / 12n;
+    const suppressedFailures = baseline + offset - crossedSummaries;
+    assert.doesNotThrow(() => createFinalityDiagnosticTrackerState({
+      ...saturatedSeed,
+      suppressedFailures: Number(suppressedFailures),
+      cadencePosition,
+    }));
+    assert.doesNotThrow(() => createFinalityDiagnosticTrackerState({
+      ...saturatedSeed,
+      suppressedFailures: Number.MAX_SAFE_INTEGER,
+      cadencePosition,
+    }));
+  }
+});
+
 void test('clamps observation time and rejects malformed state, reason and time inputs', () => {
   const first = recordFinalityDiagnosticFailure(
     createFinalityDiagnosticTrackerState(),
