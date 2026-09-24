@@ -918,7 +918,7 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /canonicalRetentionCounters/);
   assert.match(
     smoke,
-    /'transactionInboxRecoveries',\n {2}'transactionInboxDecoderRecoveries',/u,
+    /'transactionInboxDecoderRecoveries',\n {2}'transactionInboxRecoveries',/u,
     'deployment smoke must expect the decoder recovery retention counter',
   );
   assert.match(
