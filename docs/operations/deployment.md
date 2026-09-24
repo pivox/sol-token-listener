@@ -97,6 +97,16 @@ les 30 secondes et utilise seulement les IDs positionnels. Elle ne revient pas
 automatiquement à `SolanaProgramSubscriber`; elle reste strictement
 observe/paper only, sans wallet, signature ni soumission.
 
+Le déploiement transmet `LISTENER_CATCH_UP_MAX_PAGES` (défaut `20`, borne
+`1..100`) et `LISTENER_CATCH_UP_PAGE_SIZE` (défaut `100`, borne `1..1000`)
+uniquement au service `app`. Toute modification exige un redémarrage. La valeur
+`1000` pour la taille de page est réservée au canary H2i observe-only explicitement
+surveillé ; elle ne modifie pas la concurrence RPC. Après le redémarrage, vérifiez
+que l'événement structuré `listener.foundation_ready` expose exactement les
+valeurs attendues dans `listenerCatchUpMaxPages` et
+`listenerCatchUpPageSize`. Ces deux nombres sont validés par l'application et ne
+contiennent aucun endpoint ni secret.
+
 Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis
 construisez ou tirez les images immuables validées. Depuis la racine du dépôt :
 

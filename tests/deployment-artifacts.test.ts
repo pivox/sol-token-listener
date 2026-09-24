@@ -286,6 +286,8 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
+    ['LISTENER_CATCH_UP_MAX_PAGES', '20'],
+    ['LISTENER_CATCH_UP_PAGE_SIZE', '100'],
     ['LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED', 'false'],
     ['LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED', 'false'],
     ['LISTENER_BLOCK_HYDRATION_ENABLED', 'false'],
@@ -316,6 +318,43 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   assert.match(localEnvironment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
   assert.equal((compose.match(/^ {6}LISTENER_INGESTION_SCOPE:/gmu) ?? []).length, 1);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
+});
+
+void test('Compose resolves catch-up scan limit defaults and overrides only for app', (context) => {
+  const docker = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 10_000 });
+  if (docker.error !== undefined || docker.status !== 0) {
+    context.skip('Docker Compose unavailable: resolved configuration contract skipped');
+    return;
+  }
+  for (const configured of [
+    Object.freeze({ maxPages: undefined, pageSize: undefined, expectedMaxPages: '20', expectedPageSize: '100' }),
+    Object.freeze({ maxPages: '37', pageSize: '777', expectedMaxPages: '37', expectedPageSize: '777' }),
+  ]) {
+    const result = spawnSync('docker', [
+      'compose', '--env-file', '/dev/null', '-f', 'deploy/compose.yaml', 'config', '--format', 'json',
+    ], {
+      cwd: fileURLToPath(root), encoding: 'utf8', timeout: 10_000,
+      env: {
+        PATH: process.env.PATH,
+        POSTGRES_DB: 'compose_contract', POSTGRES_USER: 'compose_contract',
+        POSTGRES_PASSWORD: 'contract-only', POSTGRES_PASSWORD_URI_ENCODED: 'contract-only',
+        BACKEND_IMAGE: 'registry.invalid/backend:test', FRONTEND_IMAGE: 'registry.invalid/frontend:test',
+        SOLANA_HTTP_RPC_URL: 'https://rpc.invalid', SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
+        ...(configured.maxPages === undefined ? {} : { LISTENER_CATCH_UP_MAX_PAGES: configured.maxPages }),
+        ...(configured.pageSize === undefined ? {} : { LISTENER_CATCH_UP_PAGE_SIZE: configured.pageSize }),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const resolved = JSON.parse(result.stdout) as {
+      readonly services: Readonly<Record<string, { readonly environment?: Readonly<Record<string, string>> }>>;
+    };
+    assert.equal(resolved.services.app?.environment?.LISTENER_CATCH_UP_MAX_PAGES, configured.expectedMaxPages);
+    assert.equal(resolved.services.app?.environment?.LISTENER_CATCH_UP_PAGE_SIZE, configured.expectedPageSize);
+    for (const service of ['postgres', 'migrate', 'retention', 'frontend']) {
+      assert.equal(resolved.services[service]?.environment?.LISTENER_CATCH_UP_MAX_PAGES, undefined);
+      assert.equal(resolved.services[service]?.environment?.LISTENER_CATCH_UP_PAGE_SIZE, undefined);
+    }
+  }
 });
 
 void test('Compose catch-up admission resolves default-off and explicit activation without other service exposure', (context) => {
