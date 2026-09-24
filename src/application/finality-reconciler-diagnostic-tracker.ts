@@ -32,6 +32,10 @@ const TRACKER_FIELDS = Object.freeze([
 
 type TrackerField = (typeof TRACKER_FIELDS)[number];
 
+const SATURATED_SUPPRESSION_BASELINE = Number.MAX_SAFE_INTEGER
+  - 1
+  - Math.floor(Number.MAX_SAFE_INTEGER / 12);
+
 export function createFinalityDiagnosticTrackerState(
   seed?: unknown,
 ): FinalityDiagnosticTrackerState {
@@ -61,7 +65,11 @@ export function createFinalityDiagnosticTrackerState(
     && lastObservedAtMs !== null
     && lastObservedAtMs >= degradedAtMs
     && consecutiveFailures >= 1
-    && suppressedFailures <= consecutiveFailures
+    && coherentIncidentCounters(
+      consecutiveFailures,
+      suppressedFailures,
+      cadencePosition,
+    )
     && latestReasonCode !== null;
   if (!inactive && !active) invalidState();
 
@@ -227,6 +235,21 @@ function optionalReason(value: unknown): FinalityReconcilerDiagnosticReason | nu
   if (value === null) return null;
   if (!isReason(value)) invalidState();
   return value;
+}
+
+function coherentIncidentCounters(
+  consecutiveFailures: number,
+  suppressedFailures: number,
+  cadencePosition: number,
+): boolean {
+  if (consecutiveFailures === Number.MAX_SAFE_INTEGER) {
+    return suppressedFailures >= SATURATED_SUPPRESSION_BASELINE
+      && suppressedFailures <= Number.MAX_SAFE_INTEGER;
+  }
+  return cadencePosition === consecutiveFailures % 12
+    && suppressedFailures === consecutiveFailures
+      - 1
+      - Math.floor(consecutiveFailures / 12);
 }
 
 function isReason(value: unknown): value is FinalityReconcilerDiagnosticReason {
