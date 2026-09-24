@@ -262,15 +262,36 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              AND NOT COALESCE((
                inbox.catch_up_classification_version=1
                AND inbox.catch_up_enqueued=FALSE
+               AND inbox.discovery_sources=ARRAY['CATCH_UP']::TEXT[]
+               AND inbox.catch_up_mints IS NOT NULL
+               AND transaction_inbox_catch_up_mints_valid(inbox.catch_up_mints)
+               AND inbox.catch_up_evidence_fingerprint ~ '^[0-9a-f]{64}$'
+               AND inbox.catch_up_classified_at IS NOT NULL
+               AND isfinite(inbox.catch_up_classified_at)
+               AND inbox.catch_up_classified_at>=inbox.observed_at
+               AND inbox.catch_up_classified_at<=TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+               AND date_trunc('milliseconds',inbox.catch_up_classified_at)=inbox.catch_up_classified_at
+               AND inbox.terminal_at=inbox.catch_up_classified_at
+               AND inbox.purge_after=inbox.terminal_at+INTERVAL '4 hours'
+               AND inbox.ingestion_priority='NORMAL'
                AND (
                  (inbox.processing_status='IGNORED'
                    AND inbox.catch_up_disposition='IGNORED'
                    AND inbox.catch_up_reason_code IN (
                      'SOLANA_TRANSACTION_FAILED','NO_SUPPORTED_PUMP_ACTION'
-                   ))
+                   )
+                   AND inbox.catch_up_action_key='NONE'
+                   AND inbox.catch_up_mints=ARRAY[]::TEXT[]
+                   AND inbox.ingestion_hint='NONE'
+                   AND inbox.ingestion_hint_mint IS NULL)
                  OR (inbox.processing_status='DEFERRED'
                    AND inbox.catch_up_disposition='DEFERRED'
-                   AND inbox.catch_up_reason_code='PUMP_TRADE_UNTRACKED')
+                   AND inbox.catch_up_reason_code='PUMP_TRADE_UNTRACKED'
+                   AND CARDINALITY(inbox.catch_up_mints)>=1
+                   AND inbox.ingestion_hint='PUMPFUN_TRADE'
+                   AND transaction_inbox_solana_public_key_valid(inbox.ingestion_hint_mint)
+                   AND inbox.catch_up_action_key='PUMPFUN_TRADE:' || inbox.ingestion_hint_mint
+                   AND inbox.ingestion_hint_mint=ANY(inbox.catch_up_mints))
                )
                AND inbox.attempts=0
                AND inbox.attempts_in_cycle=0
