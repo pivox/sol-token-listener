@@ -13,6 +13,7 @@ import {
   type StrictCatchUpScanResult,
 } from '../src/application/strict-catch-up-scanner.js';
 import {
+  WEBSOCKET_FRONTIER_INTERVAL_MS,
   WebSocketFailoverSupervisor,
   type WebSocketFailoverScheduler,
 } from '../src/application/websocket-failover-supervisor.js';
@@ -706,7 +707,7 @@ void test('persists native partial-ACK and setup-timeout failures after the real
   }
 });
 
-void test('restarts a paused fallback run, then bridges its frozen H1 to H2 before promotion in a fresh process', async (context) => {
+void test('restarts a paused fallback run, then bridges frozen H1 to H2 on the same candidate session', async (context) => {
   await withDatabase(context, async (pool) => {
     const inbox = new PostgresTransactionInboxRepository(pool);
     const health = new PostgresWebSocketHealthRepository(pool);
@@ -720,7 +721,9 @@ void test('restarts a paused fallback run, then bridges its frozen H1 to H2 befo
       providerId,
       async list(_programId: string, before: string | undefined) {
         sourceCalls.push([providerId, before]);
+        if (before === STRICT_WINDOW_LAUNCHPAD_SIGNATURE) freshHead = true;
         const rows: [string, bigint][] = freshHead
+          && before === undefined
           ? [[STRICT_WINDOW_MARKET_SIGNATURE, 46n], [MULTI_PAGE_SIGNATURE, 45n]]
           : before === undefined
           ? [[MULTI_PAGE_SIGNATURE, 45n], [SHARED_SIGNATURE, 44n]]
@@ -758,33 +761,19 @@ void test('restarts a paused fallback run, then bridges its frozen H1 to H2 befo
       reporter: reporterFor(inbox, health), strict });
     await restarted.start();
     restartScheduler.fire(0);
-    await waitForPhase(health, 'DEGRADED');
-    assert.equal(restarted.activeProviderId(), null);
+    await waitForProvider(restarted, 'fallback-1');
+    assert.equal(restarted.activeProviderId(), 'fallback-1');
     assert.equal(restartSessions.count, 1);
-    assert.equal(restartSessions.at(0).closeCalls, 1);
-    assert.deepEqual(restartScheduler.pendingDelays(), [500]);
+    assert.equal(restartSessions.at(0).closeCalls, 0);
+    assert.deepEqual(restartScheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
     assert.equal(await inbox.readActiveStrictCatchUpRun('launchpad'), null);
-    assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, MULTI_PAGE_SIGNATURE);
-    assert.deepEqual(sourceCalls, [['fallback-1', undefined], ['fallback-1', SHARED_SIGNATURE],
-      ['fallback-1', STRICT_WINDOW_LAUNCHPAD_SIGNATURE]]);
-    assert.equal(await unresolvedStrictFailureCount(pool), 0);
-    await restarted.close();
-
-    // No in-memory flag survives: the canonical checkpoint alone forces H2 -> H1.
-    freshHead = true;
-    const bridgeScheduler = new ManualScheduler();
-    const bridgeSessions = new SessionFactory();
-    const bridge = supervisorFor({ inbox, health, scheduler: bridgeScheduler, sessions: bridgeSessions,
-      reporter: reporterFor(inbox, health), strict });
-    await bridge.start();
-    bridgeScheduler.fire(0);
-    await waitForProvider(bridge, 'primary');
-    assert.equal(bridgeSessions.count, 1);
     assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, STRICT_WINDOW_MARKET_SIGNATURE);
+    assert.deepEqual(sourceCalls, [['fallback-1', undefined], ['fallback-1', SHARED_SIGNATURE],
+      ['fallback-1', STRICT_WINDOW_LAUNCHPAD_SIGNATURE], ['fallback-1', undefined]]);
+    assert.equal(await unresolvedStrictFailureCount(pool), 0);
     assert.equal((await pool.query('SELECT 1 FROM chain_transaction_inbox WHERE signature=$1', [STRICT_WINDOW_MARKET_SIGNATURE])).rowCount, 1);
-    assert.deepEqual(sourceCalls.at(-1), ['primary', undefined]);
     assert.equal(sourceCalls.length, 4);
-    await bridge.close();
+    await restarted.close();
   });
 });
 

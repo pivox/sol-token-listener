@@ -231,10 +231,18 @@ health reason. Page-budget exhaustion throws a typed retryable
 and aggregate counters. It contains no signatures or endpoints in its public
 message.
 
-The supervisor treats this error as a recoverable degraded cycle pinned to the
-same provider. It must not call `becomeUnrecoverable`, promote the WebSocket
-session, or report readiness `RUNNING` while any active run remains incomplete.
-The next scheduled recovery resumes the run.
+The supervisor treats `StrictCatchUpRefreshRequiredError` as one bounded
+continuation on the same provider, session and abort scope. It must not call
+`becomeUnrecoverable` or promote a candidate between the two scans. The second
+scan must complete before candidate readiness becomes `RUNNING`. An already
+promoted incumbent may remain `RUNNING` during its serialized periodic
+continuation because its WebSocket continues durable ingestion.
+
+`StrictCatchUpPausedError` remains a recoverable degraded cycle pinned to the
+same provider. It must not promote the WebSocket session or report candidate
+readiness `RUNNING` while an active run remains incomplete. The next scheduled
+recovery resumes the run. A second refresh in one operation follows this same
+fail-closed cleanup and scheduled-recovery boundary.
 
 ## Failure and concurrency behavior
 

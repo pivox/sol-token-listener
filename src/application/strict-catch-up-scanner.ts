@@ -101,6 +101,8 @@ export class StrictCatchUpPausedError extends Error {
   }
 }
 
+const STRICT_CATCH_UP_REFRESH_ERRORS = new WeakSet();
+
 export class StrictCatchUpRefreshRequiredError extends Error {
   public readonly code = 'CATCH_UP_REFRESH_REQUIRED' as const;
   public readonly retryable = true;
@@ -109,8 +111,24 @@ export class StrictCatchUpRefreshRequiredError extends Error {
   public constructor(public readonly providerId: RpcProviderId) {
     super('Strict catch-up requires a fresh recovery cycle.');
     Object.defineProperty(this, 'name', { value: 'StrictCatchUpRefreshRequiredError' });
+    STRICT_CATCH_UP_REFRESH_ERRORS.add(this);
     Object.freeze(this);
   }
+}
+
+export function isStrictCatchUpRefreshRequiredError(
+  value: unknown,
+  providerId: RpcProviderId,
+): value is StrictCatchUpRefreshRequiredError {
+  if (typeof value !== 'object' || value === null || isProxy(value)
+    || !STRICT_CATCH_UP_REFRESH_ERRORS.has(value)
+    || !Object.isFrozen(value)
+    || Object.getPrototypeOf(value) !== StrictCatchUpRefreshRequiredError.prototype) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'providerId');
+  return descriptor !== undefined
+    && descriptor.enumerable === true
+    && 'value' in descriptor
+    && descriptor.value === providerId;
 }
 
 export class StrictCatchUpProviderAffinityError extends Error {
