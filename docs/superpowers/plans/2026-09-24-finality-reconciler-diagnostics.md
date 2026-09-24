@@ -1,6 +1,6 @@
 # Bounded Finality Reconciler Diagnostics Implementation Plan
 
-Version: 1.0.0 — 2026-09-24 — issue #151
+Version: 1.0.1 — 2026-09-24 — issue #151
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development or superpowers:executing-plans and
@@ -84,12 +84,16 @@ recordFinalityDiagnosticFailure(state, reasonCode, observedAtMs): FinalityDiagno
 recordFinalityDiagnosticRecovery(state, observedAtMs): FinalityDiagnosticReduction
 ```
 
-All returned state and diagnostics are frozen and detached. Assert immediate
+All returned state and diagnostics are frozen and detached. Before saturation,
+the state factory rejects any seed whose cadence and suppressed count do not
+match the total failure count. Assert immediate
 failure 1, no event for failures 2–11, a summary on 12 carrying the latest
 reason, continued summaries at 24, cumulative suppressed counts and one
-recovery. Seed the pure tracker at `Number.MAX_SAFE_INTEGER - 1` with cadence
-position 11 and prove that total saturation does not stop the independent
-0-to-11 cadence. Cover non-regressing time, invalid/throwing injected clock,
+recovery. Seed the pure tracker at `Number.MAX_SAFE_INTEGER` with its
+mathematically reachable baseline suppressed count and cadence position
+`Number.MAX_SAFE_INTEGER % 12`; prove that later saturated failures still reach
+the next summary and continue the independent 0-to-11 cadence. Cover
+non-regressing time, invalid/throwing injected clock,
 throwing sink, close in flight and close timeout. The close timeout must not be
 reported as a pass failure.
 
