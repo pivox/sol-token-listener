@@ -858,6 +858,126 @@ void test('worker-eligible cohort: excludes only exact never-worker-touched catc
   });
 });
 
+void test('worker-eligible coherence: keeps a pristine WebSocket-admitted classification eligible', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const signature = 'canary-websocket-catch-up-pristine';
+    await repository.enqueue(Object.freeze({
+      ...notification(signature, 1n, 'WEBSOCKET', 'confirmed'),
+      observedAtMs: startedAtMs,
+    }));
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      observedAtMs: startedAtMs,
+      classifiedAtMs: startedAtMs + 1,
+      disposition: 'IGNORED',
+      reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null,
+      ingestionHintMint: null,
+      mints: [],
+    }));
+    const stored = await row(pool, signature);
+    assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.equal(stored.attempts, 0);
+    assert.equal(stored.catch_up_enqueued, false);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.terminalCount, 1);
+  });
+});
+
+void test('worker-eligible coherence: keeps every malformed V1 receipt field fail-closed', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const corruptions = [
+      { name: 'classification-version', disposition: 'IGNORED', mutation: 'catch_up_classification_version=2' },
+      { name: 'processing-status', disposition: 'IGNORED', mutation: "processing_status='QUARANTINED'" },
+      { name: 'disposition', disposition: 'IGNORED', mutation: "catch_up_disposition='QUARANTINED'" },
+      { name: 'reason-code', disposition: 'IGNORED', mutation: "catch_up_reason_code='PUMP_TRADE_UNTRACKED'" },
+      { name: 'enqueued-absent', disposition: 'IGNORED', mutation: 'catch_up_enqueued=NULL' },
+      { name: 'enqueued-true', disposition: 'IGNORED', mutation: 'catch_up_enqueued=TRUE' },
+      { name: 'ignored-action-key', disposition: 'IGNORED', mutation: "catch_up_action_key='PUMPFUN_CREATE'" },
+      { name: 'ignored-mints', disposition: 'IGNORED', mutation: `catch_up_mints=ARRAY['${tradeMint}']` },
+      { name: 'ignored-hint', disposition: 'IGNORED', mutation: "ingestion_hint='PUMPFUN_CREATE'" },
+      { name: 'ignored-hint-mint', disposition: 'IGNORED', mutation: `ingestion_hint_mint='${tradeMint}'` },
+      { name: 'deferred-action-key', disposition: 'DEFERRED',
+        mutation: `catch_up_action_key='PUMPFUN_TRADE:${PUMPSWAP_PROGRAM_ID}'` },
+      { name: 'deferred-mints', disposition: 'DEFERRED',
+        mutation: `catch_up_mints=ARRAY['${PUMPSWAP_PROGRAM_ID}']` },
+      { name: 'deferred-hint', disposition: 'DEFERRED', mutation: "ingestion_hint='NONE'" },
+      { name: 'deferred-hint-mint', disposition: 'DEFERRED',
+        mutation: `ingestion_hint_mint='${PUMPSWAP_PROGRAM_ID}'` },
+      { name: 'fingerprint-absent', disposition: 'IGNORED', mutation: 'catch_up_evidence_fingerprint=NULL' },
+      { name: 'fingerprint-invalid', disposition: 'IGNORED',
+        mutation: `catch_up_evidence_fingerprint='${'z'.repeat(64)}'` },
+      { name: 'classified-at-absent', disposition: 'IGNORED', mutation: 'catch_up_classified_at=NULL' },
+      { name: 'classified-at-before-observation', disposition: 'IGNORED',
+        mutation: "catch_up_classified_at=observed_at-INTERVAL '1 millisecond'" },
+      { name: 'observed-at-after-classification', disposition: 'IGNORED',
+        mutation: "observed_at=catch_up_classified_at+INTERVAL '1 millisecond'" },
+      { name: 'terminal-at-absent', disposition: 'IGNORED', mutation: 'terminal_at=NULL' },
+      { name: 'terminal-at-incoherent', disposition: 'IGNORED',
+        mutation: "terminal_at=catch_up_classified_at+INTERVAL '1 millisecond'" },
+      { name: 'deferred-terminal-at-absent', disposition: 'DEFERRED', mutation: 'terminal_at=NULL' },
+      { name: 'purge-after-absent', disposition: 'IGNORED', mutation: 'purge_after=NULL' },
+      { name: 'purge-after-incoherent', disposition: 'IGNORED',
+        mutation: "purge_after=terminal_at+INTERVAL '4 hours 1 millisecond'" },
+      { name: 'deferred-purge-after-incoherent', disposition: 'DEFERRED',
+        mutation: "purge_after=terminal_at+INTERVAL '4 hours 1 millisecond'" },
+      { name: 'catch-up-source-absent', disposition: 'IGNORED',
+        mutation: "discovery_sources=ARRAY['WEBSOCKET']" },
+      { name: 'ingestion-priority', disposition: 'IGNORED', mutation: "ingestion_priority='TRACKED_TRADE'" },
+    ] as const;
+    for (const [index, corruption] of corruptions.entries()) {
+      const signature = `canary-malformed-receipt-${corruption.name}`;
+      const deferred = corruption.disposition === 'DEFERRED';
+      await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput(signature),
+        slot: BigInt(index + 1),
+        observedAtMs: startedAtMs,
+        classifiedAtMs: startedAtMs + index + 1,
+        disposition: deferred ? 'DEFERRED' : 'IGNORED',
+        reasonCode: deferred ? 'PUMP_TRADE_UNTRACKED' : 'NO_SUPPORTED_PUMP_ACTION',
+        ingestionHint: deferred ? 'PUMPFUN_TRADE' : null,
+        ingestionHintMint: deferred ? tradeMint : null,
+        mints: deferred ? [tradeMint] : [],
+      }));
+    }
+    await dropInboxIntegrityGuards(pool);
+    for (const corruption of corruptions) {
+      await pool.query(`UPDATE chain_transaction_inbox SET ${corruption.mutation}
+        WHERE signature=$1`, [`canary-malformed-receipt-${corruption.name}`]);
+    }
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, corruptions.length);
+    assert.equal(evidence.terminalCount, corruptions.length);
+  });
+});
+
+void test('worker-eligible coherence: keeps IGNORED without an exact classification eligible', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const signature = 'canary-ignored-without-classification';
+    await repository.enqueue(Object.freeze({
+      ...notification(signature, 1n, 'WEBSOCKET', 'confirmed'),
+      observedAtMs: startedAtMs,
+    }));
+    await dropInboxIntegrityGuards(pool);
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='IGNORED',
+      terminal_at=first_detected_at,purge_after=first_detected_at+INTERVAL '4 hours'
+      WHERE signature=$1`, [signature]);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.terminalCount, 1);
+  });
+});
+
 void test('worker-eligible cohort: keeps unrelated, incomplete, contradictory and failed rows fail-closed', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -960,16 +1080,23 @@ void test('worker-eligible cohort: keeps every individual worker-history contrad
     const contradictions = [
       "attempts=1",
       "attempts_in_cycle=1",
-      "lease_token='active-lease', lease_expires_at=clock_timestamp()+INTERVAL '1 minute'",
+      "lease_token='active-lease'",
+      "lease_expires_at=clock_timestamp()+INTERVAL '1 minute'",
       "normalized_transaction='{}'::JSONB",
       `immutable_fingerprint='${'b'.repeat(64)}'`,
       "processed_at=first_detected_at+INTERVAL '1 millisecond'",
       "first_processed_at=first_detected_at+INTERVAL '1 millisecond'",
-      "manual_recovery_count=1, last_manual_recovery_at=first_detected_at+INTERVAL '1 millisecond'",
+      "manual_recovery_count=1",
+      "last_manual_recovery_at=first_detected_at+INTERVAL '1 millisecond'",
+      "decoder_recovery_used=TRUE",
+      "decoder_quarantine_eligible_at=first_detected_at",
       "next_attempt_at=first_detected_at+INTERVAL '1 millisecond'",
       "retry_exhausted_at=first_detected_at+INTERVAL '1 millisecond'",
-      "error_code='RPC_TRANSIENT', error_name='CanaryFailure', error_retryable=TRUE",
-      "missing_finality_polls=1, last_missing_finality_provider_id='primary'",
+      "error_code='RPC_TRANSIENT'",
+      "error_name='CanaryFailure'",
+      "error_retryable=TRUE",
+      "missing_finality_polls=1",
+      "last_missing_finality_provider_id='primary'",
       "finality_evidence_version=1",
       "first_processing_evidence_unavailable=TRUE",
       "catch_up_admission_priority='NORMAL'",
@@ -988,13 +1115,7 @@ void test('worker-eligible cohort: keeps every individual worker-history contrad
       }));
     }
 
-    const checks = await pool.query<{ readonly conname: string }>(`SELECT conname
-      FROM pg_constraint WHERE conrelid='chain_transaction_inbox'::REGCLASS AND contype='c'`);
-    for (const { conname } of checks.rows) {
-      await pool.query(`ALTER TABLE chain_transaction_inbox DROP CONSTRAINT ${quoteIdentifier(conname)}`);
-    }
-    await pool.query(`DROP TRIGGER IF EXISTS chain_transaction_inbox_first_processing_guard
-      ON chain_transaction_inbox`);
+    await dropInboxIntegrityGuards(pool);
     for (let index = 0; index < contradictions.length; index += 1) {
       await pool.query(`UPDATE chain_transaction_inbox SET ${contradictions[index]}
         WHERE signature=$1`, [`canary-worker-history-${index}`]);
@@ -5793,6 +5914,19 @@ async function insertCanaryInboxRow(
     CASE WHEN $4::TEXT='FAILED' THEN $6::BOOLEAN ELSE NULL END,
     CASE WHEN $6::BOOLEAN THEN to_timestamp(($2::BIGINT + 1) / 1000.0) ELSE NULL END
   )`, [signature, detectedAtMs, processedAtMs, processingStatus, unavailable, exhausted, 'a'.repeat(64)]);
+}
+
+async function dropInboxIntegrityGuards(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  const checks = await pool.query<{ readonly conname: string }>(`SELECT conname
+    FROM pg_constraint WHERE conrelid='chain_transaction_inbox'::REGCLASS AND contype='c'`);
+  for (const { conname } of checks.rows) {
+    await pool.query(`ALTER TABLE chain_transaction_inbox DROP CONSTRAINT ${quoteIdentifier(conname)}`);
+  }
+  const triggers = await pool.query<{ readonly tgname: string }>(`SELECT tgname FROM pg_trigger
+    WHERE tgrelid='chain_transaction_inbox'::REGCLASS AND NOT tgisinternal`);
+  for (const { tgname } of triggers.rows) {
+    await pool.query(`DROP TRIGGER ${quoteIdentifier(tgname)} ON chain_transaction_inbox`);
+  }
 }
 
 async function strictCatchUpRunRow(
