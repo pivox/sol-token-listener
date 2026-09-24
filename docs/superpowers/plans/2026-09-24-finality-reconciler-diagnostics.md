@@ -1,6 +1,6 @@
 # Bounded Finality Reconciler Diagnostics Implementation Plan
 
-Version: 1.0.2 — 2026-09-24 — issue #151
+Version: 1.0.3 — 2026-09-24 — issue #151
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development or superpowers:executing-plans and
@@ -144,6 +144,7 @@ records contain exactly event plus diagnostic fields. Prove no error, stack,
 URL, signature, payload, mint, wallet or secret field can enter the record.
 Add a logger method returning a rejected native Promise and prove its rejection
 is consumed without awaiting or delaying the reconciler.
+Also assert directly that synchronous `warn` and `info` throws are contained.
 
 - [ ] **Step 2: Implement and compose the logger adapter**
 
@@ -183,7 +184,7 @@ Commit composition and documentation separately.
 
 - [ ] **Step 1: Independent local review**
 
-Check the diff against issue #151 and design v1.0.0. Reject behavior changes,
+Check the diff against issue #151 and design v1.0.1. Reject behavior changes,
 unbounded logs, external values, API/storage widening, wallet/signing/submission
 imports and any raw error logging. Apply only findings reproduced by tests.
 

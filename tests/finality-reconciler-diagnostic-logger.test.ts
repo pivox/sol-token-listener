@@ -155,3 +155,21 @@ void test('diagnostic logger never inspects or invokes an arbitrary thenable', (
   assert.doesNotThrow(() => { sink(diagnostic('DEGRADED')); });
   assert.equal(thenReads, 0);
 });
+
+void test('diagnostic logger contains synchronous warn and info failures directly', () => {
+  let calls = 0;
+  const sink = createFinalityReconcilerDiagnosticSink(Object.freeze({
+    warn(): never {
+      calls += 1;
+      throw new Error('private synchronous warn failure');
+    },
+    info(): never {
+      calls += 1;
+      throw new Error('private synchronous info failure');
+    },
+  }));
+
+  assert.doesNotThrow(() => { sink(diagnostic('DEGRADED')); });
+  assert.doesNotThrow(() => { sink(diagnostic('RECOVERED')); });
+  assert.equal(calls, 2);
+});
