@@ -259,6 +259,42 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            CROSS JOIN sampled
            WHERE inbox.first_detected_at >= to_timestamp($1 / 1000.0)
              AND inbox.first_detected_at < LEAST(sampled.sampled_at, to_timestamp($2 / 1000.0))
+             AND NOT COALESCE((
+               inbox.catch_up_classification_version=1
+               AND inbox.catch_up_enqueued=FALSE
+               AND (
+                 (inbox.processing_status='IGNORED'
+                   AND inbox.catch_up_disposition='IGNORED'
+                   AND inbox.catch_up_reason_code IN (
+                     'SOLANA_TRANSACTION_FAILED','NO_SUPPORTED_PUMP_ACTION'
+                   ))
+                 OR (inbox.processing_status='DEFERRED'
+                   AND inbox.catch_up_disposition='DEFERRED'
+                   AND inbox.catch_up_reason_code='PUMP_TRADE_UNTRACKED')
+               )
+               AND inbox.attempts=0
+               AND inbox.attempts_in_cycle=0
+               AND inbox.lease_token IS NULL
+               AND inbox.lease_expires_at IS NULL
+               AND inbox.normalized_transaction IS NULL
+               AND inbox.immutable_fingerprint IS NULL
+               AND inbox.processed_at IS NULL
+               AND inbox.first_processed_at IS NULL
+               AND inbox.manual_recovery_count=0
+               AND inbox.last_manual_recovery_at IS NULL
+               AND inbox.decoder_recovery_used=FALSE
+               AND inbox.decoder_quarantine_eligible_at IS NULL
+               AND inbox.next_attempt_at IS NULL
+               AND inbox.retry_exhausted_at IS NULL
+               AND inbox.error_code IS NULL
+               AND inbox.error_name IS NULL
+               AND inbox.error_retryable IS NULL
+               AND inbox.missing_finality_polls=0
+               AND inbox.last_missing_finality_provider_id IS NULL
+               AND inbox.finality_evidence_version=0
+               AND inbox.first_processing_evidence_unavailable=FALSE
+               AND inbox.catch_up_admission_priority IS NULL
+             ),FALSE)
            ORDER BY inbox.first_detected_at, inbox.signature
            LIMIT $3
          ), classified AS MATERIALIZED (
