@@ -27,4 +27,3 @@ production Compose deployment and attest their effective parsed values.
 
 No change may enable live execution, inspect a wallet, increase request
 concurrency, expose RPC endpoints, or place these variables on another service.
-

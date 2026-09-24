@@ -33,4 +33,3 @@ environment and in `deploy/env.example`. A resolved Compose test proves defaults
 and non-default overrides, and proves absence from all other services. Bootstrap
 tests pin the exact effective foundation log. The deployment runbook documents
 the effective-log check after restart.
-
