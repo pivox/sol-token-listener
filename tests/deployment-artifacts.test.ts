@@ -722,12 +722,15 @@ void test('decoder quarantine runbook documents bounded observation-only recover
     readArtifact('docs/superpowers/specs/2026-09-20-pumpfun-decoder-quarantine-design.md'),
     readArtifact('docs/superpowers/plans/2026-09-20-pumpfun-decoder-quarantine.md'),
   ]);
-  assert.match(design, /Version: 1\.0\.2/u);
-  assert.match(plan, /Version: 1\.0\.3/u);
+  assert.match(design, /Version: 1\.0\.3/u);
+  assert.match(plan, /Version: 1\.0\.4/u);
   assert.match(plan, /docs\/operations\/block-hydration-canary\.md/u);
   assert.doesNotMatch(plan, /docs\/runbooks\/mainnet-observe-dry-run\.md/u);
   assert.match(runbook, /heartbeat\.decoderQuarantine[^.]{0,200}unresolvedCount/iu);
   assert.match(runbook, /npm run inbox:recover-decoder -- --signature=<SIGNATURE> --confirm=<SIGNATURE>/u);
+  assert.match(runbook, /SELECT\s+signature[\s\S]{0,1800}chain_transaction_inbox/iu);
+  assert.match(runbook, /terminal_at[\s\S]{0,240}signature/iu);
+  assert.match(runbook, /local[^.]{0,240}(?:non publié|ne doit pas être publié)/iu);
   for (const code of [
     'DECODER_RECOVERY_SCHEDULED', 'DECODER_RECOVERY_ALREADY_SCHEDULED',
     'DECODER_RECOVERY_NOT_FOUND', 'DECODER_RECOVERY_EXPIRED',

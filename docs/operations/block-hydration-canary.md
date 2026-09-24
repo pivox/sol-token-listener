@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.0 — 2026-09-24 — issues #114, #142, #143, #146 et #148.
+Version : 1.2.1 — 2026-09-24 — issues #114, #142, #143, #146 et #148.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -18,8 +18,41 @@ Le champ public `heartbeat.decoderQuarantine` expose uniquement `version: 1` et
 compteur non nul identifie un travail d'observation incompatible conservé, sans
 exposer signature, mint, payload, URL, message d'erreur ou donnée de wallet.
 
-L'opérateur doit d'abord déployer et vérifier le décodeur corrigé, puis lancer
-localement, pour une signature exacte encore retenue :
+L'opérateur doit d'abord déployer et vérifier le décodeur corrigé. Si le
+compteur est non nul, il identifie les signatures candidates avec la requête
+locale suivante, exécutée avec le rôle PostgreSQL dédié au listener :
+
+```sql
+SELECT signature
+FROM chain_transaction_inbox inbox
+WHERE processing_status = 'FAILED'
+  AND error_code = 'PIPELINE_STAGE_FAILED'
+  AND error_retryable = FALSE
+  AND error_name IN (
+    'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+    'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_TRUNCATED'
+  )
+  AND retry_exhausted_at IS NULL
+  AND processed_at IS NULL
+  AND lease_token IS NULL
+  AND lease_expires_at IS NULL
+  AND next_attempt_at IS NULL
+  AND terminal_at IS NOT NULL
+  AND purge_after = terminal_at + INTERVAL '4 hours'
+  AND purge_after > clock_timestamp()
+  AND normalized_transaction IS NOT NULL
+  AND immutable_fingerprint IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM transaction_inbox_decoder_recoveries recovery
+    WHERE recovery.signature = inbox.signature
+  )
+ORDER BY terminal_at, signature;
+```
+
+Cette liste reste un artefact opérateur local et ne doit pas être publiée. Le
+repository recalcule le compteur après validation canonique du snapshot et de
+son fingerprint ; la commande ci-dessous effectue à nouveau cette validation
+sous verrou. Pour chaque signature exacte encore retenue, lancer localement :
 
 ```bash
 npm run inbox:recover-decoder -- --signature=<SIGNATURE> --confirm=<SIGNATURE>

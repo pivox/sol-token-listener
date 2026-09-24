@@ -1,6 +1,6 @@
 # Pump.fun Decoder Quarantine and Replay Design
 
-Version: 1.0.2 — 2026-09-24 — issue #148
+Version: 1.0.3 — 2026-09-24 — issue #148
 
 Status: approved for implementation under the standing operator instruction
 
@@ -177,10 +177,12 @@ normal processing cycle under the current decoder.
 
 ## Bounded observability
 
-Inbox counts gain `decoderQuarantinedCount`, computed in PostgreSQL from the exact
-closed worker taxonomy. Catch-up quarantines are not included because their
-exact origin is not recoverably encoded. The value is a non-negative safe
-integer and exposes no signature, mint, raw payload, URL, error message or
+Inbox counts gain `decoderQuarantinedCount`. PostgreSQL selects retained
+terminal candidates and the repository applies the same closed domain taxonomy
+and canonical snapshot/fingerprint validation as recovery before counting.
+Malformed snapshots, fingerprint drift, prior recovery receipts and catch-up
+quarantines are excluded. Catch-up origin is not recoverably encoded. The value
+is a non-negative safe integer and exposes no signature, mint, raw payload, URL, error message or
 wallet data.
 
 The listener heartbeat gains a separate optional

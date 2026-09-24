@@ -166,8 +166,27 @@ interface StrictCatchUpRunRow extends QueryResultRow {
 const SERVICE_KEY = 'transaction-listener';
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM = 100;
+const MAX_POSTGRES_INTEGER = 2_147_483_647;
 export const MAX_CONSECUTIVE_URGENT_CLAIMS = 32;
 const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
+const DECODER_QUARANTINE_CANDIDATE_SQL = `inbox.processing_status='FAILED'
+  AND inbox.error_code='PIPELINE_STAGE_FAILED'
+  AND inbox.error_retryable=FALSE
+  AND inbox.retry_exhausted_at IS NULL
+  AND inbox.processed_at IS NULL
+  AND inbox.lease_token IS NULL
+  AND inbox.lease_expires_at IS NULL
+  AND inbox.next_attempt_at IS NULL
+  AND inbox.terminal_at IS NOT NULL
+  AND inbox.purge_after IS NOT NULL
+  AND inbox.purge_after=inbox.terminal_at+INTERVAL '4 hours'
+  AND inbox.purge_after>clock_timestamp()
+  AND inbox.normalized_transaction IS NOT NULL
+  AND inbox.immutable_fingerprint IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM transaction_inbox_decoder_recoveries recovery
+    WHERE recovery.signature=inbox.signature
+  )`;
 
 type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE' | 'TRACKED_TRADE';
 type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED'
@@ -2239,25 +2258,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                AND retry_exhausted_at IS NOT NULL
            ) AS exhausted_failed,
            COUNT(*) FILTER (
-             WHERE processing_status='FAILED'
-               AND error_code='PIPELINE_STAGE_FAILED'
-               AND error_retryable=FALSE
-               AND error_name IN (
-                 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
-                 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_TRUNCATED'
-               )
-               AND retry_exhausted_at IS NULL
-               AND processed_at IS NULL
-               AND lease_token IS NULL
-               AND lease_expires_at IS NULL
-               AND next_attempt_at IS NULL
-               AND terminal_at IS NOT NULL
-               AND purge_after IS NOT NULL
-               AND purge_after=terminal_at+INTERVAL '4 hours'
-               AND purge_after>clock_timestamp()
-               AND normalized_transaction IS NOT NULL
-               AND immutable_fingerprint IS NOT NULL
-           ) AS decoder_quarantined,
+             WHERE ${DECODER_QUARANTINE_CANDIDATE_SQL}
+           ) AS decoder_quarantine_candidates,
            COUNT(*) FILTER (WHERE ${actionable}
              AND 'WEBSOCKET' = ANY(discovery_sources)
              AND NOT ('CATCH_UP' = ANY(discovery_sources))) AS websocket_only,
@@ -2276,9 +2278,30 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            COUNT(*) FILTER (WHERE processing_status = 'DEFERRED') AS deferred,
            COUNT(*) FILTER (WHERE processing_status = 'IGNORED') AS ignored,
            COUNT(*) FILTER (WHERE processing_status = 'QUARANTINED') AS quarantined
-         FROM chain_transaction_inbox`,
+         FROM chain_transaction_inbox inbox`,
       );
       const row = requiredRow(result.rows[0]);
+      const candidateCount = safeCount(
+        row.decoder_quarantine_candidates,
+        'decoder quarantine candidate count',
+      );
+      let decoderQuarantinedCount = 0;
+      if (candidateCount > 0) {
+        const candidates = await this.pool.query(
+          `SELECT inbox.signature,inbox.observed_slot,inbox.target_confirmation_status,
+             inbox.attempts,inbox.attempts_in_cycle,inbox.manual_recovery_count,
+             inbox.error_code,inbox.error_name,inbox.error_retryable,
+             inbox.normalized_transaction,inbox.immutable_fingerprint
+           FROM chain_transaction_inbox inbox
+           WHERE ${DECODER_QUARANTINE_CANDIDATE_SQL}
+           ORDER BY inbox.signature`,
+        );
+        decoderQuarantinedCount = candidates.rows.reduce(
+          (count, candidate) => count + (isRecoverableDecoderQuarantineRow(candidate) ? 1 : 0),
+          0,
+        );
+        safeCount(decoderQuarantinedCount, 'decoder quarantined count');
+      }
       const counts = Object.freeze({
         pending: safeCount(row.pending, 'pending count'),
         processing: safeCount(row.processing, 'processing count'),
@@ -2286,10 +2309,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         failed: safeCount(row.failed, 'failed count'),
         retryableFailed: safeCount(row.retryable_failed, 'retryable failed count'),
         exhaustedFailed: safeCount(row.exhausted_failed, 'exhausted failed count'),
-        decoderQuarantinedCount: safeCount(
-          row.decoder_quarantined,
-          'decoder quarantined count',
-        ),
+        decoderQuarantinedCount,
         catchUpAdmission: Object.freeze({
           actionableBacklogBySource: Object.freeze({
             websocketOnly: safeCount(row.websocket_only, 'websocket only count'),
@@ -3609,6 +3629,26 @@ function isStoredDecoderQuarantineFailure(row: QueryResultRow): boolean {
     return false;
   }
   return isDecoderQuarantineFailure(candidate);
+}
+
+function isRecoverableDecoderQuarantineRow(row: QueryResultRow): boolean {
+  try {
+    if (!isStoredDecoderQuarantineFailure(row)) return false;
+    positiveBoundedInteger(row.attempts, 'lifetime attempts', MAX_POSTGRES_INTEGER);
+    positiveBoundedInteger(row.attempts_in_cycle, 'cycle attempts', 100);
+    const recoveryCount = safeCount(row.manual_recovery_count, 'manual recovery count');
+    if (recoveryCount >= MAX_POSTGRES_INTEGER) return false;
+    decodeSnapshot(
+      row.normalized_transaction,
+      requiredFingerprint(row.immutable_fingerprint),
+      requiredText(row.signature, 'signature'),
+      numericBigInt(row.observed_slot, 'observed slot'),
+      confirmation(row.target_confirmation_status),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function requireOne(rowCount: number | null): void {

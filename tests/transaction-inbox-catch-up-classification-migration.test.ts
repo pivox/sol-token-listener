@@ -222,6 +222,10 @@ void test('ignored and quarantined classifications purge after exactly four hour
       new URL('050_transaction_inbox_first_processing.sql', migrationsDirectory),
       'utf8',
     ));
+    await pool.query(await readFile(
+      new URL('051_transaction_inbox_decoder_quarantine_recovery.sql', migrationsDirectory),
+      'utf8',
+    ));
     assert.deepEqual((await pool.query(`SELECT first_detected_at FROM chain_transaction_inbox
       WHERE signature LIKE 'purge-%' ORDER BY signature`)).rows, [
       { first_detected_at: null }, { first_detected_at: null },

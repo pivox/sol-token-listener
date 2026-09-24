@@ -33,7 +33,8 @@ const BUSINESS_TABLES = Object.freeze([
   'social_http_observations', 'social_links', 'social_verification_evidence',
   'state_transitions', 'swap_events', 'token_holders_snapshots', 'token_launches',
   'token_metadata_snapshots', 'token_risk_reports', 'token_sessions', 'trades',
-  'trading_candidates', 'transaction_inbox_recoveries', 'wallet_cluster_members',
+  'trading_candidates', 'transaction_inbox_decoder_recoveries',
+  'transaction_inbox_recoveries', 'wallet_cluster_members',
   'wallet_clusters', 'wallet_funding_evidence', 'wallet_funding_observations',
   'wallet_graph_profiles', 'wallet_graph_snapshots', 'wallet_relationships',
 ] as const);

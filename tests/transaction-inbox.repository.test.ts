@@ -995,6 +995,24 @@ void test('counts only retained unresolved worker decoder quarantines and clears
     await storeWorkerDecoderQuarantine(
       repository, 'decoder-count-expired', 931n, 'PUMP_BORSH_TRUNCATED',
     );
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-count-malformed', 932n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      normalized_transaction='{}'::jsonb
+      WHERE signature='decoder-count-malformed'`);
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-count-fingerprint-drift', 933n, 'PUMP_BORSH_TRUNCATED',
+    );
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      immutable_fingerprint=repeat('a',64)
+      WHERE signature='decoder-count-fingerprint-drift'`);
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-count-saturated', 934n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      manual_recovery_count=2147483647,last_manual_recovery_at=terminal_at
+      WHERE signature='decoder-count-saturated'`);
     await pool.query(`UPDATE chain_transaction_inbox SET
       terminal_at=date_trunc('milliseconds',clock_timestamp()-INTERVAL '4 hours'),
       purge_after=date_trunc('milliseconds',clock_timestamp())
@@ -1004,7 +1022,7 @@ void test('counts only retained unresolved worker decoder quarantines and clears
       disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
       ingestionHint: null, ingestionHintMint: null, mints: [],
     }));
-    await repository.enqueue(notification('decoder-count-processed', 932n));
+    await repository.enqueue(notification('decoder-count-processed', 935n));
     const claimed = await repository.claim(Date.now(), 30);
     assert.equal(claimed?.signature, 'decoder-count-processed');
     await repository.saveSnapshot(
@@ -1016,6 +1034,14 @@ void test('counts only retained unresolved worker decoder quarantines and clears
     assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-count-retained'), {
       code: 'DECODER_RECOVERY_SCHEDULED', signature: 'decoder-count-retained',
     });
+    assert.equal((await repository.counts()).decoderQuarantinedCount, 0);
+    const replay = await repository.claim(Date.now(), 30);
+    assert.equal(replay?.signature, 'decoder-count-retained');
+    await repository.markFailed(replay.signature, replay.leaseToken, Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED',
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+    }));
     assert.equal((await repository.counts()).decoderQuarantinedCount, 0);
   });
 });
@@ -1145,6 +1171,7 @@ for (const [location, boundary] of [
         assert.ok(written);
         assert.deepEqual(payload, {
           startedAt: new Date(written.startedAtMs).toISOString(), catchUpAdmission: expected,
+          decoderQuarantine: written.decoderQuarantine,
           firstProcessingCanary: written.firstProcessingCanary,
         });
         assert.equal(serializationReads, 0);
@@ -1163,6 +1190,7 @@ for (const [location, boundary] of [
 void test('catch-up admission counts reject malformed PostgreSQL values and inconsistent dimensions', async () => {
   const valid = {
     pending: '1', processing: '1', processed: '0', failed: '1', retryable_failed: '1', exhausted_failed: '0',
+    decoder_quarantine_candidates: '0',
     websocket_only: '1', catch_up_only: '1', websocket_and_catch_up: '1',
     normal: '1', launch_candidate: '1', tracked_trade: '1', deferred: '0', ignored: '0', quarantined: '0',
   };

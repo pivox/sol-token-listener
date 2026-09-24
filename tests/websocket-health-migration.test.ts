@@ -61,6 +61,7 @@ void test('websocket health migration upgrades legacy state without trusting its
       '047_transaction_inbox_tracked_trade_priority.sql',
       '048_transaction_inbox_catch_up_classification.sql',
       '049_transaction_inbox_catch_up_admission_receipt.sql',
+      '050_transaction_inbox_first_processing.sql',
       latestMigrationName,
     ]);
     const beforeReplay = await canonicalRow(pool);
