@@ -8,6 +8,10 @@ import {
   createRuntimeRpcHttpEvidence,
   type RuntimeRpcHttpEvidenceV1,
 } from '../domain/rpc-http-evidence.js';
+import type {
+  FinalityReconcilerDiagnosticReason,
+  FinalityReconcilerDiagnosticV1,
+} from '../domain/finality-reconciler-diagnostic.js';
 import {
   createFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
@@ -69,7 +73,16 @@ import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox
 import { PostgresWebSocketHealthRepository } from '../storage/websocket-health.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
 import { PostgresWalletGraphRepository } from '../storage/wallet-graph.repository.js';
-import { FinalityReconciler } from './finality-reconciler.js';
+import {
+  FinalityReconciler,
+  FinalityReconcilerError,
+} from './finality-reconciler.js';
+import {
+  createFinalityDiagnosticTrackerState,
+  recordFinalityDiagnosticFailure,
+  recordFinalityDiagnosticRecovery,
+  type FinalityDiagnosticTrackerState,
+} from './finality-reconciler-diagnostic-tracker.js';
 import { LaunchParticipantAnalyticsService } from './launch-participant-analytics.service.js';
 import { listenerIngestionPrograms } from './listener-ingestion-programs.js';
 import { LaunchpadObservationService } from './launchpad-observation.service.js';
@@ -614,6 +627,8 @@ export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
 export interface RecurringFinalityOptions extends RecurringListenerOptions {
   readonly initialFailureMode?: InitialFinalityFailureMode;
   readonly currentSelection?: () => PromotedProviderSelection;
+  readonly diagnosticSink?: (diagnostic: FinalityReconcilerDiagnosticV1) => void;
+  readonly diagnosticNow?: () => number;
 }
 
 export class ListenerControllerCloseError extends Error {
@@ -638,6 +653,22 @@ const listenerScheduler: ListenerRuntimeScheduler = Object.freeze({
   },
 });
 
+type ProviderSelectionDiagnosticReason = Extract<
+  FinalityReconcilerDiagnosticReason,
+  'PROVIDER_UNAVAILABLE' | 'PROVIDER_CHANGED'
+>;
+
+class FinalityProviderSelectionError extends Error {
+  public constructor(
+    public readonly reasonCode: ProviderSelectionDiagnosticReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'FinalityProviderSelectionError';
+    Object.freeze(this);
+  }
+}
+
 export class RecurringFinalityReconciler {
   private currentState: ListenerRuntimeState = 'STOPPED';
   private readonly intervalMs: number;
@@ -645,6 +676,9 @@ export class RecurringFinalityReconciler {
   private readonly scheduler: ListenerRuntimeScheduler;
   private readonly initialFailureMode: InitialFinalityFailureMode;
   private readonly currentSelection: (() => PromotedProviderSelection) | null;
+  private readonly diagnosticSink: ((diagnostic: FinalityReconcilerDiagnosticV1) => void) | null;
+  private readonly diagnosticNow: () => number;
+  private diagnosticState: FinalityDiagnosticTrackerState = createFinalityDiagnosticTrackerState();
   private currentReadySelection: PromotedProviderSelection | null = null;
   private timer: unknown = null;
   private inFlight: Promise<unknown> | null = null;
@@ -670,6 +704,22 @@ export class RecurringFinalityReconciler {
       throw new TypeError('Current finality provider selector is invalid.');
     }
     this.currentSelection = options.currentSelection ?? null;
+    const configuredDiagnosticSink: unknown = options.diagnosticSink;
+    if (configuredDiagnosticSink !== undefined
+      && typeof configuredDiagnosticSink !== 'function') {
+      throw new TypeError('Finality diagnostic sink is invalid.');
+    }
+    this.diagnosticSink = configuredDiagnosticSink === undefined
+      ? null
+      : configuredDiagnosticSink as (diagnostic: FinalityReconcilerDiagnosticV1) => void;
+    const configuredDiagnosticNow: unknown = options.diagnosticNow;
+    if (configuredDiagnosticNow !== undefined
+      && typeof configuredDiagnosticNow !== 'function') {
+      throw new TypeError('Finality diagnostic clock is invalid.');
+    }
+    this.diagnosticNow = configuredDiagnosticNow === undefined
+      ? Date.now
+      : configuredDiagnosticNow as () => number;
   }
 
   public async start(): Promise<void> {
@@ -683,6 +733,7 @@ export class RecurringFinalityReconciler {
       if (this.inFlight === operation) this.inFlight = null;
       if (this.hasClosed()) return;
       this.currentState = 'RUNNING';
+      this.recordDiagnosticRecovery();
       this.schedule();
     } catch (error) {
       if (this.inFlight === operation) this.inFlight = null;
@@ -691,6 +742,7 @@ export class RecurringFinalityReconciler {
         return;
       }
       this.currentState = 'DEGRADED';
+      this.recordDiagnosticFailure(error);
       if (this.initialFailureMode === 'FAIL_START') throw error;
       this.schedule();
     }
@@ -739,13 +791,15 @@ export class RecurringFinalityReconciler {
           if (this.inFlight === operation) this.inFlight = null;
           if (this.closed) return;
           this.currentState = 'RUNNING';
+          this.recordDiagnosticRecovery();
           this.schedule();
         },
-        () => {
+        (error: unknown) => {
           if (this.inFlight === operation) this.inFlight = null;
           if (this.closed) return;
           this.currentReadySelection = null;
           this.currentState = 'DEGRADED';
+          this.recordDiagnosticFailure(error);
           this.schedule();
         },
       );
@@ -772,10 +826,18 @@ export class RecurringFinalityReconciler {
       return;
     }
     const selection = this.readCurrentSelection();
-    if (selection.providerId === null) throw new Error('Current finality provider is unavailable.');
+    if (selection.providerId === null) {
+      throw new FinalityProviderSelectionError(
+        'PROVIDER_UNAVAILABLE',
+        'Current finality provider is unavailable.',
+      );
+    }
     await this.reconciler.runOnce();
     if (!sameProviderSelection(this.readCurrentSelection(), selection)) {
-      throw new Error('Current finality provider changed.');
+      throw new FinalityProviderSelectionError(
+        'PROVIDER_CHANGED',
+        'Current finality provider changed.',
+      );
     }
     if (!this.closed) this.currentReadySelection = selection;
   }
@@ -803,8 +865,94 @@ export class RecurringFinalityReconciler {
     } catch {
       // Converted to one fixed provider-unavailable result below.
     }
-    throw new Error('Current finality provider is unavailable.');
+    throw new FinalityProviderSelectionError(
+      'PROVIDER_UNAVAILABLE',
+      'Current finality provider is unavailable.',
+    );
   }
+
+  private recordDiagnosticFailure(error: unknown): void {
+    try {
+      const reduction = recordFinalityDiagnosticFailure(
+        this.diagnosticState,
+        classifyFinalityReconcilerFailure(error),
+        this.readDiagnosticNow(),
+      );
+      this.diagnosticState = reduction.state;
+      this.offerDiagnostic(reduction.diagnostic);
+    } catch {
+      // Diagnostics cannot affect finality state, retry cadence or readiness.
+    }
+  }
+
+  private recordDiagnosticRecovery(): void {
+    if (this.diagnosticState.degradedAtMs === null) return;
+    try {
+      const reduction = recordFinalityDiagnosticRecovery(
+        this.diagnosticState,
+        this.readDiagnosticNow(),
+      );
+      this.diagnosticState = reduction.state;
+      this.offerDiagnostic(reduction.diagnostic);
+    } catch {
+      // Diagnostics cannot affect finality state, retry cadence or readiness.
+    }
+  }
+
+  private readDiagnosticNow(): number {
+    try {
+      const sampled: unknown = Reflect.apply(this.diagnosticNow, undefined, []);
+      if (isDiagnosticTime(sampled)) return sampled;
+    } catch {
+      // Fall through to the trusted process clock below.
+    }
+    try {
+      const fallback = Date.now();
+      if (isDiagnosticTime(fallback)) return fallback;
+    } catch {
+      // A process-clock failure remains confined to diagnostics.
+    }
+    return this.diagnosticState.lastObservedAtMs ?? 0;
+  }
+
+  private offerDiagnostic(diagnostic: FinalityReconcilerDiagnosticV1 | null): void {
+    if (diagnostic === null || this.diagnosticSink === null) return;
+    try {
+      Reflect.apply(this.diagnosticSink, undefined, [diagnostic]);
+    } catch {
+      // The passive reconciler never delegates control to its diagnostic sink.
+    }
+  }
+}
+
+function classifyFinalityReconcilerFailure(
+  error: unknown,
+): FinalityReconcilerDiagnosticReason {
+  try {
+    if (error instanceof FinalityProviderSelectionError) return error.reasonCode;
+    if (!(error instanceof FinalityReconcilerError)) return 'UNKNOWN';
+    switch (error.stage) {
+      case 'list': return 'FINALITY_LIST';
+      case 'pass': return 'FINALITY_PASS';
+      case 'history': return 'FINALITY_HISTORY';
+      case 'root': return 'FINALITY_ROOT';
+      case 'poll': return 'FINALITY_POLL';
+      case 'block': return 'FINALITY_BLOCK';
+      case 'revision': return 'FINALITY_REVISION';
+      case 'clock': return 'FINALITY_CLOCK';
+      case 'finality-contradiction': return 'FINALITY_CONTRADICTION';
+      default: return 'UNKNOWN';
+    }
+  } catch {
+    return 'UNKNOWN';
+  }
+}
+
+function isDiagnosticTime(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && !Object.is(value, -0);
 }
 
 function snapshotProviderSelection(value: unknown): PromotedProviderSelection {
