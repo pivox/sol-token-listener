@@ -83,6 +83,7 @@ import {
   recordFinalityDiagnosticRecovery,
   type FinalityDiagnosticTrackerState,
 } from './finality-reconciler-diagnostic-tracker.js';
+import { createFinalityReconcilerDiagnosticSink } from './finality-reconciler-diagnostic-logger.js';
 import { LaunchParticipantAnalyticsService } from './launch-participant-analytics.service.js';
 import { listenerIngestionPrograms } from './listener-ingestion-programs.js';
 import { LaunchpadObservationService } from './launchpad-observation.service.js';
@@ -365,6 +366,7 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       initialFailureMode: 'DEGRADED_RETRY',
       currentSelection: (): PromotedProviderSelection => promoted.selection(),
+      diagnosticSink: createFinalityReconcilerDiagnosticSink(logger),
     },
   );
 
