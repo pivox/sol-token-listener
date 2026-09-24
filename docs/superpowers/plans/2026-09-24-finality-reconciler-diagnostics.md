@@ -1,6 +1,6 @@
 # Bounded Finality Reconciler Diagnostics Implementation Plan
 
-Version: 1.0.4 — 2026-09-24 — issue #151
+Version: 1.0.5 — 2026-09-24 — issue #151
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development or superpowers:executing-plans and
@@ -188,7 +188,7 @@ Commit composition and documentation separately.
 
 - [ ] **Step 1: Independent local review**
 
-Check the diff against issue #151 and design v1.0.1. Reject behavior changes,
+Check the diff against issue #151 and design v1.0.2. Reject behavior changes,
 unbounded logs, external values, API/storage widening, wallet/signing/submission
 imports and any raw error logging. Apply only findings reproduced by tests.
 
