@@ -1,6 +1,6 @@
 # Finality Reconciler Diagnostics Design
 
-Version: 1.0.1 — 2026-09-24 — issue #151
+Version: 1.0.2 — 2026-09-24 — issue #151
 
 Status: approved under the standing operator instruction to use the recommended
 safe option without pausing for resolvable questions
@@ -122,6 +122,10 @@ An incident starts on the first failed pass after a non-degraded state. Emit a
 A separate cadence counter cycles from 1 to 12 independently of the saturating
 incident totals. Summaries therefore continue at a bounded one-in-twelve rate
 even after `consecutiveFailures` reaches `Number.MAX_SAFE_INTEGER`.
+The validated tracker state preserves the exact mathematical relation between
+cadence and suppressed failures after total-count saturation until the
+suppressed counter itself saturates. Once both counters are saturated, every
+cadence position is reachable and remains valid.
 
 `consecutiveFailures` is the total saturating failure count for the current
 incident. `suppressedFailures` is the cumulative number of failures in that

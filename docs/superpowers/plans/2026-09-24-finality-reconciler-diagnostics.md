@@ -1,6 +1,6 @@
 # Bounded Finality Reconciler Diagnostics Implementation Plan
 
-Version: 1.0.3 — 2026-09-24 — issue #151
+Version: 1.0.4 — 2026-09-24 — issue #151
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development or superpowers:executing-plans and
@@ -92,7 +92,11 @@ reason, continued summaries at 24, cumulative suppressed counts and one
 recovery. Seed the pure tracker at `Number.MAX_SAFE_INTEGER` with its
 mathematically reachable baseline suppressed count and cadence position
 `Number.MAX_SAFE_INTEGER % 12`; prove that later saturated failures still reach
-the next summary and continue the independent 0-to-11 cadence. Cover
+the next summary and continue the independent 0-to-11 cadence. While the
+suppressed counter remains below saturation, reject every saturated-total seed
+whose cadence/suppression pair cannot be derived from a non-negative number of
+later failures; use exact integer arithmetic for this relation. Once both
+counters are saturated, accept every cadence position as reachable. Cover
 non-regressing time, invalid/throwing injected clock,
 throwing sink, close in flight and close timeout. The close timeout must not be
 reported as a pass failure.
