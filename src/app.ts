@@ -209,6 +209,8 @@ function logFoundation(
     qualificationProfileFingerprint: profile.fingerprint,
     qualificationMinimumScore: profile.minimumTotalScore,
     pumpFunListenerActive: config.listenerEnabled,
+    listenerCatchUpMaxPages: config.listenerCatchUpMaxPages,
+    listenerCatchUpPageSize: config.listenerCatchUpPageSize,
     pumpSwapPipelineAvailable: true,
     transactionSubmissionEnabled: false,
   }, 'Socle d’observation Pump prêt selon la configuration du listener.');

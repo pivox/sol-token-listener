@@ -283,10 +283,17 @@ void test('explicit diagnostic disablement logs listener.disabled without openin
   assert.deepEqual(calls, ['log:listener.foundation_ready', 'log:listener.disabled']);
 });
 
-void test('logs only the effective qualification profile identity at foundation startup', async () => {
+void test('logs only the effective foundation configuration at startup', async () => {
   const logs: object[] = [];
+  const effectiveConfig = parseConfig({
+    SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
+    SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
+    LISTENER_CATCH_UP_MAX_PAGES: '37',
+    LISTENER_CATCH_UP_PAGE_SIZE: '777',
+  });
   await runApplication(dependencies([], {
-    loadConfig: () => ({ ...config, listenerEnabled: false, apiEnabled: false, autoMigrate: false }),
+    loadConfig: () => ({ ...effectiveConfig, listenerEnabled: false, apiEnabled: false, autoMigrate: false }),
     createQualificationEngine: () => ({
       minimumTotalScore: 60,
       profileSummary: Object.freeze({
@@ -311,6 +318,8 @@ void test('logs only the effective qualification profile identity at foundation 
     qualificationProfileFingerprint: 'a'.repeat(64),
     qualificationMinimumScore: 60,
     pumpFunListenerActive: false,
+    listenerCatchUpMaxPages: 37,
+    listenerCatchUpPageSize: 777,
     pumpSwapPipelineAvailable: true,
     transactionSubmissionEnabled: false,
   });
