@@ -1,6 +1,6 @@
 # Pump.fun Decoder Quarantine and Replay Design
 
-Version: 1.0.4 — 2026-09-24 — issue #148
+Version: 1.0.5 — 2026-09-24 — issue #148
 
 Status: approved for implementation under the standing operator instruction
 
@@ -172,8 +172,8 @@ After recovery the ordinary claim path owns the row:
 - a fixed decoder processes the exact retained snapshot;
 - all normal idempotence and projection constraints apply;
 - success uses the existing `markProcessed` path;
-- the same recognized incompatibility returns to terminal `FAILED` with a fresh
-  four-hour deadline;
+- the same recognized incompatibility returns to terminal `FAILED`, but the
+  durable one-replay marker keeps it ineligible for a second decoder replay;
 - an unknown/transient error follows the unchanged retry policy;
 - finality and orphan reconciliation remain unchanged.
 
@@ -182,10 +182,14 @@ normal processing cycle under the current decoder.
 
 ## Bounded observability
 
-Inbox rows gain nullable `decoder_quarantine_eligible_at`. The worker sets it to
-the database terminal time only after validating the closed domain taxonomy,
-canonical snapshot, fingerprint, counters and absence of a prior decoder
-recovery receipt. A database constraint binds it to the exact terminal state;
+Inbox rows gain nullable `decoder_quarantine_eligible_at` and monotonic
+`decoder_recovery_used`. The worker sets the eligibility timestamp to the
+database terminal time only after validating the closed domain taxonomy,
+canonical snapshot, fingerprint, counters, absence of a retained recovery
+receipt and an unused durable marker. Recovery sets the marker atomically with
+the receipt and inbox transition. The marker survives receipt expiry and
+finality reprocessing for as long as the inbox row is retained. A database
+constraint binds eligibility to the exact terminal state and unused marker;
 an evidence-drift trigger clears it if any dependent field changes. Existing
 binaries leave it null. Heartbeat counting is therefore one bounded PostgreSQL
 aggregate over retained non-null markers: it never transfers or hashes raw
@@ -207,6 +211,8 @@ errors are redacted.
 
 - No automatic recovery and no retry loop over an immutable incompatible
   snapshot.
+- At most one explicit decoder replay per retained inbox signature, including
+  after receipt expiry or finality reprocessing.
 - No permissive Borsh length, discriminator or schema fallback.
 - No mutation of catch-up identity or evidence during recovery.
 - No checkpoint, receipt or first-success timestamp before genuine pipeline

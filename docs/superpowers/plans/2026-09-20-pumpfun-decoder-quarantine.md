@@ -1,12 +1,12 @@
 # Pump.fun Decoder Quarantine and Replay Implementation Plan
 
-Version: 1.0.5 — 2026-09-24 — issue #148
+Version: 1.0.6 — 2026-09-24 — issue #148
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Preserve incompatible Pump.fun decoder evidence for four hours and allow one explicit, audited, idempotent replay after a decoder upgrade, without automatic retries or any execution capability.
 
-**Architecture:** Keep the worker's existing terminal non-retryable `FAILED` lifecycle as the snapshot-bearing decoder quarantine. Add a closed domain classifier, a replay-safe migration containing a bounded recovery receipt, and a dedicated repository/CLI recovery path. Catch-up quarantines remain non-recoverable in V1 because their exact origin cannot be derived from the stored one-way fingerprint. Publish one aggregate worker decoder-quarantine count through a separate optional versioned health object.
+**Architecture:** Keep the worker's existing terminal non-retryable `FAILED` lifecycle as the snapshot-bearing decoder quarantine. Add a closed domain classifier, a replay-safe migration containing a bounded recovery receipt plus a durable one-replay marker on the retained inbox row, and a dedicated repository/CLI recovery path. Catch-up quarantines remain non-recoverable in V1 because their exact origin cannot be derived from the stored one-way fingerprint. Publish one aggregate worker decoder-quarantine count through a separate optional versioned health object.
 
 **Tech Stack:** TypeScript strict ESM, PostgreSQL, Node test runner, Zod/API V1 contracts, structured JSON CLI output.
 
@@ -143,8 +143,10 @@ Add the required `recoverDecoderQuarantine(signature)` method to
 `TransactionInboxRepository`, the PostgreSQL implementation and the CLI
 production bootstrap/package script; no optional port or cast is allowed.
 Use the existing per-signature advisory lock plus `SELECT ... FOR UPDATE`.
-Validate the worker form, retention and exact evidence. Insert the
-receipt and update the inbox in one transaction. Preserve first-detection,
+Validate the worker form, retention and exact evidence. Insert the receipt, set
+the monotonic `decoder_recovery_used` marker and update the inbox in one
+transaction. Treat every later command as already scheduled while the marker
+is retained, even after worker completion or receipt expiry. Preserve first-detection,
 first-processing, snapshot, fingerprint, identity and classification fields.
 Return stable frozen results and map database failures to the existing redacted
 repository error.

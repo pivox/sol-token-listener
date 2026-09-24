@@ -102,6 +102,7 @@ void test('schedules one retained worker decoder quarantine from its immutable s
     }
     assert.equal(recovered.manual_recovery_count, 1);
     assert.ok(recovered.last_manual_recovery_at instanceof Date);
+    assert.equal(recovered.decoder_recovery_used, true);
     const receipt = (await pool.query(
       'SELECT * FROM transaction_inbox_decoder_recoveries WHERE signature=$1', [signature],
     )).rows[0];
@@ -162,6 +163,59 @@ void test('serializes concurrent decoder recoveries and makes every replay idemp
       'SELECT COUNT(*)::INTEGER AS count FROM transaction_inbox_decoder_recoveries WHERE signature=$1',
       [signature],
     )).rows[0]?.count, 1);
+  });
+});
+
+void test('keeps decoder recovery idempotent after worker completion and receipt expiry', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'decoder-quarantine-durable-idempotency';
+    await storeWorkerDecoderQuarantine(
+      repository, signature, 9021n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_SCHEDULED', signature,
+    });
+    const claimed = await repository.claim(Date.now(), 30);
+    assert.equal(claimed?.signature, signature);
+    await repository.markProcessed(signature, claimed.leaseToken, 'confirmed');
+    assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_ALREADY_SCHEDULED', signature,
+    });
+
+    await pool.query(`WITH expiry AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+    ) UPDATE transaction_inbox_decoder_recoveries SET
+      quarantined_at=expiry.at-INTERVAL '4 hours',
+      recovered_at=expiry.at-INTERVAL '4 hours',
+      purge_after=expiry.at
+      FROM expiry WHERE signature=$1`, [signature]);
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInboxDecoderRecoveries, 1);
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM transaction_inbox_decoder_recoveries WHERE signature=$1`, [signature])).rows[0]?.count, 0);
+
+    await repository.enqueueRevision(Object.freeze({
+      signature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 1,
+    }));
+    const replay = await repository.claim(Date.now() + 2, 30);
+    assert.equal(replay?.signature, signature);
+    await repository.markFailed(signature, replay.leaseToken, Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED',
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+    }));
+    const failed = await row(pool, signature);
+    assert.equal(failed.decoder_quarantine_eligible_at, null);
+    assert.equal(failed.decoder_recovery_used, true);
+    assert.equal((await repository.counts()).decoderQuarantinedCount, 0);
+    assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_ALREADY_SCHEDULED', signature,
+    });
+    await assert.rejects(
+      pool.query(`UPDATE chain_transaction_inbox
+        SET decoder_recovery_used=FALSE WHERE signature=$1`, [signature]),
+      { code: '23514' },
+    );
   });
 });
 
@@ -1053,7 +1107,7 @@ void test('counts only retained unresolved worker decoder quarantines and clears
     }));
     assert.equal((await repository.counts()).decoderQuarantinedCount, 0);
     assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-count-retained'), {
-      code: 'DECODER_RECOVERY_NOT_ELIGIBLE', signature: 'decoder-count-retained',
+      code: 'DECODER_RECOVERY_ALREADY_SCHEDULED', signature: 'decoder-count-retained',
     });
   });
 });

@@ -1245,7 +1245,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              terminal_at = CASE WHEN $8 THEN completed.completed_at ELSE NULL END,
              purge_after = CASE WHEN $8 THEN
                completed.completed_at + INTERVAL '4 hours' ELSE NULL END,
-             decoder_quarantine_eligible_at = CASE WHEN $9 AND NOT EXISTS (
+             decoder_quarantine_eligible_at = CASE WHEN $9
+               AND decoder_recovery_used=FALSE AND NOT EXISTS (
                SELECT 1 FROM transaction_inbox_decoder_recoveries receipt
                WHERE receipt.signature=$1
              ) THEN completed.completed_at ELSE NULL END,
@@ -1412,10 +1413,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         const status = inboxStatus(row.processing_status);
         const recoveryCount = safeCount(row.manual_recovery_count, 'manual recovery count');
-        if ((status === 'PENDING' || status === 'PROCESSING')
-          && row.decoder_recovery_recorded === true
-          && recoveryCount > 0
-          && row.last_manual_recovery_at !== null) {
+        const decoderRecoveryUsed = row.decoder_recovery_used === true;
+        if (decoderRecoveryUsed) {
+          if (recoveryCount === 0 || row.last_manual_recovery_at === null) {
+            throw new TypeError('Stored decoder recovery marker is invalid.');
+          }
           dateMs(row.last_manual_recovery_at, 'last manual recovery at');
           return decoderRecoveryResult('DECODER_RECOVERY_ALREADY_SCHEDULED', signature);
         }
@@ -1492,6 +1494,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              next_attempt_at=NULL, retry_exhausted_at=NULL, processed_at=NULL,
              terminal_at=NULL, purge_after=NULL,
              decoder_quarantine_eligible_at=NULL,
+             decoder_recovery_used=TRUE,
              manual_recovery_count=manual_recovery_count+1,
              last_manual_recovery_at=$2,
              updated_at=GREATEST(updated_at,$2)

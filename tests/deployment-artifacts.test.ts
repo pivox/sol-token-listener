@@ -722,8 +722,8 @@ void test('decoder quarantine runbook documents bounded observation-only recover
     readArtifact('docs/superpowers/specs/2026-09-20-pumpfun-decoder-quarantine-design.md'),
     readArtifact('docs/superpowers/plans/2026-09-20-pumpfun-decoder-quarantine.md'),
   ]);
-  assert.match(design, /Version: 1\.0\.4/u);
-  assert.match(plan, /Version: 1\.0\.5/u);
+  assert.match(design, /Version: 1\.0\.5/u);
+  assert.match(plan, /Version: 1\.0\.6/u);
   assert.match(plan, /docs\/operations\/block-hydration-canary\.md/u);
   assert.doesNotMatch(plan, /docs\/runbooks\/mainnet-observe-dry-run\.md/u);
   assert.match(runbook, /heartbeat\.decoderQuarantine[^.]{0,200}unresolvedCount/iu);
@@ -738,6 +738,7 @@ void test('decoder quarantine runbook documents bounded observation-only recover
   ]) assert.match(runbook, new RegExp(code, 'u'));
   assert.match(runbook, /quatre heures[^.]{0,240}mise\s+en\s+quarantaine\s+originale/iu);
   assert.match(runbook, /reçu d.audit[^.]{0,240}purge quatre heures/iu);
+  assert.match(runbook, /marqueur booléen monotone[^.]{0,240}expiration du reçu/iu);
   assert.match(runbook, /n'est jamais une autorisation de trade/iu);
   assert.match(runbook, /ni succès du décodage, ni qualification, ni sellabilité, ni profit/iu);
   assert.match(runbook, /aucune transaction brute/iu);
@@ -915,6 +916,11 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /MAX_RETENTION_OUTPUT_BYTES/);
   assert.match(retention, /JSON\.parse\(serialized\)/);
   assert.match(retention, /canonicalRetentionCounters/);
+  assert.match(
+    smoke,
+    /'transactionInboxRecoveries',\n {2}'transactionInboxDecoderRecoveries',/u,
+    'deployment smoke must expect the decoder recovery retention counter',
+  );
   assert.match(
     smoke,
     /'executionActivationArmaments',\n {2}'executionActivationEvents',\n {2}'executionAttempts',\n {2}'executionControlEvents',\n {2}'executionDryRunAssessments',\n {2}'executionExitAuthorizations',\n {2}'executionIntents',\n {2}'executionIntentsExpiredPreSubmission',\n {2}'executionIntentTransitions',\n {2}'executionLivePositions',\n {2}'executionLiveUnsignedSimulationEvidence',\n {2}'executionOperatorAuthorizations',\n {2}'executionPreflightIntentPairMemberships',\n {2}'executionPreflightIntentPairs',\n {2}'executionPreflightPreparationRuns',\n {2}'executionPreSignatureLocks',\n {2}'executionRiskAdmissionReports',\n {2}'executionRiskFaults',\n {2}'executionRiskProviderOperations',\n {2}'executionRiskProviderSnapshots',\n {2}'executionRiskRateLimitEvents',\n {2}'executionRiskReconciliationEvidence',\n {2}'executionRiskReservations',\n {2}'executionRiskTombstones',\n {2}'executionRiskWalletSnapshots',\n {2}'executionSafetyQualifications',\n {2}'executionSignedSimulationEvidence',\n {2}'executionSignedTransactions',\n {2}'executionSimulationArtifacts',\n {2}'executionSubmissionEvents',/u,

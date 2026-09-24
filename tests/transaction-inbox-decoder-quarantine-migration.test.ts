@@ -26,6 +26,7 @@ void test('051 declares a bounded standalone decoder recovery receipt', async ()
     'PRIMARY KEY (signature, quarantined_at)',
     'transaction_inbox_decoder_recoveries_purge_idx',
     'decoder_quarantine_eligible_at TIMESTAMPTZ',
+    'decoder_recovery_used BOOLEAN NOT NULL DEFAULT FALSE',
     'chain_transaction_inbox_decoder_quarantine_eligibility_check',
     'chain_transaction_inbox_decoder_quarantine_drift_trigger',
   ]) assert.ok(sql.includes(fragment), `missing migration fragment: ${fragment}`);
@@ -235,18 +236,31 @@ void test('051 leaves pristine catch-up quarantine state and 049 constraints unc
 
     const after = (await pool.query(`SELECT * FROM chain_transaction_inbox
       WHERE signature='catch-up-quarantine'`)).rows[0];
-    const { decoder_quarantine_eligible_at: eligibility, ...unchanged } = after;
+    const {
+      decoder_quarantine_eligible_at: eligibility,
+      decoder_recovery_used: recovered,
+      ...unchanged
+    } = after;
     assert.equal(eligibility, null);
+    assert.equal(recovered, false);
     assert.deepEqual(unchanged, before);
     assert.deepEqual(await catchUpConstraintSnapshot(pool), constraintBefore);
     const columnsAfter = await inboxColumnSnapshot(pool);
-    assert.deepEqual(columnsAfter.slice(0, -1), columnsBefore);
-    assert.deepEqual(columnsAfter.at(-1), {
-      column_name: 'decoder_quarantine_eligible_at',
-      data_type: 'timestamp with time zone',
-      is_nullable: 'YES',
-      column_default: null,
-    });
+    assert.deepEqual(columnsAfter.slice(0, -2), columnsBefore);
+    assert.deepEqual(columnsAfter.slice(-2), [
+      {
+        column_name: 'decoder_quarantine_eligible_at',
+        data_type: 'timestamp with time zone',
+        is_nullable: 'YES',
+        column_default: null,
+      },
+      {
+        column_name: 'decoder_recovery_used',
+        data_type: 'boolean',
+        is_nullable: 'NO',
+        column_default: 'false',
+      },
+    ]);
     assert.equal((await pool.query('SELECT COUNT(*) AS count FROM transaction_inbox_decoder_recoveries')).rows[0]?.count, '0');
     assert.equal(before?.normalized_transaction, null);
     assert.equal(before?.immutable_fingerprint, null);

@@ -153,6 +153,7 @@ const canonicalRetentionCounters = Object.freeze([
   'tradingCandidates',
   'transactionInbox',
   'transactionInboxRecoveries',
+  'transactionInboxDecoderRecoveries',
   'walletClusterMembers',
   'walletClusters',
   'walletFundingEvidence',

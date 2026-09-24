@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.2 — 2026-09-24 — issues #114, #142, #143, #146 et #148.
+Version : 1.2.3 — 2026-09-24 — issues #114, #142, #143, #146 et #148.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -53,6 +53,10 @@ en quarantaine originale. L'heure est réévaluée après verrouillage de la lig
 une commande commencée avant la limite mais déverrouillée après la limite est
 `DECODER_RECOVERY_EXPIRED`. Le reçu d'audit a sa propre purge quatre heures
 après la récupération et ne conserve aucune transaction brute.
+Un marqueur booléen monotone reste sur la ligne inbox jusqu'à sa purge : il
+empêche un second rejeu après expiration du reçu ou après une révision de
+finalité. Une commande répétée répond donc
+`DECODER_RECOVERY_ALREADY_SCHEDULED` tant que cette ligne est retenue.
 
 Cette commande programme uniquement un rejeu normal du snapshot immuable. Elle
 ne prouve ni succès du décodage, ni qualification, ni sellabilité, ni profit.
