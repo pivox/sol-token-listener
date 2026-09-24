@@ -6,6 +6,7 @@ import {
   MAX_API_JSON_NODES,
   type ApiAvailability,
   type ApiDomainPayload,
+  type ApiDecoderQuarantineMetricsV1,
   type ApiFailure,
   type ApiFirstProcessingCanaryEvidenceV1,
   type ApiHealth,
@@ -25,6 +26,17 @@ import {
   toApiJson,
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
+
+void test('decoder quarantine health contract permits optional nullable aggregate-only metrics', () => {
+  const metrics: ApiDecoderQuarantineMetricsV1 = { version: 1, unresolvedCount: 2 };
+  const omitted: Pick<ApiHealth['heartbeat'], 'decoderQuarantine'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'decoderQuarantine'> = {
+    decoderQuarantine: null,
+  };
+  assert.deepEqual(omitted, {});
+  assert.deepEqual(explicitNull, { decoderQuarantine: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+});
 
 void test('first-processing canary health contract permits optional nullable fixed evidence', () => {
   const evidence: ApiFirstProcessingCanaryEvidenceV1 = {

@@ -63,6 +63,34 @@ const DOMAIN_EVENT_TYPES = [
 ] as const;
 
 describe('frontend-owned API V1 schemas', () => {
+  it('accepts exact decoder quarantine aggregates and rolling absence only', () => {
+    const parse = (decoderQuarantine: unknown) => apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: { ...health.heartbeat, decoderQuarantine },
+    })).data.heartbeat.decoderQuarantine;
+    expect(parse({ version: 1, unresolvedCount: 2 })).toEqual({
+      version: 1, unresolvedCount: 2,
+    });
+    expect(parse({ version: 1, unresolvedCount: Number.MAX_SAFE_INTEGER }))
+      .toEqual({ version: 1, unresolvedCount: Number.MAX_SAFE_INTEGER });
+    expect(parse(null)).toBeNull();
+    const legacyHeartbeat: Record<string, unknown> = { ...health.heartbeat };
+    delete legacyHeartbeat.decoderQuarantine;
+    expect(apiHealthEnvelopeSchema.parse(success({
+      ...health, heartbeat: legacyHeartbeat,
+    })).data.heartbeat.decoderQuarantine).toBeUndefined();
+    for (const candidate of [
+      { version: 2, unresolvedCount: 2 },
+      { version: 1, unresolvedCount: -1 },
+      { version: 1, unresolvedCount: -0 },
+      { version: 1, unresolvedCount: 0.5 },
+      { version: 1, unresolvedCount: Number.MAX_SAFE_INTEGER + 1 },
+      { version: 1, unresolvedCount: 2, signature: 'secret-signature' },
+      { unresolvedCount: 2 },
+      { version: 1 },
+    ]) expect(() => parse(candidate)).toThrow();
+  });
+
   it('accepts PASS, FAIL and INCONCLUSIVE first-processing canary evidence', () => {
     expect(parseFirstProcessingCanary(firstProcessingCanary)?.verdict).toBe('PASS');
     expect(parseFirstProcessingCanary({

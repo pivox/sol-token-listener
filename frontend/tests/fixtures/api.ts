@@ -283,6 +283,7 @@ export const health = {
     lastHttpSlot: '100', lastWebsocketSlot: '100', lastFinalizedSlot: '99',
     lastSignature: null, pendingTransactions: 1, activeSessions: 1,
     firstProcessingCanary,
+    decoderQuarantine: { version: 1, unresolvedCount: 2 },
     blockHydration: {
       version: 1, enabled: true, callerConcurrency: 1,
       locates: 10, hits: 6, misses: 4, inFlightJoins: 0, fetches: 4,

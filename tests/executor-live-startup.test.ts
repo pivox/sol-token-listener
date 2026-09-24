@@ -18,9 +18,9 @@ const PUBLIC_KEY = '11111111111111111111111111111111';
 const FINGERPRINT = 'b'.repeat(64);
 
 void test('pins the existing migration catalogue and rejects a changed migration hash', async () => {
-  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 50);
+  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 51);
   assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.at(-1)?.name,
-    '050_transaction_inbox_first_processing.sql');
+    '051_transaction_inbox_decoder_quarantine_recovery.sql');
   await validateLiveExecutorMigrationFiles();
 
   const directory = await mkdtemp(join(tmpdir(), 'executor-live-migrations-'));
@@ -50,7 +50,7 @@ void test('validates role, exact authority, migrations and live bindings without
     assert.deepEqual(evidence, {
       payloadVersion: 1,
       role: 'sol_token_executor_live',
-      migrationHead: '050_transaction_inbox_first_processing.sql',
+      migrationHead: '051_transaction_inbox_decoder_quarantine_recovery.sql',
       generationId: GENERATION_ID,
       providerId: 'primary',
       phase: 'CANARY',

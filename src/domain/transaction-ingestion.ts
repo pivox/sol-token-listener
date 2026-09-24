@@ -50,6 +50,14 @@ export const TRANSACTION_INBOX_RECOVERY_RESULT_CODES = Object.freeze([
   'RECOVERY_NOT_FOUND',
 ] as const);
 
+export const DECODER_RECOVERY_RESULT_CODES = Object.freeze([
+  'DECODER_RECOVERY_SCHEDULED',
+  'DECODER_RECOVERY_ALREADY_SCHEDULED',
+  'DECODER_RECOVERY_NOT_FOUND',
+  'DECODER_RECOVERY_EXPIRED',
+  'DECODER_RECOVERY_NOT_ELIGIBLE',
+] as const);
+
 export const TRANSACTION_INGESTION_HINTS = Object.freeze([
   'NONE',
   'PUMPFUN_CREATE',
@@ -77,6 +85,7 @@ export type TransactionNotificationIngestionHint = Exclude<TransactionIngestionH
 export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
 export type InboxRecoveryResultCode =
   (typeof TRANSACTION_INBOX_RECOVERY_RESULT_CODES)[number];
+export type DecoderRecoveryResultCode = (typeof DECODER_RECOVERY_RESULT_CODES)[number];
 export type ProcessingCheckpointKey = 'launchpad' | 'market';
 export type DurableSnapshotValue =
   | null
@@ -270,6 +279,12 @@ export interface RuntimeHeartbeat {
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
   readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
+  readonly decoderQuarantine?: RuntimeDecoderQuarantineMetricsV1;
+}
+
+export interface RuntimeDecoderQuarantineMetricsV1 {
+  readonly version: 1;
+  readonly unresolvedCount: number;
 }
 
 export interface RuntimeCatchUpAdmissionMetricsV1 extends CatchUpAdmissionCounts {
@@ -325,11 +340,17 @@ export interface InboxCounts {
   readonly failed: number;
   readonly retryableFailed: number;
   readonly exhaustedFailed: number;
+  readonly decoderQuarantinedCount: number;
   readonly catchUpAdmission: CatchUpAdmissionCounts;
 }
 
 export interface InboxRecoveryResult {
   readonly code: InboxRecoveryResultCode;
+  readonly signature: string;
+}
+
+export interface DecoderRecoveryResult {
+  readonly code: DecoderRecoveryResultCode;
   readonly signature: string;
 }
 
@@ -701,6 +722,13 @@ export function assertValidRuntimeHeartbeat(
       }
       assertValidFirstProcessingCanaryEvidence(firstProcessingCanary.value);
     }
+    const decoderQuarantine = Object.getOwnPropertyDescriptor(value, 'decoderQuarantine');
+    if (decoderQuarantine !== undefined) {
+      if (!('value' in decoderQuarantine) || decoderQuarantine.enumerable !== true) {
+        throw new TypeError('Decoder quarantine metrics are invalid.');
+      }
+      snapshotRuntimeDecoderQuarantineMetrics(decoderQuarantine.value);
+    }
   }
   const record = frozenRecord(value, 'Runtime heartbeat');
   for (const field of [
@@ -734,6 +762,37 @@ export function assertValidRuntimeHeartbeat(
   }
   if (record.catchUpAdmission !== undefined) {
     snapshotRuntimeCatchUpAdmissionMetrics(record.catchUpAdmission, record.backlogCount);
+  }
+  if (record.decoderQuarantine !== undefined) {
+    snapshotRuntimeDecoderQuarantineMetrics(record.decoderQuarantine);
+  }
+}
+
+/** Detach the aggregate from callback- or repository-owned objects before persistence. */
+export function snapshotRuntimeDecoderQuarantineMetrics(
+  value: unknown,
+): RuntimeDecoderQuarantineMetricsV1 {
+  try {
+    if (typeof value !== 'object' || value === null || isProxy(value)
+      || !Object.isFrozen(value)) {
+      throw new TypeError('Runtime heartbeat decoder quarantine is invalid.');
+    }
+    const metrics = frozenRecord(value, 'Runtime heartbeat decoder quarantine');
+    assertExactKeys(
+      metrics,
+      ['version', 'unresolvedCount'],
+      'Runtime heartbeat decoder quarantine',
+    );
+    if (metrics.version !== 1) {
+      throw new TypeError('Runtime heartbeat decoder quarantine version is invalid.');
+    }
+    assertCount(
+      metrics.unresolvedCount,
+      'Runtime heartbeat decoder quarantine unresolvedCount',
+    );
+    return Object.freeze({ version: 1, unresolvedCount: metrics.unresolvedCount });
+  } catch {
+    throw new TypeError('Runtime heartbeat decoder quarantine metrics are invalid.');
   }
 }
 
@@ -828,6 +887,7 @@ export function assertValidInboxCounts(value: unknown): asserts value is InboxCo
   assertCount(record.failed, 'Inbox counts failed');
   assertCount(record.retryableFailed, 'Inbox counts retryableFailed');
   assertCount(record.exhaustedFailed, 'Inbox counts exhaustedFailed');
+  assertCount(record.decoderQuarantinedCount, 'Inbox counts decoderQuarantinedCount');
   if (record.retryableFailed + record.exhaustedFailed > record.failed) {
     throw new TypeError('Inbox counts retryableFailed and exhaustedFailed exceed failed.');
   }
@@ -871,6 +931,23 @@ export function assertValidInboxRecoveryResult(
     throw new TypeError('Inbox recovery result code is invalid.');
   }
   assertText(record.signature, 'Inbox recovery result signature');
+}
+
+export function assertValidDecoderRecoveryResult(
+  value: unknown,
+): asserts value is DecoderRecoveryResult {
+  if (typeof value === 'object' && value !== null && isProxy(value)) {
+    throw new TypeError('Decoder recovery result is invalid.');
+  }
+  const record = frozenRecord(value, 'Decoder recovery result');
+  assertExactKeys(record, ['code', 'signature'], 'Decoder recovery result');
+  if (!DECODER_RECOVERY_RESULT_CODES.includes(record.code as DecoderRecoveryResultCode)) {
+    throw new TypeError('Decoder recovery result code is invalid.');
+  }
+  assertText(record.signature, 'Decoder recovery result signature');
+  if (record.signature.length === 0) {
+    throw new TypeError('Decoder recovery result signature must not be empty.');
+  }
 }
 
 function frozenRecord(value: unknown, name: string): Readonly<Record<string, unknown>> {

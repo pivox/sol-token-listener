@@ -13,6 +13,7 @@ import {
 import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
+import { isDecoderQuarantineFailure } from '../domain/observed-pipeline-failure.js';
 import {
   assertValidCatchUpClassification,
   createCatchUpClassification,
@@ -23,6 +24,7 @@ import {
 import {
   assertValidClaimedTransaction,
   assertValidCatchUpGap,
+  assertValidDecoderRecoveryResult,
   assertValidFinalityCandidate,
   assertValidFinalityPollObservation,
   assertValidFinalityRevision,
@@ -32,12 +34,14 @@ import {
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
   snapshotRuntimeCatchUpAdmissionMetrics,
+  snapshotRuntimeDecoderQuarantineMetrics,
   assertValidTransactionNotification,
   createDurableTransactionSnapshot,
   isCanonicalSolanaProgramId,
   MAX_FINALITY_EVIDENCE_VERSION,
   type ClaimedTransaction,
   type CatchUpGap,
+  type DecoderRecoveryResult,
   type DurableNormalizedTransaction,
   type FinalityCandidate,
   type FinalityPollObservation,
@@ -1210,7 +1214,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           client,
           signature,
           token,
-          'attempts_in_cycle, retry_max_attempts, retry_base_delay_ms',
+          `attempts, attempts_in_cycle, retry_max_attempts, retry_base_delay_ms,
+           manual_recovery_count, normalized_transaction, immutable_fingerprint,
+           observed_slot, target_confirmation_status`,
         );
         const attemptsInCycle = safeCount(row.attempts_in_cycle, 'attempts in cycle');
         const maxAttempts = positiveBoundedInteger(
@@ -1226,6 +1232,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const exhausted = failure.retryable && attemptsInCycle >= maxAttempts;
         const terminal = !failure.retryable || exhausted;
         const delayMs = retryDelayMs(baseDelayMs, attemptsInCycle);
+        const decoderQuarantineEligible = isDecoderQuarantineFailure(failure)
+          && hasRecoverableDecoderQuarantineSnapshot(row, signature);
         const result = await client.query(
           `UPDATE chain_transaction_inbox SET
              processing_status = 'FAILED', lease_token = NULL, lease_expires_at = NULL,
@@ -1237,6 +1245,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              terminal_at = CASE WHEN $8 THEN completed.completed_at ELSE NULL END,
              purge_after = CASE WHEN $8 THEN
                completed.completed_at + INTERVAL '4 hours' ELSE NULL END,
+             decoder_quarantine_eligible_at = CASE WHEN $9
+               AND decoder_recovery_used=FALSE AND NOT EXISTS (
+               SELECT 1 FROM transaction_inbox_decoder_recoveries receipt
+               WHERE receipt.signature=$1
+             ) THEN completed.completed_at ELSE NULL END,
              updated_at = completed.completed_at
            FROM (SELECT clock_timestamp() AS completed_at) completed
            WHERE signature = $1 AND lease_token = $2 AND processing_status = 'PROCESSING'`,
@@ -1249,6 +1262,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             exhausted,
             delayMs,
             terminal,
+            decoderQuarantineEligible,
           ],
         );
         requireLease(result.rowCount);
@@ -1369,6 +1383,126 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         );
         requireOne(updated.rowCount);
         return inboxRecoveryResult('RECOVERY_SCHEDULED', signature);
+      });
+    });
+  }
+
+  public async recoverDecoderQuarantine(signature: string): Promise<DecoderRecoveryResult> {
+    return this.safely(async () => {
+      requireText(signature, 'signature');
+      return this.transaction(async (client) => {
+        await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
+          [signature],
+        );
+        const selected = await client.query(
+          `SELECT inbox.*,
+             EXISTS (
+               SELECT 1 FROM transaction_inbox_decoder_recoveries receipt
+               WHERE receipt.signature=inbox.signature
+             ) AS decoder_recovery_recorded
+           FROM chain_transaction_inbox inbox
+           WHERE inbox.signature=$1
+           FOR UPDATE OF inbox`,
+          [signature],
+        );
+        const row = selected.rows[0];
+        if (row === undefined) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_FOUND', signature);
+        }
+        const status = inboxStatus(row.processing_status);
+        const recoveryCount = safeCount(row.manual_recovery_count, 'manual recovery count');
+        const decoderRecoveryUsed = row.decoder_recovery_used === true;
+        if (decoderRecoveryUsed) {
+          if (recoveryCount === 0 || row.last_manual_recovery_at === null) {
+            throw new TypeError('Stored decoder recovery marker is invalid.');
+          }
+          dateMs(row.last_manual_recovery_at, 'last manual recovery at');
+          return decoderRecoveryResult('DECODER_RECOVERY_ALREADY_SCHEDULED', signature);
+        }
+        const recoveryClock = await client.query(
+          "SELECT date_trunc('milliseconds',clock_timestamp()) AS recovered_at",
+        );
+        const recoveredAtMs = dateMs(
+          requiredRow(recoveryClock.rows[0]).recovered_at,
+          'decoder recovery time',
+        );
+        const terminalAtMs = nullableDateMs(row.terminal_at, 'terminal at');
+        const purgeAfterMs = nullableDateMs(row.purge_after, 'purge after');
+        const exactWorkerFailure = isStoredDecoderQuarantineFailure(row);
+        const decoderQuarantineEligibleAtMs = nullableDateMs(
+          row.decoder_quarantine_eligible_at,
+          'decoder quarantine eligible at',
+        );
+        if (status !== 'FAILED'
+          || !exactWorkerFailure
+          || row.decoder_recovery_recorded === true
+          || row.retry_exhausted_at !== null
+          || row.processed_at !== null
+          || row.lease_token !== null
+          || row.lease_expires_at !== null
+          || row.next_attempt_at !== null
+          || terminalAtMs === null
+          || purgeAfterMs === null
+          || purgeAfterMs - terminalAtMs !== 14_400_000) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        if (purgeAfterMs <= recoveredAtMs) {
+          return decoderRecoveryResult('DECODER_RECOVERY_EXPIRED', signature);
+        }
+        if (decoderQuarantineEligibleAtMs !== terminalAtMs) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        positiveBoundedInteger(row.attempts, 'lifetime attempts', 2_147_483_647);
+        positiveBoundedInteger(row.attempts_in_cycle, 'cycle attempts', 100);
+        if (recoveryCount >= 2_147_483_647) {
+          throw new TypeError('Stored manual recovery count is invalid.');
+        }
+        if (row.normalized_transaction === null || row.immutable_fingerprint === null) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        try {
+          decodeSnapshot(
+            row.normalized_transaction,
+            requiredFingerprint(row.immutable_fingerprint),
+            signature,
+            numericBigInt(row.observed_slot, 'observed slot'),
+            confirmation(row.target_confirmation_status),
+          );
+        } catch {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        const reasonCode = row.error_name
+          === 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED'
+          ? 'PUMP_SCHEMA_UNSUPPORTED' : 'PUMP_BORSH_TRUNCATED';
+        const receipt = await client.query(
+          `INSERT INTO transaction_inbox_decoder_recoveries (
+             signature,quarantine_kind,worker_reason_code,snapshot_fingerprint,
+             quarantined_at,recovered_at,recovery_source,purge_after
+           ) VALUES ($1,'WORKER_SNAPSHOT',$2,$3,$4,$5::TIMESTAMPTZ,'LOCAL_CLI',
+             $5::TIMESTAMPTZ+INTERVAL '4 hours')`,
+          [signature, reasonCode, row.immutable_fingerprint,
+            new Date(terminalAtMs), new Date(recoveredAtMs)],
+        );
+        requireOne(receipt.rowCount);
+        const updated = await client.query(
+          `UPDATE chain_transaction_inbox SET
+             processing_status='PENDING', attempts_in_cycle=0,
+             lease_token=NULL, lease_expires_at=NULL,
+             error_code=NULL, error_name=NULL, error_retryable=NULL,
+             next_attempt_at=NULL, retry_exhausted_at=NULL, processed_at=NULL,
+             terminal_at=NULL, purge_after=NULL,
+             decoder_quarantine_eligible_at=NULL,
+             decoder_recovery_used=TRUE,
+             manual_recovery_count=manual_recovery_count+1,
+             last_manual_recovery_at=$2,
+             updated_at=GREATEST(updated_at,$2)
+           WHERE signature=$1 AND processing_status='FAILED'`,
+          [signature, new Date(recoveredAtMs)],
+        );
+        requireOne(updated.rowCount);
+        return decoderRecoveryResult('DECODER_RECOVERY_SCHEDULED', signature);
       });
     });
   }
@@ -2047,6 +2181,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : createRuntimeRpcHttpEvidence(value.rpcHttpEvidence);
       const firstProcessingCanary = value.firstProcessingCanary === undefined ? undefined
         : createFirstProcessingCanaryEvidence(value.firstProcessingCanary);
+      const decoderQuarantine = value.decoderQuarantine === undefined ? undefined
+        : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
@@ -2096,6 +2232,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               : { catchUpAdmission }),
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
+            ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
           }),
           value.exhaustedCount,
         ],
@@ -2122,6 +2259,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              WHERE processing_status = 'FAILED' AND error_retryable = TRUE
                AND retry_exhausted_at IS NOT NULL
            ) AS exhausted_failed,
+           COUNT(*) FILTER (
+             WHERE decoder_quarantine_eligible_at IS NOT NULL
+               AND purge_after>clock_timestamp()
+           ) AS decoder_quarantined,
            COUNT(*) FILTER (WHERE ${actionable}
              AND 'WEBSOCKET' = ANY(discovery_sources)
              AND NOT ('CATCH_UP' = ANY(discovery_sources))) AS websocket_only,
@@ -2140,7 +2281,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            COUNT(*) FILTER (WHERE processing_status = 'DEFERRED') AS deferred,
            COUNT(*) FILTER (WHERE processing_status = 'IGNORED') AS ignored,
            COUNT(*) FILTER (WHERE processing_status = 'QUARANTINED') AS quarantined
-         FROM chain_transaction_inbox`,
+         FROM chain_transaction_inbox inbox`,
       );
       const row = requiredRow(result.rows[0]);
       const counts = Object.freeze({
@@ -2150,6 +2291,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         failed: safeCount(row.failed, 'failed count'),
         retryableFailed: safeCount(row.retryable_failed, 'retryable failed count'),
         exhaustedFailed: safeCount(row.exhausted_failed, 'exhausted failed count'),
+        decoderQuarantinedCount: safeCount(
+          row.decoder_quarantined,
+          'decoder quarantined count',
+        ),
         catchUpAdmission: Object.freeze({
           actionableBacklogBySource: Object.freeze({
             websocketOnly: safeCount(row.websocket_only, 'websocket only count'),
@@ -3410,6 +3555,15 @@ function inboxRecoveryResult(
   return result;
 }
 
+function decoderRecoveryResult(
+  code: DecoderRecoveryResult['code'],
+  signature: string,
+): DecoderRecoveryResult {
+  const result = Object.freeze({ code, signature });
+  assertValidDecoderRecoveryResult(result);
+  return result;
+}
+
 function safeFailureMetadata(
   stage: TransactionInboxFailureMetadata['stage'],
 ): TransactionInboxFailureMetadata {
@@ -3446,6 +3600,42 @@ function requireCheckpointKey(value: unknown): asserts value is 'launchpad' | 'm
 function requiredRow(row: QueryResultRow | undefined): QueryResultRow {
   if (row === undefined) throw new TypeError('Repository query returned no row.');
   return row;
+}
+
+function isStoredDecoderQuarantineFailure(row: QueryResultRow): boolean {
+  const candidate: unknown = Object.freeze({
+    code: row.error_code as unknown,
+    errorName: row.error_name as unknown,
+    retryable: row.error_retryable as unknown,
+  });
+  try {
+    assertValidIngestionFailure(candidate);
+  } catch {
+    return false;
+  }
+  return isDecoderQuarantineFailure(candidate);
+}
+
+function hasRecoverableDecoderQuarantineSnapshot(
+  row: QueryResultRow,
+  signature: string,
+): boolean {
+  try {
+    positiveBoundedInteger(row.attempts, 'lifetime attempts', 2_147_483_647);
+    positiveBoundedInteger(row.attempts_in_cycle, 'cycle attempts', 100);
+    const recoveryCount = safeCount(row.manual_recovery_count, 'manual recovery count');
+    if (recoveryCount >= 2_147_483_647) return false;
+    decodeSnapshot(
+      row.normalized_transaction,
+      requiredFingerprint(row.immutable_fingerprint),
+      signature,
+      numericBigInt(row.observed_slot, 'observed slot'),
+      confirmation(row.target_confirmation_status),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function requireOne(rowCount: number | null): void {

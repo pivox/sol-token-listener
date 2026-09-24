@@ -1,6 +1,7 @@
 import type {
   ClaimedTransaction,
   CatchUpGap,
+  DecoderRecoveryResult,
   FinalityCandidate,
   FinalityPollObservation,
   FinalityRevision,
@@ -41,6 +42,7 @@ export interface TransactionInboxRepository {
   ): Promise<void>;
   markFailed(signature: string, token: string, failure: IngestionFailure): Promise<void>;
   recoverExhausted(signature: string): Promise<InboxRecoveryResult>;
+  recoverDecoderQuarantine(signature: string): Promise<DecoderRecoveryResult>;
   listForFinality(limit: number): Promise<readonly FinalityCandidate[]>;
   recordFinalityPoll(value: FinalityPollObservation): Promise<FinalityCandidate>;
   enqueueRevision(value: FinalityRevision): Promise<void>;

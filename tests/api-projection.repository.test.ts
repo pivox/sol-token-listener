@@ -1723,6 +1723,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       catchUpAdmission: null,
       rpcHttpEvidence: null,
       firstProcessingCanary: null,
+      decoderQuarantine: null,
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2119,7 +2120,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
     websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
-    rpcHttpEvidence: null, firstProcessingCanary: null,
+    rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
   });
   assert.equal(health.lagSlots, null);
 });
@@ -2389,6 +2390,53 @@ function catchUpAdmissionMetrics() {
     deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
   };
 }
+
+async function projectDecoderQuarantine(payload: unknown) {
+  return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow(), false, healthyHeartbeatRow({ payload }),
+  ))).getHealth();
+}
+
+void test('decoder quarantine projects one exact frozen aggregate and legacy absence as null', async () => {
+  for (const payload of [null, {}, { rpcHttpEvidence: rpcHttpEvidenceMetrics() }]) {
+    const health = await projectDecoderQuarantine(payload);
+    assert.equal(health.status, 'OK');
+    assert.equal(health.heartbeat.decoderQuarantine, null);
+  }
+  const source = { version: 1, unresolvedCount: 2 };
+  const health = await projectDecoderQuarantine({ decoderQuarantine: source });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.decoderQuarantine, source);
+  assert.ok(Object.isFrozen(health.heartbeat.decoderQuarantine));
+  assert.notEqual(health.heartbeat.decoderQuarantine, source);
+});
+
+void test('decoder quarantine rejects malformed or identifying payloads fail closed', async () => {
+  let calls = 0;
+  const accessor = Object.defineProperty({}, 'decoderQuarantine', {
+    enumerable: true,
+    get() { calls += 1; throw new Error('private-secret'); },
+  });
+  const proxy = new Proxy({ version: 1, unresolvedCount: 2 }, {
+    ownKeys() { calls += 1; throw new Error('private-secret'); },
+  });
+  for (const payload of [
+    { decoderQuarantine: null },
+    { decoderQuarantine: { version: 2, unresolvedCount: 2 } },
+    { decoderQuarantine: { version: 1, unresolvedCount: -1 } },
+    { decoderQuarantine: { version: 1, unresolvedCount: -0 } },
+    { decoderQuarantine: { version: 1, unresolvedCount: Number.MAX_SAFE_INTEGER + 1 } },
+    { decoderQuarantine: { version: 1, unresolvedCount: 2, signature: 'private-secret' } },
+    { decoderQuarantine: proxy },
+    accessor,
+  ]) {
+    const health = await projectDecoderQuarantine(payload);
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.heartbeat.decoderQuarantine, null);
+    assert.doesNotMatch(JSON.stringify(health), /private-secret/u);
+  }
+  assert.equal(calls, 0);
+});
 
 async function projectCatchUpAdmission(payload: unknown, backlog = 6) {
   return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(

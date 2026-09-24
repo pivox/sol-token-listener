@@ -9,6 +9,7 @@ import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import {
   LISTENER_RUNTIME_STATES,
   MAX_FINALITY_EVIDENCE_VERSION,
+  DECODER_RECOVERY_RESULT_CODES,
   TRANSACTION_INBOX_RECOVERY_RESULT_CODES,
   MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH,
   MAX_TRANSACTION_SNAPSHOT_DEPTH,
@@ -24,6 +25,7 @@ import {
   assertValidFinalityPollObservation,
   assertValidFinalityRevision,
   assertValidIngestionFailure,
+  assertValidDecoderRecoveryResult,
   assertValidInboxCounts,
   assertValidInboxRecoveryResult,
   assertValidProcessingCheckpoint,
@@ -32,12 +34,14 @@ import {
   createDurableTransactionSnapshot,
   createCatchUpGap,
   restoreNormalizedTransactionSnapshot,
+  snapshotRuntimeDecoderQuarantineMetrics,
   type ClaimedTransaction,
   type CatchUpGap,
   type FinalityCandidate,
   type FinalityPollObservation,
   type FinalityRevision,
   type IngestionFailure,
+  type DecoderRecoveryResult,
   type InboxRecoveryResult,
   type ProcessingCheckpoint,
   type RuntimeHeartbeat,
@@ -50,6 +54,33 @@ import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
+
+void test('decoder quarantine metrics are exact, frozen, aggregate-only and rolling-compatible', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const metrics = snapshotRuntimeDecoderQuarantineMetrics(Object.freeze({
+    version: 1,
+    unresolvedCount: 2,
+  }));
+  assert.deepEqual(metrics, { version: 1, unresolvedCount: 2 });
+  assert.ok(Object.isFrozen(metrics));
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, decoderQuarantine: metrics }));
+  });
+  for (const decoderQuarantine of [
+    null,
+    { version: 1, unresolvedCount: 2 },
+    Object.freeze({ version: 2, unresolvedCount: 2 }),
+    Object.freeze({ version: 1, unresolvedCount: -0 }),
+    Object.freeze({ version: 1, unresolvedCount: Number.MAX_SAFE_INTEGER + 1 }),
+    Object.freeze({ version: 1, unresolvedCount: 2, signature: 'must-not-leak' }),
+    new Proxy(metrics, {}),
+  ]) {
+    assert.throws(() => {
+      assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, decoderQuarantine }));
+    }, TypeError);
+  }
+});
 
 void test('heartbeat accepts omitted historical RPC HTTP evidence and the exact fixed provider snapshot', () => {
   const heartbeat = rpcEvidenceHeartbeat();
@@ -233,8 +264,48 @@ void test('publishes exact frozen ingestion status constants', () => {
     'RECOVERY_NOT_FOUND',
   ]);
   assert.ok(Object.isFrozen(TRANSACTION_INBOX_RECOVERY_RESULT_CODES));
+  assert.deepEqual(DECODER_RECOVERY_RESULT_CODES, [
+    'DECODER_RECOVERY_SCHEDULED',
+    'DECODER_RECOVERY_ALREADY_SCHEDULED',
+    'DECODER_RECOVERY_NOT_FOUND',
+    'DECODER_RECOVERY_EXPIRED',
+    'DECODER_RECOVERY_NOT_ELIGIBLE',
+  ]);
+  assert.ok(Object.isFrozen(DECODER_RECOVERY_RESULT_CODES));
   assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE']);
   assert.ok(Object.isFrozen(TRANSACTION_INGESTION_HINTS));
+});
+
+void test('accepts every exact frozen decoder recovery result', () => {
+  for (const code of DECODER_RECOVERY_RESULT_CODES) {
+    const result: DecoderRecoveryResult = Object.freeze({ code, signature: 'signature' });
+    assert.doesNotThrow(() => { assertValidDecoderRecoveryResult(result); });
+  }
+});
+
+void test('rejects non-exact decoder recovery results without inspecting proxies', () => {
+  let traps = 0;
+  const trap = (): never => { traps += 1; throw new Error('secret trap'); };
+  const valid = Object.freeze({
+    code: 'DECODER_RECOVERY_SCHEDULED' as const,
+    signature: 'signature',
+  });
+  const proxy = new Proxy(valid, {
+    get: trap,
+    getPrototypeOf: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+  });
+  for (const value of [
+    { ...valid },
+    Object.freeze({ ...valid, privateDetail: 'must-not-persist' }),
+    Object.freeze({ ...valid, code: 'RECOVERY_SCHEDULED' }),
+    Object.freeze({ ...valid, signature: '' }),
+    proxy,
+  ]) {
+    assert.throws(() => { assertValidDecoderRecoveryResult(value); }, TypeError);
+  }
+  assert.equal(traps, 0);
 });
 
 void test('accepts canonical frozen ingestion contracts with bigint slots and integer milliseconds', () => {
@@ -786,6 +857,7 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     failed: 2,
     retryableFailed: 1,
     exhaustedFailed: 1,
+    decoderQuarantinedCount: 0,
     catchUpAdmission: Object.freeze({
       actionableBacklogBySource: Object.freeze({ websocketOnly: 1, catchUpOnly: 0, websocketAndCatchUp: 0 }),
       actionableBacklogByPriority: Object.freeze({ normal: 1, launchCandidate: 0, trackedTrade: 0 }),
@@ -797,6 +869,16 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     () => { assertValidInboxCounts(Object.freeze({ ...counts, exhaustedFailed: 2 })); },
     /exhaustedFailed|failed/u,
   );
+  for (const decoderQuarantinedCount of [
+    -1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity,
+  ]) {
+    assert.throws(
+      () => {
+        assertValidInboxCounts(Object.freeze({ ...counts, decoderQuarantinedCount }));
+      },
+      /decoderQuarantinedCount|safe integer/u,
+    );
+  }
   assert.throws(
     () => { assertValidRuntimeHeartbeat(Object.freeze({
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
@@ -816,7 +898,8 @@ void test('InboxCounts validates exact frozen catch-up admission counts and both
     deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
   });
   const counts = Object.freeze({ pending: 2, processing: 1, processed: 7, failed: 4,
-    retryableFailed: 3, exhaustedFailed: 1, catchUpAdmission: admission });
+    retryableFailed: 3, exhaustedFailed: 1, decoderQuarantinedCount: 0,
+    catchUpAdmission: admission });
   assert.doesNotThrow(() => { assertValidInboxCounts(counts); });
   for (const catchUpAdmission of [
     undefined,

@@ -716,6 +716,34 @@ void test('catch-up admission documentation fixes the restart-only activation an
   assert.match(runbook, /Rollback complet d'hydratation bloc[\s\S]{0,500}LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false[\s\S]{0,500}LISTENER_BLOCK_HYDRATION_ENABLED=false[\s\S]{0,300}redémarr/iu);
 });
 
+void test('decoder quarantine runbook documents bounded observation-only recovery', async () => {
+  const [runbook, design, plan] = await Promise.all([
+    readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('docs/superpowers/specs/2026-09-20-pumpfun-decoder-quarantine-design.md'),
+    readArtifact('docs/superpowers/plans/2026-09-20-pumpfun-decoder-quarantine.md'),
+  ]);
+  assert.match(design, /Version: 1\.0\.5/u);
+  assert.match(plan, /Version: 1\.0\.6/u);
+  assert.match(plan, /docs\/operations\/block-hydration-canary\.md/u);
+  assert.doesNotMatch(plan, /docs\/runbooks\/mainnet-observe-dry-run\.md/u);
+  assert.match(runbook, /heartbeat\.decoderQuarantine[^.]{0,200}unresolvedCount/iu);
+  assert.match(runbook, /npm run inbox:recover-decoder -- --signature=<SIGNATURE> --confirm=<SIGNATURE>/u);
+  assert.match(runbook, /SELECT\s+signature[\s\S]{0,1800}chain_transaction_inbox/iu);
+  assert.match(runbook, /terminal_at[\s\S]{0,240}signature/iu);
+  assert.match(runbook, /local[^.]{0,240}(?:non publié|ne doit pas être publié)/iu);
+  for (const code of [
+    'DECODER_RECOVERY_SCHEDULED', 'DECODER_RECOVERY_ALREADY_SCHEDULED',
+    'DECODER_RECOVERY_NOT_FOUND', 'DECODER_RECOVERY_EXPIRED',
+    'DECODER_RECOVERY_NOT_ELIGIBLE',
+  ]) assert.match(runbook, new RegExp(code, 'u'));
+  assert.match(runbook, /quatre heures[^.]{0,240}mise\s+en\s+quarantaine\s+originale/iu);
+  assert.match(runbook, /reçu d.audit[^.]{0,240}purge quatre heures/iu);
+  assert.match(runbook, /marqueur booléen monotone[^.]{0,240}expiration du reçu/iu);
+  assert.match(runbook, /n'est jamais une autorisation de trade/iu);
+  assert.match(runbook, /ni succès du décodage, ni qualification, ni sellabilité, ni profit/iu);
+  assert.match(runbook, /aucune transaction brute/iu);
+});
+
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {
   const vite = await readArtifact('frontend/vite.config.ts');
   const readme = await readArtifact('frontend/README.md');
@@ -888,6 +916,11 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /MAX_RETENTION_OUTPUT_BYTES/);
   assert.match(retention, /JSON\.parse\(serialized\)/);
   assert.match(retention, /canonicalRetentionCounters/);
+  assert.match(
+    smoke,
+    /'transactionInboxDecoderRecoveries',\n {2}'transactionInboxRecoveries',/u,
+    'deployment smoke must expect the decoder recovery retention counter',
+  );
   assert.match(
     smoke,
     /'executionActivationArmaments',\n {2}'executionActivationEvents',\n {2}'executionAttempts',\n {2}'executionControlEvents',\n {2}'executionDryRunAssessments',\n {2}'executionExitAuthorizations',\n {2}'executionIntents',\n {2}'executionIntentsExpiredPreSubmission',\n {2}'executionIntentTransitions',\n {2}'executionLivePositions',\n {2}'executionLiveUnsignedSimulationEvidence',\n {2}'executionOperatorAuthorizations',\n {2}'executionPreflightIntentPairMemberships',\n {2}'executionPreflightIntentPairs',\n {2}'executionPreflightPreparationRuns',\n {2}'executionPreSignatureLocks',\n {2}'executionRiskAdmissionReports',\n {2}'executionRiskFaults',\n {2}'executionRiskProviderOperations',\n {2}'executionRiskProviderSnapshots',\n {2}'executionRiskRateLimitEvents',\n {2}'executionRiskReconciliationEvidence',\n {2}'executionRiskReservations',\n {2}'executionRiskTombstones',\n {2}'executionRiskWalletSnapshots',\n {2}'executionSafetyQualifications',\n {2}'executionSignedSimulationEvidence',\n {2}'executionSignedTransactions',\n {2}'executionSimulationArtifacts',\n {2}'executionSubmissionEvents',/u,

@@ -13,6 +13,7 @@ const migrationAdvisoryLockId = 7_347_662_125;
 const PAPER_MVP_RETENTION_FENCE_SQL =
   "SELECT pg_advisory_xact_lock(hashtextextended('paper-mvp-owner-fence:v1', 0))";
 const EXECUTION_INTENT_EXPIRATION_BATCH_SIZE = 1_000;
+const DECODER_RECOVERY_RECEIPT_PURGE_BATCH_SIZE = 1_000;
 
 export function getDatabasePool(
   databaseUrl = process.env.DATABASE_URL,
@@ -198,6 +199,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly walletClusters: number;
   readonly walletGraphSnapshots: number;
   readonly transactionInboxRecoveries: number;
+  readonly transactionInboxDecoderRecoveries: number;
   readonly listenerCatchUpGaps: number;
   readonly listenerStrictCatchUpFailures: number;
   readonly listenerStrictCatchUpRuns: number;
@@ -937,6 +939,20 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const transactionInboxRecoveries = await client.query(
       'DELETE FROM transaction_inbox_recoveries WHERE purge_after <= clock_timestamp()',
     );
+    const transactionInboxDecoderRecoveries = await client.query(
+      `WITH expired AS MATERIALIZED (
+         SELECT signature,quarantined_at
+         FROM transaction_inbox_decoder_recoveries
+         WHERE purge_after<=clock_timestamp()
+         ORDER BY purge_after,signature
+         LIMIT $1
+       )
+       DELETE FROM transaction_inbox_decoder_recoveries receipt
+       USING expired
+       WHERE receipt.signature=expired.signature
+         AND receipt.quarantined_at=expired.quarantined_at`,
+      [DECODER_RECOVERY_RECEIPT_PURGE_BATCH_SIZE],
+    );
     const listenerCatchUpGaps = await client.query(
       'DELETE FROM listener_catch_up_gaps WHERE purge_after <= clock_timestamp()',
     );
@@ -1258,6 +1274,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       walletClusters: walletClusters.rowCount ?? 0,
       walletGraphSnapshots: walletGraphSnapshots.rowCount ?? 0,
       transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
+      transactionInboxDecoderRecoveries: transactionInboxDecoderRecoveries.rowCount ?? 0,
       listenerCatchUpGaps: listenerCatchUpGaps.rowCount ?? 0,
       listenerStrictCatchUpFailures: listenerStrictCatchUpFailures.rowCount ?? 0,
       listenerStrictCatchUpRuns: listenerStrictCatchUpRuns.rowCount ?? 0,
