@@ -1,6 +1,6 @@
 # Pump.fun Decoder Quarantine and Replay Implementation Plan
 
-Version: 1.0.2 — 2026-09-20 — issue #148
+Version: 1.0.3 — 2026-09-24 — issue #148
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -171,7 +171,7 @@ repository lifecycle separately.
 - Modify: `src/storage/api-projection.repository.ts`
 - Modify: diagnostic frontend health types/components only where required
 - Modify: associated domain/repository/API/frontend tests
-- Modify: `docs/runbooks/mainnet-observe-dry-run.md`
+- Modify: `docs/operations/block-hydration-canary.md`
 - Modify: `docs/superpowers/specs/2026-09-20-pumpfun-decoder-quarantine-design.md`
 - Modify: this plan
 

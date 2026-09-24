@@ -16,6 +16,7 @@ import {
   assertValidInboxCounts,
   assertValidRuntimeHeartbeat,
   snapshotRuntimeCatchUpAdmissionMetrics,
+  snapshotRuntimeDecoderQuarantineMetrics,
   type CatchUpGap,
   type InboxCounts,
   type ListenerRuntimeState,
@@ -1032,6 +1033,10 @@ export class PersistentListenerHeartbeat {
       leasedCount: this.leasedCount,
       exhaustedCount: this.exhaustedCount,
       firstProcessingCanary,
+      decoderQuarantine: snapshotRuntimeDecoderQuarantineMetrics(Object.freeze({
+        version: 1,
+        unresolvedCount: counts.decoderQuarantinedCount,
+      })),
       ...(blockHydration === undefined ? {} : { blockHydration }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),

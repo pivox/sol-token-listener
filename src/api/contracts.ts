@@ -549,6 +549,13 @@ export interface ApiHeartbeat {
   readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
   /** Optional during rolling deployment; null when first-processing evidence is absent. */
   readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
+  /** Optional during rolling deployment; null when decoder-quarantine evidence is absent. */
+  readonly decoderQuarantine?: ApiDecoderQuarantineMetricsV1 | null;
+}
+
+export interface ApiDecoderQuarantineMetricsV1 {
+  readonly version: 1;
+  readonly unresolvedCount: number;
 }
 
 export interface ApiFirstProcessingCanaryEvidenceV1 {

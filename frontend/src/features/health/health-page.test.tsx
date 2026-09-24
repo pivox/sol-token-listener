@@ -43,6 +43,41 @@ function renderHealth(value: ApiHealth): ReturnType<typeof vi.fn<ApiClient['getH
 }
 
 describe('technical health page', () => {
+  it('renders only the decoder quarantine aggregate without identifiers', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        signature: 'secret-signature',
+        mint: 'secret-mint',
+        decoderQuarantine: { version: 1, unresolvedCount: 2 },
+      },
+    })).data);
+    const card = (await screen.findByRole('heading', {
+      name: 'Quarantaine décodeur',
+    })).closest('section');
+    expect(within(card!).getByText('2')).toBeVisible();
+    expect(card).toHaveTextContent('Incompatibilités non résolues : 2');
+    expect(document.body).not.toHaveTextContent('secret-signature');
+    expect(document.body).not.toHaveTextContent('secret-mint');
+  });
+
+  it.each([
+    [undefined, 'Non disponible — backend antérieur'],
+    [null, 'Non disponible — heartbeat antérieur ou invalide'],
+  ] as const)('renders decoder quarantine rolling absence for %s', async (value, message) => {
+    const heartbeat: Record<string, unknown> = {
+      ...health.heartbeat,
+      decoderQuarantine: value,
+    };
+    if (value === undefined) delete heartbeat.decoderQuarantine;
+    renderHealth(apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat })).data);
+    const card = (await screen.findByRole('heading', {
+      name: 'Quarantaine décodeur',
+    })).closest('section');
+    expect(within(card!).getByText(message)).toBeVisible();
+  });
+
   it('renders fixed first-processing evidence, overflow and completed drain without identifiers', async () => {
     renderHealth(apiHealthEnvelopeSchema.parse(success({
       ...health,

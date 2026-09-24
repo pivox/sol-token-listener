@@ -479,6 +479,10 @@ const blockHydrationSchema = z.object({
   || queueDelayMs.maximum === null
   || queueDelayMs.last <= queueDelayMs.maximum);
 const catchUpAdmissionCountSchema = countSchema.refine((value) => !Object.is(value, -0));
+const decoderQuarantineSchema = z.object({
+  version: z.literal(1),
+  unresolvedCount: countSchema.refine((value) => !Object.is(value, -0)),
+}).strict();
 const catchUpAdmissionSchema = z.object({
   version: z.literal(1),
   enabled: z.boolean(),
@@ -665,6 +669,7 @@ const healthSchema = z.object({
     catchUpAdmission: catchUpAdmissionSchema.nullish(),
     rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
     firstProcessingCanary: firstProcessingCanarySchema.nullish(),
+    decoderQuarantine: decoderQuarantineSchema.nullish(),
   }).loose().refine(({ catchUpAdmission, backlogCount }) => {
     if (catchUpAdmission === undefined || catchUpAdmission === null) return true;
     const source = catchUpAdmission.actionableBacklogBySource;

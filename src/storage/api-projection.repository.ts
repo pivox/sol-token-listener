@@ -7,6 +7,7 @@ import {
   type ApiHealth,
   type ApiBlockHydrationMetricsV1,
   type ApiCatchUpAdmissionMetricsV1,
+  type ApiDecoderQuarantineMetricsV1,
   type ApiFirstProcessingCanaryEvidenceV1,
   type ApiRpcHttpEvidenceV1,
   type ApiWebSocketHealth,
@@ -2109,7 +2110,7 @@ function emptyHeartbeat(
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
     websocket, blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null,
-    firstProcessingCanary: null });
+    firstProcessingCanary: null, decoderQuarantine: null });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2197,6 +2198,27 @@ function heartbeatFromRow(
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
     firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
+    decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
+  });
+}
+
+function decoderQuarantineFromPayload(
+  value: unknown,
+): ApiDecoderQuarantineMetricsV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'decoderQuarantine');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  const metrics = exactDataRecord(
+    descriptor.value,
+    ['version', 'unresolvedCount'],
+    'Decoder quarantine metrics',
+  );
+  if (metrics.version !== 1) throw invalid();
+  return freeze({
+    version: 1,
+    unresolvedCount: nonNegativeSafeNumber(metrics.unresolvedCount),
   });
 }
 

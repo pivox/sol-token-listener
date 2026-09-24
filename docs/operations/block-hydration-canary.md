@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.1.3 — 2026-09-20 — issues #114, #142, #143 et #146.
+Version : 1.2.0 — 2026-09-24 — issues #114, #142, #143, #146 et #148.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -10,6 +10,36 @@ readiness Mainnet n'est déclarée avant que cette fenêtre ait passé. Utiliser
 seule réplique avec `LISTENER_INGESTION_SCOPE=launchpad-only`, en mode `observe`.
 Archiver le health, les compteurs inbox, le RSS et le tableau fournisseur avant
 activation.
+
+## Quarantaine du décodeur Pump.fun
+
+Le champ public `heartbeat.decoderQuarantine` expose uniquement `version: 1` et
+`unresolvedCount`. Une absence historique est `null`, jamais un zéro déduit. Un
+compteur non nul identifie un travail d'observation incompatible conservé, sans
+exposer signature, mint, payload, URL, message d'erreur ou donnée de wallet.
+
+L'opérateur doit d'abord déployer et vérifier le décodeur corrigé, puis lancer
+localement, pour une signature exacte encore retenue :
+
+```bash
+npm run inbox:recover-decoder -- --signature=<SIGNATURE> --confirm=<SIGNATURE>
+```
+
+La confirmation répétée est obligatoire. Les cinq résultats métier sont
+`DECODER_RECOVERY_SCHEDULED`, `DECODER_RECOVERY_ALREADY_SCHEDULED`,
+`DECODER_RECOVERY_NOT_FOUND`, `DECODER_RECOVERY_EXPIRED` et
+`DECODER_RECOVERY_NOT_ELIGIBLE`. Les erreurs de commande restent redacted.
+
+La récupération n'est possible que pendant les quatre heures suivant la mise
+en quarantaine originale. L'heure est réévaluée après verrouillage de la ligne :
+une commande commencée avant la limite mais déverrouillée après la limite est
+`DECODER_RECOVERY_EXPIRED`. Le reçu d'audit a sa propre purge quatre heures
+après la récupération et ne conserve aucune transaction brute.
+
+Cette commande programme uniquement un rejeu normal du snapshot immuable. Elle
+ne prouve ni succès du décodage, ni qualification, ni sellabilité, ni profit.
+Elle n'est jamais une autorisation de trade, n'arme aucun executor et ne lit,
+ne signe ni ne soumet aucune transaction avec un wallet.
 
 ## Déroulement
 

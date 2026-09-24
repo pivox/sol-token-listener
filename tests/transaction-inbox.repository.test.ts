@@ -972,7 +972,8 @@ void test('catch-up admission counts partition actionable work by source and pri
     const counts = await measured.counts();
     assert.equal(queries.length, 1);
     assert.deepEqual(counts, {
-      pending: 2, processing: 1, processed: 1, failed: 3, retryableFailed: 1, exhaustedFailed: 1,
+      pending: 2, processing: 1, processed: 1, failed: 3, retryableFailed: 1,
+      exhaustedFailed: 1, decoderQuarantinedCount: 0,
       catchUpAdmission: {
         actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 1 },
         actionableBacklogByPriority: { normal: 2, launchCandidate: 1, trackedTrade: 1 },
@@ -983,6 +984,68 @@ void test('catch-up admission counts partition actionable work by source and pri
     assert.ok(Object.isFrozen(counts.catchUpAdmission.actionableBacklogBySource));
     assert.ok(Object.isFrozen(counts.catchUpAdmission.actionableBacklogByPriority));
   });
+});
+
+void test('counts only retained unresolved worker decoder quarantines and clears the aggregate on recovery', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-count-retained', 930n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-count-expired', 931n, 'PUMP_BORSH_TRUNCATED',
+    );
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      terminal_at=date_trunc('milliseconds',clock_timestamp()-INTERVAL '4 hours'),
+      purge_after=date_trunc('milliseconds',clock_timestamp())
+      WHERE signature='decoder-count-expired'`);
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput('decoder-count-catch-up'),
+      disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
+      ingestionHint: null, ingestionHintMint: null, mints: [],
+    }));
+    await repository.enqueue(notification('decoder-count-processed', 932n));
+    const claimed = await repository.claim(Date.now(), 30);
+    assert.equal(claimed?.signature, 'decoder-count-processed');
+    await repository.saveSnapshot(
+      claimed.signature, claimed.leaseToken, normalized(claimed.signature, claimed.slot),
+    );
+    await repository.markProcessed(claimed.signature, claimed.leaseToken, 'finalized');
+
+    assert.equal((await repository.counts()).decoderQuarantinedCount, 1);
+    assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-count-retained'), {
+      code: 'DECODER_RECOVERY_SCHEDULED', signature: 'decoder-count-retained',
+    });
+    assert.equal((await repository.counts()).decoderQuarantinedCount, 0);
+  });
+});
+
+void test('persists detached decoder quarantine heartbeat metrics and supports legacy omission', async () => {
+  const captured: unknown[][] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      captured.push(values === undefined ? [] : [...values]);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const owned = Object.freeze({ version: 1 as const, unresolvedCount: 2 });
+  const heartbeat: RuntimeHeartbeat = Object.freeze({
+    ...rpcEvidenceHeartbeat(), decoderQuarantine: owned,
+  });
+  await repository.writeHeartbeat(heartbeat);
+  assert.deepEqual(captured[0]?.[14], {
+    startedAt: '1970-01-01T00:00:01.000Z',
+    decoderQuarantine: { version: 1, unresolvedCount: 2 },
+  });
+  assert.notEqual(
+    (captured[0]?.[14] as { readonly decoderQuarantine?: unknown }).decoderQuarantine,
+    owned,
+  );
+  const { decoderQuarantine: omitted, ...legacy } = heartbeat;
+  assert.ok(omitted);
+  await repository.writeHeartbeat(Object.freeze({ ...legacy, updatedAtMs: 3_000 }));
+  assert.deepEqual(captured[1]?.[14], { startedAt: '1970-01-01T00:00:01.000Z' });
 });
 
 void test('persists optional catch-up admission heartbeat metrics and rejects invalid payloads', async (context) => {
@@ -1552,7 +1615,7 @@ void test('persists ignored and quarantined classifications as non-claimable fou
     assert.equal(await repository.claim(1_001, 30), null);
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 0,
-      retryableFailed: 0, exhaustedFailed: 0,
+      retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0,
       catchUpAdmission: {
         actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
         actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },
@@ -1969,7 +2032,8 @@ void test('defers untracked trade hints durably without claims, finality, retry 
       code: 'RECOVERY_NOT_ELIGIBLE', signature: 'untracked',
     });
     assert.deepEqual(await repository.counts(), {
-      pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0,
+      pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0,
+      exhaustedFailed: 0, decoderQuarantinedCount: 0,
       catchUpAdmission: {
         actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
         actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },
@@ -3627,7 +3691,7 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     );
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 2,
-      retryableFailed: 1, exhaustedFailed: 0,
+      retryableFailed: 1, exhaustedFailed: 0, decoderQuarantinedCount: 0,
       catchUpAdmission: {
         actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 0, websocketAndCatchUp: 0 },
         actionableBacklogByPriority: { normal: 1, launchCandidate: 0, trackedTrade: 0 },
@@ -3667,7 +3731,7 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     assert.equal(await repository.claim(Date.now() + 86_400_000, 120), null);
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 0, processed: 0, failed: 2,
-      retryableFailed: 0, exhaustedFailed: 1,
+      retryableFailed: 0, exhaustedFailed: 1, decoderQuarantinedCount: 0,
       catchUpAdmission: {
         actionableBacklogBySource: { websocketOnly: 0, catchUpOnly: 0, websocketAndCatchUp: 0 },
         actionableBacklogByPriority: { normal: 0, launchCandidate: 0, trackedTrade: 0 },

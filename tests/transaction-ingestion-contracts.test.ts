@@ -34,6 +34,7 @@ import {
   createDurableTransactionSnapshot,
   createCatchUpGap,
   restoreNormalizedTransactionSnapshot,
+  snapshotRuntimeDecoderQuarantineMetrics,
   type ClaimedTransaction,
   type CatchUpGap,
   type FinalityCandidate,
@@ -53,6 +54,33 @@ import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
+
+void test('decoder quarantine metrics are exact, frozen, aggregate-only and rolling-compatible', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const metrics = snapshotRuntimeDecoderQuarantineMetrics(Object.freeze({
+    version: 1,
+    unresolvedCount: 2,
+  }));
+  assert.deepEqual(metrics, { version: 1, unresolvedCount: 2 });
+  assert.ok(Object.isFrozen(metrics));
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, decoderQuarantine: metrics }));
+  });
+  for (const decoderQuarantine of [
+    null,
+    { version: 1, unresolvedCount: 2 },
+    Object.freeze({ version: 2, unresolvedCount: 2 }),
+    Object.freeze({ version: 1, unresolvedCount: -0 }),
+    Object.freeze({ version: 1, unresolvedCount: Number.MAX_SAFE_INTEGER + 1 }),
+    Object.freeze({ version: 1, unresolvedCount: 2, signature: 'must-not-leak' }),
+    new Proxy(metrics, {}),
+  ]) {
+    assert.throws(() => {
+      assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, decoderQuarantine }));
+    }, TypeError);
+  }
+});
 
 void test('heartbeat accepts omitted historical RPC HTTP evidence and the exact fixed provider snapshot', () => {
   const heartbeat = rpcEvidenceHeartbeat();
@@ -829,6 +857,7 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     failed: 2,
     retryableFailed: 1,
     exhaustedFailed: 1,
+    decoderQuarantinedCount: 0,
     catchUpAdmission: Object.freeze({
       actionableBacklogBySource: Object.freeze({ websocketOnly: 1, catchUpOnly: 0, websocketAndCatchUp: 0 }),
       actionableBacklogByPriority: Object.freeze({ normal: 1, launchCandidate: 0, trackedTrade: 0 }),
@@ -840,6 +869,16 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     () => { assertValidInboxCounts(Object.freeze({ ...counts, exhaustedFailed: 2 })); },
     /exhaustedFailed|failed/u,
   );
+  for (const decoderQuarantinedCount of [
+    -1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity,
+  ]) {
+    assert.throws(
+      () => {
+        assertValidInboxCounts(Object.freeze({ ...counts, decoderQuarantinedCount }));
+      },
+      /decoderQuarantinedCount|safe integer/u,
+    );
+  }
   assert.throws(
     () => { assertValidRuntimeHeartbeat(Object.freeze({
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
@@ -859,7 +898,8 @@ void test('InboxCounts validates exact frozen catch-up admission counts and both
     deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
   });
   const counts = Object.freeze({ pending: 2, processing: 1, processed: 7, failed: 4,
-    retryableFailed: 3, exhaustedFailed: 1, catchUpAdmission: admission });
+    retryableFailed: 3, exhaustedFailed: 1, decoderQuarantinedCount: 0,
+    catchUpAdmission: admission });
   assert.doesNotThrow(() => { assertValidInboxCounts(counts); });
   for (const catchUpAdmission of [
     undefined,

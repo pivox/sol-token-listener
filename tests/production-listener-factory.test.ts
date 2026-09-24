@@ -753,7 +753,7 @@ void test('heartbeat stop fences an in-flight RUNNING write before durable STOPP
       async counts() {
         return {
           pending: 0, processing: 0, processed: 0, failed: 0,
-          retryableFailed: 0, exhaustedFailed: 0,
+          retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0,
           catchUpAdmission: admissionCounts(),
         };
       },
@@ -793,6 +793,7 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
     readonly backlogCount: number;
     readonly leasedCount: number;
     readonly exhaustedCount: number;
+    readonly decoderQuarantine?: RuntimeHeartbeat['decoderQuarantine'];
   }[] = [];
   const heartbeat = new PersistentListenerHeartbeat(
     {
@@ -800,7 +801,7 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
       async counts() {
         return {
           pending: 2, processing: 1, processed: 4, failed: 3,
-          retryableFailed: 2, exhaustedFailed: 1,
+          retryableFailed: 2, exhaustedFailed: 1, decoderQuarantinedCount: 2,
           catchUpAdmission: admissionCounts(5),
         };
       },
@@ -820,6 +821,8 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
   assert.equal(writes[0]?.backlogCount, 5);
   assert.equal(writes[0]?.leasedCount, 1);
   assert.equal(writes[0]?.exhaustedCount, 1);
+  assert.deepEqual(writes[0]?.decoderQuarantine, { version: 1, unresolvedCount: 2 });
+  assert.ok(Object.isFrozen(writes[0]?.decoderQuarantine));
   await heartbeat.stop();
 });
 
@@ -836,7 +839,7 @@ void test('heartbeat publishes one bounded block hydration snapshot without iden
   const heartbeat = new PersistentListenerHeartbeat(
     {
       ...heartbeatCanaryMethods(),
-      async counts() { return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0, catchUpAdmission: admissionCounts() }; },
+      async counts() { return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0, catchUpAdmission: admissionCounts() }; },
       async writeHeartbeat(value) { writes.push(value); },
     },
     { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
@@ -859,7 +862,8 @@ void test('heartbeat catch-up admission snapshots use the same count read and re
       async counts() {
         reads += 1;
         return Object.freeze({ pending: reads, processing: 0, processed: 0, failed: 0,
-          retryableFailed: 0, exhaustedFailed: 0, catchUpAdmission: admissionCounts(reads) });
+          retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0,
+          catchUpAdmission: admissionCounts(reads) });
       },
       async writeHeartbeat(value) { writes.push(value); },
     }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
@@ -888,7 +892,8 @@ void test('heartbeat catch-up admission snapshots use the same count read and re
 
 async function heartbeatCounts() {
   return Object.freeze({ pending: 1, processing: 0, processed: 0, failed: 0,
-    retryableFailed: 0, exhaustedFailed: 0, catchUpAdmission: admissionCounts(1) });
+    retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0,
+    catchUpAdmission: admissionCounts(1) });
 }
 
 void test('heartbeat catch-up admission rejects invalid state and sums before a redacted write', async () => {
@@ -967,12 +972,12 @@ void test('heartbeat refreshes post-drain counts without another shutdown RPC re
         return countReads === 1
           ? {
             pending: 4, processing: 1, processed: 0, failed: 0,
-            retryableFailed: 0, exhaustedFailed: 0,
+            retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0,
             catchUpAdmission: admissionCounts(5),
           }
           : {
             pending: 2, processing: 0, processed: 3, failed: 2,
-            retryableFailed: 1, exhaustedFailed: 1,
+            retryableFailed: 1, exhaustedFailed: 1, decoderQuarantinedCount: 0,
             catchUpAdmission: admissionCounts(3),
           };
       },
@@ -1017,7 +1022,7 @@ void test('heartbeat refuses a stale STOPPED snapshot when the final count read 
         if (countReads === 2) throw new Error('private final count failure');
         return {
           pending: 1, processing: 1, processed: 0, failed: 0,
-          retryableFailed: 0, exhaustedFailed: 0,
+          retryableFailed: 0, exhaustedFailed: 0, decoderQuarantinedCount: 0,
           catchUpAdmission: admissionCounts(2),
         };
       },

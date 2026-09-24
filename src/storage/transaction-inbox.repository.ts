@@ -34,6 +34,7 @@ import {
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
   snapshotRuntimeCatchUpAdmissionMetrics,
+  snapshotRuntimeDecoderQuarantineMetrics,
   assertValidTransactionNotification,
   createDurableTransactionSnapshot,
   isCanonicalSolanaProgramId,
@@ -2159,6 +2160,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : createRuntimeRpcHttpEvidence(value.rpcHttpEvidence);
       const firstProcessingCanary = value.firstProcessingCanary === undefined ? undefined
         : createFirstProcessingCanaryEvidence(value.firstProcessingCanary);
+      const decoderQuarantine = value.decoderQuarantine === undefined ? undefined
+        : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
@@ -2208,6 +2211,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               : { catchUpAdmission }),
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
+            ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
           }),
           value.exhaustedCount,
         ],
@@ -2234,6 +2238,26 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              WHERE processing_status = 'FAILED' AND error_retryable = TRUE
                AND retry_exhausted_at IS NOT NULL
            ) AS exhausted_failed,
+           COUNT(*) FILTER (
+             WHERE processing_status='FAILED'
+               AND error_code='PIPELINE_STAGE_FAILED'
+               AND error_retryable=FALSE
+               AND error_name IN (
+                 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+                 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_TRUNCATED'
+               )
+               AND retry_exhausted_at IS NULL
+               AND processed_at IS NULL
+               AND lease_token IS NULL
+               AND lease_expires_at IS NULL
+               AND next_attempt_at IS NULL
+               AND terminal_at IS NOT NULL
+               AND purge_after IS NOT NULL
+               AND purge_after=terminal_at+INTERVAL '4 hours'
+               AND purge_after>clock_timestamp()
+               AND normalized_transaction IS NOT NULL
+               AND immutable_fingerprint IS NOT NULL
+           ) AS decoder_quarantined,
            COUNT(*) FILTER (WHERE ${actionable}
              AND 'WEBSOCKET' = ANY(discovery_sources)
              AND NOT ('CATCH_UP' = ANY(discovery_sources))) AS websocket_only,
@@ -2262,6 +2286,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         failed: safeCount(row.failed, 'failed count'),
         retryableFailed: safeCount(row.retryable_failed, 'retryable failed count'),
         exhaustedFailed: safeCount(row.exhausted_failed, 'exhausted failed count'),
+        decoderQuarantinedCount: safeCount(
+          row.decoder_quarantined,
+          'decoder quarantined count',
+        ),
         catchUpAdmission: Object.freeze({
           actionableBacklogBySource: Object.freeze({
             websocketOnly: safeCount(row.websocket_only, 'websocket only count'),
