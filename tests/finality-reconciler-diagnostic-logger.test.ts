@@ -23,6 +23,10 @@ function captureLogger(entries: CapturedLog[]): FinalityDiagnosticLogger {
   });
 }
 
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => { setImmediate(resolve); });
+}
+
 function diagnostic(
   phase: FinalityReconcilerDiagnosticV1['phase'],
 ): FinalityReconcilerDiagnosticV1 {
@@ -113,4 +117,41 @@ void test('diagnostic logger projects only the stable event and diagnostic field
   for (const forbidden of [
     'error', 'stack', 'url', 'signature', 'payload', 'mint', 'wallet', 'secret',
   ]) assert.equal(Object.hasOwn(entry.record, forbidden), false);
+});
+
+void test('diagnostic logger consumes a rejected native Promise without awaiting it', async () => {
+  const failure = new Error('private asynchronous logger failure');
+  const unhandled: unknown[] = [];
+  const observeUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', observeUnhandled);
+  try {
+    const sink = createFinalityReconcilerDiagnosticSink(Object.freeze({
+      warn(): unknown { return Promise.reject(failure); },
+      info(): unknown { return undefined; },
+    }));
+
+    sink(diagnostic('DEGRADED'));
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', observeUnhandled);
+  }
+});
+
+void test('diagnostic logger never inspects or invokes an arbitrary thenable', () => {
+  let thenReads = 0;
+  const arbitraryThenable = Object.defineProperty({}, 'then', {
+    get(): never {
+      thenReads += 1;
+      throw new Error('arbitrary thenable must remain opaque');
+    },
+  });
+  const sink = createFinalityReconcilerDiagnosticSink(Object.freeze({
+    warn(): unknown { return arbitraryThenable; },
+    info(): unknown { return undefined; },
+  }));
+
+  assert.doesNotThrow(() => { sink(diagnostic('DEGRADED')); });
+  assert.equal(thenReads, 0);
 });

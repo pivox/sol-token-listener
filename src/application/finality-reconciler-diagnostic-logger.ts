@@ -1,9 +1,12 @@
+import { types } from 'node:util';
 import type { FinalityReconcilerDiagnosticV1 } from '../domain/finality-reconciler-diagnostic.js';
 
 export interface FinalityDiagnosticLogger {
-  readonly warn: (record: object, message: string) => void;
-  readonly info: (record: object, message: string) => void;
+  readonly warn: (record: object, message: string) => unknown;
+  readonly info: (record: object, message: string) => unknown;
 }
+
+const ignoreLoggerRejection = (): undefined => undefined;
 
 export function createFinalityReconcilerDiagnosticSink(
   logger: FinalityDiagnosticLogger,
@@ -23,9 +26,23 @@ export function createFinalityReconcilerDiagnosticSink(
       suppressedFailures: diagnostic.suppressedFailures,
     });
     if (diagnostic.phase === 'DEGRADED') {
-      logger.warn(record, 'Réconciliateur de finalité dégradé.');
+      consumeLoggerResult(
+        () => logger.warn(record, 'Réconciliateur de finalité dégradé.'),
+      );
       return;
     }
-    logger.info(record, 'Réconciliateur de finalité rétabli.');
+    consumeLoggerResult(
+      () => logger.info(record, 'Réconciliateur de finalité rétabli.'),
+    );
   };
+}
+
+function consumeLoggerResult(log: () => unknown): void {
+  try {
+    const result = log();
+    if (!types.isPromise(result)) return;
+    void Promise.prototype.then.call(result, undefined, ignoreLoggerRejection);
+  } catch {
+    // Diagnostics never delegate control to the logger implementation.
+  }
 }
