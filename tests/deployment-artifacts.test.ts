@@ -747,7 +747,7 @@ void test('decoder quarantine runbook documents bounded observation-only recover
 void test('block hydration runbook defines the corrected worker-eligible cohort and mandatory replay', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.2\.6/u);
+  assert.match(runbook, /Version : 1\.2\.7/u);
   assert.match(runbook, /population worker-éligible/iu);
   for (const exclusion of [
     'IGNORED / SOLANA_TRANSACTION_FAILED',
@@ -769,13 +769,28 @@ void test('block hydration runbook defines the corrected worker-eligible cohort 
   assert.match(runbook, /canary Mainnet[^.]{0,240}2026-09-24[^.]{0,240}doit être rejoué/iu);
 });
 
+void test('block hydration runbook keeps catch-up refresh continuation bounded and fail-closed', async () => {
+  const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
+
+  assert.match(runbook, /Version : 1\.2\.7/u);
+  assert.match(runbook, /CATCH_UP_REFRESH_REQUIRED[\s\S]{0,400}exactement un scan supplémentaire/iu);
+  assert.match(runbook, /même provider[\s\S]{0,180}même session WebSocket[\s\S]{0,180}même signal d'arrêt/iu);
+  assert.match(runbook, /ne promeut jamais[\s\S]{0,180}avant la réussite[\s\S]{0,120}seconde passe/iu);
+  assert.match(runbook, /deuxième `CATCH_UP_REFRESH_REQUIRED`[\s\S]{0,400}ferme la session puis applique le jitter/iu);
+  assert.match(runbook, /CATCH_UP_PAGE_BUDGET_EXHAUSTED[\s\S]{0,400}ferme la session puis applique le jitter/iu);
+  assert.match(runbook, /erreur\s+transitoire ou une fin de session[^.]{0,240}DEGRADED[^.]{0,240}récupération/iu);
+  assert.match(runbook, /arrêt ferme les ressources[^.]{0,240}STOPPING[^.]{0,120}STOPPED[^.]{0,180}aucun retry/iu);
+  assert.match(runbook, /Tous ces chemins restent fail-closed/iu);
+  assert.match(runbook, /ne modifie ni la concurrence RPC[\s\S]{0,240}cadence d'hydratation/iu);
+});
+
 void test('finality reconciler diagnostics are composed and documented as a non-PASS signal', async () => {
   const [runbook, factory] = await Promise.all([
     readArtifact('docs/operations/block-hydration-canary.md'),
     readArtifact('src/application/production-listener-factory.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.2\.6/u);
+  assert.match(runbook, /Version : 1\.2\.7/u);
   assert.match(runbook, /listener\.finality_reconciler_degraded/u);
   assert.match(runbook, /listener\.finality_reconciler_recovered/u);
   for (const reasonCode of [

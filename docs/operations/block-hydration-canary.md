@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.6 — 2026-09-24 — issues #114, #142, #143, #146, #148, #151 et #153.
+Version : 1.2.7 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153 et #155.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -316,6 +316,29 @@ peut être réutilisée pour déclarer un `PASS`.
    (inbox, checkpoints, snapshots, receipts, health et cache durable) sont
    attendues, isolées sur cette base fraîche et incluses dans le résultat du
    replay. Archiver ce résultat avec la preuve RPC publique expurgée.
+
+## Continuation bornée de la tête catch-up
+
+`CATCH_UP_REFRESH_REQUIRED` signifie qu'une reprise durable vient d'atteindre
+sa tête gelée H1 et qu'un second scan doit couvrir la tête fraîche H2 vers H1.
+Le listener autorise exactement un scan supplémentaire sur le même provider,
+la même session WebSocket et le même signal d'arrêt. Il ne ferme ni ne rouvre la
+session entre ces deux passes et ne promeut jamais un candidat avant la réussite
+de la seconde passe. Une session déjà promue continue son ingestion durable
+pendant cette continuation périodique sérialisée.
+
+Un deuxième `CATCH_UP_REFRESH_REQUIRED` dans la même opération, un
+`CATCH_UP_PAGE_BUDGET_EXHAUSTED`, un provider différent, une erreur malformée,
+une fin de session ou un arrêt ne sont jamais assimilés à un succès. Un deuxième
+refresh ou une pause ferme la session puis applique le jitter. Une erreur
+transitoire ou une fin de session publie `DEGRADED` et déclenche la récupération
+existante ; l'incumbent peut rester ouvert jusqu'à son remplacement borné. Un
+arrêt ferme les ressources, publie `STOPPING` puis `STOPPED` et ne programme
+aucun retry. Tous ces chemins restent fail-closed. Toute répétition pendant la
+fenêtre rend le gate backlog/finalité
+`FAIL` ou `INCONCLUSIVE` selon les preuves disponibles ; elle ne peut jamais
+constituer un `PASS`. Ce comportement ne modifie ni la concurrence RPC, ni la
+cadence d'hydratation, ni les gates oversize, rétention ou HTTP 429.
 
 ## Gates PASS
 

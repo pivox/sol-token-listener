@@ -169,15 +169,18 @@ void test('page-budget pause closes the candidate and retries only the newly pin
   assert.equal(fixture.supervisor.activeProviderId(), 'primary');
 });
 
-void test('refresh-required from recovery or periodic scan closes the session and backs off without rotation', async () => {
+void test('refresh-required continues once on the same recovery or periodic session', async () => {
   for (const periodic of [false, true]) {
     const session = controlledSession('primary');
     const fixture = supervisorFixture({
-      providerIds: ['primary', 'fallback-1'], random: () => 0,
+      providerIds: ['primary'], random: () => 0,
       sessionFactories: [() => Promise.resolve(session.session)],
     });
     if (periodic) fixture.strictResults.push(Promise.resolve(scanResult('primary')));
-    fixture.strictResults.push(rejected(new StrictCatchUpRefreshRequiredError('primary')));
+    fixture.strictResults.push(
+      rejected(new StrictCatchUpRefreshRequiredError('primary')),
+      Promise.resolve(scanResult('primary')),
+    );
     await fixture.supervisor.start();
     fixture.scheduler.fireNext(0);
     await flushLifecycle();
@@ -186,13 +189,319 @@ void test('refresh-required from recovery or periodic scan closes the session an
       await flushLifecycle();
     }
     assert.deepEqual(fixture.openedAttempts.map(({ endpoint }) => endpoint.id), ['primary']);
-    assert.equal(session.closeCalls(), 1);
-    assert.equal(fixture.supervisor.activeProviderId(), null);
-    assert.equal(fixture.supervisor.state(), 'DEGRADED');
-    assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'RUNNING').length, periodic ? 1 : 0);
-    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    assert.equal(fixture.strictCalls.length, periodic ? 3 : 2);
+    assert.equal(fixture.strictCalls.at(-2)?.providerId, 'primary');
+    assert.equal(fixture.strictCalls.at(-1)?.providerId, 'primary');
+    assert.equal(fixture.strictCalls.at(-2)?.signal, fixture.strictCalls.at(-1)?.signal);
+    assert.equal(session.closeCalls(), 0);
+    assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+    assert.equal(fixture.supervisor.state(), 'RUNNING');
+    assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'DEGRADED').length, 0);
+    assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'RUNNING').length, 1);
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
     await fixture.supervisor.close();
   }
+});
+
+void test('a candidate is never promoted before its deferred refresh continuation succeeds', async () => {
+  const session = controlledSession('primary');
+  const continuation = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(session.session)],
+  });
+  fixture.strictResults.push(
+    rejected(new StrictCatchUpRefreshRequiredError('primary')),
+    continuation.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls.length, 2);
+  assert.equal(fixture.strictCalls[0]?.signal, fixture.strictCalls[1]?.signal);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.reporter.transitions.some(({ phase }) => phase === 'RUNNING'), false);
+  assert.equal(session.closeCalls(), 0);
+
+  continuation.resolve(scanResult('primary'));
+  await flushLifecycle();
+  assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+  assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'RUNNING').length, 1);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+  await fixture.supervisor.close();
+});
+
+void test('a deferred periodic refresh continuation keeps the incumbent ingesting and rearms only after success', async () => {
+  const session = controlledSession('primary');
+  const continuation = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(session.session)],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpRefreshRequiredError('primary')),
+    continuation.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls.length, 3);
+  assert.equal(fixture.strictCalls.at(-2)?.signal, fixture.strictCalls.at(-1)?.signal);
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+  assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+  assert.equal(session.closeCalls(), 0);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+
+  const observe = fixture.openedAttempts[0]?.observe;
+  assert.ok(observe !== undefined);
+  await observe(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    hint: 'PUMPFUN_CREATE',
+    hintMint: null,
+    signature: '1'.repeat(64),
+    slot: 42n,
+  }));
+  assert.equal(fixture.reporter.observations.length, 1);
+
+  continuation.resolve(scanResult('primary'));
+  await flushLifecycle();
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+  assert.equal(session.closeCalls(), 0);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+  await fixture.supervisor.close();
+});
+
+void test('a second refresh or page-budget pause is bounded and uses the fail-closed path', async () => {
+  for (const secondFailure of ['refresh', 'pause'] as const) {
+    for (const periodic of [false, true]) {
+      const session = controlledSession('primary');
+      const fixture = supervisorFixture({
+        providerIds: ['primary', 'fallback-1'], random: () => 0,
+        sessionFactories: [() => Promise.resolve(session.session)],
+      });
+      if (periodic) fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+      const error = secondFailure === 'refresh'
+        ? new StrictCatchUpRefreshRequiredError('primary')
+        : new StrictCatchUpPausedError('primary', 'launchpad', 'run', 1n, 2n);
+      fixture.strictResults.push(
+        rejected(new StrictCatchUpRefreshRequiredError('primary')),
+        rejected(error),
+      );
+      await fixture.supervisor.start();
+      fixture.scheduler.fireNext(0);
+      await flushLifecycle();
+      if (periodic) {
+        fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+        await flushLifecycle();
+      }
+      assert.equal(fixture.strictCalls.length, periodic ? 3 : 2);
+      assert.equal(session.closeCalls(), 1);
+      assert.equal(fixture.supervisor.activeProviderId(), null);
+      assert.equal(fixture.supervisor.state(), 'DEGRADED');
+      assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+      await fixture.supervisor.close();
+    }
+  }
+});
+
+void test('typed failures from the refresh continuation retain transient and window semantics', async () => {
+  for (const secondFailure of [
+    new StrictCatchUpScannerError('source', 'primary', 'launchpad', 'request'),
+    new StrictCatchUpWindowExceededError('primary', 'launchpad', strictFrontier('refresh')),
+  ]) {
+    const session = controlledSession('primary');
+    const fixture = supervisorFixture({
+      providerIds: ['primary'], random: () => 0,
+      sessionFactories: [() => Promise.resolve(session.session)],
+    });
+    fixture.strictResults.push(
+      rejected(new StrictCatchUpRefreshRequiredError('primary')),
+      rejected(secondFailure),
+    );
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+
+    assert.equal(fixture.strictCalls.length, 2);
+    assert.equal(session.closeCalls(), 1);
+    assert.equal(fixture.supervisor.activeProviderId(), null);
+    if (secondFailure instanceof StrictCatchUpWindowExceededError) {
+      assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+      assert.equal(fixture.reporter.transitions.at(-1)?.recoveryReasonCode, 'CATCH_UP_WINDOW_EXCEEDED');
+      assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+    } else {
+      assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+      assert.equal(fixture.reporter.transitions.at(-1)?.recoveryReasonCode, 'RPC_UNAVAILABLE');
+      assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    }
+    await fixture.supervisor.close();
+  }
+});
+
+void test('shutdown fences a refresh continuation before its second scan', async () => {
+  const session = controlledSession('primary');
+  const firstScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(session.session)],
+  });
+  fixture.strictResults.push(firstScan.promise);
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.length, 1);
+
+  const closing = fixture.supervisor.close();
+  await flushMicrotasks();
+  assert.equal(fixture.strictCalls[0]?.signal.aborted, true);
+  firstScan.reject(new StrictCatchUpRefreshRequiredError('primary'));
+  await closing;
+
+  assert.equal(fixture.strictCalls.length, 1);
+  assert.equal(session.closeCalls(), 1);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+});
+
+void test('candidate completion wins over refresh and preserves its session failure reason', async () => {
+  const session = controlledSession('primary');
+  const firstScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    random: () => 0,
+    sessionFactories: [() => Promise.resolve(session.session)],
+  });
+  fixture.strictResults.push(firstScan.promise);
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  session.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls[0]?.signal.aborted, true);
+  firstScan.reject(new StrictCatchUpRefreshRequiredError('primary'));
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls.length, 1);
+  assert.equal(session.closeCalls(), 1);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.reporter.transitions.at(-1)?.recoveryReasonCode, 'SESSION_FAILURE');
+  assert.equal(fixture.reporter.transitions.at(-1)?.disconnectReasonCode, 'REMOTE_CLOSE');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  await fixture.supervisor.close();
+});
+
+void test('shutdown joins an in-flight periodic refresh continuation without a late rearm', async () => {
+  const session = controlledSession('primary');
+  const continuation = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(session.session)],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpRefreshRequiredError('primary')),
+    continuation.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  const closing = fixture.supervisor.close();
+  let settled = false;
+  void closing.then(() => { settled = true; }, () => { settled = true; });
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.at(-1)?.signal.aborted, true);
+  assert.equal(session.closeCalls(), 1);
+  assert.equal(settled, false);
+
+  continuation.resolve(scanResult('primary'));
+  await closing;
+  assert.equal(fixture.strictCalls.length, 3);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+});
+
+void test('incumbent completion fences a periodic refresh continuation and preserves recovery', async () => {
+  const session = controlledSession('primary');
+  const periodicScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(session.session)],
+  });
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')), periodicScan.promise);
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  session.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  periodicScan.reject(new StrictCatchUpRefreshRequiredError('primary'));
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls.length, 2);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.reporter.transitions.at(-1)?.recoveryReasonCode, 'SESSION_FAILURE');
+  assert.equal(fixture.reporter.transitions.at(-1)?.disconnectReasonCode, 'REMOTE_CLOSE');
+  assert.equal(session.closeCalls(), 0);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [0]);
+  await fixture.supervisor.close();
+  assert.equal(session.closeCalls(), 1);
+});
+
+void test('wrong-provider, forged and proxied refresh errors never receive an inline continuation', async () => {
+  let traps = 0;
+  const forged = Object.freeze(Object.assign(
+    Object.create(StrictCatchUpRefreshRequiredError.prototype) as object,
+    {
+      providerId: 'primary', code: 'CATCH_UP_REFRESH_REQUIRED',
+      retryable: true, stage: 'head-refresh',
+    },
+  ));
+  const proxied = new Proxy(new StrictCatchUpRefreshRequiredError('primary'), {
+    get() { traps += 1; throw new Error('secret'); },
+  });
+  for (const error of [
+    new StrictCatchUpRefreshRequiredError('fallback-1'),
+    forged as unknown as Error,
+    proxied,
+  ]) {
+    for (const periodic of [false, true]) {
+      const session = controlledSession('primary');
+      const fixture = supervisorFixture({
+        providerIds: ['primary'], random: () => 0,
+        sessionFactories: [() => Promise.resolve(session.session)],
+      });
+      if (periodic) fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+      fixture.strictResults.push(rejected(error));
+      await fixture.supervisor.start();
+      fixture.scheduler.fireNext(0);
+      await flushLifecycle();
+      if (periodic) {
+        fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+        await flushLifecycle();
+      }
+      assert.equal(fixture.strictCalls.length, periodic ? 2 : 1);
+      assert.equal(fixture.supervisor.activeProviderId(), null);
+      assert.equal(fixture.supervisor.state(), 'DEGRADED');
+      if (periodic && error === proxied) {
+        assert.equal(session.closeCalls(), 0);
+        assert.deepEqual(fixture.scheduler.pendingDelays(), [0]);
+      } else {
+        assert.equal(session.closeCalls(), 1);
+        assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+      }
+      await fixture.supervisor.close();
+    }
+  }
+  assert.equal(traps, 0);
 });
 
 void test('rereads durable affinity after a transient scan before rotating providers', async () => {

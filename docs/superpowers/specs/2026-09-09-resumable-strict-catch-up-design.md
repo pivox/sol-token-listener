@@ -1,8 +1,8 @@
 # Resumable strict catch-up design
 
 Status: approved for implementation
-Version: 3
-Issue: #100
+Version: 4
+Issues: #100, #155
 Scope: listener ingestion only; no signer, submission, wallet loading, or armament
 
 ## Revision history and implementation decisions
@@ -12,6 +12,10 @@ Scope: listener ingestion only; no signer, submission, wallet loading, or armame
   comparison, durable counters, atomic completion and operational pause contract.
 - v3 (2026-09-12): resumed completion requires a fresh recovery cycle, and
   matching ACTIVE runs take precedence over other keys' retained failures.
+- v4 (2026-09-25): the fresh-head cycle is continued once on the same
+  provider-affine WebSocket session instead of being misclassified as an RPC
+  outage. The continuation is bounded, abort-aware and never waives a pause,
+  provider mismatch, malformed error, session completion or second refresh.
 - Before source access, preload and validate active runs for every configured
   key. Process all ACTIVE runs whose previous boundary is still canonical before
   any non-active key or historical failure. Supersede stale runs after valid
@@ -20,10 +24,20 @@ Scope: listener ingestion only; no signer, submission, wallet loading, or armame
   up to the new session's head H2. After completing all matching active runs,
   throw `StrictCatchUpRefreshRequiredError` (`CATCH_UP_REFRESH_REQUIRED`,
   retryable, redacted) before scanning non-active keys or reporting success.
-  The supervisor handles it as `paused`: cleanup, DEGRADED/REQUIRED with durable
-  `RPC_UNAVAILABLE`, and one jitter, without rotation or promotion in that cycle.
-  A new session and bounded fresh scan must cover H2 -> H1 before RUNNING.
-  Once no ACTIVE pin remains, the next cycle uses normal provider selection.
+  A canonical, provider-matching signal is a control-flow continuation rather
+  than an RPC failure. The supervisor keeps the same acknowledged candidate (or
+  periodic incumbent), the same provider and the same abort scope, then invokes
+  exactly one fresh strict scan to cover H2 -> H1. A candidate remains
+  `RECOVERING` and cannot be promoted between the two passes. A periodic
+  incumbent remains on the already-established session while the continuation
+  completes. A second refresh, a page-budget pause, provider mismatch, malformed
+  signal or a second page-budget pause follows the existing fail-closed cleanup
+  and jitter path. A periodic incumbent session completion starts recovery
+  immediately (`delay = 0`) while keeping the incumbent until its bounded
+  replacement succeeds. Shutdown instead transitions through `STOPPING` to
+  `STOPPED` without retry. No third immediate scan is allowed.
+  Once no ACTIVE pin remains, the bounded continuation uses the same provider;
+  a later recovery cycle uses normal provider selection.
   The persisted checkpoint makes this safe even across a process crash between
   completion and refresh. No extra page is appended beyond the invocation budget.
 - After no active run, `readStrictCatchUpRun` looks up retained history by
@@ -220,10 +234,18 @@ health reason. Page-budget exhaustion throws a typed retryable
 and aggregate counters. It contains no signatures or endpoints in its public
 message.
 
-The supervisor treats this error as a recoverable degraded cycle pinned to the
-same provider. It must not call `becomeUnrecoverable`, promote the WebSocket
-session, or report readiness `RUNNING` while any active run remains incomplete.
-The next scheduled recovery resumes the run.
+The supervisor treats `StrictCatchUpRefreshRequiredError` as one bounded
+continuation on the same provider, session and abort scope. It must not call
+`becomeUnrecoverable` or promote a candidate between the two scans. The second
+scan must complete before candidate readiness becomes `RUNNING`. An already
+promoted incumbent may remain `RUNNING` during its serialized periodic
+continuation because its WebSocket continues durable ingestion.
+
+`StrictCatchUpPausedError` remains a recoverable degraded cycle pinned to the
+same provider. It must not promote the WebSocket session or report candidate
+readiness `RUNNING` while an active run remains incomplete. The next scheduled
+recovery resumes the run. A second refresh in one operation follows this same
+fail-closed cleanup and scheduled-recovery boundary.
 
 ## Failure and concurrency behavior
 

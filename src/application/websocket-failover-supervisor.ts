@@ -6,6 +6,7 @@ import {
   StrictCatchUpRefreshRequiredError,
   StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError,
+  isStrictCatchUpRefreshRequiredError,
   type StrictCatchUpScanResult,
 } from './strict-catch-up-scanner.js';
 import { StrictCatchUpAffinityReadError } from './strict-catch-up-coordinator.js';
@@ -621,9 +622,18 @@ export class WebSocketFailoverSupervisor {
           : cleaned ? result : cleanupFailureAttempt();
       }
       try {
-        await this.#dependencies.runStrictScan(providerId, controller.signal);
+        await this.#runStrictScanWithOneRefresh(
+          providerId,
+          controller.signal,
+          () => this.#candidate === candidate
+            && !candidate.completed
+            && !this.#isPermanentlyClosed()
+            && !controller.signal.aborted,
+        );
       } catch (error) {
-        const failure = strictScanFailureFrom(error, candidate);
+        const failure = candidate.completed || candidate.queuedCompletion !== null
+          ? completionAttemptFailure(candidate)
+          : strictScanFailureFrom(error, candidate);
         const cleaned = await this.#cleanupCandidate(candidate);
         if (this.#isPermanentlyClosed()) return abortedAttempt();
         if (failure.kind === 'paused') {
@@ -1185,7 +1195,13 @@ export class WebSocketFailoverSupervisor {
       }
       if (pinned !== null && pinned !== record.providerId) throw new StrictCatchUpAffinityReadError();
       scanning = true;
-      await this.#dependencies.runStrictScan(record.providerId, controller.signal);
+      await this.#runStrictScanWithOneRefresh(
+        record.providerId,
+        controller.signal,
+        () => this.#periodicAbort === controller
+          && !record.completed
+          && this.#canScanPeriodic(record, controller.signal),
+      );
     } catch (error) {
       if (this.#periodicAbort === controller) this.#periodicAbort = null;
       if (this.#permanentlyClosed
@@ -1222,6 +1238,20 @@ export class WebSocketFailoverSupervisor {
   #canScanPeriodic(record: SessionRecord, signal: AbortSignal): boolean {
     return !this.#permanentlyClosed && !signal.aborted && this.#incumbent === record
       && this.#currentProviderId === record.providerId && this.#currentState === 'RUNNING';
+  }
+
+  async #runStrictScanWithOneRefresh(
+    providerId: RpcProviderId,
+    signal: AbortSignal,
+    canContinue: () => boolean,
+  ): Promise<void> {
+    try {
+      await this.#dependencies.runStrictScan(providerId, signal);
+      return;
+    } catch (error) {
+      if (!isStrictCatchUpRefreshRequiredError(error, providerId) || !canContinue()) throw error;
+    }
+    await this.#dependencies.runStrictScan(providerId, signal);
   }
 
   async #pausePeriodicRecovery(
