@@ -13,6 +13,7 @@ import {
 import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
+import { isDecoderQuarantineFailure } from '../domain/observed-pipeline-failure.js';
 import {
   assertValidCatchUpClassification,
   createCatchUpClassification,
@@ -23,6 +24,7 @@ import {
 import {
   assertValidClaimedTransaction,
   assertValidCatchUpGap,
+  assertValidDecoderRecoveryResult,
   assertValidFinalityCandidate,
   assertValidFinalityPollObservation,
   assertValidFinalityRevision,
@@ -38,6 +40,7 @@ import {
   MAX_FINALITY_EVIDENCE_VERSION,
   type ClaimedTransaction,
   type CatchUpGap,
+  type DecoderRecoveryResult,
   type DurableNormalizedTransaction,
   type FinalityCandidate,
   type FinalityPollObservation,
@@ -1369,6 +1372,113 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         );
         requireOne(updated.rowCount);
         return inboxRecoveryResult('RECOVERY_SCHEDULED', signature);
+      });
+    });
+  }
+
+  public async recoverDecoderQuarantine(signature: string): Promise<DecoderRecoveryResult> {
+    return this.safely(async () => {
+      requireText(signature, 'signature');
+      return this.transaction(async (client) => {
+        await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
+          [signature],
+        );
+        const selected = await client.query(
+          `WITH recovery_clock AS MATERIALIZED (
+             SELECT date_trunc('milliseconds',clock_timestamp()) AS recovered_at
+           )
+           SELECT inbox.*, recovery_clock.recovered_at,
+             EXISTS (
+               SELECT 1 FROM transaction_inbox_decoder_recoveries receipt
+               WHERE receipt.signature=inbox.signature
+             ) AS decoder_recovery_recorded
+           FROM chain_transaction_inbox inbox
+           CROSS JOIN recovery_clock
+           WHERE inbox.signature=$1
+           FOR UPDATE OF inbox`,
+          [signature],
+        );
+        const row = selected.rows[0];
+        if (row === undefined) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_FOUND', signature);
+        }
+        const status = inboxStatus(row.processing_status);
+        const recoveryCount = safeCount(row.manual_recovery_count, 'manual recovery count');
+        if ((status === 'PENDING' || status === 'PROCESSING')
+          && row.decoder_recovery_recorded === true
+          && recoveryCount > 0
+          && row.last_manual_recovery_at !== null) {
+          dateMs(row.last_manual_recovery_at, 'last manual recovery at');
+          return decoderRecoveryResult('DECODER_RECOVERY_ALREADY_SCHEDULED', signature);
+        }
+        const recoveredAtMs = dateMs(row.recovered_at, 'decoder recovery time');
+        const terminalAtMs = nullableDateMs(row.terminal_at, 'terminal at');
+        const purgeAfterMs = nullableDateMs(row.purge_after, 'purge after');
+        const exactWorkerFailure = isStoredDecoderQuarantineFailure(row);
+        if (status !== 'FAILED'
+          || !exactWorkerFailure
+          || row.retry_exhausted_at !== null
+          || row.processed_at !== null
+          || row.lease_token !== null
+          || row.lease_expires_at !== null
+          || row.next_attempt_at !== null
+          || terminalAtMs === null
+          || purgeAfterMs === null
+          || purgeAfterMs - terminalAtMs !== 14_400_000) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        if (purgeAfterMs <= recoveredAtMs) {
+          return decoderRecoveryResult('DECODER_RECOVERY_EXPIRED', signature);
+        }
+        positiveBoundedInteger(row.attempts, 'lifetime attempts', 2_147_483_647);
+        positiveBoundedInteger(row.attempts_in_cycle, 'cycle attempts', 100);
+        if (recoveryCount >= 2_147_483_647) {
+          throw new TypeError('Stored manual recovery count is invalid.');
+        }
+        if (row.normalized_transaction === null || row.immutable_fingerprint === null) {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        try {
+          decodeSnapshot(
+            row.normalized_transaction,
+            requiredFingerprint(row.immutable_fingerprint),
+            signature,
+            numericBigInt(row.observed_slot, 'observed slot'),
+            confirmation(row.target_confirmation_status),
+          );
+        } catch {
+          return decoderRecoveryResult('DECODER_RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        const reasonCode = row.error_name
+          === 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED'
+          ? 'PUMP_SCHEMA_UNSUPPORTED' : 'PUMP_BORSH_TRUNCATED';
+        const receipt = await client.query(
+          `INSERT INTO transaction_inbox_decoder_recoveries (
+             signature,quarantine_kind,worker_reason_code,snapshot_fingerprint,
+             quarantined_at,recovered_at,recovery_source,purge_after
+           ) VALUES ($1,'WORKER_SNAPSHOT',$2,$3,$4,$5::TIMESTAMPTZ,'LOCAL_CLI',
+             $5::TIMESTAMPTZ+INTERVAL '4 hours')`,
+          [signature, reasonCode, row.immutable_fingerprint,
+            new Date(terminalAtMs), new Date(recoveredAtMs)],
+        );
+        requireOne(receipt.rowCount);
+        const updated = await client.query(
+          `UPDATE chain_transaction_inbox SET
+             processing_status='PENDING', attempts_in_cycle=0,
+             lease_token=NULL, lease_expires_at=NULL,
+             error_code=NULL, error_name=NULL, error_retryable=NULL,
+             next_attempt_at=NULL, retry_exhausted_at=NULL, processed_at=NULL,
+             terminal_at=NULL, purge_after=NULL,
+             manual_recovery_count=manual_recovery_count+1,
+             last_manual_recovery_at=$2,
+             updated_at=GREATEST(updated_at,$2)
+           WHERE signature=$1 AND processing_status='FAILED'`,
+          [signature, new Date(recoveredAtMs)],
+        );
+        requireOne(updated.rowCount);
+        return decoderRecoveryResult('DECODER_RECOVERY_SCHEDULED', signature);
       });
     });
   }
@@ -3410,6 +3520,15 @@ function inboxRecoveryResult(
   return result;
 }
 
+function decoderRecoveryResult(
+  code: DecoderRecoveryResult['code'],
+  signature: string,
+): DecoderRecoveryResult {
+  const result = Object.freeze({ code, signature });
+  assertValidDecoderRecoveryResult(result);
+  return result;
+}
+
 function safeFailureMetadata(
   stage: TransactionInboxFailureMetadata['stage'],
 ): TransactionInboxFailureMetadata {
@@ -3446,6 +3565,20 @@ function requireCheckpointKey(value: unknown): asserts value is 'launchpad' | 'm
 function requiredRow(row: QueryResultRow | undefined): QueryResultRow {
   if (row === undefined) throw new TypeError('Repository query returned no row.');
   return row;
+}
+
+function isStoredDecoderQuarantineFailure(row: QueryResultRow): boolean {
+  const candidate: unknown = Object.freeze({
+    code: row.error_code as unknown,
+    errorName: row.error_name as unknown,
+    retryable: row.error_retryable as unknown,
+  });
+  try {
+    assertValidIngestionFailure(candidate);
+  } catch {
+    return false;
+  }
+  return isDecoderQuarantineFailure(candidate);
 }
 
 function requireOne(rowCount: number | null): void {

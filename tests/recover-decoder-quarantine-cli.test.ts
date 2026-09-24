@@ -103,6 +103,18 @@ void test('command runner exposes no wallet, RPC, server or submission capabilit
     new URL('../scripts/recover-decoder-quarantine.ts', import.meta.url),
     'utf8',
   );
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
+    readonly scripts?: Readonly<Record<string, unknown>>;
+  };
+
+  assert.equal(
+    packageJson.scripts?.['inbox:recover-decoder'],
+    'tsx scripts/recover-decoder-quarantine.ts',
+  );
+  assert.match(source, /PostgresTransactionInboxRepository/u);
+  assert.match(source, /getDatabasePool/u);
+  assert.match(source, /closeDatabase/u);
+  assert.match(source, /pathToFileURL/u);
   assert.doesNotMatch(
     source,
     /@solana|wallet|Keypair|secretKey|privateKey|sendRawTransaction|sendTransaction|\bRPC\b|createServer|fetch\(|submit/iu,

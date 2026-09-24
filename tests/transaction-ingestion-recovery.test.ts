@@ -48,6 +48,8 @@ import { PostgresTransactionInboxRepository } from '../src/storage/transaction-i
 import { PostgresWalletEvidenceRepository } from '../src/storage/wallet-evidence.repository.js';
 import { PostgresWalletGraphRepository } from '../src/storage/wallet-graph.repository.js';
 import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
+import { failurePipeline, malformedPumpTransaction, realPumpPipeline } from
+  './observed-pipeline-failure-fixtures.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -106,6 +108,48 @@ const BOUNDARIES = Object.freeze([
 type Boundary = (typeof BOUNDARIES)[number];
 type ReplayStage = Boundary | 'paper';
 const FULL_REPLAY: readonly ReplayStage[] = Object.freeze([...BOUNDARIES, 'paper']);
+
+void test('recovers a real terminal Pump Borsh worker quarantine from the retained snapshot only', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const signature = 'worker-decoder-quarantine-recovery';
+    const transaction = malformedPumpTransaction('PUMP_BORSH_TRUNCATED', signature);
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(Object.freeze({
+      signature, slot: transaction.slot, source: 'WEBSOCKET' as const,
+      ingestionHint: null, ingestionHintMint: null,
+      programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'confirmed' as const,
+      observedAtMs: Date.now(),
+    }));
+    const incompatible = worker(repository, transaction, realPumpPipeline());
+    assert.deepEqual(await incompatible.runOnce(), {
+      kind: 'failed', signature,
+      failure: {
+        code: 'PIPELINE_STAGE_FAILED',
+        errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_TRUNCATED',
+        retryable: false,
+      },
+    });
+    await incompatible.close();
+    const failed = await inboxRow(pool, signature);
+    assert.equal(failed.processing_status, 'FAILED');
+    assert.equal(failed.error_retryable, false);
+    assert.ok(failed.normalized_transaction);
+    assert.equal(await repository.claim(Date.now() + 60_000, 30), null);
+
+    assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_SCHEDULED', signature,
+    });
+    const fixed = worker(
+      repository, transaction, failurePipeline(() => {}), Date.now() + 60_001, false,
+    );
+    assert.deepEqual(await fixed.runOnce(), { kind: 'processed', signature });
+    await fixed.close();
+    const processed = await inboxRow(pool, signature);
+    assert.equal(processed.processing_status, 'PROCESSED');
+    assert.ok(processed.processed_at instanceof Date);
+    assert.ok(processed.normalized_transaction);
+  });
+});
 
 void test('claims a late prioritized launch before 2,000 normal rows and decodes its initial buy', async (context) => {
   await withDatabase(context, async (pool) => {

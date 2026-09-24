@@ -57,6 +57,283 @@ import {
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
+void test('schedules one retained worker decoder quarantine from its immutable snapshot', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 5, baseDelayMs: 60_000,
+    }));
+    const signature = 'decoder-quarantine-scheduled';
+    await repository.enqueue(notification(signature, 901n, 'WEBSOCKET', 'confirmed'));
+    const claimed = await repository.claim(Date.now(), 30);
+    assert.ok(claimed);
+    await repository.saveSnapshot(signature, claimed.leaseToken, normalized(signature, 901n));
+    await repository.markFailed(signature, claimed.leaseToken, Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED',
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+      retryable: false,
+    }));
+    const quarantined = await row(pool, signature);
+    assert.equal(quarantined.processing_status, 'FAILED');
+    assert.equal(await repository.claim(Date.now() + 1, 30), null);
+
+    assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_SCHEDULED', signature,
+    });
+
+    const recovered = await row(pool, signature);
+    assert.equal(recovered.processing_status, 'PENDING');
+    assert.equal(recovered.attempts, quarantined.attempts);
+    assert.equal(recovered.attempts_in_cycle, 0);
+    assert.deepEqual(recovered.normalized_transaction, quarantined.normalized_transaction);
+    assert.equal(recovered.immutable_fingerprint, quarantined.immutable_fingerprint);
+    assert.equal(recovered.observed_slot, quarantined.observed_slot);
+    assert.deepEqual(recovered.discovery_sources, quarantined.discovery_sources);
+    assert.deepEqual(recovered.program_ids, quarantined.program_ids);
+    assert.equal(recovered.target_confirmation_status, quarantined.target_confirmation_status);
+    assert.equal(recovered.observed_at.getTime(), quarantined.observed_at.getTime());
+    assert.equal(recovered.first_detected_at.getTime(), quarantined.first_detected_at.getTime());
+    assert.equal(recovered.first_processed_at, quarantined.first_processed_at);
+    assert.equal(recovered.first_processing_evidence_unavailable,
+      quarantined.first_processing_evidence_unavailable);
+    for (const field of ['lease_token', 'lease_expires_at', 'error_code', 'error_name',
+      'error_retryable', 'next_attempt_at', 'retry_exhausted_at', 'processed_at',
+      'terminal_at', 'purge_after'] as const) {
+      assert.equal(recovered[field], null, field);
+    }
+    assert.equal(recovered.manual_recovery_count, 1);
+    assert.ok(recovered.last_manual_recovery_at instanceof Date);
+    const receipt = (await pool.query(
+      'SELECT * FROM transaction_inbox_decoder_recoveries WHERE signature=$1', [signature],
+    )).rows[0];
+    assert.deepEqual({
+      signature: receipt?.signature,
+      kind: receipt?.quarantine_kind,
+      reason: receipt?.worker_reason_code,
+      fingerprint: receipt?.snapshot_fingerprint,
+      quarantinedAt: receipt?.quarantined_at?.getTime(),
+      recoveredAt: receipt?.recovered_at?.getTime(),
+      source: receipt?.recovery_source,
+      retentionMs: receipt?.purge_after?.getTime() - receipt?.recovered_at?.getTime(),
+    }, {
+      signature, kind: 'WORKER_SNAPSHOT', reason: 'PUMP_SCHEMA_UNSUPPORTED',
+      fingerprint: quarantined.immutable_fingerprint,
+      quarantinedAt: quarantined.terminal_at.getTime(),
+      recoveredAt: recovered.last_manual_recovery_at.getTime(),
+      source: 'LOCAL_CLI', retentionMs: 14_400_000,
+    });
+  });
+});
+
+void test('serializes concurrent decoder recoveries and makes every replay idempotent', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const signature = 'decoder-quarantine-concurrent';
+    const firstRepository = new PostgresTransactionInboxRepository(pool);
+    const staleToken = await storeWorkerDecoderQuarantine(
+      firstRepository, signature, 902n, 'PUMP_BORSH_TRUNCATED',
+    );
+    const secondRepository = new PostgresTransactionInboxRepository(pool);
+
+    const results = await Promise.all([
+      firstRepository.recoverDecoderQuarantine(signature),
+      secondRepository.recoverDecoderQuarantine(signature),
+    ]);
+    assert.deepEqual(results.map((result) => result.code).sort(), [
+      'DECODER_RECOVERY_ALREADY_SCHEDULED', 'DECODER_RECOVERY_SCHEDULED',
+    ]);
+    assert.deepEqual(await firstRepository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_ALREADY_SCHEDULED', signature,
+    });
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM transaction_inbox_decoder_recoveries WHERE signature=$1',
+      [signature],
+    )).rows[0]?.count, 1);
+    assert.equal((await row(pool, signature)).manual_recovery_count, 1);
+    const claimed = await firstRepository.claim(Date.now(), 30);
+    assert.equal(claimed?.signature, signature);
+    assert.deepEqual(await secondRepository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_ALREADY_SCHEDULED', signature,
+    });
+    await assert.rejects(firstRepository.markFailed(signature, staleToken, Object.freeze({
+      code: 'PIPELINE_STAGE_FAILED',
+      errorName: 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_TRUNCATED',
+      retryable: false,
+    })), TransactionInboxLeaseError);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM transaction_inbox_decoder_recoveries WHERE signature=$1',
+      [signature],
+    )).rows[0]?.count, 1);
+  });
+});
+
+void test('fails closed for every non-worker, malformed, processed, retryable and expired state', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 5, baseDelayMs: 60_000,
+    }));
+    assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-missing'), {
+      code: 'DECODER_RECOVERY_NOT_FOUND', signature: 'decoder-missing',
+    });
+    const failures = [
+      ['decoder-ordinary', 'NORMALIZATION_FAILED', 'TypeError', false],
+      ['decoder-invalid', 'PIPELINE_STAGE_FAILED',
+        'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_INVALID', false],
+      ['decoder-retryable', 'RPC_TRANSIENT', 'RpcError', true],
+    ] as const;
+    for (const [index, [signature, code, errorName, retryable]] of failures.entries()) {
+      await repository.enqueue(notification(signature, 910n + BigInt(index), 'WEBSOCKET', 'confirmed'));
+      const claimed = await repository.claim(Date.now(), 30);
+      assert.ok(claimed);
+      await repository.saveSnapshot(signature, claimed.leaseToken, normalized(signature, claimed.slot));
+      await repository.markFailed(signature, claimed.leaseToken, Object.freeze({
+        code, errorName, retryable,
+      }));
+    }
+    await repository.enqueue(notification('decoder-processed', 913n, 'WEBSOCKET', 'confirmed'));
+    const processed = await repository.claim(Date.now(), 30);
+    assert.ok(processed);
+    await repository.saveSnapshot(
+      'decoder-processed', processed.leaseToken, normalized('decoder-processed', 913n),
+    );
+    await repository.markProcessed('decoder-processed', processed.leaseToken, 'confirmed');
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-expired', 914n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      terminal_at=date_trunc('milliseconds',clock_timestamp()-INTERVAL '4 hours'),
+      purge_after=date_trunc('milliseconds',clock_timestamp())
+      WHERE signature='decoder-expired'`);
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-malformed', 915n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await pool.query(
+      "UPDATE chain_transaction_inbox SET normalized_transaction='{}'::jsonb WHERE signature='decoder-malformed'",
+    );
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-missing-snapshot', 916n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await storeWorkerDecoderQuarantine(
+      repository, 'decoder-missing-fingerprint', 917n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await pool.query(
+      'ALTER TABLE chain_transaction_inbox DROP CONSTRAINT chain_transaction_inbox_snapshot_check',
+    );
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      normalized_transaction=NULL,immutable_fingerprint=NULL
+      WHERE signature='decoder-missing-snapshot'`);
+    await pool.query(`UPDATE chain_transaction_inbox SET immutable_fingerprint=NULL
+      WHERE signature='decoder-missing-fingerprint'`);
+
+    for (const signature of ['decoder-ordinary', 'decoder-invalid', 'decoder-retryable',
+      'decoder-processed', 'decoder-malformed', 'decoder-missing-snapshot',
+      'decoder-missing-fingerprint'] as const) {
+      const before = await recoveryState(pool, signature);
+      assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+        code: 'DECODER_RECOVERY_NOT_ELIGIBLE', signature,
+      });
+      assert.deepEqual(await recoveryState(pool, signature), before);
+    }
+    const expiredBefore = await recoveryState(pool, 'decoder-expired');
+    assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-expired'), {
+      code: 'DECODER_RECOVERY_EXPIRED', signature: 'decoder-expired',
+    });
+    assert.deepEqual(await recoveryState(pool, 'decoder-expired'), expiredBefore);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM transaction_inbox_decoder_recoveries',
+    )).rows[0]?.count, 0);
+  });
+});
+
+void test('rejects every catch-up PUMP_SCHEMA_UNSUPPORTED origin without changing its evidence', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const [signature, fingerprint] of [
+      ['catch-up-decoder-origin', 'a'.repeat(64)],
+      ['catch-up-normalization-origin', 'b'.repeat(64)],
+      ['catch-up-multi-mint-origin', 'c'.repeat(64)],
+      ['catch-up-overflow-origin', 'd'.repeat(64)],
+    ] as const) {
+      await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput(signature),
+        disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+        evidenceFingerprint: fingerprint,
+      }));
+      const before = await row(pool, signature);
+      assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+        code: 'DECODER_RECOVERY_NOT_ELIGIBLE', signature,
+      });
+      assert.deepEqual(await row(pool, signature), before);
+    }
+  });
+});
+
+void test('rediscovery and finality attempts never extend a worker quarantine deadline', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'decoder-quarantine-interactions';
+    await storeWorkerDecoderQuarantine(
+      repository, signature, 918n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    const initial = await row(pool, signature);
+    await repository.enqueue(notification(
+      signature, 918n, 'CATCH_UP', 'finalized', Date.now() + 1,
+    ));
+    const rediscovered = await row(pool, signature);
+    assert.equal(rediscovered.terminal_at.getTime(), initial.terminal_at.getTime());
+    assert.equal(rediscovered.purge_after.getTime(), initial.purge_after.getTime());
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature), slot: 918n,
+    }));
+    const classified = await row(pool, signature);
+    assert.equal(classified.processing_status, 'FAILED');
+    assert.equal(classified.terminal_at.getTime(), initial.terminal_at.getTime());
+    assert.equal(classified.purge_after.getTime(), initial.purge_after.getTime());
+    await assert.rejects(repository.enqueueRevision(Object.freeze({
+      signature, confirmationStatus: 'finalized', observedAtMs: Date.now() + 2,
+    })), TransactionInboxConflictError);
+    const afterFinality = await row(pool, signature);
+    assert.equal(afterFinality.terminal_at.getTime(), initial.terminal_at.getTime());
+    assert.equal(afterFinality.purge_after.getTime(), initial.purge_after.getTime());
+
+    assert.deepEqual(await repository.recoverDecoderQuarantine(signature), {
+      code: 'DECODER_RECOVERY_SCHEDULED', signature,
+    });
+    const recovered = await row(pool, signature);
+    assert.equal(recovered.target_confirmation_status, 'finalized');
+    assert.equal(recovered.catch_up_disposition, 'ACTIONABLE');
+    assert.equal(recovered.catch_up_evidence_fingerprint, classified.catch_up_evidence_fingerprint);
+  });
+});
+
+void test('purges decoder recovery receipts at their own exact deadline without deleting inbox work', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('receipt-boundary', 920n, 'WEBSOCKET', 'confirmed'));
+    await pool.query(`WITH purge_clock AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+    ) INSERT INTO transaction_inbox_decoder_recoveries (
+      signature,quarantine_kind,worker_reason_code,snapshot_fingerprint,
+      quarantined_at,recovered_at,recovery_source,purge_after
+    ) SELECT 'receipt-boundary','WORKER_SNAPSHOT','PUMP_SCHEMA_UNSUPPORTED',repeat('a',64),
+      at-INTERVAL '4 hours',at-INTERVAL '4 hours','LOCAL_CLI',at FROM purge_clock`);
+    await pool.query(`WITH retained_clock AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+    ) INSERT INTO transaction_inbox_decoder_recoveries (
+      signature,quarantine_kind,worker_reason_code,snapshot_fingerprint,
+      quarantined_at,recovered_at,recovery_source,purge_after
+    ) SELECT 'receipt-retained','WORKER_SNAPSHOT','PUMP_BORSH_TRUNCATED',repeat('b',64),
+      at,at,'LOCAL_CLI',at+INTERVAL '4 hours' FROM retained_clock`);
+
+    const purged = await purgeExpiredFoundationData(pool);
+
+    assert.equal(purged.transactionInboxDecoderRecoveries, 1);
+    assert.deepEqual((await pool.query(
+      'SELECT signature FROM transaction_inbox_decoder_recoveries ORDER BY signature',
+    )).rows, [{ signature: 'receipt-retained' }]);
+    assert.equal((await row(pool, 'receipt-boundary')).processing_status, 'PENDING');
+  });
+});
+
 void test('heartbeat persists a detached first processing canary snapshot and rejects malformed evidence before I/O', async () => {
   const queryCalls: unknown[][] = [];
   const repository = new PostgresTransactionInboxRepository({
@@ -5027,6 +5304,35 @@ async function finalityRowTuple(
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
   return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
+}
+
+async function storeWorkerDecoderQuarantine(
+  repository: PostgresTransactionInboxRepository,
+  signature: string,
+  slot: bigint,
+  reasonCode: 'PUMP_SCHEMA_UNSUPPORTED' | 'PUMP_BORSH_TRUNCATED',
+): Promise<string> {
+  await repository.enqueue(notification(signature, slot, 'WEBSOCKET', 'confirmed'));
+  const claimed = await repository.claim(Date.now(), 30);
+  assert.equal(claimed?.signature, signature);
+  await repository.saveSnapshot(signature, claimed.leaseToken, normalized(signature, slot));
+  await repository.markFailed(signature, claimed.leaseToken, Object.freeze({
+    code: 'PIPELINE_STAGE_FAILED',
+    errorName: `ObservedPipelineFailure.v1.launchpad_observation.${reasonCode}`,
+    retryable: false,
+  }));
+  return claimed.leaseToken;
+}
+
+async function recoveryState(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+): Promise<unknown> {
+  return (await pool.query(`SELECT processing_status,attempts,attempts_in_cycle,
+    lease_token,lease_expires_at,error_code,error_name,error_retryable,next_attempt_at,
+    retry_exhausted_at,processed_at,terminal_at,purge_after,manual_recovery_count,
+    last_manual_recovery_at,normalized_transaction,immutable_fingerprint,updated_at
+    FROM chain_transaction_inbox WHERE signature=$1`, [signature])).rows[0];
 }
 
 function catchUpCoverageCandidate(

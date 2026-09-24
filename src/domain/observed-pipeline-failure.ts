@@ -67,7 +67,7 @@ export function isDecoderQuarantineFailure(value: IngestionFailure): boolean;
 export function isDecoderQuarantineFailure(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || isProxy(value)
     || !Object.isFrozen(value)) return false;
-  const prototype = Reflect.getPrototypeOf(value);
+  const prototype: object | null = Object.getPrototypeOf(value) as object | null;
   if (prototype !== Object.prototype && prototype !== null) return false;
   const keys = Reflect.ownKeys(value);
   if (keys.length !== 3
