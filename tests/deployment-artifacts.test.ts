@@ -744,6 +744,36 @@ void test('decoder quarantine runbook documents bounded observation-only recover
   assert.match(runbook, /aucune transaction brute/iu);
 });
 
+void test('finality reconciler diagnostics are composed and documented as a non-PASS signal', async () => {
+  const [runbook, factory] = await Promise.all([
+    readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('src/application/production-listener-factory.ts'),
+  ]);
+
+  assert.match(runbook, /Version : 1\.2\.4/u);
+  assert.match(runbook, /listener\.finality_reconciler_degraded/u);
+  assert.match(runbook, /listener\.finality_reconciler_recovered/u);
+  for (const reasonCode of [
+    'PROVIDER_UNAVAILABLE',
+    'PROVIDER_CHANGED',
+    'FINALITY_LIST',
+    'FINALITY_PASS',
+    'FINALITY_HISTORY',
+    'FINALITY_ROOT',
+    'FINALITY_POLL',
+    'FINALITY_BLOCK',
+    'FINALITY_REVISION',
+    'FINALITY_CLOCK',
+    'FINALITY_CONTRADICTION',
+    'UNKNOWN',
+  ]) assert.match(runbook, new RegExp(reasonCode, 'u'));
+  assert.match(runbook, /une fois toutes les douze défaillances/iu);
+  assert.match(runbook, /durationMs[^.]{0,240}durée/iu);
+  assert.match(runbook, /DEGRADED[^.]{0,240}(?:n'autorise|interdit)[^.]{0,120}PASS/iu);
+  assert.match(factory, /createFinalityReconcilerDiagnosticSink\(logger\)/u);
+  assert.doesNotMatch(factory, /diagnosticSink[^\n]{0,240}(?:database|repository|wallet|executor)/iu);
+});
+
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {
   const vite = await readArtifact('frontend/vite.config.ts');
   const readme = await readArtifact('frontend/README.md');

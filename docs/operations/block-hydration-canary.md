@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.3 — 2026-09-24 — issues #114, #142, #143, #146 et #148.
+Version : 1.2.4 — 2026-09-24 — issues #114, #142, #143, #146, #148 et #151.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -62,6 +62,41 @@ Cette commande programme uniquement un rejeu normal du snapshot immuable. Elle
 ne prouve ni succès du décodage, ni qualification, ni sellabilité, ni profit.
 Elle n'est jamais une autorisation de trade, n'arme aucun executor et ne lit,
 ne signe ni ne soumet aucune transaction avec un wallet.
+
+## Diagnostic du réconciliateur de finalité
+
+Une transition causée par un échec de passe vers `DEGRADED` produit le log
+structuré `listener.finality_reconciler_degraded` au niveau `warn`. La première
+défaillance est journalisée immédiatement ; si l'incident continue, un résumé
+borné est journalisé une fois toutes les douze défaillances, jamais une fois par
+tentative. Le log ne contient que le diagnostic V1 fermé : horodatages,
+`durationMs`, compteurs et reason code. Il ne contient ni erreur brute, stack,
+URL, signature, payload, mint, wallet ou secret.
+
+Les reason codes ont le sens opérateur suivant :
+
+- `PROVIDER_UNAVAILABLE` : aucun provider promu exploitable n'est disponible ;
+- `PROVIDER_CHANGED` : le provider ou sa révision a changé pendant la passe ;
+- `FINALITY_LIST` : la liste des candidats à réconcilier a échoué ;
+- `FINALITY_PASS` : la passe globale de réconciliation a échoué ;
+- `FINALITY_HISTORY` : la lecture d'historique de signature a échoué ;
+- `FINALITY_ROOT` : la lecture du slot racine/finalisé a échoué ;
+- `FINALITY_POLL` : l'observation de finalité d'une transaction a échoué ;
+- `FINALITY_BLOCK` : la preuve de bloc nécessaire n'est pas disponible ;
+- `FINALITY_REVISION` : la révision atomique d'un candidat a échoué ;
+- `FINALITY_CLOCK` : l'horloge métier du réconciliateur est invalide ;
+- `FINALITY_CONTRADICTION` : les preuves de finalité se contredisent ;
+- `UNKNOWN` : un rejet non reconnu a été contenu sans en journaliser la valeur.
+
+La première passe réussie qui suit l'incident produit
+`listener.finality_reconciler_recovered` au niveau `info`. Son `durationMs`
+indique la durée non régressive entre le début de la dégradation et la reprise,
+et ses compteurs décrivent l'incident complet.
+
+Ces événements expliquent le heartbeat ; ils ne le remplacent pas. Tout état
+`DEGRADED` n'autorise jamais un verdict `PASS`, même si un log de diagnostic est
+présent. Il faut observer la reprise, un heartbeat `RUNNING` cohérent et tous les
+autres gates indépendants avant de conclure.
 
 ## Déroulement
 
