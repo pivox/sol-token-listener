@@ -31,8 +31,11 @@ Scope: listener ingestion only; no signer, submission, wallet loading, or armame
   `RECOVERING` and cannot be promoted between the two passes. A periodic
   incumbent remains on the already-established session while the continuation
   completes. A second refresh, a page-budget pause, provider mismatch, malformed
-  signal, session completion or abort follows the existing fail-closed cleanup
-  and jitter path. No third immediate scan is allowed.
+  signal or a second page-budget pause follows the existing fail-closed cleanup
+  and jitter path. A periodic incumbent session completion starts recovery
+  immediately (`delay = 0`) while keeping the incumbent until its bounded
+  replacement succeeds. Shutdown instead transitions through `STOPPING` to
+  `STOPPED` without retry. No third immediate scan is allowed.
   Once no ACTIVE pin remains, the bounded continuation uses the same provider;
   a later recovery cycle uses normal provider selection.
   The persisted checkpoint makes this safe even across a process crash between
