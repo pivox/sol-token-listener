@@ -1,15 +1,15 @@
 # First-Processing Canary Evidence Design
 
-Version: 1.0.2 — 2026-09-20 — issue #143
+Version: 1.1.2 — 2026-09-24 — issues #143 and #153
 
 Status: approved for implementation under the standing operator instruction
 
-Issue: #143, part 2 of #140
+Issue: #153, correction post-canary de #143, part 2 of #140
 
 ## Goal
 
 Make the 15-minute Mainnet observe-only canary able to prove the latency from
-durable transaction detection to the first successful business processing.
+durable worker-eligible transaction detection to the first successful business processing.
 The proof must be immutable, bounded, aggregate-only, durable through the
 listener heartbeat, and backward-compatible with historical data.
 
@@ -152,6 +152,45 @@ This excludes historical rows and makes all heartbeat snapshots for one
 process converge on the same final cohort. The query returns one aggregate row;
 it never returns per-transaction evidence to the application.
 
+The cohort measures worker processing, not successful catch-up classification
+that deliberately decides no worker admission is required. Before ordering and
+applying the capacity bound, it therefore excludes only exact, coherent,
+version-1 classification-only rows that remain non-admitted:
+
+- `IGNORED / SOLANA_TRANSACTION_FAILED` with `catch_up_enqueued=false`;
+- `IGNORED / NO_SUPPORTED_PUMP_ACTION` with `catch_up_enqueued=false`;
+- `DEFERRED / PUMP_TRADE_UNTRACKED` with `catch_up_enqueued=false`.
+
+The stored processing status, disposition and reason must all match the listed
+combination. The receipt must come exclusively from `CATCH_UP`; any row also
+observed through `WEBSOCKET` remains eligible because its prior worker
+admission cannot be disproved. All version-1 receipt fields must form the exact
+coherent shape already enforced for catch-up classification: action key, mints,
+ingestion hint and optional mint, evidence fingerprint, classification time,
+terminal time and purge deadline. Exclusion also requires positive proof that
+the row has never been worker-admitted or processed: zero lifetime and cycle
+attempts, no current or historical lease, snapshot, immutable fingerprint,
+processing timestamp, first-processing timestamp, recovery, retry, error or
+finality evidence, `first_processing_evidence_unavailable=false`, and no
+catch-up admission priority. These conditions mirror and strengthen the
+repository's pristine-row invariant. Any partial, unknown or contradictory
+combination remains eligible and fail-closed. `QUARANTINED` always remains
+eligible and terminal. A deferred row promoted through `syncTrackedMint()` to
+`PENDING`, `PROCESSING` or `PROCESSED` becomes eligible even though its
+immutable historical `catch_up_enqueued=false` receipt remains, so its original
+immutable detection timestamp continues to measure the full wait before worker
+processing.
+
+The SQL exclusion predicate is total under PostgreSQL three-valued logic:
+`NULL` or any unknown value never satisfies an exclusion. The query must use a
+null-safe exact predicate (for example `NOT COALESCE(exact_match, FALSE)`) so a
+legacy or malformed partial classification remains inside the fail-closed
+cohort.
+
+This is a correction to the intended V1 population, not a JSON schema change:
+the aggregate keys, `version: 1`, arithmetic invariants and public projection
+remain unchanged.
+
 The version-1 aggregate contains only fixed fields:
 
 ```ts
@@ -183,7 +222,8 @@ nearest-rank p95 of completed, valid integer-millisecond durations. A duration
 of 44,999 ms belongs to `underThresholdCount`; 45,000 ms belongs to
 `atOrAboveThresholdCount`.
 
-Categories use this ordered, mutually exclusive decision table:
+After the exact non-admitted classification-only exclusions above, categories
+use this ordered, mutually exclusive decision table:
 
 1. invalid: a present timestamp yields a negative or non-integer duration;
 2. completed: a present timestamp yields a valid integer duration;
@@ -297,6 +337,14 @@ Tests must prove:
 - a partially purged cohort is `INCONCLUSIVE` from its first possible purge
   instant and cannot recover a misleading `PASS`;
 - the cohort excludes pre-start and post-window rows and caps at 50,000;
+- exact non-admitted `IGNORED/SOLANA_TRANSACTION_FAILED`,
+  `IGNORED/NO_SUPPORTED_PUMP_ACTION` and
+  `DEFERRED/PUMP_TRADE_UNTRACKED` classifications do not enter the cohort;
+- quarantine, malformed classification combinations and genuine worker
+  terminal failures remain eligible and blocking;
+- a deferred classification promoted through the real `syncTrackedMint()` and
+  claim/processing path becomes eligible with its original `first_detected_at`,
+  while contradictory rows with any worker-history trace remain fail-closed;
 - 44,999 and 45,000 ms fall into different buckets;
 - nearest-rank p95 works for one-row and other small samples;
 - right-censored, tail-censored, terminal, unavailable, invalid, empty, and

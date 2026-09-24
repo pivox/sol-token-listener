@@ -744,13 +744,38 @@ void test('decoder quarantine runbook documents bounded observation-only recover
   assert.match(runbook, /aucune transaction brute/iu);
 });
 
+void test('block hydration runbook defines the corrected worker-eligible cohort and mandatory replay', async () => {
+  const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
+
+  assert.match(runbook, /Version : 1\.2\.6/u);
+  assert.match(runbook, /population worker-éligible/iu);
+  for (const exclusion of [
+    'IGNORED / SOLANA_TRANSACTION_FAILED',
+    'IGNORED / NO_SUPPORTED_PUMP_ACTION',
+    'DEFERRED / PUMP_TRADE_UNTRACKED',
+  ]) assert.match(runbook, new RegExp(exclusion, 'u'));
+  assert.match(runbook, /provenance[^.]{0,120}exclusivement[^.]{0,80}CATCH_UP/iu);
+  assert.match(runbook, /WEBSOCKET[^.]{0,80}CATCH_UP[^.]{0,160}fail-closed/iu);
+  assert.match(runbook, /QUARANTINED[^.]{0,240}bloquant/iu);
+  assert.match(runbook, /(?:état|combinaison)[^.]{0,120}malformé[^.]{0,240}bloquant/iu);
+  for (const independentGate of [
+    'backlog', 'finalité', 'oversize', 'rétention', 'HTTP 429',
+  ]) {
+    assert.match(
+      runbook,
+      new RegExp(`gates[^.]{0,320}${independentGate}[^.]{0,320}indépendants`, 'iu'),
+    );
+  }
+  assert.match(runbook, /canary Mainnet[^.]{0,240}2026-09-24[^.]{0,240}doit être rejoué/iu);
+});
+
 void test('finality reconciler diagnostics are composed and documented as a non-PASS signal', async () => {
   const [runbook, factory] = await Promise.all([
     readArtifact('docs/operations/block-hydration-canary.md'),
     readArtifact('src/application/production-listener-factory.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.2\.4/u);
+  assert.match(runbook, /Version : 1\.2\.6/u);
   assert.match(runbook, /listener\.finality_reconciler_degraded/u);
   assert.match(runbook, /listener\.finality_reconciler_recovered/u);
   for (const reasonCode of [

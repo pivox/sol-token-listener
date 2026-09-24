@@ -259,6 +259,63 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            CROSS JOIN sampled
            WHERE inbox.first_detected_at >= to_timestamp($1 / 1000.0)
              AND inbox.first_detected_at < LEAST(sampled.sampled_at, to_timestamp($2 / 1000.0))
+             AND NOT COALESCE((
+               inbox.catch_up_classification_version=1
+               AND inbox.catch_up_enqueued=FALSE
+               AND inbox.discovery_sources=ARRAY['CATCH_UP']::TEXT[]
+               AND inbox.catch_up_mints IS NOT NULL
+               AND transaction_inbox_catch_up_mints_valid(inbox.catch_up_mints)
+               AND inbox.catch_up_evidence_fingerprint ~ '^[0-9a-f]{64}$'
+               AND inbox.catch_up_classified_at IS NOT NULL
+               AND isfinite(inbox.catch_up_classified_at)
+               AND inbox.catch_up_classified_at>=inbox.observed_at
+               AND inbox.catch_up_classified_at<=TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+               AND date_trunc('milliseconds',inbox.catch_up_classified_at)=inbox.catch_up_classified_at
+               AND inbox.terminal_at=inbox.catch_up_classified_at
+               AND inbox.purge_after=inbox.terminal_at+INTERVAL '4 hours'
+               AND inbox.ingestion_priority='NORMAL'
+               AND (
+                 (inbox.processing_status='IGNORED'
+                   AND inbox.catch_up_disposition='IGNORED'
+                   AND inbox.catch_up_reason_code IN (
+                     'SOLANA_TRANSACTION_FAILED','NO_SUPPORTED_PUMP_ACTION'
+                   )
+                   AND inbox.catch_up_action_key='NONE'
+                   AND inbox.catch_up_mints=ARRAY[]::TEXT[]
+                   AND inbox.ingestion_hint='NONE'
+                   AND inbox.ingestion_hint_mint IS NULL)
+                 OR (inbox.processing_status='DEFERRED'
+                   AND inbox.catch_up_disposition='DEFERRED'
+                   AND inbox.catch_up_reason_code='PUMP_TRADE_UNTRACKED'
+                   AND CARDINALITY(inbox.catch_up_mints)>=1
+                   AND inbox.ingestion_hint='PUMPFUN_TRADE'
+                   AND transaction_inbox_solana_public_key_valid(inbox.ingestion_hint_mint)
+                   AND inbox.catch_up_action_key='PUMPFUN_TRADE:' || inbox.ingestion_hint_mint
+                   AND inbox.ingestion_hint_mint=ANY(inbox.catch_up_mints))
+               )
+               AND inbox.attempts=0
+               AND inbox.attempts_in_cycle=0
+               AND inbox.lease_token IS NULL
+               AND inbox.lease_expires_at IS NULL
+               AND inbox.normalized_transaction IS NULL
+               AND inbox.immutable_fingerprint IS NULL
+               AND inbox.processed_at IS NULL
+               AND inbox.first_processed_at IS NULL
+               AND inbox.manual_recovery_count=0
+               AND inbox.last_manual_recovery_at IS NULL
+               AND inbox.decoder_recovery_used=FALSE
+               AND inbox.decoder_quarantine_eligible_at IS NULL
+               AND inbox.next_attempt_at IS NULL
+               AND inbox.retry_exhausted_at IS NULL
+               AND inbox.error_code IS NULL
+               AND inbox.error_name IS NULL
+               AND inbox.error_retryable IS NULL
+               AND inbox.missing_finality_polls=0
+               AND inbox.last_missing_finality_provider_id IS NULL
+               AND inbox.finality_evidence_version=0
+               AND inbox.first_processing_evidence_unavailable=FALSE
+               AND inbox.catch_up_admission_priority IS NULL
+             ),FALSE)
            ORDER BY inbox.first_detected_at, inbox.signature
            LIMIT $3
          ), classified AS MATERIALIZED (

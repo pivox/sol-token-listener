@@ -816,37 +816,355 @@ void test('counts one completed duration, excludes pre-cohort and historical row
   });
 });
 
-void test('classifies valid DEFERRED, IGNORED, and QUARANTINED repository rows as terminal', async (context) => {
+void test('worker-eligible cohort: excludes only exact never-worker-touched catch-up outcomes', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
     const startedAtMs = Date.now() - 1_000;
-    const terminalRows = [
-      createCatchUpClassification({ ...catchUpClassificationInput('canary-deferred-valid'),
+    const classificationOnly = [
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-ignored-solana-failed'),
         observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 1,
+        disposition: 'IGNORED', reasonCode: 'SOLANA_TRANSACTION_FAILED',
+        ingestionHint: null, ingestionHintMint: null, mints: [],
+      }),
+      createCatchUpClassification({ ...catchUpClassificationInput('canary-deferred-valid'),
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 2,
         disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
         ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint, mints: [tradeMint],
       }),
       createCatchUpClassification({ ...catchUpClassificationInput('canary-ignored-valid'),
-        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 2,
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 3,
         disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
         ingestionHint: null, ingestionHintMint: null, mints: [],
       }),
+    ];
+    const blocking = [
       createCatchUpClassification({ ...catchUpClassificationInput('canary-quarantined-valid'),
-        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 3,
+        observedAtMs: startedAtMs, classifiedAtMs: startedAtMs + 4,
         disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
         ingestionHint: null, ingestionHintMint: null, mints: [],
       }),
     ];
-    for (const classification of terminalRows) await repository.recordCatchUpClassification(classification);
+    for (const classification of [...classificationOnly, ...blocking]) {
+      const receipt = await repository.recordCatchUpClassification(classification);
+      assert.equal(receipt.admission, 'NOT_ENQUEUED');
+      assert.equal((await row(pool, classification.signature)).catch_up_enqueued, false);
+    }
 
-    assert.equal((await row(pool, 'canary-deferred-valid')).processing_status, 'DEFERRED');
-    assert.equal((await row(pool, 'canary-ignored-valid')).processing_status, 'IGNORED');
-    assert.equal((await row(pool, 'canary-quarantined-valid')).processing_status, 'QUARANTINED');
     const evidence = await repository.firstProcessingCanary(startedAtMs);
-    assert.equal(evidence.eligibleCount, 3);
-    assert.equal(evidence.terminalCount, 3);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.terminalCount, 1);
     assert.equal(evidence.pendingCount, 0);
     assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('worker-eligible coherence: keeps a pristine WebSocket-admitted classification eligible', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const signature = 'canary-websocket-catch-up-pristine';
+    await repository.enqueue(Object.freeze({
+      ...notification(signature, 1n, 'WEBSOCKET', 'confirmed'),
+      observedAtMs: startedAtMs,
+    }));
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      observedAtMs: startedAtMs,
+      classifiedAtMs: startedAtMs + 1,
+      disposition: 'IGNORED',
+      reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null,
+      ingestionHintMint: null,
+      mints: [],
+    }));
+    const stored = await row(pool, signature);
+    assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.equal(stored.attempts, 0);
+    assert.equal(stored.catch_up_enqueued, false);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.terminalCount, 1);
+  });
+});
+
+void test('worker-eligible coherence: keeps every malformed V1 receipt field fail-closed', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const corruptions = [
+      { name: 'classification-version', disposition: 'IGNORED', mutation: 'catch_up_classification_version=2' },
+      { name: 'processing-status', disposition: 'IGNORED', mutation: "processing_status='QUARANTINED'" },
+      { name: 'disposition', disposition: 'IGNORED', mutation: "catch_up_disposition='QUARANTINED'" },
+      { name: 'reason-code', disposition: 'IGNORED', mutation: "catch_up_reason_code='PUMP_TRADE_UNTRACKED'" },
+      { name: 'enqueued-absent', disposition: 'IGNORED', mutation: 'catch_up_enqueued=NULL' },
+      { name: 'enqueued-true', disposition: 'IGNORED', mutation: 'catch_up_enqueued=TRUE' },
+      { name: 'ignored-action-key', disposition: 'IGNORED', mutation: "catch_up_action_key='PUMPFUN_CREATE'" },
+      { name: 'ignored-mints', disposition: 'IGNORED', mutation: `catch_up_mints=ARRAY['${tradeMint}']` },
+      { name: 'ignored-hint', disposition: 'IGNORED', mutation: "ingestion_hint='PUMPFUN_CREATE'" },
+      { name: 'ignored-hint-mint', disposition: 'IGNORED', mutation: `ingestion_hint_mint='${tradeMint}'` },
+      { name: 'deferred-action-key', disposition: 'DEFERRED',
+        mutation: `catch_up_action_key='PUMPFUN_TRADE:${PUMPSWAP_PROGRAM_ID}'` },
+      { name: 'deferred-mints', disposition: 'DEFERRED',
+        mutation: `catch_up_mints=ARRAY['${PUMPSWAP_PROGRAM_ID}']` },
+      { name: 'deferred-hint', disposition: 'DEFERRED', mutation: "ingestion_hint='NONE'" },
+      { name: 'deferred-hint-mint', disposition: 'DEFERRED',
+        mutation: `ingestion_hint_mint='${PUMPSWAP_PROGRAM_ID}'` },
+      { name: 'fingerprint-absent', disposition: 'IGNORED', mutation: 'catch_up_evidence_fingerprint=NULL' },
+      { name: 'fingerprint-invalid', disposition: 'IGNORED',
+        mutation: `catch_up_evidence_fingerprint='${'z'.repeat(64)}'` },
+      { name: 'classified-at-absent', disposition: 'IGNORED', mutation: 'catch_up_classified_at=NULL' },
+      { name: 'classified-at-before-observation', disposition: 'IGNORED',
+        mutation: "catch_up_classified_at=observed_at-INTERVAL '1 millisecond'" },
+      { name: 'observed-at-after-classification', disposition: 'IGNORED',
+        mutation: "observed_at=catch_up_classified_at+INTERVAL '1 millisecond'" },
+      { name: 'terminal-at-absent', disposition: 'IGNORED', mutation: 'terminal_at=NULL' },
+      { name: 'terminal-at-incoherent', disposition: 'IGNORED',
+        mutation: "terminal_at=catch_up_classified_at+INTERVAL '1 millisecond'" },
+      { name: 'deferred-terminal-at-absent', disposition: 'DEFERRED', mutation: 'terminal_at=NULL' },
+      { name: 'purge-after-absent', disposition: 'IGNORED', mutation: 'purge_after=NULL' },
+      { name: 'purge-after-incoherent', disposition: 'IGNORED',
+        mutation: "purge_after=terminal_at+INTERVAL '4 hours 1 millisecond'" },
+      { name: 'deferred-purge-after-incoherent', disposition: 'DEFERRED',
+        mutation: "purge_after=terminal_at+INTERVAL '4 hours 1 millisecond'" },
+      { name: 'catch-up-source-absent', disposition: 'IGNORED',
+        mutation: "discovery_sources=ARRAY['WEBSOCKET']" },
+      { name: 'ingestion-priority', disposition: 'IGNORED', mutation: "ingestion_priority='TRACKED_TRADE'" },
+    ] as const;
+    for (const [index, corruption] of corruptions.entries()) {
+      const signature = `canary-malformed-receipt-${corruption.name}`;
+      const deferred = corruption.disposition === 'DEFERRED';
+      await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput(signature),
+        slot: BigInt(index + 1),
+        observedAtMs: startedAtMs,
+        classifiedAtMs: startedAtMs + index + 1,
+        disposition: deferred ? 'DEFERRED' : 'IGNORED',
+        reasonCode: deferred ? 'PUMP_TRADE_UNTRACKED' : 'NO_SUPPORTED_PUMP_ACTION',
+        ingestionHint: deferred ? 'PUMPFUN_TRADE' : null,
+        ingestionHintMint: deferred ? tradeMint : null,
+        mints: deferred ? [tradeMint] : [],
+      }));
+    }
+    await dropInboxIntegrityGuards(pool);
+    for (const corruption of corruptions) {
+      await pool.query(`UPDATE chain_transaction_inbox SET ${corruption.mutation}
+        WHERE signature=$1`, [`canary-malformed-receipt-${corruption.name}`]);
+    }
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, corruptions.length);
+    assert.equal(evidence.terminalCount, corruptions.length);
+  });
+});
+
+void test('worker-eligible coherence: keeps IGNORED without an exact classification eligible', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const signature = 'canary-ignored-without-classification';
+    await repository.enqueue(Object.freeze({
+      ...notification(signature, 1n, 'WEBSOCKET', 'confirmed'),
+      observedAtMs: startedAtMs,
+    }));
+    await dropInboxIntegrityGuards(pool);
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='IGNORED',
+      terminal_at=first_detected_at,purge_after=first_detected_at+INTERVAL '4 hours'
+      WHERE signature=$1`, [signature]);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.terminalCount, 1);
+  });
+});
+
+void test('worker-eligible cohort: keeps unrelated, incomplete, contradictory and failed rows fail-closed', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    await repository.enqueue(Object.freeze({
+      ...tradeNotification('canary-unrelated-deferred', 1n),
+      observedAtMs: startedAtMs,
+    }));
+    await insertCanaryInboxRow(
+      pool,
+      'canary-genuine-worker-failed',
+      startedAtMs + 1,
+      null,
+      'FAILED',
+    );
+    await repository.enqueue(Object.freeze({
+      ...notification('canary-incomplete-classification', 2n),
+      observedAtMs: startedAtMs,
+    }));
+    await repository.enqueue(Object.freeze({
+      ...notification('canary-contradictory-classification', 3n),
+      observedAtMs: startedAtMs,
+    }));
+    await pool.query(`UPDATE chain_transaction_inbox SET attempts=1
+      WHERE signature='canary-contradictory-classification'`);
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput('canary-contradictory-classification'),
+      slot: 3n,
+      observedAtMs: startedAtMs,
+      classifiedAtMs: startedAtMs + 2,
+      disposition: 'IGNORED',
+      reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
+      ingestionHint: null,
+      ingestionHintMint: null,
+      mints: [],
+    }));
+    await pool.query(`ALTER TABLE chain_transaction_inbox
+      DROP CONSTRAINT chain_transaction_inbox_catch_up_classification_check`);
+    await pool.query(`UPDATE chain_transaction_inbox SET catch_up_classification_version=1
+      WHERE signature='canary-incomplete-classification'`);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 4);
+    assert.equal(evidence.terminalCount, 2);
+    assert.equal(evidence.pendingCount, 2);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('worker-eligible cohort: includes a deferred row after real promotion and processing', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const signature = 'canary-promoted-deferred';
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(signature),
+      observedAtMs: startedAtMs,
+      classifiedAtMs: startedAtMs + 1,
+      disposition: 'DEFERRED',
+      reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE',
+      ingestionHintMint: tradeMint,
+      mints: [tradeMint],
+    }));
+    const initiallyDeferred = await row(pool, signature);
+    const firstDetectedAtMs = new Date(initiallyDeferred.first_detected_at).getTime();
+    assert.equal(initiallyDeferred.processing_status, 'DEFERRED');
+    assert.equal(initiallyDeferred.catch_up_enqueued, false);
+
+    await insertTrackedLaunch(pool);
+    await repository.syncTrackedMint(tradeMint);
+    const promoted = await row(pool, signature);
+    assert.equal(promoted.processing_status, 'PENDING');
+    assert.equal(promoted.catch_up_enqueued, false);
+    assert.equal(new Date(promoted.first_detected_at).getTime(), firstDetectedAtMs);
+
+    const claimed = await repository.claim(Date.now(), 30);
+    assert.ok(claimed);
+    assert.equal(claimed.signature, signature);
+    assert.equal((await row(pool, signature)).processing_status, 'PROCESSING');
+    await repository.saveSnapshot(signature, claimed.leaseToken, normalized(signature, 1n));
+    await repository.markProcessed(signature, claimed.leaseToken, 'confirmed');
+    const processed = await row(pool, signature);
+    const firstProcessedAtMs = new Date(processed.first_processed_at).getTime();
+    assert.equal(processed.processing_status, 'PROCESSED');
+    assert.equal(processed.catch_up_enqueued, false);
+    assert.equal(new Date(processed.first_detected_at).getTime(), firstDetectedAtMs);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.completedCount, 1);
+    assert.equal(evidence.p95Ms, firstProcessedAtMs - firstDetectedAtMs);
+  });
+});
+
+void test('worker-eligible cohort: keeps every individual worker-history contradiction', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    const contradictions = [
+      "attempts=1",
+      "attempts_in_cycle=1",
+      "lease_token='active-lease'",
+      "lease_expires_at=clock_timestamp()+INTERVAL '1 minute'",
+      "normalized_transaction='{}'::JSONB",
+      `immutable_fingerprint='${'b'.repeat(64)}'`,
+      "processed_at=first_detected_at+INTERVAL '1 millisecond'",
+      "first_processed_at=first_detected_at+INTERVAL '1 millisecond'",
+      "manual_recovery_count=1",
+      "last_manual_recovery_at=first_detected_at+INTERVAL '1 millisecond'",
+      "decoder_recovery_used=TRUE",
+      "decoder_quarantine_eligible_at=first_detected_at",
+      "next_attempt_at=first_detected_at+INTERVAL '1 millisecond'",
+      "retry_exhausted_at=first_detected_at+INTERVAL '1 millisecond'",
+      "error_code='RPC_TRANSIENT'",
+      "error_name='CanaryFailure'",
+      "error_retryable=TRUE",
+      "missing_finality_polls=1",
+      "last_missing_finality_provider_id='primary'",
+      "finality_evidence_version=1",
+      "first_processing_evidence_unavailable=TRUE",
+      "catch_up_admission_priority='NORMAL'",
+    ] as const;
+    for (let index = 0; index < contradictions.length; index += 1) {
+      const signature = `canary-worker-history-${index}`;
+      await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput(signature),
+        observedAtMs: startedAtMs,
+        classifiedAtMs: startedAtMs + index + 1,
+        disposition: 'DEFERRED',
+        reasonCode: 'PUMP_TRADE_UNTRACKED',
+        ingestionHint: 'PUMPFUN_TRADE',
+        ingestionHintMint: tradeMint,
+        mints: [tradeMint],
+      }));
+    }
+
+    await dropInboxIntegrityGuards(pool);
+    for (let index = 0; index < contradictions.length; index += 1) {
+      await pool.query(`UPDATE chain_transaction_inbox SET ${contradictions[index]}
+        WHERE signature=$1`, [`canary-worker-history-${index}`]);
+    }
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, contradictions.length);
+    assert.equal(
+      evidence.completedCount + evidence.terminalCount + evidence.unavailableCount,
+      contradictions.length,
+    );
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
+void test('worker-eligible cohort: excludes classification-only rows before capacity probing', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+      processing_status, observed_at, first_detected_at, terminal_at, purge_after,
+      catch_up_classification_version, catch_up_disposition, catch_up_reason_code,
+      catch_up_action_key, catch_up_mints, catch_up_evidence_fingerprint,
+      catch_up_classified_at, catch_up_enqueued, catch_up_admission_priority
+    ) SELECT 'canary-classification-only-' || LPAD(series::TEXT, 5, '0'), series,
+      ARRAY['CATCH_UP'], ARRAY[$3], 'confirmed', 'IGNORED',
+      to_timestamp($1::BIGINT / 1000.0), to_timestamp($1::BIGINT / 1000.0),
+      to_timestamp($1::BIGINT / 1000.0),
+      to_timestamp($1::BIGINT / 1000.0) + INTERVAL '4 hours',
+      1, 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION', 'NONE', ARRAY[]::TEXT[], $4,
+      to_timestamp($1::BIGINT / 1000.0), FALSE, NULL
+      FROM generate_series(1, $2) AS series`, [
+      startedAtMs,
+      FIRST_PROCESSING_COHORT_CAPACITY + 1,
+      PUMP_PROGRAM_ID,
+      'c'.repeat(64),
+    ]);
+    await insertCanaryInboxRow(
+      pool,
+      'canary-capacity-worker-eligible',
+      startedAtMs + 1,
+      null,
+    );
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.overflowed, false);
+    assert.equal(evidence.eligibleCount, 1);
+    assert.equal(evidence.tailCensoredCount, 1);
   });
 });
 
@@ -5596,6 +5914,19 @@ async function insertCanaryInboxRow(
     CASE WHEN $4::TEXT='FAILED' THEN $6::BOOLEAN ELSE NULL END,
     CASE WHEN $6::BOOLEAN THEN to_timestamp(($2::BIGINT + 1) / 1000.0) ELSE NULL END
   )`, [signature, detectedAtMs, processedAtMs, processingStatus, unavailable, exhausted, 'a'.repeat(64)]);
+}
+
+async function dropInboxIntegrityGuards(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  const checks = await pool.query<{ readonly conname: string }>(`SELECT conname
+    FROM pg_constraint WHERE conrelid='chain_transaction_inbox'::REGCLASS AND contype='c'`);
+  for (const { conname } of checks.rows) {
+    await pool.query(`ALTER TABLE chain_transaction_inbox DROP CONSTRAINT ${quoteIdentifier(conname)}`);
+  }
+  const triggers = await pool.query<{ readonly tgname: string }>(`SELECT tgname FROM pg_trigger
+    WHERE tgrelid='chain_transaction_inbox'::REGCLASS AND NOT tgisinternal`);
+  for (const { tgname } of triggers.rows) {
+    await pool.query(`DROP TRIGGER ${quoteIdentifier(tgname)} ON chain_transaction_inbox`);
+  }
 }
 
 async function strictCatchUpRunRow(
