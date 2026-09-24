@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.5 — 2026-09-24 — issues #114, #142, #143, #146, #148, #151 et #153.
+Version : 1.2.6 — 2026-09-24 — issues #114, #142, #143, #146, #148, #151 et #153.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -114,7 +114,10 @@ versionnées et non admises suivantes sont exclues de cette cohorte :
 Cette exclusion exige également la preuve complète que la ligne n'a jamais été
 touchée par le worker : aucun essai, lease présent ou historique, snapshot,
 fingerprint immuable, traitement, récupération, retry, erreur, preuve de
-finalité ou priorité d'admission. Une ligne différée ensuite promue par
+finalité ou priorité d'admission. La provenance doit être exclusivement
+`CATCH_UP` et le reçu V1 complet doit être cohérent ; une provenance mêlant
+`WEBSOCKET` et `CATCH_UP`, ou tout champ de reçu absent ou contradictoire,
+reste worker-éligible et fail-closed. Une ligne différée ensuite promue par
 `syncTrackedMint()` redevient worker-éligible avec son `first_detected_at`
 original, même si son reçu historique conserve `catch_up_enqueued=false`.
 

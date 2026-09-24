@@ -1,6 +1,6 @@
 # First-Processing Worker Eligibility Implementation Plan
 
-Version: 1.0.1 — 2026-09-24 — issue #153
+Version: 1.0.2 — 2026-09-24 — issue #153
 
 > **For agentic workers:** use test-driven development, request independent
 > review, and verify evidence before completion.
@@ -13,7 +13,7 @@ quarantine, malformed-state, latency, overflow or retention gate.
 
 Design authority:
 `docs/superpowers/specs/2026-09-20-first-processing-canary-evidence-design.md`
-version 1.1.1.
+version 1.1.2.
 
 ## Scope constraints
 
@@ -67,6 +67,10 @@ complete never-worker-touched/pristine proof. Do not use a broad
 SQL three-valued logic: `NULL`, unknown and partial legacy state must remain
 eligible, using a null-safe exact match such as
 `NOT COALESCE(exact_match, FALSE)`.
+
+The exact predicate must also prove catch-up-only provenance and the complete
+coherent version-1 receipt shape. `WEBSOCKET + CATCH_UP`, a malformed receipt,
+or any single worker-history contradiction stays eligible and fail-closed.
 
 Run the RED tests to GREEN, then the complete repository test file, backend
 type-check and targeted lint.

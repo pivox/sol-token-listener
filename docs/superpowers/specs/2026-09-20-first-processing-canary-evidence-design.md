@@ -1,6 +1,6 @@
 # First-Processing Canary Evidence Design
 
-Version: 1.1.1 — 2026-09-24 — issues #143 and #153
+Version: 1.1.2 — 2026-09-24 — issues #143 and #153
 
 Status: approved for implementation under the standing operator instruction
 
@@ -162,18 +162,24 @@ version-1 classification-only rows that remain non-admitted:
 - `DEFERRED / PUMP_TRADE_UNTRACKED` with `catch_up_enqueued=false`.
 
 The stored processing status, disposition and reason must all match the listed
-combination. Exclusion also requires positive proof that the row has never been
-worker-admitted or processed: zero lifetime and cycle attempts, no current or
-historical lease, snapshot, immutable fingerprint, processing timestamp,
-first-processing timestamp, recovery, retry, error or finality evidence,
-`first_processing_evidence_unavailable=false`, and no catch-up admission
-priority. These conditions mirror and strengthen the repository's pristine-row
-invariant. Any partial, unknown or contradictory combination remains eligible
-and fail-closed. `QUARANTINED` always remains eligible and terminal. A deferred
-row promoted through `syncTrackedMint()` to `PENDING`, `PROCESSING` or
-`PROCESSED` becomes eligible even though its immutable historical
-`catch_up_enqueued=false` receipt remains, so its original immutable detection
-timestamp continues to measure the full wait before worker processing.
+combination. The receipt must come exclusively from `CATCH_UP`; any row also
+observed through `WEBSOCKET` remains eligible because its prior worker
+admission cannot be disproved. All version-1 receipt fields must form the exact
+coherent shape already enforced for catch-up classification: action key, mints,
+ingestion hint and optional mint, evidence fingerprint, classification time,
+terminal time and purge deadline. Exclusion also requires positive proof that
+the row has never been worker-admitted or processed: zero lifetime and cycle
+attempts, no current or historical lease, snapshot, immutable fingerprint,
+processing timestamp, first-processing timestamp, recovery, retry, error or
+finality evidence, `first_processing_evidence_unavailable=false`, and no
+catch-up admission priority. These conditions mirror and strengthen the
+repository's pristine-row invariant. Any partial, unknown or contradictory
+combination remains eligible and fail-closed. `QUARANTINED` always remains
+eligible and terminal. A deferred row promoted through `syncTrackedMint()` to
+`PENDING`, `PROCESSING` or `PROCESSED` becomes eligible even though its
+immutable historical `catch_up_enqueued=false` receipt remains, so its original
+immutable detection timestamp continues to measure the full wait before worker
+processing.
 
 The SQL exclusion predicate is total under PostgreSQL three-valued logic:
 `NULL` or any unknown value never satisfies an exclusion. The query must use a
