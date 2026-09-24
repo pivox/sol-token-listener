@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.4 — 2026-09-24 — issues #114, #142, #143, #146, #148 et #151.
+Version : 1.2.5 — 2026-09-24 — issues #114, #142, #143, #146, #148, #151 et #153.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -97,6 +97,39 @@ Ces événements expliquent le heartbeat ; ils ne le remplacent pas. Tout état
 `DEGRADED` n'autorise jamais un verdict `PASS`, même si un log de diagnostic est
 présent. Il faut observer la reprise, un heartbeat `RUNNING` cohérent et tous les
 autres gates indépendants avant de conclure.
+
+## Population worker-éligible de la cohorte first-processing
+
+La cohorte first-processing mesure uniquement la latence entre la détection
+durable d'une transaction worker-éligible et son premier traitement métier
+réussi. Une classification catch-up qui conclut de façon cohérente qu'aucune
+admission worker n'est requise ne constitue pas un échec de traitement. Avant
+le tri et la limite de 50 000 lignes, seules les trois combinaisons exactes,
+versionnées et non admises suivantes sont exclues de cette cohorte :
+
+- `IGNORED / SOLANA_TRANSACTION_FAILED` avec `catch_up_enqueued=false` ;
+- `IGNORED / NO_SUPPORTED_PUMP_ACTION` avec `catch_up_enqueued=false` ;
+- `DEFERRED / PUMP_TRADE_UNTRACKED` avec `catch_up_enqueued=false`.
+
+Cette exclusion exige également la preuve complète que la ligne n'a jamais été
+touchée par le worker : aucun essai, lease présent ou historique, snapshot,
+fingerprint immuable, traitement, récupération, retry, erreur, preuve de
+finalité ou priorité d'admission. Une ligne différée ensuite promue par
+`syncTrackedMint()` redevient worker-éligible avec son `first_detected_at`
+original, même si son reçu historique conserve `catch_up_enqueued=false`.
+
+Tout `QUARANTINED` reste une preuve bloquante. Tout état malformé, partiel,
+inconnu ou contradictoire reste lui aussi worker-éligible et bloquant ; il ne
+peut jamais bénéficier d'une exclusion large fondée uniquement sur son statut.
+Les trois exclusions retirent seulement des résultats de classification
+attendus du calcul de latence : les lignes et leurs reçus restent visibles et
+soumis à la rétention normale.
+
+Les gates backlog, finalité, oversize, rétention et HTTP 429 restent strictement
+indépendants de cette correction et doivent tous satisfaire leurs propres
+critères. Le canary Mainnet échoué du 2026-09-24 doit être rejoué intégralement
+sur une base fraîche après fusion ; aucune preuve de cette fenêtre échouée ne
+peut être réutilisée pour déclarer un `PASS`.
 
 ## Déroulement
 
