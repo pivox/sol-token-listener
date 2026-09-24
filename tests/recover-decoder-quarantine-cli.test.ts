@@ -111,6 +111,7 @@ void test('command runner exposes no wallet, RPC, server or submission capabilit
     packageJson.scripts?.['inbox:recover-decoder'],
     'tsx scripts/recover-decoder-quarantine.ts',
   );
+  assert.match(source, /import 'dotenv\/config';/u);
   assert.match(source, /PostgresTransactionInboxRepository/u);
   assert.match(source, /getDatabasePool/u);
   assert.match(source, /closeDatabase/u);

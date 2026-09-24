@@ -165,6 +165,45 @@ void test('serializes concurrent decoder recoveries and makes every replay idemp
   });
 });
 
+void test('samples decoder recovery time only after the row lock and rejects a crossed deadline', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const signature = 'decoder-quarantine-lock-deadline';
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await storeWorkerDecoderQuarantine(
+      repository, signature, 903n, 'PUMP_SCHEMA_UNSUPPORTED',
+    );
+    await pool.query(`WITH boundary AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp())+INTERVAL '250 milliseconds' AS at
+    ) UPDATE chain_transaction_inbox SET
+      terminal_at=boundary.at-INTERVAL '4 hours',purge_after=boundary.at
+      FROM boundary WHERE signature=$1`, [signature]);
+    const blocker = await pool.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(
+        'SELECT signature FROM chain_transaction_inbox WHERE signature=$1 FOR UPDATE',
+        [signature],
+      );
+      const recovery = repository.recoverDecoderQuarantine(signature);
+      await waitForActiveLockWait(pool, 'FROM chain_transaction_inbox inbox');
+      await pool.query("SELECT pg_sleep(0.3)");
+      await blocker.query('COMMIT');
+
+      assert.deepEqual(await settlesWithin(recovery, 2_000), {
+        code: 'DECODER_RECOVERY_EXPIRED', signature,
+      });
+      assert.equal((await row(pool, signature)).processing_status, 'FAILED');
+      assert.equal((await pool.query(
+        'SELECT COUNT(*)::INTEGER AS count FROM transaction_inbox_decoder_recoveries WHERE signature=$1',
+        [signature],
+      )).rows[0]?.count, 0);
+    } finally {
+      await blocker.query('ROLLBACK');
+      blocker.release();
+    }
+  });
+});
+
 void test('fails closed for every non-worker, malformed, processed, retryable and expired state', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
@@ -5099,6 +5138,20 @@ async function waitForActiveAdvisoryWait(
     await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
   }
   throw new Error('Expected a bounded advisory-lock wait.');
+}
+
+async function waitForActiveLockWait(
+  pool: InstanceType<typeof pg.Pool>,
+  queryFragment: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const result = await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM pg_stat_activity
+      WHERE state='active' AND wait_event_type='Lock'
+        AND query LIKE '%' || $1 || '%'`, [queryFragment]);
+    if ((result.rows[0] as { readonly count?: unknown } | undefined)?.count === 1) return;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+  }
+  throw new Error('Expected a bounded row-lock wait.');
 }
 
 async function settlesWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {

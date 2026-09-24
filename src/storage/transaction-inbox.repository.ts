@@ -1386,16 +1386,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [signature],
         );
         const selected = await client.query(
-          `WITH recovery_clock AS MATERIALIZED (
-             SELECT date_trunc('milliseconds',clock_timestamp()) AS recovered_at
-           )
-           SELECT inbox.*, recovery_clock.recovered_at,
+          `SELECT inbox.*,
              EXISTS (
                SELECT 1 FROM transaction_inbox_decoder_recoveries receipt
                WHERE receipt.signature=inbox.signature
              ) AS decoder_recovery_recorded
            FROM chain_transaction_inbox inbox
-           CROSS JOIN recovery_clock
            WHERE inbox.signature=$1
            FOR UPDATE OF inbox`,
           [signature],
@@ -1413,7 +1409,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           dateMs(row.last_manual_recovery_at, 'last manual recovery at');
           return decoderRecoveryResult('DECODER_RECOVERY_ALREADY_SCHEDULED', signature);
         }
-        const recoveredAtMs = dateMs(row.recovered_at, 'decoder recovery time');
+        const recoveryClock = await client.query(
+          "SELECT date_trunc('milliseconds',clock_timestamp()) AS recovered_at",
+        );
+        const recoveredAtMs = dateMs(
+          requiredRow(recoveryClock.rows[0]).recovered_at,
+          'decoder recovery time',
+        );
         const terminalAtMs = nullableDateMs(row.terminal_at, 'terminal at');
         const purgeAfterMs = nullableDateMs(row.purge_after, 'purge after');
         const exactWorkerFailure = isStoredDecoderQuarantineFailure(row);
