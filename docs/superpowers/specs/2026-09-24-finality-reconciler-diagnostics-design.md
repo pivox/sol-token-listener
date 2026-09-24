@@ -1,6 +1,6 @@
 # Finality Reconciler Diagnostics Design
 
-Version: 1.0.0 — 2026-09-24 — issue #151
+Version: 1.0.1 — 2026-09-24 — issue #151
 
 Status: approved under the standing operator instruction to use the recommended
 safe option without pausing for resolvable questions
@@ -148,6 +148,12 @@ frozen; a sink exception is contained and cannot alter state, retry scheduling,
 readiness or shutdown. Blocking or re-entrant callbacks are unsupported and no
 stronger safety claim is made.
 
+The production logger adapter also consumes a native Promise returned by an
+accidentally asynchronous logger method and attaches a rejection handler
+without awaiting it. An asynchronous logging rejection therefore cannot become
+an unhandled process rejection or delay retry scheduling. Arbitrary external
+thenables remain outside this internal trusted boundary.
+
 An injected diagnostic clock that throws or returns an invalid value falls
 back to the trusted production `Date.now()` clock. Every accepted sample is
 clamped to the previous diagnostic timestamp, so an incident stays in one
@@ -192,7 +198,8 @@ Unit tests cover:
 - exact frozen own-data diagnostics with no extra or sensitive fields;
 - a throwing sink, a throwing/invalid clock, close during an in-flight pass and
   close timeout;
-- production logger mapping with fixed event names and no raw rejection data.
+- production logger mapping with fixed event names, contained synchronous and
+  asynchronous logger failures, and no raw rejection data.
 
 The normal project build, check, lint, backend/frontend tests and documentation
 check remain required. The Mainnet canary is explicitly outside this PR.

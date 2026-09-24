@@ -1,6 +1,6 @@
 # Bounded Finality Reconciler Diagnostics Implementation Plan
 
-Version: 1.0.1 — 2026-09-24 — issue #151
+Version: 1.0.2 — 2026-09-24 — issue #151
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development or superpowers:executing-plans and
@@ -142,12 +142,16 @@ With a narrow fake logger, assert `DEGRADED` maps to warn event
 `listener.finality_reconciler_recovered`, messages are fixed and application
 records contain exactly event plus diagnostic fields. Prove no error, stack,
 URL, signature, payload, mint, wallet or secret field can enter the record.
+Add a logger method returning a rejected native Promise and prove its rejection
+is consumed without awaiting or delaying the reconciler.
 
 - [ ] **Step 2: Implement and compose the logger adapter**
 
 Create a pure adapter around the narrow logger interface and pass its sink into
-the production `RecurringFinalityReconciler`. Do not add configuration flags,
-public API fields or persistence.
+the production `RecurringFinalityReconciler`. Consume native Promise results
+with an attached rejection handler while keeping the sink synchronous. Do not
+invoke arbitrary thenables and do not add configuration flags, public API
+fields or persistence.
 
 - [ ] **Step 3: Version the runbook**
 
