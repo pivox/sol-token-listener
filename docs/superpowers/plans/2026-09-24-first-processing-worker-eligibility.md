@@ -61,7 +61,7 @@ Modify `src/storage/transaction-inbox.repository.ts` only.
 Add an explicit SQL eligibility predicate to the `ordered` cohort query before
 ordering and `LIMIT`. Exclude only rows where classification version,
 `catch_up_enqueued=false`, processing status, disposition and reason form one
-of the three exact combinations in design v1.1.1 and the row satisfies the
+of the three exact combinations in design v1.1.2 and the row satisfies the
 complete never-worker-touched/pristine proof. Do not use a broad
 `status IN ('IGNORED','DEFERRED')` exclusion. Make the predicate total under
 SQL three-valued logic: `NULL`, unknown and partial legacy state must remain
@@ -91,7 +91,7 @@ the deployment-artifact tests.
 
 ## Task 4 — Verification and delivery
 
-1. Independent local review against issue #153 and design v1.1.1.
+1. Independent local review against issue #153 and design v1.1.2.
 2. Run build, check, lint, docs, focused PostgreSQL tests and the full test gate
    with one task-owned PostgreSQL 16 instance. Every PostgreSQL command must
    fail before execution when `TEST_DATABASE_URL` is missing and report zero
