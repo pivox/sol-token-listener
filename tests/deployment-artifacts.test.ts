@@ -722,8 +722,8 @@ void test('decoder quarantine runbook documents bounded observation-only recover
     readArtifact('docs/superpowers/specs/2026-09-20-pumpfun-decoder-quarantine-design.md'),
     readArtifact('docs/superpowers/plans/2026-09-20-pumpfun-decoder-quarantine.md'),
   ]);
-  assert.match(design, /Version: 1\.0\.3/u);
-  assert.match(plan, /Version: 1\.0\.4/u);
+  assert.match(design, /Version: 1\.0\.4/u);
+  assert.match(plan, /Version: 1\.0\.5/u);
   assert.match(plan, /docs\/operations\/block-hydration-canary\.md/u);
   assert.doesNotMatch(plan, /docs\/runbooks\/mainnet-observe-dry-run\.md/u);
   assert.match(runbook, /heartbeat\.decoderQuarantine[^.]{0,200}unresolvedCount/iu);

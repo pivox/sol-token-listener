@@ -180,3 +180,162 @@ BEGIN
   END IF;
 END;
 $migration_051$;
+
+-- Materialize the exact recovery eligibility once, while the worker still owns
+-- and validates the immutable snapshot. Heartbeats can then count one bounded
+-- scalar query instead of transferring every retained transaction snapshot.
+DO $migration_051_eligibility_preflight$
+DECLARE eligibility_columns INTEGER;
+BEGIN
+  LOCK TABLE chain_transaction_inbox IN ACCESS EXCLUSIVE MODE;
+  SELECT COUNT(*) INTO eligibility_columns FROM pg_attribute
+  WHERE attrelid='chain_transaction_inbox'::REGCLASS AND attnum>0 AND NOT attisdropped
+    AND attname='decoder_quarantine_eligible_at';
+  IF eligibility_columns NOT IN (0,1) THEN
+    RAISE EXCEPTION 'decoder quarantine eligibility column is partially installed' USING ERRCODE='23514';
+  END IF;
+  IF eligibility_columns=1 AND EXISTS (
+    SELECT 1 FROM pg_attribute attribute
+    LEFT JOIN pg_attrdef attribute_default ON attribute_default.adrelid=attribute.attrelid
+      AND attribute_default.adnum=attribute.attnum
+    WHERE attribute.attrelid='chain_transaction_inbox'::REGCLASS
+      AND attribute.attname='decoder_quarantine_eligible_at'
+      AND (attribute.atttypid<>'timestamp with time zone'::REGTYPE
+        OR attribute.atttypmod<>-1 OR attribute.attnotnull
+        OR attribute.attgenerated<>'' OR attribute.attidentity<>''
+        OR pg_get_expr(attribute_default.adbin,attribute_default.adrelid) IS NOT NULL)
+  ) THEN
+    RAISE EXCEPTION 'decoder quarantine eligibility column is incompatible' USING ERRCODE='23514';
+  END IF;
+  IF eligibility_columns=1 AND (
+    NOT EXISTS (SELECT 1 FROM pg_constraint constraint_row
+      WHERE constraint_row.conrelid='chain_transaction_inbox'::REGCLASS
+        AND constraint_row.conname='chain_transaction_inbox_decoder_quarantine_eligibility_check'
+        AND constraint_row.contype='c' AND constraint_row.convalidated
+        AND md5(pg_get_constraintdef(constraint_row.oid))='d1567c71208be1a6a382160c42590f1d')
+    OR NOT EXISTS (SELECT 1 FROM pg_trigger trigger_row JOIN pg_proc routine
+      ON routine.oid=trigger_row.tgfoid
+      WHERE trigger_row.tgrelid='chain_transaction_inbox'::REGCLASS
+        AND trigger_row.tgname='chain_transaction_inbox_decoder_quarantine_drift_trigger'
+        AND trigger_row.tgtype=19 AND trigger_row.tgenabled='O'
+        AND trigger_row.tgattr=''::INT2VECTOR AND trigger_row.tgqual IS NULL
+        AND routine.proname='transaction_inbox_decoder_quarantine_drift_guard'
+        AND routine.pronamespace=current_schema()::REGNAMESPACE
+        AND routine.pronargs=0 AND routine.prorettype='trigger'::REGTYPE
+        AND md5(routine.prosrc)='3872688ecb72fe469bead6c16c12120a')
+  ) THEN
+    RAISE EXCEPTION 'decoder quarantine eligibility definition is incompatible' USING ERRCODE='23514';
+  END IF;
+  DROP TABLE IF EXISTS pg_temp.migration_051_eligibility_preflight;
+  CREATE TEMP TABLE pg_temp.migration_051_eligibility_preflight (
+    first_install BOOLEAN NOT NULL
+  ) ON COMMIT DROP;
+  INSERT INTO pg_temp.migration_051_eligibility_preflight(first_install)
+    VALUES (eligibility_columns=0);
+END;
+$migration_051_eligibility_preflight$;
+
+ALTER TABLE chain_transaction_inbox
+  ADD COLUMN IF NOT EXISTS decoder_quarantine_eligible_at TIMESTAMPTZ;
+
+DO $migration_051_eligibility_constraint$
+BEGIN
+  IF (SELECT first_install FROM pg_temp.migration_051_eligibility_preflight) THEN
+    ALTER TABLE chain_transaction_inbox
+      ADD CONSTRAINT chain_transaction_inbox_decoder_quarantine_eligibility_check CHECK (
+        decoder_quarantine_eligible_at IS NULL OR (
+          processing_status='FAILED'
+          AND error_code='PIPELINE_STAGE_FAILED'
+          AND error_name IN (
+            'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
+            'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_TRUNCATED'
+          )
+          AND error_retryable=FALSE
+          AND retry_exhausted_at IS NULL
+          AND processed_at IS NULL
+          AND lease_token IS NULL
+          AND lease_expires_at IS NULL
+          AND next_attempt_at IS NULL
+          AND terminal_at=decoder_quarantine_eligible_at
+          AND purge_after=decoder_quarantine_eligible_at+INTERVAL '4 hours'
+          AND normalized_transaction IS NOT NULL
+          AND immutable_fingerprint ~ '^[0-9a-f]{64}$'
+          AND attempts BETWEEN 1 AND 2147483647
+          AND attempts_in_cycle BETWEEN 1 AND 100
+          AND manual_recovery_count BETWEEN 0 AND 2147483646
+        )
+      );
+  END IF;
+END;
+$migration_051_eligibility_constraint$;
+
+CREATE OR REPLACE FUNCTION transaction_inbox_decoder_quarantine_drift_guard()
+RETURNS trigger LANGUAGE plpgsql AS $transaction_inbox_decoder_quarantine_drift_guard$
+BEGIN
+  -- decoder quarantine eligibility v1: any later evidence drift invalidates it
+  IF OLD.decoder_quarantine_eligible_at IS NOT NULL
+     AND NEW.decoder_quarantine_eligible_at IS NOT NULL
+     AND (
+       NEW.processing_status IS DISTINCT FROM OLD.processing_status
+       OR NEW.error_code IS DISTINCT FROM OLD.error_code
+       OR NEW.error_name IS DISTINCT FROM OLD.error_name
+       OR NEW.error_retryable IS DISTINCT FROM OLD.error_retryable
+       OR NEW.retry_exhausted_at IS DISTINCT FROM OLD.retry_exhausted_at
+       OR NEW.processed_at IS DISTINCT FROM OLD.processed_at
+       OR NEW.lease_token IS DISTINCT FROM OLD.lease_token
+       OR NEW.lease_expires_at IS DISTINCT FROM OLD.lease_expires_at
+       OR NEW.next_attempt_at IS DISTINCT FROM OLD.next_attempt_at
+       OR NEW.terminal_at IS DISTINCT FROM OLD.terminal_at
+       OR NEW.purge_after IS DISTINCT FROM OLD.purge_after
+       OR NEW.normalized_transaction IS DISTINCT FROM OLD.normalized_transaction
+       OR NEW.immutable_fingerprint IS DISTINCT FROM OLD.immutable_fingerprint
+       OR NEW.attempts IS DISTINCT FROM OLD.attempts
+       OR NEW.attempts_in_cycle IS DISTINCT FROM OLD.attempts_in_cycle
+       OR NEW.manual_recovery_count IS DISTINCT FROM OLD.manual_recovery_count
+     ) THEN
+    NEW.decoder_quarantine_eligible_at := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$transaction_inbox_decoder_quarantine_drift_guard$;
+
+DO $migration_051_eligibility_trigger$
+BEGIN
+  IF (SELECT first_install FROM pg_temp.migration_051_eligibility_preflight) THEN
+    CREATE TRIGGER chain_transaction_inbox_decoder_quarantine_drift_trigger
+      BEFORE UPDATE ON chain_transaction_inbox
+      FOR EACH ROW EXECUTE FUNCTION transaction_inbox_decoder_quarantine_drift_guard();
+  END IF;
+END;
+$migration_051_eligibility_trigger$;
+
+DO $migration_051_eligibility_verify$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute attribute
+      LEFT JOIN pg_attrdef attribute_default ON attribute_default.adrelid=attribute.attrelid
+        AND attribute_default.adnum=attribute.attnum
+      WHERE attribute.attrelid='chain_transaction_inbox'::REGCLASS
+        AND attribute.attname='decoder_quarantine_eligible_at'
+        AND attribute.atttypid='timestamp with time zone'::REGTYPE
+        AND attribute.atttypmod=-1 AND NOT attribute.attnotnull
+        AND attribute.attgenerated='' AND attribute.attidentity=''
+        AND pg_get_expr(attribute_default.adbin,attribute_default.adrelid) IS NULL)
+    OR NOT EXISTS (SELECT 1 FROM pg_constraint constraint_row
+      WHERE constraint_row.conrelid='chain_transaction_inbox'::REGCLASS
+        AND constraint_row.conname='chain_transaction_inbox_decoder_quarantine_eligibility_check'
+        AND constraint_row.contype='c' AND constraint_row.convalidated
+        AND md5(pg_get_constraintdef(constraint_row.oid))='d1567c71208be1a6a382160c42590f1d')
+    OR NOT EXISTS (SELECT 1 FROM pg_trigger trigger_row JOIN pg_proc routine
+      ON routine.oid=trigger_row.tgfoid
+      WHERE trigger_row.tgrelid='chain_transaction_inbox'::REGCLASS
+        AND trigger_row.tgname='chain_transaction_inbox_decoder_quarantine_drift_trigger'
+        AND trigger_row.tgtype=19 AND trigger_row.tgenabled='O'
+        AND trigger_row.tgattr=''::INT2VECTOR AND trigger_row.tgqual IS NULL
+        AND routine.proname='transaction_inbox_decoder_quarantine_drift_guard'
+        AND routine.pronamespace=current_schema()::REGNAMESPACE
+        AND routine.pronargs=0 AND routine.prorettype='trigger'::REGTYPE
+        AND md5(routine.prosrc)='3872688ecb72fe469bead6c16c12120a') THEN
+    RAISE EXCEPTION 'decoder quarantine eligibility definition is incompatible' USING ERRCODE='23514';
+  END IF;
+END;
+$migration_051_eligibility_verify$;

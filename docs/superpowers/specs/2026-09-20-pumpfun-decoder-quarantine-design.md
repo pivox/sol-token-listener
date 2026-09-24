@@ -1,6 +1,6 @@
 # Pump.fun Decoder Quarantine and Replay Design
 
-Version: 1.0.3 — 2026-09-24 — issue #148
+Version: 1.0.4 — 2026-09-24 — issue #148
 
 Status: approved for implementation under the standing operator instruction
 
@@ -132,6 +132,11 @@ and schedules replay; the other observes the already-scheduled state. An old or
 stale worker lease cannot overwrite the recovery because every worker write
 still requires its exact lease token and `PROCESSING` state.
 
+V1 authorizes at most one explicit decoder replay per signature. If that replay
+ends with the same recognized incompatibility, the row receives its normal new
+terminal deadline but is not recoverable again. A later retry policy requires a
+new versioned decision; it is not inferred from repeated operator commands.
+
 ## Recovery evidence and retention
 
 Migration `051_transaction_inbox_decoder_quarantine_recovery.sql` creates
@@ -177,13 +182,17 @@ normal processing cycle under the current decoder.
 
 ## Bounded observability
 
-Inbox counts gain `decoderQuarantinedCount`. PostgreSQL selects retained
-terminal candidates and the repository applies the same closed domain taxonomy
-and canonical snapshot/fingerprint validation as recovery before counting.
-Malformed snapshots, fingerprint drift, prior recovery receipts and catch-up
-quarantines are excluded. Catch-up origin is not recoverably encoded. The value
-is a non-negative safe integer and exposes no signature, mint, raw payload, URL, error message or
-wallet data.
+Inbox rows gain nullable `decoder_quarantine_eligible_at`. The worker sets it to
+the database terminal time only after validating the closed domain taxonomy,
+canonical snapshot, fingerprint, counters and absence of a prior decoder
+recovery receipt. A database constraint binds it to the exact terminal state;
+an evidence-drift trigger clears it if any dependent field changes. Existing
+binaries leave it null. Heartbeat counting is therefore one bounded PostgreSQL
+aggregate over retained non-null markers: it never transfers or hashes raw
+snapshots on the periodic path. Malformed snapshots, fingerprint drift, prior
+recovery receipts and catch-up quarantines are excluded. Catch-up origin is not
+recoverably encoded. The value is a non-negative safe integer and exposes no
+signature, mint, raw payload, URL, error message or wallet data.
 
 The listener heartbeat gains a separate optional
 `decoderQuarantine: RuntimeDecoderQuarantineMetricsV1` object containing only

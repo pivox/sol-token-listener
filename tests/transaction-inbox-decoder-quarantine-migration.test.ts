@@ -25,13 +25,16 @@ void test('051 declares a bounded standalone decoder recovery receipt', async ()
     'purge_after TIMESTAMPTZ NOT NULL',
     'PRIMARY KEY (signature, quarantined_at)',
     'transaction_inbox_decoder_recoveries_purge_idx',
+    'decoder_quarantine_eligible_at TIMESTAMPTZ',
+    'chain_transaction_inbox_decoder_quarantine_eligibility_check',
+    'chain_transaction_inbox_decoder_quarantine_drift_trigger',
   ]) assert.ok(sql.includes(fragment), `missing migration fragment: ${fragment}`);
   assert.match(sql, /quarantine_kind='WORKER_SNAPSHOT'/u);
   assert.match(sql, /worker_reason_code IN \('PUMP_SCHEMA_UNSUPPORTED','PUMP_BORSH_TRUNCATED'\)/u);
   assert.match(sql, /snapshot_fingerprint ~ '\^\[0-9a-f\]\{64\}\$'/u);
   assert.match(sql, /purge_after=recovered_at\+INTERVAL '4 hours'/u);
   assert.doesNotMatch(sql, /REFERENCES\s+chain_transaction_inbox/iu);
-  assert.doesNotMatch(sql, /ALTER TABLE\s+(?:chain_transaction_inbox|listener_strict_catch_up_runs)/iu);
+  assert.doesNotMatch(sql, /ALTER TABLE\s+listener_strict_catch_up_runs/iu);
   assert.doesNotMatch(sql, /reltablespace/u,
     'temporary canonical indexes must not constrain permanent physical placement');
 });
@@ -192,6 +195,23 @@ void test('051 rejects reordered columns and primary-key index drift', async (co
   });
 });
 
+void test('051 rejects weakened eligibility constraints, functions, and triggers', async (context) => {
+  for (const mutation of [
+    `ALTER TABLE chain_transaction_inbox
+       DROP CONSTRAINT chain_transaction_inbox_decoder_quarantine_eligibility_check,
+       ADD CONSTRAINT chain_transaction_inbox_decoder_quarantine_eligibility_check CHECK (TRUE)`,
+    `CREATE OR REPLACE FUNCTION transaction_inbox_decoder_quarantine_drift_guard()
+       RETURNS trigger LANGUAGE plpgsql AS $drift$ BEGIN RETURN NEW; END; $drift$`,
+    `ALTER TABLE chain_transaction_inbox
+       DISABLE TRIGGER chain_transaction_inbox_decoder_quarantine_drift_trigger`,
+  ]) {
+    await withInstalledMigration(context, async (pool) => {
+      await pool.query(mutation);
+      await assert.rejects(pool.query(await migrationSql()), { code: '23514' });
+    });
+  }
+});
+
 void test('051 leaves pristine catch-up quarantine state and 049 constraints unchanged', async (context) => {
   await withDatabase(context, async (pool) => {
     await applyThrough050(pool);
@@ -213,10 +233,20 @@ void test('051 leaves pristine catch-up quarantine state and 049 constraints unc
     await pool.query(sql);
     await pool.query(sql);
 
-    assert.deepEqual((await pool.query(`SELECT * FROM chain_transaction_inbox
-      WHERE signature='catch-up-quarantine'`)).rows[0], before);
+    const after = (await pool.query(`SELECT * FROM chain_transaction_inbox
+      WHERE signature='catch-up-quarantine'`)).rows[0];
+    const { decoder_quarantine_eligible_at: eligibility, ...unchanged } = after;
+    assert.equal(eligibility, null);
+    assert.deepEqual(unchanged, before);
     assert.deepEqual(await catchUpConstraintSnapshot(pool), constraintBefore);
-    assert.deepEqual(await inboxColumnSnapshot(pool), columnsBefore);
+    const columnsAfter = await inboxColumnSnapshot(pool);
+    assert.deepEqual(columnsAfter.slice(0, -1), columnsBefore);
+    assert.deepEqual(columnsAfter.at(-1), {
+      column_name: 'decoder_quarantine_eligible_at',
+      data_type: 'timestamp with time zone',
+      is_nullable: 'YES',
+      column_default: null,
+    });
     assert.equal((await pool.query('SELECT COUNT(*) AS count FROM transaction_inbox_decoder_recoveries')).rows[0]?.count, '0');
     assert.equal(before?.normalized_transaction, null);
     assert.equal(before?.immutable_fingerprint, null);

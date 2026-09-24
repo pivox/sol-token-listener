@@ -1030,7 +1030,16 @@ void test('counts only retained unresolved worker decoder quarantines and clears
     );
     await repository.markProcessed(claimed.signature, claimed.leaseToken, 'finalized');
 
-    assert.equal((await repository.counts()).decoderQuarantinedCount, 1);
+    const countQueries: string[] = [];
+    const measured = new PostgresTransactionInboxRepository({
+      connect: () => pool.connect(),
+      query: async (sql, values) => {
+        countQueries.push(sql);
+        return pool.query(sql, values === undefined ? undefined : [...values]);
+      },
+    });
+    assert.equal((await measured.counts()).decoderQuarantinedCount, 1);
+    assert.equal(countQueries.length, 1);
     assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-count-retained'), {
       code: 'DECODER_RECOVERY_SCHEDULED', signature: 'decoder-count-retained',
     });
@@ -1043,6 +1052,9 @@ void test('counts only retained unresolved worker decoder quarantines and clears
       retryable: false,
     }));
     assert.equal((await repository.counts()).decoderQuarantinedCount, 0);
+    assert.deepEqual(await repository.recoverDecoderQuarantine('decoder-count-retained'), {
+      code: 'DECODER_RECOVERY_NOT_ELIGIBLE', signature: 'decoder-count-retained',
+    });
   });
 });
 
@@ -1190,7 +1202,7 @@ for (const [location, boundary] of [
 void test('catch-up admission counts reject malformed PostgreSQL values and inconsistent dimensions', async () => {
   const valid = {
     pending: '1', processing: '1', processed: '0', failed: '1', retryable_failed: '1', exhausted_failed: '0',
-    decoder_quarantine_candidates: '0',
+    decoder_quarantined: '0',
     websocket_only: '1', catch_up_only: '1', websocket_and_catch_up: '1',
     normal: '1', launch_candidate: '1', tracked_trade: '1', deferred: '0', ignored: '0', quarantined: '0',
   };
