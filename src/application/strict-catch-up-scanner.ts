@@ -125,8 +125,7 @@ export function isStrictCatchUpRefreshRequiredError(
     || !Object.isFrozen(value)
     || Object.getPrototypeOf(value) !== StrictCatchUpRefreshRequiredError.prototype) return false;
   const descriptor = Object.getOwnPropertyDescriptor(value, 'providerId');
-  return descriptor !== undefined
-    && descriptor.enumerable === true
+  return descriptor?.enumerable === true
     && 'value' in descriptor
     && descriptor.value === providerId;
 }

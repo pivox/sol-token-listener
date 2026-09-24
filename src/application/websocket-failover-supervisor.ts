@@ -631,7 +631,9 @@ export class WebSocketFailoverSupervisor {
             && !controller.signal.aborted,
         );
       } catch (error) {
-        const failure = strictScanFailureFrom(error, candidate);
+        const failure = candidate.completed || candidate.queuedCompletion !== null
+          ? completionAttemptFailure(candidate)
+          : strictScanFailureFrom(error, candidate);
         const cleaned = await this.#cleanupCandidate(candidate);
         if (this.#isPermanentlyClosed()) return abortedAttempt();
         if (failure.kind === 'paused') {

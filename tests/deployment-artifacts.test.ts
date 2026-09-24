@@ -776,8 +776,11 @@ void test('block hydration runbook keeps catch-up refresh continuation bounded a
   assert.match(runbook, /CATCH_UP_REFRESH_REQUIRED[\s\S]{0,400}exactement un scan supplémentaire/iu);
   assert.match(runbook, /même provider[\s\S]{0,180}même session WebSocket[\s\S]{0,180}même signal d'arrêt/iu);
   assert.match(runbook, /ne promeut jamais[\s\S]{0,180}avant la réussite[\s\S]{0,120}seconde passe/iu);
-  assert.match(runbook, /deuxième `CATCH_UP_REFRESH_REQUIRED`[\s\S]{0,500}fail-closed/iu);
-  assert.match(runbook, /CATCH_UP_PAGE_BUDGET_EXHAUSTED[\s\S]{0,500}fail-closed/iu);
+  assert.match(runbook, /deuxième `CATCH_UP_REFRESH_REQUIRED`[\s\S]{0,400}ferme la session puis applique le jitter/iu);
+  assert.match(runbook, /CATCH_UP_PAGE_BUDGET_EXHAUSTED[\s\S]{0,400}ferme la session puis applique le jitter/iu);
+  assert.match(runbook, /erreur\s+transitoire ou une fin de session[^.]{0,240}DEGRADED[^.]{0,240}récupération/iu);
+  assert.match(runbook, /arrêt ferme les ressources[^.]{0,240}STOPPING[^.]{0,120}STOPPED[^.]{0,180}aucun retry/iu);
+  assert.match(runbook, /Tous ces chemins restent fail-closed/iu);
   assert.match(runbook, /ne modifie ni la concurrence RPC[\s\S]{0,240}cadence d'hydratation/iu);
 });
 

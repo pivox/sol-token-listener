@@ -329,9 +329,13 @@ pendant cette continuation périodique sérialisée.
 
 Un deuxième `CATCH_UP_REFRESH_REQUIRED` dans la même opération, un
 `CATCH_UP_PAGE_BUDGET_EXHAUSTED`, un provider différent, une erreur malformée,
-une fin de session ou un arrêt ne sont jamais assimilés à un succès : le chemin
-fail-closed existant ferme la session, publie `DEGRADED` et applique le jitter.
-Toute répétition de ce cas pendant la fenêtre rend le gate backlog/finalité
+une fin de session ou un arrêt ne sont jamais assimilés à un succès. Un deuxième
+refresh ou une pause ferme la session puis applique le jitter. Une erreur
+transitoire ou une fin de session publie `DEGRADED` et déclenche la récupération
+existante ; l'incumbent peut rester ouvert jusqu'à son remplacement borné. Un
+arrêt ferme les ressources, publie `STOPPING` puis `STOPPED` et ne programme
+aucun retry. Tous ces chemins restent fail-closed. Toute répétition pendant la
+fenêtre rend le gate backlog/finalité
 `FAIL` ou `INCONCLUSIVE` selon les preuves disponibles ; elle ne peut jamais
 constituer un `PASS`. Ce comportement ne modifie ni la concurrence RPC, ni la
 cadence d'hydratation, ni les gates oversize, rétention ou HTTP 429.
