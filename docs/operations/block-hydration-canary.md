@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.8 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155 et #163.
+Version : 1.3.0 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -10,6 +10,89 @@ readiness Mainnet n'est déclarée avant que cette fenêtre ait passé. Utiliser
 seule réplique avec `LISTENER_INGESTION_SCOPE=launchpad-only`, en mode `observe`.
 Archiver le health, les compteurs inbox, le RSS et le tableau fournisseur avant
 activation.
+
+## Verdict V1 versionné
+
+Après capture des quatre snapshots et du heartbeat arrêté, construire uniquement
+le manifeste agrégé expurgé V1 puis lancer :
+
+```bash
+npm run canary:evaluate -- /absolute/path/to/redacted-canary-input.v1.json
+```
+
+Le verdict est fail-closed. `FAIL` et `INCONCLUSIVE` bloquent tous deux la
+readiness Mainnet et tout accès wallet ; seul un `PASS` de chaque gate permet de
+poursuivre la procédure opérateur distincte. Le manifeste ne doit contenir ni
+URL RPC, signature, mint, wallet, transaction brute, message d'erreur libre ou
+secret.
+
+Les règles provider-affines corrigées sont les suivantes :
+
+- `scanActive=true` et `workerClaimReady=true` constituent une phase valide
+  quand le même provider public sert le scanner et le worker. Chaque partition
+  par source et chaque partition par priorité doit totaliser exactement le
+  backlog actionnable ; une preuve absente ou incohérente est `INCONCLUSIVE` ;
+- `epochInvalidations` est un compteur diagnostique entier et monotone, pas un
+  verdict de mélange provider. Seule une preuve positive de réutilisation entre
+  providers produit `FAIL`; un changement sans preuve suffisante reste
+  `INCONCLUSIVE` ;
+- les diagnostics finality `degraded` et `recovered` sont appariés
+  structurellement et chronologiquement. Un incident finality rétabli pendant
+  la fenêtre est compatible avec `PASS` lorsque tous les snapshots conservent
+  le réconciliateur `RUNNING` et qu'aucune contradiction ne subsiste ; un
+  incident ouvert est `FAIL` et une paire malformée est `INCONCLUSIVE` ;
+- un backlog durable peut rester après le shutdown. Les cinq composants doivent
+  être `STOPPED`, tandis que leases, admission scan, admission worker,
+  `queuedFetches`, fetches `in-flight` et cache mémoire doivent être à zéro ;
+- le compte SQL frais post-stop doit être égal au backlog du heartbeat et aux
+  deux partitions du backlog, par source et par priorité. Un désaccord est
+  `INCONCLUSIVE`; il ne faut jamais supprimer les lignes durables pour obtenir
+  artificiellement zéro.
+
+Le manifeste V1 applique en plus les invariants fail-closed suivants :
+
+- `terminalEvidence` conserve les totaux `failed`, `quarantined` et `exhausted`
+  dans `baseline` et `final`. Les groupes sont réconciliés séparément pour
+  `FAILED` et `QUARANTINED`, avec des taxonomies fermées issues des reason codes
+  de classification et des error codes d'ingestion. Tout delta expliqué est
+  `FAIL`, `exhausted` est prioritaire, et tout groupe absent, incomplet, nul ou
+  inconnu est `INCONCLUSIVE` ;
+- la preuve first-processing doit appartenir au même processus et à la même
+  cohorte ; les `sampledAtMs` sont strictement croissants de T0 au heartbeat
+  `STOPPED`, lequel doit être postérieur à T+15 et au snapshot final, mais
+  strictement antérieur à la frontière de rétention ;
+- pour chaque provider, `http429Responses <= attempts`; un provider non
+  configuré doit rester exactement à `0/0`, et un delta HTTP 429 positif prouvé
+  est prioritaire sur l'insuffisance de trafic ou une dérive de membership ;
+- les compteurs cumulatifs de `blockHydration` sont contrôlés sur chaque
+  snapshot et sur `STOPPED`; toute régression produit `INCONCLUSIVE` ;
+- une pause périodique authentifiée par un motif fermé, le même provider et le
+  même instant produit `INCONCLUSIVE`; une dégradation générique reste `FAIL` ;
+- `recoveryStatus=NOT_REQUIRED` exige `recoveryReasonCode=null`, si et seulement
+  si aucune récupération n'est requise. Tout autre statut exige un reason code
+  fermé non nul.
+
+La révision finale V1 fixe aussi les limites sans entrée opérateur :
+
+- `stoppedAt` de l'artefact devient `stoppedHeartbeat.observedAtMs`; il est
+  strictement postérieur au snapshot final. Chaque observation et chaque
+  `sampledAtMs` appartient au même processus, précède sa frontière de rétention
+  et ne peut jamais transformer une vieille cohorte en `PASS` ;
+- la limite RSS n'est pas fournie dans le manifeste. Elle est dérivée de
+  `rssBytes` à T+5 en ajoutant le maximum entre 25 % arrondi à l'entier supérieur
+  et 128 MiB. Un overflow entier produit `INCONCLUSIVE` ;
+- chaque snapshot de `blockHydration` accepte au plus `retainedEntries=64` et
+  `retainedBytes=67 108 864`; tout dépassement prouvé produit `FAIL` ;
+- le membership RPC T0 est exactement `primary`, `fallback-1`, `fallback-2`,
+  `fallback-3`, dans cet ordre. Les relevés suivants acceptent au plus huit
+  providers afin qu'un delta HTTP 429 commun reste prioritaire sur une dérive ;
+- les diagnostics finality sont bornés à 1024 entrées et ne peuvent dépasser le
+  heartbeat STOPPED. Une récupération postérieure ne ferme pas un incident
+  encore ouvert à l'arrêt ; les groupes terminaux sont bornés à 128 entrées ;
+- le lecteur CLI ouvre le manifeste en lecture seule, sans suivi de symlink et
+  sans blocage. Il vérifie deux fois, en entiers bigint, identité, taille et
+  timestamps du fichier, puis rejette FIFO, symlink et mutation avec l'erreur
+  fixe sans refléter de chemin ou de contenu.
 
 ## Quarantaine du décodeur Pump.fun
 
