@@ -1028,6 +1028,46 @@ void test('worker-eligible cohort: excludes coherent WebSocket plus catch-up def
   });
 });
 
+void test('worker-eligible cohort: keeps deferred WebSocket contradictions fail-closed', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const startedAtMs = Date.now() - 1_000;
+    for (const [index, signature] of [
+      'canary-websocket-deferred-attempted',
+      'canary-websocket-deferred-partial-receipt',
+      'canary-websocket-catch-up-deferred-mismatch',
+    ].entries()) {
+      await repository.enqueue(Object.freeze({
+        ...tradeNotification(signature, BigInt(index + 1)),
+        observedAtMs: startedAtMs,
+      }));
+    }
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput('canary-websocket-catch-up-deferred-mismatch'),
+      slot: 3n,
+      observedAtMs: startedAtMs,
+      classifiedAtMs: startedAtMs + 1,
+      disposition: 'DEFERRED',
+      reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE',
+      ingestionHintMint: tradeMint,
+      mints: [tradeMint],
+    }));
+    await dropInboxIntegrityGuards(pool);
+    await pool.query(`UPDATE chain_transaction_inbox SET attempts=1
+      WHERE signature='canary-websocket-deferred-attempted'`);
+    await pool.query(`UPDATE chain_transaction_inbox SET catch_up_classification_version=1
+      WHERE signature='canary-websocket-deferred-partial-receipt'`);
+    await pool.query(`UPDATE chain_transaction_inbox SET catch_up_action_key='PUMPFUN_TRADE:${PUMPSWAP_PROGRAM_ID}'
+      WHERE signature='canary-websocket-catch-up-deferred-mismatch'`);
+
+    const evidence = await repository.firstProcessingCanary(startedAtMs);
+    assert.equal(evidence.eligibleCount, 3);
+    assert.equal(evidence.terminalCount, 3);
+    assert.equal(evidence.verdict, 'INCONCLUSIVE');
+  });
+});
+
 void test('worker-eligible cohort: keeps incomplete, contradictory and failed rows fail-closed', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);

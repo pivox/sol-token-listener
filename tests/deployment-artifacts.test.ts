@@ -831,7 +831,7 @@ void test('finality reconciler diagnostics are composed and documented as a non-
     readArtifact('src/application/production-listener-factory.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.2\.7/u);
+  assert.match(runbook, /Version : 1\.2\.8/u);
   assert.match(runbook, /listener\.finality_reconciler_degraded/u);
   assert.match(runbook, /listener\.finality_reconciler_recovered/u);
   for (const reasonCode of [

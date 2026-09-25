@@ -159,7 +159,9 @@ remain non-admitted:
 
 - `IGNORED / SOLANA_TRANSACTION_FAILED` with `catch_up_enqueued=false`;
 - `IGNORED / NO_SUPPORTED_PUMP_ACTION` with `catch_up_enqueued=false`;
-- `DEFERRED / PUMP_TRADE_UNTRACKED` with `catch_up_enqueued=false`.
+- `DEFERRED / PUMP_TRADE_UNTRACKED`, with no catch-up receipt for a
+  WebSocket-only decision or with `catch_up_enqueued=false` when a coherent
+  version-1 catch-up receipt exists.
 
 For the two `IGNORED` combinations, the receipt must still come exclusively
 from `CATCH_UP`, and all version-1 receipt fields must form the exact coherent

@@ -110,7 +110,9 @@ suivantes sont exclues de cette cohorte :
 
 - `IGNORED / SOLANA_TRANSACTION_FAILED` avec `catch_up_enqueued=false` ;
 - `IGNORED / NO_SUPPORTED_PUMP_ACTION` avec `catch_up_enqueued=false` ;
-- `DEFERRED / PUMP_TRADE_UNTRACKED` avec `catch_up_enqueued=false`.
+- `DEFERRED / PUMP_TRADE_UNTRACKED`, sans reçu catch-up pour une décision
+  WebSocket seule ou avec `catch_up_enqueued=false` lorsqu'un reçu catch-up V1
+  cohérent existe.
 
 Les deux résultats `IGNORED` exigent une provenance exclusivement `CATCH_UP`
 et un reçu V1 complet. Le résultat `DEFERRED / PUMP_TRADE_UNTRACKED` accepte
