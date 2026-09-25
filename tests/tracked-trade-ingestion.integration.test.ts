@@ -192,14 +192,24 @@ void test('two workers keep an early trade deferred then converge the creation a
     assert.equal((await pool.query(
       `SELECT COUNT(*)::int AS count FROM launch_trades WHERE mint=$1`, [mint],
     )).rows[0]?.count, 1);
-    assert.equal(await inbox.hasActionableProgramBacklog(PUMPSWAP_PROGRAM_ID), false);
+    assert.equal(await inbox.hasNonTerminalProgramWork(PUMPSWAP_PROGRAM_ID), false);
+    await pool.query(
+      'UPDATE chain_transaction_inbox SET program_ids=$2 WHERE signature=$1',
+      [tradeSignature, [PUMPSWAP_PROGRAM_ID]],
+    );
+    assert.equal(await inbox.hasNonTerminalProgramWork(PUMPSWAP_PROGRAM_ID), true);
+    await pool.query(
+      'UPDATE chain_transaction_inbox SET program_ids=$2 WHERE signature=$1',
+      [tradeSignature, [PUMP_PROGRAM_ID]],
+    );
+    assert.equal(await inbox.hasNonTerminalProgramWork(PUMPSWAP_PROGRAM_ID), false);
     await inbox.enqueue(Object.freeze({
       ...tradeNotification('pumpswap-backlog-signature', 12n),
       ingestionHint: null,
       ingestionHintMint: null,
       programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]),
     }));
-    assert.equal(await inbox.hasActionableProgramBacklog(PUMPSWAP_PROGRAM_ID), true);
+    assert.equal(await inbox.hasNonTerminalProgramWork(PUMPSWAP_PROGRAM_ID), true);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

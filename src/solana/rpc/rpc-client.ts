@@ -40,13 +40,13 @@ export function createSolanaConnectionConfig(
   dependencies: SolanaRpcClientDependencies = {},
   onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void,
 ): ConnectionConfig {
-  const boundedFetch = dependencies.requestTimeoutMs === undefined
-    ? undefined
-    : createBoundedRpcFetch(
-      dependencies.fetch ?? globalThis.fetch,
-      dependencies.requestTimeoutMs,
-    );
   if (config.httpRpcFallbackUrls.length === 0) {
+    const boundedFetch = dependencies.requestTimeoutMs === undefined
+      ? undefined
+      : createBoundedRpcFetch(
+        dependencies.fetch ?? globalThis.fetch,
+        dependencies.requestTimeoutMs,
+      );
     const configuredFetch = dependencies.recorder === undefined
       ? boundedFetch
       : createObservedRpcFetch(
@@ -67,21 +67,22 @@ export function createSolanaConnectionConfig(
       url,
     })),
   ]);
+  const failoverFetch = createRpcHttpFailoverFetch({
+    endpoints,
+    ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+    ...(dependencies.recorder === undefined ? {} : { recorder: dependencies.recorder }),
+    ...(onEndpointSelected === undefined ? {} : { onEndpointSelected }),
+    ...(dependencies.onHttpFailoverEvent === undefined
+      ? {}
+      : { onEvent: dependencies.onHttpFailoverEvent }),
+  });
   return {
     commitment: config.commitment,
     wsEndpoint: config.wsRpcUrl,
-    fetch: createRpcHttpFailoverFetch({
-      endpoints,
-      ...(boundedFetch === undefined && dependencies.fetch === undefined
-        ? {}
-        : { fetch: boundedFetch ?? dependencies.fetch }),
-      ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
-      ...(dependencies.recorder === undefined ? {} : { recorder: dependencies.recorder }),
-      ...(onEndpointSelected === undefined ? {} : { onEndpointSelected }),
-      ...(dependencies.onHttpFailoverEvent === undefined
-        ? {}
-        : { onEvent: dependencies.onHttpFailoverEvent }),
-    }),
+    fetch: dependencies.requestTimeoutMs === undefined
+      ? failoverFetch
+      : createBoundedRpcFetch(failoverFetch, dependencies.requestTimeoutMs),
     disableRetryOnRateLimit: true,
   };
 }

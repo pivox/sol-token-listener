@@ -367,7 +367,7 @@ void test('configured inbox workers share one repository, pipeline and gated loc
   const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
   const backlog = context.mock.method(
     PostgresTransactionInboxRepository.prototype,
-    'hasActionableProgramBacklog',
+    'hasNonTerminalProgramWork',
     async () => false,
   );
   const runtime = createProductionListenerRuntime(config({
@@ -389,11 +389,11 @@ void test('configured inbox workers share one repository, pipeline and gated loc
   await dependencies.worker.close();
 });
 
-void test('multi-worker startup fails before members when a durable PumpSwap backlog exists', async (context) => {
+void test('multi-worker startup fails before members when durable PumpSwap work is non-terminal', async (context) => {
   const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
   context.mock.method(
     PostgresTransactionInboxRepository.prototype,
-    'hasActionableProgramBacklog',
+    'hasNonTerminalProgramWork',
     async () => true,
   );
   const runtime = createProductionListenerRuntime(config({
@@ -418,7 +418,7 @@ void test('multi-worker composition gates physical block and PumpSwap RPC below 
   assert.match(source, /readAccountsAtSameSlot:[\s\S]{0,180}rpcWorkGate\.run\(/u);
   assert.match(source, /gateBlockTransactionRpc\(rpcWorkGate, rpc\)/u);
   assert.match(source, /rpcRequestTimeoutMs[^;]*listenerShutdownTimeoutMs/u);
-  assert.match(source, /hasActionableProgramBacklog\(PUMPSWAP_PROGRAM_ID\)/u);
+  assert.match(source, /hasNonTerminalProgramWork\(PUMPSWAP_PROGRAM_ID\)/u);
   assert.doesNotMatch(source, /locate:[\s\S]{0,180}rpcWorkGate\.run\(/u);
   assert.match(source, /Array\.from\(\s*\{ length: config\.listenerWorkerCount \}/u);
 });

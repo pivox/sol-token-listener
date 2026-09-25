@@ -56,8 +56,9 @@ Counts above one require both `LISTENER_BLOCK_HYDRATION_ENABLED=true` and
 `LISTENER_INGESTION_SCOPE=launchpad-only`; otherwise configuration fails
 closed. PumpSwap ordering remains on one worker until a dedicated causal
 sequencing change prevents a market trade from overtaking pool activation.
-Startup also fails closed when PostgreSQL contains any actionable or leased
-PumpSwap backlog, including backlog retained from a previous broader scope.
+Startup also fails closed when PostgreSQL contains any non-terminal PumpSwap
+work, including deferred, failed, leased or processed-but-not-finalized rows
+retained from a previous broader scope.
 The first external canary uses count two. Counts three and four are considered
 only after fresh backlog, p95, RSS, lease and RPC evidence.
 
@@ -82,8 +83,9 @@ The pool is one `ListenerRuntime` component.
   restart.
 
 Before member shutdown, the shared HTTP gate is closed so queued work is
-rejected without starting another request. Physical RPC calls use a deadline
-shorter than the listener shutdown bound; the active call therefore settles
+rejected without starting another request. The complete physical RPC operation,
+including every failover attempt, uses one deadline shorter than the listener
+shutdown bound; the active call therefore settles
 before member drainage consumes the complete shutdown budget.
 
 The existing listener shutdown timeout remains the outer fail-closed bound.
@@ -113,7 +115,7 @@ restart-safe source of truth.
 - claim fairness remains the durable 32:1 urgent/normal and 3:1 launch/tracked
   policy;
 - provider-affine HTTP fetch concurrency remains one;
-- multi-worker startup requires an empty durable PumpSwap backlog;
+- multi-worker startup requires no non-terminal durable PumpSwap work;
 - physical block fetches and PumpSwap account reads share one FIFO HTTP-work gate;
 - same-slot hydration joins the existing global in-flight request;
 - provider, epoch or promotion-revision changes reject stale hydration results;

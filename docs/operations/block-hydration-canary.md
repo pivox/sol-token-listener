@@ -163,8 +163,8 @@ peut être réutilisée pour déclarer un `PASS`.
    borné à `1..4`; ne tester `3` ou `4` qu'après une fenêtre conforme à `2`.
    Toute valeur supérieure à `1` exige aussi `launchpad-only`. Les fetches bloc
    et les lectures PumpSwap utilisent toujours un seul gate HTTP.
-   Le préflight de démarrage doit confirmer l'absence de backlog PumpSwap
-   actionnable conservé d'un déploiement précédent; sinon le listener refuse de
+   Le préflight de démarrage doit confirmer l'absence de travail PumpSwap non
+   terminal conservé d'un déploiement précédent; sinon le listener refuse de
    démarrer ses workers.
    Le rollback du pool consiste à remettre `LISTENER_WORKER_COUNT=1` puis à
    redémarrer la réplique.

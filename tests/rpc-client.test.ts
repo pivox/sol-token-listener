@@ -28,6 +28,32 @@ void test('bounded RPC fetch aborts a physically pending request at its deadline
   assert.equal(aborted, true);
 });
 
+void test('one deadline bounds the complete failover operation across every endpoint', async () => {
+  let calls = 0;
+  const config = createSolanaConnectionConfig({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze([
+      'https://fallback.invalid/rpc',
+      'https://fallback-2.invalid/rpc',
+      'https://fallback-3.invalid/rpc',
+    ]),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+  }, {
+    requestTimeoutMs: 5,
+    fetch: async (_input, init) => {
+      calls += 1;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => { reject(new Error('deadline')); }, { once: true });
+      });
+    },
+  });
+  if (config.fetch === undefined) throw new Error('Bounded failover fetch is unavailable.');
+
+  await assert.rejects(config.fetch('https://primary.invalid/rpc'), /deadline/u);
+  assert.equal(calls, 1);
+});
+
 void test('counts one mono-endpoint physical attempt and returned HTTP 429 with a recorder', async () => {
   const recorder = createRpcHttpEvidenceRecorder();
   const limited = new Response('limited', { status: 429 });

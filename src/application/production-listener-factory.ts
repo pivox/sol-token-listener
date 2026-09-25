@@ -598,8 +598,8 @@ export function createProductionListenerRuntime(
     }),
   ), config.listenerWorkerCount === 1 ? {} : {
     beforeStart: async (): Promise<void> => {
-      if (await inbox.hasActionableProgramBacklog(PUMPSWAP_PROGRAM_ID)) {
-        throw new Error('Multi-worker listener requires an empty PumpSwap backlog.');
+      if (await inbox.hasNonTerminalProgramWork(PUMPSWAP_PROGRAM_ID)) {
+        throw new Error('Multi-worker listener requires no non-terminal PumpSwap work.');
       }
     },
   });

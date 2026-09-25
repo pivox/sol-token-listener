@@ -1173,7 +1173,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
-  public async hasActionableProgramBacklog(programId: string): Promise<boolean> {
+  public async hasNonTerminalProgramWork(programId: string): Promise<boolean> {
     return this.safely(async () => {
       if (typeof programId !== 'string' || programId.length === 0) {
         throw new TypeError('Program id is invalid.');
@@ -1182,17 +1182,16 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         `SELECT EXISTS (
            SELECT 1 FROM chain_transaction_inbox
            WHERE $1 = ANY(program_ids)
-             AND (
-               processing_status IN ('PENDING','PROCESSING')
-               OR (processing_status='FAILED' AND error_retryable=TRUE
-                 AND retry_exhausted_at IS NULL)
+             AND NOT (
+               processing_status='PROCESSED'
+               AND target_confirmation_status IN ('finalized','orphaned')
              )
          ) AS present`,
         [programId],
       );
       if (result.rowCount !== 1 || result.rows.length !== 1
         || typeof result.rows[0]?.present !== 'boolean') {
-        throw new TypeError('Program backlog state is invalid.');
+        throw new TypeError('Program work state is invalid.');
       }
       return result.rows[0].present;
     });

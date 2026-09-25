@@ -13,8 +13,8 @@ Design: `docs/superpowers/specs/2026-09-25-bounded-transaction-inbox-worker-pool
    close.
 3. Add a close-failure test proving every member settles before the pool emits
    one typed, redacted error.
-4. Add a fail-closed startup preflight for actionable PumpSwap backlog left by
-   an earlier broader ingestion scope.
+4. Add a fail-closed startup preflight for all non-terminal PumpSwap work left
+   by an earlier broader ingestion scope.
 5. Change the production factory lifecycle test to require all worker members
    to settle before provider-affine hydration closes.
 6. Add production-factory tests proving the configured member count shares one
