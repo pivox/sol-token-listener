@@ -529,6 +529,7 @@ EXECUTION_MODE=observe
 LISTENER_ENABLED=true
 LISTENER_INGESTION_SCOPE=launchpad-only
 LISTENER_CATCH_UP_POLICY=live-edge
+LISTENER_WORKER_COUNT=2
 LISTENER_BLOCK_HYDRATION_ENABLED=true
 LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true
 LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=true
@@ -550,6 +551,15 @@ peut être réutilisé. Le rollback est de remettre
 `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis de redémarrer. Les
 receipts de classification/admission restent une preuve historique et expirent
 selon leur rétention de quatre heures.
+
+Le pool interne conserve `LISTENER_WORKER_COUNT=1` par défaut. Les valeurs
+`2..4` exigent `LISTENER_BLOCK_HYDRATION_ENABLED=true` et
+`LISTENER_INGESTION_SCOPE=launchpad-only`. Elles ne changent pas la concurrence
+HTTP : fetches bloc et lectures PumpSwap partagent un gate FIFO de capacité
+`1`. Le démarrage refuse aussi tout travail PumpSwap non terminal encore en
+base, y compris traité mais non finalisé. Le premier canary après #166 utilise
+`2`; revenir à `1` puis redémarrer
+constitue le rollback immédiat.
 
 Le fast path de couverture durable reste indépendamment désactivé par défaut.
 Lorsqu'il est activé dans cette même enveloppe observe-only, les transactions

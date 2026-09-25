@@ -61,6 +61,7 @@ export interface AppConfig {
   readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
   readonly expectedGenesisHash: string | null;
+  readonly listenerWorkerCount: number;
   readonly listenerWorkerLeaseSeconds: number;
   readonly listenerCatchUpPolicy: ListenerCatchUpPolicy;
   readonly listenerCatchUpMaxPages: number;
@@ -230,12 +231,27 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   );
   const transactionInboxRetryPolicy = parseTransactionInboxRetryPolicy(environment);
   const blockHydration = parseBlockHydrationConfig(environment);
+  const listenerWorkerCount = parseCanonicalBoundedInteger(
+    environment.LISTENER_WORKER_COUNT,
+    1,
+    'LISTENER_WORKER_COUNT',
+    1,
+    4,
+  );
   const listenerIngestionScope = parseClosedLiteral(
     environment.LISTENER_INGESTION_SCOPE,
     'launchpad-and-market',
     'LISTENER_INGESTION_SCOPE',
     ['launchpad-only', 'launchpad-and-market'],
   );
+  if (listenerWorkerCount > 1 && (
+    !blockHydration.listenerBlockHydrationEnabled
+    || listenerIngestionScope !== 'launchpad-only'
+  )) {
+    throw new Error(
+      'LISTENER_WORKER_COUNT above one requires block hydration and launchpad-only ingestion.',
+    );
+  }
   const listenerCatchUpPolicy = parseClosedLiteral(
     environment.LISTENER_CATCH_UP_POLICY,
     'live-edge',
@@ -321,6 +337,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,
     expectedGenesisHash,
+    listenerWorkerCount,
     listenerWorkerLeaseSeconds: parseInteger(
       environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
     ),

@@ -153,10 +153,21 @@ peut être réutilisée pour déclarer un `PASS`.
    LISTENER_ENABLED=true
    LISTENER_INGESTION_SCOPE=launchpad-only
    LISTENER_CATCH_UP_POLICY=live-edge
+   LISTENER_WORKER_COUNT=2
    LISTENER_BLOCK_HYDRATION_ENABLED=true
    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true
    LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=true
    ```
+
+   `LISTENER_WORKER_COUNT=2` est la première valeur de canary. Le pool reste
+   borné à `1..4`; ne tester `3` ou `4` qu'après une fenêtre conforme à `2`.
+   Toute valeur supérieure à `1` exige aussi `launchpad-only`. Les fetches bloc
+   et les lectures PumpSwap utilisent toujours un seul gate HTTP.
+   Le préflight de démarrage doit confirmer l'absence de travail PumpSwap non
+   terminal conservé d'un déploiement précédent; sinon le listener refuse de
+   démarrer ses workers.
+   Le rollback du pool consiste à remettre `LISTENER_WORKER_COUNT=1` puis à
+   redémarrer la réplique.
 
    Compose transmet ce flag restart-only uniquement à `app`; contrôler la
    configuration résolue avant le démarrage.

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { PublicKey, type FetchFn } from '@solana/web3.js';
 import {
   SolanaRpcClient,
+  createBoundedRpcFetch,
   createSolanaConnectionConfig,
   type SolanaRpcClientDependencies,
 } from '../src/solana/rpc/rpc-client.js';
@@ -10,6 +11,58 @@ import type { RpcHttpFailoverEvent } from '../src/solana/rpc/http-failover-trans
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
+
+void test('bounded RPC fetch aborts a physically pending request at its deadline', async () => {
+  const keepAlive = setTimeout(() => undefined, 100);
+  let aborted = false;
+  const bounded = createBoundedRpcFetch(async (_input, init) => {
+    const observedSignal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      observedSignal?.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('aborted'));
+      }, { once: true });
+    });
+  }, 5);
+
+  try {
+    await assert.rejects(bounded('https://primary.invalid/rpc'), /aborted/u);
+    assert.equal(aborted, true);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
+void test('one deadline bounds the complete failover operation across every endpoint', async () => {
+  const keepAlive = setTimeout(() => undefined, 100);
+  let calls = 0;
+  const config = createSolanaConnectionConfig({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze([
+      'https://fallback.invalid/rpc',
+      'https://fallback-2.invalid/rpc',
+      'https://fallback-3.invalid/rpc',
+    ]),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+  }, {
+    requestTimeoutMs: 5,
+    fetch: async (_input, init) => {
+      calls += 1;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => { reject(new Error('deadline')); }, { once: true });
+      });
+    },
+  });
+  if (config.fetch === undefined) throw new Error('Bounded failover fetch is unavailable.');
+
+  try {
+    await assert.rejects(config.fetch('https://primary.invalid/rpc'), /deadline/u);
+    assert.equal(calls, 1);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
 
 void test('counts one mono-endpoint physical attempt and returned HTTP 429 with a recorder', async () => {
   const recorder = createRpcHttpEvidenceRecorder();

@@ -52,6 +52,7 @@ import { SolanaTransactionLocator } from '../src/solana/rpc/transaction-locator.
 import { ProviderAffineCatchUpHydration } from '../src/application/provider-affine-catch-up-hydration.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import type { ListenerRuntimeDependencies } from '../src/application/listener-runtime.js';
+import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
@@ -189,7 +190,7 @@ void test('production shares exactly one RPC HTTP recorder across every transpor
   assert.equal(count(source, /createRpcHttpEvidenceRecorder\(\)/gu), 1);
   assert.match(source, /new SolanaRpcClient\(config,\s*\{\s*recorder,/u);
   assert.match(source, /createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder\)/u);
-  assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*config\.listenerShutdownTimeoutMs,?\s*\}, recorder\)/u);
+  assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*rpcRequestTimeoutMs,?\s*\}, recorder\)/u);
   assert.match(source, /createProviderPinnedCatchUpSource\(\s*providers,\s*providerId,\s*'confirmed',\s*expectedGenesisHash,\s*undefined,\s*recorder,/u);
   assert.match(source, /rpcHttpEvidenceMetrics:\s*\(\).*?=> recorder\.snapshot\(configuredRpcHttpProviderIds\)/u);
   for (const name of ['createProviderPinnedFinalityPass', 'createProviderPinnedBlockRpc', 'createProviderPinnedCatchUpSource']) {
@@ -362,6 +363,66 @@ void test('catch-up admission flag off creates no provider-affine locators and r
   assert.equal(workers.mock.callCount(), 0);
 });
 
+void test('configured inbox workers share one repository, pipeline and gated locator', async (context) => {
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  const backlog = context.mock.method(
+    PostgresTransactionInboxRepository.prototype,
+    'hasNonTerminalProgramWork',
+    async () => false,
+  );
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_WORKER_COUNT: '2',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+
+  await dependencies.worker.start();
+  assert.equal(backlog.mock.callCount(), 1);
+  assert.equal(starts.mock.callCount(), 2);
+  const members = starts.mock.calls.map(({ this: worker }) => worker as unknown as {
+    repository: unknown; locator: unknown; pipeline: unknown;
+  });
+  assert.equal(members[0]?.repository, members[1]?.repository);
+  assert.equal(members[0]?.locator, members[1]?.locator);
+  assert.equal(members[0]?.pipeline, members[1]?.pipeline);
+  await dependencies.worker.close();
+});
+
+void test('multi-worker startup fails before members when durable PumpSwap work is non-terminal', async (context) => {
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  context.mock.method(
+    PostgresTransactionInboxRepository.prototype,
+    'hasNonTerminalProgramWork',
+    async () => true,
+  );
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_WORKER_COUNT: '2',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+
+  await assert.rejects(dependencies.worker.start());
+  assert.equal(starts.mock.callCount(), 0);
+  await dependencies.worker.close();
+});
+
+void test('multi-worker composition gates physical block and PumpSwap RPC below cache lookup', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+  assert.equal(count(source, /new ListenerRpcWorkGate\(/gu), 1);
+  assert.match(source, /config\.listenerWorkerCount > 1 \? new ListenerRpcWorkGate\(\) : null/u);
+  assert.match(source, /readAccountsAtSameSlot:[\s\S]{0,180}rpcWorkGate\.run\(/u);
+  assert.match(source, /gateBlockTransactionRpc\(rpcWorkGate, rpc\)/u);
+  assert.match(source, /rpcRequestTimeoutMs[^;]*listenerShutdownTimeoutMs/u);
+  assert.match(source, /hasNonTerminalProgramWork\(PUMPSWAP_PROGRAM_ID\)/u);
+  assert.doesNotMatch(source, /locate:[\s\S]{0,180}rpcWorkGate\.run\(/u);
+  assert.match(source, /Array\.from\(\s*\{ length: config\.listenerWorkerCount \}/u);
+});
+
 void test('catch-up admission uses one provider-affine coordinator for each catalog provider and gates worker claims', async (context) => {
   const classifiers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'classifierLocator');
   const workers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'workerLocator');
@@ -408,13 +469,13 @@ void test('catch-up admission wires identical provider admitters into both scann
   assert.equal(count(source, /new PumpFunCatchUpBlockClassifier\(/gu), 1);
   assert.equal(count(source, /new PumpFunStrictCatchUpPageAdmitter\(/gu), 1);
   assert.match(source, /providers\.ids\.map\([\s\S]*?createProviderPinnedBlockRpc\(providers, providerId,/u);
-  assert.match(source, /requestTimeoutMs:\s*config\.listenerShutdownTimeoutMs/u);
+  assert.match(source, /requestTimeoutMs:\s*rpcRequestTimeoutMs/u);
   assert.equal(count(source, /pageAdmitters\.get\(providerId\)/gu), 2);
   assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => coordinator\.run\(scanSignal\), signal\)/u);
   assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => baselineScanner\.scan\(scanSignal\), signal\)/u);
 });
 
-void test('catch-up admission starts worker close then immediately aborts hydration before worker settlement', async (context) => {
+void test('catch-up admission drains every worker before closing hydration', async (context) => {
   const gate = deferred<undefined>();
   const order: string[] = [];
   context.mock.method(TransactionInboxWorker.prototype, 'close', async () => {
@@ -432,10 +493,10 @@ void test('catch-up admission starts worker close then immediately aborts hydrat
   }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
   const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
   const closing = dependencies.worker.close();
-  assert.deepEqual(order, ['worker-start', 'hydration']);
+  assert.deepEqual(order, ['worker-start']);
   gate.resolve(undefined);
-  await assert.rejects(closing, /worker cleanup failed/u);
-  assert.deepEqual(order, ['worker-start', 'hydration', 'worker-settled']);
+  await assert.rejects(closing);
+  assert.deepEqual(order, ['worker-start', 'worker-settled', 'hydration']);
 });
 
 void test('production block hydration keeps the exact legacy locator unless explicitly enabled', () => {
@@ -473,7 +534,7 @@ void test('production block hydration keeps the exact legacy locator unless expl
   enabled.close();
 });
 
-void test('worker shutdown closes block hydration before awaiting a stuck worker', async () => {
+void test('worker shutdown closes block hydration after awaiting a stuck worker', async () => {
   const workerClose = deferred<undefined>();
   let cacheClosed = false;
   const component = lifecycleComponent({
@@ -483,9 +544,10 @@ void test('worker shutdown closes block hydration before awaiting a stuck worker
   }, () => { cacheClosed = true; });
 
   const closing = component.close();
-  assert.equal(cacheClosed, true);
+  assert.equal(cacheClosed, false);
   workerClose.resolve(undefined);
   await closing;
+  assert.equal(cacheClosed, true);
 });
 
 void test('selects one frozen canonical ingestion program list and rejects unknown scopes', () => {
@@ -603,7 +665,7 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
 
   assert.match(
     source,
-    /new SolanaRpcClient\(config,\s*\{\s*recorder,\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,\s*\}\)/u,
+    /new SolanaRpcClient\(config,\s*\{\s*recorder,\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,/u,
   );
   const sink = /function logRpcHttpFailoverEvent\([\s\S]*?\n\}/u.exec(source)?.[0];
   assert.ok(sink);

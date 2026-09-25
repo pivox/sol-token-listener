@@ -318,6 +318,7 @@ void test('logs only the effective foundation configuration at startup', async (
     qualificationProfileFingerprint: 'a'.repeat(64),
     qualificationMinimumScore: 60,
     pumpFunListenerActive: false,
+    listenerWorkerCount: 1,
     listenerCatchUpMaxPages: 37,
     listenerCatchUpPageSize: 777,
     pumpSwapPipelineAvailable: true,

@@ -966,8 +966,8 @@ transaction et son index depuis une réponse `getBlock` complète. La factory
 conserve exactement le locator legacy lorsque
 `LISTENER_BLOCK_HYDRATION_ENABLED=false`. Après un redémarrage explicite avec
 la valeur `true`, elle branche uniquement le locator bloc/cache : il n’existe
-aucun double appel ni fallback legacy. Le worker V1 sérialise les callers
-(`callerConcurrency=1`) et ferme le cache après son propre arrêt. Son contrat et les
+aucun double appel ni fallback legacy. Le chemin HTTP V1 sérialise les callers
+(`callerConcurrency=1`) et ferme le cache après le drainage des workers. Son contrat et les
 contraintes de validation sont versionnés dans
 [`2026-09-12-coherent-slot-block-hydration-design.md`](../superpowers/specs/2026-09-12-coherent-slot-block-hydration-design.md).
 
@@ -977,6 +977,18 @@ HTTP, snapshots data-only immutables, LRU borné en octets et entrées, TTL et
 pacing FIFO. Les réglages stricts et les métriques de l’activation sont
 versionnés dans la [spécification #114](../superpowers/specs/2026-09-12-block-hydration-activation-design.md).
 Les leases, le catch-up strict et la réconciliation de finalité restent inchangés.
+
+Le pool d'inbox reste à un worker par défaut avec `LISTENER_WORKER_COUNT=1` et
+accepte `1..4`. Au-delà de `1`, l'hydratation bloc et le scope
+`launchpad-only` sont obligatoires ; PumpSwap reste mono-worker jusqu'à
+l'introduction d'un séquencement causal dédié. Tous les
+workers partagent repository, pipeline, cache et locator ; les claims
+PostgreSQL `SKIP LOCKED`, leases et compteurs durables restent les autorités.
+Un gate FIFO de capacité `1` couvre les fetches bloc sous le single-flight et
+les lectures de comptes PumpSwap du
+pipeline, afin que le parallélisme interne n'augmente jamais la concurrence
+HTTP. Le premier canary utilise deux workers. L'arrêt demande la fermeture de
+tous les membres, attend toutes les leases, puis ferme l'hydratation.
 
 ### Admission de page Pump.fun provider-affine (canary B3b)
 
@@ -994,8 +1006,9 @@ toute utilisation du catch-up ; une divergence échoue fail-closed.
 
 La factory crée alors un coordinateur provider-affine avec un cache unique,
 une file FIFO commune et un seul fetch actif. Chaque scan strict est épinglé au
-provider de sa page ; le worker attend les scans puis relit la promotion avant de
-retourner un résultat. Un changement de provider incrémente l'époque, évacue le
+provider de sa page ; un worker peut partager un scan périodique du même provider,
+sinon il attend, puis relit toujours la promotion avant de retourner un résultat.
+Un changement de provider incrémente l'époque, évacue le
 cache et empêche tout résultat ancien d'être conservé ou renvoyé. Le cache reste
 l'autorité de pacing globale : avec un intervalle de fetch d'au moins 250 ms,
 aucun appelant ni provider ne peut démarrer plus de quatre fetches par seconde.

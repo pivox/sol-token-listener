@@ -1173,6 +1173,30 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
+  public async hasNonTerminalProgramWork(programId: string): Promise<boolean> {
+    return this.safely(async () => {
+      if (typeof programId !== 'string' || programId.length === 0) {
+        throw new TypeError('Program id is invalid.');
+      }
+      const result = await this.pool.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM chain_transaction_inbox
+           WHERE $1 = ANY(program_ids)
+             AND NOT (
+               processing_status='PROCESSED'
+               AND target_confirmation_status IN ('finalized','orphaned')
+             )
+         ) AS present`,
+        [programId],
+      );
+      if (result.rowCount !== 1 || result.rows.length !== 1
+        || typeof result.rows[0]?.present !== 'boolean') {
+        throw new TypeError('Program work state is invalid.');
+      }
+      return result.rows[0].present;
+    });
+  }
+
   public async renewLease(signature: string, token: string, untilMs: number): Promise<void> {
     return this.safely(async () => {
       requireText(signature, 'signature');
