@@ -11,7 +11,7 @@ const healthMigrationName = '030_listener_websocket_health.sql';
 const executionIntentMigrationName = '031_execution_intents.sql';
 const executionDryRunMigrationName = '032_execution_dry_run_assessments.sql';
 const executionSimulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '053_transaction_inbox_worker_admission_foundation.sql';
+const latestMigrationName = '055_creation_entry_single_active_session.sql';
 const migrationUrl = new URL(`../migrations/${healthMigrationName}`, import.meta.url);
 
 void test('websocket health migration upgrades legacy state without trusting its websocket evidence', async (context) => {

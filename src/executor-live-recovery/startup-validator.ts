@@ -36,7 +36,7 @@ export interface LiveRecoveryStartupDatabase {
 export interface LiveRecoveryStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live_recovery';
-  readonly migrationHead: '053_transaction_inbox_worker_admission_foundation.sql';
+  readonly migrationHead: '055_creation_entry_single_active_session.sql';
   readonly generationId: string;
   readonly providerId: string;
 }
@@ -262,7 +262,7 @@ export async function validateLiveRecoveryStartup(
     return Object.freeze({
       payloadVersion: 1,
       role: 'sol_token_executor_live_recovery',
-      migrationHead: '053_transaction_inbox_worker_admission_foundation.sql',
+      migrationHead: '055_creation_entry_single_active_session.sql',
       generationId: config.generationId,
       providerId: config.providerId,
     });

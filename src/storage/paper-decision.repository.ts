@@ -1010,14 +1010,21 @@ async function upsertSession(
     strategy_id,strategy_version,actor_kind,state,reason_code,quote_mint,
     quote_decimals,quote_token_program,position_id,open_command_id,close_command_id,
     entry_slot,entry_transaction_index,entry_instruction_index,
-    entry_inner_instruction_index,external_buy_target,external_buy_count,
+    entry_inner_instruction_index,entry_boundary_slot,entry_boundary_quote_id,
+    entry_boundary_observed_at,external_buy_target,external_buy_count,
     minimum_confirmation,created_at,updated_at,terminal_at,purge_after,payload_version,payload
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
   ON CONFLICT (session_id) DO UPDATE SET
     session_event_id=EXCLUDED.session_event_id,state=EXCLUDED.state,
     reason_code=EXCLUDED.reason_code,position_id=EXCLUDED.position_id,
     close_command_id=EXCLUDED.close_command_id,external_buy_count=EXCLUDED.external_buy_count,
+    entry_boundary_slot=COALESCE(
+      paper_strategy_sessions.entry_boundary_slot,EXCLUDED.entry_boundary_slot),
+    entry_boundary_quote_id=COALESCE(
+      paper_strategy_sessions.entry_boundary_quote_id,EXCLUDED.entry_boundary_quote_id),
+    entry_boundary_observed_at=COALESCE(
+      paper_strategy_sessions.entry_boundary_observed_at,EXCLUDED.entry_boundary_observed_at),
     updated_at=EXCLUDED.updated_at,terminal_at=EXCLUDED.terminal_at,
     purge_after=EXCLUDED.purge_after,payload_version=EXCLUDED.payload_version,
     payload=EXCLUDED.payload
@@ -1027,7 +1034,7 @@ async function upsertSession(
         paper_strategy_sessions.updated_at = EXCLUDED.updated_at
         AND (
           EXCLUDED.external_buy_count >= paper_strategy_sessions.external_buy_count
-          OR $31::boolean
+          OR $34::boolean
         )
       )
     )
@@ -1041,7 +1048,12 @@ async function upsertSession(
     session.quoteAsset.decimals,session.quoteAsset.tokenProgram,session.positionId,
     session.openCommandId,session.closeCommandId,session.entryCursor.slot.toString(),
     session.entryCursor.transactionIndex,session.entryCursor.instructionIndex,
-    session.entryCursor.innerInstructionIndex,session.externalBuyTarget,
+    session.entryCursor.innerInstructionIndex,
+    session.payloadVersion === 2 ? session.entryBoundary?.slot.toString() ?? null : null,
+    session.payloadVersion === 2 ? session.entryBoundary?.quoteId ?? null : null,
+    session.payloadVersion === 2 && session.entryBoundary !== null
+      ? new Date(session.entryBoundary.observedAtMs) : null,
+    session.externalBuyTarget,
     session.externalBuyCount,session.minimumConfirmation,new Date(session.createdAtMs),
     new Date(session.updatedAtMs),terminal ? new Date(session.updatedAtMs) : null,
     purgeAfter,session.payloadVersion,toJsonValue(session),

@@ -4,6 +4,7 @@ import { CreationEntryV1Strategy } from '../src/application/creation-entry-v1.st
 import type { DomainEvent } from '../src/domain/events.js';
 import type { BondingCurveTradeObservedEventV1 } from '../src/domain/launchpad-events.js';
 import type { MarketTrade } from '../src/domain/market.js';
+import type { PaperStrategySessionV2 } from '../src/domain/paper-strategy.js';
 import type {
   ClosePaperPositionCommand,
   OpenPaperPositionCommand,
@@ -44,6 +45,87 @@ void test('opens one creation position and moves the V2 session to monitoring', 
   assert.equal(ledger.openCalls.length, 1);
   assert.equal(ledger.openCalls[0]?.entryDecisionAtMs, 500);
   assert.equal(ledger.openCalls[0]?.entryDecisionJobId, 'paper-job-open');
+  assert.deepEqual(
+    (result.session as unknown as { readonly entryBoundary?: unknown }).entryBoundary,
+    {
+      kind: 'PAPER_BUY_QUOTE_SLOT',
+      slot: 10n,
+      quoteId: 'buy',
+      observedAtMs: 4_000,
+    },
+  );
+});
+
+void test('counts only trades from slots strictly after the successful paper BUY watermark', async () => {
+  const strategy = new CreationEntryV1Strategy(
+    new FakeLedger(), new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const prepared = strategy.prepare(candidate, {
+    externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+  const opened = await strategy.open({
+    candidate,
+    session: prepared,
+    qualification: Object.freeze({}) as QualificationReport,
+    qualificationEvent: candidateEvent(),
+    maximumRoundTripLossBps: 3_000n,
+    entryDecisionAtMs: 500,
+    entryDecisionJobId: 'paper-job-boundary',
+  });
+
+  const sameSlotBeforeEntry = launchBuyAtSlot(
+    'between-qualification-and-buy', 10n, 2, 'wallet-before', 2_000n,
+  );
+  const strictlyAfterEntry = launchBuyAtSlot('strictly-after-entry', 11n, 0, 'wallet-after', 2_000n);
+  const result = await strategy.reconcile({
+    candidate,
+    session: opened.session,
+    position: POSITION,
+    creator: 'creator',
+    launchTrades: [sameSlotBeforeEntry, strictlyAfterEntry],
+    marketTrades: [],
+    nowMs: 5_000,
+  });
+
+  assert.equal(result.session.externalBuyCount, 1);
+  assert.deepEqual(result.session.countedBuyerWallets, ['wallet-after']);
+});
+
+void test('recovers the exact paper BUY watermark after a crash before session completion', async () => {
+  const ledger = new FakeLedger();
+  ledger.reconcileOpenResult = POSITION;
+  const strategy = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const staged = strategy.prepare(candidate, {
+    externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(staged);
+
+  const recovered = await strategy.recoverOpen({
+    candidate,
+    session: staged,
+    qualification: Object.freeze({}) as QualificationReport,
+    qualificationEvent: candidateEvent(),
+    maximumRoundTripLossBps: 3_000n,
+    entryDecisionAtMs: 500,
+    entryDecisionJobId: 'paper-job-recovery',
+  });
+
+  assert.deepEqual(
+    (recovered.session as unknown as { readonly entryBoundary?: unknown }).entryBoundary,
+    {
+      kind: 'PAPER_BUY_QUOTE_SLOT',
+      slot: 10n,
+      quoteId: 'buy',
+      observedAtMs: 4_000,
+    },
+  );
 });
 
 void test('keeps the persisted minimum buy threshold when runtime configuration changes', async () => {
@@ -63,7 +145,7 @@ void test('keeps the persisted minimum buy threshold when runtime configuration 
 
   const result = await permissiveStrategy.reconcile({
     candidate,
-    session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    session: holdingSession(session),
     position: POSITION,
     creator: 'creator',
     launchTrades: [launchBuy('below-persisted-threshold', 2, 'wallet-a', 999n)],
@@ -86,7 +168,7 @@ void test('counts one wallet once across repeated Pump.fun and PumpSwap buys', a
     externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
   });
   assert.ok(pending);
-  const holding = { ...pending, state: 'WAITING_EXTERNAL_BUYS' as const, positionId: POSITION.id };
+  const holding = holdingSession(pending);
   const repeated = Array.from({ length: 10 }, (_, index) => (
     launchBuy(`launch-${index}`, index + 2, 'wallet-a', 2_000n)
   ));
@@ -127,7 +209,7 @@ void test('counts ten distinct eligible wallets and rejects below-minimum or inv
   };
   const result = await strategy.reconcile({
     candidate,
-    session: { ...pending, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    session: holdingSession(pending),
     position: POSITION,
     creator: 'creator',
     launchTrades: [...valid, below, creator, unknown, orphaned],
@@ -159,7 +241,7 @@ void test('closes the full position when the executable minimum proceeds reach 2
 
   const result = await strategy.reconcile({
     candidate,
-    session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    session: holdingSession(session),
     position: POSITION,
     creator: 'creator',
     launchTrades: [],
@@ -191,7 +273,7 @@ void test('does not close on a theoretical 2x when minimum executable proceeds a
   assert.ok(session);
 
   const result = await strategy.reconcile({
-    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    candidate, session: holdingSession(session),
     position: POSITION, creator: 'creator', launchTrades: [], marketTrades: [], nowMs: 4_000,
   });
 
@@ -214,7 +296,7 @@ void test('prioritizes creator sell over take profit and buyer target', async ()
   assert.ok(session);
 
   const result = await strategy.reconcile({
-    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    candidate, session: holdingSession(session),
     position: POSITION, creator: 'creator',
     launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n), launchSell('creator-sell', 3, 'creator')],
     marketTrades: [], nowMs: 4_000,
@@ -243,7 +325,7 @@ void test('prioritizes the manual kill switch over every market trigger', async 
   assert.ok(session);
 
   const result = await strategy.reconcile({
-    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    candidate, session: holdingSession(session),
     position: POSITION, creator: 'creator',
     launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n), launchSell('creator-sell', 3, 'creator')],
     marketTrades: [], nowMs: 4_000,
@@ -267,7 +349,7 @@ void test('preserves the first manual kill detection time across a quote retry',
   });
   assert.ok(prepared);
   const pending = await failed.reconcile({
-    candidate,session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    candidate,session:holdingSession(prepared),
     position:POSITION,creator:'creator',launchTrades:[],marketTrades:[],nowMs:4_000,
   });
   assert.equal(pending.session.pendingExitTriggerAtMs, 4_000);
@@ -321,7 +403,7 @@ void test('replays an orphaned open with provenance persisted on the position', 
   const orphaned = Object.freeze({ ...candidateEvent(),confirmationStatus:'orphaned' as const });
 
   await strategy.reconcileSource({
-    candidate,session:{ ...session,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    candidate,session:holdingSession(session),
     qualification:Object.freeze({}) as QualificationReport,qualificationEvent:orphaned,
     maximumRoundTripLossBps:3_000n,entryDecisionAtMs:500,
     entryDecisionJobId:'persisted-paper-job',
@@ -345,7 +427,7 @@ void test('keeps a mandatory exit pending when the full sell quote is unavailabl
   assert.ok(session);
 
   const result = await strategy.reconcile({
-    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    candidate, session: holdingSession(session),
     position: POSITION, creator: 'creator', launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n)],
     marketTrades: [], nowMs: 4_000,
   });
@@ -371,7 +453,7 @@ void test('preserves the exact target-buy observation across a quote retry', asy
   assert.ok(prepared);
   const sourceBuy = launchBuy('target-source', 2, 'wallet-a', 2_000n);
   const pending = await failed.reconcile({
-    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    candidate, session:holdingSession(prepared),
     position:POSITION,creator:'creator',launchTrades:[sourceBuy],marketTrades:[],nowMs:4_000,
     contextEvent:candidateEvent(),
   });
@@ -406,7 +488,7 @@ void test('keeps a retrospective exit quote pending until a post-trigger retry',
   assert.ok(prepared);
 
   const pending = await strategy.reconcile({
-    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    candidate, session:holdingSession(prepared),
     position:POSITION,creator:'creator',launchTrades:[sourceBuy],marketTrades:[],nowMs:4_000,
   });
 
@@ -444,7 +526,7 @@ void test('uses the exact Nth new wallet trade when prior-wallet duplicates are 
   });
   assert.ok(prepared);
   const first = await strategy.reconcile({
-    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    candidate, session:holdingSession(prepared),
     position:POSITION,creator:'creator',
     launchTrades:[
       launchBuy('wallet-a-first', 2, 'wallet-a', 2_000n),
@@ -493,7 +575,7 @@ void test('recovers a committed creation close without quoting or closing twice'
 
   const result = await strategy.reconcile({
     candidate,
-    session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    session: holdingSession(session),
     position: committed,
     creator: 'creator',
     launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n)],
@@ -512,15 +594,16 @@ class FakeLedger {
   public readonly openCalls: OpenPaperPositionCommand[] = [];
   public readonly reconcileOpenCalls: OpenPaperPositionCommand[] = [];
   public readonly closeCalls: ClosePaperPositionCommand[] = [];
+  public reconcileOpenResult: PaperPosition = Object.freeze({
+    ...POSITION,status:'PAPER_RETRACTED',closedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.openCalls.push(command);
     return POSITION;
   }
   public async reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.reconcileOpenCalls.push(command);
-    return Object.freeze({
-      ...POSITION,status:'PAPER_RETRACTED',closedAtMs:2_000,purgeAfterMs:14_402_000,
-    });
+    return this.reconcileOpenResult;
   }
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.closeCalls.push(command);
@@ -600,7 +683,7 @@ function launchBuy(
   quoteAmountRaw: bigint,
 ): BondingCurveTradeObservedEventV1 {
   const cursor = Object.freeze({
-    slot: 10n, transactionIndex: 0, instructionIndex, innerInstructionIndex: null,
+    slot: 11n, transactionIndex: 0, instructionIndex, innerInstructionIndex: null,
   });
   return Object.freeze({
     id: `evt_${id}`, type: 'BondingCurveTradeObserved', mint: 'MINT', source: 'pumpfun',
@@ -611,6 +694,38 @@ function launchBuy(
       quoteAsset: Object.freeze({ mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' }),
       cursor,
     }) }),
+  });
+}
+
+function launchBuyAtSlot(
+  id: string,
+  slot: bigint,
+  instructionIndex: number,
+  trader: string,
+  quoteAmountRaw: bigint,
+): BondingCurveTradeObservedEventV1 {
+  const buy = launchBuy(id, instructionIndex, trader, quoteAmountRaw);
+  const cursor = Object.freeze({ ...buy.cursor, slot });
+  return Object.freeze({
+    ...buy,
+    cursor,
+    payload: Object.freeze({
+      trade: Object.freeze({ ...buy.payload.trade, cursor }),
+    }),
+  });
+}
+
+function holdingSession(session: PaperStrategySessionV2): PaperStrategySessionV2 {
+  return Object.freeze({
+    ...session,
+    state: 'WAITING_EXTERNAL_BUYS',
+    positionId: POSITION.id,
+    entryBoundary: Object.freeze({
+      kind: 'PAPER_BUY_QUOTE_SLOT',
+      slot: 10n,
+      quoteId: 'buy',
+      observedAtMs: 4_000,
+    }),
   });
 }
 
@@ -640,7 +755,7 @@ function marketBuy(
     kind: 'BUY', trader, baseAmountRaw: 1n, quoteAmountRaw, source: 'pumpswap',
     program: 'pump-amm', signature: `sig-${id}`,
     cursor: Object.freeze({
-      slot: 10n, transactionIndex: 0, instructionIndex, innerInstructionIndex: null,
+      slot: 11n, transactionIndex: 0, instructionIndex, innerInstructionIndex: null,
     }),
     confirmationStatus: 'confirmed', blockchainTimeMs: 1_000, observedAtMs: 2_000,
   });

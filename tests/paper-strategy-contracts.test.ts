@@ -75,6 +75,12 @@ void test('creates a deterministic V2 creation session with paired unique buyer 
       slot: 10n, transactionIndex: 1, instructionIndex: 3, innerInstructionIndex: null,
     },
     pendingExitReason: null,
+    entryBoundary: Object.freeze({
+      kind: 'PAPER_BUY_QUOTE_SLOT' as const,
+      slot: 9n,
+      quoteId: 'buy-quote',
+      observedAtMs: 1_500,
+    }),
     updatedAtMs: 2_003,
   };
   const first = createCreationEntrySession(input);

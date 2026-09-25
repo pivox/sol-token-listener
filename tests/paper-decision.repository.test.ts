@@ -142,6 +142,15 @@ void test('persists V2 buyer evidence and replaces an orphaned wallet trade proj
     const persisted = await repository.loadSnapshot(claim);
     assert.ok(persisted.currentSession?.payloadVersion === 2);
     assert.equal(persisted.currentSession.externalMinimumBuyAmountRaw, 1_000n);
+    assert.deepEqual(persisted.currentSession.entryBoundary, {
+      kind: 'PAPER_BUY_QUOTE_SLOT', slot: 10n, quoteId: 'buy', observedAtMs: 4_000,
+    });
+    const boundary = await pool.query(`SELECT entry_boundary_slot::text slot,
+      entry_boundary_quote_id quote_id,entry_boundary_observed_at observed_at
+      FROM paper_strategy_sessions WHERE session_id=$1`, [persisted.currentSession.id]);
+    assert.equal(boundary.rows[0]?.slot, '10');
+    assert.equal(boundary.rows[0]?.quote_id, 'buy');
+    assert.equal((boundary.rows[0]?.observed_at as Date).getTime(), 4_000);
     await repository.stageDecision(claim, creationDecisionWithEvidence('trade-active', 2_001));
 
     const rows = await pool.query(`SELECT trade_id,trader,quote_amount_raw::text,
@@ -2060,7 +2069,8 @@ function creationDecisionWithEvidence(tradeId: string, updatedAtMs: number): Pap
     externalBuyCount:1,countedTradeIds:[tradeId],countedBuyerWallets:['external-wallet'],
     externalMinimumBuyAmountRaw:1_000n,
     lastCountedCursor:cursor,minimumConfirmation:'confirmed',lastQuote:candidate.buyQuote,
-    lastError:null,pendingExitReason:null,createdAtMs:candidate.createdAtMs,updatedAtMs,
+    lastError:null,pendingExitReason:null,entryBoundary:paperEntryBoundary(),
+    createdAtMs:candidate.createdAtMs,updatedAtMs,
     purgeAfterMs:updatedAtMs+14_400_000,
   });
   const sessionEvent = derivedEvent(
@@ -2099,6 +2109,7 @@ function creationDecisionWithoutEvidence(
     lastQuote: base.candidate.buyQuote,
     lastError: null,
     pendingExitReason: null,
+    entryBoundary: base.session.entryBoundary,
     createdAtMs: base.session.createdAtMs,
     updatedAtMs,
     purgeAfterMs: updatedAtMs + 14_400_000,
@@ -2140,6 +2151,7 @@ function creationSourceOrphanDecision(
     lastQuote: base.session.lastQuote,
     lastError: null,
     pendingExitReason: null,
+    entryBoundary: base.session.entryBoundary,
     createdAtMs: base.session.createdAtMs,
     updatedAtMs,
     purgeAfterMs: updatedAtMs + 14_400_000,
@@ -2157,6 +2169,15 @@ function creationSourceOrphanDecision(
     sessionEvent,
     countedExternalBuys: Object.freeze([]),
     requestedAction: 'NONE' as const,
+  });
+}
+
+function paperEntryBoundary() {
+  return Object.freeze({
+    kind: 'PAPER_BUY_QUOTE_SLOT' as const,
+    slot: 10n,
+    quoteId: 'buy',
+    observedAtMs: 4_000,
   });
 }
 

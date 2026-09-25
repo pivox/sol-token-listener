@@ -7,8 +7,10 @@ import {
   countUniqueExternalBuy,
   createDeterministicCreationExitCommandId,
   createCreationEntrySession,
+  isStrictlyAfterPaperEntry,
   type CreationExitReason,
   type PaperExternalBuyEvidenceV2,
+  type PaperEntryBoundary,
   type PaperMinimumConfirmation,
   type PaperStrategySessionV2,
 } from '../domain/paper-strategy.js';
@@ -101,6 +103,7 @@ export class CreationEntryV1Strategy {
       lastError: null,
       pendingExitReason: null,
       pendingExitTriggerAtMs: null,
+      entryBoundary: null,
       createdAtMs: input.nowMs,
       updatedAtMs: input.nowMs,
       purgeAfterMs: input.nowMs + this.options.retentionMs,
@@ -179,6 +182,7 @@ export class CreationEntryV1Strategy {
       state: 'WAITING_EXTERNAL_BUYS',
       reasonCode: 'QUALIFIED_ENTRY',
       positionId: position.id,
+      entryBoundary: entryBoundary(candidate),
       lastQuote: candidate.buyQuote,
       lastError: null,
       updatedAtMs: position.openedAtMs,
@@ -235,6 +239,7 @@ export class CreationEntryV1Strategy {
       state: 'PAPER_RETRACTED',
       reasonCode: 'SOURCE_ORPHANED',
       positionId: position.id,
+      entryBoundary: entryBoundary(candidate),
       lastError: null,
       updatedAtMs: Math.max(session.updatedAtMs, position.closedAtMs),
       purgeAfterMs: position.purgeAfterMs,
@@ -605,6 +610,7 @@ function updateSession(
     lastError: next.lastError,
     pendingExitReason: next.pendingExitReason,
     pendingExitTriggerAtMs: next.pendingExitTriggerAtMs ?? null,
+    entryBoundary: next.entryBoundary,
     createdAtMs: next.createdAtMs,
     updatedAtMs: next.updatedAtMs,
     purgeAfterMs: next.purgeAfterMs,
@@ -623,7 +629,7 @@ function earliestCreatorSell(
       && trade.launchMint === input.candidate.mint
       && trade.quoteAsset.mint === input.candidate.quoteAsset.mint
       && confirmationReached(event.confirmationStatus, input.session.minimumConfirmation)
-      && compareCursors(trade.cursor, input.session.entryCursor) > 0
+      && isStrictlyAfterPaperEntry(input.session, trade.cursor)
     ) sells.push(event as unknown as DomainEvent);
   }
   for (const trade of input.marketTrades) {
@@ -633,7 +639,7 @@ function earliestCreatorSell(
       && trade.mint === input.candidate.mint
       && trade.quoteAsset.mint === input.candidate.quoteAsset.mint
       && confirmationReached(trade.confirmationStatus, input.session.minimumConfirmation)
-      && compareCursors(trade.cursor, input.session.entryCursor) > 0
+      && isStrictlyAfterPaperEntry(input.session, trade.cursor)
     ) sells.push(marketTrigger(trade));
   }
   sells.sort((left, right) => {
@@ -658,7 +664,7 @@ function canonicalBuys(
       || trade.quoteAsset.mint !== input.candidate.quoteAsset.mint
       || trade.quoteAmountRaw < minimumAmountRaw
       || !confirmationReached(event.confirmationStatus, input.session.minimumConfirmation)
-      || compareCursors(trade.cursor, input.session.entryCursor) <= 0
+      || !isStrictlyAfterPaperEntry(input.session, trade.cursor)
     ) continue;
     buys.push(Object.freeze({
       id: trade.id,
@@ -679,7 +685,7 @@ function canonicalBuys(
       || trade.quoteAsset.mint !== input.candidate.quoteAsset.mint
       || trade.quoteAmountRaw < minimumAmountRaw
       || !confirmationReached(trade.confirmationStatus, input.session.minimumConfirmation)
-      || compareCursors(trade.cursor, input.session.entryCursor) <= 0
+      || !isStrictlyAfterPaperEntry(input.session, trade.cursor)
     ) continue;
     buys.push(Object.freeze({
       id: trade.id,
@@ -701,6 +707,17 @@ function canonicalBuys(
     wallets.add(buy.trader);
     return true;
   }));
+}
+
+function entryBoundary(candidate: TradingCandidateV1): PaperEntryBoundary {
+  const quote = candidate.buyQuote;
+  if (quote === null) throw new TypeError('Creation paper BUY quote is missing.');
+  return Object.freeze({
+    kind: 'PAPER_BUY_QUOTE_SLOT',
+    slot: quote.observedSlot,
+    quoteId: quote.id,
+    observedAtMs: quote.observedAtMs,
+  });
 }
 
 function confirmationReached(

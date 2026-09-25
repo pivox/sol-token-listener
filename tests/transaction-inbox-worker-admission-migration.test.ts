@@ -56,11 +56,12 @@ void test('053 upgrades 052 with exact per-status backfill and replays with stab
   });
 });
 
-void test('053 is the replay-safe clean database head', async (context) => {
+void test('053 remains installed beneath the replay-safe clean database head', async (context) => {
   await withDatabase(context, async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
-    assert.equal(applied.length, 53);
+    assert.ok(applied.includes(migrationName));
+    assert.equal(applied.at(-1), '055_creation_entry_single_active_session.sql');
+    assert.equal(applied.length, 55);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await assertCatalog(pool);
   });

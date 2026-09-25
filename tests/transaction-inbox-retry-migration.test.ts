@@ -53,7 +53,7 @@ void test('applies all migrations, replays and backfills legacy retries', async 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '053_transaction_inbox_worker_admission_foundation.sql');
+    assert.equal(applied.at(-1), '055_creation_entry_single_active_session.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
