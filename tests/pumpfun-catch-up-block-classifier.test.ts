@@ -348,6 +348,27 @@ void test('classifies mono-mint trades, failed transactions and unsupported tran
   assert.equal(bySignature.get(unsupported.signature)?.reasonCode, 'NO_SUPPORTED_PUMP_ACTION');
 });
 
+void test('classifies bounded historical BUY layouts as supported untracked trades', async () => {
+  for (const name of [
+    'buy-exact-quote-v2-track-volume-mainnet.json',
+    'buy-exact-sol-in-option-mainnet.json',
+  ]) {
+    const transaction = await fixtureTransaction(name);
+    const repository = new RecordingRepository();
+
+    await new PumpFunCatchUpBlockClassifier(
+      returning(new Map([[transaction.signature, transaction]])),
+      repository,
+      () => 25_000,
+    ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
+
+    assert.equal(repository.values[0]?.disposition, 'DEFERRED');
+    assert.equal(repository.values[0]?.reasonCode, 'PUMP_TRADE_UNTRACKED');
+    assert.equal(repository.values[0]?.ingestionHint, 'PUMPFUN_TRADE');
+    assert.equal(repository.values[0]?.mints.length, 1);
+  }
+});
+
 void test('quarantines trade-only multi-mint evidence and bounds overflow at sixteen mints', async () => {
   const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
   const decoded = decodePumpTransaction(transaction);

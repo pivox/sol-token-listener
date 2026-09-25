@@ -321,6 +321,16 @@ mint déjà autorisé par `Global`. Le mint et la bonding curve de l’événeme
 doivent correspondre exactement aux comptes de l’instruction. Aucun octet final
 inconnu n’est toléré.
 
+Les BUY conservent également une compatibilité wire explicitement bornée.
+`buy` sans `track_volume` est autorisé par un IDL officiel historique ; le
+décodeur ne synthétise pas ce champ absent. Deux formes supplémentaires sont
+liées à des transactions Mainnet finalisées et réussies :
+`buy_exact_sol_in` avec le suffixe exact `[1, 0]`, et
+`buy_exact_quote_in_v2` avec le suffixe exact `[1]`. Toute autre longueur ou
+valeur reste rejetée par `PUMP_BORSH_INVALID`. Les mêmes règles s’appliquent
+aux instructions externes et internes et ne modifient aucune capacité
+d’exécution.
+
 Les fixtures mainnet minimisées et versionnées couvrent une création avec
 achat initial, une vente CPI, un achat V2 CPI, une migration V2 avec son
 `create_pool` canonique et une vente PumpSwap dont le quote mint n’est pas

@@ -2,6 +2,7 @@ import { PublicKey } from '@solana/web3.js';
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpBorshReader } from './borsh-reader.js';
 import { PUMP_PROGRAM_ID } from './constants.js';
+import type { PumpDecodingError } from './errors.js';
 import { createPumpDecodingError } from './errors.js';
 import { PUMP_INSTRUCTIONS } from './generated/pump-idl.js';
 import { decodeIdlFields } from './idl-codec.js';
@@ -58,9 +59,7 @@ export function decodePumpInstruction(
     instruction,
   );
   const reader = new PumpBorshReader(instruction.data.subarray(8));
-  const args = matched.name === 'create_v2'
-    ? decodeCreateV2Args(matched.definition, reader)
-    : decodeIdlFields(matched.definition.args, reader);
+  const args = decodeInstructionArgs(matched.name, matched.definition, reader);
   if (reader.remaining !== 0) {
     throw createPumpDecodingError(
       'PUMP_BORSH_INVALID',
@@ -76,6 +75,83 @@ export function decodePumpInstruction(
     accounts,
     args,
   });
+}
+
+function decodeInstructionArgs(
+  name: PumpInstructionName,
+  definition: InstructionDefinition,
+  reader: PumpBorshReader,
+): Readonly<Record<string, PumpIdlValue>> {
+  if (name === 'create_v2') return decodeCreateV2Args(definition, reader);
+  if (name === 'buy' || name === 'buy_exact_sol_in') {
+    return decodeLegacyBuyArgs(name, definition, reader);
+  }
+  if (name === 'buy_exact_quote_in_v2') {
+    return decodeExactQuoteBuyArgs(definition, reader);
+  }
+  return decodeIdlFields(definition.args, reader);
+}
+
+function decodeLegacyBuyArgs(
+  name: 'buy' | 'buy_exact_sol_in',
+  definition: InstructionDefinition,
+  reader: PumpBorshReader,
+): Readonly<Record<string, PumpIdlValue>> {
+  const required = decodeIdlFields(definition.args.slice(0, 2), reader);
+  const suffixLength = reader.remaining;
+  if (name === 'buy') {
+    if (suffixLength === 0) return required;
+    if (suffixLength !== 1) throw invalidBuySuffix(name, suffixLength);
+    return Object.freeze({
+      ...required,
+      track_volume: Object.freeze([reader.readBool()]),
+    });
+  }
+
+  if (suffixLength === 1) {
+    return Object.freeze({
+      ...required,
+      track_volume: Object.freeze([reader.readBool()]),
+    });
+  }
+  if (suffixLength !== 2) throw invalidBuySuffix(name, suffixLength);
+  const historicalSuffix = reader.readBytes(2);
+  if (historicalSuffix[0] !== 1 || historicalSuffix[1] !== 0) {
+    throw invalidBuySuffix(name, suffixLength);
+  }
+  return Object.freeze({
+    ...required,
+    track_volume: Object.freeze([false]),
+  });
+}
+
+function decodeExactQuoteBuyArgs(
+  definition: InstructionDefinition,
+  reader: PumpBorshReader,
+): Readonly<Record<string, PumpIdlValue>> {
+  const required = decodeIdlFields(definition.args, reader);
+  const suffixLength = reader.remaining;
+  if (suffixLength === 0) return required;
+  if (suffixLength !== 1) {
+    throw invalidBuySuffix('buy_exact_quote_in_v2', suffixLength);
+  }
+  const trackVolume = reader.readBool();
+  if (!trackVolume) throw invalidBuySuffix('buy_exact_quote_in_v2', suffixLength);
+  return Object.freeze({
+    ...required,
+    track_volume: Object.freeze([true]),
+  });
+}
+
+function invalidBuySuffix(
+  name: 'buy' | 'buy_exact_quote_in_v2' | 'buy_exact_sol_in',
+  suffixLength: number,
+): PumpDecodingError {
+  return createPumpDecodingError(
+    'PUMP_BORSH_INVALID',
+    false,
+    `Instruction Pump ${name}: suffixe BUY historique invalide (${suffixLength} octet(s)).`,
+  );
 }
 
 function decodeCreateV2Args(

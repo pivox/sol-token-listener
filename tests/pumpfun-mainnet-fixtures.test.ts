@@ -80,6 +80,38 @@ void test('décode hors ligne un achat V2 CPI multi-quote', async () => {
   assert.equal(decoded.trades[0]?.eventCpi.instruction.stackHeight, 3);
 });
 
+void test('décode le suffixe volume historique de buy_exact_quote_in_v2 interne', async () => {
+  const fixture = await loadPumpFixture(
+    'buy-exact-quote-v2-track-volume-mainnet.json',
+  );
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const trade = decoded.trades[0];
+
+  assert.equal(fixture.provenance.slot, 450_205_204n);
+  assert.equal(fixture.provenance.transactionIndex, 1_113);
+  assert.equal(decoded.trades.length, 1);
+  assert.ok(trade);
+  assert.equal(trade.action.name, 'buy_exact_quote_in_v2');
+  assert.equal(trade.action.instruction.innerInstructionIndex, 1);
+  assert.deepEqual(trade.action.args.track_volume, [true]);
+});
+
+void test('décode le suffixe option historique de buy_exact_sol_in externe', async () => {
+  const fixture = await loadPumpFixture(
+    'buy-exact-sol-in-option-mainnet.json',
+  );
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const trade = decoded.trades[0];
+
+  assert.equal(fixture.provenance.slot, 450_205_410n);
+  assert.equal(fixture.provenance.transactionIndex, 238);
+  assert.equal(decoded.trades.length, 1);
+  assert.ok(trade);
+  assert.equal(trade.action.name, 'buy_exact_sol_in');
+  assert.equal(trade.action.instruction.innerInstructionIndex, null);
+  assert.deepEqual(trade.action.args.track_volume, [false]);
+});
+
 void test('refuse une provenance qui ne correspond pas à la transaction', async () => {
   const path = new URL(
     './fixtures/pumpfun/sell-cpi-mainnet.json',
