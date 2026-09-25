@@ -8,11 +8,17 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js `node:test`, immutable JSON contracts, existing first-processing validator, npm scripts, Markdown deployment contracts.
 
-**Plan revision:** 1.1.0. Cycle-1 corrections extend Task 2 and Task 4 with
+**Plan revision:** 1.2.0. Cycle-1 corrections extend Task 2 and Task 4 with
 exact terminal totals/taxonomies, same-process first-processing chronology,
 HTTP counter invariants and positive-429 priority, hydration monotonicity,
 authenticated periodic-pause evidence, nullable recovery coherence, and
 paired finality recovery during the observation window.
+
+Cycle-2 final corrections bind evidence to process/observation/retention time,
+derive RSS bounds internally, cap hydration retention and manifest arrays,
+freeze local V1 taxonomies and canonical RPC membership, require Pump.fun
+pipeline health, close finality at STOPPED, and harden the CLI against special
+files and concurrent mutation.
 
 ---
 

@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.9 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
+Version : 1.3.0 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -71,6 +71,28 @@ Le manifeste V1 applique en plus les invariants fail-closed suivants :
 - `recoveryStatus=NOT_REQUIRED` exige `recoveryReasonCode=null`, si et seulement
   si aucune récupération n'est requise. Tout autre statut exige un reason code
   fermé non nul.
+
+La révision finale V1 fixe aussi les limites sans entrée opérateur :
+
+- `stoppedAt` de l'artefact devient `stoppedHeartbeat.observedAtMs`; il est
+  strictement postérieur au snapshot final. Chaque observation et chaque
+  `sampledAtMs` appartient au même processus, précède sa frontière de rétention
+  et ne peut jamais transformer une vieille cohorte en `PASS` ;
+- la limite RSS n'est pas fournie dans le manifeste. Elle est dérivée de
+  `rssBytes` à T+5 en ajoutant le maximum entre 25 % arrondi à l'entier supérieur
+  et 128 MiB. Un overflow entier produit `INCONCLUSIVE` ;
+- chaque snapshot de `blockHydration` accepte au plus `retainedEntries=64` et
+  `retainedBytes=67 108 864`; tout dépassement prouvé produit `FAIL` ;
+- le membership RPC T0 est exactement `primary`, `fallback-1`, `fallback-2`,
+  `fallback-3`, dans cet ordre. Les relevés suivants acceptent au plus huit
+  providers afin qu'un delta HTTP 429 commun reste prioritaire sur une dérive ;
+- les diagnostics finality sont bornés à 1024 entrées et ne peuvent dépasser le
+  heartbeat STOPPED. Une récupération postérieure ne ferme pas un incident
+  encore ouvert à l'arrêt ; les groupes terminaux sont bornés à 128 entrées ;
+- le lecteur CLI ouvre le manifeste en lecture seule, sans suivi de symlink et
+  sans blocage. Il vérifie deux fois, en entiers bigint, identité, taille et
+  timestamps du fichier, puis rejette FIFO, symlink et mutation avec l'erreur
+  fixe sans refléter de chemin ou de contenu.
 
 ## Quarantaine du décodeur Pump.fun
 

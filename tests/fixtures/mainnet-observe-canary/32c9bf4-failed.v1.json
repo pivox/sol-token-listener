@@ -144,6 +144,7 @@
     }
   },
   "stoppedHeartbeat": {
+    "observedAtMs": 1790314339762,
     "startedAtMs": 1790313390116,
     "runtimeState": "STOPPED", "subscriberState": "STOPPED", "scannerState": "STOPPED", "workerState": "STOPPED", "reconcilerState": "STOPPED",
     "backlogCount": 26742, "leasedCount": 0,
@@ -181,6 +182,5 @@
     "normalized": { "legacy": 841, "v0": 272, "v1": 192 },
     "persisted": { "legacy": 1, "v0": 1, "v1": 1 }
   },
-  "rssLimitBytes": 859796480,
   "cleanupComplete": true
 }

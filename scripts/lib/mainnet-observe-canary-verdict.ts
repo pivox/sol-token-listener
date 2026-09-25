@@ -4,8 +4,6 @@ import {
   createFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from '../../src/domain/first-processing-canary.js';
-import { CATCH_UP_CLASSIFICATION_REASON_CODES } from '../../src/domain/catch-up-classification.js';
-import { TRANSACTION_INGESTION_ERROR_CODES } from '../../src/domain/transaction-ingestion.js';
 
 export type MainnetObserveCanaryVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
@@ -45,6 +43,27 @@ const RECOVERY_REASON_CODES = [
   'STARTUP', 'UNEXPECTED_RESTART', 'SESSION_FAILURE', 'RPC_UNAVAILABLE',
   'CHECKPOINT_CONFLICT', 'CATCH_UP_WINDOW_EXCEEDED',
 ] as const;
+const FINALITY_REASON_CODES = [
+  'PROVIDER_UNAVAILABLE', 'PROVIDER_CHANGED', 'FINALITY_LIST', 'FINALITY_PASS',
+  'FINALITY_HISTORY', 'FINALITY_ROOT', 'FINALITY_POLL', 'FINALITY_BLOCK',
+  'FINALITY_REVISION', 'FINALITY_CLOCK', 'FINALITY_CONTRADICTION', 'UNKNOWN',
+] as const;
+const TERMINAL_REASON_CODES = [
+  'PUMP_ACTION_SUPPORTED', 'PUMP_TRADE_UNTRACKED', 'SOLANA_TRANSACTION_FAILED',
+  'NO_SUPPORTED_PUMP_ACTION', 'PUMP_SCHEMA_UNSUPPORTED', 'PROVIDER_SIGNATURE_MISSING',
+] as const;
+const TERMINAL_ERROR_CODES = [
+  'RPC_TRANSIENT', 'TRANSACTION_NOT_AVAILABLE', 'BLOCK_NOT_AVAILABLE',
+  'TRANSACTION_INDEX_NOT_FOUND', 'NORMALIZATION_FAILED', 'PIPELINE_STAGE_FAILED',
+  'FINALITY_INCONSISTENT', 'CATCH_UP_WINDOW_EXCEEDED', 'WORKER_LEASE_EXPIRED',
+] as const;
+const CANONICAL_RPC_PROVIDER_IDS = ['primary', 'fallback-1', 'fallback-2', 'fallback-3'] as const;
+const MAX_RPC_PROVIDERS = 8;
+const MAX_FINALITY_DIAGNOSTICS = 1_024;
+const MAX_TERMINAL_GROUPS = 128;
+const MAX_HYDRATION_RETAINED_ENTRIES = 64;
+const MAX_HYDRATION_RETAINED_BYTES = 67_108_864;
+const MIN_RSS_HEADROOM_BYTES = 134_217_728;
 type SnapshotName = (typeof SNAPSHOT_NAMES)[number];
 type VersionCounts = Readonly<{ legacy: number; v0: number; v1: number }>;
 type TerminalCounts = Readonly<{ failed: number; quarantined: number; exhausted: number }>;
@@ -126,6 +145,7 @@ interface Snapshot {
 }
 
 interface StoppedHeartbeat {
+  readonly observedAtMs: number;
   readonly startedAtMs: number;
   readonly runtimeState: string;
   readonly subscriberState: string;
@@ -180,7 +200,6 @@ interface CanaryInput {
     normalized: VersionCounts;
     persisted: VersionCounts;
   }>;
-  readonly rssLimitBytes: number;
   readonly cleanupComplete: boolean;
 }
 
@@ -232,7 +251,7 @@ function evaluateRuntime(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   let periodicPauseObserved = false;
   for (const snapshot of snapshots) {
     const degraded = snapshot.status !== 'OK' || snapshot.subscriberState !== 'RUNNING'
-      || snapshot.scannerState !== 'RUNNING';
+      || snapshot.scannerState !== 'RUNNING' || snapshot.pipelinePumpfun !== 'RUNNING';
     if (!degraded && snapshot.periodicPauseEvidence !== null) {
       return gate('INCONCLUSIVE', 'RUNTIME_PERIODIC_PAUSE_INCOHERENT');
     }
@@ -254,6 +273,7 @@ function isAuthenticatedPeriodicPause(snapshot: Snapshot): boolean {
     && snapshot.runtimeState === 'RUNNING'
     && snapshot.subscriberState === 'RUNNING'
     && snapshot.scannerState === 'DEGRADED'
+    && snapshot.pipelinePumpfun === 'DEGRADED'
     && snapshot.workerState === 'RUNNING'
     && snapshot.reconcilerState === 'RUNNING'
     && snapshot.websocket.phase === 'RUNNING'
@@ -277,6 +297,9 @@ function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     || (!provider.configured && (provider.attempts !== 0 || provider.http429Responses !== 0))))) {
     return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
   }
+  const firstEvidence = rpcSnapshots[0];
+  if (firstEvidence === undefined) return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
+  const ids = firstEvidence.providers.map((provider) => provider.providerId);
   for (let index = 1; index < rpcSnapshots.length; index += 1) {
     const previous = rpcSnapshots[index - 1];
     const current = rpcSnapshots[index];
@@ -290,9 +313,9 @@ function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
         && provider.http429Responses > prior.http429Responses;
     })) return gate('FAIL', 'RPC_HTTP_429_OBSERVED');
   }
-  const firstEvidence = rpcSnapshots[0];
-  if (firstEvidence === undefined) return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
-  const ids = firstEvidence.providers.map((provider) => provider.providerId);
+  if (!sameStrings(ids, CANONICAL_RPC_PROVIDER_IDS)) {
+    return gate('INCONCLUSIVE', 'RPC_PROVIDER_MEMBERSHIP_INCOHERENT');
+  }
   for (let index = 1; index < rpcSnapshots.length; index += 1) {
     const previousEvidence = rpcSnapshots[index - 1];
     const currentEvidence = rpcSnapshots[index];
@@ -390,7 +413,15 @@ function evaluateFirstProcessing(input: CanaryInput): MainnetObserveCanaryGateRe
   }
   const stopped = input.stoppedHeartbeat.firstProcessingCanary;
   const retentionDeadline = safeAdd(cohortStartedAtMs, FIRST_PROCESSING_EVIDENCE_RETENTION_MS);
-  if (retentionDeadline === null || stopped.sampledAtMs >= retentionDeadline) {
+  const observations = snapshots.map((snapshot) => snapshot.observedAtMs);
+  if (retentionDeadline === null
+    || snapshots.some((snapshot) => snapshot.observedAtMs < snapshot.startedAtMs
+      || snapshot.firstProcessingCanary.sampledAtMs > snapshot.observedAtMs
+      || snapshot.observedAtMs >= retentionDeadline)
+    || input.stoppedHeartbeat.observedAtMs <= input.snapshots.FINAL_PRESTOP.observedAtMs
+    || stopped.sampledAtMs > input.stoppedHeartbeat.observedAtMs
+    || input.stoppedHeartbeat.observedAtMs >= retentionDeadline
+    || !strictlyIncreasing([...observations, input.stoppedHeartbeat.observedAtMs])) {
     return gate('INCONCLUSIVE', 'FIRST_PROCESSING_EVIDENCE_STALE');
   }
   return gate(stopped.verdict, `FIRST_PROCESSING_${stopped.verdict}`);
@@ -405,6 +436,10 @@ function evaluateHydration(input: CanaryInput): MainnetObserveCanaryGateResultV1
   }
   const hydrationEvidence = [...snapshots.map((snapshot) => snapshot.blockHydration),
     input.stoppedHeartbeat.blockHydration];
+  if (hydrationEvidence.some((item) => item.retainedEntries > MAX_HYDRATION_RETAINED_ENTRIES
+    || item.retainedBytes > MAX_HYDRATION_RETAINED_BYTES)) {
+    return gate('FAIL', 'BLOCK_HYDRATION_RETENTION_LIMIT_EXCEEDED');
+  }
   for (const counter of ['fetches', 'oversizeBypasses', 'fetchFailures',
     'epochInvalidations'] as const) {
     if (!nonDecreasing(hydrationEvidence.map((item) => item[counter]))) {
@@ -457,8 +492,13 @@ function evaluateAffinity(input: CanaryInput): MainnetObserveCanaryGateResultV1 
 }
 
 function evaluateRss(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
-  return input.snapshots.T_PLUS_5.rssBytes <= input.rssLimitBytes
-    && input.snapshots.FINAL_PRESTOP.rssBytes <= input.rssLimitBytes
+  const baseline = BigInt(input.snapshots.T_PLUS_5.rssBytes);
+  const proportionalHeadroom = (baseline + 3n) / 4n;
+  const headroom = proportionalHeadroom > BigInt(MIN_RSS_HEADROOM_BYTES)
+    ? proportionalHeadroom : BigInt(MIN_RSS_HEADROOM_BYTES);
+  const limit = baseline + headroom;
+  if (limit > BigInt(Number.MAX_SAFE_INTEGER)) return gate('INCONCLUSIVE', 'RSS_LIMIT_OVERFLOW');
+  return BigInt(input.snapshots.FINAL_PRESTOP.rssBytes) <= limit
     ? gate('PASS', 'RSS_WITHIN_LIMIT') : gate('FAIL', 'RSS_LIMIT_EXCEEDED');
 }
 
@@ -484,6 +524,10 @@ function evaluateFinality(input: CanaryInput): MainnetObserveCanaryGateResultV1 
       return gate('INCONCLUSIVE', 'FINALITY_DIAGNOSTICS_UNPAIRABLE');
     }
     lastObservedAtMs = diagnostic.observedAtMs;
+    if (diagnostic.observedAtMs > input.stoppedHeartbeat.observedAtMs) {
+      return open === null ? gate('INCONCLUSIVE', 'FINALITY_DIAGNOSTIC_AFTER_STOP')
+        : gate('FAIL', 'FINALITY_INCIDENT_OPEN');
+    }
     if (diagnostic.event === 'listener.finality_reconciler_degraded') {
       if (diagnostic.phase !== 'DEGRADED' || diagnostic.reasonCode === null || open !== null
         || diagnostic.observedAtMs !== diagnostic.degradedAtMs) {
@@ -534,7 +578,7 @@ function parseInput(value: unknown): CanaryInput {
   const input = exactObject(value, [
     'schemaVersion', 'commit', 'snapshots', 'stoppedHeartbeat', 'finalityDiagnostics',
     'providerMixingEvidenceCount', 'terminalEvidence', 'postStopActionableCount',
-    'versionReplayProof', 'rssLimitBytes', 'cleanupComplete',
+    'versionReplayProof', 'cleanupComplete',
   ]);
   if (input.schemaVersion !== 'mainnet-observe-canary-input.v1'
     || typeof input.commit !== 'string' || !/^[0-9a-f]{40}$/u.test(input.commit)) invalid();
@@ -548,16 +592,17 @@ function parseInput(value: unknown): CanaryInput {
     ['freshDatabase', 'observed', 'normalized', 'persisted']);
   return Object.freeze({
     commit: input.commit, snapshots, stoppedHeartbeat: parseStopped(input.stoppedHeartbeat),
-    finalityDiagnostics: Object.freeze(exactArray(input.finalityDiagnostics).map(parseFinality)),
+    finalityDiagnostics: Object.freeze(exactArray(input.finalityDiagnostics,
+      MAX_FINALITY_DIAGNOSTICS).map(parseFinality)),
     providerMixingEvidenceCount: integer(input.providerMixingEvidenceCount),
     terminalEvidence: Object.freeze({ baseline: parseTerminalCounts(terminal.baseline),
       final: parseTerminalCounts(terminal.final),
-      groups: Object.freeze(exactArray(terminal.groups).map(parseTerminalGroup)) }),
+      groups: Object.freeze(exactArray(terminal.groups, MAX_TERMINAL_GROUPS).map(parseTerminalGroup)) }),
     postStopActionableCount: integer(input.postStopActionableCount),
     versionReplayProof: Object.freeze({ freshDatabase: bool(proof.freshDatabase),
       observed: parseVersionCounts(proof.observed), normalized: parseVersionCounts(proof.normalized),
       persisted: parseVersionCounts(proof.persisted) }),
-    rssLimitBytes: positiveInteger(input.rssLimitBytes), cleanupComplete: bool(input.cleanupComplete),
+    cleanupComplete: bool(input.cleanupComplete),
   });
 }
 
@@ -612,11 +657,13 @@ function parseSnapshot(value: unknown): Snapshot {
 
 function parseStopped(value: unknown): StoppedHeartbeat {
   const input = exactObject(value, [
-    'startedAtMs', 'runtimeState', 'subscriberState', 'scannerState', 'workerState', 'reconcilerState',
+    'observedAtMs', 'startedAtMs', 'runtimeState', 'subscriberState', 'scannerState', 'workerState',
+    'reconcilerState',
     'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary',
   ]);
-  return Object.freeze({ startedAtMs: integer(input.startedAtMs),
+  return Object.freeze({ observedAtMs: integer(input.observedAtMs),
+    startedAtMs: integer(input.startedAtMs),
     runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
     subscriberState: enumeration(input.subscriberState, RUNTIME_STATES),
     scannerState: enumeration(input.scannerState, RUNTIME_STATES),
@@ -671,7 +718,7 @@ function parsePeriodicPause(value: unknown): PeriodicPauseEvidence | null {
 function parseRpc(value: unknown): RpcEvidence {
   const input = exactObject(value, ['version', 'overflowed', 'providers']);
   if (input.version !== 1) invalid();
-  const providers = exactArray(input.providers).map((provider) => {
+  const providers = exactArray(input.providers, MAX_RPC_PROVIDERS).map((provider) => {
     const fields = exactObject(provider, ['providerId', 'configured', 'attempts', 'http429Responses']);
     return Object.freeze({ providerId: providerId(fields.providerId), configured: bool(fields.configured),
       attempts: integer(fields.attempts), http429Responses: integer(fields.http429Responses) });
@@ -686,7 +733,8 @@ function parseFinality(value: unknown): FinalityDiagnostic {
     && input.event !== 'listener.finality_reconciler_recovered') invalid();
   if (input.phase !== 'DEGRADED' && input.phase !== 'RECOVERED') invalid();
   return Object.freeze({ event: input.event, phase: input.phase,
-    reasonCode: nullableCode(input.reasonCode), degradedAtMs: integer(input.degradedAtMs),
+    reasonCode: nullableEnumeration(input.reasonCode, FINALITY_REASON_CODES),
+    degradedAtMs: integer(input.degradedAtMs),
     observedAtMs: integer(input.observedAtMs) });
 }
 
@@ -694,8 +742,8 @@ function parseTerminalGroup(value: unknown): TerminalGroup {
   const input = exactObject(value, ['processingStatus', 'reasonCode', 'errorCode', 'count']);
   if (input.processingStatus !== 'FAILED' && input.processingStatus !== 'QUARANTINED') invalid();
   return Object.freeze({ processingStatus: input.processingStatus,
-    reasonCode: nullableEnumeration(input.reasonCode, CATCH_UP_CLASSIFICATION_REASON_CODES),
-    errorCode: nullableEnumeration(input.errorCode, TRANSACTION_INGESTION_ERROR_CODES),
+    reasonCode: nullableEnumeration(input.reasonCode, TERMINAL_REASON_CODES),
+    errorCode: nullableEnumeration(input.errorCode, TERMINAL_ERROR_CODES),
     count: integer(input.count) });
 }
 
@@ -731,9 +779,11 @@ function exactObject<const K extends readonly string[]>(value: unknown, keys: K)
   }
 }
 
-function exactArray(value: unknown): readonly unknown[] {
+function exactArray(value: unknown, maximumLength = Number.MAX_SAFE_INTEGER): readonly unknown[] {
   try {
-    if (!Array.isArray(value) || types.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) invalid();
+    if (!Array.isArray(value) || types.isProxy(value)
+      || Object.getPrototypeOf(value) !== Array.prototype) invalid();
+    if (value.length > maximumLength) invalid();
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const ownKeys = Reflect.ownKeys(descriptors).filter((key) => key !== 'length');
     if (ownKeys.some((key) => typeof key !== 'string')) invalid();
@@ -788,29 +838,14 @@ function integer(value: unknown): number {
   return value;
 }
 
-function positiveInteger(value: unknown): number {
-  const parsed = integer(value);
-  if (parsed === 0) invalid();
-  return parsed;
-}
-
 function bool(value: unknown): boolean {
   if (typeof value !== 'boolean') invalid();
-  return value;
-}
-
-function code(value: unknown): string {
-  if (typeof value !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value)) invalid();
   return value;
 }
 
 function enumeration<const T extends readonly string[]>(value: unknown, allowed: T): T[number] {
   if (typeof value !== 'string' || !allowed.includes(value)) invalid();
   return value;
-}
-
-function nullableCode(value: unknown): string | null {
-  return value === null ? null : code(value);
 }
 
 function nullableEnumeration<const T extends readonly string[]>(value: unknown, allowed: T): T[number] | null {

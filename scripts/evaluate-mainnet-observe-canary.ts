@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, open } from 'node:fs/promises';
+import type { BigIntStats } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluateMainnetObserveCanary } from './lib/mainnet-observe-canary-verdict.js';
@@ -40,26 +41,32 @@ export async function runMainnetObserveCanaryCommand(
   }
 }
 
-async function readBoundedRegularFile(path: string, maximumBytes: number): Promise<string> {
-  const pathStat = await lstat(path);
-  if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size > maximumBytes) throw new Error();
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+export async function readBoundedRegularFile(path: string, maximumBytes: number): Promise<string> {
+  const handle = await open(path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const fileStat = await handle.stat();
-    if (!fileStat.isFile() || fileStat.size < 0 || fileStat.size > maximumBytes) throw new Error();
-    const expectedBytes = fileStat.size;
-    const bytes = Buffer.alloc(expectedBytes);
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size < 0n || before.size > BigInt(maximumBytes)) throw new Error();
+    const expectedBytes = Number(before.size);
+    const bytes = Buffer.alloc(expectedBytes + 1);
     let offset = 0;
-    while (offset < expectedBytes) {
-      const { bytesRead } = await handle.read(bytes, offset, expectedBytes - offset, offset);
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
     if (offset !== expectedBytes) throw new Error();
-    return bytes.toString('utf8');
+    const after = await handle.stat({ bigint: true });
+    if (!after.isFile() || !stableFileIdentity(before, after)) throw new Error();
+    return bytes.subarray(0, expectedBytes).toString('utf8');
   } finally {
     await handle.close();
   }
+}
+
+function stableFileIdentity(before: BigIntStats, after: BigIntStats): boolean {
+  return before.dev === after.dev && before.ino === after.ino && before.size === after.size
+    && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs;
 }
 
 function isMainModule(): boolean {

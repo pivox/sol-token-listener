@@ -6,7 +6,7 @@ Issue: #169
 
 Status: approved for implementation
 
-Contract revision: 1.1.0
+Contract revision: 1.2.0
 
 ## Purpose
 
@@ -67,6 +67,11 @@ verdict and bounded aggregate evidence. Overall precedence is:
 The evaluator never reads the filesystem, environment, database, network,
 wallet, or arbitrary callbacks.
 
+The V1 manifest does not accept a caller-supplied RSS limit. The evaluator
+derives it from T+5 RSS plus the greater of an exact ceiling 25% headroom and
+128 MiB. It bounds providers to 8, finality diagnostics to 1,024, and terminal
+groups to 128.
+
 ### CLI
 
 `scripts/evaluate-mainnet-observe-canary.ts` accepts exactly one input path,
@@ -75,6 +80,12 @@ JSON result. It exits `0` for overall `PASS`, `2` for overall `FAIL` or
 `INCONCLUSIVE`, and `1` for malformed invocation or unreadable input. Errors
 use fixed codes and never echo paths, JSON fragments, URLs, signatures, mints,
 or exception messages.
+
+The CLI opens with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, then reads only from
+the handle. Bigint handle stats before and after must preserve regular-file
+type, device, inode, size, `mtimeNs`, and `ctimeNs`. One sentinel byte detects
+growth. FIFO, symlink, shrink, growth, replacement, or mutation fail with the
+same fixed error.
 
 The package exposes the development command
 `npm run canary:evaluate -- <path>`. No compiled production listener command is
@@ -96,12 +107,15 @@ and reason are related exactly: `NOT_REQUIRED` iff the reason is null. A final
 snapshot with unresolved `RPC_UNAVAILABLE` or subscriber recovery is `FAIL`.
 A periodic catch-up pause is `INCONCLUSIVE` only when a closed reason, provider,
 timestamp, healthy transport, and exact degraded scanner state authenticate it;
-generic degradation is `FAIL`. Malformed or missing state is `INCONCLUSIVE`;
-it is never `PASS`.
+the Pump.fun pipeline must then be exactly `DEGRADED`. Outside that pause it
+must be `RUNNING`; generic degradation is `FAIL`. Malformed or missing state is
+`INCONCLUSIVE`; it is never `PASS`.
 
 ### HTTP 429
 
-Provider membership and configuration must remain stable, counters must be
+T0 provider membership is exactly `primary`, `fallback-1`, `fallback-2`, and
+`fallback-3` in that order. Later membership/configuration must remain stable
+for `PASS`; all provider arrays are bounded to eight entries. Counters must be
 monotone, evidence must not overflow, responses never exceed attempts, and an
 unconfigured provider must remain at zero attempts and zero responses. A
 positive 429 delta proved between adjacent observations of a common configured
@@ -118,6 +132,11 @@ process start and cohort; sample times are strictly increasing through
 `STOPPED`, after T+15/final and before the retention boundary. An internally
 passing but old, restarted, or non-progressing cohort is `INCONCLUSIVE`.
 Neither gate is weakened by #169.
+
+Every snapshot observation is at or after process start and before cohort
+retention. Evidence sampling cannot be after its containing observation. The
+STOPPED observation is strictly after final, contains the stopped evidence,
+and is itself before retention.
 
 ### Terminal failures
 
@@ -139,6 +158,7 @@ average fetch rate at most four per second, no fetch-failure delta, and at most
 one oversize bypass. Fetch, oversize, failure, and epoch counters must be
 monotone over all snapshots and `STOPPED`; a reset is `INCONCLUSIVE`. The known
 oversize product debt in #149 is not hidden or silently relaxed here.
+Any snapshot above 64 retained entries or 67,108,864 retained bytes is `FAIL`.
 
 ### Catch-up admission
 
@@ -164,6 +184,9 @@ reconciler remains `RUNNING` and no contradiction exists. At least one
 WebSocket/catch-up overlap must exist, and finality contradictions plus
 replay-receipt violations must remain zero. An unresolved incident or explicit
 contradiction is `FAIL`; malformed or unpairable evidence is `INCONCLUSIVE`.
+Reason codes use a local frozen V1 taxonomy. Diagnostics after STOPPED cannot
+close an incident that was open at shutdown, and the diagnostic array is
+bounded to 1,024 entries.
 
 ### Shutdown
 

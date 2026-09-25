@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import {
   MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES,
+  readBoundedRegularFile,
   runMainnetObserveCanaryCommand,
   type MainnetObserveCanaryCommandDependencies,
 } from '../scripts/evaluate-mainnet-observe-canary.js';
@@ -75,6 +78,44 @@ void test('real CLI exits 2 and writes one JSON line for the known failed fixtur
   assert.equal(result.stderr, '');
   assert.equal(result.stdout.trimEnd().split('\n').length, 1);
   assert.equal((JSON.parse(result.stdout) as { overallVerdict?: unknown }).overallVerdict, 'FAIL');
+});
+
+void test('bounded reader rejects symlinks and FIFOs without blocking', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'canary-cli-'));
+  try {
+    const regular = join(directory, 'input.json');
+    const linked = join(directory, 'linked.json');
+    const fifo = join(directory, 'input.fifo');
+    await writeFile(regular, fixtureText, 'utf8');
+    await symlink(regular, linked);
+    const created = spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
+    assert.equal(created.status, 0, created.stderr);
+    for (const path of [linked, fifo]) {
+      await assert.rejects(Promise.race([
+        readBoundedRegularFile(path, MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES),
+        new Promise<string>((_resolve, reject) => {
+          setTimeout(() => { reject(new Error('reader blocked')); }, 1_000);
+        }),
+      ]));
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('bounded reader rejects a file that grows after reading starts', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'canary-cli-growth-'));
+  try {
+    const mutable = join(directory, 'mutable.json');
+    const padding = ' '.repeat(MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES
+      - Buffer.byteLength(fixtureText, 'utf8'));
+    await writeFile(mutable, `${fixtureText}${padding}`, 'utf8');
+    const reading = readBoundedRegularFile(mutable, MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES);
+    await appendFile(mutable, 'x', 'utf8');
+    await assert.rejects(reading);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 function commandHarness(
