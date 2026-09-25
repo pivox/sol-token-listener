@@ -1,7 +1,7 @@
 # Pump.fun Paper MVP Technical Design
 
-**Status:** accepted implementation contract for issues #149 and #28  
-**Date:** 2026-09-25  
+**Status:** accepted implementation contract for issues #149 and #28
+**Date:** 2026-09-25
 **Safety boundary:** paper execution only; no signer, private key, transaction submission, or live arming
 
 ## Outcome
