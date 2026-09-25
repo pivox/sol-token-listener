@@ -57,10 +57,11 @@ void test('applies all migrations, replays and backfills legacy retries', async 
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at
+      processing_status, observed_at, worker_admitted_at
     ) VALUES (
       'policy-default', 1, ARRAY['WEBSOCKET'],
-      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING', NOW()
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
+      statement_timestamp(), statement_timestamp()
     )`);
     await pool.query("INSERT INTO listener_heartbeats (service_key) VALUES ('migration-test')");
     const policy = (await pool.query(`SELECT retry_max_attempts, retry_base_delay_ms,

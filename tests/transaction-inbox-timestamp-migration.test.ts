@@ -31,10 +31,10 @@ void test('bulk inserts cannot violate inbox timestamp ordering', async (context
     assert.equal(applied.at(-1), '053_transaction_inbox_worker_admission_foundation.sql');
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at
+      processing_status, observed_at, worker_admitted_at
     ) SELECT 'bulk-' || value, value, ARRAY['CATCH_UP'],
       ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-      'PENDING', statement_timestamp()
+      'PENDING', statement_timestamp(), statement_timestamp()
       FROM generate_series(1, 20000) value`);
     const invalid = await pool.query(
       'SELECT COUNT(*) FROM chain_transaction_inbox WHERE updated_at < created_at',
