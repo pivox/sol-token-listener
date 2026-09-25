@@ -107,6 +107,7 @@ void test('execution dry-run migration applies, upgrades 031, and replays safely
         '049_transaction_inbox_catch_up_admission_receipt.sql',
         '050_transaction_inbox_first_processing.sql',
         '051_transaction_inbox_decoder_quarantine_recovery.sql',
+        '052_transaction_inbox_urgent_fairness.sql',
         latestMigrationName,
       ]);
       assert.equal((await upgradePool.query('SELECT id FROM execution_intents WHERE id = $1', [parent.id])).rowCount, 1);

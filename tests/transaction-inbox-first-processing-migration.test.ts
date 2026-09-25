@@ -55,10 +55,13 @@ void test('migration 050 classifies all legacy inbox rows unavailable without in
       .filter((name) => /^0(?:0[1-9]|[1-4][0-9])_/u.test(name)).sort();
     assert.equal(legacyNames.at(-1), '049_transaction_inbox_catch_up_admission_receipt.sql');
     for (const name of legacyNames) await pool.query(await readFile(new URL(name, migrationsUrl), 'utf8'));
-    // The current repository reads the later 052 scheduler field; this test deliberately
-    // keeps the inbox itself at 049 so migration 050 can still classify genuine legacy rows.
+    // The current repository reads the later 052 scheduler field and writes the inert 053
+    // admission field; this test deliberately keeps the remaining inbox schema at 049 so
+    // migration 050 can still classify genuine legacy rows.
     await pool.query(`ALTER TABLE chain_transaction_inbox_claim_scheduler
       ADD COLUMN launch_claims_since_tracked SMALLINT NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE chain_transaction_inbox
+      ADD COLUMN worker_admitted_at TIMESTAMPTZ`);
     const legacyRepository = new PostgresTransactionInboxRepository(pool);
     for (const [signature, slot] of [['legacy-processed', 1n], ['legacy-reopened', 2n]] as const) {
       await legacyRepository.enqueue(legacyNotification(signature, slot));

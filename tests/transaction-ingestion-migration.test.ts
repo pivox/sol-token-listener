@@ -401,10 +401,10 @@ void test('applies migrations 001-052 on an empty PostgreSQL schema and replays 
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at,
-      terminal_at, purge_after
+      worker_admitted_at, terminal_at, purge_after
     ) VALUES (
       'failed-structured', 42, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-      'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW(),
+      'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW(), NOW(),
       NOW(), NOW() + INTERVAL '4 hours'
     )`);
     assert.equal((await pool.query(
@@ -416,16 +416,16 @@ void test('applies migrations 001-052 on an empty PostgreSQL schema and replays 
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at,
-      terminal_at, purge_after
+      worker_admitted_at, terminal_at, purge_after
     ) VALUES ($1, 45, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
-      'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
+      'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
     ['failed-multibyte', multibyteName]);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at,
-      terminal_at, purge_after
+      worker_admitted_at, terminal_at, purge_after
     ) VALUES ($1, 46, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
-      'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
+      'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
     ['failed-exact-name', exactMultibyteName]);
     assert.equal((await pool.query<{ readonly bytes: number }>(
       "SELECT OCTET_LENGTH(error_name) AS bytes FROM chain_transaction_inbox WHERE signature = 'failed-exact-name'",
@@ -434,19 +434,20 @@ void test('applies migrations 001-052 on an empty PostgreSQL schema and replays 
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_code, error_name, error_retryable, observed_at,
-        terminal_at, purge_after
+        worker_admitted_at, terminal_at, purge_after
       ) VALUES ($1, 47, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
-        'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
+        'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
       ['failed-oversized-name', oversizedMultibyteName]),
       /chain_transaction_inbox_error_check/u,
     );
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-        processing_status, error_code, error_name, observed_at, terminal_at, purge_after
+        processing_status, error_code, error_name, observed_at, worker_admitted_at,
+        terminal_at, purge_after
       ) VALUES (
         'failed-incomplete', 43, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-        'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW(),
+        'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW(), NOW(),
         NOW(), NOW() + INTERVAL '4 hours'
       )`),
       /chain_transaction_inbox_error_check/u,
@@ -454,10 +455,11 @@ void test('applies migrations 001-052 on an empty PostgreSQL schema and replays 
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-        processing_status, error_name, error_retryable, observed_at, terminal_at, purge_after
+        processing_status, error_name, error_retryable, observed_at, worker_admitted_at,
+        terminal_at, purge_after
       ) VALUES (
         'failed-without-code', 44, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-        'FAILED', 'TransactionNormalizationError', FALSE, NOW(),
+        'FAILED', 'TransactionNormalizationError', FALSE, NOW(), NOW(),
         NOW(), NOW() + INTERVAL '4 hours'
       )`),
       /chain_transaction_inbox_error_check/u,
@@ -789,6 +791,7 @@ interface InboxInsert {
   readonly errorRetryable: boolean | null;
   readonly blockchainTime: string | null;
   readonly observedAt: string;
+  readonly workerAdmittedAt: string | null;
   readonly processedAt: string | null;
   readonly terminalAt: string | null;
   readonly purgeAfter: string | null;
@@ -844,6 +847,11 @@ function inboxValue(
   };
   return {
     ...value,
+    workerAdmittedAt: timestamps.workerAdmittedAt !== undefined
+      ? timestamps.workerAdmittedAt
+      : overrides.workerAdmittedAt !== undefined
+        ? overrides.workerAdmittedAt
+        : value.observedAt,
     firstDetectedAt: timestamps.firstDetectedAt ?? overrides.firstDetectedAt ?? value.createdAt,
   };
 }
@@ -916,10 +924,10 @@ async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
     processing_status, attempts, missing_finality_polls, lease_token, lease_expires_at,
     next_attempt_at, normalized_transaction, immutable_fingerprint, error_code, error_name,
     error_retryable, blockchain_time, observed_at, processed_at, terminal_at, purge_after,
-    first_detected_at, created_at, updated_at
+    worker_admitted_at, first_detected_at, created_at, updated_at
   ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22, $23, $24
+    $17, $18, $19, $20, $21, $22, $23, $24, $25
   )`, [
     value.signature, value.observedSlot, value.discoverySources, value.programIds,
     value.targetConfirmationStatus, value.processingStatus, value.attempts,
@@ -929,6 +937,7 @@ async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
     value.immutableFingerprint,
     value.errorCode, value.errorName, value.errorRetryable, value.blockchainTime,
     value.observedAt, value.processedAt, value.terminalAt, value.purgeAfter,
+    value.workerAdmittedAt,
     value.firstDetectedAt, value.createdAt, value.updatedAt,
   ]);
 }
