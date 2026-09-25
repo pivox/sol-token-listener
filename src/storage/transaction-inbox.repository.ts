@@ -167,12 +167,49 @@ const SERVICE_KEY = 'transaction-listener';
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM = 100;
 export const MAX_CONSECUTIVE_URGENT_CLAIMS = 32;
+export const MAX_LAUNCH_CLAIMS_BEFORE_TRACKED = 3;
 const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
 
 type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE' | 'TRACKED_TRADE';
 type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED'
   | 'IGNORED' | 'QUARANTINED';
 type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE';
+
+const CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = Object.freeze({
+  NORMAL: `SELECT signature, ingestion_priority
+    FROM chain_transaction_inbox
+    WHERE ingestion_priority='NORMAL' AND (
+      (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='FAILED' AND error_retryable=TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+    )
+    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+  LAUNCH_CANDIDATE: `SELECT signature, ingestion_priority
+    FROM chain_transaction_inbox
+    WHERE ingestion_priority='LAUNCH_CANDIDATE' AND (
+      (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='FAILED' AND error_retryable=TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+    )
+    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+  TRACKED_TRADE: `SELECT signature, ingestion_priority
+    FROM chain_transaction_inbox
+    WHERE ingestion_priority='TRACKED_TRADE' AND (
+      (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='FAILED' AND error_retryable=TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+    )
+    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+});
 
 export interface TransactionInboxRetryPolicy {
   readonly maxAttempts: number;
@@ -1052,7 +1089,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [now, MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM],
         );
         const scheduler = await client.query(
-          `SELECT consecutive_urgent_claims
+          `SELECT consecutive_urgent_claims, launch_claims_since_tracked
            FROM chain_transaction_inbox_claim_scheduler
            WHERE scheduler_key = 'global'
            FOR UPDATE`,
@@ -1067,39 +1104,29 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (urgentStreak > MAX_CONSECUTIVE_URGENT_CLAIMS) {
           throw new TypeError('Transaction inbox claim scheduler is invalid.');
         }
-        let selected = urgentStreak === MAX_CONSECUTIVE_URGENT_CLAIMS
-          ? await client.query(
-            `SELECT signature, ingestion_priority
-             FROM chain_transaction_inbox
-             WHERE ingestion_priority = 'NORMAL'
-               AND (
-                 (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
-                 OR (processing_status = 'FAILED' AND error_retryable = TRUE
-                     AND retry_exhausted_at IS NULL AND next_attempt_at <= $1
-                     AND attempts_in_cycle < retry_max_attempts)
-                 OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1
-                     AND attempts_in_cycle < retry_max_attempts)
-               )
-             ORDER BY observed_slot, signature
-             FOR UPDATE SKIP LOCKED
-             LIMIT 1`,
-            [now],
-          )
-          : { rows: [], rowCount: 0 };
-        if (selected.rows.length === 0) selected = await client.query(
-          `SELECT signature, ingestion_priority
-           FROM chain_transaction_inbox
-           WHERE (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
-              OR (processing_status = 'FAILED' AND error_retryable = TRUE
-                  AND retry_exhausted_at IS NULL AND next_attempt_at <= $1
-                  AND attempts_in_cycle < retry_max_attempts)
-              OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1
-                  AND attempts_in_cycle < retry_max_attempts)
-           ORDER BY (ingestion_priority <> 'NORMAL') DESC, observed_slot, signature
-           FOR UPDATE SKIP LOCKED
-           LIMIT 1`,
-          [now],
+        const launchStreak = safeCount(
+          scheduler.rows[0]?.launch_claims_since_tracked,
+          'launch claims since tracked',
         );
+        if (launchStreak > MAX_LAUNCH_CLAIMS_BEFORE_TRACKED) {
+          throw new TypeError('Transaction inbox claim scheduler is invalid.');
+        }
+        let selected = urgentStreak === MAX_CONSECUTIVE_URGENT_CLAIMS
+          ? await client.query(CLAIM_CANDIDATE_SQL.NORMAL, [now])
+          : { rows: [], rowCount: 0 };
+        if (selected.rows.length === 0) {
+          const urgentOrder: readonly TransactionInboxPriority[] = launchStreak
+            === MAX_LAUNCH_CLAIMS_BEFORE_TRACKED
+            ? ['TRACKED_TRADE', 'LAUNCH_CANDIDATE']
+            : ['LAUNCH_CANDIDATE', 'TRACKED_TRADE'];
+          for (const priority of urgentOrder) {
+            selected = await client.query(CLAIM_CANDIDATE_SQL[priority], [now]);
+            if (selected.rows.length > 0) break;
+          }
+        }
+        if (selected.rows.length === 0) {
+          selected = await client.query(CLAIM_CANDIDATE_SQL.NORMAL, [now]);
+        }
         const selectedRow = selected.rows[0];
         const signature = optionalText(selectedRow?.signature, 'claim signature');
         if (signature === null) return null;
@@ -1125,9 +1152,20 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                  THEN LEAST(consecutive_urgent_claims + 1, $2)
                ELSE 0
              END,
-             updated_at = GREATEST(updated_at, $3)
+             launch_claims_since_tracked = CASE
+               WHEN $1::chain_transaction_inbox_priority = 'LAUNCH_CANDIDATE'
+                 THEN LEAST(launch_claims_since_tracked + 1, $3)
+               WHEN $1::chain_transaction_inbox_priority = 'TRACKED_TRADE' THEN 0
+               ELSE launch_claims_since_tracked
+             END,
+             updated_at = GREATEST(updated_at, $4)
            WHERE scheduler_key = 'global'`,
-          [ingestionPriority, MAX_CONSECUTIVE_URGENT_CLAIMS, now],
+          [
+            ingestionPriority,
+            MAX_CONSECUTIVE_URGENT_CLAIMS,
+            MAX_LAUNCH_CLAIMS_BEFORE_TRACKED,
+            now,
+          ],
         );
         requireOne(schedulerUpdated.rowCount);
         return claimFromRow(requiredRow(updated.rows[0]));

@@ -81,12 +81,12 @@ void test('047 remains installed beneath the clean-database head and the runner 
     await migrationSql();
     const applied = await migrateDatabase({ pool });
     assert.equal(applied.includes(migrationName), true);
-    assert.equal(applied.at(-1), '051_transaction_inbox_decoder_quarantine_recovery.sql');
-    assert.equal(applied.length, 51);
+    assert.equal(applied.at(-1), '052_transaction_inbox_urgent_fairness.sql');
+    assert.equal(applied.length, 52);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.deepEqual((await pool.query(`SELECT scheduler_key, consecutive_urgent_claims
       FROM chain_transaction_inbox_claim_scheduler`)).rows, [{ scheduler_key: 'global', consecutive_urgent_claims: 0 }]);
-    await assertCatalog(pool);
+    await assertCatalog(pool, true);
   });
 });
 
@@ -417,7 +417,7 @@ async function insertInbox(pool: pg.Pool, overrides: Readonly<Record<string, unk
     VALUES (${columns.map((_, index) => `$${index + 1}`).join(',')})`, Object.values(row));
 }
 
-async function assertCatalog(pool: pg.Pool): Promise<void> {
+async function assertCatalog(pool: pg.Pool, includesUrgentFairness = false): Promise<void> {
   assert.deepEqual((await pool.query(`SELECT enumlabel FROM pg_enum
     WHERE enumtypid='chain_transaction_inbox_priority'::REGTYPE ORDER BY enumsortorder`)).rows,
   ['NORMAL', 'LAUNCH_CANDIDATE', 'TRACKED_TRADE'].map((enumlabel) => ({ enumlabel })));
@@ -436,7 +436,9 @@ async function assertCatalog(pool: pg.Pool): Promise<void> {
   ]);
   assert.deepEqual((await pool.query(`SELECT attname FROM pg_attribute
     WHERE attrelid='chain_transaction_inbox_claim_scheduler'::REGCLASS AND attnum>0 AND NOT attisdropped ORDER BY attnum`)).rows,
-  ['scheduler_key', 'consecutive_urgent_claims', 'created_at', 'updated_at'].map((attname) => ({ attname })));
+  ['scheduler_key', 'consecutive_urgent_claims', 'created_at', 'updated_at',
+    ...(includesUrgentFairness ? ['launch_claims_since_tracked'] : [])]
+    .map((attname) => ({ attname })));
   assert.deepEqual((await pool.query(`SELECT conname FROM pg_constraint WHERE conrelid='chain_transaction_inbox'::REGCLASS
     AND conname IN ('chain_transaction_inbox_ingestion_hint_check','chain_transaction_inbox_deferred_check')
     AND convalidated ORDER BY conname`)).rows, [
