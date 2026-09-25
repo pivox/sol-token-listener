@@ -140,6 +140,15 @@
       "priority": { "normal": 11022, "launchCandidate": 0, "trackedTrade": 15720 }
     },
     "blockHydration": { "version": 1, "enabled": true, "callerConcurrency": 1, "fetches": 1554, "oversizeBypasses": 230, "fetchFailures": 3, "epochInvalidations": 9, "retainedEntries": 0, "retainedBytes": 0, "inFlightFetches": 0, "queuedFetches": 0 },
+    "rpcHttpEvidence": {
+      "version": 1, "overflowed": false,
+      "providers": [
+        { "providerId": "primary", "configured": true, "attempts": 2045, "http429Responses": 0 },
+        { "providerId": "fallback-1", "configured": false, "attempts": 0, "http429Responses": 0 },
+        { "providerId": "fallback-2", "configured": false, "attempts": 0, "http429Responses": 0 },
+        { "providerId": "fallback-3", "configured": false, "attempts": 0, "http429Responses": 0 }
+      ]
+    },
     "firstProcessingCanary": { "version": 1, "thresholdMs": 45000, "cohortCapacity": 50000, "cohortStartedAtMs": 1790313390116, "cohortEndsAtMs": 1790314290116, "sampledAtMs": 1790314338979, "overflowed": false, "eligibleCount": 29882, "completedCount": 2309, "underThresholdCount": 351, "atOrAboveThresholdCount": 1958, "pendingCount": 24920, "rightCensoredCount": 0, "tailCensoredCount": 24920, "terminalCount": 2653, "unavailableCount": 0, "invalidDurationCount": 0, "p95Ms": 739483, "verdict": "FAIL" }
   },
   "finalityDiagnostics": [
@@ -150,10 +159,7 @@
   "terminalEvidence": {
     "baseline": { "exhausted": 0, "quarantined": 0 },
     "final": { "exhausted": 2, "quarantined": 190 },
-    "groups": [
-      { "processingStatus": "FAILED", "reasonCode": "RETRY_EXHAUSTED", "errorCode": "RETRY_EXHAUSTED", "count": 2 },
-      { "processingStatus": "QUARANTINED", "reasonCode": "DECODER_QUARANTINED", "errorCode": "DECODER_QUARANTINED", "count": 190 }
-    ]
+    "groups": []
   },
   "postStopActionableCount": 26742,
   "versionReplayProof": {

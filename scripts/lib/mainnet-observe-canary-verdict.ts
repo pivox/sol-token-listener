@@ -116,6 +116,7 @@ interface StoppedHeartbeat {
   readonly leasedCount: number;
   readonly catchUpAdmission: Admission;
   readonly blockHydration: Hydration;
+  readonly rpcHttpEvidence: RpcEvidence;
   readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
 }
 
@@ -206,25 +207,29 @@ function evaluateRuntime(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     || snapshot.workerState !== 'RUNNING')) return gate('FAIL', 'RUNTIME_COMPONENT_NOT_RUNNING');
   if (snapshots.some((snapshot) => snapshot.status !== 'OK'
     || snapshot.subscriberState !== 'RUNNING' || snapshot.scannerState !== 'RUNNING')) {
-    return gate('INCONCLUSIVE', 'RUNTIME_PERIODIC_PAUSE');
+    return gate('FAIL', 'RUNTIME_COMPONENT_DEGRADED');
   }
   return gate('PASS', 'RUNTIME_HEALTHY');
 }
 
 function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
-  if (snapshots.some((snapshot) => snapshot.rpcHttpEvidence.overflowed)) {
+  const rpcSnapshots = [...snapshots.map((snapshot) => snapshot.rpcHttpEvidence),
+    input.stoppedHeartbeat.rpcHttpEvidence];
+  if (rpcSnapshots.some((rpcEvidence) => rpcEvidence.overflowed)) {
     return gate('INCONCLUSIVE', 'RPC_COUNTER_OVERFLOW');
   }
-  const ids = snapshots[0].rpcHttpEvidence.providers.map((provider) => provider.providerId);
-  for (let index = 1; index < snapshots.length; index += 1) {
-    const previousSnapshot = snapshots[index - 1];
-    const currentSnapshot = snapshots[index];
-    if (previousSnapshot === undefined || currentSnapshot === undefined) {
+  const firstEvidence = rpcSnapshots[0];
+  if (firstEvidence === undefined) return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
+  const ids = firstEvidence.providers.map((provider) => provider.providerId);
+  for (let index = 1; index < rpcSnapshots.length; index += 1) {
+    const previousEvidence = rpcSnapshots[index - 1];
+    const currentEvidence = rpcSnapshots[index];
+    if (previousEvidence === undefined || currentEvidence === undefined) {
       return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
     }
-    const previous = previousSnapshot.rpcHttpEvidence.providers;
-    const current = currentSnapshot.rpcHttpEvidence.providers;
+    const previous = previousEvidence.providers;
+    const current = currentEvidence.providers;
     if (current.length !== previous.length
       || !sameStrings(ids, current.map((provider) => provider.providerId))
       || previous.some((provider, providerIndex) => {
@@ -234,8 +239,8 @@ function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
           || provider.http429Responses > next.http429Responses);
       })) return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
   }
-  const first = snapshots[0].rpcHttpEvidence.providers;
-  const last = snapshots[3].rpcHttpEvidence.providers;
+  const first = firstEvidence.providers;
+  const last = input.stoppedHeartbeat.rpcHttpEvidence.providers;
   const attemptDelta = sum(last.map((provider, index) => provider.attempts - (first[index]?.attempts ?? 0)));
   const responseDelta = sum(last.map((provider, index) => provider.http429Responses
     - (first[index]?.http429Responses ?? 0)));
@@ -479,13 +484,15 @@ function parseSnapshot(value: unknown): Snapshot {
 function parseStopped(value: unknown): StoppedHeartbeat {
   const input = exactObject(value, [
     'runtimeState', 'subscriberState', 'scannerState', 'workerState', 'reconcilerState',
-    'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'firstProcessingCanary',
+    'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
+    'firstProcessingCanary',
   ]);
   return Object.freeze({ runtimeState: code(input.runtimeState), subscriberState: code(input.subscriberState),
     scannerState: code(input.scannerState), workerState: code(input.workerState),
     reconcilerState: code(input.reconcilerState), backlogCount: integer(input.backlogCount),
     leasedCount: integer(input.leasedCount), catchUpAdmission: parseAdmission(input.catchUpAdmission),
     blockHydration: parseHydration(input.blockHydration),
+    rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary) });
 }
 

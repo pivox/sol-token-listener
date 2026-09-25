@@ -46,6 +46,39 @@ void test('accepts coherent non-zero durable backlog after a clean shutdown', ()
   assert.equal(result.gates.shutdown.verdict, 'PASS');
 });
 
+void test('uses the stopped RPC counters so a late HTTP 429 cannot be hidden', () => {
+  const copy = cloneFixture();
+  const stopped = nested(copy, 'stoppedHeartbeat');
+  stopped.rpcHttpEvidence = JSON.parse(JSON.stringify(
+    nested(copy, 'snapshots', 'FINAL_PRESTOP').rpcHttpEvidence,
+  )) as unknown;
+  const providers = nested(stopped, 'rpcHttpEvidence').providers as Record<string, unknown>[];
+  assert.ok(providers[0]);
+  providers[0].attempts = 2045;
+  providers[0].http429Responses = 1;
+
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.http429.verdict, 'FAIL');
+});
+
+void test('preserves absent run-era terminal grouping instead of inventing reason codes', () => {
+  const terminal = nested(cloneFixture(), 'terminalEvidence');
+  assert.deepEqual(terminal.groups, []);
+});
+
+void test('does not label a generic degraded status as an identified periodic pause', () => {
+  const copy = cloneFixture();
+  const final = nested(copy, 'snapshots', 'FINAL_PRESTOP');
+  final.subscriberState = 'RUNNING';
+  final.scannerState = 'RUNNING';
+  final.status = 'DEGRADED';
+  const websocket = nested(final, 'websocket');
+  websocket.phase = 'RUNNING';
+  websocket.recoveryStatus = 'RECOVERED';
+  websocket.recoveryReasonCode = 'STARTUP';
+
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.runtime.verdict, 'FAIL');
+});
+
 void test('classifies unsafe and incomplete gate evidence without allowing unrelated PASS gates to override it', () => {
   const cases: readonly [string, (copy: Record<string, unknown>) => void,
   MainnetObserveCanaryGateName, 'FAIL' | 'INCONCLUSIVE'][] = [
