@@ -859,6 +859,32 @@ void test('finality reconciler diagnostics are composed and documented as a non-
   assert.doesNotMatch(factory, /diagnosticSink[^\n]{0,240}(?:database|repository|wallet|executor)/iu);
 });
 
+void test('versioned canary verdict documents provider-affine and durable shutdown semantics', async () => {
+  const [runbook, overview] = await Promise.all([
+    readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('docs/system-overview.html'),
+  ]);
+
+  assert.match(runbook,
+    /scanActive=true[^.]{0,240}workerClaimReady=true[^.]{0,240}valide[^.]{0,160}même provider/iu);
+  assert.match(runbook,
+    /epochInvalidations[^.]{0,240}diagnostique[^.]{0,160}monotone[^.]{0,240}pas[^.]{0,160}mélange provider/iu);
+  assert.match(runbook,
+    /finality[^.]{0,240}degraded[^.]{0,240}recovered[^.]{0,240}appariés[^.]{0,160}structure/iu);
+  assert.match(runbook, /backlog durable[^.]{0,240}peut rester[^.]{0,160}shutdown/iu);
+  assert.match(runbook,
+    /leases[^.]{0,180}scan[^.]{0,180}queued[^.]{0,120}in-flight[^.]{0,180}cache[^.]{0,160}zéro/iu);
+  assert.match(runbook,
+    /compte SQL[^.]{0,180}post-stop[^.]{0,240}deux partitions[^.]{0,160}backlog/iu);
+  assert.match(runbook,
+    /npm run canary:evaluate -- \/absolute\/path\/to\/redacted-canary-input\.v1\.json/u);
+  assert.match(runbook, /FAIL[^.]{0,160}INCONCLUSIVE[^.]{0,240}bloquent[^.]{0,160}wallet/iu);
+
+  assert.match(overview,
+    /href="superpowers\/specs\/2026-09-25-mainnet-observe-canary-verdict-design\.md"/u);
+  assert.match(overview, /npm run canary:evaluate/u);
+});
+
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {
   const vite = await readArtifact('frontend/vite.config.ts');
   const readme = await readArtifact('frontend/README.md');

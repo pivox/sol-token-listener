@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.8 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155 et #163.
+Version : 1.2.8 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -10,6 +10,42 @@ readiness Mainnet n'est déclarée avant que cette fenêtre ait passé. Utiliser
 seule réplique avec `LISTENER_INGESTION_SCOPE=launchpad-only`, en mode `observe`.
 Archiver le health, les compteurs inbox, le RSS et le tableau fournisseur avant
 activation.
+
+## Verdict V1 versionné
+
+Après capture des quatre snapshots et du heartbeat arrêté, construire uniquement
+le manifeste agrégé expurgé V1 puis lancer :
+
+```bash
+npm run canary:evaluate -- /absolute/path/to/redacted-canary-input.v1.json
+```
+
+Le verdict est fail-closed. `FAIL` et `INCONCLUSIVE` bloquent tous deux la
+readiness Mainnet et tout accès wallet ; seul un `PASS` de chaque gate permet de
+poursuivre la procédure opérateur distincte. Le manifeste ne doit contenir ni
+URL RPC, signature, mint, wallet, transaction brute, message d'erreur libre ou
+secret.
+
+Les règles provider-affines corrigées sont les suivantes :
+
+- `scanActive=true` et `workerClaimReady=true` constituent une phase valide
+  quand le même provider public sert le scanner et le worker. Chaque partition
+  par source et chaque partition par priorité doit totaliser exactement le
+  backlog actionnable ; une preuve absente ou incohérente est `INCONCLUSIVE` ;
+- `epochInvalidations` est un compteur diagnostique entier et monotone, pas un
+  verdict de mélange provider. Seule une preuve positive de réutilisation entre
+  providers produit `FAIL`; un changement sans preuve suffisante reste
+  `INCONCLUSIVE` ;
+- les diagnostics finality `degraded` et `recovered` sont appariés
+  structurellement et chronologiquement. Un incident refermé avant T0 est
+  compatible avec `PASS`; un incident ouvert ou une contradiction est `FAIL` ;
+- un backlog durable peut rester après le shutdown. Les cinq composants doivent
+  être `STOPPED`, tandis que leases, admission scan, admission worker,
+  `queuedFetches`, fetches `in-flight` et cache mémoire doivent être à zéro ;
+- le compte SQL frais post-stop doit être égal au backlog du heartbeat et aux
+  deux partitions du backlog, par source et par priorité. Un désaccord est
+  `INCONCLUSIVE`; il ne faut jamais supprimer les lignes durables pour obtenir
+  artificiellement zéro.
 
 ## Quarantaine du décodeur Pump.fun
 
