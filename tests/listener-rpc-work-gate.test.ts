@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ListenerRpcWorkGate } from '../src/application/listener-rpc-work-gate.js';
+import {
+  ListenerRpcWorkGate,
+  ListenerRpcWorkGateClosedError,
+} from '../src/application/listener-rpc-work-gate.js';
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -84,4 +87,18 @@ void test('rejects a non-function operation without exposing its data or poisoni
     return true;
   });
   assert.equal(await next, 'next');
+});
+
+void test('close lets the active operation settle and rejects queued or later work', async () => {
+  const gate = new ListenerRpcWorkGate();
+  const release = deferred();
+  const first = gate.run(async () => { await release.promise; return 'first'; });
+  const queued = gate.run(async () => 'queued');
+  await flush();
+
+  gate.close();
+  release.resolve();
+  assert.equal(await first, 'first');
+  await assert.rejects(queued, ListenerRpcWorkGateClosedError);
+  await assert.rejects(gate.run(async () => 'late'), ListenerRpcWorkGateClosedError);
 });

@@ -40,6 +40,26 @@ void test('starts every member once across repeated and concurrent starts', asyn
   assert.deepEqual(starts, [1, 1, 1]);
 });
 
+void test('fails closed before starting any member when the durable backlog preflight rejects', async () => {
+  let starts = 0;
+  const pool = new TransactionInboxWorkerPool([member(), member()].map((value) => ({
+    ...value,
+    async start() { starts += 1; },
+  })), {
+    beforeStart: async () => { throw new Error('sensitive backlog detail'); },
+  });
+
+  await assert.rejects(pool.start(), (error: unknown) => {
+    assert.ok(error instanceof TransactionInboxWorkerPoolError);
+    assert.equal(error.stage, 'start');
+    assert.equal(error.message, 'Transaction inbox worker pool operation failed.');
+    assert.doesNotMatch(JSON.stringify(error), /sensitive/u);
+    return true;
+  });
+  assert.equal(starts, 0);
+  assert.equal(pool.state, 'DEGRADED');
+});
+
 void test('aggregates running, degraded and unexpectedly stopped member states', async () => {
   const members = Array.from({ length: 2 }, () => ({
     state: 'STOPPED' as TransactionInboxWorkerState,

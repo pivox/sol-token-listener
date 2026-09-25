@@ -13,11 +13,13 @@ Design: `docs/superpowers/specs/2026-09-25-bounded-transaction-inbox-worker-pool
    close.
 3. Add a close-failure test proving every member settles before the pool emits
    one typed, redacted error.
-4. Change the production factory lifecycle test to require all worker members
+4. Add a fail-closed startup preflight for actionable PumpSwap backlog left by
+   an earlier broader ingestion scope.
+5. Change the production factory lifecycle test to require all worker members
    to settle before provider-affine hydration closes.
-5. Add production-factory tests proving the configured member count shares one
+6. Add production-factory tests proving the configured member count shares one
    repository, pipeline and provider-affine locator.
-6. Add RED gate tests proving worker locator and PumpSwap account reads cannot
+7. Add RED gate tests proving worker locator and PumpSwap account reads cannot
    overlap and that failures release the next queued operation.
 
 Run only the new and modified suites and retain the expected RED evidence.
@@ -36,9 +38,11 @@ Run only the new and modified suites and retain the expected RED evidence.
    `production-listener-factory.ts`, sharing the inbox, locator and pipeline.
 5. Aggregate worker health through the pool and close provider-affine
    hydration only after all member closes settle.
-6. Keep block-hydration caller concurrency at one and update only stale
+6. Close the shared gate before draining workers and bound physical RPC calls
+   below the listener shutdown deadline.
+7. Keep block-hydration caller concurrency at one and update only stale
    explanatory comments if needed.
-7. Expose the effective count in the structured foundation-ready log.
+8. Expose the effective count in the structured foundation-ready log.
 
 Run the pool, worker, hydration, production-factory, listener-runtime and app
 tests.

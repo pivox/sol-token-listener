@@ -11,6 +11,7 @@ import {
 } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
 import type { TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
@@ -157,7 +158,12 @@ void test('two workers keep an early trade deferred then converge the creation a
 
     const creating = first.runOnce();
     try {
-      await creationReachedProjection.promise;
+      await Promise.race([
+        creationReachedProjection.promise,
+        creating.then(() => Promise.reject(
+          new Error('Creation worker settled before reaching the projection barrier.'),
+        )),
+      ]);
       const activated = await pool.query(`SELECT processing_status,ingestion_priority
         FROM chain_transaction_inbox WHERE signature=$1`, [tradeSignature]);
       assert.deepEqual(activated.rows[0], {
@@ -186,6 +192,14 @@ void test('two workers keep an early trade deferred then converge the creation a
     assert.equal((await pool.query(
       `SELECT COUNT(*)::int AS count FROM launch_trades WHERE mint=$1`, [mint],
     )).rows[0]?.count, 1);
+    assert.equal(await inbox.hasActionableProgramBacklog(PUMPSWAP_PROGRAM_ID), false);
+    await inbox.enqueue(Object.freeze({
+      ...tradeNotification('pumpswap-backlog-signature', 12n),
+      ingestionHint: null,
+      ingestionHintMint: null,
+      programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]),
+    }));
+    assert.equal(await inbox.hasActionableProgramBacklog(PUMPSWAP_PROGRAM_ID), true);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

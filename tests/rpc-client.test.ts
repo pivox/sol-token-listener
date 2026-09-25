@@ -3,6 +3,7 @@ import test from 'node:test';
 import { PublicKey, type FetchFn } from '@solana/web3.js';
 import {
   SolanaRpcClient,
+  createBoundedRpcFetch,
   createSolanaConnectionConfig,
   type SolanaRpcClientDependencies,
 } from '../src/solana/rpc/rpc-client.js';
@@ -10,6 +11,22 @@ import type { RpcHttpFailoverEvent } from '../src/solana/rpc/http-failover-trans
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
+
+void test('bounded RPC fetch aborts a physically pending request at its deadline', async () => {
+  let aborted = false;
+  const bounded = createBoundedRpcFetch(async (_input, init) => {
+    const observedSignal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      observedSignal?.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('aborted'));
+      }, { once: true });
+    });
+  }, 5);
+
+  await assert.rejects(bounded('https://primary.invalid/rpc'), /aborted/u);
+  assert.equal(aborted, true);
+});
 
 void test('counts one mono-endpoint physical attempt and returned HTTP 429 with a recorder', async () => {
   const recorder = createRpcHttpEvidenceRecorder();

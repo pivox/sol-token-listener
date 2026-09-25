@@ -27,6 +27,7 @@ export interface SolanaRpcClientDependencies {
   readonly now?: () => number;
   readonly onHttpFailoverEvent?: (event: RpcHttpFailoverEvent) => void;
   readonly recorder?: RpcHttpEvidenceRecorder;
+  readonly requestTimeoutMs?: number;
 }
 
 type SolanaConnectionConfig = Pick<
@@ -39,13 +40,22 @@ export function createSolanaConnectionConfig(
   dependencies: SolanaRpcClientDependencies = {},
   onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void,
 ): ConnectionConfig {
+  const boundedFetch = dependencies.requestTimeoutMs === undefined
+    ? undefined
+    : createBoundedRpcFetch(
+      dependencies.fetch ?? globalThis.fetch,
+      dependencies.requestTimeoutMs,
+    );
   if (config.httpRpcFallbackUrls.length === 0) {
+    const configuredFetch = dependencies.recorder === undefined
+      ? boundedFetch
+      : createObservedRpcFetch(
+        'primary', dependencies.recorder, boundedFetch ?? dependencies.fetch,
+      );
     return {
       commitment: config.commitment,
       wsEndpoint: config.wsRpcUrl,
-      ...(dependencies.recorder === undefined
-        ? {}
-        : { fetch: createObservedRpcFetch('primary', dependencies.recorder, dependencies.fetch) }),
+      ...(configuredFetch === undefined ? {} : { fetch: configuredFetch }),
       disableRetryOnRateLimit: true,
     };
   }
@@ -62,7 +72,9 @@ export function createSolanaConnectionConfig(
     wsEndpoint: config.wsRpcUrl,
     fetch: createRpcHttpFailoverFetch({
       endpoints,
-      ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+      ...(boundedFetch === undefined && dependencies.fetch === undefined
+        ? {}
+        : { fetch: boundedFetch ?? dependencies.fetch }),
       ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
       ...(dependencies.recorder === undefined ? {} : { recorder: dependencies.recorder }),
       ...(onEndpointSelected === undefined ? {} : { onEndpointSelected }),
@@ -71,6 +83,21 @@ export function createSolanaConnectionConfig(
         : { onEvent: dependencies.onHttpFailoverEvent }),
     }),
     disableRetryOnRateLimit: true,
+  };
+}
+
+export function createBoundedRpcFetch(fetch: FetchFn, timeoutMs: number): FetchFn {
+  if (typeof fetch !== 'function' || !Number.isSafeInteger(timeoutMs)
+    || timeoutMs < 1 || timeoutMs > 120_000) {
+    throw new TypeError('RPC request timeout is invalid.');
+  }
+  return async (input, init): Promise<Response> => {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    const signal = callerSignal === undefined
+      ? timeoutSignal
+      : AbortSignal.any([callerSignal, timeoutSignal]);
+    return fetch(input, { ...init, signal });
   };
 }
 

@@ -2,14 +2,30 @@ import type { TransactionBlockRpc } from '../solana/rpc/transaction-locator.js';
 
 export class ListenerRpcWorkGate {
   private tail: Promise<void> = Promise.resolve();
+  private closed = false;
 
   run<T>(operation: () => Promise<T>): Promise<T> {
     if (typeof operation !== 'function') {
       return Promise.reject(new TypeError('RPC work operation must be a function'));
     }
-    const result = this.tail.then(operation);
+    const result = this.tail.then(() => {
+      if (this.closed) throw new ListenerRpcWorkGateClosedError();
+      return operation();
+    });
     this.tail = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+export class ListenerRpcWorkGateClosedError extends Error {
+  public constructor() {
+    super('RPC work gate is closed.');
+    this.name = 'ListenerRpcWorkGateClosedError';
+    Object.freeze(this);
   }
 }
 

@@ -33,6 +33,7 @@ import {
   type PumpFunBondingCurveStateReader,
 } from '../launchpads/pumpfun/pumpfun-launchpad.adapter.js';
 import { PumpSwapFeeStateReader } from '../markets/pumpswap/pumpswap-fee-state.js';
+import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
 import { PumpSwapMarketAdapter } from '../markets/pumpswap/pumpswap-market.adapter.js';
 import { PumpSwapQuoteProvider } from '../markets/pumpswap/pumpswap-quote.provider.js';
 import { PumpSwapReserveReader } from '../markets/pumpswap/pumpswap-reserve-reader.js';
@@ -226,11 +227,17 @@ export function createProductionListenerRuntime(
   const ingestionPrograms = listenerIngestionPrograms(config.listenerIngestionScope);
   const databasePool = pool ?? getDatabasePool();
   const recorder = createRpcHttpEvidenceRecorder();
+  const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
+  const rpcRequestTimeoutMs = rpcWorkGate === null
+    ? config.listenerShutdownTimeoutMs
+    : Math.max(1, Math.floor(config.listenerShutdownTimeoutMs / 2));
   const rpc = new SolanaRpcClient(config, {
     recorder,
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
+    ...(rpcWorkGate === null ? {} : {
+      requestTimeoutMs: rpcRequestTimeoutMs,
+    }),
   });
-  const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
   const gatedBlockRpc = rpcWorkGate === null ? null : gateBlockTransactionRpc(rpcWorkGate, rpc);
   const workerBlockRpc: TransactionLocatorRpc & EpochTransactionBlockRpc = gatedBlockRpc === null
     ? rpc
@@ -261,7 +268,7 @@ export function createProductionListenerRuntime(
     ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
       providerId, ((): ProviderPinnedBlockRpc => {
         const pinned = createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
-          requestTimeoutMs: config.listenerShutdownTimeoutMs,
+          requestTimeoutMs: rpcRequestTimeoutMs,
         }, recorder);
         if (rpcWorkGate === null) return pinned;
         const gated = gateBlockTransactionRpc(rpcWorkGate, pinned);
@@ -589,8 +596,18 @@ export function createProductionListenerRuntime(
       idlePollMs: 1_000,
       ...(hydration === null ? {} : { canClaim: (): boolean => hydration.canWorkerClaim() }),
     }),
-  ));
-  const workerComponent = lifecycleComponent(worker, blockHydration.close);
+  ), config.listenerWorkerCount === 1 ? {} : {
+    beforeStart: async (): Promise<void> => {
+      if (await inbox.hasActionableProgramBacklog(PUMPSWAP_PROGRAM_ID)) {
+        throw new Error('Multi-worker listener requires an empty PumpSwap backlog.');
+      }
+    },
+  });
+  const workerComponent = lifecycleComponent(
+    worker,
+    blockHydration.close,
+    (): void => { rpcWorkGate?.close(); },
+  );
   const socialWorkerComponent = lifecycleComponent(socialWorker);
   const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
@@ -1300,12 +1317,13 @@ export function lifecycleComponent(component: {
   start(): Promise<void>;
   close(): Promise<void>;
   readonly state: ListenerRuntimeState;
-}, afterClose: () => void = () => undefined): {
+}, afterClose: () => void = () => undefined, beforeClose: () => void = () => undefined): {
   start(): Promise<void>; close(): Promise<void>; state(): ListenerRuntimeState;
 } {
   return {
     start: () => component.start(),
     close: async (): Promise<void> => {
+      beforeClose();
       try { await component.close(); } finally { afterClose(); }
     },
     state: () => component.state,

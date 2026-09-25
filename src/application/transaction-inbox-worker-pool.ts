@@ -6,6 +6,10 @@ export interface TransactionInboxWorkerPoolMember {
   close(): Promise<void>;
 }
 
+export interface TransactionInboxWorkerPoolOptions {
+  readonly beforeStart?: () => Promise<void>;
+}
+
 export class TransactionInboxWorkerPoolError extends Error {
   public constructor(public readonly stage: 'start' | 'close') {
     super('Transaction inbox worker pool operation failed.');
@@ -23,12 +27,20 @@ export class TransactionInboxWorkerPool {
   private closeFailed = false;
   private startPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
+  private readonly beforeStart: (() => Promise<void>) | null;
 
-  public constructor(members: readonly TransactionInboxWorkerPoolMember[]) {
+  public constructor(
+    members: readonly TransactionInboxWorkerPoolMember[],
+    options: TransactionInboxWorkerPoolOptions = {},
+  ) {
     if (members.length < 1 || members.length > 4) {
       throw new TypeError('Transaction inbox worker pool size is invalid.');
     }
     this.members = [...members];
+    if (options.beforeStart !== undefined && typeof options.beforeStart !== 'function') {
+      throw new TypeError('Transaction inbox worker pool preflight is invalid.');
+    }
+    this.beforeStart = options.beforeStart ?? null;
   }
 
   public get state(): TransactionInboxWorkerState {
@@ -52,6 +64,12 @@ export class TransactionInboxWorkerPool {
   }
 
   private async performStart(): Promise<void> {
+    try {
+      await this.beforeStart?.();
+    } catch {
+      this.startFailed = true;
+      throw new TransactionInboxWorkerPoolError('start');
+    }
     const results = await Promise.allSettled(this.members.map(async (member) => member.start()));
     if (results.some((result) => result.status === 'rejected')) {
       this.startFailed = true;

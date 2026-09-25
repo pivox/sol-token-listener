@@ -556,7 +556,8 @@ Le pool interne conserve `LISTENER_WORKER_COUNT=1` par défaut. Les valeurs
 `2..4` exigent `LISTENER_BLOCK_HYDRATION_ENABLED=true` et
 `LISTENER_INGESTION_SCOPE=launchpad-only`. Elles ne changent pas la concurrence
 HTTP : fetches bloc et lectures PumpSwap partagent un gate FIFO de capacité
-`1`. Le premier canary après #166 utilise `2`; revenir à `1` puis redémarrer
+`1`. Le démarrage refuse aussi tout backlog PumpSwap encore actionnable en
+base. Le premier canary après #166 utilise `2`; revenir à `1` puis redémarrer
 constitue le rollback immédiat.
 
 Le fast path de couverture durable reste indépendamment désactivé par défaut.
