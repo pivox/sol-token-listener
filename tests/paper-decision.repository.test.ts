@@ -2475,10 +2475,10 @@ async function seedFinalityPreflightBacklog(
     'confirmed',to_timestamp(1),1,'{}'::jsonb FROM generate_series(1,$1) value`,[count]);
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
-    processing_status,observed_at
+    processing_status,observed_at,worker_admitted_at
   ) SELECT 'fair-signature-'||value,10,ARRAY['WEBSOCKET'],
     ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'confirmed','PENDING',
-    to_timestamp(1) FROM generate_series(1,$1) value`,[count]);
+    to_timestamp(1),to_timestamp(1) FROM generate_series(1,$1) value`,[count]);
   if(readyRanks.length>0){
     await pool.query(`UPDATE chain_transaction_inbox SET processing_status='PROCESSED',
       normalized_transaction=jsonb_build_object('signature',signature),
@@ -2542,10 +2542,10 @@ async function seedProcessedInbox(
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
     processing_status,normalized_transaction,immutable_fingerprint,observed_at,
-    processed_at,terminal_at,purge_after
+    processed_at,terminal_at,purge_after,worker_admitted_at
   ) VALUES ($1,$2,ARRAY['WEBSOCKET'],
     ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],$3,'PROCESSED',
-    $4,$5,$6,$6,$7,$8)
+    $4,$5,$6,$6,$7,$8,$6)
   ON CONFLICT (signature) DO UPDATE SET
     target_confirmation_status=EXCLUDED.target_confirmation_status,
     processing_status='PROCESSED',processed_at=EXCLUDED.processed_at,
@@ -2562,10 +2562,10 @@ async function insertHistoricalPendingInbox(
 ):Promise<void>{
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
-    processing_status,observed_at,first_detected_at
+    processing_status,observed_at,first_detected_at,worker_admitted_at
   ) VALUES ('signature',10,ARRAY['WEBSOCKET'],
     ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],$1,'PENDING',
-    to_timestamp(1),to_timestamp(1))`,
+    to_timestamp(1),to_timestamp(1),to_timestamp(1))`,
   [confirmationStatus]);
 }
 
@@ -2629,13 +2629,13 @@ async function seedMixedReplayRows(
   ) INSERT INTO chain_transaction_inbox (
     signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
     processing_status,normalized_transaction,immutable_fingerprint,observed_at,processed_at,
-    terminal_at,purge_after
+    terminal_at,purge_after,worker_admitted_at
   ) SELECT $2||'-signature-'||value,9,ARRAY['WEBSOCKET'],
     ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],confirmation_status,
     'PROCESSED',jsonb_build_object('signature',$2||'-signature-'||value),$5,$4,$4,
     CASE WHEN confirmation_status IN ('finalized','orphaned') THEN $4::timestamptz END,
     CASE WHEN confirmation_status IN ('finalized','orphaned')
-      THEN $4::timestamptz+INTERVAL '4 hours' END
+      THEN $4::timestamptz+INTERVAL '4 hours' END,$4
     FROM replay`,[MINT,prefix,count,new Date(900),'e'.repeat(64)]);
 }
 

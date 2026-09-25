@@ -60,6 +60,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       '050_transaction_inbox_first_processing.sql',
       '051_transaction_inbox_decoder_quarantine_recovery.sql',
       '052_transaction_inbox_urgent_fairness.sql',
+      '053_transaction_inbox_worker_admission_foundation.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),
@@ -82,10 +83,10 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     await assert.rejects(pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, missing_finality_polls, last_missing_finality_provider_id,
-      finality_evidence_version, observed_at
+      finality_evidence_version, observed_at, worker_admitted_at
     ) VALUES (
       'negative-version', 1, ARRAY['WEBSOCKET'], ARRAY[$1], 'confirmed', 'PENDING',
-      1, 'primary', -1, NOW()
+      1, 'primary', -1, NOW(), NOW()
     )`, [programId]));
 
     await pool.query(sql);
@@ -148,8 +149,9 @@ async function insertInbox(
 ): Promise<void> {
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-    processing_status, missing_finality_polls, last_missing_finality_provider_id, observed_at
-  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY[$2], 'confirmed', 'PENDING', $3, $4, NOW())`, [
+    processing_status, missing_finality_polls, last_missing_finality_provider_id,
+    observed_at, worker_admitted_at
+  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY[$2], 'confirmed', 'PENDING', $3, $4, NOW(), NOW())`, [
     signature,
     programId,
     missingFinalityPolls,

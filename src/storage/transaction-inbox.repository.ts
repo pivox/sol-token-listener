@@ -591,10 +591,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             INSERT INTO chain_transaction_inbox (
               signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
               processing_status, observed_at, retry_max_attempts, retry_base_delay_ms,
-              ingestion_priority, ingestion_hint, ingestion_hint_mint, terminal_at, purge_after
+              ingestion_priority, ingestion_hint, ingestion_hint_mint, terminal_at, purge_after,
+              worker_admitted_at
             ) SELECT $1,$2,ARRAY[$3]::TEXT[],$4,$5,$12,$6,$7,$8,$9,$10,$11,
               CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) END,
-              CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) + INTERVAL '4 hours' END
+              CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) + INTERVAL '4 hours' END,
+              CASE WHEN $12='PENDING' THEN $6 END
               FROM decision_clock`,
             [
               value.signature,
@@ -670,6 +672,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              ingestion_priority = $7::chain_transaction_inbox_priority,
              ingestion_hint = $8,
              ingestion_hint_mint = $9,
+             worker_admitted_at = CASE
+               WHEN worker_admitted_at IS NULL
+                 AND (CASE WHEN $5 THEN 'PENDING' ELSE $10 END)='PENDING'
+                 THEN GREATEST(decision_clock.at,observed_at)
+               ELSE worker_admitted_at END,
              updated_at = GREATEST(updated_at, $6)
            FROM decision_clock WHERE signature = $1`,
           [
@@ -817,12 +824,18 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                ingestion_hint=$7,ingestion_hint_mint=$8,terminal_at=$9,
                purge_after=CASE WHEN $9::TIMESTAMPTZ IS NULL THEN NULL
                  ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
+               worker_admitted_at=CASE
+                 WHEN worker_admitted_at IS NULL
+                   AND (CASE WHEN $11 THEN 'PENDING' ELSE $5 END)='PENDING'
+                   THEN $12::TIMESTAMPTZ
+                 ELSE worker_admitted_at END,
                updated_at=GREATEST(updated_at,$10)
              WHERE signature=$1`,
             [
               value.signature, sources, programs, status, replayDecision.status,
               replayDecision.priority, replayDecision.hint, replayDecision.mint,
               replayTerminalAt, dateFromMs(value.observedAtMs), shouldReplay,
+              dateFromMs(value.classifiedAtMs),
             ],
           );
           requireOne(updated.rowCount);
@@ -838,10 +851,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                ingestion_priority,ingestion_hint,ingestion_hint_mint,terminal_at,purge_after,
                catch_up_classification_version,catch_up_disposition,catch_up_reason_code,
                catch_up_action_key,catch_up_mints,catch_up_evidence_fingerprint,catch_up_classified_at,
-               catch_up_enqueued,catch_up_admission_priority
+               catch_up_enqueued,catch_up_admission_priority,worker_admitted_at
              ) VALUES ($1,$2,ARRAY['CATCH_UP']::TEXT[],$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                CASE WHEN $12::TIMESTAMPTZ IS NULL THEN NULL ELSE $12::TIMESTAMPTZ+INTERVAL '4 hours' END,
-               $13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+               $13,$14,$15,$16,$17,$18,$19,$20,$21,
+               CASE WHEN $5='PENDING' THEN $19::TIMESTAMPTZ END)`,
             [
               value.signature, value.slot.toString(), value.programIds, value.confirmationStatus,
               decision.status, dateFromMs(value.observedAtMs), this.retryPolicy.maxAttempts,
@@ -897,6 +911,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              catch_up_classification_version=$10,catch_up_disposition=$11,catch_up_reason_code=$12,
              catch_up_action_key=$13,catch_up_mints=$14,catch_up_evidence_fingerprint=$15,
              catch_up_classified_at=$16,catch_up_enqueued=$19,catch_up_admission_priority=$20,
+             worker_admitted_at=CASE
+               WHEN worker_admitted_at IS NULL
+                 AND (CASE WHEN $17 THEN 'PENDING' WHEN $18 THEN $5 ELSE processing_status END)='PENDING'
+                 THEN $16::TIMESTAMPTZ
+               ELSE worker_admitted_at END,
              updated_at=GREATEST(updated_at,$16)
            WHERE signature=$1 AND catch_up_classification_version IS NULL`,
           [
@@ -1022,6 +1041,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              missing_finality_polls=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN inbox.missing_finality_polls ELSE 0 END,
              last_missing_finality_provider_id=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN inbox.last_missing_finality_provider_id END,
              finality_evidence_version=CASE WHEN CARDINALITY(inbox.program_ids)>1 THEN inbox.finality_evidence_version ELSE 0 END,
+             worker_admitted_at=CASE
+               WHEN inbox.worker_admitted_at IS NULL
+                 AND (decision.active OR CARDINALITY(inbox.program_ids)>1)
+                 THEN GREATEST(decision.at,inbox.observed_at)
+               ELSE inbox.worker_admitted_at END,
              updated_at=GREATEST(inbox.updated_at,decision.at)
            FROM decision
            WHERE inbox.ingestion_hint='PUMPFUN_TRADE' AND inbox.ingestion_hint_mint=$1

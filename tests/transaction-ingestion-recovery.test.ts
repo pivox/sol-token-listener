@@ -156,9 +156,9 @@ void test('claims a late prioritized launch before 2,000 normal rows and decodes
     const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at
+      processing_status, observed_at, worker_admitted_at
     ) SELECT 'normal-' || value, value, ARRAY['CATCH_UP'], ARRAY[$1], 'confirmed',
-      'PENDING', clock_timestamp()
+      'PENDING', statement_timestamp(), statement_timestamp()
       FROM generate_series(1, 2000) value`, [PUMP_PROGRAM_ID]);
     const repository = new PostgresTransactionInboxRepository(pool);
     await repository.enqueue(Object.freeze({
@@ -1110,14 +1110,17 @@ async function insertProcessed(
   ageHours: number,
 ): Promise<void> {
   await pool.query(
-    `INSERT INTO chain_transaction_inbox (
+    `WITH evidence_clock AS MATERIALIZED (
+       SELECT clock_timestamp() - ($4 * INTERVAL '1 hour') AS at
+     ) INSERT INTO chain_transaction_inbox (
        signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
        processing_status, normalized_transaction, immutable_fingerprint, observed_at,
-       processed_at, first_detected_at, first_processing_evidence_unavailable
+       worker_admitted_at, processed_at, first_detected_at,
+       first_processing_evidence_unavailable
      ) VALUES ($1, 1, ARRAY['WEBSOCKET'],
        ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], $2, 'PROCESSED',
-       '{}'::jsonb, $3, clock_timestamp() - ($4 * INTERVAL '1 hour'),
-       clock_timestamp() - ($4 * INTERVAL '1 hour'),NULL,TRUE)`,
+       '{}'::jsonb, $3, (SELECT at FROM evidence_clock),
+       (SELECT at FROM evidence_clock), (SELECT at FROM evidence_clock), NULL, TRUE)`,
     [signature, confirmationStatus, 'a'.repeat(64), ageHours],
   );
   if (confirmationStatus === 'finalized') {

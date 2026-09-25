@@ -1,6 +1,12 @@
 import 'dotenv/config';
 import { isIP } from 'node:net';
 import { requireSolanaGenesisHash } from '../domain/solana-genesis-hash.js';
+import {
+  DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  MAX_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  MIN_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  createPumpFunWorkerAdmissionPolicy,
+} from '../domain/worker-admission.js';
 import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 
 const DEFAULT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -10,6 +16,8 @@ const PUMPFUN_CATCH_UP_PAGE_ADMISSION_ERROR =
   'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED requires a safe observation envelope.';
 const PUMPFUN_CATCH_UP_COVERAGE_ERROR =
   'LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED requires observe-only launchpad page admission.';
+const PUMPFUN_BOUNDED_WORKER_ADMISSION_ACTIVATION_ERROR =
+  'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED is not available until the admission/classification delivery.';
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
@@ -57,6 +65,8 @@ export interface AppConfig {
   readonly qualificationMinimumScore: number | null;
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
+  readonly listenerPumpFunBoundedWorkerAdmissionEnabled: boolean;
+  readonly listenerPumpFunTrackingWindowSeconds: number;
   readonly listenerPumpFunCatchUpPageAdmissionEnabled: boolean;
   readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
@@ -175,6 +185,29 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   rejectPrivateKeyConfiguration(environment);
 
   const listenerEnabled = parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED');
+  const boundedWorkerAdmissionEnabled = parseStrictBoolean(
+    environment.LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED,
+    false,
+    'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED',
+  );
+  if (boundedWorkerAdmissionEnabled) {
+    throw new Error(PUMPFUN_BOUNDED_WORKER_ADMISSION_ACTIVATION_ERROR);
+  }
+  if (environment.LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS === '') {
+    throw new Error(
+      'LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS must be a canonical decimal integer.',
+    );
+  }
+  const workerAdmissionPolicy = createPumpFunWorkerAdmissionPolicy({
+    enabled: boundedWorkerAdmissionEnabled,
+    trackingWindowSeconds: parseCanonicalBoundedInteger(
+      environment.LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS,
+      DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+      'LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS',
+      MIN_PUMPFUN_TRACKING_WINDOW_SECONDS,
+      MAX_PUMPFUN_TRACKING_WINDOW_SECONDS,
+    ),
+  });
   const listenerPumpFunCatchUpPageAdmissionEnabled = parseStrictBoolean(
     environment.LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED,
     false,
@@ -333,6 +366,8 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
     listenerEnabled,
+    listenerPumpFunBoundedWorkerAdmissionEnabled: workerAdmissionPolicy.enabled,
+    listenerPumpFunTrackingWindowSeconds: workerAdmissionPolicy.trackingWindowSeconds,
     listenerPumpFunCatchUpPageAdmissionEnabled,
     listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,

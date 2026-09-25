@@ -514,6 +514,8 @@ void test('documents H2d-H2k external evidence without starting a canary',
     ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'052_transaction_inbox_urgent_fairness\.sql'/gu)
     ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'053_transaction_inbox_worker_admission_foundation\.sql'/gu)
+    ?? []).length, 1);
   const trackedTradeMigrationHash = createHash('sha256').update(trackedTradeMigration).digest('hex');
   assert.notEqual(trackedTradeMigrationHash, '0'.repeat(64));
   assert.equal(
@@ -531,7 +533,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
     'live migration catalogue contains the exact 047 bytes hash once',
   );
   assert.equal(
-  /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n {2}'042_execution_preflight_intent_preparation\.sql',\n {2}'043_execution_intent_causal_lineage\.sql',\n {2}'044_transaction_inbox_launch_priority\.sql',\n {2}'045_execution_wallet_snapshot_refresh\.sql',\n {2}'046_listener_strict_catch_up_runs\.sql',\n {2}'047_transaction_inbox_tracked_trade_priority\.sql',\n {2}'048_transaction_inbox_catch_up_classification\.sql',\n {2}'049_transaction_inbox_catch_up_admission_receipt\.sql',\n {2}'050_transaction_inbox_first_processing\.sql',\n {2}'051_transaction_inbox_decoder_quarantine_recovery\.sql',\n {2}'052_transaction_inbox_urgent_fairness\.sql',\n\]\);/u.test(deploymentSmoke),
+  /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n {2}'041_execution_preflight_intent_pairs\.sql',\n {2}'042_execution_preflight_intent_preparation\.sql',\n {2}'043_execution_intent_causal_lineage\.sql',\n {2}'044_transaction_inbox_launch_priority\.sql',\n {2}'045_execution_wallet_snapshot_refresh\.sql',\n {2}'046_listener_strict_catch_up_runs\.sql',\n {2}'047_transaction_inbox_tracked_trade_priority\.sql',\n {2}'048_transaction_inbox_catch_up_classification\.sql',\n {2}'049_transaction_inbox_catch_up_admission_receipt\.sql',\n {2}'050_transaction_inbox_first_processing\.sql',\n {2}'051_transaction_inbox_decoder_quarantine_recovery\.sql',\n {2}'052_transaction_inbox_urgent_fairness\.sql',\n {2}'053_transaction_inbox_worker_admission_foundation\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );
