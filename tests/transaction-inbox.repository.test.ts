@@ -681,11 +681,12 @@ void test('retention anchors post-migration classifications to durable detection
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, observed_at, first_detected_at, error_code, error_name,
-      error_retryable, terminal_at, purge_after
+      error_retryable, terminal_at, purge_after, worker_admitted_at
     ) VALUES ('legacy-null-detection-retention', 2, ARRAY['CATCH_UP'], ARRAY[$1],
       'confirmed', 'FAILED', to_timestamp($2::BIGINT / 1000.0), NULL,
       'NORMALIZATION_FAILED', 'LegacyFailure', FALSE,
-      to_timestamp($2::BIGINT / 1000.0), to_timestamp($2::BIGINT / 1000.0)+INTERVAL '4 hours')`,
+      to_timestamp($2::BIGINT / 1000.0), to_timestamp($2::BIGINT / 1000.0)+INTERVAL '4 hours',
+      to_timestamp($2::BIGINT / 1000.0))`,
     [PUMP_PROGRAM_ID, classifiedAtMs]);
 
     assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
@@ -765,10 +766,11 @@ void test('uses a 50,001st deterministic overflow probe without counting it in t
     const startedAtMs = Date.now() - FIRST_PROCESSING_COHORT_DURATION_MS - 100_000;
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at, first_detected_at
+      processing_status, observed_at, first_detected_at, worker_admitted_at
     ) SELECT 'canary-cap-' || LPAD(series::TEXT, 5, '0'), series, ARRAY['WEBSOCKET'],
       ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
-      to_timestamp(($1::BIGINT - 3600000) / 1000.0), to_timestamp($1::BIGINT / 1000.0)
+      to_timestamp(($1::BIGINT - 3600000) / 1000.0), to_timestamp($1::BIGINT / 1000.0),
+      to_timestamp(($1::BIGINT - 3600000) / 1000.0)
       FROM generate_series(1, $2) AS series`, [startedAtMs, FIRST_PROCESSING_COHORT_CAPACITY + 1]);
 
     const evidence = await repository.firstProcessingCanary(startedAtMs);
@@ -803,10 +805,12 @@ void test('counts one completed duration, excludes pre-cohort and historical row
     await insertCanaryInboxRow(pool, 'canary-before-start', startedAtMs - 1, startedAtMs + 44_998);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at, first_detected_at, first_processing_evidence_unavailable
+      processing_status, observed_at, first_detected_at, first_processing_evidence_unavailable,
+      worker_admitted_at
     ) VALUES ('canary-historical', 2, ARRAY['WEBSOCKET'],
       ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'PENDING',
-      to_timestamp($1::BIGINT / 1000.0), NULL, TRUE)`, [startedAtMs]);
+      to_timestamp($1::BIGINT / 1000.0), NULL, TRUE,
+      to_timestamp($1::BIGINT / 1000.0))`, [startedAtMs]);
 
     const evidence = await repository.firstProcessingCanary(startedAtMs);
     assert.equal(evidence.eligibleCount, 1);
@@ -2539,6 +2543,91 @@ void test('defers untracked trade hints durably without claims, finality, retry 
   });
 });
 
+void test('records legacy worker admission once while leaving pristine terminal decisions unadmitted', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+
+    const websocketSignature = 'worker-admission-websocket';
+    await assert.doesNotReject(() => repository.enqueue(notification(
+      websocketSignature, 1n, 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE',
+    )), 'WebSocket create admission must succeed');
+    const websocketAdmission = (await row(pool, websocketSignature)).worker_admitted_at;
+    assert.equal(websocketAdmission.getTime(), 1_000);
+    await assert.doesNotReject(() => repository.enqueue(notification(
+      websocketSignature, 1n, 'WEBSOCKET', 'confirmed', 2_000, 'PUMPFUN_CREATE',
+    )), 'WebSocket create replay must preserve admission');
+    assert.equal((await row(pool, websocketSignature)).worker_admitted_at.getTime(), 1_000);
+
+    const actionable = catchUpClassification('worker-admission-catch-up');
+    await assert.doesNotReject(
+      () => repository.recordCatchUpClassification(actionable),
+      'actionable catch-up admission must succeed',
+    );
+    const actionableAdmission = (await row(pool, actionable.signature)).worker_admitted_at;
+    assert.equal(actionableAdmission.getTime(), actionable.classifiedAtMs);
+    await assert.doesNotReject(() => repository.recordCatchUpClassification(createCatchUpClassification({
+      ...actionable, observedAtMs: 2_000, classifiedAtMs: 2_001,
+    })), 'actionable catch-up replay must preserve admission');
+    assert.equal((await row(pool, actionable.signature)).worker_admitted_at.getTime(),
+      actionable.classifiedAtMs);
+
+    const promotedSignature = 'worker-admission-tracked-promotion';
+    await assert.doesNotReject(
+      () => repository.enqueue(tradeNotification(promotedSignature, 2n)),
+      'untracked trade must remain unadmitted',
+    );
+    assert.equal((await row(pool, promotedSignature)).worker_admitted_at, null);
+    await insertTrackedLaunch(pool);
+    await assert.doesNotReject(
+      () => repository.syncTrackedMint(tradeMint),
+      'tracked-mint promotion must admit once',
+    );
+    const promotedAdmission = (await row(pool, promotedSignature)).worker_admitted_at;
+    assert.ok(promotedAdmission instanceof Date);
+    await assert.doesNotReject(
+      () => repository.syncTrackedMint(tradeMint),
+      'tracked-mint replay must preserve admission',
+    );
+    await assert.doesNotReject(
+      () => repository.enqueue(tradeNotification(promotedSignature, 2n)),
+      'tracked trade replay must preserve admission',
+    );
+    assert.equal((await row(pool, promotedSignature)).worker_admitted_at.getTime(),
+      promotedAdmission.getTime());
+
+    const lateCreateSignature = 'worker-admission-late-create';
+    await pool.query('UPDATE token_launches SET terminal_at=clock_timestamp() WHERE mint=$1', [tradeMint]);
+    await assert.doesNotReject(
+      () => repository.enqueue(tradeNotification(lateCreateSignature, 3n)),
+      'inactive trade must remain unadmitted',
+    );
+    assert.equal((await row(pool, lateCreateSignature)).worker_admitted_at, null);
+    await assert.doesNotReject(() => repository.enqueue(notification(
+      lateCreateSignature, 3n, 'WEBSOCKET', 'processed', 3_000, 'PUMPFUN_CREATE',
+    )), 'late create must admit deferred work once');
+    const lateCreateAdmission = (await row(pool, lateCreateSignature)).worker_admitted_at;
+    assert.ok(lateCreateAdmission instanceof Date);
+    await assert.doesNotReject(() => repository.enqueue(notification(
+      lateCreateSignature, 3n, 'WEBSOCKET', 'confirmed', 4_000, 'PUMPFUN_CREATE',
+    )), 'late create replay must preserve admission');
+    assert.equal((await row(pool, lateCreateSignature)).worker_admitted_at.getTime(),
+      lateCreateAdmission.getTime());
+
+    for (const [signature, disposition, reasonCode, ingestionHint, ingestionHintMint, mints] of [
+      ['worker-admission-deferred', 'DEFERRED', 'PUMP_TRADE_UNTRACKED',
+        'PUMPFUN_TRADE', tradeMint, [tradeMint]],
+      ['worker-admission-ignored', 'IGNORED', 'NO_SUPPORTED_PUMP_ACTION', null, null, []],
+      ['worker-admission-quarantined', 'QUARANTINED', 'PUMP_SCHEMA_UNSUPPORTED', null, null, []],
+    ] as const) {
+      await assert.doesNotReject(() => repository.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput(signature), disposition, reasonCode,
+        ingestionHint, ingestionHintMint, mints,
+      })), `${signature} must remain unadmitted`);
+      assert.equal((await row(pool, signature)).worker_admitted_at, null, signature);
+    }
+  });
+});
+
 void test('uses canonical active launch membership at enqueue and rejects terminal membership', async (context) => {
   await withDatabase(context, async (pool) => {
     await insertTrackedLaunch(pool);
@@ -2734,13 +2823,15 @@ void test('syncTrackedMint uses a mint-selective index for activation and deacti
     assert.equal(version.rows[0]?.major, 16);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, ingestion_hint, ingestion_hint_mint, observed_at, terminal_at, purge_after
+      processing_status, ingestion_hint, ingestion_hint_mint, observed_at, terminal_at, purge_after,
+      worker_admitted_at
     ) SELECT 'unrelated-' || value, value, ARRAY['WEBSOCKET'], ARRAY[$1], 'confirmed',
       CASE WHEN value % 3 = 0 THEN 'DEFERRED' ELSE 'PENDING' END,
       CASE WHEN value % 3 = 1 THEN 'NONE' ELSE 'PUMPFUN_TRADE' END,
       CASE WHEN value % 3 <> 1 THEN $2 END, at,
       CASE WHEN value % 3 = 0 THEN at END,
-      CASE WHEN value % 3 = 0 THEN at + INTERVAL '4 hours' END
+      CASE WHEN value % 3 = 0 THEN at + INTERVAL '4 hours' END,
+      CASE WHEN value % 3 = 0 THEN NULL ELSE at END
       FROM generate_series(1, 100000) value CROSS JOIN (SELECT NOW() AS at) observed`,
     [PUMP_PROGRAM_ID, '1'.repeat(32)]);
     const plans: ExplainPlan[] = [];
@@ -3116,9 +3207,9 @@ void test('upgrades duplicate creation hints monotonically and claims a late lau
     const repository = new PostgresTransactionInboxRepository(pool);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at
+      processing_status, observed_at, worker_admitted_at
     ) SELECT 'normal-' || value, value, ARRAY['CATCH_UP'], ARRAY[$1], 'confirmed',
-      'PENDING', clock_timestamp()
+      'PENDING', clock_timestamp(), clock_timestamp()
       FROM generate_series(1, 2000) value`, [PUMP_PROGRAM_ID]);
     await repository.enqueue(notification(
       'normal-upgraded',
@@ -3434,13 +3525,15 @@ void test('rotates a bounded finality page after every durable poll using databa
       await pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids,
         target_confirmation_status, processing_status, normalized_transaction,
-        immutable_fingerprint, observed_at, processed_at, created_at, updated_at
+        immutable_fingerprint, observed_at, processed_at, created_at, updated_at,
+        worker_admitted_at
       ) VALUES (
         $1, $2::BIGINT, ARRAY['WEBSOCKET'], ARRAY[$3], 'confirmed', 'PROCESSED',
         '{}'::JSONB, $4, '2000-01-01T00:00:00Z'::TIMESTAMPTZ,
         '2000-01-01T00:00:00Z'::TIMESTAMPTZ + ($2::BIGINT * INTERVAL '1 second'),
         '2000-01-01T00:00:00Z'::TIMESTAMPTZ,
-        '2000-01-01T00:00:00Z'::TIMESTAMPTZ + ($2::BIGINT * INTERVAL '1 second')
+        '2000-01-01T00:00:00Z'::TIMESTAMPTZ + ($2::BIGINT * INTERVAL '1 second'),
+        '2000-01-01T00:00:00Z'::TIMESTAMPTZ
       )`, [signature, index + 1, PUMP_PROGRAM_ID, 'a'.repeat(64)]);
     }
 
@@ -4439,9 +4532,9 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
     await insertTerminal(pool, 'keep-me', new Date(Date.now() + 60_000));
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at, first_detected_at
+      processing_status, observed_at, first_detected_at, worker_admitted_at
     ) VALUES ('failed-purge-me', 51, ARRAY['WEBSOCKET'], ARRAY[$1],
-      'processed', 'PENDING', clock_timestamp(), NULL)`, [PUMP_PROGRAM_ID]);
+      'processed', 'PENDING', clock_timestamp(), NULL, clock_timestamp())`, [PUMP_PROGRAM_ID]);
     const failedClaim = await repository.claim(Date.now(), 120);
     assert.equal(failedClaim?.signature, 'failed-purge-me');
     await repository.markFailed('failed-purge-me', failedClaim.leaseToken, Object.freeze({
@@ -5209,7 +5302,11 @@ void test('leaves strict race evidence resolved in record-first and CAS-first or
 void test('records immutable strict failures once and resolves only the exact nullable boundary', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
-    const lifecycleStartedAt = Date.now();
+    const databaseNowMs = async (): Promise<number> => Number((await pool.query(
+      `SELECT (EXTRACT(EPOCH FROM date_trunc('milliseconds', clock_timestamp())) * 1000)::BIGINT
+         AS now_ms`,
+    )).rows[0]?.now_ms);
+    const lifecycleStartedAt = await databaseNowMs();
     const absentPrimary = strictFailure('launchpad', null, 'primary', 99n, 500_000);
     const absentFallback = strictFailure('launchpad', null, 'fallback-1', 99n, 500_001);
     const previous = checkpoint('launchpad', 45n, 'resolved-boundary', 499_000);
@@ -5227,7 +5324,7 @@ void test('records immutable strict failures once and resolves only the exact nu
     await repository.recordStrictCatchUpFailure(otherBoundary);
     await repository.compareAndSwapCheckpoint(null, otherKeyPrevious);
     await repository.recordStrictCatchUpFailure(otherKey);
-    const lifecycleFinishedAt = Date.now();
+    const lifecycleFinishedAt = await databaseNowMs();
 
     const replayed = await pool.query(
       `SELECT (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint AS detected_at_ms
@@ -5262,9 +5359,9 @@ void test('records immutable strict failures once and resolves only the exact nu
       failure_id: otherKey.failureId, resolved: false, resolved_at: null, purge_after: null,
     });
 
-    const resolutionStartedAt = Date.now();
+    const resolutionStartedAt = await databaseNowMs();
     await repository.resolveStrictCatchUpFailures('launchpad', previous);
-    const resolutionFinishedAt = Date.now();
+    const resolutionFinishedAt = await databaseNowMs();
     await repository.resolveStrictCatchUpFailures('launchpad', previous);
     const resolvedPresent = await pool.query(
       `SELECT resolved_at IS NOT NULL AS resolved, resolved_at, purge_after
@@ -5434,31 +5531,32 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
   await withDatabase(context, async (pool) => {
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at
+      processing_status, observed_at, worker_admitted_at
     ) SELECT 'pending-' || value, value + 20000, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
-      'PENDING', clock_timestamp()
+      'PENDING', clock_timestamp(), clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, error_code, error_name, error_retryable, next_attempt_at, observed_at
+      processing_status, error_code, error_name, error_retryable, next_attempt_at, observed_at,
+      worker_admitted_at
     ) SELECT 'retry-' || value, value, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
       'FAILED', 'RPC_TRANSIENT', 'RpcError', TRUE, clock_timestamp() + INTERVAL '1 day',
-      clock_timestamp()
+      clock_timestamp(), clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, lease_token, lease_expires_at, observed_at
+      processing_status, lease_token, lease_expires_at, observed_at, worker_admitted_at
     ) SELECT 'leased-' || value, value + 10000, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
       'PROCESSING', 'lease-' || value, clock_timestamp() + INTERVAL '1 day',
-      clock_timestamp()
+      clock_timestamp(), clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, observed_at, ingestion_priority
+      processing_status, observed_at, ingestion_priority, worker_admitted_at
     ) VALUES (
       'late-launch', 99999, ARRAY['WEBSOCKET'],
       ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
-      'PENDING', clock_timestamp(), 'LAUNCH_CANDIDATE'
+      'PENDING', clock_timestamp(), 'LAUNCH_CANDIDATE', clock_timestamp()
     )`);
     await pool.query('ANALYZE chain_transaction_inbox');
     const version = await pool.query<{ readonly major: string }>(
@@ -6036,12 +6134,14 @@ async function insertCanaryInboxRow(
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, normalized_transaction, immutable_fingerprint, observed_at,
-    processed_at, first_detected_at, first_processed_at, first_processing_evidence_unavailable,
-    terminal_at, purge_after, error_code, error_name, error_retryable, retry_exhausted_at
+    worker_admitted_at, processed_at, first_detected_at, first_processed_at,
+    first_processing_evidence_unavailable, terminal_at, purge_after, error_code, error_name,
+    error_retryable, retry_exhausted_at
   ) VALUES (
     $1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
     $4, CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE '{}'::JSONB END,
     CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE $7 END, to_timestamp(($2::BIGINT - 3600000) / 1000.0),
+    to_timestamp(($2::BIGINT - 3600000) / 1000.0),
     CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE to_timestamp($3::BIGINT / 1000.0) END,
     to_timestamp($2::BIGINT / 1000.0), CASE WHEN $3::BIGINT IS NULL THEN NULL ELSE to_timestamp($3::BIGINT / 1000.0) END,
     $5::BOOLEAN, CASE WHEN $4::TEXT='FAILED' THEN to_timestamp($2::BIGINT / 1000.0) END,
@@ -6089,10 +6189,11 @@ async function insertTerminal(
   await pool.query(`INSERT INTO chain_transaction_inbox (
     signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, normalized_transaction, immutable_fingerprint, observed_at,
-    processed_at, terminal_at, purge_after, first_detected_at
+    processed_at, terminal_at, purge_after, first_detected_at, worker_admitted_at
   ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'finalized', 'PROCESSED', $2, $3,
     $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
-    $4::TIMESTAMPTZ + INTERVAL '4 hours', NULL)`, [signature, snapshot, 'a'.repeat(64), completedAt]);
+    $4::TIMESTAMPTZ + INTERVAL '4 hours', NULL, $4::TIMESTAMPTZ)`,
+  [signature, snapshot, 'a'.repeat(64), completedAt]);
   await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
     signature,observed_slot,confirmation_status,finality_evidence_version,
     immutable_fingerprint,replay_completed_at
