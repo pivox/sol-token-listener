@@ -67,6 +67,14 @@ export class PaperDecisionWorkerError extends Error {
 
 interface QualificationRebuilder {
   reauthorize(projection: CanonicalQualificationProjection): RebuiltQualification;
+  rebuildWithQuotes?: (
+    mint: string,
+    buyQuote: PaperExecutionQuote | null,
+    reverseSellQuote: PaperExecutionQuote | null,
+  ) => Promise<Readonly<{
+    kind: 'UPDATED' | 'UNCHANGED' | 'DISSOLVED';
+    projection: CanonicalQualificationProjection | null;
+  }>>;
 }
 
 interface CandidateBuilder {
@@ -267,6 +275,25 @@ export class PaperDecisionWorker {
             : new PaperQuoteError('QUOTE_STATE_INCONSISTENT','Paper quote failed.');
           reverseSellQuote=null;
         }
+      }
+      if (!this.paperReady()) return this.readinessLost(job, lease);
+    }
+    if (paperEnabled) {
+      if (this.qualification.rebuildWithQuotes === undefined) {
+        return this.fail(job,lease,'DECISION_INVALID',false,null);
+      }
+      try {
+        const quoteBacked=await this.qualification.rebuildWithQuotes(
+          snapshot.mint,buyQuote ?? null,reverseSellQuote ?? null,
+        );
+        if (quoteBacked.projection === null || quoteBacked.kind === 'DISSOLVED') {
+          return await this.fail(job,lease,'RPC_TRANSIENT',true,null);
+        }
+        rebuilt=authorizedQualification(
+          this.qualification.reauthorize(quoteBacked.projection),quoteBacked.projection,
+        );
+      } catch {
+        return this.fail(job,lease,'DECISION_INVALID',false,null);
       }
       if (!this.paperReady()) return this.readinessLost(job, lease);
     }

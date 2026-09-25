@@ -537,7 +537,7 @@ export function createProductionListenerRuntime(
   const paperWorker = new PaperDecisionWorker(
     paperRepository,
     quoteRouter,
-    qualificationRebuilder,
+    qualification,
     new TradingCandidateService({
       strategy: { id: config.paperStrategyId, version: config.paperStrategyVersion },
       quoteMintAllowlist: config.paperQuoteMintAllowlist,

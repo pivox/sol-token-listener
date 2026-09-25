@@ -231,6 +231,26 @@ void test('quotes both directions, stages BUY_PENDING before the ledger and comp
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
+void test('persists and authorizes the quote-backed qualification before paper candidate creation', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('ELIGIBLE');
+  const quotes = new FakeQuotes();
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind, 'completed');
+  assert.equal(services.qualification.quoteBackedCalls.length, 1);
+  assert.equal(services.qualification.quoteBackedCalls[0]?.mint, 'MINT');
+  assert.equal(services.qualification.quoteBackedCalls[0]?.buyQuote?.id, 'buy');
+  assert.equal(services.qualification.quoteBackedCalls[0]?.reverseSellQuote?.id, 'reverse');
+  assert.equal(
+    services.candidates.calls[0]?.reportId,
+    canonicalQualification().reportId,
+  );
+});
+
 void test('turns a typed transient quote error into a bounded repository retry', async () => {
   const repository = new FakeRepository([claim()]);
   const quotes = new FakeQuotes();
@@ -1209,6 +1229,11 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   };
   const qualification = {
     calls:[] as CanonicalQualificationProjection[],
+    quoteBackedCalls:[] as Readonly<{
+      mint:string;
+      buyQuote:PaperExecutionQuote|null;
+      reverseSellQuote:PaperExecutionQuote|null;
+    }>[],
     rejected:null as CanonicalQualificationProjection|null,
     beforeReauthorize:()=>undefined,
     authorizedReport:rebuilt.report,
@@ -1219,6 +1244,17 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       return Object.freeze({
         ...rebuilt,reportId:'qreport_authorized',reportEventId:'evt_authorized',
         evidenceFingerprint:'e'.repeat(64),event:event('QualificationUpdated','evt_authorized'),
+      });
+    },
+    async rebuildWithQuotes(
+      mint:string,
+      buyQuote:PaperExecutionQuote|null,
+      reverseSellQuote:PaperExecutionQuote|null,
+    ) {
+      this.quoteBackedCalls.push(Object.freeze({ mint,buyQuote,reverseSellQuote }));
+      return Object.freeze({
+        kind:'UPDATED' as const,
+        projection:canonicalQualification(),
       });
     },
   };

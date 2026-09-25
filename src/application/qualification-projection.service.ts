@@ -1,5 +1,7 @@
 import { isProxy } from 'node:util/types';
+import type { PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { QualificationRebuildService } from './qualification-rebuild.service.js';
+import type { RebuiltQualification } from './qualification-rebuild.service.js';
 import type { MissingCanonicalLaunchPolicy } from '../domain/projection-reconciliation.js';
 import type {
   CanonicalQualificationProjection,
@@ -46,6 +48,31 @@ export class QualificationProjectionService {
     if (!isMissingCanonicalLaunchPolicy(missingLaunchPolicy)) {
       throw new TypeError('Qualification projection missing launch policy is invalid.');
     }
+    return this.rebuildCanonical(mint, missingLaunchPolicy, undefined, undefined);
+  }
+
+  public async rebuildWithQuotes(
+    mint: string,
+    buyQuote: PaperExecutionQuote | null,
+    reverseSellQuote: PaperExecutionQuote | null,
+  ): Promise<QualificationProjectionRebuildResult> {
+    return this.rebuildCanonical(mint, 'ERROR', buyQuote, reverseSellQuote);
+  }
+
+  public reauthorize(projection: CanonicalQualificationProjection): RebuiltQualification {
+    return this.rebuilder.reauthorize(projection);
+  }
+
+  private async rebuildCanonical(
+    mint: string,
+    missingLaunchPolicy: MissingCanonicalLaunchPolicy,
+    buyQuote: PaperExecutionQuote | null | undefined,
+    reverseSellQuote: PaperExecutionQuote | null | undefined,
+  ): Promise<QualificationProjectionRebuildResult> {
+    assertCanonicalMint(mint, 'Qualification projection mint is invalid.');
+    if (!isMissingCanonicalLaunchPolicy(missingLaunchPolicy)) {
+      throw new TypeError('Qualification projection missing launch policy is invalid.');
+    }
     const result = await this.repository.transact<
       QualificationProjectionRebuildResult | typeof MISSING_CANONICAL_LAUNCH
     >(mint, async (transaction) => {
@@ -57,10 +84,11 @@ export class QualificationProjectionService {
         await transaction.dissolveCurrent(mint);
         return Object.freeze({ kind:'DISSOLVED' as const, projection:null });
       }
+      assertQuotePair(snapshot, buyQuote, reverseSellQuote, this.quoteMintAllowlist);
       const rebuilt = this.rebuilder.rebuild({
         snapshot,
-        buyQuote:undefined,
-        reverseSellQuote:undefined,
+        buyQuote,
+        reverseSellQuote,
         upstreamConditions:Object.freeze([Object.freeze({
           code:'UNSUPPORTED_QUOTE_MINT' as const,
           triggered:!snapshot.launch.quoteAssets.some((asset) => (
@@ -84,6 +112,30 @@ export class QualificationProjectionService {
       throw new QualificationProjectionLaunchNotFoundError(mint);
     }
     return result;
+  }
+}
+
+function assertQuotePair(
+  snapshot: Parameters<QualificationRebuildService['rebuild']>[0]['snapshot'],
+  buyQuote: PaperExecutionQuote | null | undefined,
+  reverseSellQuote: PaperExecutionQuote | null | undefined,
+  quoteMintAllowlist: readonly string[],
+): void {
+  if (buyQuote === undefined && reverseSellQuote === undefined) return;
+  if (buyQuote === null && reverseSellQuote === null) return;
+  if (buyQuote === null || buyQuote === undefined) {
+    throw new TypeError('Qualification projection quote pair is invalid.');
+  }
+  const buyValid = buyQuote.outputMint === snapshot.mint
+    && quoteMintAllowlist.includes(buyQuote.inputMint)
+    && snapshot.launch.quoteAssets.some((asset) => asset.mint === buyQuote.inputMint);
+  const reverseValid = reverseSellQuote === null || (
+    reverseSellQuote?.inputMint === snapshot.mint
+    && reverseSellQuote.outputMint === buyQuote.inputMint
+    && reverseSellQuote.amountInRaw === buyQuote.minimumAmountOutRaw
+  );
+  if (!buyValid || !reverseValid) {
+    throw new TypeError('Qualification projection quote pair is invalid.');
   }
 }
 
