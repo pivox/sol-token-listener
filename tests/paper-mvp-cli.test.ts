@@ -109,6 +109,23 @@ void test('accepts bounded configurable N and configured take profit values', ()
   });
 });
 
+void test('requires the exact technical MVP profile without a score override', () => {
+  const historical = parseConfig({
+    SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
+    SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid', EXECUTION_MODE: 'paper',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
+    CREATION_STRATEGY_ENABLED: 'true', PAPER_ENTRY_QUOTE_AMOUNT_RAW: '1000',
+    PAPER_SLIPPAGE_BPS: '100', EXTERNAL_MIN_BUY_AMOUNT_RAW: '1',
+    QUALIFICATION_PROFILE_PATH: 'config/qualification/pumpfun-v1-unvalidated.json',
+    RISK_MAX_ROUNDTRIP_LOSS_BPS: '3000',
+  });
+  assert.throws(() => { assertPaperMvpSafety(historical); }, isCliError('SAFETY_GATE_FAILED'));
+  assert.throws(
+    () => { assertPaperMvpSafety({ ...paperConfig(), qualificationMinimumScore: 39 }); },
+    isCliError('SAFETY_GATE_FAILED'),
+  );
+});
+
 void test('runs the real bootstrap lifetime, reaches target, verifies durable state, and exports wx 0600', async (context) => {
   const directory = await mkdtemp(join(tmpdir(), 'paper-mvp-cli-'));
   context.after(async () => rm(directory, { recursive: true, force: true }));
@@ -230,7 +247,6 @@ void test('rejects every changed effective creation-entry input before listener 
     { ...baseline,paperDecisionWorkerLeaseSeconds:31 },
     { ...baseline,paperDecisionRetryMaxAttempts:6 },
     { ...baseline,paperDecisionRetryBaseDelayMs:501 },
-    { ...baseline,qualificationMinimumScore:61 },
   ];
   for (const config of changedConfigurations) {
     const repository = new MemoryRepository();
@@ -708,7 +724,7 @@ function paperConfig(): AppConfig {
     SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
     CREATION_STRATEGY_ENABLED: 'true', PAPER_ENTRY_QUOTE_AMOUNT_RAW: '1000',
     PAPER_SLIPPAGE_BPS: '100', EXTERNAL_MIN_BUY_AMOUNT_RAW: '1',
-    QUALIFICATION_PROFILE_PATH: 'config/qualification/pumpfun-v1-unvalidated.json',
+    QUALIFICATION_PROFILE_PATH: 'config/qualification/pumpfun-mvp-technical-v1.json',
     RISK_MAX_ROUNDTRIP_LOSS_BPS: '3000',
   });
 }

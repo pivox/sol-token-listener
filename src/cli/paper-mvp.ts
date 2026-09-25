@@ -571,6 +571,15 @@ async function requiredRunningSnapshot(
 }
 
 export function assertPaperMvpSafety(config: AppConfig): void {
+  let profileId: string;
+  let profileVersion: number;
+  try {
+    const profile = createQualificationEngine(config).profileSummary;
+    profileId = profile.id;
+    profileVersion = profile.version;
+  } catch {
+    throw new PaperMvpCliError('SAFETY_GATE_FAILED');
+  }
   if (
     config.cluster !== 'mainnet-beta'
     || config.executionMode !== 'paper'
@@ -583,6 +592,9 @@ export function assertPaperMvpSafety(config: AppConfig): void {
     || config.paperExternalBuyTarget > 1_000
     || config.creationTakeProfitMultiplierBps < 10_000n
     || config.creationTakeProfitMultiplierBps > 1_000_000n
+    || profileId !== 'pumpfun-mvp-technical-v1'
+    || profileVersion !== 1
+    || config.qualificationMinimumScore !== null
     || config.paperQuoteMintAllowlist.length !== 1
     || config.paperQuoteMintAllowlist[0] !== config.wsolMint
   ) throw new PaperMvpCliError('SAFETY_GATE_FAILED');
