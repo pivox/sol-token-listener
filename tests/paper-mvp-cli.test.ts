@@ -28,6 +28,7 @@ import {
 } from '../src/cli/paper-mvp.js';
 import { acquirePostgresRunner } from '../src/cli/paper-mvp-runtime.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
+import { paperMvpCycleEvidence } from './fixtures/paper-mvp-cycle-evidence.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const OWNER = 'paper-mvp-owner-test';
@@ -227,6 +228,25 @@ void test('runs the real bootstrap lifetime, reaches target, verifies durable st
   }), isCliError('REPORT_EXPORT_FAILED'));
   assert.equal(exportFailureRepository.snapshot?.run.state, 'COMPLETED');
   assert.equal(exportFailureRepository.snapshot?.run.verdict, 'PASS');
+});
+
+void test('exports INCOMPLETE with exit 2 when a profitable closure has no causal evidence', async () => {
+  const repository = new MemoryRepository();
+  const result = await runPaperMvp({ ...options(), targetClosedPositions: 1 }, {
+    ...dependencies(repository), now: sequenceClock(1_000, 2_000, 2_001, 3_000),
+    createCollector: () => ({ collect: async () => {
+      repository.addSample(sample());
+      repository.setProviderUsage(availableProbeSnapshot());
+      assert.ok(repository.snapshot);
+      repository.snapshot = { ...repository.snapshot, causalEvidence: null };
+      return emptyCollection();
+    } }),
+    createStopController: () => stopController('POLL'),
+  });
+  assert.equal(result.exitCode, 2);
+  assert.equal(result.report?.verdict, 'FAIL');
+  assert.equal(result.report?.oneShotCycle.functionalStatus, 'INCOMPLETE');
+  assert.equal(result.report?.historicalCampaignReport.verdict, 'PASS');
 });
 
 void test('resumes compatible state, rejects incompatible state, and keeps provider-unavailable honest', async () => {
@@ -954,7 +974,13 @@ class MemoryRepository implements PaperMvpRepository {
       }),
       closedPositions: samples.length,
       updatedAtMs: this.snapshot.run.updatedAtMs + 1 });
-    this.snapshot = Object.freeze({ ...this.snapshot, run, samples });
+    this.snapshot = Object.freeze({ ...this.snapshot, run, samples,
+      causalEvidence: paperMvpCycleEvidence({ positionId: value.positionId, mint: value.mint,
+        quoteMint: value.quoteMint, fingerprint: run.configuration.qualificationProfileFingerprint,
+        target: run.configuration.externalUniqueBuyersTarget, buyAtMs: value.paperBuyAtMs,
+        sellAtMs: value.paperSellAtMs, entryQuoteAtMs: value.entryQuoteAtMs,
+        exitTriggerAtMs: value.exitTriggerAtMs }),
+    });
   }
 
   public setProviderUsage(value: ReturnType<typeof availableProbeSnapshot>): void {

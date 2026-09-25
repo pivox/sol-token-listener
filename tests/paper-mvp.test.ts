@@ -6,6 +6,7 @@ import {
   createPaperMvpOneShotReport,
   type PaperMvpReportV1,
 } from '../src/domain/paper-mvp.js';
+import { paperMvpCycleEvidence } from './fixtures/paper-mvp-cycle-evidence.js';
 
 void test('creates an exact causal sample and applies both network fees', () => {
   const value = createPaperMvpPositionSample(sampleInput());
@@ -97,6 +98,7 @@ void test('reports a completed one-shot cycle for configurable N independently o
     maxDurationMs: 60_000,
     externalUniqueBuyersTarget: 3,
     qualificationProfileFingerprint: 'a'.repeat(64),
+    causalEvidence: paperMvpCycleEvidence(),
   });
 
   assert.equal(report.schemaVersion, 'paper-mvp.v3');
@@ -130,6 +132,47 @@ void test('reports a completed one-shot cycle for configurable N independently o
     takeProfitReached: 0,
     safetyExit: 0,
   });
+});
+
+void test('does not infer counted buyers from the sell reason without exact causal evidence', () => {
+  const evidence = paperMvpCycleEvidence();
+  const input = {
+    runId: 'causal-run', completionReason: 'TARGET_REACHED' as const,
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 1,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 1,
+    entriesRejected: 0, openedPositions: 1, openPositions: 0,
+    samples: [createPaperMvpPositionSample(sampleInput())],
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: { status: 'AVAILABLE' as const, creditsUsedStart: 1n,
+      creditsUsedEnd: 2n, rateLimitedCount: 0 },
+    maxDurationMs: 60_000, externalUniqueBuyersTarget: 3,
+    qualificationProfileFingerprint: 'a'.repeat(64),
+  };
+  for (const causalEvidence of [
+    null,
+    { ...evidence, positionId: 'other-position' },
+    { ...evidence, qualification: { ...evidence.qualification, verdict: 'REJECTED' } },
+    { ...evidence, qualification: { ...evidence.qualification, blockers: ['STALE_DATA'] } },
+    { ...evidence, qualification: { ...evidence.qualification, profileFingerprint: 'b'.repeat(64) } },
+    { ...evidence, buy: { ...evidence.buy, quoteId: 'other-quote' } },
+    { ...evidence, sell: { ...evidence.sell, tradeId: evidence.buy.tradeId } },
+    { ...evidence, externalUniqueBuyers: { ...evidence.externalUniqueBuyers,
+      progression: evidence.externalUniqueBuyers.progression.slice(0, 2) } },
+    { ...evidence, externalUniqueBuyers: { ...evidence.externalUniqueBuyers,
+      progression: evidence.externalUniqueBuyers.progression.map((item) => ({ ...item, wallet: 'same' })) } },
+    { ...evidence, externalUniqueBuyers: { ...evidence.externalUniqueBuyers,
+      progression: evidence.externalUniqueBuyers.progression.map((item) => ({ ...item,
+        cursor: { ...item.cursor, slot: '10' } })) } },
+    { ...evidence, externalUniqueBuyers: { ...evidence.externalUniqueBuyers,
+      progression: evidence.externalUniqueBuyers.progression.map((item) => ({ ...item,
+        confirmationStatus: 'orphaned' })) } },
+  ]) {
+    const report = createPaperMvpOneShotReport({ ...input, causalEvidence });
+    assert.equal(report.oneShotCycle.functionalStatus, 'INCOMPLETE');
+    assert.equal(report.oneShotCycle.externalUniqueBuyers.thresholdReached, false);
+    assert.equal(report.verdict, 'FAIL');
+    assert.equal(report.historicalCampaignReport.verdict, 'PASS');
+  }
 });
 
 void test('marks a multi-position campaign as incomplete without changing its historical report', () => {
@@ -186,6 +229,7 @@ void test('keeps a safety exit explicit and incomplete when N buyers was not rea
 
   assert.equal(report.oneShotCycle.functionalStatus, 'INCOMPLETE');
   assert.deepEqual(report.oneShotCycle.failedGateCodes, [
+    'CAUSAL_EVIDENCE_MISSING_OR_INCONSISTENT',
     'EXTERNAL_UNIQUE_BUYERS_TARGET_NOT_REACHED',
   ]);
   assert.equal(report.oneShotCycle.externalUniqueBuyers.thresholdReached, false);

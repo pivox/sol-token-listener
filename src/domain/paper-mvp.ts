@@ -1,4 +1,5 @@
 import { assertValidTimestampMs } from './timestamp.js';
+import { inspectPaperMvpCausalEvidence, type PaperMvpCausalEvidence } from './paper-mvp-causal-evidence.js';
 
 const BPS = 10_000n;
 const MAX_COUNT = 1_000_000;
@@ -139,15 +140,18 @@ export type PaperMvpOneShotGateCode =
   | 'EXTERNAL_UNIQUE_BUYERS_TARGET_NOT_REACHED'
   | 'UNKNOWN_TERMINAL_POSITION'
   | 'DUPLICATE_LOGICAL_BUY'
-  | 'DUPLICATE_LOGICAL_SELL';
+  | 'DUPLICATE_LOGICAL_SELL'
+  | 'CAUSAL_EVIDENCE_MISSING_OR_INCONSISTENT';
 
 export interface CreatePaperMvpOneShotReportInput extends CreatePaperMvpReportInput {
   readonly maxDurationMs: number;
   readonly externalUniqueBuyersTarget: number;
   readonly qualificationProfileFingerprint: string;
+  readonly causalEvidence?: unknown;
 }
 
 export interface PaperMvpOneShotCycleV1 {
+  readonly causalEvidence: PaperMvpCausalEvidence | null;
   readonly functionalStatus: 'COMPLETED' | 'INCOMPLETE';
   readonly failedGateCodes: readonly PaperMvpOneShotGateCode[];
   readonly logicalBuyCount: number;
@@ -377,8 +381,14 @@ export function createPaperMvpOneShotReport(
   const sample = logicalSellCount === 1 && input.samples[0] !== undefined
     ? validateSample(input.samples[0])
     : null;
-  const externalBuyerThresholdReached =
-    sample?.exitReason === 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED';
+  const inspected = sample === null ? null : inspectPaperMvpCausalEvidence(
+    input.causalEvidence, sample, input.qualificationProfileFingerprint, input.externalUniqueBuyersTarget,
+  );
+  const externalBuyerThresholdReached = inspected?.targetReached === true
+    && sample?.exitReason === 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED';
+  if (sample !== null && inspected?.coherent !== true) {
+    failedGateCodes.push('CAUSAL_EVIDENCE_MISSING_OR_INCONSISTENT');
+  }
   if (sample !== null && !externalBuyerThresholdReached) {
     failedGateCodes.push('EXTERNAL_UNIQUE_BUYERS_TARGET_NOT_REACHED');
   }
@@ -409,6 +419,7 @@ export function createPaperMvpOneShotReport(
       netPnlRaw: sample.modelNetPnlRaw.toString(),
     });
   const oneShotCycle: PaperMvpOneShotCycleV1 = Object.freeze({
+    causalEvidence: inspected?.evidence ?? null,
     functionalStatus: failedGateCodes.length === 0 ? 'COMPLETED' : 'INCOMPLETE',
     failedGateCodes: Object.freeze(failedGateCodes),
     logicalBuyCount: openedPositions,
@@ -418,7 +429,7 @@ export function createPaperMvpOneShotReport(
       : openPositions > 0 ? 'PAPER_HOLDING' : 'NO_CYCLE',
     qualification: Object.freeze({
       profileFingerprint: input.qualificationProfileFingerprint,
-      admissionObserved: openedPositions > 0,
+      admissionObserved: inspected?.coherent === true,
     }),
     externalUniqueBuyers: Object.freeze({
       target: input.externalUniqueBuyersTarget,

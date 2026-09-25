@@ -510,6 +510,7 @@ function oneShotReportFromSnapshot(
   completionReason: 'TARGET_REACHED' | 'TIMEOUT' | 'SIGINT' | 'SIGTERM',
 ): PaperMvpReportV3 {
   return createPaperMvpOneShotReport({
+    causalEvidence: snapshot.causalEvidence,
     runId: snapshot.run.runId,
     completionReason,
     startedAtMs: snapshot.run.startedAtMs,

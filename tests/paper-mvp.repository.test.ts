@@ -144,8 +144,10 @@ void test('persists the exact 79-digit derived PnL at the accepted 78-digit fee 
       }),
       samples: Object.freeze([boundarySample]), unknownPositions: Object.freeze([]),
     });
-    assert.equal((await repository.load(run.runId))?.samples[0]?.modelNetPnlRaw,
-      -2n * maximumFee);
+    const loaded = await repository.load(run.runId);
+    assert.equal(loaded?.samples[0]?.modelNetPnlRaw, -2n * maximumFee);
+    assert.equal(loaded?.causalEvidence, null,
+      'a detached legacy sample cannot invent qualification/buyer lineage');
   });
 });
 

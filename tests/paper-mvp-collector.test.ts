@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
-import { createPaperMvpPositionSample } from '../src/domain/paper-mvp.js';
+import { createPaperMvpOneShotReport, createPaperMvpPositionSample } from '../src/domain/paper-mvp.js';
 import type { PaperMvpRepository, PaperMvpRunSnapshot } from '../src/ports/paper-mvp-repository.js';
 import type { PaperMvpSource } from '../src/ports/paper-mvp-source.js';
 import { PaperMvpCollector } from '../src/application/paper-mvp-collector.js';
@@ -13,6 +13,7 @@ import {
   PaperMvpConflictError,
   PostgresPaperMvpRepository,
 } from '../src/storage/paper-mvp.repository.js';
+import { paperMvpCycleEvidence } from './fixtures/paper-mvp-cycle-evidence.js';
 
 const OWNER = 'paper-mvp-owner-test';
 
@@ -560,6 +561,81 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
     strategyVersion: 1, deadlineAtMs: 61_000, limit: 1_001,
   }), /limit/u);
   assert.equal(queries.length, 2);
+});
+
+void test('loads exact one-shot causal lineage and invalidates orphaned counted buyers', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (!databaseUrl) { context.skip('TEST_DATABASE_URL absent'); return; }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await seedCausalLineage(pool);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume({ ...runSnapshot.run.configuration,
+      targetClosedPositions: 1, externalUniqueBuyersTarget: 3 }, OWNER, 1_000);
+    const source = new PostgresPaperMvpSource(pool);
+    await new PaperMvpCollector(repository, source, () => 2_000).collect({
+      runId: run.runId, runnerOwnerId: OWNER, limit: 1,
+    });
+    const loadReport = async (reader = repository) => {
+      const snapshot = await reader.load(run.runId);
+      assert.ok(snapshot);
+      return createPaperMvpOneShotReport({
+        runId: run.runId, completionReason: 'TARGET_REACHED', startedAtMs: 1_000, completedAtMs: 2_000,
+        targetClosedPositions: 1, initialCapitalRaw: 10_000_000_000_000_000n, quoteMint: 'SOL',
+        creationsObserved: 1, entriesRejected: 0, openedPositions: 1, openPositions: 0,
+        samples: snapshot.samples, unknownTerminalPositions: 0,
+        duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+        providerUsage: { status: 'AVAILABLE', creditsUsedStart: 1n, creditsUsedEnd: 2n, rateLimitedCount: 0 },
+        maxDurationMs: 60_000, externalUniqueBuyersTarget: 3,
+        qualificationProfileFingerprint: 'a'.repeat(64), causalEvidence: snapshot.causalEvidence,
+      });
+    };
+    const report = await loadReport();
+    assert.equal(report.oneShotCycle.functionalStatus, 'COMPLETED');
+    const evidence = report.oneShotCycle.causalEvidence;
+    assert.ok(evidence);
+    assert.equal(evidence.qualification.reportId, `qreport_${'a'.repeat(64)}`);
+    assert.equal(evidence.qualification.profileId, 'pumpfun-mvp-technical-v1');
+    assert.deepEqual(evidence.qualification.blockers, []);
+    assert.deepEqual(evidence.qualification.reasonCodes, ['BUY_SIMULATION_FAILED']);
+    assert.equal(evidence.buy.tradeId, 'buy-1');
+    assert.equal(evidence.buy.boundary?.slot, '10');
+    assert.deepEqual(evidence.externalUniqueBuyers.progression.map((item) =>
+      [item.count, item.tradeId, item.wallet, item.cursor.slot]), [
+      [1, 'external-0', 'wallet-0', '11'], [2, 'external-1', 'wallet-1', '12'],
+      [3, 'external-2', 'wallet-2', '13'],
+    ]);
+    assert.equal(evidence.sell.tradeId, 'sell-1');
+    assert.equal(evidence.sell.closeEvent.id, 'close-event');
+    assert.equal(evidence.recovery.quoteWaitHistory, 'UNAVAILABLE');
+    let observedRun: (() => void) | undefined;
+    let releaseRead: (() => void) | undefined;
+    const observed = new Promise<void>((resolve) => { observedRun = resolve; });
+    const resume = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const concurrentReader = new PostgresPaperMvpRepository({ connect: async () => {
+      const client = await pool.connect();
+      return { release: () => { client.release(); }, query: async (sql, values) => {
+        const result = await client.query(sql, values === undefined ? [] : [...values]);
+        if (sql.includes('FROM paper_mvp_runs run WHERE run.run_id=$1')) {
+          observedRun?.(); await resume;
+        }
+        return result;
+      } };
+    } });
+    const concurrent = loadReport(concurrentReader);
+    await observed;
+    try {
+      await pool.query("UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id='raw-counted-2'");
+    } finally { releaseRead?.(); }
+    assert.equal((await concurrent).oneShotCycle.functionalStatus, 'COMPLETED',
+      'one repeatable-read snapshot must not mix old samples with a concurrent finality change');
+    const invalid = await loadReport();
+    assert.equal(invalid.oneShotCycle.functionalStatus, 'INCOMPLETE');
+    assert.equal(invalid.verdict, 'FAIL');
+    assert.equal(invalid.oneShotCycle.externalUniqueBuyers.thresholdReached, false);
+    assert.equal(invalid.oneShotCycle.causalEvidence?.externalUniqueBuyers.progression.length, 2);
+    assert.equal(invalid.historicalCampaignReport.verdict, 'PASS');
+  });
 });
 
 void test('counts exact opened and holding positions without sampling non-terminal facts', async (context) => {
@@ -1338,6 +1414,84 @@ async function seedPostgresFacts(pool: InstanceType<typeof pg.Pool>): Promise<vo
   ) VALUES ('position-retracted','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
     'PAPER_RETRACTED',1,1,1,0,'missing-buy','open-hash-2','source-open',1,'{}',
     $1,$2,$3)`, [date(1_500),date(1_800),date(1_800 + 14_400_000)]);
+}
+
+async function seedCausalLineage(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  const reportId = `qreport_${'a'.repeat(64)}`;
+  const candidateId = `candidate_${'a'.repeat(64)}`;
+  const sessionId = `paper_session_${'a'.repeat(64)}`;
+  const fixture = paperMvpCycleEvidence({ mint: 'MINT', buyAtMs: 1_400, sellAtMs: 1_700,
+    entryQuoteAtMs: 1_300, exitTriggerAtMs: 1_500 });
+  const date = (ms: number) => new Date(ms);
+  await pool.query("DELETE FROM paper_positions WHERE position_id='position-retracted'");
+  await pool.query("DELETE FROM paper_trades WHERE trade_id IN ('buy-duplicate','sell-duplicate')");
+  await pool.query(`UPDATE domain_events SET confirmation_status='finalized',slot=14,
+    payload='{"position":{"id":"position-1"},"trade":{"id":"sell-1","positionId":"position-1"}}'
+    WHERE event_id='close-event'`);
+  await pool.query("UPDATE paper_trades SET reason='EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED' WHERE trade_id='sell-1'");
+  await pool.query("UPDATE paper_trades SET payload=$1 WHERE trade_id='buy-1'", [
+    { quote: { observedSlot: { $solTokenListenerBigInt: '10' } } },
+  ]);
+  await pool.query(`INSERT INTO qualification_reports (
+    report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+    profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+    preparation_score,social_score,onchain_score,total_score,as_of_slot,
+    as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+    purge_after,payload_version,payload
+  ) VALUES ($1,'MINT','source-open','raw-open','source-open','pumpfun-mvp-technical-v1',
+    1,$2,$2,'QUALIFIED',0,0,60,60,1,0,0,'confirmed',$3,$4,1,$5)`,
+  [reportId, 'a'.repeat(64), date(1_200), date(1_200 + 14_400_000), {
+    ruleSet: { id: 'pumpfun-mvp-technical-v1', version: 1, fingerprint: 'a'.repeat(64) },
+    verdict: 'QUALIFIED', blockers: [], conditions: [{ code: 'BUY_SIMULATION_FAILED' }],
+  }]);
+  await pool.query(`INSERT INTO trading_candidates (
+    candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,strategy_version,
+    evidence_fingerprint,confirmation_status,state,quote_mint,quote_decimals,quote_token_program,
+    reason_codes,eligible_until,created_at,purge_after,payload_version,payload
+  ) VALUES ($1,'MINT',$2,'source-open','source-open','creation-entry-v1',1,$3,'confirmed','ELIGIBLE',
+    'SOL',9,'SPL_TOKEN','["QUALIFIED_ENTRY"]',$4,$5,$6,1,'{}')`,
+  [candidateId, reportId, 'a'.repeat(64), date(45_000), date(1_200), date(1_200 + 14_400_000)]);
+  await pool.query(`INSERT INTO paper_strategy_sessions (
+    session_id,mint,candidate_id,report_id,source_event_id,session_event_id,strategy_id,strategy_version,
+    actor_kind,state,reason_code,quote_mint,quote_decimals,quote_token_program,position_id,open_command_id,
+    entry_slot,entry_transaction_index,entry_instruction_index,external_buy_target,external_buy_count,
+    minimum_confirmation,created_at,updated_at,terminal_at,purge_after,payload_version,payload,
+    entry_boundary_slot,entry_boundary_quote_id,entry_boundary_observed_at
+  ) VALUES ($1,'MINT',$2,$3,'source-open','source-open','creation-entry-v1',1,'PAPER_SIMULATION',
+    'PAPER_CLOSED','EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED','SOL',9,'SPL_TOKEN','position-1',$4,
+    9,0,0,3,3,'confirmed',$5,$6,$6,$7,2,$8,10,'buy-quote',$9)`,
+  [sessionId, candidateId, reportId, `paper_open_${'a'.repeat(64)}`, date(1_200), date(1_700),
+    date(1_700 + 14_400_000), {
+      countedTradeIds: fixture.externalUniqueBuyers.countedTradeIds,
+      countedBuyerWallets: fixture.externalUniqueBuyers.countedWallets,
+      externalMinimumBuyAmountRaw: { $solTokenListenerBigInt: '1' },
+      entryBoundary: { kind: 'PAPER_BUY_QUOTE_SLOT', slot: { $solTokenListenerBigInt: '10' },
+        quoteId: 'buy-quote', observedAtMs: 1_300 },
+      pendingExitReason: null, lastError: null,
+    }, date(1_300)]);
+  await pool.query(`UPDATE paper_positions SET strategy_session_id=$1,
+    qualification_report_id=$2,candidate_id=$3 WHERE position_id='position-1'`,
+  [sessionId, reportId, candidateId]);
+  for (let i = 0; i < 3; i += 1) {
+    const rawId = `raw-counted-${i}`;
+    const eventId = `counted-${i}`;
+    const tradeId = `external-${i}`;
+    await pool.query(`INSERT INTO raw_chain_events (
+      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+      confirmation_status,observed_at,payload_version,payload
+    ) VALUES ($1,'pumpfun','pump','MINT',$1,$2,0,0,'confirmed',$3,1,'{}')`,
+    [rawId, 11 + i, date(1_401 + i)]);
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,confirmation_status,observed_at,payload_version,payload
+    ) VALUES ($1,$2,'PaperExternalBuyCounted','MINT','paper-decision','pump',$2,$3,0,0,
+      'confirmed',$4,1,$5)`, [eventId, rawId, 11 + i, date(1_401 + i), { sessionId, tradeId }]);
+    await pool.query(`INSERT INTO paper_external_buy_events (
+      session_id,trade_id,source_event_id,mint,quote_mint,trader,strategy_id,quote_amount_raw,
+      slot,transaction_index,instruction_index,confirmation_status,observed_at,payload_version,payload
+    ) VALUES ($1,$2,$3,'MINT','SOL',$4,'creation-entry-v1',2,$5,0,0,'confirmed',$6,2,'{}')`,
+    [sessionId, tradeId, eventId, `wallet-${i}`, 11 + i, date(1_401 + i)]);
+  }
 }
 
 async function seedExpiredVenueEvidence(
