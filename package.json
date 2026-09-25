@@ -58,6 +58,7 @@
     "paper:dry-run": "tsx src/cli/paper-dry-run.ts",
     "paper:mvp": "tsx src/cli/paper-mvp.ts",
     "pool:diagnose": "tsx scripts/diagnose-pool.ts",
+    "canary:evaluate": "tsx scripts/evaluate-mainnet-observe-canary.ts",
     "tx:diagnose": "tsx scripts/diagnose-transaction.ts",
     "fixture:capture": "tsx scripts/capture-fixture.ts",
     "inbox:recover": "tsx scripts/recover-inbox.ts",
