@@ -61,6 +61,7 @@ export interface AppConfig {
   readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
   readonly expectedGenesisHash: string | null;
+  readonly listenerWorkerCount: number;
   readonly listenerWorkerLeaseSeconds: number;
   readonly listenerCatchUpPolicy: ListenerCatchUpPolicy;
   readonly listenerCatchUpMaxPages: number;
@@ -230,6 +231,16 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   );
   const transactionInboxRetryPolicy = parseTransactionInboxRetryPolicy(environment);
   const blockHydration = parseBlockHydrationConfig(environment);
+  const listenerWorkerCount = parseCanonicalBoundedInteger(
+    environment.LISTENER_WORKER_COUNT,
+    1,
+    'LISTENER_WORKER_COUNT',
+    1,
+    4,
+  );
+  if (listenerWorkerCount > 1 && !blockHydration.listenerBlockHydrationEnabled) {
+    throw new Error('LISTENER_WORKER_COUNT above one requires LISTENER_BLOCK_HYDRATION_ENABLED=true.');
+  }
   const listenerIngestionScope = parseClosedLiteral(
     environment.LISTENER_INGESTION_SCOPE,
     'launchpad-and-market',
@@ -321,6 +332,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,
     expectedGenesisHash,
+    listenerWorkerCount,
     listenerWorkerLeaseSeconds: parseInteger(
       environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
     ),

@@ -362,6 +362,37 @@ void test('catch-up admission flag off creates no provider-affine locators and r
   assert.equal(workers.mock.callCount(), 0);
 });
 
+void test('configured inbox workers share one repository, pipeline and gated locator', async (context) => {
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_WORKER_COUNT: '2',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+
+  await dependencies.worker.start();
+  assert.equal(starts.mock.callCount(), 2);
+  const members = starts.mock.calls.map(({ this: worker }) => worker as unknown as {
+    repository: unknown; locator: unknown; pipeline: unknown;
+  });
+  assert.equal(members[0]?.repository, members[1]?.repository);
+  assert.equal(members[0]?.locator, members[1]?.locator);
+  assert.equal(members[0]?.pipeline, members[1]?.pipeline);
+  await dependencies.worker.close();
+});
+
+void test('multi-worker composition shares one HTTP gate across locator and PumpSwap account reads', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+  assert.equal(count(source, /new ListenerRpcWorkGate\(/gu), 1);
+  assert.match(source, /config\.listenerWorkerCount > 1 \? new ListenerRpcWorkGate\(\) : null/u);
+  assert.match(source, /readAccountsAtSameSlot:[\s\S]{0,180}rpcWorkGate\.run\(/u);
+  assert.match(source, /locate:[\s\S]{0,180}rpcWorkGate\.run\(/u);
+  assert.match(source, /Array\.from\(\s*\{ length: config\.listenerWorkerCount \}/u);
+});
+
 void test('catch-up admission uses one provider-affine coordinator for each catalog provider and gates worker claims', async (context) => {
   const classifiers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'classifierLocator');
   const workers = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'workerLocator');
@@ -414,7 +445,7 @@ void test('catch-up admission wires identical provider admitters into both scann
   assert.match(source, /hydration\.runStrictScan\(providerId,\s*\(scanSignal\) => baselineScanner\.scan\(scanSignal\), signal\)/u);
 });
 
-void test('catch-up admission starts worker close then immediately aborts hydration before worker settlement', async (context) => {
+void test('catch-up admission drains every worker before closing hydration', async (context) => {
   const gate = deferred<undefined>();
   const order: string[] = [];
   context.mock.method(TransactionInboxWorker.prototype, 'close', async () => {
@@ -432,10 +463,10 @@ void test('catch-up admission starts worker close then immediately aborts hydrat
   }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
   const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
   const closing = dependencies.worker.close();
-  assert.deepEqual(order, ['worker-start', 'hydration']);
+  assert.deepEqual(order, ['worker-start']);
   gate.resolve(undefined);
-  await assert.rejects(closing, /worker cleanup failed/u);
-  assert.deepEqual(order, ['worker-start', 'hydration', 'worker-settled']);
+  await assert.rejects(closing);
+  assert.deepEqual(order, ['worker-start', 'worker-settled', 'hydration']);
 });
 
 void test('production block hydration keeps the exact legacy locator unless explicitly enabled', () => {
@@ -473,7 +504,7 @@ void test('production block hydration keeps the exact legacy locator unless expl
   enabled.close();
 });
 
-void test('worker shutdown closes block hydration before awaiting a stuck worker', async () => {
+void test('worker shutdown closes block hydration after awaiting a stuck worker', async () => {
   const workerClose = deferred<undefined>();
   let cacheClosed = false;
   const component = lifecycleComponent({
@@ -483,9 +514,10 @@ void test('worker shutdown closes block hydration before awaiting a stuck worker
   }, () => { cacheClosed = true; });
 
   const closing = component.close();
-  assert.equal(cacheClosed, true);
+  assert.equal(cacheClosed, false);
   workerClose.resolve(undefined);
   await closing;
+  assert.equal(cacheClosed, true);
 });
 
 void test('selects one frozen canonical ingestion program list and rejects unknown scopes', () => {

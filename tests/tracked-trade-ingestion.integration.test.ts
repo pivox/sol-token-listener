@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
 import { ObservedTransactionPipeline } from '../src/application/observed-transaction-pipeline.js';
+import { LaunchParticipantAnalyticsService } from '../src/application/launch-participant-analytics.service.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import {
   createBondingCurveTradeObservedEvent,
@@ -15,6 +16,7 @@ import type { TransactionNotification } from '../src/domain/transaction-ingestio
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
+import { PostgresParticipantAnalyticsRepository } from '../src/storage/participant-analytics.repository.js';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -90,6 +92,102 @@ void test('persists a deferred trade without a body fetch until creation persist
   }
 });
 
+void test('two workers keep an early trade deferred then converge the creation and holder projection', async (context) => {
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: tracked-trade pipeline integration skipped');
+    return;
+  }
+  const schema = `tracked_trade_pool_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await migrateDatabase({ pool });
+    const inbox = new PostgresTransactionInboxRepository(pool);
+    const launches = new PostgresLaunchpadEventRepository(pool);
+    const participantService = new LaunchParticipantAnalyticsService(
+      new PostgresParticipantAnalyticsRepository(pool),
+    );
+    const creationReachedProjection = deferred();
+    const releaseCreationProjection = deferred();
+    let projectionCalls = 0;
+    const pipeline = new ObservedTransactionPipeline(
+      launches,
+      {
+        observe: async (observed) => launches.record(
+          observed.signature === creationSignature
+            ? creation(creationSignature, mint)
+            : tradeObservation(tradeSignature, mint),
+        ),
+      },
+      { observe: async () => ({ assessments: [], evidence: [] }) },
+      {
+        rebuild: async (projectionMint, missingLaunchPolicy) => {
+          projectionCalls += 1;
+          if (projectionCalls === 1) {
+            creationReachedProjection.resolve();
+            await releaseCreationProjection.promise;
+          }
+          return participantService.rebuild(projectionMint, missingLaunchPolicy);
+        },
+      },
+      { rebuild: async () => undefined },
+      { processObserved: async () => ({ migrations: [], activations: [], affectedMints: [] }) },
+      null,
+      null,
+      inbox,
+    );
+    await inbox.enqueue(tradeNotification(tradeSignature, 11n));
+    await inbox.enqueue(creationNotification(creationSignature, 10n));
+
+    const locator = {
+      locate: async ({ signature }: { readonly signature: string }) => normalized(
+        signature,
+        signature === creationSignature ? 10n : 11n,
+      ),
+    };
+    const first = new TransactionInboxWorker(
+      inbox, locator, pipeline,
+      { leaseSeconds: 30, renewalIntervalMs: 1_000, idlePollMs: 1_000 },
+    );
+    const second = new TransactionInboxWorker(
+      inbox, locator, pipeline,
+      { leaseSeconds: 30, renewalIntervalMs: 1_000, idlePollMs: 1_000 },
+    );
+
+    const creating = first.runOnce();
+    await creationReachedProjection.promise;
+    const activated = await pool.query(`SELECT processing_status,ingestion_priority
+      FROM chain_transaction_inbox WHERE signature=$1`, [tradeSignature]);
+    assert.deepEqual(activated.rows[0], {
+      processing_status: 'PENDING', ingestion_priority: 'TRACKED_TRADE',
+    });
+
+    assert.deepEqual(await second.runOnce(), {
+      kind: 'processed', signature: tradeSignature,
+    });
+    releaseCreationProjection.resolve();
+    assert.deepEqual(await creating, {
+      kind: 'processed', signature: creationSignature,
+    });
+
+    const latest = await pool.query(`SELECT as_of_slot::text AS as_of_slot,
+      unique_external_buyers,total_positive_net_base_raw::text AS total_positive_net_base_raw
+      FROM token_holders_snapshots WHERE mint=$1
+      ORDER BY as_of_slot DESC, snapshot_id DESC LIMIT 1`, [mint]);
+    assert.deepEqual(latest.rows[0], {
+      as_of_slot: '11', unique_external_buyers: 1, total_positive_net_base_raw: '1',
+    });
+    assert.equal((await pool.query(
+      `SELECT COUNT(*)::int AS count FROM launch_trades WHERE mint=$1`, [mint],
+    )).rows[0]?.count, 1);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await admin.end();
+  }
+});
+
 function tradeNotification(signature: string, slot: bigint): TransactionNotification {
   return Object.freeze({
     signature,
@@ -101,6 +199,25 @@ function tradeNotification(signature: string, slot: bigint): TransactionNotifica
     confirmationStatus: 'processed',
     observedAtMs: 1_000,
   });
+}
+
+function creationNotification(signature: string, slot: bigint): TransactionNotification {
+  return Object.freeze({
+    signature,
+    slot,
+    source: 'WEBSOCKET',
+    ingestionHint: 'PUMPFUN_CREATE',
+    ingestionHintMint: null,
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
+    confirmationStatus: 'processed',
+    observedAtMs: 1_000,
+  });
+}
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return Object.freeze({ promise, resolve });
 }
 
 function normalized(signature: string, slot: bigint): NormalizedTransaction {

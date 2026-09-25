@@ -43,6 +43,7 @@ import { BoundedPublicHttpClient } from '../metadata/bounded-public-http.client.
 import { HttpMetadataProvider } from '../metadata/http-metadata.provider.js';
 import { RpcPumpSwapPoolValidator } from '../markets/pumpswap/pool-validator.js';
 import type { ListenerRuntime } from '../ports/listener-runtime.js';
+import type { MarketRpcReader } from '../ports/market-rpc-reader.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import { SolanaMarketRpcReader } from '../solana/rpc/market-rpc-reader.js';
 import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';
@@ -54,7 +55,10 @@ import { createRpcHttpEvidenceRecorder } from '../solana/rpc/rpc-http-evidence.j
 import { openWsProgramSession } from '../solana/rpc/ws-program-session.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
-import type { TransactionLocatorRpc } from '../solana/rpc/transaction-locator.js';
+import type {
+  TransactionLocationTarget,
+  TransactionLocatorRpc,
+} from '../solana/rpc/transaction-locator.js';
 import {
   CachedSolanaBlockTransactionLocator,
   type EpochTransactionBlockRpc,
@@ -104,6 +108,8 @@ import {
   TransactionInboxWorker,
   type TransactionInboxWorkerLocator,
 } from './transaction-inbox-worker.js';
+import { TransactionInboxWorkerPool } from './transaction-inbox-worker-pool.js';
+import { ListenerRpcWorkGate } from './listener-rpc-work-gate.js';
 import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
 import { PersistentWebSocketHealthReporter } from './websocket-health-reporter.js';
 import { WalletEvidenceObservationService } from './wallet-evidence-observation.service.js';
@@ -399,7 +405,15 @@ export function createProductionListenerRuntime(
     new PostgresWalletGraphRepository(databasePool),
   );
 
-  const marketRpc = new SolanaMarketRpcReader(rpc.http, config.commitment);
+  const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
+  const directMarketRpc = new SolanaMarketRpcReader(rpc.http, config.commitment);
+  const marketRpc: MarketRpcReader = rpcWorkGate === null
+    ? directMarketRpc
+    : Object.freeze({
+      readAccountsAtSameSlot: (addresses: readonly string[]) => rpcWorkGate.run(
+        () => directMarketRpc.readAccountsAtSameSlot(addresses),
+      ),
+    });
   const feeState = new PumpSwapFeeStateReader(marketRpc);
   const market = new PumpSwapMarketAdapter(
     undefined,
@@ -533,23 +547,23 @@ export function createProductionListenerRuntime(
     inbox,
   );
 
-  const worker = new TransactionInboxWorker(inbox, blockHydration.locator, pipeline, {
-    leaseSeconds: config.listenerWorkerLeaseSeconds,
-    renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
-    idlePollMs: 1_000,
-    ...(hydration === null ? {} : { canClaim: (): boolean => hydration.canWorkerClaim() }),
-  });
-  const workerComponent = hydration === null
-    ? lifecycleComponent(worker, blockHydration.close)
-    : lifecycleComponent({
-      start: (): Promise<void> => worker.start(),
-      close: async (): Promise<void> => {
-        let closing: Promise<void> | null = null;
-        try { closing = worker.close(); } finally { hydration.close(); }
-        await closing;
-      },
-      get state(): ListenerRuntimeState { return worker.state; },
+  const workerLocator: TransactionInboxWorkerLocator = rpcWorkGate === null
+    ? blockHydration.locator
+    : Object.freeze({
+      locate: (target: TransactionLocationTarget) => rpcWorkGate.run(
+        () => blockHydration.locator.locate(target),
+      ),
     });
+  const worker = new TransactionInboxWorkerPool(Array.from(
+    { length: config.listenerWorkerCount },
+    () => new TransactionInboxWorker(inbox, workerLocator, pipeline, {
+      leaseSeconds: config.listenerWorkerLeaseSeconds,
+      renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
+      idlePollMs: 1_000,
+      ...(hydration === null ? {} : { canClaim: (): boolean => hydration.canWorkerClaim() }),
+    }),
+  ));
+  const workerComponent = lifecycleComponent(worker, blockHydration.close);
   const socialWorkerComponent = lifecycleComponent(socialWorker);
   const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
@@ -1265,9 +1279,7 @@ export function lifecycleComponent(component: {
   return {
     start: () => component.start(),
     close: async (): Promise<void> => {
-      let closing: Promise<void> | null = null;
-      try { closing = component.close(); } finally { afterClose(); }
-      await closing;
+      try { await component.close(); } finally { afterClose(); }
     },
     state: () => component.state,
   };

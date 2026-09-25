@@ -767,6 +767,7 @@ void test('le listener durable est activé avec des bornes sûres par défaut', 
   assert.equal(config.listenerIngestionScope, 'launchpad-and-market');
   assert.equal(config.expectedGenesisHash, base.SOLANA_EXPECTED_GENESIS_HASH);
   assert.equal(config.listenerCatchUpPolicy, 'live-edge');
+  assert.equal(config.listenerWorkerCount, 1);
   assert.equal(config.listenerWorkerLeaseSeconds, 120);
   assert.equal(config.listenerCatchUpMaxPages, 20);
   assert.equal(config.listenerCatchUpPageSize, 100);
@@ -842,6 +843,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
   const minimums = parseConfig({
     ...base,
     LISTENER_ENABLED: 'false',
+    LISTENER_WORKER_COUNT: '1',
     LISTENER_WORKER_LEASE_SECONDS: '30',
     LISTENER_CATCH_UP_MAX_PAGES: '1',
     LISTENER_CATCH_UP_PAGE_SIZE: '1',
@@ -849,6 +851,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
     LISTENER_SHUTDOWN_TIMEOUT_MS: '1000',
   });
   assert.equal(minimums.listenerEnabled, false);
+  assert.equal(minimums.listenerWorkerCount, 1);
   assert.equal(minimums.listenerWorkerLeaseSeconds, 30);
   assert.equal(minimums.listenerCatchUpMaxPages, 1);
   assert.equal(minimums.listenerCatchUpPageSize, 1);
@@ -857,6 +860,8 @@ void test('la configuration listener accepte ses bornes exactes', () => {
 
   const maximums = parseConfig({
     ...base,
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_WORKER_COUNT: '4',
     LISTENER_WORKER_LEASE_SECONDS: '900',
     LISTENER_CATCH_UP_MAX_PAGES: '100',
     LISTENER_CATCH_UP_PAGE_SIZE: '1000',
@@ -866,6 +871,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
     RPC_RETRY_BASE_DELAY_MS: '60000',
   });
   assert.equal(maximums.listenerWorkerLeaseSeconds, 900);
+  assert.equal(maximums.listenerWorkerCount, 4);
   assert.equal(maximums.listenerCatchUpMaxPages, 100);
   assert.equal(maximums.listenerCatchUpPageSize, 1_000);
   assert.equal(maximums.listenerFinalityMissingPolls, 20);
@@ -878,6 +884,10 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
   const invalid: readonly Record<string, string>[] = [
     { LISTENER_ENABLED: '1' },
     { LISTENER_ENABLED: ' TRUE' },
+    { LISTENER_WORKER_COUNT: '0' },
+    { LISTENER_WORKER_COUNT: '5' },
+    { LISTENER_WORKER_COUNT: '1.0' },
+    { LISTENER_WORKER_COUNT: ' 1' },
     { LISTENER_WORKER_LEASE_SECONDS: '29' },
     { LISTENER_WORKER_LEASE_SECONDS: '901' },
     { LISTENER_WORKER_LEASE_SECONDS: '30.0' },
@@ -898,6 +908,18 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
   for (const values of invalid) assert.throws(() => parseConfig({ ...base, ...values }));
 });
 
+void test('plusieurs workers exigent le cache d’hydratation bloc', () => {
+  assert.throws(
+    () => parseConfig({ ...base, LISTENER_WORKER_COUNT: '2' }),
+    /LISTENER_WORKER_COUNT/u,
+  );
+  assert.equal(parseConfig({
+    ...base,
+    LISTENER_WORKER_COUNT: '2',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+  }).listenerWorkerCount, 2);
+});
+
 void test('le modèle d’environnement publie les valeurs listener sûres exactes', async () => {
   const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
   for (const line of [
@@ -905,6 +927,7 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
     'LISTENER_ENABLED=true',
     'LISTENER_INGESTION_SCOPE=launchpad-and-market',
     'LISTENER_CATCH_UP_POLICY=live-edge',
+    'LISTENER_WORKER_COUNT=1',
     'LISTENER_WORKER_LEASE_SECONDS=120',
     'LISTENER_CATCH_UP_MAX_PAGES=20',
     'LISTENER_CATCH_UP_PAGE_SIZE=100',

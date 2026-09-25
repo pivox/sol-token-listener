@@ -209,6 +209,7 @@ function logFoundation(
     qualificationProfileFingerprint: profile.fingerprint,
     qualificationMinimumScore: profile.minimumTotalScore,
     pumpFunListenerActive: config.listenerEnabled,
+    listenerWorkerCount: config.listenerWorkerCount,
     listenerCatchUpMaxPages: config.listenerCatchUpMaxPages,
     listenerCatchUpPageSize: config.listenerCatchUpPageSize,
     pumpSwapPipelineAvailable: true,

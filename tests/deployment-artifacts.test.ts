@@ -285,6 +285,7 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   ]);
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
+    ['LISTENER_WORKER_COUNT', '1'],
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
     ['LISTENER_CATCH_UP_MAX_PAGES', '20'],
     ['LISTENER_CATCH_UP_PAGE_SIZE', '100'],
@@ -327,8 +328,8 @@ void test('Compose resolves catch-up scan limit defaults and overrides only for 
     return;
   }
   for (const configured of [
-    Object.freeze({ maxPages: undefined, pageSize: undefined, expectedMaxPages: '20', expectedPageSize: '100' }),
-    Object.freeze({ maxPages: '37', pageSize: '777', expectedMaxPages: '37', expectedPageSize: '777' }),
+    Object.freeze({ workerCount: undefined, maxPages: undefined, pageSize: undefined, expectedWorkerCount: '1', expectedMaxPages: '20', expectedPageSize: '100' }),
+    Object.freeze({ workerCount: '2', maxPages: '37', pageSize: '777', expectedWorkerCount: '2', expectedMaxPages: '37', expectedPageSize: '777' }),
   ]) {
     const result = spawnSync('docker', [
       'compose', '--env-file', '/dev/null', '-f', 'deploy/compose.yaml', 'config', '--format', 'json',
@@ -340,6 +341,7 @@ void test('Compose resolves catch-up scan limit defaults and overrides only for 
         POSTGRES_PASSWORD: 'contract-only', POSTGRES_PASSWORD_URI_ENCODED: 'contract-only',
         BACKEND_IMAGE: 'registry.invalid/backend:test', FRONTEND_IMAGE: 'registry.invalid/frontend:test',
         SOLANA_HTTP_RPC_URL: 'https://rpc.invalid', SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
+        ...(configured.workerCount === undefined ? {} : { LISTENER_WORKER_COUNT: configured.workerCount }),
         ...(configured.maxPages === undefined ? {} : { LISTENER_CATCH_UP_MAX_PAGES: configured.maxPages }),
         ...(configured.pageSize === undefined ? {} : { LISTENER_CATCH_UP_PAGE_SIZE: configured.pageSize }),
       },
@@ -348,9 +350,11 @@ void test('Compose resolves catch-up scan limit defaults and overrides only for 
     const resolved = JSON.parse(result.stdout) as {
       readonly services: Readonly<Record<string, { readonly environment?: Readonly<Record<string, string>> }>>;
     };
+    assert.equal(resolved.services.app?.environment?.LISTENER_WORKER_COUNT, configured.expectedWorkerCount);
     assert.equal(resolved.services.app?.environment?.LISTENER_CATCH_UP_MAX_PAGES, configured.expectedMaxPages);
     assert.equal(resolved.services.app?.environment?.LISTENER_CATCH_UP_PAGE_SIZE, configured.expectedPageSize);
     for (const service of ['postgres', 'migrate', 'retention', 'frontend']) {
+      assert.equal(resolved.services[service]?.environment?.LISTENER_WORKER_COUNT, undefined);
       assert.equal(resolved.services[service]?.environment?.LISTENER_CATCH_UP_MAX_PAGES, undefined);
       assert.equal(resolved.services[service]?.environment?.LISTENER_CATCH_UP_PAGE_SIZE, undefined);
     }
