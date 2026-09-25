@@ -14,6 +14,61 @@ const base = {
   SOLANA_EXPECTED_GENESIS_HASH: bs58.encode(Uint8Array.from({ length: 32 }, () => 7)),
 };
 
+void test('bounded Pump.fun worker admission is inactive with an exact validated window', () => {
+  const defaults = parseConfig(base);
+  assert.equal(defaults.listenerPumpFunBoundedWorkerAdmissionEnabled, false);
+  assert.equal(defaults.listenerPumpFunTrackingWindowSeconds, 45);
+
+  const explicitlyDisabled = parseConfig({
+    ...base,
+    LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: 'false',
+    LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS: '1',
+  });
+  assert.equal(explicitlyDisabled.listenerPumpFunBoundedWorkerAdmissionEnabled, false);
+  assert.equal(explicitlyDisabled.listenerPumpFunTrackingWindowSeconds, 1);
+  assert.equal(parseConfig({
+    ...base,
+    LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS: '3600',
+  }).listenerPumpFunTrackingWindowSeconds, 3_600);
+});
+
+void test('bounded worker admission remains fail-closed until admission/classification ships', () => {
+  const activationError =
+    'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED is not available until the admission/classification delivery.';
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: 'true',
+    }),
+    (error: unknown) => error instanceof Error && error.message === activationError,
+  );
+  for (const value of ['TRUE', '1', ' true', 'true ', ' ', '']) {
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: value,
+      }),
+      /LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED must be true or false\./u,
+    );
+  }
+});
+
+void test('the Pump.fun tracking window rejects ambiguous values even while admission is disabled', () => {
+  for (const value of [
+    '0', '3601', '01', '1.0', '1e2', '-1', '+1', ' 45', '45 ',
+    '9007199254740992', ' ', '',
+  ]) {
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: 'false',
+        LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS: value,
+      }),
+      /LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS/u,
+    );
+  }
+});
+
 void test('Pump.fun catch-up page admission is disabled by default', () => {
   assert.equal(parseConfig(base).listenerPumpFunCatchUpPageAdmissionEnabled, false);
   for (const value of ['TRUE', '1', ' true', 'true ', ' ', '']) {
