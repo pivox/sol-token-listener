@@ -2463,6 +2463,11 @@ void test('catch-up admission projects exact frozen V1 counts and public provide
     assert.ok(Object.isFrozen(health.heartbeat.catchUpAdmission?.actionableBacklogByPriority));
     assert.notEqual(health.heartbeat.catchUpAdmission, metrics);
   }
+  const cooperative = { ...catchUpAdmissionMetrics(), providerId: 'primary' as const, workerClaimReady: true };
+  assert.deepEqual(
+    (await projectCatchUpAdmission({ catchUpAdmission: cooperative })).heartbeat.catchUpAdmission,
+    cooperative,
+  );
   const metrics = { ...catchUpAdmissionMetrics(), enabled: false, providerId: null, scanActive: false };
   assert.deepEqual((await projectCatchUpAdmission({ catchUpAdmission: metrics })).heartbeat.catchUpAdmission, metrics);
 });
@@ -2475,7 +2480,7 @@ void test('catch-up admission rejects malformed present payload through redacted
     { ...metrics, providerId: 'fallback-99' }, { ...metrics, providerId: 'https://secret.invalid' },
     { ...metrics, providerId: 'secret-signature' }, { ...metrics, providerId: 'secret-mint' },
     { ...metrics, rpcUrl: 'https://secret.invalid' }, { ...metrics, signature: 'secret-signature' },
-    { ...metrics, mint: 'secret-mint' }, { ...metrics, workerClaimReady: true },
+    { ...metrics, mint: 'secret-mint' },
     { ...metrics, providerId: null }, { ...metrics, enabled: false },
     { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, extra: 0 } },
     { ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, mint: 'secret-mint' } },

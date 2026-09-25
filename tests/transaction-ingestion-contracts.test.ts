@@ -34,6 +34,7 @@ import {
   createDurableTransactionSnapshot,
   createCatchUpGap,
   restoreNormalizedTransactionSnapshot,
+  snapshotRuntimeCatchUpAdmissionMetrics,
   snapshotRuntimeDecoderQuarantineMetrics,
   type ClaimedTransaction,
   type CatchUpGap,
@@ -913,6 +914,48 @@ void test('InboxCounts validates exact frozen catch-up admission counts and both
     assert.throws(() => { assertValidInboxCounts(Object.freeze({ ...counts, catchUpAdmission })); }, TypeError);
   }
   assert.throws(() => { assertValidInboxCounts(Object.freeze({ ...counts, pending: Number.MAX_SAFE_INTEGER })); }, TypeError);
+});
+
+void test('runtime catch-up admission accepts same-provider worker progress during an active scan', () => {
+  const metrics = snapshotRuntimeCatchUpAdmissionMetrics(Object.freeze({
+    version: 1,
+    enabled: true,
+    providerId: 'primary',
+    scanActive: true,
+    workerClaimReady: true,
+    actionableBacklogBySource: Object.freeze({
+      websocketOnly: 1,
+      catchUpOnly: 2,
+      websocketAndCatchUp: 3,
+    }),
+    actionableBacklogByPriority: Object.freeze({
+      normal: 3,
+      launchCandidate: 2,
+      trackedTrade: 1,
+    }),
+    deferredCount: 4,
+    ignoredCount: 5,
+    quarantinedCount: 6,
+  }), 6);
+
+  assert.deepEqual(metrics, {
+    version: 1,
+    enabled: true,
+    providerId: 'primary',
+    scanActive: true,
+    workerClaimReady: true,
+    actionableBacklogBySource: { websocketOnly: 1, catchUpOnly: 2, websocketAndCatchUp: 3 },
+    actionableBacklogByPriority: { normal: 3, launchCandidate: 2, trackedTrade: 1 },
+    deferredCount: 4,
+    ignoredCount: 5,
+    quarantinedCount: 6,
+  });
+  assert.ok(Object.isFrozen(metrics));
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(Object.freeze({
+    ...rpcEvidenceHeartbeat(),
+    backlogCount: 6,
+    catchUpAdmission: metrics,
+  })); });
 });
 
 void test('rejects incoherent, unproven and accessor-backed finality evidence', () => {
