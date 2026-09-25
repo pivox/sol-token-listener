@@ -79,6 +79,27 @@ void test('does not label a generic degraded status as an identified periodic pa
   assert.equal(evaluateMainnetObserveCanary(copy).gates.runtime.verdict, 'FAIL');
 });
 
+void test('rejects unknown closed-enum runtime states as inconclusive evidence', () => {
+  const copy = cloneFixture();
+  nested(copy, 'snapshots', 'T0').runtimeState = 'UNKNOWN_STATE';
+
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.runtime.verdict, 'INCONCLUSIVE');
+});
+
+void test('rejects chronologically out-of-order finality incident pairs', () => {
+  const copy = cloneFixture();
+  const diagnostics = copy.finalityDiagnostics as Record<string, unknown>[];
+  diagnostics.push(
+    { event: 'listener.finality_reconciler_degraded', phase: 'DEGRADED',
+      reasonCode: 'PROVIDER_UNAVAILABLE', degradedAtMs: 1790313390000,
+      observedAtMs: 1790313390000 },
+    { event: 'listener.finality_reconciler_recovered', phase: 'RECOVERED',
+      reasonCode: null, degradedAtMs: 1790313390000, observedAtMs: 1790313390050 },
+  );
+
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.finality.verdict, 'INCONCLUSIVE');
+});
+
 void test('classifies unsafe and incomplete gate evidence without allowing unrelated PASS gates to override it', () => {
   const cases: readonly [string, (copy: Record<string, unknown>) => void,
   MainnetObserveCanaryGateName, 'FAIL' | 'INCONCLUSIVE'][] = [

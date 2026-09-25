@@ -30,6 +30,18 @@ export interface MainnetObserveCanaryResultV1 {
 }
 
 const SNAPSHOT_NAMES = ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP'] as const;
+const HEALTH_STATUSES = ['OK', 'DEGRADED'] as const;
+const PIPELINE_STATES = ['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED'] as const;
+const RUNTIME_STATES = ['STARTING', 'RUNNING', 'DEGRADED', 'STOPPING', 'STOPPED'] as const;
+const WEBSOCKET_PHASES = [
+  'STOPPED', 'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING',
+  'RUNNING', 'DEGRADED', 'UNRECOVERABLE', 'STOPPING',
+] as const;
+const RECOVERY_STATUSES = ['NOT_REQUIRED', 'REQUIRED', 'IN_PROGRESS', 'RECOVERED', 'FAILED'] as const;
+const RECOVERY_REASON_CODES = [
+  'STARTUP', 'UNEXPECTED_RESTART', 'SESSION_FAILURE', 'RPC_UNAVAILABLE',
+  'CHECKPOINT_CONFLICT', 'CATCH_UP_WINDOW_EXCEEDED',
+] as const;
 type SnapshotName = (typeof SNAPSHOT_NAMES)[number];
 type VersionCounts = Readonly<{ legacy: number; v0: number; v1: number }>;
 
@@ -362,7 +374,12 @@ function evaluateFinality(input: CanaryInput): MainnetObserveCanaryGateResultV1 
   }
   if (finalInbox.overlapCount <= 0) return gate('INCONCLUSIVE', 'FINALITY_OVERLAP_MISSING');
   let open: FinalityDiagnostic | null = null;
+  let lastObservedAtMs = -1;
   for (const diagnostic of input.finalityDiagnostics) {
+    if (diagnostic.observedAtMs < lastObservedAtMs) {
+      return gate('INCONCLUSIVE', 'FINALITY_DIAGNOSTICS_UNPAIRABLE');
+    }
+    lastObservedAtMs = diagnostic.observedAtMs;
     if (diagnostic.event === 'listener.finality_reconciler_degraded') {
       if (diagnostic.phase !== 'DEGRADED' || diagnostic.reasonCode === null || open !== null
         || diagnostic.observedAtMs !== diagnostic.degradedAtMs) {
@@ -460,14 +477,20 @@ function parseSnapshot(value: unknown): Snapshot {
     'terminalRetentionViolations',
   ]);
   return Object.freeze({
-    observedAtMs: integer(input.observedAtMs), status: code(input.status),
-    pipelinePumpfun: code(input.pipelinePumpfun), pipelinePumpswap: code(input.pipelinePumpswap),
-    runtimeState: code(input.runtimeState), subscriberState: code(input.subscriberState),
-    scannerState: code(input.scannerState), workerState: code(input.workerState),
-    reconcilerState: code(input.reconcilerState), backlogCount: integer(input.backlogCount),
+    observedAtMs: integer(input.observedAtMs), status: enumeration(input.status, HEALTH_STATUSES),
+    pipelinePumpfun: enumeration(input.pipelinePumpfun, PIPELINE_STATES),
+    pipelinePumpswap: enumeration(input.pipelinePumpswap, PIPELINE_STATES),
+    runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
+    subscriberState: enumeration(input.subscriberState, RUNTIME_STATES),
+    scannerState: enumeration(input.scannerState, RUNTIME_STATES),
+    workerState: enumeration(input.workerState, RUNTIME_STATES),
+    reconcilerState: enumeration(input.reconcilerState, RUNTIME_STATES),
+    backlogCount: integer(input.backlogCount),
     leasedCount: integer(input.leasedCount),
-    websocket: Object.freeze({ phase: code(websocket.phase), providerId: nullableProviderId(websocket.providerId),
-      recoveryStatus: code(websocket.recoveryStatus), recoveryReasonCode: code(websocket.recoveryReasonCode) }),
+    websocket: Object.freeze({ phase: enumeration(websocket.phase, WEBSOCKET_PHASES),
+      providerId: nullableProviderId(websocket.providerId),
+      recoveryStatus: enumeration(websocket.recoveryStatus, RECOVERY_STATUSES),
+      recoveryReasonCode: enumeration(websocket.recoveryReasonCode, RECOVERY_REASON_CODES) }),
     catchUpAdmission: parseAdmission(input.catchUpAdmission), blockHydration: parseHydration(input.blockHydration),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     decoderQuarantine: Object.freeze({ version: 1, unresolvedCount: integer(decoder.unresolvedCount) }),
@@ -487,9 +510,12 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary',
   ]);
-  return Object.freeze({ runtimeState: code(input.runtimeState), subscriberState: code(input.subscriberState),
-    scannerState: code(input.scannerState), workerState: code(input.workerState),
-    reconcilerState: code(input.reconcilerState), backlogCount: integer(input.backlogCount),
+  return Object.freeze({ runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
+    subscriberState: enumeration(input.subscriberState, RUNTIME_STATES),
+    scannerState: enumeration(input.scannerState, RUNTIME_STATES),
+    workerState: enumeration(input.workerState, RUNTIME_STATES),
+    reconcilerState: enumeration(input.reconcilerState, RUNTIME_STATES),
+    backlogCount: integer(input.backlogCount),
     leasedCount: integer(input.leasedCount), catchUpAdmission: parseAdmission(input.catchUpAdmission),
     blockHydration: parseHydration(input.blockHydration),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
@@ -656,6 +682,11 @@ function bool(value: unknown): boolean {
 
 function code(value: unknown): string {
   if (typeof value !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value)) invalid();
+  return value;
+}
+
+function enumeration<const T extends readonly string[]>(value: unknown, allowed: T): T[number] {
+  if (typeof value !== 'string' || !allowed.includes(value)) invalid();
   return value;
 }
 
