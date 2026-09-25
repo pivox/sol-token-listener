@@ -321,6 +321,49 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
 });
 
+void test('deployment documents the inactive bounded worker admission foundation', async () => {
+  const [compose, environment, localEnvironment, overview] = await Promise.all([
+    readArtifact('deploy/compose.yaml'),
+    readArtifact('deploy/env.example'),
+    readArtifact('.env.example'),
+    readArtifact('docs/system-overview.html'),
+  ]);
+  const app = composeService(compose, 'app');
+  const settings = Object.freeze([
+    ['LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED', 'false'],
+    ['LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS', '45'],
+  ] as const);
+
+  for (const [name, fallback] of settings) {
+    const assignment = new RegExp(`^${name}=${fallback}$`, 'gmu');
+    assert.equal((environment.match(assignment) ?? []).length, 1);
+    assert.equal((localEnvironment.match(assignment) ?? []).length, 1);
+    assert.equal(
+      (app.match(new RegExp(`^ {6}${name}: "\\$\\{${name}:-${fallback}\\}"$`, 'gmu')) ?? [])
+        .length,
+      1,
+    );
+  }
+
+  for (const example of [environment, localEnvironment]) {
+    assert.match(example, /inactive foundation[^.]{0,180}restart-only/iu);
+    assert.match(example, /true[^.]{0,180}(?:rejected|refused)[^.]{0,120}#171-B/iu);
+  }
+
+  assert.match(overview, /migration 053[^.]{0,200}worker_admitted_at/iu);
+  assert.match(overview, /worker_admitted_at[^.]{0,240}monotone[^.]{0,160}(?:never cleared|jamais effacé)/iu);
+  assert.match(overview, /Part A[^.]{0,240}(?:cannot|ne peut pas)[^.]{0,120}activ(?:ate|er)/iu);
+  assert.match(overview, /restart-only/iu);
+  assert.match(overview, /legacy[^.]{0,240}claim[^.]{0,240}(?:unchanged|inchangé)/iu);
+  assert.match(
+    overview,
+    /drain[^.]{0,200}migration 053[^.]{0,200}deploy[^.]{0,200}restart/iu,
+  );
+  assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
+  assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
+  assert.doesNotMatch(overview, /45-second policy[^.]{0,120}(?:active|enabled)/iu);
+});
+
 void test('Compose resolves catch-up scan limit defaults and overrides only for app', (context) => {
   const docker = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 10_000 });
   if (docker.error !== undefined || docker.status !== 0) {
