@@ -910,7 +910,6 @@ void test('heartbeat catch-up admission rejects invalid state and sums before a 
     Object.freeze({ ...valid, version: 2 }),
     Object.freeze({ ...valid, providerId: 'https://private-secret.invalid' }),
     Object.freeze({ ...valid, providerId: null }),
-    Object.freeze({ ...valid, scanActive: true }),
     Object.freeze({ ...valid, workerClaimReady: 'private-secret' }),
     Object.freeze({ ...valid, enabled: false }),
     Object.freeze({ ...valid, enabled: 'private-secret' }),

@@ -508,7 +508,6 @@ const catchUpAdmissionSchema = z.object({
   const total = source.websocketOnly + source.catchUpOnly + source.websocketAndCatchUp;
   return Number.isSafeInteger(total)
     && total === priority.normal + priority.launchCandidate + priority.trackedTrade
-    && !(value.scanActive && value.workerClaimReady)
     && !(value.providerId === null && (value.scanActive || value.workerClaimReady))
     && !(!value.enabled && (value.providerId !== null || value.scanActive || value.workerClaimReady));
 });

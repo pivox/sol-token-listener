@@ -15,6 +15,7 @@ import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import type { PromotedProviderSelection } from './promoted-provider-selector.js';
 import type { PumpFunCatchUpTransactionLocator } from './pumpfun-catch-up-block-classifier.js';
 import {
+  isStrictCatchUpPausedError, isStrictCatchUpRefreshRequiredError,
   StrictCatchUpAbortedError, StrictCatchUpPausedError, StrictCatchUpRefreshRequiredError,
   StrictCatchUpScannerError, StrictCatchUpWindowExceededError, type StrictCatchUpScanResult,
 } from './strict-catch-up-scanner.js';
@@ -38,6 +39,8 @@ interface ScanPermit {
   readonly signal: AbortSignal;
   readonly pending: Set<Promise<NormalizedTransaction>>;
   readonly calls: Set<Readonly<{ target: TransactionLocationTarget; signal: AbortSignal | undefined }>>;
+  readonly workerSelectionRevision: bigint | null;
+  workerSharingRevoked: boolean;
   accepting: boolean;
 }
 const MAX_PERMIT_WAITERS = 1024;
@@ -145,10 +148,14 @@ export class ProviderAffineCatchUpHydration {
       await this.acquire('SCAN', combined);
       acquired = true;
       this.assertOpen(combined);
+      const selection = this.selection();
+      this.assertOpen(combined);
       this.scanGeneration += 1n;
       const permit: ScanPermit = {
         context: Object.freeze({ providerId, token: `scan:${this.scanGeneration}` }),
-        signal: combined, pending: new Set(), calls: new Set(), accepting: true,
+        signal: combined, pending: new Set(), calls: new Set(),
+        workerSelectionRevision: selection?.providerId === providerId ? selection.revision : null,
+        workerSharingRevoked: false, accepting: true,
       };
       this.scanPermit = permit;
       let result: StrictCatchUpScanResult;
@@ -181,8 +188,7 @@ export class ProviderAffineCatchUpHydration {
 
   public canWorkerClaim(): boolean {
     const selection = this.closed ? null : this.selection();
-    return !this.closed && selection !== null && selection.providerId !== null
-      && this.permitKind !== 'SCAN' && !this.queue.some(({ kind }) => kind === 'SCAN');
+    return this.isWorkerClaimReady(selection);
   }
 
   public metrics(): RuntimeBlockHydrationMetricsV1 {
@@ -195,8 +201,7 @@ export class ProviderAffineCatchUpHydration {
     return Object.freeze({
       providerId: this.closed ? null : this.scanPermit?.context.providerId ?? selection?.providerId ?? null,
       scanActive: this.scanPermit !== null,
-      workerClaimReady: !this.closed && selection?.providerId !== undefined && selection.providerId !== null
-        && this.permitKind !== 'SCAN' && !this.queue.some(({ kind }) => kind === 'SCAN'),
+      workerClaimReady: this.isWorkerClaimReady(selection),
     });
   }
 
@@ -218,6 +223,8 @@ export class ProviderAffineCatchUpHydration {
       this.assertOpen();
       selected = this.selection();
       if (selected?.providerId === undefined || selected.providerId === null) throw retryableFailure();
+      const sharedPermit = this.sharedScanPermit(selected);
+      if (sharedPermit !== null) return await this.locateSharedWorker(sharedPermit, selected, target);
       await this.acquire('WORKER');
       acquired = true;
       this.assertOpen();
@@ -235,6 +242,37 @@ export class ProviderAffineCatchUpHydration {
       throw locatorFailure(error);
     }
     finally { if (acquired) this.release(); }
+  }
+
+  private async locateSharedWorker(
+    permit: ScanPermit,
+    selected: PromotedProviderSelection,
+    target: TransactionLocationTarget,
+  ): Promise<NormalizedTransaction> {
+    const call = Object.freeze({ target: Object.freeze({ ...target }), signal: undefined });
+    permit.calls.add(call);
+    const pending = this.cache.locate(call.target);
+    permit.pending.add(pending);
+    try {
+      const result = await pending;
+      this.assertOpen();
+      this.assertOpen(permit.signal);
+      if (this.scanPermit !== permit || this.active !== permit.context) throw retryableFailure();
+      this.assertSelection(selected);
+      return result;
+    } catch (error) {
+      if (this.closed || permit.signal.aborted) throw retryableFailure();
+      const current = this.selection();
+      this.assertOpen(permit.signal);
+      if (current?.providerId !== selected.providerId || current.revision !== selected.revision) {
+        this.revokeWorkerSharing(permit);
+        throw retryableFailure();
+      }
+      throw locatorFailure(error);
+    } finally {
+      permit.pending.delete(pending);
+      permit.calls.delete(call);
+    }
   }
 
   private async locateClassifier(
@@ -319,6 +357,25 @@ export class ProviderAffineCatchUpHydration {
     if (actual?.providerId !== expected.providerId || actual.revision !== expected.revision) throw retryableFailure();
   }
 
+  private sharedScanPermit(selected: PromotedProviderSelection): ScanPermit | null {
+    const permit = this.scanPermit;
+    if (permit === null || !permit.accepting || permit.signal.aborted
+      || permit.context.providerId !== selected.providerId || this.active !== permit.context
+      || permit.workerSharingRevoked || this.queue.some(({ kind }) => kind === 'SCAN')) return null;
+    if (permit.workerSelectionRevision !== selected.revision) {
+      this.revokeWorkerSharing(permit);
+      return null;
+    }
+    return permit;
+  }
+
+  private isWorkerClaimReady(selection: PromotedProviderSelection | null): boolean {
+    if (this.closed || selection?.providerId === undefined || selection.providerId === null) return false;
+    const permit = this.scanPermit;
+    if (permit !== null) return this.sharedScanPermit(selection) !== null;
+    return this.permitKind !== 'SCAN' && !this.queue.some(({ kind }) => kind === 'SCAN');
+  }
+
   private selection(): PromotedProviderSelection | null {
     let result: PromotedProviderSelection | null = null;
     try {
@@ -356,6 +413,17 @@ export class ProviderAffineCatchUpHydration {
 
   private advanceEpoch(): void {
     this.epoch = this.epoch === Number.MAX_SAFE_INTEGER ? 0 : this.epoch + 1;
+  }
+
+  private invalidateActiveCacheEpoch(): void {
+    this.advanceEpoch();
+    void this.cache.metrics;
+  }
+
+  private revokeWorkerSharing(permit: ScanPermit): void {
+    if (permit.workerSharingRevoked) return;
+    permit.workerSharingRevoked = true;
+    this.invalidateActiveCacheEpoch();
   }
 }
 
@@ -426,7 +494,8 @@ function inspectScannerError(value: unknown): value is Error {
   }
   if (prototype === StrictCatchUpRefreshRequiredError.prototype && value instanceof StrictCatchUpRefreshRequiredError) {
     return exact(['code', 'retryable', 'stage', 'providerId'], 'StrictCatchUpRefreshRequiredError', 'Strict catch-up requires a fresh recovery cycle.')
-      && isRpcProviderId(fields.providerId) && fields.code === 'CATCH_UP_REFRESH_REQUIRED'
+      && isRpcProviderId(fields.providerId) && isStrictCatchUpRefreshRequiredError(value, fields.providerId)
+      && fields.code === 'CATCH_UP_REFRESH_REQUIRED'
       && fields.retryable === true && fields.stage === 'head-refresh';
   }
   if (prototype === StrictCatchUpWindowExceededError.prototype && value instanceof StrictCatchUpWindowExceededError) {
@@ -438,7 +507,8 @@ function inspectScannerError(value: unknown): value is Error {
   if (prototype === StrictCatchUpPausedError.prototype && value instanceof StrictCatchUpPausedError) {
     return exact(['code', 'retryable', 'stage', 'providerId', 'checkpointKey', 'runId', 'pagesScanned', 'signaturesEnqueued'],
       'StrictCatchUpPausedError', 'Strict catch-up paused after its page budget.')
-      && isRpcProviderId(fields.providerId) && (fields.checkpointKey === 'launchpad' || fields.checkpointKey === 'market')
+      && isRpcProviderId(fields.providerId) && isStrictCatchUpPausedError(value, fields.providerId)
+      && (fields.checkpointKey === 'launchpad' || fields.checkpointKey === 'market')
       && fields.code === 'CATCH_UP_PAGE_BUDGET_EXHAUSTED' && fields.retryable === true && fields.stage === 'page-budget'
       && typeof fields.runId === 'string' && /^strict_catchup_run_[0-9a-f]{64}$/u.test(fields.runId)
       && typeof fields.pagesScanned === 'bigint' && fields.pagesScanned >= 0n

@@ -569,10 +569,55 @@ void test('a periodic pause retains one jitter when degraded persistence rejects
   await fixture.supervisor.start();
   fixture.scheduler.fireNext(0);
   await flushLifecycle();
+  const observe = fixture.openedAttempts[0]?.observe;
+  assert.ok(observe !== undefined);
   fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
   await flushLifecycle();
   assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
   assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(fixture.openedAttempts[0]?.signal.aborted, true);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  await observe(Object.freeze({
+    endpointId: 'primary', program: 'pumpfun', hint: 'PUMPFUN_CREATE', hintMint: null,
+    signature: '1'.repeat(64), slot: 42n,
+  }));
+  assert.equal(fixture.reporter.observations.length, 0);
+});
+
+void test('wrong-provider and forged periodic pauses reset the incumbent fail closed', async () => {
+  const forged = Object.assign(
+    new Error('Strict catch-up paused after its page budget.'),
+    {
+      name: 'StrictCatchUpPausedError', code: 'CATCH_UP_PAGE_BUDGET_EXHAUSTED',
+      retryable: true, stage: 'page-budget', providerId: 'primary', checkpointKey: 'launchpad',
+      runId: `strict_catchup_run_${'a'.repeat(64)}`, pagesScanned: 1n, signaturesEnqueued: 2n,
+    },
+  );
+  Object.setPrototypeOf(forged, StrictCatchUpPausedError.prototype);
+  Object.freeze(forged);
+  for (const error of [
+    new StrictCatchUpPausedError('fallback-1', 'launchpad', 'run', 1n, 2n),
+    forged,
+  ]) {
+    const incumbent = controlledSession('primary');
+    const fixture = supervisorFixture({
+      random: () => 0,
+      sessionFactories: [() => Promise.resolve(incumbent.session)],
+    });
+    fixture.strictResults.push(Promise.resolve(scanResult('primary')), rejected(error));
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+    await flushLifecycle();
+    assert.equal(incumbent.closeCalls(), 1);
+    assert.equal(fixture.supervisor.activeProviderId(), null);
+    assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+    assert.equal(fixture.supervisor.state(), 'DEGRADED');
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  }
 });
 
 void test('a pinned window failure is never unanimous catalog exhaustion', async () => {
@@ -609,10 +654,107 @@ void test('shutdown waits for an affinity read and prevents all subsequent netwo
   assert.equal(fixture.supervisor.state(), 'STOPPED');
 });
 
-void test('periodic page-budget pause closes the incumbent and schedules one jitter without rotation', async () => {
+void test('periodic page-budget pause retains the incumbent until successful recovery replaces it', async () => {
   const incumbent = controlledSession('primary');
+  const recovered = controlledSession('primary');
   const fixture = supervisorFixture({
-    providerIds: ['primary', 'fallback-1'], random: () => 0,
+    providerIds: ['primary'], random: () => 0,
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(recovered.session),
+    ],
+  });
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpPausedError('primary', 'launchpad', 'run', 1n, 2n)));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  assert.equal(incumbent.closeCalls(), 0);
+  assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  assert.deepEqual(fixture.openedAttempts.map(({ endpoint }) => endpoint.id), ['primary']);
+  assert.deepEqual(fixture.reporter.transitions.at(-1), {
+    ownerGeneration: 1n,
+    expectedRevision: 5n,
+    phase: 'DEGRADED',
+    providerId: 'primary',
+    activeSessionGeneration: 1n,
+    candidateProviderId: null,
+    candidateSessionGeneration: null,
+    acknowledged: true,
+    disconnectReasonCode: null,
+    recoveryStatus: 'REQUIRED',
+    recoveryReasonCode: 'RPC_UNAVAILABLE',
+  });
+
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  fixture.scheduler.fireNext(500);
+  await flushLifecycle();
+
+  assert.deepEqual(fixture.openedAttempts.map(({ endpoint }) => endpoint.id), ['primary', 'primary']);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(recovered.closeCalls(), 0);
+  assert.equal(fixture.supervisor.activeProviderId(), 'primary');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+  await fixture.supervisor.close();
+});
+
+void test('a durably degraded periodic pause keeps its healthy incumbent across readiness reads', async () => {
+  const reporterScheduler = new ReporterScheduler();
+  const health = new DurableHealthRepository();
+  const incumbent = controlledSession('primary');
+  const base = supervisorFixture({
+    providerIds: ['primary'], random: () => 0,
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  base.strictResults.push(Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpPausedError('primary', 'launchpad', 'run', 1n, 2n)));
+  const reporter = new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    health,
+    {
+      touchIntervalMs: 5,
+      shutdownTimeoutMs: 20,
+      scheduler: Object.freeze({
+        schedule(callback: () => void, delayMs: number): unknown {
+          return reporterScheduler.schedule(callback, delayMs);
+        },
+        cancel(handle: unknown): void { reporterScheduler.cancel(handle); },
+      }),
+    },
+  );
+  const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
+    ...base.dependencies,
+    health,
+    reporter,
+  });
+  const supervisor = new WebSocketFailoverSupervisor(dependencies, base.options);
+  await supervisor.start();
+  base.scheduler.fireNext(0);
+  await flushLifecycle();
+  base.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  assert.equal(reporter.state(), 'DEGRADED');
+  assert.equal(reporter.hasOperationalFailure(), false);
+  assert.equal(supervisor.state(), 'DEGRADED');
+  assert.equal(supervisor.activeProviderId(), 'primary');
+  assert.equal(dependencies.promoted.activeProviderId(), 'primary');
+  assert.equal(incumbent.closeCalls(), 0);
+  assert.deepEqual(base.scheduler.pendingDelays(), [500]);
+  await supervisor.close();
+});
+
+void test('periodic pause persistence plus cleanup failure remains a shutdown failure', async () => {
+  const incumbent = controlledSession('primary', rejected(new Error('secret cleanup failure')));
+  const fixture = supervisorFixture({
+    random: () => 0, transitionFailure: 'DEGRADED',
     sessionFactories: [() => Promise.resolve(incumbent.session)],
   });
   fixture.strictResults.push(Promise.resolve(scanResult('primary')),
@@ -623,11 +765,12 @@ void test('periodic page-budget pause closes the incumbent and schedules one jit
   fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
   await flushLifecycle();
   assert.equal(incumbent.closeCalls(), 1);
-  assert.equal(fixture.supervisor.activeProviderId(), null);
-  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  await assert.rejects(
+    fixture.supervisor.close(),
+    (error: unknown) => error instanceof WebSocketFailoverSupervisorError
+      && error.stage === 'cleanup',
+  );
   assert.equal(fixture.supervisor.state(), 'DEGRADED');
-  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
-  assert.deepEqual(fixture.openedAttempts.map(({ endpoint }) => endpoint.id), ['primary']);
 });
 
 void test('periodic affinity mismatch or read failure prevents the strict scan and backs off', async () => {

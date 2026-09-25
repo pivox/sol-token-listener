@@ -83,6 +83,8 @@ export type StrictCatchUpScannerStage =
   | 'run-fail'
   | 'run-supersede';
 
+const STRICT_CATCH_UP_PAUSED_ERRORS = new WeakSet();
+
 export class StrictCatchUpPausedError extends Error {
   public readonly code = 'CATCH_UP_PAGE_BUDGET_EXHAUSTED' as const;
   public readonly retryable = true;
@@ -97,8 +99,23 @@ export class StrictCatchUpPausedError extends Error {
   ) {
     super('Strict catch-up paused after its page budget.');
     Object.defineProperty(this, 'name', { value: 'StrictCatchUpPausedError' });
+    STRICT_CATCH_UP_PAUSED_ERRORS.add(this);
     Object.freeze(this);
   }
+}
+
+export function isStrictCatchUpPausedError(
+  value: unknown,
+  providerId: RpcProviderId,
+): value is StrictCatchUpPausedError {
+  if (typeof value !== 'object' || value === null || isProxy(value)
+    || !STRICT_CATCH_UP_PAUSED_ERRORS.has(value)
+    || !Object.isFrozen(value)
+    || Object.getPrototypeOf(value) !== StrictCatchUpPausedError.prototype) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'providerId');
+  return descriptor?.enumerable === true
+    && 'value' in descriptor
+    && descriptor.value === providerId;
 }
 
 const STRICT_CATCH_UP_REFRESH_ERRORS = new WeakSet();

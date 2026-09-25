@@ -89,6 +89,10 @@ export class PersistentWebSocketHealthReporter {
     return this.degraded ? 'DEGRADED' : this.currentPhase;
   }
 
+  public hasOperationalFailure(): boolean {
+    return this.degraded;
+  }
+
   public transition(input: WebSocketHealthTransition): Promise<WebSocketHealthSnapshot> {
     if (this.permanentlyClosed) return Promise.reject(reporterError('STATE_CONFLICT'));
     const predecessor = this.lifecycleTransitionTail;

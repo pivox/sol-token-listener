@@ -266,6 +266,15 @@ describe('frontend-owned API V1 schemas', () => {
     for (const providerId of ['primary', 'fallback-1', 'fallback-2', 'fallback-3', null]) {
       expect(parseCatchUpAdmission({ ...metrics, providerId, scanActive: false }).heartbeat.catchUpAdmission?.providerId).toBe(providerId);
     }
+    expect(parseCatchUpAdmission({
+      ...metrics,
+      scanActive: true,
+      workerClaimReady: true,
+    }).heartbeat.catchUpAdmission).toEqual({
+      ...metrics,
+      scanActive: true,
+      workerClaimReady: true,
+    });
     expect(parseCatchUpAdmission({ ...metrics, enabled: false, providerId: null, scanActive: false }).heartbeat.catchUpAdmission?.enabled).toBe(false);
     const maximum = {
       ...metrics,
@@ -284,7 +293,7 @@ describe('frontend-owned API V1 schemas', () => {
       { ...metrics, providerId: 'fallback-99' }, { ...metrics, providerId: 'https://secret.invalid' },
       { ...metrics, providerId: 'secret-signature' }, { ...metrics, providerId: 'secret-mint' },
       { ...metrics, rpcUrl: 'https://secret.invalid' }, { ...metrics, signature: 'secret-signature' },
-      { ...metrics, mint: 'secret-mint' }, { ...metrics, workerClaimReady: true },
+      { ...metrics, mint: 'secret-mint' },
       { ...metrics, providerId: null }, { ...metrics, enabled: false },
       { ...metrics, actionableBacklogBySource: { ...metrics.actionableBacklogBySource, extra: 0 } },
       { ...metrics, actionableBacklogByPriority: { ...metrics.actionableBacklogByPriority, mint: 'secret-mint' } },

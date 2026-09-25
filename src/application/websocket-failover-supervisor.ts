@@ -1,6 +1,7 @@
 import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import {
+  isStrictCatchUpPausedError,
   StrictCatchUpAbortedError,
   StrictCatchUpPausedError,
   StrictCatchUpRefreshRequiredError,
@@ -151,6 +152,7 @@ const REJECTED_SESSION_COMPLETION_REASON: WsProgramSessionCompletionReason = 'PR
 
 interface ValidatedReporter {
   state: PersistentWebSocketHealthReporter['state'];
+  hasOperationalFailure: PersistentWebSocketHealthReporter['hasOperationalFailure'];
   startTouch(snapshot: WebSocketHealthSnapshot): void;
   transition: PersistentWebSocketHealthReporter['transition'];
   observe: PersistentWebSocketHealthReporter['observe'];
@@ -248,7 +250,7 @@ export class WebSocketFailoverSupervisor {
       || this.#currentState === 'STOPPED') return;
     let reporterDegraded = true;
     try {
-      reporterDegraded = this.#dependencies.reporter.state() === 'DEGRADED';
+      reporterDegraded = this.#dependencies.reporter.hasOperationalFailure();
     } catch {
       // An unreadable reporter is not safe evidence for publication.
     }
@@ -1187,6 +1189,7 @@ export class WebSocketFailoverSupervisor {
     const controller = new AbortController();
     this.#periodicAbort = controller;
     let scanning = false;
+    const scanState: { continued: boolean } = { continued: false };
     try {
       const pinned = await this.#dependencies.readPinnedProviderId(controller.signal);
       if (!this.#canScanPeriodic(record, controller.signal)) {
@@ -1201,6 +1204,7 @@ export class WebSocketFailoverSupervisor {
         () => this.#periodicAbort === controller
           && !record.completed
           && this.#canScanPeriodic(record, controller.signal),
+        () => { scanState.continued = true; },
       );
     } catch (error) {
       if (this.#periodicAbort === controller) this.#periodicAbort = null;
@@ -1216,9 +1220,14 @@ export class WebSocketFailoverSupervisor {
         try { await pending; } catch { /* fixed degradation already handled */ }
         return;
       }
-      const operation = !scanning || failure.kind === 'paused'
+      const directPageBudgetPause = scanning
+        && !scanState.continued
+        && isStrictCatchUpPausedError(error, record.providerId);
+      const operation = directPageBudgetPause
         ? this.#pausePeriodicRecovery(record, recoveryReason)
-        : this.#degradeActiveIncumbent(record, 'UNEXPECTED_RESTART', recoveryReason);
+        : !scanning || failure.kind === 'paused'
+          ? this.#resetPeriodicRecovery(record, recoveryReason)
+          : this.#degradeActiveIncumbent(record, 'UNEXPECTED_RESTART', recoveryReason);
       this.#activeFailurePromise = operation;
       try {
         await operation;
@@ -1244,6 +1253,7 @@ export class WebSocketFailoverSupervisor {
     providerId: RpcProviderId,
     signal: AbortSignal,
     canContinue: () => boolean,
+    onContinue: () => void = () => undefined,
   ): Promise<void> {
     try {
       await this.#dependencies.runStrictScan(providerId, signal);
@@ -1251,10 +1261,47 @@ export class WebSocketFailoverSupervisor {
     } catch (error) {
       if (!isStrictCatchUpRefreshRequiredError(error, providerId) || !canContinue()) throw error;
     }
+    onContinue();
     await this.#dependencies.runStrictScan(providerId, signal);
   }
 
   async #pausePeriodicRecovery(
+    record: SessionRecord,
+    recoveryReason: WebSocketRecoveryReasonCode,
+  ): Promise<void> {
+    this.#cancelPeriodicFrontier();
+    if (this.#isPermanentlyClosed()) return;
+    this.#currentState = 'DEGRADED';
+    this.#pendingRecoveryReason = recoveryReason;
+    try {
+      await this.#persistCycleDegraded(recoveryReason, null);
+    } catch (error) {
+      await this.#failClosedPeriodicPausePersistence(record);
+      throw error;
+    } finally {
+      if (!this.#isPermanentlyClosed() && this.#loopHandle === null && this.#loopPromise === null) {
+        this.#scheduleCycleRetry();
+      }
+    }
+  }
+
+  async #failClosedPeriodicPausePersistence(record: SessionRecord): Promise<void> {
+    this.#abandonPromotedSession(record);
+    if (this.#incumbent === record) this.#incumbent = null;
+    try {
+      await this.#closeSession(record);
+    } catch {
+      this.#shutdownResourceFailed = true;
+    }
+    if (!this.#permanentlyClosed && this.#touchStarted) {
+      this.#reporterStopPromise ??= Promise.resolve().then(
+        () => this.#dependencies.reporter.stop(() => Promise.resolve()),
+      );
+      try { await this.#reporterStopPromise; } catch { /* transition failure remains authoritative */ }
+    }
+  }
+
+  async #resetPeriodicRecovery(
     record: SessionRecord,
     recoveryReason: WebSocketRecoveryReasonCode,
   ): Promise<void> {
@@ -1439,6 +1486,9 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     reporterValue,
     'state',
   );
+  const reporterHasOperationalFailure = dataMethod<
+    PersistentWebSocketHealthReporter['hasOperationalFailure']
+  >(reporterValue, 'hasOperationalFailure');
   const transition = dataMethod<PersistentWebSocketHealthReporter['transition']>(
     reporterValue,
     'transition',
@@ -1480,6 +1530,9 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     reporter: Object.freeze({
       state() {
         return Reflect.apply(reporterState, reporterValue, []);
+      },
+      hasOperationalFailure() {
+        return Reflect.apply(reporterHasOperationalFailure, reporterValue, []);
       },
       startTouch(snapshot: WebSocketHealthSnapshot): void {
         Reflect.apply(startTouch, reporterValue, [snapshot]);

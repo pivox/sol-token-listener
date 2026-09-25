@@ -811,7 +811,6 @@ export function snapshotRuntimeCatchUpAdmissionMetrics(
     if (metrics.version !== 1 || typeof metrics.enabled !== 'boolean'
       || typeof metrics.scanActive !== 'boolean' || typeof metrics.workerClaimReady !== 'boolean'
       || (metrics.providerId !== null && !isRpcProviderId(metrics.providerId))
-      || (metrics.scanActive && metrics.workerClaimReady)
       || (metrics.providerId === null && (metrics.scanActive || metrics.workerClaimReady))
       || (!metrics.enabled && (metrics.providerId !== null || metrics.scanActive || metrics.workerClaimReady))) {
       throw new TypeError('Runtime heartbeat catch-up admission state is invalid.');
