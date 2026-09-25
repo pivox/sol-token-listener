@@ -786,15 +786,17 @@ void test('decoder quarantine runbook documents bounded observation-only recover
 void test('block hydration runbook defines the corrected worker-eligible cohort and mandatory replay', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.2\.7/u);
+  assert.match(runbook, /Version : 1\.2\.8/u);
   assert.match(runbook, /population worker-éligible/iu);
   for (const exclusion of [
     'IGNORED / SOLANA_TRANSACTION_FAILED',
     'IGNORED / NO_SUPPORTED_PUMP_ACTION',
     'DEFERRED / PUMP_TRADE_UNTRACKED',
   ]) assert.match(runbook, new RegExp(exclusion, 'u'));
-  assert.match(runbook, /provenance[^.]{0,120}exclusivement[^.]{0,80}CATCH_UP/iu);
-  assert.match(runbook, /WEBSOCKET[^.]{0,80}CATCH_UP[^.]{0,160}fail-closed/iu);
+  assert.match(runbook, /IGNORED[^.]{0,160}provenance[^.]{0,120}exclusivement[^.]{0,80}CATCH_UP/iu);
+  assert.match(runbook, /DEFERRED[^.]{0,160}WEBSOCKET[^.]{0,160}sans aucun reçu catch-up/iu);
+  assert.match(runbook, /WEBSOCKET, CATCH_UP[^.]{0,200}reçu V1 deferred[^.]{0,120}même mint/iu);
+  assert.match(runbook, /Toute autre combinaison de provenance[^.]{0,160}fail-closed/iu);
   assert.match(runbook, /QUARANTINED[^.]{0,240}bloquant/iu);
   assert.match(runbook, /(?:état|combinaison)[^.]{0,120}malformé[^.]{0,240}bloquant/iu);
   for (const independentGate of [
@@ -811,7 +813,7 @@ void test('block hydration runbook defines the corrected worker-eligible cohort 
 void test('block hydration runbook keeps catch-up refresh continuation bounded and fail-closed', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.2\.7/u);
+  assert.match(runbook, /Version : 1\.2\.8/u);
   assert.match(runbook, /CATCH_UP_REFRESH_REQUIRED[\s\S]{0,400}exactement un scan supplémentaire/iu);
   assert.match(runbook, /même provider[\s\S]{0,180}même session WebSocket[\s\S]{0,180}même signal d'arrêt/iu);
   assert.match(runbook, /ne promeut jamais[\s\S]{0,180}avant la réussite[\s\S]{0,120}seconde passe/iu);
