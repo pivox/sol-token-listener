@@ -11,6 +11,7 @@ const ACTIVE_STATES = [
   'WAITING_EXTERNAL_BUYS',
   'EXIT_PENDING_QUOTE',
   'SELL_PENDING',
+  'MANUAL_REVIEW',
 ] as const;
 
 const FOUNDATION_MIGRATIONS = [
@@ -78,8 +79,20 @@ void test('055 admits one concurrent creation entry globally and releases admiss
     await second.query('ROLLBACK');
 
     await pool.query(`UPDATE paper_strategy_sessions
-      SET state='PAPER_CLOSED',updated_at=to_timestamp(2),terminal_at=to_timestamp(2),
+      SET state='MANUAL_REVIEW',reason_code='RECONCILIATION_REQUIRED',
+        updated_at=to_timestamp(2),terminal_at=to_timestamp(2),
         purge_after=to_timestamp(2) + INTERVAL '4 hours'
+      WHERE session_id=$1`, [firstLineage.sessionId]);
+
+    await assert.rejects(
+      () => insertActiveSession(second, secondLineage),
+      (error: unknown) => postgresErrorCode(error) === '23505'
+        && postgresConstraint(error) === 'paper_strategy_sessions_creation_entry_active_singleton_idx',
+    );
+
+    await pool.query(`UPDATE paper_strategy_sessions
+      SET state='PAPER_RETRACTED',updated_at=to_timestamp(3),terminal_at=to_timestamp(3),
+        purge_after=to_timestamp(3) + INTERVAL '4 hours'
       WHERE session_id=$1`, [firstLineage.sessionId]);
 
     await second.query('BEGIN');

@@ -43,6 +43,38 @@ void test('055 is replay-safe and installs the active creation-entry singleton i
     assert.match(index.rows[0]?.definition ?? '', /strategy_id = 'creation-entry-v1'/u);
     assert.match(index.rows[0]?.definition ?? '', /BUY_PENDING/u);
     assert.match(index.rows[0]?.definition ?? '', /SELL_PENDING/u);
+    assert.match(index.rows[0]?.definition ?? '', /MANUAL_REVIEW/u);
+    await pool.query(await readFile(migrationUrl, 'utf8'));
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('055 refuses a homonymous non-unique index instead of marking the migration applied', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  const schema = `paper_singleton_collision_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await migrateDatabase({ pool });
+    await pool.query('DROP INDEX paper_strategy_sessions_creation_entry_active_singleton_idx');
+    await pool.query('DELETE FROM migration_history WHERE version=$1', [migrationName]);
+    await pool.query(`CREATE INDEX paper_strategy_sessions_creation_entry_active_singleton_idx
+      ON paper_strategy_sessions (strategy_id)`);
+
+    await assert.rejects(
+      () => migrateDatabase({ pool }),
+      /creation-entry active singleton index definition is incompatible/u,
+    );
+    const history = await pool.query('SELECT version FROM migration_history WHERE version=$1', [migrationName]);
+    assert.equal(history.rowCount, 0);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
