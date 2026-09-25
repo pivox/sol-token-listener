@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '043_execution_intent_causal_lineage.sql';
-const migrationHeadName = '052_transaction_inbox_urgent_fairness.sql';
+const migrationHeadName = '053_transaction_inbox_worker_admission_foundation.sql';
 
 void test('migration 043 adds nullable lineage identity and non-blocking foreign keys', async () => {
   const sql = await readFile(new URL(`../migrations/${migrationName}`, import.meta.url), 'utf8');
