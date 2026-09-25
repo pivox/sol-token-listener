@@ -7,26 +7,37 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { copyQualificationProfiles } from '../scripts/copy-qualification-profiles.js';
 
-const profileName = 'pumpfun-v1-unvalidated.json';
-const bundledProfile = new URL('../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url);
+const historicalProfileName = 'pumpfun-v1-unvalidated.json';
+const technicalProfileName = 'pumpfun-mvp-technical-v1.json';
+const canonicalProfileNames = [historicalProfileName, technicalProfileName] as const;
+const bundledHistoricalProfile = new URL(
+  '../config/qualification/pumpfun-v1-unvalidated.json',
+  import.meta.url,
+);
+const bundledTechnicalProfile = new URL(
+  '../config/qualification/pumpfun-mvp-technical-v1.json',
+  import.meta.url,
+);
 
-void test('copies the only canonical profile byte-for-byte and removes stale target files', async () => {
+void test('copies the fixed two-profile allowlist byte-for-byte and removes stale target files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'sol-listener-qualification-profiles-'));
   const sourceDirectory = join(root, 'source');
   const targetDirectory = join(root, 'target');
   try {
     await mkdir(sourceDirectory);
     await mkdir(targetDirectory);
-    const expected = await readFile(bundledProfile);
-    await writeFile(join(sourceDirectory, profileName), expected);
+    const historical = await readFile(bundledHistoricalProfile);
+    const technical = await readFile(bundledTechnicalProfile);
+    await writeCanonicalProfiles(sourceDirectory);
     await writeFile(join(sourceDirectory, 'ignored.json'), '{}');
     await writeFile(join(targetDirectory, 'stale.json'), 'stale');
 
     const copied = await copyQualificationProfiles({ sourceDirectory, targetDirectory });
 
-    assert.deepEqual(copied, [profileName]);
-    assert.deepEqual(await readFile(join(targetDirectory, profileName)), expected);
-    assert.deepEqual((await readdir(targetDirectory)).sort(), [profileName]);
+    assert.deepEqual(copied, canonicalProfileNames);
+    assert.deepEqual(await readFile(join(targetDirectory, historicalProfileName)), historical);
+    assert.deepEqual(await readFile(join(targetDirectory, technicalProfileName)), technical);
+    assert.deepEqual((await readdir(targetDirectory)).sort(), [...canonicalProfileNames].sort());
     assert.deepEqual((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-')), []);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -42,14 +53,17 @@ void test('rejects missing, invalid, and oversized profile sources before cleani
     await mkdir(targetDirectory);
     const stale = join(targetDirectory, 'preserve-me');
     await writeFile(stale, 'stale');
-    for (const contents of [undefined, Buffer.from('{'), Buffer.alloc(65_537)]) {
-      if (contents === undefined) {
-        await rm(join(sourceDirectory, profileName), { force: true });
-      } else {
-        await writeFile(join(sourceDirectory, profileName), contents);
+    for (const profileName of canonicalProfileNames) {
+      for (const contents of [undefined, Buffer.from('{'), Buffer.alloc(65_537)]) {
+        await writeCanonicalProfiles(sourceDirectory);
+        if (contents === undefined) {
+          await rm(join(sourceDirectory, profileName), { force: true });
+        } else {
+          await writeFile(join(sourceDirectory, profileName), contents);
+        }
+        await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
+        assert.equal(await readFile(stale, 'utf8'), 'stale');
       }
-      await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
-      assert.equal(await readFile(stale, 'utf8'), 'stale');
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -60,13 +74,14 @@ void test('rejects duplicate keys and invalid UTF-8 without altering the target'
   const root = await mkdtemp(join(tmpdir(), 'sol-listener-ambiguous-qualification-profile-'));
   const sourceDirectory = join(root, 'source');
   const targetDirectory = join(root, 'target');
-  const sourcePath = join(sourceDirectory, profileName);
+  const sourcePath = join(sourceDirectory, historicalProfileName);
   const sentinel = join(targetDirectory, 'preserve-me');
   try {
     await mkdir(sourceDirectory);
     await mkdir(targetDirectory);
+    await writeCanonicalProfiles(sourceDirectory);
     await writeFile(sentinel, 'stale');
-    const canonical = await readFile(bundledProfile, 'utf8');
+    const canonical = await readFile(bundledHistoricalProfile, 'utf8');
     for (const contents of [
       Buffer.from(canonical.replace('"schemaVersion": 1', '"schemaVersion": 1, "schemaVersion": 1')),
       Buffer.from([0xc3, 0x28]),
@@ -88,14 +103,21 @@ void test('rejects symlinked sources and source-target aliases without altering 
   try {
     await mkdir(sourceDirectory);
     await mkdir(targetDirectory);
-    await symlink(bundledProfile, join(sourceDirectory, profileName));
+    await writeFile(join(sourceDirectory, technicalProfileName), await readFile(bundledTechnicalProfile));
+    await symlink(bundledHistoricalProfile, join(sourceDirectory, historicalProfileName));
     await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
-    assert.equal((await lstat(join(sourceDirectory, profileName))).isSymbolicLink(), true);
+    assert.equal((await lstat(join(sourceDirectory, historicalProfileName))).isSymbolicLink(), true);
 
-    await rm(join(sourceDirectory, profileName));
-    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await rm(join(sourceDirectory, historicalProfileName));
+    await writeFile(
+      join(sourceDirectory, historicalProfileName),
+      await readFile(bundledHistoricalProfile),
+    );
     await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory: sourceDirectory }));
-    assert.deepEqual(await readFile(join(sourceDirectory, profileName)), await readFile(bundledProfile));
+    assert.deepEqual(
+      await readFile(join(sourceDirectory, historicalProfileName)),
+      await readFile(bundledHistoricalProfile),
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -111,7 +133,7 @@ void test('rejects the current working directory as a target without deleting it
   try {
     await mkdir(sourceDirectory);
     await mkdir(childWorkingDirectory);
-    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeCanonicalProfiles(sourceDirectory);
     await writeFile(sentinel, 'preserve-me');
     const script = `
       import { copyQualificationProfiles } from ${JSON.stringify(copierPath)};
@@ -146,7 +168,11 @@ void test('rejects deeply nested JSON before cleaning the target', async () => {
   try {
     await mkdir(sourceDirectory);
     await mkdir(targetDirectory);
-    await writeFile(join(sourceDirectory, profileName), `${'['.repeat(15_000)}${']'.repeat(15_000)}`);
+    await writeCanonicalProfiles(sourceDirectory);
+    await writeFile(
+      join(sourceDirectory, historicalProfileName),
+      `${'['.repeat(15_000)}${']'.repeat(15_000)}`,
+    );
     await writeFile(sentinel, 'stale');
 
     await assert.rejects(
@@ -166,13 +192,16 @@ void test('rejects canonical target aliases that would create a child beneath th
   const targetAlias = join(root, 'source-alias');
   try {
     await mkdir(sourceDirectory);
-    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeCanonicalProfiles(sourceDirectory);
     await symlink(sourceDirectory, targetAlias);
 
     await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory: join(targetAlias, 'child', 'target') }));
 
     await assert.rejects(lstat(join(sourceDirectory, 'child')));
-    assert.deepEqual(await readFile(join(sourceDirectory, profileName)), await readFile(bundledProfile));
+    assert.deepEqual(
+      await readFile(join(sourceDirectory, historicalProfileName)),
+      await readFile(bundledHistoricalProfile),
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -184,7 +213,7 @@ void test('cleans its private staging directory when an existing target is inval
   const targetDirectory = join(root, 'target');
   try {
     await mkdir(sourceDirectory);
-    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeCanonicalProfiles(sourceDirectory);
     await writeFile(targetDirectory, 'not a directory');
 
     await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
@@ -201,7 +230,7 @@ void test('rejects filesystem root and repository working-directory ancestors as
   const sourceDirectory = join(root, 'source');
   try {
     await mkdir(sourceDirectory);
-    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeCanonicalProfiles(sourceDirectory);
     for (const targetDirectory of [parse(process.cwd()).root, process.cwd(), dirname(process.cwd())]) {
       await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
     }
@@ -214,20 +243,24 @@ void test('replaces direct stale entries deterministically without leaving sibli
   const root = await mkdtemp(join(tmpdir(), 'sol-listener-repeatable-qualification-profile-'));
   const sourceDirectory = join(root, 'source');
   const targetDirectory = join(root, 'target');
-  const expected = await readFile(bundledProfile);
+  const historical = await readFile(bundledHistoricalProfile);
+  const technical = await readFile(bundledTechnicalProfile);
   try {
     await mkdir(sourceDirectory);
     await mkdir(targetDirectory);
-    await writeFile(join(sourceDirectory, profileName), expected);
+    await writeCanonicalProfiles(sourceDirectory);
     await writeFile(join(targetDirectory, 'stale'), 'stale');
 
     await copyQualificationProfiles({ sourceDirectory, targetDirectory });
-    const first = await readFile(join(targetDirectory, profileName));
+    const firstHistorical = await readFile(join(targetDirectory, historicalProfileName));
+    const firstTechnical = await readFile(join(targetDirectory, technicalProfileName));
     await copyQualificationProfiles({ sourceDirectory, targetDirectory });
 
-    assert.deepEqual(first, expected);
-    assert.deepEqual(await readFile(join(targetDirectory, profileName)), expected);
-    assert.deepEqual(await readdir(targetDirectory), [profileName]);
+    assert.deepEqual(firstHistorical, historical);
+    assert.deepEqual(firstTechnical, technical);
+    assert.deepEqual(await readFile(join(targetDirectory, historicalProfileName)), historical);
+    assert.deepEqual(await readFile(join(targetDirectory, technicalProfileName)), technical);
+    assert.deepEqual((await readdir(targetDirectory)).sort(), [...canonicalProfileNames].sort());
     assert.deepEqual((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-')), []);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -242,7 +275,7 @@ void test('rejects nested stale target directories without touching either direc
   try {
     await mkdir(sourceDirectory);
     await mkdir(nestedDirectory, { recursive: true });
-    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeCanonicalProfiles(sourceDirectory);
     await writeFile(join(sourceDirectory, 'source-sentinel'), 'source');
     await writeFile(join(nestedDirectory, 'target-sentinel'), 'target');
 
@@ -255,3 +288,14 @@ void test('rejects nested stale target directories without touching either direc
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function writeCanonicalProfiles(sourceDirectory: string): Promise<void> {
+  await writeFile(
+    join(sourceDirectory, historicalProfileName),
+    await readFile(bundledHistoricalProfile),
+  );
+  await writeFile(
+    join(sourceDirectory, technicalProfileName),
+    await readFile(bundledTechnicalProfile),
+  );
+}

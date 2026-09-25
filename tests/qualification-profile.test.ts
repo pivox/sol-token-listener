@@ -345,6 +345,44 @@ void test('loads default and custom profiles with bounded, redacted failures', (
   }
 });
 
+void test('loads the explicit Pump.fun technical MVP profile without changing the default', () => {
+  const historical = loadQualificationProfile({
+    profilePath: null,
+    minimumScoreOverride: null,
+  });
+  const technical = loadQualificationProfile({
+    profilePath: 'config/qualification/pumpfun-mvp-technical-v1.json',
+    minimumScoreOverride: null,
+  });
+
+  assert.equal(historical.id, 'pumpfun-v1-initial');
+  assert.equal(historical.minimumTotalScore, 60);
+  assert.equal(technical.id, 'pumpfun-mvp-technical-v1');
+  assert.equal(technical.version, 1);
+  assert.equal(technical.minimumTotalScore, 40);
+  assert.notEqual(technical.fingerprint, historical.fingerprint);
+  assert.equal(
+    technical.rules.find((rule) => rule.signal === 'imageValid')?.required,
+    false,
+  );
+  assert.equal(
+    technical.rules.find((rule) => rule.signal === 'socialCrossLinkConfirmed')?.required,
+    false,
+  );
+  assert.equal(
+    technical.rules.find((rule) => rule.signal === 'creatorHasNotSold')?.required,
+    true,
+  );
+  assert.equal(
+    technical.rules.find((rule) => rule.signal === 'reverseQuoteAvailable')?.required,
+    true,
+  );
+  assert.equal(
+    technical.rules.find((rule) => rule.signal === 'externalBuyersObserved')?.required,
+    false,
+  );
+});
+
 void test('rejects duplicate decoded JSON keys before profile materialization', () => {
   const canonical = JSON.stringify(validRawProfile());
   const duplicateProfiles = [

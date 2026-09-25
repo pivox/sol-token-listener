@@ -4,7 +4,10 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseQualificationProfileJson } from '../src/qualification/qualification-profile.js';
 
-const canonicalProfileName = 'pumpfun-v1-unvalidated.json' as const;
+const canonicalProfileNames = Object.freeze([
+  'pumpfun-v1-unvalidated.json',
+  'pumpfun-mvp-technical-v1.json',
+] as const);
 const MAX_PROFILE_BYTES = 65_536;
 const MAX_PATH_BYTES = 4_096;
 const repositoryRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
@@ -16,13 +19,16 @@ export interface CopyQualificationProfilesOptions {
 
 export async function copyQualificationProfiles(
   options: CopyQualificationProfilesOptions,
-): Promise<readonly ['pumpfun-v1-unvalidated.json']> {
+): Promise<typeof canonicalProfileNames> {
   const sourceDirectory = safeDirectoryPath(options.sourceDirectory, 'source');
   const targetDirectory = safeDirectoryPath(options.targetDirectory, 'target');
-  const sourceBytes = readCanonicalProfile(sourceDirectory);
-  validateProfile(sourceBytes);
-  await replaceTargetDirectory(sourceDirectory, targetDirectory, sourceBytes);
-  return Object.freeze([canonicalProfileName]);
+  const profiles = canonicalProfileNames.map((name) => Object.freeze({
+    name,
+    bytes:readCanonicalProfile(sourceDirectory, name),
+  }));
+  for (const profile of profiles) validateProfile(profile.bytes);
+  await replaceTargetDirectory(sourceDirectory, targetDirectory, profiles);
+  return canonicalProfileNames;
 }
 
 function safeDirectoryPath(value: string, label: 'source' | 'target'): string {
@@ -34,9 +40,12 @@ function safeDirectoryPath(value: string, label: 'source' | 'target'): string {
   return resolved;
 }
 
-function readCanonicalProfile(sourceDirectory: string): Buffer {
+function readCanonicalProfile(
+  sourceDirectory: string,
+  profileName: (typeof canonicalProfileNames)[number],
+): Buffer {
   assertSafeExistingDirectory(sourceDirectory, 'source');
-  const profilePath = join(sourceDirectory, canonicalProfileName);
+  const profilePath = join(sourceDirectory, profileName);
   const listed = lstatSync(profilePath);
   if (!listed.isFile() || listed.isSymbolicLink()) throw new Error('Qualification profile source must be a regular file.');
 
@@ -69,7 +78,14 @@ function validateProfile(bytes: Buffer): void {
   }
 }
 
-async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: string, sourceBytes: Buffer): Promise<void> {
+async function replaceTargetDirectory(
+  sourceDirectory: string,
+  targetDirectory: string,
+  profiles: readonly Readonly<{
+    name: (typeof canonicalProfileNames)[number];
+    bytes: Buffer;
+  }>[],
+): Promise<void> {
   const sourceRealPath = realpathSync(sourceDirectory);
   const canonicalTarget = canonicalTargetDirectory(sourceRealPath, targetDirectory);
   const sourceIdentity = directoryIdentity(sourceDirectory, 'source');
@@ -81,7 +97,9 @@ async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: 
   const stagingDirectory = mkdtempSync(join(stableTargetParent, '.qualification-profile-stage-'));
   const stagingIdentity = directoryIdentity(stagingDirectory, 'target');
   try {
-    await writeFile(join(stagingDirectory, canonicalProfileName), sourceBytes, { flag: 'wx', mode: 0o600 });
+    for (const profile of profiles) {
+      await writeFile(join(stagingDirectory, profile.name), profile.bytes, { flag: 'wx', mode: 0o600 });
+    }
     const targetIdentity = ensureTargetDirectory(stableTargetDirectory, sourceDirectory, sourceIdentity);
     const entries = directTargetEntries(stableTargetDirectory);
     for (const entry of entries) {
@@ -93,7 +111,12 @@ async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: 
     assertStableDirectories(stableTargetDirectory, targetIdentity, sourceDirectory, sourceIdentity);
     if (readdirSync(stableTargetDirectory).length !== 0) throw new Error('Target directory changed before replacement.');
     if (!sameIdentity(directoryIdentity(stagingDirectory, 'target'), stagingIdentity)) throw new Error('Staging directory changed before replacement.');
-    renameSync(join(stagingDirectory, canonicalProfileName), join(stableTargetDirectory, canonicalProfileName));
+    for (const profile of profiles) {
+      renameSync(
+        join(stagingDirectory, profile.name),
+        join(stableTargetDirectory, profile.name),
+      );
+    }
   } finally {
     removePrivateStagingDirectory(stagingDirectory, stagingIdentity);
   }
@@ -222,13 +245,15 @@ function sameIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolea
 function removePrivateStagingDirectory(directory: string, expected: DirectoryIdentity): void {
   try {
     if (!sameIdentity(directoryIdentity(directory, 'target'), expected)) return;
-    const profilePath = join(directory, canonicalProfileName);
-    try {
-      const profile = lstatSync(profilePath);
-      if (profile.isSymbolicLink() || !profile.isFile()) return;
-      unlinkSync(profilePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return;
+    for (const profileName of canonicalProfileNames) {
+      const profilePath = join(directory, profileName);
+      try {
+        const profile = lstatSync(profilePath);
+        if (profile.isSymbolicLink() || !profile.isFile()) return;
+        unlinkSync(profilePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return;
+      }
     }
     if (sameIdentity(directoryIdentity(directory, 'target'), expected)) rmdirSync(directory);
   } catch { /* A failed private staging cleanup is retained rather than broadened. */ }
