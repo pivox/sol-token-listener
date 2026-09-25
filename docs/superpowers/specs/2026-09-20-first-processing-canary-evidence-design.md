@@ -1,6 +1,6 @@
 # First-Processing Canary Evidence Design
 
-Version: 1.1.2 — 2026-09-24 — issues #143 and #153
+Version: 1.1.3 — 2026-09-25 — issues #143, #153 and #163
 
 Status: approved for implementation under the standing operator instruction
 
@@ -152,23 +152,33 @@ This excludes historical rows and makes all heartbeat snapshots for one
 process converge on the same final cohort. The query returns one aggregate row;
 it never returns per-transaction evidence to the application.
 
-The cohort measures worker processing, not successful catch-up classification
-that deliberately decides no worker admission is required. Before ordering and
-applying the capacity bound, it therefore excludes only exact, coherent,
-version-1 classification-only rows that remain non-admitted:
+The cohort measures worker processing, not a durable ingestion decision that
+deliberately requires no worker admission. Before ordering and applying the
+capacity bound, it therefore excludes only exact, coherent, pristine rows that
+remain non-admitted:
 
 - `IGNORED / SOLANA_TRANSACTION_FAILED` with `catch_up_enqueued=false`;
 - `IGNORED / NO_SUPPORTED_PUMP_ACTION` with `catch_up_enqueued=false`;
-- `DEFERRED / PUMP_TRADE_UNTRACKED` with `catch_up_enqueued=false`.
+- `DEFERRED / PUMP_TRADE_UNTRACKED`, with no catch-up receipt for a
+  WebSocket-only decision or with `catch_up_enqueued=false` when a coherent
+  version-1 catch-up receipt exists.
 
-The stored processing status, disposition and reason must all match the listed
-combination. The receipt must come exclusively from `CATCH_UP`; any row also
-observed through `WEBSOCKET` remains eligible because its prior worker
-admission cannot be disproved. All version-1 receipt fields must form the exact
-coherent shape already enforced for catch-up classification: action key, mints,
-ingestion hint and optional mint, evidence fingerprint, classification time,
-terminal time and purge deadline. Exclusion also requires positive proof that
-the row has never been worker-admitted or processed: zero lifetime and cycle
+For the two `IGNORED` combinations, the receipt must still come exclusively
+from `CATCH_UP`, and all version-1 receipt fields must form the exact coherent
+shape already enforced for catch-up classification.
+
+The `DEFERRED / PUMP_TRADE_UNTRACKED` combination additionally covers the
+repository's canonical WebSocket decision for a Pump.fun trade whose mint is
+not tracked. A WebSocket-only row is excluded only when its discovery sources
+are exactly `WEBSOCKET`, every catch-up receipt field is absent, its status is
+`DEFERRED`, its priority is `NORMAL`, and its canonical trade hint contains a
+valid mint. A row enriched later by catch-up is excluded only when its sources
+are exactly `WEBSOCKET, CATCH_UP` and the complete version-1 deferred receipt
+matches that same mint. Other mixed-source shapes remain eligible and
+fail-closed.
+
+Every exclusion also requires positive proof that the row has never been
+worker-admitted or processed: zero lifetime and cycle
 attempts, no current or historical lease, snapshot, immutable fingerprint,
 processing timestamp, first-processing timestamp, recovery, retry, error or
 finality evidence, `first_processing_evidence_unavailable=false`, and no
@@ -187,7 +197,9 @@ null-safe exact predicate (for example `NOT COALESCE(exact_match, FALSE)`) so a
 legacy or malformed partial classification remains inside the fail-closed
 cohort.
 
-This is a correction to the intended V1 population, not a JSON schema change:
+The exclusions are applied before row numbering, the 50,000-row capacity bound
+and overflow probing. This is a correction to the intended V1 population, not
+a JSON schema change:
 the aggregate keys, `version: 1`, arithmetic invariants and public projection
 remain unchanged.
 

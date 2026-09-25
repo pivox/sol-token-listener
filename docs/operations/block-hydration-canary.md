@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.7 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153 et #155.
+Version : 1.2.8 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155 et #163.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -102,22 +102,29 @@ autres gates indépendants avant de conclure.
 
 La cohorte first-processing mesure uniquement la latence entre la détection
 durable d'une transaction worker-éligible et son premier traitement métier
-réussi. Une classification catch-up qui conclut de façon cohérente qu'aucune
+réussi. Une décision d'ingestion qui conclut de façon cohérente qu'aucune
 admission worker n'est requise ne constitue pas un échec de traitement. Avant
-le tri et la limite de 50 000 lignes, seules les trois combinaisons exactes,
-versionnées et non admises suivantes sont exclues de cette cohorte :
+le tri, la limite de 50 000 lignes et le calcul d'overflow, seules les trois
+combinaisons exactes, versionnées lorsqu'un reçu catch-up existe, et non admises
+suivantes sont exclues de cette cohorte :
 
 - `IGNORED / SOLANA_TRANSACTION_FAILED` avec `catch_up_enqueued=false` ;
 - `IGNORED / NO_SUPPORTED_PUMP_ACTION` avec `catch_up_enqueued=false` ;
-- `DEFERRED / PUMP_TRADE_UNTRACKED` avec `catch_up_enqueued=false`.
+- `DEFERRED / PUMP_TRADE_UNTRACKED`, sans reçu catch-up pour une décision
+  WebSocket seule ou avec `catch_up_enqueued=false` lorsqu'un reçu catch-up V1
+  cohérent existe.
+
+Les deux résultats `IGNORED` exigent une provenance exclusivement `CATCH_UP`
+et un reçu V1 complet. Le résultat `DEFERRED / PUMP_TRADE_UNTRACKED` accepte
+soit la provenance exacte `WEBSOCKET` sans aucun reçu catch-up, soit les
+provenances exactes `WEBSOCKET, CATCH_UP` avec un reçu V1 deferred complet et
+cohérent pour le même mint. Toute autre combinaison de provenance reste
+worker-éligible et fail-closed.
 
 Cette exclusion exige également la preuve complète que la ligne n'a jamais été
 touchée par le worker : aucun essai, lease présent ou historique, snapshot,
 fingerprint immuable, traitement, récupération, retry, erreur, preuve de
-finalité ou priorité d'admission. La provenance doit être exclusivement
-`CATCH_UP` et le reçu V1 complet doit être cohérent ; une provenance mêlant
-`WEBSOCKET` et `CATCH_UP`, ou tout champ de reçu absent ou contradictoire,
-reste worker-éligible et fail-closed. Une ligne différée ensuite promue par
+finalité ou priorité d'admission. Une ligne différée ensuite promue par
 `syncTrackedMint()` redevient worker-éligible avec son `first_detected_at`
 original, même si son reçu historique conserve `catch_up_enqueued=false`.
 
