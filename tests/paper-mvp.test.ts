@@ -155,6 +155,32 @@ void test('marks a multi-position campaign as incomplete without changing its hi
   assert.equal(report.oneShotCycle.profitability.status, 'NOT_AVAILABLE');
 });
 
+void test('keeps a safety exit explicit and incomplete when N buyers was not reached', () => {
+  const report = createPaperMvpOneShotReport({
+    runId: 'paper_mvp_run_safety_exit', completionReason: 'TARGET_REACHED',
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 1,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 1,
+    entriesRejected: 0, openedPositions: 1, openPositions: 0,
+    samples: [createPaperMvpPositionSample(sampleInput({
+      exitReason: 'CREATOR_EARLY_SELL',
+    }))],
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: {
+      status: 'AVAILABLE', creditsUsedStart: 10n, creditsUsedEnd: 11n, rateLimitedCount: 0,
+    },
+    maxDurationMs: 60_000,
+    externalUniqueBuyersTarget: 3,
+    qualificationProfileFingerprint: 'c'.repeat(64),
+  });
+
+  assert.equal(report.oneShotCycle.functionalStatus, 'INCOMPLETE');
+  assert.deepEqual(report.oneShotCycle.failedGateCodes, [
+    'EXTERNAL_UNIQUE_BUYERS_TARGET_NOT_REACHED',
+  ]);
+  assert.equal(report.oneShotCycle.externalUniqueBuyers.thresholdReached, false);
+  assert.equal(report.oneShotCycle.cycle?.exitReason, 'CREATOR_EARLY_SELL');
+});
+
 void test('reports opened and open positions with floored closed-sample execution means', () => {
   const first = createPaperMvpPositionSample(sampleInput({
     positionId: 'metrics-1', buySlippageBps: 101n, sellSlippageBps: 102n,

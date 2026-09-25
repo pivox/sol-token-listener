@@ -136,6 +136,7 @@ export type PaperMvpOneShotGateCode =
   | 'LOGICAL_BUY_COUNT_NOT_ONE'
   | 'LOGICAL_SELL_COUNT_NOT_ONE'
   | 'OPEN_POSITION_REMAINS'
+  | 'EXTERNAL_UNIQUE_BUYERS_TARGET_NOT_REACHED'
   | 'UNKNOWN_TERMINAL_POSITION'
   | 'DUPLICATE_LOGICAL_BUY'
   | 'DUPLICATE_LOGICAL_SELL';
@@ -370,6 +371,11 @@ export function createPaperMvpOneShotReport(
   const sample = logicalSellCount === 1 && input.samples[0] !== undefined
     ? validateSample(input.samples[0])
     : null;
+  const externalBuyerThresholdReached =
+    sample?.exitReason === 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED';
+  if (sample !== null && !externalBuyerThresholdReached) {
+    failedGateCodes.push('EXTERNAL_UNIQUE_BUYERS_TARGET_NOT_REACHED');
+  }
   const cycle = sample === null ? null : Object.freeze({
     positionId: sample.positionId,
     mint: sample.mint,
@@ -409,7 +415,7 @@ export function createPaperMvpOneShotReport(
     }),
     externalUniqueBuyers: Object.freeze({
       target: input.externalUniqueBuyersTarget,
-      thresholdReached: sample?.exitReason === 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+      thresholdReached: externalBuyerThresholdReached,
     }),
     profitability,
     cycle,

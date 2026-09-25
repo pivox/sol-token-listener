@@ -831,7 +831,7 @@ function sample(positionId = 'position-1') {
   const config = paperConfig();
   return createPaperMvpPositionSample({
     positionId, mint: 'mint', quoteMint: config.wsolMint,
-    exitReason: 'TAKE_PROFIT_2X_EXECUTABLE', creationDetectedAtMs: 1_100,
+    exitReason: 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED', creationDetectedAtMs: 1_100,
     entryDecisionAtMs: 1_200, entryQuoteAtMs: 1_300, paperBuyAtMs: 1_400,
     exitTriggerAtMs: 1_500, exitQuoteAtMs: 1_600, paperSellAtMs: 1_700,
     buyAmountInRaw: 100n, buyAmountOutRaw: 100n, buyMinimumAmountOutRaw: 100n,
