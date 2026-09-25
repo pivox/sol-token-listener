@@ -21,6 +21,7 @@ import {
 } from '../src/ports/provider-usage-probe.js';
 import {
   PaperMvpCliError,
+  assertPaperMvpSafety,
   parsePaperMvpArguments,
   runPaperMvp,
   type PaperMvpRunnerDependencies,
@@ -84,8 +85,9 @@ void test('fails every safety gate before bootstrap, database, collector, or fil
     { ...valid, paperStrategyId: 'validated-external-buys' },
     { ...valid, paperQuoteMintAllowlist: [valid.wsolMint, 'other'] },
     { ...valid, paperQuoteMintAllowlist: ['other'] },
-    { ...valid, paperExternalBuyTarget: 9 },
-    { ...valid, creationTakeProfitMultiplierBps: 19_999n },
+    { ...valid, paperExternalBuyTarget: 0 },
+    { ...valid, paperExternalBuyTarget: 1_001 },
+    { ...valid, creationTakeProfitMultiplierBps: 9_999n },
   ];
   for (const config of invalid) {
     let bootstrapCalls = 0;
@@ -95,6 +97,16 @@ void test('fails every safety gate before bootstrap, database, collector, or fil
     }), isCliError('SAFETY_GATE_FAILED'));
     assert.equal(bootstrapCalls, 0);
   }
+});
+
+void test('accepts bounded configurable N and configured take profit values', () => {
+  assert.doesNotThrow(() => {
+    assertPaperMvpSafety({
+      ...paperConfig(),
+      paperExternalBuyTarget: 3,
+      creationTakeProfitMultiplierBps: 25_000n,
+    });
+  });
 });
 
 void test('runs the real bootstrap lifetime, reaches target, verifies durable state, and exports wx 0600', async (context) => {
@@ -127,6 +139,10 @@ void test('runs the real bootstrap lifetime, reaches target, verifies durable st
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.report?.verdict, 'PASS');
+  assert.equal(result.report?.schemaVersion, 'paper-mvp.v3');
+  assert.equal(result.report?.oneShotCycle.functionalStatus, 'COMPLETED');
+  assert.equal(result.report?.oneShotCycle.externalUniqueBuyers.target, 10);
+  assert.equal(result.report?.historicalCampaignReport.schemaVersion, 'paper-mvp.v2');
   assert.equal(repository.snapshot?.run.state, 'COMPLETED');
   assert.equal(repository.snapshot?.run.configuration.externalUniqueBuyersTarget, 10);
   assert.equal(repository.snapshot?.run.configuration.takeProfitMultiplierBps, 20_000n);
@@ -651,6 +667,7 @@ void test('publishes an executable ESM command with no signing or submission imp
     readonly scripts?: Readonly<Record<string, unknown>>;
   };
   assert.equal(manifest.scripts?.['paper:mvp'], 'tsx src/cli/paper-mvp.ts');
+  assert.equal(manifest.scripts?.['paper:mvp:compiled'], 'node dist/src/cli/paper-mvp.js');
   const entrypoint = fileURLToPath(new URL('../src/cli/paper-mvp.ts', import.meta.url));
   const graph = await readLocalImportGraph(entrypoint);
   const violations: string[] = [];
@@ -886,7 +903,13 @@ class MemoryRepository implements PaperMvpRepository {
   public addSample(value: ReturnType<typeof sample>): void {
     if (this.snapshot === null || this.snapshot.samples.some((item) => item.positionId === value.positionId)) return;
     const samples = Object.freeze([...this.snapshot.samples, value]);
-    const run = Object.freeze({ ...this.snapshot.run, closedPositions: samples.length,
+    const run = Object.freeze({ ...this.snapshot.run,
+      counters: Object.freeze({
+        ...this.snapshot.run.counters,
+        openedPositions: samples.length,
+        openPositions: 0,
+      }),
+      closedPositions: samples.length,
       updatedAtMs: this.snapshot.run.updatedAtMs + 1 });
     this.snapshot = Object.freeze({ ...this.snapshot, run, samples });
   }

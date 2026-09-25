@@ -1,7 +1,12 @@
 import { pathToFileURL } from 'node:url';
 import type { PaperMvpCollectorResult } from '../application/paper-mvp-collector.js';
 import { loadConfig, type AppConfig } from '../config/env.js';
-import { createPaperMvpReport, type PaperMvpReportV2 } from '../domain/paper-mvp.js';
+import {
+  createPaperMvpOneShotReport,
+  createPaperMvpReport,
+  type PaperMvpReportV2,
+  type PaperMvpReportV3,
+} from '../domain/paper-mvp.js';
 import type { PaperMvpRepository, PaperMvpRun, PaperMvpRunSnapshot } from '../ports/paper-mvp-repository.js';
 import type { ProviderUsageProbe } from '../ports/provider-usage-probe.js';
 import { createQualificationEngine } from '../qualification/qualification-engine.js';
@@ -69,7 +74,7 @@ export interface PaperMvpRunnerDependencies {
 
 export interface PaperMvpRunResult {
   readonly exitCode: 0 | 2;
-  readonly report: PaperMvpReportV2 | null;
+  readonly report: PaperMvpReportV3 | null;
 }
 
 export type PaperMvpCliErrorCode =
@@ -483,10 +488,11 @@ async function completeAndExport(
     || durable.run.verdict !== candidate.verdict
     || durable.run.completionReason !== completionReason
   ) throw new PaperMvpCliError('DURABLE_REPORT_INVALID');
-  const report = reportFromSnapshot(durable, durable.run.terminalAtMs, completionReason);
-  if (JSON.stringify(report) !== JSON.stringify(candidate)) {
+  const historicalReport = reportFromSnapshot(durable, durable.run.terminalAtMs, completionReason);
+  if (JSON.stringify(historicalReport) !== JSON.stringify(candidate)) {
     throw new PaperMvpCliError('DURABLE_REPORT_INVALID');
   }
+  const report = oneShotReportFromSnapshot(durable, durable.run.terminalAtMs, completionReason);
   try {
     assertRunnerOwnership(lease);
     await dependencies.writeReport(options.reportFile, `${JSON.stringify(report, null, 2)}\n`);
@@ -495,6 +501,35 @@ async function completeAndExport(
     throw new PaperMvpCliError('REPORT_EXPORT_FAILED');
   }
   return Object.freeze({ exitCode: report.verdict === 'PASS' ? 0 : 2, report });
+}
+
+function oneShotReportFromSnapshot(
+  snapshot: PaperMvpRunSnapshot,
+  completedAtMs: number,
+  completionReason: 'TARGET_REACHED' | 'TIMEOUT' | 'SIGINT' | 'SIGTERM',
+): PaperMvpReportV3 {
+  return createPaperMvpOneShotReport({
+    runId: snapshot.run.runId,
+    completionReason,
+    startedAtMs: snapshot.run.startedAtMs,
+    completedAtMs,
+    targetClosedPositions: snapshot.run.configuration.targetClosedPositions,
+    initialCapitalRaw: snapshot.run.configuration.initialCapitalRaw,
+    quoteMint: snapshot.run.configuration.quoteMint,
+    creationsObserved: snapshot.run.counters.creationsObserved,
+    entriesRejected: snapshot.run.counters.entriesRejected,
+    openedPositions: snapshot.run.counters.openedPositions ?? 0,
+    openPositions: snapshot.run.counters.openPositions ?? 0,
+    samples: snapshot.samples,
+    unknownTerminalPositions: snapshot.unknownPositions.length,
+    duplicateLogicalBuys: snapshot.run.counters.duplicateLogicalBuys,
+    duplicateLogicalSells: snapshot.run.counters.duplicateLogicalSells,
+    providerUsage: snapshot.run.providerUsage,
+    maxDurationMs: snapshot.run.configuration.maxDurationMs,
+    externalUniqueBuyersTarget: snapshot.run.configuration.externalUniqueBuyersTarget,
+    qualificationProfileFingerprint:
+      snapshot.run.configuration.qualificationProfileFingerprint,
+  });
 }
 
 function reportFromSnapshot(
@@ -543,8 +578,11 @@ export function assertPaperMvpSafety(config: AppConfig): void {
     || !config.creationStrategyEnabled
     || !config.paperStrategyEnabled
     || config.paperStrategyId !== 'creation-entry-v1'
-    || config.paperExternalBuyTarget !== 10
-    || config.creationTakeProfitMultiplierBps !== 20_000n
+    || !Number.isSafeInteger(config.paperExternalBuyTarget)
+    || config.paperExternalBuyTarget < 1
+    || config.paperExternalBuyTarget > 1_000
+    || config.creationTakeProfitMultiplierBps < 10_000n
+    || config.creationTakeProfitMultiplierBps > 1_000_000n
     || config.paperQuoteMintAllowlist.length !== 1
     || config.paperQuoteMintAllowlist[0] !== config.wsolMint
   ) throw new PaperMvpCliError('SAFETY_GATE_FAILED');

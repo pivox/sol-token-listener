@@ -57,6 +57,7 @@
     "rpc:soak": "tsx scripts/rpc-soak.ts",
     "paper:dry-run": "tsx src/cli/paper-dry-run.ts",
     "paper:mvp": "tsx src/cli/paper-mvp.ts",
+    "paper:mvp:compiled": "node dist/src/cli/paper-mvp.js",
     "pool:diagnose": "tsx scripts/diagnose-pool.ts",
     "canary:evaluate": "tsx scripts/evaluate-mainnet-observe-canary.ts",
     "tx:diagnose": "tsx scripts/diagnose-transaction.ts",

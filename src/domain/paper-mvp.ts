@@ -130,6 +130,67 @@ export interface PaperMvpReportV2 extends Omit<PaperMvpReportV1, 'schemaVersion'
   readonly averageSellPriceImpactBps: number;
 }
 
+export type PaperMvpOneShotGateCode =
+  | 'TARGET_CLOSED_POSITIONS_NOT_ONE'
+  | 'RUN_NOT_TARGET_REACHED'
+  | 'LOGICAL_BUY_COUNT_NOT_ONE'
+  | 'LOGICAL_SELL_COUNT_NOT_ONE'
+  | 'OPEN_POSITION_REMAINS'
+  | 'UNKNOWN_TERMINAL_POSITION'
+  | 'DUPLICATE_LOGICAL_BUY'
+  | 'DUPLICATE_LOGICAL_SELL';
+
+export interface CreatePaperMvpOneShotReportInput extends CreatePaperMvpReportInput {
+  readonly maxDurationMs: number;
+  readonly externalUniqueBuyersTarget: number;
+  readonly qualificationProfileFingerprint: string;
+}
+
+export interface PaperMvpOneShotCycleV1 {
+  readonly functionalStatus: 'COMPLETED' | 'INCOMPLETE';
+  readonly failedGateCodes: readonly PaperMvpOneShotGateCode[];
+  readonly logicalBuyCount: number;
+  readonly logicalSellCount: number;
+  readonly finalState: 'PAPER_CLOSED' | 'PAPER_HOLDING' | 'NO_CYCLE';
+  readonly qualification: Readonly<{
+    profileFingerprint: string;
+    admissionObserved: boolean;
+  }>;
+  readonly externalUniqueBuyers: Readonly<{
+    target: number;
+    thresholdReached: boolean;
+  }>;
+  readonly profitability: Readonly<{
+    status: 'PROFITABLE' | 'BREAK_EVEN' | 'LOSS' | 'NOT_AVAILABLE';
+    grossPnlRaw: string | null;
+    netPnlRaw: string | null;
+  }>;
+  readonly cycle: Readonly<{
+    positionId: string;
+    mint: string;
+    quoteMint: string;
+    exitReason: PaperMvpExitReason;
+    entryAt: string;
+    exitAt: string;
+    entryCostRaw: string;
+    exitProceedsRaw: string;
+    venueFeesRaw: string;
+    networkFeesRaw: string;
+  }> | null;
+}
+
+export interface PaperMvpReportV3 extends Omit<PaperMvpReportV2, 'schemaVersion'> {
+  readonly schemaVersion: 'paper-mvp.v3';
+  readonly boundedRun: Readonly<{
+    targetClosedPositions: number;
+    maximumActivePositions: 1;
+    maxDurationMs: number;
+    externalUniqueBuyersTarget: number;
+  }>;
+  readonly oneShotCycle: PaperMvpOneShotCycleV1;
+  readonly historicalCampaignReport: PaperMvpReportV2;
+}
+
 export function createPaperMvpPositionSample(
   input: PaperMvpPositionSampleInput,
 ): PaperMvpPositionSample {
@@ -275,6 +336,95 @@ export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvp
       ? null : (credits / BigInt(completed)).toString(),
     rateLimitedCount: usage.rateLimitedCount,
     failedGateCodes: Object.freeze(failed),
+  });
+}
+
+export function createPaperMvpOneShotReport(
+  input: CreatePaperMvpOneShotReportInput,
+): PaperMvpReportV3 {
+  count(input.maxDurationMs, 60_000, 14_400_000);
+  count(input.externalUniqueBuyersTarget, 1, 1_000);
+  if (!/^[a-f0-9]{64}$/u.test(input.qualificationProfileFingerprint)) {
+    throw invalid('qualification profile fingerprint');
+  }
+  const historicalCampaignReport = createPaperMvpReport(input);
+  const openedPositions = input.openedPositions ?? 0;
+  const openPositions = input.openPositions ?? 0;
+  const logicalSellCount = input.samples.length;
+  const failedGateCodes: PaperMvpOneShotGateCode[] = [];
+  if (input.targetClosedPositions !== 1) {
+    failedGateCodes.push('TARGET_CLOSED_POSITIONS_NOT_ONE');
+  }
+  if (input.completionReason !== 'TARGET_REACHED') {
+    failedGateCodes.push('RUN_NOT_TARGET_REACHED');
+  }
+  if (openedPositions !== 1) failedGateCodes.push('LOGICAL_BUY_COUNT_NOT_ONE');
+  if (logicalSellCount !== 1) failedGateCodes.push('LOGICAL_SELL_COUNT_NOT_ONE');
+  if (openPositions !== 0) failedGateCodes.push('OPEN_POSITION_REMAINS');
+  if (input.unknownTerminalPositions !== 0) {
+    failedGateCodes.push('UNKNOWN_TERMINAL_POSITION');
+  }
+  if (input.duplicateLogicalBuys !== 0) failedGateCodes.push('DUPLICATE_LOGICAL_BUY');
+  if (input.duplicateLogicalSells !== 0) failedGateCodes.push('DUPLICATE_LOGICAL_SELL');
+
+  const sample = logicalSellCount === 1 && input.samples[0] !== undefined
+    ? validateSample(input.samples[0])
+    : null;
+  const cycle = sample === null ? null : Object.freeze({
+    positionId: sample.positionId,
+    mint: sample.mint,
+    quoteMint: sample.quoteMint,
+    exitReason: sample.exitReason,
+    entryAt: new Date(sample.paperBuyAtMs).toISOString(),
+    exitAt: new Date(sample.paperSellAtMs).toISOString(),
+    entryCostRaw: sample.buyAmountInRaw.toString(),
+    exitProceedsRaw: sample.sellAmountOutRaw.toString(),
+    venueFeesRaw: (sample.buyFeesRaw + sample.sellFeesRaw).toString(),
+    networkFeesRaw: (2n * sample.networkFeeRawPerTransaction).toString(),
+  });
+  const profitability = sample === null
+    ? Object.freeze({
+      status: 'NOT_AVAILABLE' as const,
+      grossPnlRaw: null,
+      netPnlRaw: null,
+    })
+    : Object.freeze({
+      status: sample.modelNetPnlRaw > 0n
+        ? 'PROFITABLE' as const
+        : sample.modelNetPnlRaw < 0n ? 'LOSS' as const : 'BREAK_EVEN' as const,
+      grossPnlRaw: sample.grossPnlRaw.toString(),
+      netPnlRaw: sample.modelNetPnlRaw.toString(),
+    });
+  const oneShotCycle: PaperMvpOneShotCycleV1 = Object.freeze({
+    functionalStatus: failedGateCodes.length === 0 ? 'COMPLETED' : 'INCOMPLETE',
+    failedGateCodes: Object.freeze(failedGateCodes),
+    logicalBuyCount: openedPositions,
+    logicalSellCount,
+    finalState: sample !== null && openPositions === 0
+      ? 'PAPER_CLOSED'
+      : openPositions > 0 ? 'PAPER_HOLDING' : 'NO_CYCLE',
+    qualification: Object.freeze({
+      profileFingerprint: input.qualificationProfileFingerprint,
+      admissionObserved: openedPositions > 0,
+    }),
+    externalUniqueBuyers: Object.freeze({
+      target: input.externalUniqueBuyersTarget,
+      thresholdReached: sample?.exitReason === 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+    }),
+    profitability,
+    cycle,
+  });
+  return Object.freeze({
+    ...historicalCampaignReport,
+    schemaVersion: 'paper-mvp.v3',
+    boundedRun: Object.freeze({
+      targetClosedPositions: input.targetClosedPositions,
+      maximumActivePositions: 1,
+      maxDurationMs: input.maxDurationMs,
+      externalUniqueBuyersTarget: input.externalUniqueBuyersTarget,
+    }),
+    oneShotCycle,
+    historicalCampaignReport,
   });
 }
 

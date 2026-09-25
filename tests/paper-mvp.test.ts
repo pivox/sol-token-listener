@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createPaperMvpPositionSample,
   createPaperMvpReport,
+  createPaperMvpOneShotReport,
   type PaperMvpReportV1,
 } from '../src/domain/paper-mvp.js';
 
@@ -78,6 +79,80 @@ void test('keeps the historical paper-mvp.v1 type free of v2-only metrics', () =
 
   assert.equal('openedPositions' in historical,false);
   assert.equal('averageBuySlippageBps' in historical,false);
+});
+
+void test('reports a completed one-shot cycle for configurable N independently of profitability', () => {
+  const report = createPaperMvpOneShotReport({
+    runId: 'paper_mvp_run_one_shot', completionReason: 'TARGET_REACHED',
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 1,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 1,
+    entriesRejected: 0, openedPositions: 1, openPositions: 0,
+    samples: [createPaperMvpPositionSample(sampleInput({
+      sellAmountOutRaw: 800n, sellMinimumAmountOutRaw: 780n,
+    }))],
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: {
+      status: 'AVAILABLE', creditsUsedStart: 10n, creditsUsedEnd: 11n, rateLimitedCount: 0,
+    },
+    maxDurationMs: 60_000,
+    externalUniqueBuyersTarget: 3,
+    qualificationProfileFingerprint: 'a'.repeat(64),
+  });
+
+  assert.equal(report.schemaVersion, 'paper-mvp.v3');
+  assert.equal(report.historicalCampaignReport.schemaVersion, 'paper-mvp.v2');
+  assert.equal(report.historicalCampaignReport.verdict, 'FAIL');
+  assert.equal(report.oneShotCycle.functionalStatus, 'COMPLETED');
+  assert.deepEqual(report.oneShotCycle.failedGateCodes, []);
+  assert.equal(report.oneShotCycle.profitability.status, 'LOSS');
+  assert.equal(report.oneShotCycle.profitability.netPnlRaw, '-230');
+  assert.equal(report.oneShotCycle.externalUniqueBuyers.target, 3);
+  assert.equal(report.oneShotCycle.externalUniqueBuyers.thresholdReached, true);
+  assert.equal(report.oneShotCycle.logicalBuyCount, 1);
+  assert.equal(report.oneShotCycle.logicalSellCount, 1);
+  assert.equal(report.oneShotCycle.finalState, 'PAPER_CLOSED');
+  assert.equal(report.oneShotCycle.cycle?.mint, 'mint-1');
+  assert.equal(report.oneShotCycle.cycle?.entryCostRaw, '1000');
+  assert.equal(report.oneShotCycle.cycle?.exitProceedsRaw, '800');
+  assert.equal(report.oneShotCycle.cycle?.venueFeesRaw, '10');
+  assert.equal(report.oneShotCycle.cycle?.networkFeesRaw, '10');
+  assert.deepEqual(report.boundedRun, {
+    targetClosedPositions: 1,
+    maximumActivePositions: 1,
+    maxDurationMs: 60_000,
+    externalUniqueBuyersTarget: 3,
+  });
+  assert.deepEqual(report.exitCounts, { '10_UNIQUE_BUYERS': 1, '2X': 0, SAFETY: 0 });
+});
+
+void test('marks a multi-position campaign as incomplete without changing its historical report', () => {
+  const samples = [1, 2].map((value) => createPaperMvpPositionSample(sampleInput({
+    positionId: `position-${value}`,
+    paperSellAtMs: 220 + value,
+  })));
+  const report = createPaperMvpOneShotReport({
+    runId: 'paper_mvp_run_campaign', completionReason: 'TARGET_REACHED',
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 2,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 2,
+    entriesRejected: 0, openedPositions: 2, openPositions: 0, samples,
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: {
+      status: 'AVAILABLE', creditsUsedStart: 10n, creditsUsedEnd: 12n, rateLimitedCount: 0,
+    },
+    maxDurationMs: 120_000,
+    externalUniqueBuyersTarget: 7,
+    qualificationProfileFingerprint: 'b'.repeat(64),
+  });
+
+  assert.equal(report.historicalCampaignReport.verdict, 'PASS');
+  assert.equal(report.oneShotCycle.functionalStatus, 'INCOMPLETE');
+  assert.deepEqual(report.oneShotCycle.failedGateCodes, [
+    'TARGET_CLOSED_POSITIONS_NOT_ONE',
+    'LOGICAL_BUY_COUNT_NOT_ONE',
+    'LOGICAL_SELL_COUNT_NOT_ONE',
+  ]);
+  assert.equal(report.oneShotCycle.cycle, null);
+  assert.equal(report.oneShotCycle.profitability.status, 'NOT_AVAILABLE');
 });
 
 void test('reports opened and open positions with floored closed-sample execution means', () => {
