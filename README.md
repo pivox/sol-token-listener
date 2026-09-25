@@ -553,10 +553,11 @@ receipts de classification/admission restent une preuve historique et expirent
 selon leur rétention de quatre heures.
 
 Le pool interne conserve `LISTENER_WORKER_COUNT=1` par défaut. Les valeurs
-`2..4` exigent `LISTENER_BLOCK_HYDRATION_ENABLED=true` et ne changent pas la
-concurrence HTTP : locator et lectures PumpSwap partagent un gate FIFO de
-capacité `1`. Le premier canary après #166 utilise `2`; revenir à `1` puis
-redémarrer constitue le rollback immédiat.
+`2..4` exigent `LISTENER_BLOCK_HYDRATION_ENABLED=true` et
+`LISTENER_INGESTION_SCOPE=launchpad-only`. Elles ne changent pas la concurrence
+HTTP : fetches bloc et lectures PumpSwap partagent un gate FIFO de capacité
+`1`. Le premier canary après #166 utilise `2`; revenir à `1` puis redémarrer
+constitue le rollback immédiat.
 
 Le fast path de couverture durable reste indépendamment désactivé par défaut.
 Lorsqu'il est activé dans cette même enveloppe observe-only, les transactions

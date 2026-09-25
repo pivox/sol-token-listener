@@ -3,6 +3,10 @@ import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
 import { BLOCK_TRANSACTION_CACHE_DEFAULTS, CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import {
+  ListenerRpcWorkGate,
+  gateBlockTransactionRpc,
+} from '../src/application/listener-rpc-work-gate.js';
+import {
   BlockUnavailableError, RpcTransientError, TransactionIndexNotFoundError,
   TransactionNormalizationError, type TransactionLocationTarget,
   trustedTransactionLocatorFailure,
@@ -74,6 +78,34 @@ void test('whole-slot single-flight and sequential hits preserve canonical index
   assert.equal(h.calls.length, 1);
   assert.equal(h.locator.stats.entries, 1);
   assert.equal(h.locator.stats.inFlight, 0);
+});
+
+void test('a low-level RPC gate preserves same-slot single-flight even when the block is not retained', async () => {
+  const release = deferred<unknown>();
+  let calls = 0;
+  const gate = new ListenerRpcWorkGate();
+  const gated = gateBlockTransactionRpc(gate, {
+    async getBlockTransactions() {
+      calls += 1;
+      return release.promise;
+    },
+  });
+  const locator = new CachedSolanaBlockTransactionLocator({
+    httpTransportEpoch: 0,
+    getBlockTransactions: gated.getBlockTransactions,
+  }, { maxEntryBytes: 1 });
+
+  const first = locator.locate(target());
+  const joined = locator.locate(target());
+  await flushMicrotasks();
+  assert.equal(calls, 1);
+  assert.equal(locator.metrics.inFlightJoins, 1);
+
+  release.resolve(block());
+  await Promise.all([first, joined]);
+  assert.equal(calls, 1);
+  assert.equal(locator.stats.entries, 0);
+  locator.close();
 });
 
 void test('publishes one frozen bounded V1 metrics snapshot for hits and shared misses', async () => {

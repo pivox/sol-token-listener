@@ -32,17 +32,17 @@ work allocation. Each member retains its own lease token and renewal guard.
 
 The shared `ProviderAffineCatchUpHydration` remains the only worker HTTP route.
 Its admission coordinator and global block cache keep one fetch start at a
-time, enforce pacing and allow concurrent members targeting the same slot to
-join one in-flight request. Increasing the worker count does not change the
-reported `callerConcurrency=1` contract.
+time and enforce pacing. Pool members targeting the same slot join the same
+in-flight cache request before the physical HTTP-fetch gate. Increasing the
+worker count does not change the reported `callerConcurrency=1` contract.
 
-A shared FIFO `ListenerRpcWorkGate` of capacity one is placed in front of both
-the worker locator and the PumpSwap account reader used by the observed
-pipeline. This matters because a hydrated transaction can trigger additional
-market-account reads after the block lookup. The gate prevents a second pool
-member from adding HTTP concurrency during that phase as well. Other existing
-runtime components keep their current behaviour; this PR adds no new HTTP
-caller.
+A shared FIFO `ListenerRpcWorkGate` of capacity one is placed at the physical
+block-fetch boundary, below cache lookup and single-flight, and in front of the
+PumpSwap account reader used by the observed pipeline. Keeping cache admission
+outside the gate lets same-slot callers join one request. The shared gate still
+prevents a second pool member from adding HTTP concurrency after hydration.
+Other existing runtime components keep their current behaviour; this PR adds
+no new HTTP caller.
 
 ## Configuration
 
@@ -52,10 +52,12 @@ forwarded only to the listener application service, documented in
 deployment contracts. Invalid, fractional or out-of-range values fail closed
 during configuration parsing.
 
-Counts above one require `LISTENER_BLOCK_HYDRATION_ENABLED=true`; otherwise
-configuration fails closed because same-block single-flight cannot be
-attested. The first external canary uses count two. Counts three and four are
-considered only after fresh backlog, p95, RSS, lease and RPC evidence.
+Counts above one require both `LISTENER_BLOCK_HYDRATION_ENABLED=true` and
+`LISTENER_INGESTION_SCOPE=launchpad-only`; otherwise configuration fails
+closed. PumpSwap ordering remains on one worker until a dedicated causal
+sequencing change prevents a market trade from overtaking pool activation.
+The first external canary uses count two. Counts three and four are considered
+only after fresh backlog, p95, RSS, lease and RPC evidence.
 
 No migration is required. A single global claim-scheduler row remains durable
 and serializes fairness counter updates across all pool members.
@@ -104,7 +106,7 @@ restart-safe source of truth.
 - claim fairness remains the durable 32:1 urgent/normal and 3:1 launch/tracked
   policy;
 - provider-affine HTTP fetch concurrency remains one;
-- worker locator and PumpSwap account reads share one FIFO HTTP-work gate;
+- physical block fetches and PumpSwap account reads share one FIFO HTTP-work gate;
 - same-slot hydration joins the existing global in-flight request;
 - provider, epoch or promotion-revision changes reject stale hydration results;
 - shutdown drains all member leases before closing hydration resources;

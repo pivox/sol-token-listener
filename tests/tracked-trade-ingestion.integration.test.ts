@@ -156,20 +156,25 @@ void test('two workers keep an early trade deferred then converge the creation a
     );
 
     const creating = first.runOnce();
-    await creationReachedProjection.promise;
-    const activated = await pool.query(`SELECT processing_status,ingestion_priority
-      FROM chain_transaction_inbox WHERE signature=$1`, [tradeSignature]);
-    assert.deepEqual(activated.rows[0], {
-      processing_status: 'PENDING', ingestion_priority: 'TRACKED_TRADE',
-    });
+    try {
+      await creationReachedProjection.promise;
+      const activated = await pool.query(`SELECT processing_status,ingestion_priority
+        FROM chain_transaction_inbox WHERE signature=$1`, [tradeSignature]);
+      assert.deepEqual(activated.rows[0], {
+        processing_status: 'PENDING', ingestion_priority: 'TRACKED_TRADE',
+      });
 
-    assert.deepEqual(await second.runOnce(), {
-      kind: 'processed', signature: tradeSignature,
-    });
-    releaseCreationProjection.resolve();
-    assert.deepEqual(await creating, {
-      kind: 'processed', signature: creationSignature,
-    });
+      assert.deepEqual(await second.runOnce(), {
+        kind: 'processed', signature: tradeSignature,
+      });
+      releaseCreationProjection.resolve();
+      assert.deepEqual(await creating, {
+        kind: 'processed', signature: creationSignature,
+      });
+    } finally {
+      releaseCreationProjection.resolve();
+      await creating.catch(() => undefined);
+    }
 
     const latest = await pool.query(`SELECT as_of_slot::text AS as_of_slot,
       unique_external_buyers,total_positive_net_base_raw::text AS total_positive_net_base_raw

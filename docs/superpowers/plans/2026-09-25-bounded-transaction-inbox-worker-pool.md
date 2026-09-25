@@ -7,7 +7,7 @@ Design: `docs/superpowers/specs/2026-09-25-bounded-transaction-inbox-worker-pool
 
 1. Add configuration tests for a default count of one, valid bounds one and
    four, and fail-closed zero, five, fractional and malformed values. Require
-   block hydration when the count exceeds one.
+   block hydration and `launchpad-only` ingestion when the count exceeds one.
 2. Add `TransactionInboxWorkerPool` tests proving bounded construction,
    exactly-once member start, aggregate state, parallel progress and idempotent
    close.
@@ -29,8 +29,9 @@ Run only the new and modified suites and retain the expected RED evidence.
 2. Implement a small `TransactionInboxWorkerPool` lifecycle component over the
    existing worker class. Do not move claim, lease, retry or pipeline logic
    into the pool.
-3. Implement a capacity-one FIFO `ListenerRpcWorkGate` and use it for the
-   worker locator and the shared `MarketRpcReader`.
+3. Implement a capacity-one FIFO `ListenerRpcWorkGate` and use it at the
+   physical block-fetch boundary below cache single-flight, plus the shared
+   `MarketRpcReader`.
 4. Construct the configured number of members in
    `production-listener-factory.ts`, sharing the inbox, locator and pipeline.
 5. Aggregate worker health through the pool and close provider-affine

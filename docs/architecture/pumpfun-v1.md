@@ -979,10 +979,13 @@ versionnés dans la [spécification #114](../superpowers/specs/2026-09-12-block-
 Les leases, le catch-up strict et la réconciliation de finalité restent inchangés.
 
 Le pool d'inbox reste à un worker par défaut avec `LISTENER_WORKER_COUNT=1` et
-accepte `1..4`. Au-delà de `1`, l'hydratation bloc est obligatoire. Tous les
+accepte `1..4`. Au-delà de `1`, l'hydratation bloc et le scope
+`launchpad-only` sont obligatoires ; PumpSwap reste mono-worker jusqu'à
+l'introduction d'un séquencement causal dédié. Tous les
 workers partagent repository, pipeline, cache et locator ; les claims
 PostgreSQL `SKIP LOCKED`, leases et compteurs durables restent les autorités.
-Un gate FIFO de capacité `1` couvre aussi les lectures de comptes PumpSwap du
+Un gate FIFO de capacité `1` couvre les fetches bloc sous le single-flight et
+les lectures de comptes PumpSwap du
 pipeline, afin que le parallélisme interne n'augmente jamais la concurrence
 HTTP. Le premier canary utilise deux workers. L'arrêt demande la fermeture de
 tous les membres, attend toutes les leases, puis ferme l'hydratation.

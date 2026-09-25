@@ -367,6 +367,7 @@ void test('configured inbox workers share one repository, pipeline and gated loc
   const runtime = createProductionListenerRuntime(config({
     LISTENER_WORKER_COUNT: '2',
     LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
   }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
   const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
 
@@ -381,7 +382,7 @@ void test('configured inbox workers share one repository, pipeline and gated loc
   await dependencies.worker.close();
 });
 
-void test('multi-worker composition shares one HTTP gate across locator and PumpSwap account reads', async () => {
+void test('multi-worker composition gates physical block and PumpSwap RPC below cache lookup', async () => {
   const source = await readFile(
     new URL('../src/application/production-listener-factory.ts', import.meta.url),
     'utf8',
@@ -389,7 +390,8 @@ void test('multi-worker composition shares one HTTP gate across locator and Pump
   assert.equal(count(source, /new ListenerRpcWorkGate\(/gu), 1);
   assert.match(source, /config\.listenerWorkerCount > 1 \? new ListenerRpcWorkGate\(\) : null/u);
   assert.match(source, /readAccountsAtSameSlot:[\s\S]{0,180}rpcWorkGate\.run\(/u);
-  assert.match(source, /locate:[\s\S]{0,180}rpcWorkGate\.run\(/u);
+  assert.match(source, /gateBlockTransactionRpc\(rpcWorkGate, rpc\)/u);
+  assert.doesNotMatch(source, /locate:[\s\S]{0,180}rpcWorkGate\.run\(/u);
   assert.match(source, /Array\.from\(\s*\{ length: config\.listenerWorkerCount \}/u);
 });
 

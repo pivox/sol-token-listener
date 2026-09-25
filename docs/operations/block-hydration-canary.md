@@ -161,7 +161,8 @@ peut être réutilisée pour déclarer un `PASS`.
 
    `LISTENER_WORKER_COUNT=2` est la première valeur de canary. Le pool reste
    borné à `1..4`; ne tester `3` ou `4` qu'après une fenêtre conforme à `2`.
-   Le locator et les lectures PumpSwap utilisent toujours un seul gate HTTP.
+   Toute valeur supérieure à `1` exige aussi `launchpad-only`. Les fetches bloc
+   et les lectures PumpSwap utilisent toujours un seul gate HTTP.
    Le rollback du pool consiste à remettre `LISTENER_WORKER_COUNT=1` puis à
    redémarrer la réplique.
 

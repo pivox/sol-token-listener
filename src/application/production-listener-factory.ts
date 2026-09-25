@@ -47,7 +47,10 @@ import type { MarketRpcReader } from '../ports/market-rpc-reader.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import { SolanaMarketRpcReader } from '../solana/rpc/market-rpc-reader.js';
 import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';
-import { createProviderPinnedBlockRpc } from '../solana/rpc/provider-pinned-block-rpc.js';
+import {
+  createProviderPinnedBlockRpc,
+  type ProviderPinnedBlockRpc,
+} from '../solana/rpc/provider-pinned-block-rpc.js';
 import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-finality-source.js';
 import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
@@ -109,7 +112,7 @@ import {
   type TransactionInboxWorkerLocator,
 } from './transaction-inbox-worker.js';
 import { TransactionInboxWorkerPool } from './transaction-inbox-worker-pool.js';
-import { ListenerRpcWorkGate } from './listener-rpc-work-gate.js';
+import { ListenerRpcWorkGate, gateBlockTransactionRpc } from './listener-rpc-work-gate.js';
 import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
 import { PersistentWebSocketHealthReporter } from './websocket-health-reporter.js';
 import { WalletEvidenceObservationService } from './wallet-evidence-observation.service.js';
@@ -227,6 +230,26 @@ export function createProductionListenerRuntime(
     recorder,
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
   });
+  const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
+  const gatedBlockRpc = rpcWorkGate === null ? null : gateBlockTransactionRpc(rpcWorkGate, rpc);
+  const workerBlockRpc: TransactionLocatorRpc & EpochTransactionBlockRpc = gatedBlockRpc === null
+    ? rpc
+    : Object.freeze({
+      get httpTransportEpoch(): number { return rpc.httpTransportEpoch; },
+      getTransaction(
+        signature: string,
+        status: TransactionLocationTarget['confirmationStatus'],
+      ) { return rpc.getTransaction(signature, status); },
+      getBlockSignatures(
+        slot: bigint,
+        status: TransactionLocationTarget['confirmationStatus'],
+      ) { return rpc.getBlockSignatures(slot, status); },
+      getBlockTransactions(
+        slot: bigint,
+        status: TransactionLocationTarget['confirmationStatus'],
+        signal?: AbortSignal,
+      ) { return gatedBlockRpc.getBlockTransactions(slot, status, signal); },
+    });
   const inbox = new PostgresTransactionInboxRepository(databasePool, Object.freeze({
     maxAttempts: config.rpcRetryMaxAttempts,
     baseDelayMs: config.rpcRetryBaseDelayMs,
@@ -236,9 +259,21 @@ export function createProductionListenerRuntime(
   );
   const hydration = config.listenerPumpFunCatchUpPageAdmissionEnabled
     ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
-      providerId, createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
-        requestTimeoutMs: config.listenerShutdownTimeoutMs,
-      }, recorder),
+      providerId, ((): ProviderPinnedBlockRpc => {
+        const pinned = createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
+          requestTimeoutMs: config.listenerShutdownTimeoutMs,
+        }, recorder);
+        if (rpcWorkGate === null) return pinned;
+        const gated = gateBlockTransactionRpc(rpcWorkGate, pinned);
+        return Object.freeze({
+          providerId: pinned.providerId,
+          getBlockTransactions: (
+            slot: bigint,
+            status: TransactionLocationTarget['confirmationStatus'],
+            signal?: AbortSignal,
+          ) => gated.getBlockTransactions(slot, status, signal),
+        });
+      })(),
     ])), {
       maxEntries: config.listenerBlockHydrationMaxEntries,
       maxBytes: config.listenerBlockHydrationMaxBytes,
@@ -249,7 +284,7 @@ export function createProductionListenerRuntime(
       currentSelection: (): PromotedProviderSelection => promoted.selection(),
     }) : null;
   const blockHydration: ProductionBlockHydration = hydration === null
-    ? createProductionBlockHydration(config, rpc)
+    ? createProductionBlockHydration(config, workerBlockRpc)
     : Object.freeze({
       locator: hydration.workerLocator(),
       metrics: (): RuntimeBlockHydrationMetricsV1 => hydration.metrics(),
@@ -405,7 +440,6 @@ export function createProductionListenerRuntime(
     new PostgresWalletGraphRepository(databasePool),
   );
 
-  const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
   const directMarketRpc = new SolanaMarketRpcReader(rpc.http, config.commitment);
   const marketRpc: MarketRpcReader = rpcWorkGate === null
     ? directMarketRpc
@@ -547,16 +581,9 @@ export function createProductionListenerRuntime(
     inbox,
   );
 
-  const workerLocator: TransactionInboxWorkerLocator = rpcWorkGate === null
-    ? blockHydration.locator
-    : Object.freeze({
-      locate: (target: TransactionLocationTarget) => rpcWorkGate.run(
-        () => blockHydration.locator.locate(target),
-      ),
-    });
   const worker = new TransactionInboxWorkerPool(Array.from(
     { length: config.listenerWorkerCount },
-    () => new TransactionInboxWorker(inbox, workerLocator, pipeline, {
+    () => new TransactionInboxWorker(inbox, blockHydration.locator, pipeline, {
       leaseSeconds: config.listenerWorkerLeaseSeconds,
       renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
       idlePollMs: 1_000,

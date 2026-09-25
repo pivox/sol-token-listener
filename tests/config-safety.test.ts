@@ -861,6 +861,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
   const maximums = parseConfig({
     ...base,
     LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
     LISTENER_WORKER_COUNT: '4',
     LISTENER_WORKER_LEASE_SECONDS: '900',
     LISTENER_CATCH_UP_MAX_PAGES: '100',
@@ -908,15 +909,24 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
   for (const values of invalid) assert.throws(() => parseConfig({ ...base, ...values }));
 });
 
-void test('plusieurs workers exigent le cache d’hydratation bloc', () => {
+void test('plusieurs workers exigent le cache bloc et le scope launchpad-only', () => {
   assert.throws(
     () => parseConfig({ ...base, LISTENER_WORKER_COUNT: '2' }),
+    /LISTENER_WORKER_COUNT/u,
+  );
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      LISTENER_WORKER_COUNT: '2',
+      LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    }),
     /LISTENER_WORKER_COUNT/u,
   );
   assert.equal(parseConfig({
     ...base,
     LISTENER_WORKER_COUNT: '2',
     LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
   }).listenerWorkerCount, 2);
 });
 

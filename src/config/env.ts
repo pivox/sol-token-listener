@@ -238,15 +238,20 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     1,
     4,
   );
-  if (listenerWorkerCount > 1 && !blockHydration.listenerBlockHydrationEnabled) {
-    throw new Error('LISTENER_WORKER_COUNT above one requires LISTENER_BLOCK_HYDRATION_ENABLED=true.');
-  }
   const listenerIngestionScope = parseClosedLiteral(
     environment.LISTENER_INGESTION_SCOPE,
     'launchpad-and-market',
     'LISTENER_INGESTION_SCOPE',
     ['launchpad-only', 'launchpad-and-market'],
   );
+  if (listenerWorkerCount > 1 && (
+    !blockHydration.listenerBlockHydrationEnabled
+    || listenerIngestionScope !== 'launchpad-only'
+  )) {
+    throw new Error(
+      'LISTENER_WORKER_COUNT above one requires block hydration and launchpad-only ingestion.',
+    );
+  }
   const listenerCatchUpPolicy = parseClosedLiteral(
     environment.LISTENER_CATCH_UP_POLICY,
     'live-edge',
