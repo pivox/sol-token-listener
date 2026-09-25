@@ -111,9 +111,11 @@ void test('reports a completed one-shot cycle for configurable N independently o
   assert.equal(report.oneShotCycle.logicalBuyCount, 1);
   assert.equal(report.oneShotCycle.logicalSellCount, 1);
   assert.equal(report.oneShotCycle.finalState, 'PAPER_CLOSED');
+  assert.equal(report.verdict, 'FAIL');
   assert.equal(report.oneShotCycle.cycle?.mint, 'mint-1');
   assert.equal(report.oneShotCycle.cycle?.entryCostRaw, '1000');
-  assert.equal(report.oneShotCycle.cycle?.exitProceedsRaw, '800');
+  assert.equal(report.oneShotCycle.cycle?.quotedExitAmountRaw, '800');
+  assert.equal(report.oneShotCycle.cycle?.exitProceedsRaw, '780');
   assert.equal(report.oneShotCycle.cycle?.venueFeesRaw, '10');
   assert.equal(report.oneShotCycle.cycle?.networkFeesRaw, '10');
   assert.deepEqual(report.boundedRun, {
@@ -122,7 +124,12 @@ void test('reports a completed one-shot cycle for configurable N independently o
     maxDurationMs: 60_000,
     externalUniqueBuyersTarget: 3,
   });
-  assert.deepEqual(report.exitCounts, { '10_UNIQUE_BUYERS': 1, '2X': 0, SAFETY: 0 });
+  assert.equal('exitCounts' in report, false);
+  assert.deepEqual(report.exitOutcomes, {
+    externalUniqueBuyersTargetReached: 1,
+    takeProfitReached: 0,
+    safetyExit: 0,
+  });
 });
 
 void test('marks a multi-position campaign as incomplete without changing its historical report', () => {
@@ -145,7 +152,11 @@ void test('marks a multi-position campaign as incomplete without changing its hi
   });
 
   assert.equal(report.historicalCampaignReport.verdict, 'PASS');
+  assert.equal(report.verdict, 'FAIL');
+  assert.equal(report.technicalStatus, 'DEGRADED');
   assert.equal(report.oneShotCycle.functionalStatus, 'INCOMPLETE');
+  assert.equal(report.verdict, 'FAIL');
+  assert.equal(report.technicalStatus, 'DEGRADED');
   assert.deepEqual(report.oneShotCycle.failedGateCodes, [
     'TARGET_CLOSED_POSITIONS_NOT_ONE',
     'LOGICAL_BUY_COUNT_NOT_ONE',

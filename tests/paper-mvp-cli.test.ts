@@ -126,6 +126,32 @@ void test('requires the exact technical MVP profile without a score override', (
   );
 });
 
+void test('rejects a modified profile even when its id and version match', async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), 'paper-mvp-profile-'));
+  context.after(async () => rm(directory, { recursive: true, force: true }));
+  const canonical = JSON.parse(await readFile(
+    new URL('../config/qualification/pumpfun-mvp-technical-v1.json', import.meta.url),
+    'utf8',
+  )) as { minimumTotalScore: number };
+  canonical.minimumTotalScore += 1;
+  const profilePath = join(directory, 'pumpfun-mvp-technical-v1.json');
+  await writeFile(profilePath, JSON.stringify(canonical));
+  const tampered = parseConfig({
+    SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
+    SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid', EXECUTION_MODE: 'paper',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
+    CREATION_STRATEGY_ENABLED: 'true', PAPER_ENTRY_QUOTE_AMOUNT_RAW: '1000',
+    PAPER_SLIPPAGE_BPS: '100', EXTERNAL_MIN_BUY_AMOUNT_RAW: '1',
+    QUALIFICATION_PROFILE_PATH: profilePath,
+    RISK_MAX_ROUNDTRIP_LOSS_BPS: '3000',
+  });
+
+  assert.throws(
+    () => { assertPaperMvpSafety(tampered); },
+    isCliError('SAFETY_GATE_FAILED'),
+  );
+});
+
 void test('runs the real bootstrap lifetime, reaches target, verifies durable state, and exports wx 0600', async (context) => {
   const directory = await mkdtemp(join(tmpdir(), 'paper-mvp-cli-'));
   context.after(async () => rm(directory, { recursive: true, force: true }));
@@ -285,7 +311,8 @@ void test('bounds every collection to the number of target positions still missi
   });
   assert.deepEqual(limits, [3, 1]);
   assert.equal(result.report?.closedPositions, 3);
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.report?.oneShotCycle.functionalStatus, 'INCOMPLETE');
+  assert.equal(result.exitCode, 2);
 });
 
 void test('a signal latched during collection wins over a newly reached target', async () => {

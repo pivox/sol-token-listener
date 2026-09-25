@@ -10,6 +10,7 @@ import {
 import type { PaperMvpRepository, PaperMvpRun, PaperMvpRunSnapshot } from '../ports/paper-mvp-repository.js';
 import type { ProviderUsageProbe } from '../ports/provider-usage-probe.js';
 import { createQualificationEngine } from '../qualification/qualification-engine.js';
+import { loadBundledTechnicalMvpQualificationProfile } from '../qualification/qualification-profile.js';
 import { logger } from '../utils/logger.js';
 import { productionRunnerDependencies } from './paper-mvp-runtime.js';
 
@@ -573,10 +574,14 @@ async function requiredRunningSnapshot(
 export function assertPaperMvpSafety(config: AppConfig): void {
   let profileId: string;
   let profileVersion: number;
+  let profileFingerprint: string;
+  let canonicalProfileFingerprint: string;
   try {
     const profile = createQualificationEngine(config).profileSummary;
     profileId = profile.id;
     profileVersion = profile.version;
+    profileFingerprint = profile.fingerprint;
+    canonicalProfileFingerprint = loadBundledTechnicalMvpQualificationProfile().fingerprint;
   } catch {
     throw new PaperMvpCliError('SAFETY_GATE_FAILED');
   }
@@ -594,6 +599,7 @@ export function assertPaperMvpSafety(config: AppConfig): void {
     || config.creationTakeProfitMultiplierBps > 1_000_000n
     || profileId !== 'pumpfun-mvp-technical-v1'
     || profileVersion !== 1
+    || profileFingerprint !== canonicalProfileFingerprint
     || config.qualificationMinimumScore !== null
     || config.paperQuoteMintAllowlist.length !== 1
     || config.paperQuoteMintAllowlist[0] !== config.wsolMint

@@ -174,14 +174,20 @@ export interface PaperMvpOneShotCycleV1 {
     entryAt: string;
     exitAt: string;
     entryCostRaw: string;
+    quotedExitAmountRaw: string;
     exitProceedsRaw: string;
     venueFeesRaw: string;
     networkFeesRaw: string;
   }> | null;
 }
 
-export interface PaperMvpReportV3 extends Omit<PaperMvpReportV2, 'schemaVersion'> {
+export interface PaperMvpReportV3 extends Omit<PaperMvpReportV2, 'schemaVersion' | 'exitCounts'> {
   readonly schemaVersion: 'paper-mvp.v3';
+  readonly exitOutcomes: Readonly<{
+    readonly externalUniqueBuyersTargetReached: number;
+    readonly takeProfitReached: number;
+    readonly safetyExit: number;
+  }>;
   readonly boundedRun: Readonly<{
     targetClosedPositions: number;
     maximumActivePositions: 1;
@@ -384,7 +390,8 @@ export function createPaperMvpOneShotReport(
     entryAt: new Date(sample.paperBuyAtMs).toISOString(),
     exitAt: new Date(sample.paperSellAtMs).toISOString(),
     entryCostRaw: sample.buyAmountInRaw.toString(),
-    exitProceedsRaw: sample.sellAmountOutRaw.toString(),
+    quotedExitAmountRaw: sample.sellAmountOutRaw.toString(),
+    exitProceedsRaw: sample.sellMinimumAmountOutRaw.toString(),
     venueFeesRaw: (sample.buyFeesRaw + sample.sellFeesRaw).toString(),
     networkFeesRaw: (2n * sample.networkFeeRawPerTransaction).toString(),
   });
@@ -420,9 +427,21 @@ export function createPaperMvpOneShotReport(
     profitability,
     cycle,
   });
+  const { exitCounts: historicalExitCounts, ...historicalCompatibilityFields } =
+    historicalCampaignReport;
+  const functionalComplete = oneShotCycle.functionalStatus === 'COMPLETED';
   return Object.freeze({
-    ...historicalCampaignReport,
+    ...historicalCompatibilityFields,
     schemaVersion: 'paper-mvp.v3',
+    technicalStatus: functionalComplete
+      ? historicalCampaignReport.technicalStatus : 'DEGRADED',
+    verdict: functionalComplete && historicalCampaignReport.verdict === 'PASS'
+      ? 'PASS' : 'FAIL',
+    exitOutcomes: Object.freeze({
+      externalUniqueBuyersTargetReached: historicalExitCounts['10_UNIQUE_BUYERS'],
+      takeProfitReached: historicalExitCounts['2X'],
+      safetyExit: historicalExitCounts.SAFETY,
+    }),
     boundedRun: Object.freeze({
       targetClosedPositions: input.targetClosedPositions,
       maximumActivePositions: 1,

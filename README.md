@@ -124,8 +124,8 @@ Configuration minimale de la stratégie de création, toujours simulée :
 ```dotenv
 EXECUTION_MODE=paper
 CREATION_STRATEGY_ENABLED=true
-PAPER_STRATEGY_ENABLED=true
-PAPER_STRATEGY_ID=creation-entry-v1
+PAPER_STRATEGY_ENABLED=false
+PAPER_STRATEGY_ID=validated-external-buys
 PAPER_ENTRY_QUOTE_AMOUNT_RAW=10000000
 PAPER_SLIPPAGE_BPS=500
 PAPER_QUOTE_MINT_ALLOWLIST=So11111111111111111111111111111111111111112
@@ -671,9 +671,11 @@ preuves techniques et laisse image, social et clusters informatifs. Le profil
 historique reste inchangé et demeure le défaut hors sélection explicite.
 
 Après application des migrations, lancer avec les six arguments fermés et une
-configuration comprenant `PAPER_STRATEGY_ENABLED=true`,
-`PAPER_STRATEGY_ID=creation-entry-v1`, un montant d'entrée, N et les limites de
-risque explicites :
+configuration comprenant `CREATION_STRATEGY_ENABLED=true`,
+`PAPER_STRATEGY_ENABLED=false` et `PAPER_STRATEGY_ID=validated-external-buys`.
+Le flag de création sélectionne seul `creation-entry-v1`; les deux flags paper
+sont mutuellement exclusifs. Configurer aussi un montant d'entrée, N et les
+limites de risque explicites :
 
 ```bash
 npm run paper:mvp -- \

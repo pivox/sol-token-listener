@@ -10,9 +10,11 @@ validée.
 1. Appliquer les migrations avec `npm run db:migrate`.
 2. Configurer `SOLANA_CLUSTER=mainnet-beta`, `EXECUTION_MODE=paper`,
    `LISTENER_ENABLED=true`, `CREATION_STRATEGY_ENABLED=true`,
-   `PAPER_STRATEGY_ENABLED=true`, `PAPER_STRATEGY_ID=creation-entry-v1`,
+   `PAPER_STRATEGY_ENABLED=false`, `PAPER_STRATEGY_ID=validated-external-buys`,
    `PAPER_STRATEGY_VERSION=1` et
    `PAPER_QUOTE_MINT_ALLOWLIST` avec exactement `WSOL_MINT`.
+   `CREATION_STRATEGY_ENABLED` sélectionne `creation-entry-v1`; les deux flags
+   d'activation ne doivent jamais être vrais simultanément.
 3. Sélectionner explicitement
    `QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-mvp-technical-v1.json`.
    Ne pas définir `QUALIFICATION_MIN_SCORE` : le minimum appartient au profil
