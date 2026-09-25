@@ -36,7 +36,9 @@ npm run paper:mvp -- \
 ```
 
 Dans l'image de production déjà compilée, utiliser la même liste d'arguments
-avec `npm run paper:mvp:compiled --`. Le run one-shot exige
+avec `npm run paper:mvp:compiled --` et sélectionner le profil empaqueté via
+`QUALIFICATION_PROFILE_PATH=dist/config/qualification/pumpfun-mvp-technical-v1.json`.
+Le run one-shot exige
 `--target-closed=1`; toute autre cible produit honnêtement un cycle fonctionnel
 `INCOMPLETE` dans le rapport v3.
 

@@ -685,7 +685,9 @@ npm run paper:mvp -- \
   --report-file=paper-mvp.json
 ```
 
-L'image compilée expose la commande équivalente `paper:mvp:compiled`. L'export
+L'image compilée expose la commande équivalente `paper:mvp:compiled`; elle
+utilise le profil empaqueté sous
+`dist/config/qualification/pumpfun-mvp-technical-v1.json`. L'export
 `paper-mvp.v3` sépare la complétude fonctionnelle one-shot de la profitabilité,
 publie le N effectif et conserve le rapport de campagne v2 pour compatibilité.
 Une perte reste visible et n'est jamais présentée comme un profit. Une fenêtre
