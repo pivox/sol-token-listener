@@ -2857,24 +2857,78 @@ void test('trade enqueue and canonical projection synchronization converge under
   });
 });
 
-void test('shares urgent FIFO and the 32-to-1 fairness budget between creates and tracked trades', async (context) => {
+void test('bounds launch/tracked claims 3-to-1 inside the durable 32-to-1 urgent budget', async (context) => {
   await withDatabase(context, async (pool) => {
     await insertTrackedLaunch(pool);
     const repository = new PostgresTransactionInboxRepository(pool);
     await repository.enqueue(notification('normal-shared-fairness', 0n, 'CATCH_UP'));
-    for (let index = 0; index < 34; index += 1) {
-      const signature = `urgent-${String(index).padStart(2, '0')}`;
-      await repository.enqueue(index % 2 === 0
-        ? notification(signature, BigInt(index + 1), 'WEBSOCKET', 'processed', 1000, 'PUMPFUN_CREATE')
-        : tradeNotification(signature, BigInt(index + 1)));
+    for (let index = 0; index < 40; index += 1) {
+      await repository.enqueue(notification(
+        `launch-${String(index).padStart(2, '0')}`,
+        BigInt(index + 1_000), 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE',
+      ));
+      await repository.enqueue(tradeNotification(
+        `tracked-${String(index).padStart(2, '0')}`,
+        BigInt(index + 1),
+      ));
     }
     const now = Date.now();
-    for (let index = 0; index < 32; index += 1) {
-      assert.equal((await repository.claim(now, 120))?.signature, `urgent-${String(index).padStart(2, '0')}`);
+    const expectedUrgent: string[] = [];
+    for (let group = 0; group < 8; group += 1) {
+      expectedUrgent.push(
+        ...[0, 1, 2].map((offset) => `launch-${String(group * 3 + offset).padStart(2, '0')}`),
+        `tracked-${String(group).padStart(2, '0')}`,
+      );
+    }
+    for (const signature of expectedUrgent) {
+      assert.equal((await repository.claim(now, 120))?.signature, signature);
     }
     assert.equal((await repository.claim(now, 120))?.signature, 'normal-shared-fairness');
-    assert.equal((await repository.claim(now, 120))?.signature, 'urgent-32');
-    assert.equal((await repository.claim(now, 120))?.signature, 'urgent-33');
+    assert.equal((await repository.claim(now, 120))?.signature, 'launch-24');
+  });
+});
+
+void test('saturates launch fairness through fallback and prefers a later tracked trade across repositories', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await insertTrackedLaunch(pool);
+    const first = new PostgresTransactionInboxRepository(pool);
+    const restarted = new PostgresTransactionInboxRepository(pool);
+    for (let index = 0; index < 5; index += 1) {
+      await first.enqueue(notification(
+        `fallback-launch-${index}`, BigInt(index + 1), 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE',
+      ));
+    }
+    const now = Date.now();
+    for (let index = 0; index < 4; index += 1) {
+      assert.equal((await first.claim(now, 120))?.signature, `fallback-launch-${index}`);
+    }
+    assert.equal((await pool.query(`SELECT launch_claims_since_tracked
+      FROM chain_transaction_inbox_claim_scheduler`)).rows[0]?.launch_claims_since_tracked, 3);
+    await first.enqueue(tradeNotification('fallback-tracked', 100n));
+    assert.equal((await restarted.claim(now, 120))?.signature, 'fallback-tracked');
+    assert.equal((await pool.query(`SELECT launch_claims_since_tracked
+      FROM chain_transaction_inbox_claim_scheduler`)).rows[0]?.launch_claims_since_tracked, 0);
+  });
+});
+
+void test('rolls back the inbox lease and both fairness counters when scheduler update fails', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification(
+      'fairness-rollback', 1n, 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE',
+    ));
+    await pool.query(`CREATE FUNCTION reject_fairness_update() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced'; END $$`);
+    await pool.query(`CREATE TRIGGER reject_fairness_update BEFORE UPDATE
+      ON chain_transaction_inbox_claim_scheduler FOR EACH ROW EXECUTE FUNCTION reject_fairness_update()`);
+    await assert.rejects(repository.claim(Date.now(), 120), TransactionInboxRepositoryError);
+    const stored = await row(pool, 'fairness-rollback');
+    assert.equal(stored.processing_status, 'PENDING');
+    assert.equal(stored.attempts, 0);
+    assert.deepEqual((await pool.query(`SELECT consecutive_urgent_claims,launch_claims_since_tracked
+      FROM chain_transaction_inbox_claim_scheduler`)).rows, [{
+      consecutive_urgent_claims: 0, launch_claims_since_tracked: 0,
+    }]);
   });
 });
 

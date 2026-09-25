@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '051_transaction_inbox_decoder_quarantine_recovery.sql';
+  readonly migrationHead: '052_transaction_inbox_urgent_fairness.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -589,7 +589,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '051_transaction_inbox_decoder_quarantine_recovery.sql',
+    migrationHead: '052_transaction_inbox_urgent_fairness.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,

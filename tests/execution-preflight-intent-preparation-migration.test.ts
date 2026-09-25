@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '042_execution_preflight_intent_preparation.sql';
-const migrationHeadName = '051_transaction_inbox_decoder_quarantine_recovery.sql';
+const migrationHeadName = '052_transaction_inbox_urgent_fairness.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 042 declares the bounded preparation-run authority', async () => {

@@ -37,8 +37,9 @@ void test('052 upgrades 051, preserves durable state and replays without replaci
       launch_claims_since_tracked FROM chain_transaction_inbox_claim_scheduler`)).rows, [{
       scheduler_key: 'global', consecutive_urgent_claims: 17, launch_claims_since_tracked: 0,
     }]);
-    assert.deepEqual(await pool.query(`SELECT
-      'chain_transaction_inbox_priority_claim_order_idx'::REGCLASS::OID AS oid`), beforeIndex);
+    assert.deepEqual((await pool.query(`SELECT
+      'chain_transaction_inbox_priority_claim_order_idx'::REGCLASS::OID AS oid`)).rows,
+    beforeIndex.rows);
     await assertCatalog(pool);
   });
 });
@@ -50,7 +51,7 @@ void test('052 is the replay-safe clean database head', async (context) => {
     assert.equal(applied.length, 52);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await assertCatalog(pool);
-  }, false);
+  });
 });
 
 void test('052 rejects partial columns, weakened checks and incompatible indexes', async (context) => {
@@ -146,7 +147,6 @@ async function applyThrough051(pool: InstanceType<typeof pg.Pool>): Promise<void
 async function withDatabase(
   context: { skip(message?: string): void },
   run: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
-  applyLegacy = true,
 ): Promise<void> {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -158,8 +158,7 @@ async function withDatabase(
   const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
-    if (!applyLegacy) await run(pool);
-    else await run(pool);
+    await run(pool);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
