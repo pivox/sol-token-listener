@@ -124,7 +124,8 @@ Configuration minimale de la stratégie de création, toujours simulée :
 ```dotenv
 EXECUTION_MODE=paper
 CREATION_STRATEGY_ENABLED=true
-PAPER_STRATEGY_ENABLED=false
+PAPER_STRATEGY_ENABLED=true
+PAPER_STRATEGY_ID=creation-entry-v1
 PAPER_ENTRY_QUOTE_AMOUNT_RAW=10000000
 PAPER_SLIPPAGE_BPS=500
 PAPER_QUOTE_MINT_ALLOWLIST=So11111111111111111111111111111111111111112
@@ -132,7 +133,8 @@ EXTERNAL_UNIQUE_BUYERS_TARGET=10
 EXTERNAL_MIN_BUY_AMOUNT_RAW=1000000
 CREATION_TAKE_PROFIT_MULTIPLIER_BPS=20000
 CREATION_MANUAL_KILL_SWITCH=false
-QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-v1-unvalidated.json
+QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-mvp-technical-v1.json
+QUALIFICATION_MIN_SCORE=
 RISK_MAX_ROUNDTRIP_LOSS_BPS=3000
 ```
 
@@ -147,7 +149,10 @@ première mesure d'unicité ne détecte pas encore les Sybil ou clusters liés.
 ## Profil de qualification Pump.fun
 
 Le profil chargé par défaut est
-`config/qualification/pumpfun-v1-unvalidated.json`. On peut sélectionner un
+`config/qualification/pumpfun-v1-unvalidated.json`. Le profil paper one-shot
+`config/qualification/pumpfun-mvp-technical-v1.json` doit être sélectionné
+explicitement : il rend image/social/clusters informatifs et conserve les
+conditions techniques éliminatoires. On peut sélectionner un
 fichier local différent avec `QUALIFICATION_PROFILE_PATH`; `QUALIFICATION_MIN_SCORE`
 remplace le minimum effectif lorsqu'il est défini (de 0 à 100). En son absence,
 le minimum du profil sélectionné est conservé; celui du profil initial vaut 60. Le
@@ -166,7 +171,7 @@ chemin ni le contenu du profil.
 Exemple de configuration local, sans secret :
 
 ```dotenv
-QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-v1-unvalidated.json
+QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-mvp-technical-v1.json
 QUALIFICATION_MIN_SCORE=
 ```
 
@@ -660,17 +665,31 @@ le cluster n'est pas exactement `mainnet-beta`, si le listener ou la stratégie
 de création sont désactivés, si le mode n'est pas `paper`, ou si l'allowlist
 quote n'est pas exactement le seul mint WSOL configuré.
 
-Après application des migrations, lancer avec les six arguments fermés :
+Le run produit one-shot sélectionne explicitement
+`config/qualification/pumpfun-mvp-technical-v1.json`. Ce profil exige les
+preuves techniques et laisse image, social et clusters informatifs. Le profil
+historique reste inchangé et demeure le défaut hors sélection explicite.
+
+Après application des migrations, lancer avec les six arguments fermés et une
+configuration comprenant `PAPER_STRATEGY_ENABLED=true`,
+`PAPER_STRATEGY_ID=creation-entry-v1`, un montant d'entrée, N et les limites de
+risque explicites :
 
 ```bash
 npm run paper:mvp -- \
-  --target-closed=50 \
+  --target-closed=1 \
   --max-duration-seconds=14400 \
   --poll-seconds=5 \
   --initial-capital-raw=1000000000 \
   --network-fee-raw-per-transaction=5000 \
   --report-file=paper-mvp.json
 ```
+
+L'image compilée expose la commande équivalente `paper:mvp:compiled`. L'export
+`paper-mvp.v3` sépare la complétude fonctionnelle one-shot de la profitabilité,
+publie le N effectif et conserve le rapport de campagne v2 pour compatibilité.
+Une perte reste visible et n'est jamais présentée comme un profit. Une fenêtre
+sans cycle complet produit `INCOMPLETE`, jamais un faux succès.
 
 Un seul processus collecte un run à la fois; il acquiert le verrou avant le
 démarrage du listener ou de l'API et échoue fermé si la session du verrou est
