@@ -74,15 +74,23 @@ void test('053 rejects every null-admission worker-evidence contradiction', asyn
       `processing_status='PROCESSING',lease_token='lease',
        lease_expires_at=clock_timestamp()+INTERVAL '1 minute'`,
       `attempts=1`,
+      `attempts_in_cycle=1`,
       `attempts=1,attempts_in_cycle=1`,
       `normalized_transaction='{}'::JSONB,immutable_fingerprint=repeat('a',64)`,
       `processed_at=clock_timestamp()`,
+      `retry_exhausted_at=clock_timestamp()`,
+      `error_code='RPC_TRANSIENT'`,
+      `error_name='RpcFailure'`,
+      `error_retryable=TRUE`,
       `processing_status='FAILED',attempts=1,attempts_in_cycle=1,
        error_code='RPC_TRANSIENT',error_name='RpcFailure',error_retryable=TRUE,
        next_attempt_at=clock_timestamp()+INTERVAL '1 minute'`,
       `missing_finality_polls=1,last_missing_finality_provider_id='primary'`,
       `finality_evidence_version=1`,
       `manual_recovery_count=1,last_manual_recovery_at=clock_timestamp()`,
+      `first_processed_at=clock_timestamp()`,
+      `decoder_quarantine_eligible_at=clock_timestamp()`,
+      `decoder_recovery_used=TRUE`,
     ];
     for (const mutation of contradictions) {
       await pool.query('BEGIN');
@@ -135,6 +143,10 @@ void test('053 fails closed on column, check, function, trigger and index drift'
        RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
       `ALTER TABLE chain_transaction_inbox
        DISABLE TRIGGER chain_transaction_inbox_worker_admission_guard`,
+      `DROP TRIGGER chain_transaction_inbox_worker_admission_guard ON chain_transaction_inbox;
+       CREATE TRIGGER chain_transaction_inbox_worker_admission_guard
+       BEFORE UPDATE ON chain_transaction_inbox FOR EACH ROW
+       EXECUTE FUNCTION transaction_inbox_worker_admission_guard('unexpected')`,
       `DROP INDEX chain_transaction_inbox_worker_admitted_claim_idx;
        CREATE INDEX chain_transaction_inbox_worker_admitted_claim_idx
        ON chain_transaction_inbox (signature)`,

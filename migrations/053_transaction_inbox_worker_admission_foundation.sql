@@ -154,6 +154,7 @@ BEGIN
       AND NOT trigger_row.tgisinternal AND trigger_row.tgfoid=actual_function
       AND trigger_row.tgtype=19 AND trigger_row.tgenabled='O'
       AND trigger_row.tgattr=''::INT2VECTOR AND trigger_row.tgqual IS NULL
+      AND trigger_row.tgnargs=0 AND trigger_row.tgargs=''::BYTEA
   ) THEN
     RAISE EXCEPTION 'transaction inbox worker admission trigger is incompatible'
       USING ERRCODE='23514';
