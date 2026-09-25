@@ -208,10 +208,38 @@ async function assertCatalog(pool: pg.Pool): Promise<void> {
     attname: 'worker_admitted_at', type: 'timestamp with time zone', attnotnull: false,
     default_value: null,
   }]);
-  assert.deepEqual((await pool.query(`SELECT convalidated FROM pg_constraint
+  const admissionConstraint = (await pool.query(`SELECT convalidated,pg_get_constraintdef(oid) AS definition
+    FROM pg_constraint
     WHERE conrelid='chain_transaction_inbox'::REGCLASS
-      AND conname='chain_transaction_inbox_worker_admission_check'`)).rows,
-  [{ convalidated: true }]);
+      AND conname='chain_transaction_inbox_worker_admission_check'`)).rows;
+  assert.equal(admissionConstraint.length, 1);
+  assert.equal(admissionConstraint[0]?.convalidated, true);
+  const definition: unknown = admissionConstraint[0]?.definition;
+  assert.equal(typeof definition, 'string');
+  for (const protectedEvidence of [
+    'attempts = 0',
+    'attempts_in_cycle = 0',
+    'lease_token IS NULL',
+    'lease_expires_at IS NULL',
+    'normalized_transaction IS NULL',
+    'immutable_fingerprint IS NULL',
+    'error_code IS NULL',
+    'error_name IS NULL',
+    'error_retryable IS NULL',
+    'processed_at IS NULL',
+    'next_attempt_at IS NULL',
+    'retry_exhausted_at IS NULL',
+    'missing_finality_polls = 0',
+    'last_missing_finality_provider_id IS NULL',
+    'finality_evidence_version = 0',
+    'manual_recovery_count = 0',
+    'last_manual_recovery_at IS NULL',
+    'first_processed_at IS NULL',
+    'decoder_quarantine_eligible_at IS NULL',
+    'decoder_recovery_used = false',
+  ]) {
+    assert.ok((definition as string).includes(protectedEvidence), protectedEvidence);
+  }
   assert.deepEqual((await pool.query(`SELECT trigger_row.tgenabled
     FROM pg_trigger trigger_row WHERE trigger_row.tgrelid='chain_transaction_inbox'::REGCLASS
       AND trigger_row.tgname='chain_transaction_inbox_worker_admission_guard'
