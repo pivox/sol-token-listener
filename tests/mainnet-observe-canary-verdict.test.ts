@@ -63,6 +63,113 @@ void test('uses the stopped RPC counters so a late HTTP 429 cannot be hidden', (
 void test('preserves absent run-era terminal grouping instead of inventing reason codes', () => {
   const terminal = nested(cloneFixture(), 'terminalEvidence');
   assert.deepEqual(terminal.groups, []);
+  assert.deepEqual(terminal.baseline, { failed: 10, quarantined: 0, exhausted: 0 });
+  assert.deepEqual(terminal.final, { failed: 54, quarantined: 190, exhausted: 2 });
+});
+
+void test('fails explained terminal deltas and keeps incomplete grouping inconclusive', () => {
+  const complete = cloneFixture();
+  const completeTerminal = nested(complete, 'terminalEvidence');
+  completeTerminal.baseline = { failed: 10, quarantined: 0, exhausted: 0 };
+  completeTerminal.final = { failed: 11, quarantined: 0, exhausted: 0 };
+  completeTerminal.groups = [{ processingStatus: 'FAILED', reasonCode: 'PUMP_ACTION_SUPPORTED',
+    errorCode: 'RPC_TRANSIENT', count: 1 }];
+  assert.equal(evaluateMainnetObserveCanary(complete).gates.terminalFailures.verdict, 'FAIL');
+
+  for (const mutate of [
+    (copy: Record<string, unknown>) => { nested(copy, 'terminalEvidence').groups = []; },
+    (copy: Record<string, unknown>) => {
+      nested(copy, 'terminalEvidence').groups = [{ processingStatus: 'FAILED',
+        reasonCode: 'PUMP_ACTION_SUPPORTED', errorCode: null, count: 1 }];
+    },
+    (copy: Record<string, unknown>) => {
+      nested(copy, 'terminalEvidence').groups = [{ processingStatus: 'FAILED',
+        reasonCode: 'UNKNOWN_REASON', errorCode: 'RPC_TRANSIENT', count: 1 }];
+    },
+    (copy: Record<string, unknown>) => {
+      nested(copy, 'terminalEvidence').groups = [{ processingStatus: 'FAILED',
+        reasonCode: 'PUMP_ACTION_SUPPORTED', errorCode: 'RPC_TRANSIENT', count: 2 }];
+    },
+  ]) {
+    const copy = cloneFixture();
+    nested(copy, 'terminalEvidence').baseline = { failed: 10, quarantined: 0, exhausted: 0 };
+    nested(copy, 'terminalEvidence').final = { failed: 11, quarantined: 0, exhausted: 0 };
+    mutate(copy);
+    assert.equal(evaluateMainnetObserveCanary(copy).gates.terminalFailures.verdict,
+      'INCONCLUSIVE');
+  }
+});
+
+void test('reconciles terminal groups per status and rejects exhausted greater than failed', () => {
+  const statusMismatch = cloneFixture();
+  nested(statusMismatch, 'terminalEvidence').baseline = {
+    failed: 10, quarantined: 0, exhausted: 0,
+  };
+  nested(statusMismatch, 'terminalEvidence').final = {
+    failed: 11, quarantined: 1, exhausted: 0,
+  };
+  nested(statusMismatch, 'terminalEvidence').groups = [
+    { processingStatus: 'FAILED', reasonCode: 'PUMP_ACTION_SUPPORTED',
+      errorCode: 'RPC_TRANSIENT', count: 2 },
+  ];
+  assert.equal(evaluateMainnetObserveCanary(statusMismatch).gates.terminalFailures.verdict,
+    'INCONCLUSIVE');
+
+  const impossibleExhaustion = cloneFixture();
+  nested(impossibleExhaustion, 'terminalEvidence').baseline = {
+    failed: 10, quarantined: 0, exhausted: 0,
+  };
+  nested(impossibleExhaustion, 'terminalEvidence').final = {
+    failed: 10, quarantined: 0, exhausted: 11,
+  };
+  assert.equal(evaluateMainnetObserveCanary(impossibleExhaustion).gates.terminalFailures.verdict,
+    'INCONCLUSIVE');
+});
+
+void test('captures one process and a strictly advancing first-processing cohort in every snapshot', () => {
+  const copy = cloneFixture();
+  const samples: number[] = [];
+  for (const name of ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP']) {
+    const snapshot = nested(copy, 'snapshots', name);
+    assert.equal(snapshot.startedAtMs, 1790313390116);
+    const evidence = nested(snapshot, 'firstProcessingCanary');
+    assert.equal(evidence.cohortStartedAtMs, 1790313390116);
+    samples.push(evidence.sampledAtMs as number);
+  }
+  const stopped = nested(copy, 'stoppedHeartbeat', 'firstProcessingCanary');
+  samples.push(stopped.sampledAtMs as number);
+  assert.deepEqual(samples, [...samples].sort((left, right) => left - right));
+
+  nested(copy, 'snapshots', 'T_PLUS_5').startedAtMs = 1790313390117;
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.firstProcessing.verdict,
+    'INCONCLUSIVE');
+});
+
+void test('fails first-processing closed on equal samples, stopped process mismatch and stale PASS evidence', () => {
+  const equalSamples = cloneFixture();
+  const t0Sample = nested(equalSamples, 'snapshots', 'T0', 'firstProcessingCanary')
+    .sampledAtMs;
+  nested(equalSamples, 'snapshots', 'T_PLUS_5', 'firstProcessingCanary').sampledAtMs = t0Sample;
+  assert.equal(evaluateMainnetObserveCanary(equalSamples).gates.firstProcessing.verdict,
+    'INCONCLUSIVE');
+
+  const stoppedProcessMismatch = cloneFixture();
+  nested(stoppedProcessMismatch, 'stoppedHeartbeat').startedAtMs = 1790313390117;
+  assert.equal(evaluateMainnetObserveCanary(stoppedProcessMismatch).gates.firstProcessing.verdict,
+    'INCONCLUSIVE');
+
+  const stoppedNotAfterT15 = cloneFixture();
+  const t15Sample = nested(stoppedNotAfterT15, 'snapshots', 'T_PLUS_15',
+    'firstProcessingCanary').sampledAtMs;
+  nested(stoppedNotAfterT15, 'stoppedHeartbeat', 'firstProcessingCanary').sampledAtMs = t15Sample;
+  assert.equal(evaluateMainnetObserveCanary(stoppedNotAfterT15).gates.firstProcessing.verdict,
+    'INCONCLUSIVE');
+
+  const stalePass = cloneFixture();
+  const stale = passFirstProcessingEvidence(1790313390116, 1790327790116);
+  nested(stalePass, 'stoppedHeartbeat').firstProcessingCanary = stale;
+  assert.equal(evaluateMainnetObserveCanary(stalePass).gates.firstProcessing.verdict,
+    'INCONCLUSIVE');
 });
 
 void test('does not label a generic degraded status as an identified periodic pause', () => {
@@ -98,6 +205,102 @@ void test('rejects chronologically out-of-order finality incident pairs', () => 
   );
 
   assert.equal(evaluateMainnetObserveCanary(copy).gates.finality.verdict, 'INCONCLUSIVE');
+});
+
+void test('accepts a finality incident recovered during the window when samples remain healthy', () => {
+  const copy = cloneFixture();
+  copy.finalityDiagnostics = [
+    { event: 'listener.finality_reconciler_degraded', phase: 'DEGRADED',
+      reasonCode: 'PROVIDER_UNAVAILABLE', degradedAtMs: 1790313500000,
+      observedAtMs: 1790313500000 },
+    { event: 'listener.finality_reconciler_recovered', phase: 'RECOVERED',
+      reasonCode: null, degradedAtMs: 1790313500000, observedAtMs: 1790313500100 },
+  ];
+
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.finality.verdict, 'PASS');
+});
+
+void test('checks RPC counter invariants before classifying traffic volume', () => {
+  const late429 = cloneFixture();
+  for (const name of ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP']) {
+    const providers = nested(late429, 'snapshots', name, 'rpcHttpEvidence')
+      .providers as Record<string, unknown>[];
+    assert.ok(providers[0]);
+    providers[0].attempts = 39;
+    providers[0].http429Responses = name === 'T0' ? 0 : 1;
+  }
+  const stoppedProviders = nested(late429, 'stoppedHeartbeat', 'rpcHttpEvidence')
+    .providers as Record<string, unknown>[];
+  assert.ok(stoppedProviders[0]);
+  stoppedProviders[0].attempts = 39;
+  stoppedProviders[0].http429Responses = 1;
+  assert.equal(evaluateMainnetObserveCanary(late429).gates.http429.verdict, 'FAIL');
+
+  const invalidCases = [cloneFixture(), cloneFixture()];
+  const unconfigured = nested(invalidCases[0] ?? {}, 'snapshots', 'T_PLUS_5',
+    'rpcHttpEvidence').providers as Record<string, unknown>[];
+  assert.ok(unconfigured[1]);
+  unconfigured[1].attempts = 1;
+  const impossible = nested(invalidCases[1] ?? {}, 'snapshots', 'T_PLUS_5',
+    'rpcHttpEvidence').providers as Record<string, unknown>[];
+  assert.ok(impossible[0]);
+  impossible[0].http429Responses = 653;
+  for (const invalid of invalidCases) {
+    assert.equal(evaluateMainnetObserveCanary(invalid).gates.http429.verdict, 'INCONCLUSIVE');
+  }
+});
+
+void test('fails a proved HTTP 429 delta on a common provider before membership drift', () => {
+  const copy = cloneFixture();
+  const finalProviders = nested(copy, 'snapshots', 'FINAL_PRESTOP', 'rpcHttpEvidence')
+    .providers as Record<string, unknown>[];
+  const stoppedProviders = nested(copy, 'stoppedHeartbeat', 'rpcHttpEvidence')
+    .providers as Record<string, unknown>[];
+  assert.ok(finalProviders[0]);
+  assert.ok(stoppedProviders[0]);
+  finalProviders[0].http429Responses = 1;
+  stoppedProviders[0].http429Responses = 1;
+  stoppedProviders.push({ providerId: 'late-provider', configured: true,
+    attempts: 1, http429Responses: 0 });
+
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.http429.verdict, 'FAIL');
+});
+
+void test('treats a cumulative hydration counter reset as inconclusive', () => {
+  const copy = cloneFixture();
+  nested(copy, 'snapshots', 'T_PLUS_15', 'blockHydration').fetches = 400;
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.blockHydration.verdict,
+    'INCONCLUSIVE');
+});
+
+void test('distinguishes an authenticated periodic pause from generic degradation', () => {
+  const copy = cloneFixture();
+  const final = nested(copy, 'snapshots', 'FINAL_PRESTOP');
+  final.status = 'DEGRADED';
+  final.subscriberState = 'RUNNING';
+  final.scannerState = 'DEGRADED';
+  final.periodicPauseEvidence = { version: 1, reasonCode: 'CATCH_UP_PAGE_BUDGET_EXHAUSTED',
+    providerId: 'primary', observedAtMs: final.observedAtMs };
+  const websocket = nested(final, 'websocket');
+  websocket.phase = 'RUNNING';
+  websocket.recoveryStatus = 'NOT_REQUIRED';
+  websocket.recoveryReasonCode = null;
+
+  const gate = evaluateMainnetObserveCanary(copy).gates.runtime;
+  assert.deepEqual(gate, { verdict: 'INCONCLUSIVE', reasonCode: 'RUNTIME_PERIODIC_PAUSE' });
+});
+
+void test('enforces nullable recovery reason only for NOT_REQUIRED recovery', () => {
+  const valid = cloneFixture();
+  const validRecovery = nested(valid, 'snapshots', 'T0', 'websocket');
+  validRecovery.recoveryStatus = 'NOT_REQUIRED';
+  validRecovery.recoveryReasonCode = null;
+  assert.equal(evaluateMainnetObserveCanary(valid).commit,
+    '32c9bf4c35268219184bd054f1e1f643065ecfd6');
+
+  const invalid = cloneFixture();
+  nested(invalid, 'snapshots', 'T0', 'websocket').recoveryReasonCode = null;
+  assert.equal(evaluateMainnetObserveCanary(invalid).overallVerdict, 'INCONCLUSIVE');
 });
 
 void test('classifies unsafe and incomplete gate evidence without allowing unrelated PASS gates to override it', () => {
@@ -180,4 +383,29 @@ function nested(root: Record<string, unknown>, ...keys: readonly string[]): Reco
   assert.equal(typeof value, 'object');
   assert.notEqual(value, null);
   return value as Record<string, unknown>;
+}
+
+function passFirstProcessingEvidence(cohortStartedAtMs: number, sampledAtMs: number):
+Record<string, unknown> {
+  return {
+    version: 1,
+    thresholdMs: 45_000,
+    cohortCapacity: 50_000,
+    cohortStartedAtMs,
+    cohortEndsAtMs: cohortStartedAtMs + 900_000,
+    sampledAtMs,
+    overflowed: false,
+    eligibleCount: 1,
+    completedCount: 1,
+    underThresholdCount: 1,
+    atOrAboveThresholdCount: 0,
+    pendingCount: 0,
+    rightCensoredCount: 0,
+    tailCensoredCount: 0,
+    terminalCount: 0,
+    unavailableCount: 0,
+    invalidDurationCount: 0,
+    p95Ms: 44_999,
+    verdict: 'PASS',
+  };
 }

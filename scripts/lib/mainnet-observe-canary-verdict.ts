@@ -1,8 +1,11 @@
 import { types } from 'node:util';
 import {
+  FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
   createFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from '../../src/domain/first-processing-canary.js';
+import { CATCH_UP_CLASSIFICATION_REASON_CODES } from '../../src/domain/catch-up-classification.js';
+import { TRANSACTION_INGESTION_ERROR_CODES } from '../../src/domain/transaction-ingestion.js';
 
 export type MainnetObserveCanaryVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
@@ -44,6 +47,7 @@ const RECOVERY_REASON_CODES = [
 ] as const;
 type SnapshotName = (typeof SNAPSHOT_NAMES)[number];
 type VersionCounts = Readonly<{ legacy: number; v0: number; v1: number }>;
+type TerminalCounts = Readonly<{ failed: number; quarantined: number; exhausted: number }>;
 
 interface Admission {
   readonly version: 1;
@@ -84,6 +88,7 @@ interface RpcEvidence {
 
 interface Snapshot {
   readonly observedAtMs: number;
+  readonly startedAtMs: number;
   readonly status: string;
   readonly pipelinePumpfun: string;
   readonly pipelinePumpswap: string;
@@ -98,11 +103,13 @@ interface Snapshot {
     phase: string;
     providerId: string | null;
     recoveryStatus: string;
-    recoveryReasonCode: string;
+    recoveryReasonCode: string | null;
   }>;
+  readonly periodicPauseEvidence: PeriodicPauseEvidence | null;
   readonly catchUpAdmission: Admission;
   readonly blockHydration: Hydration;
   readonly rpcHttpEvidence: RpcEvidence;
+  readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
   readonly decoderQuarantine: Readonly<{ version: 1; unresolvedCount: number }>;
   readonly inbox: Readonly<{
     total: number;
@@ -119,6 +126,7 @@ interface Snapshot {
 }
 
 interface StoppedHeartbeat {
+  readonly startedAtMs: number;
   readonly runtimeState: string;
   readonly subscriberState: string;
   readonly scannerState: string;
@@ -130,6 +138,13 @@ interface StoppedHeartbeat {
   readonly blockHydration: Hydration;
   readonly rpcHttpEvidence: RpcEvidence;
   readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
+}
+
+interface PeriodicPauseEvidence {
+  readonly version: 1;
+  readonly reasonCode: 'CATCH_UP_PAGE_BUDGET_EXHAUSTED' | 'CATCH_UP_REFRESH_REQUIRED';
+  readonly providerId: string;
+  readonly observedAtMs: number;
 }
 
 interface FinalityDiagnostic {
@@ -154,8 +169,8 @@ interface CanaryInput {
   readonly finalityDiagnostics: readonly FinalityDiagnostic[];
   readonly providerMixingEvidenceCount: number;
   readonly terminalEvidence: Readonly<{
-    baseline: Readonly<{ exhausted: number; quarantined: number }>;
-    final: Readonly<{ exhausted: number; quarantined: number }>;
+    baseline: TerminalCounts;
+    final: TerminalCounts;
     groups: readonly TerminalGroup[];
   }>;
   readonly postStopActionableCount: number;
@@ -186,8 +201,7 @@ export function evaluateMainnetObserveCanary(input: unknown): MainnetObserveCana
     idempotence: evaluateIdempotence(evidence),
     retention: evaluateRetention(evidence),
     decoderQuarantine: evaluateDecoder(evidence),
-    firstProcessing: gate(evidence.stoppedHeartbeat.firstProcessingCanary.verdict,
-      `FIRST_PROCESSING_${evidence.stoppedHeartbeat.firstProcessingCanary.verdict}`),
+    firstProcessing: evaluateFirstProcessing(evidence),
     blockHydration: evaluateHydration(evidence),
     catchUpAdmission: evaluateAdmission(evidence),
     providerAffinity: evaluateAffinity(evidence),
@@ -210,18 +224,45 @@ function evaluateRuntime(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   const final = input.snapshots.FINAL_PRESTOP;
   if (final.websocket.recoveryStatus === 'IN_PROGRESS'
     || final.websocket.recoveryReasonCode === 'RPC_UNAVAILABLE'
-    || final.websocket.phase === 'RECOVERING'
-    || final.subscriberState === 'DEGRADED'
-    || final.scannerState === 'DEGRADED') {
+    || final.websocket.phase === 'RECOVERING') {
     return gate('FAIL', 'RUNTIME_RECOVERY_UNRESOLVED');
   }
   if (snapshots.some((snapshot) => snapshot.runtimeState !== 'RUNNING'
     || snapshot.workerState !== 'RUNNING')) return gate('FAIL', 'RUNTIME_COMPONENT_NOT_RUNNING');
-  if (snapshots.some((snapshot) => snapshot.status !== 'OK'
-    || snapshot.subscriberState !== 'RUNNING' || snapshot.scannerState !== 'RUNNING')) {
-    return gate('FAIL', 'RUNTIME_COMPONENT_DEGRADED');
+  let periodicPauseObserved = false;
+  for (const snapshot of snapshots) {
+    const degraded = snapshot.status !== 'OK' || snapshot.subscriberState !== 'RUNNING'
+      || snapshot.scannerState !== 'RUNNING';
+    if (!degraded && snapshot.periodicPauseEvidence !== null) {
+      return gate('INCONCLUSIVE', 'RUNTIME_PERIODIC_PAUSE_INCOHERENT');
+    }
+    if (degraded) {
+      if (!isAuthenticatedPeriodicPause(snapshot)) {
+        return gate('FAIL', 'RUNTIME_COMPONENT_DEGRADED');
+      }
+      periodicPauseObserved = true;
+    }
   }
-  return gate('PASS', 'RUNTIME_HEALTHY');
+  return periodicPauseObserved ? gate('INCONCLUSIVE', 'RUNTIME_PERIODIC_PAUSE')
+    : gate('PASS', 'RUNTIME_HEALTHY');
+}
+
+function isAuthenticatedPeriodicPause(snapshot: Snapshot): boolean {
+  const pause = snapshot.periodicPauseEvidence;
+  return pause !== null
+    && snapshot.status === 'DEGRADED'
+    && snapshot.runtimeState === 'RUNNING'
+    && snapshot.subscriberState === 'RUNNING'
+    && snapshot.scannerState === 'DEGRADED'
+    && snapshot.workerState === 'RUNNING'
+    && snapshot.reconcilerState === 'RUNNING'
+    && snapshot.websocket.phase === 'RUNNING'
+    && snapshot.websocket.recoveryStatus === 'NOT_REQUIRED'
+    && snapshot.websocket.recoveryReasonCode === null
+    && snapshot.catchUpAdmission.enabled
+    && snapshot.catchUpAdmission.providerId === pause.providerId
+    && snapshot.websocket.providerId === pause.providerId
+    && pause.observedAtMs === snapshot.observedAtMs;
 }
 
 function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
@@ -230,6 +271,24 @@ function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     input.stoppedHeartbeat.rpcHttpEvidence];
   if (rpcSnapshots.some((rpcEvidence) => rpcEvidence.overflowed)) {
     return gate('INCONCLUSIVE', 'RPC_COUNTER_OVERFLOW');
+  }
+  if (rpcSnapshots.some((rpcEvidence) => rpcEvidence.providers.some((provider) =>
+    provider.http429Responses > provider.attempts
+    || (!provider.configured && (provider.attempts !== 0 || provider.http429Responses !== 0))))) {
+    return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
+  }
+  for (let index = 1; index < rpcSnapshots.length; index += 1) {
+    const previous = rpcSnapshots[index - 1];
+    const current = rpcSnapshots[index];
+    if (previous === undefined || current === undefined) {
+      return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
+    }
+    const previousById = new Map(previous.providers.map((provider) => [provider.providerId, provider]));
+    if (current.providers.some((provider) => {
+      const prior = previousById.get(provider.providerId);
+      return provider.configured && prior?.configured === true
+        && provider.http429Responses > prior.http429Responses;
+    })) return gate('FAIL', 'RPC_HTTP_429_OBSERVED');
   }
   const firstEvidence = rpcSnapshots[0];
   if (firstEvidence === undefined) return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
@@ -256,10 +315,14 @@ function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   const attemptDelta = sum(last.map((provider, index) => provider.attempts - (first[index]?.attempts ?? 0)));
   const responseDelta = sum(last.map((provider, index) => provider.http429Responses
     - (first[index]?.http429Responses ?? 0)));
-  if (attemptDelta === null || responseDelta === null || attemptDelta <= 0) {
+  if (attemptDelta === null || responseDelta === null || responseDelta < 0) {
+    return gate('INCONCLUSIVE', 'RPC_COUNTERS_INCOHERENT');
+  }
+  if (responseDelta > 0) return gate('FAIL', 'RPC_HTTP_429_OBSERVED');
+  if (attemptDelta <= 0) {
     return gate('INCONCLUSIVE', 'RPC_TRAFFIC_INSUFFICIENT');
   }
-  return responseDelta > 0 ? gate('FAIL', 'RPC_HTTP_429_OBSERVED') : gate('PASS', 'RPC_HTTP_429_NONE');
+  return gate('PASS', 'RPC_HTTP_429_NONE');
 }
 
 function evaluateBacklog(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
@@ -269,19 +332,27 @@ function evaluateBacklog(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
 
 function evaluateTerminal(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   const { baseline, final, groups } = input.terminalEvidence;
-  if (final.exhausted < baseline.exhausted || final.quarantined < baseline.quarantined) {
+  if (baseline.exhausted > baseline.failed || final.exhausted > final.failed
+    || final.failed < baseline.failed || final.exhausted < baseline.exhausted
+    || final.quarantined < baseline.quarantined) {
     return gate('INCONCLUSIVE', 'TERMINAL_COUNTER_RESET');
   }
+  const failedDelta = final.failed - baseline.failed;
   const exhaustedDelta = final.exhausted - baseline.exhausted;
   const quarantinedDelta = final.quarantined - baseline.quarantined;
   if (exhaustedDelta > 0) return gate('FAIL', 'TERMINAL_RETRIES_EXHAUSTED');
-  const grouped = sum(groups.map((group) => group.count));
-  if (grouped === null || grouped !== exhaustedDelta + quarantinedDelta
+  const groupedFailed = sum(groups.filter((group) => group.processingStatus === 'FAILED')
+    .map((group) => group.count));
+  const groupedQuarantined = sum(groups.filter((group) => group.processingStatus === 'QUARANTINED')
+    .map((group) => group.count));
+  if (groupedFailed === null || groupedQuarantined === null
+    || groupedFailed !== failedDelta || groupedQuarantined !== quarantinedDelta
     || groups.some((group) => group.reasonCode === null || group.errorCode === null)) {
-    return exhaustedDelta + quarantinedDelta > 0
+    return failedDelta + quarantinedDelta > 0
       ? gate('INCONCLUSIVE', 'TERMINAL_GROUPS_INCOMPLETE') : gate('PASS', 'TERMINAL_NONE');
   }
-  return grouped > 0 ? gate('FAIL', 'TERMINAL_FAILURES_OBSERVED') : gate('PASS', 'TERMINAL_NONE');
+  return groupedFailed + groupedQuarantined > 0 ? gate('FAIL', 'TERMINAL_FAILURES_OBSERVED')
+    : gate('PASS', 'TERMINAL_NONE');
 }
 
 function evaluateIdempotence(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
@@ -300,12 +371,45 @@ function evaluateDecoder(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     ? gate('PASS', 'DECODER_QUARANTINE_EMPTY') : gate('FAIL', 'DECODER_QUARANTINE_UNRESOLVED');
 }
 
+function evaluateFirstProcessing(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+  const snapshots = orderedSnapshots(input);
+  const evidence = [...snapshots.map((snapshot) => snapshot.firstProcessingCanary),
+    input.stoppedHeartbeat.firstProcessingCanary];
+  const startedAtMs = [...snapshots.map((snapshot) => snapshot.startedAtMs),
+    input.stoppedHeartbeat.startedAtMs];
+  const cohortStartedAtMs = evidence[0]?.cohortStartedAtMs;
+  const cohortEndsAtMs = evidence[0]?.cohortEndsAtMs;
+  if (cohortStartedAtMs === undefined || cohortEndsAtMs === undefined
+    || startedAtMs.some((value) => value !== cohortStartedAtMs)
+    || evidence.some((item) => item.cohortStartedAtMs !== cohortStartedAtMs
+      || item.cohortEndsAtMs !== cohortEndsAtMs)) {
+    return gate('INCONCLUSIVE', 'FIRST_PROCESSING_COHORT_INCOHERENT');
+  }
+  if (!strictlyIncreasing(evidence.map((item) => item.sampledAtMs))) {
+    return gate('INCONCLUSIVE', 'FIRST_PROCESSING_TIMELINE_INCOHERENT');
+  }
+  const stopped = input.stoppedHeartbeat.firstProcessingCanary;
+  const retentionDeadline = safeAdd(cohortStartedAtMs, FIRST_PROCESSING_EVIDENCE_RETENTION_MS);
+  if (retentionDeadline === null || stopped.sampledAtMs >= retentionDeadline) {
+    return gate('INCONCLUSIVE', 'FIRST_PROCESSING_EVIDENCE_STALE');
+  }
+  return gate(stopped.verdict, `FIRST_PROCESSING_${stopped.verdict}`);
+}
+
 function evaluateHydration(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
   if (snapshots.some((snapshot) => !snapshot.blockHydration.enabled
     || snapshot.blockHydration.callerConcurrency !== 1 || snapshot.blockHydration.queuedFetches > 1
     || snapshot.blockHydration.inFlightFetches > 1)) {
     return gate('INCONCLUSIVE', 'BLOCK_HYDRATION_CONTRACT_INVALID');
+  }
+  const hydrationEvidence = [...snapshots.map((snapshot) => snapshot.blockHydration),
+    input.stoppedHeartbeat.blockHydration];
+  for (const counter of ['fetches', 'oversizeBypasses', 'fetchFailures',
+    'epochInvalidations'] as const) {
+    if (!nonDecreasing(hydrationEvidence.map((item) => item[counter]))) {
+      return gate('INCONCLUSIVE', 'BLOCK_HYDRATION_COUNTERS_INCOHERENT');
+    }
   }
   const first = snapshots[0];
   const last = snapshots[3];
@@ -392,9 +496,6 @@ function evaluateFinality(input: CanaryInput): MainnetObserveCanaryGateResultV1 
         || diagnostic.observedAtMs < diagnostic.degradedAtMs) {
         return gate('INCONCLUSIVE', 'FINALITY_DIAGNOSTICS_UNPAIRABLE');
       }
-      if (diagnostic.observedAtMs >= input.snapshots.T0.observedAtMs) {
-        return gate('FAIL', 'FINALITY_INCIDENT_DURING_CANARY');
-      }
       open = null;
     }
   }
@@ -462,22 +563,26 @@ function parseInput(value: unknown): CanaryInput {
 
 function parseSnapshot(value: unknown): Snapshot {
   const input = exactObject(value, [
-    'observedAtMs', 'status', 'pipelinePumpfun', 'pipelinePumpswap', 'runtimeState',
+    'observedAtMs', 'startedAtMs', 'status', 'pipelinePumpfun', 'pipelinePumpswap', 'runtimeState',
     'subscriberState', 'scannerState', 'workerState', 'reconcilerState', 'backlogCount',
     'leasedCount', 'websocket', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
-    'decoderQuarantine', 'inbox', 'rssBytes',
+    'firstProcessingCanary', 'periodicPauseEvidence', 'decoderQuarantine', 'inbox', 'rssBytes',
   ]);
   const websocket = exactObject(input.websocket,
     ['phase', 'providerId', 'recoveryStatus', 'recoveryReasonCode']);
   const decoder = exactObject(input.decoderQuarantine, ['version', 'unresolvedCount']);
   if (decoder.version !== 1) invalid();
+  const recoveryStatus = enumeration(websocket.recoveryStatus, RECOVERY_STATUSES);
+  const recoveryReasonCode = nullableEnumeration(websocket.recoveryReasonCode, RECOVERY_REASON_CODES);
+  if ((recoveryStatus === 'NOT_REQUIRED') !== (recoveryReasonCode === null)) invalid();
   const inbox = exactObject(input.inbox, [
     'total', 'distinctSignatures', 'exhausted', 'quarantined', 'overlapCount',
     'finalityContradictions', 'replayReceiptViolations', 'admissionReceiptViolations',
     'terminalRetentionViolations',
   ]);
   return Object.freeze({
-    observedAtMs: integer(input.observedAtMs), status: enumeration(input.status, HEALTH_STATUSES),
+    observedAtMs: integer(input.observedAtMs), startedAtMs: integer(input.startedAtMs),
+    status: enumeration(input.status, HEALTH_STATUSES),
     pipelinePumpfun: enumeration(input.pipelinePumpfun, PIPELINE_STATES),
     pipelinePumpswap: enumeration(input.pipelinePumpswap, PIPELINE_STATES),
     runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
@@ -489,10 +594,11 @@ function parseSnapshot(value: unknown): Snapshot {
     leasedCount: integer(input.leasedCount),
     websocket: Object.freeze({ phase: enumeration(websocket.phase, WEBSOCKET_PHASES),
       providerId: nullableProviderId(websocket.providerId),
-      recoveryStatus: enumeration(websocket.recoveryStatus, RECOVERY_STATUSES),
-      recoveryReasonCode: enumeration(websocket.recoveryReasonCode, RECOVERY_REASON_CODES) }),
+      recoveryStatus, recoveryReasonCode }),
+    periodicPauseEvidence: parsePeriodicPause(input.periodicPauseEvidence),
     catchUpAdmission: parseAdmission(input.catchUpAdmission), blockHydration: parseHydration(input.blockHydration),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
+    firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary),
     decoderQuarantine: Object.freeze({ version: 1, unresolvedCount: integer(decoder.unresolvedCount) }),
     inbox: Object.freeze({ total: integer(inbox.total), distinctSignatures: integer(inbox.distinctSignatures),
       exhausted: integer(inbox.exhausted), quarantined: integer(inbox.quarantined),
@@ -506,11 +612,12 @@ function parseSnapshot(value: unknown): Snapshot {
 
 function parseStopped(value: unknown): StoppedHeartbeat {
   const input = exactObject(value, [
-    'runtimeState', 'subscriberState', 'scannerState', 'workerState', 'reconcilerState',
+    'startedAtMs', 'runtimeState', 'subscriberState', 'scannerState', 'workerState', 'reconcilerState',
     'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary',
   ]);
-  return Object.freeze({ runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
+  return Object.freeze({ startedAtMs: integer(input.startedAtMs),
+    runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
     subscriberState: enumeration(input.subscriberState, RUNTIME_STATES),
     scannerState: enumeration(input.scannerState, RUNTIME_STATES),
     workerState: enumeration(input.workerState, RUNTIME_STATES),
@@ -551,6 +658,16 @@ function parseHydration(value: unknown): Hydration {
     queuedFetches: integer(input.queuedFetches) });
 }
 
+function parsePeriodicPause(value: unknown): PeriodicPauseEvidence | null {
+  if (value === null) return null;
+  const input = exactObject(value, ['version', 'reasonCode', 'providerId', 'observedAtMs']);
+  if (input.version !== 1) invalid();
+  const reasonCode = enumeration(input.reasonCode,
+    ['CATCH_UP_PAGE_BUDGET_EXHAUSTED', 'CATCH_UP_REFRESH_REQUIRED'] as const);
+  return Object.freeze({ version: 1, reasonCode, providerId: providerId(input.providerId),
+    observedAtMs: integer(input.observedAtMs) });
+}
+
 function parseRpc(value: unknown): RpcEvidence {
   const input = exactObject(value, ['version', 'overflowed', 'providers']);
   if (input.version !== 1) invalid();
@@ -577,13 +694,15 @@ function parseTerminalGroup(value: unknown): TerminalGroup {
   const input = exactObject(value, ['processingStatus', 'reasonCode', 'errorCode', 'count']);
   if (input.processingStatus !== 'FAILED' && input.processingStatus !== 'QUARANTINED') invalid();
   return Object.freeze({ processingStatus: input.processingStatus,
-    reasonCode: nullableCode(input.reasonCode), errorCode: nullableCode(input.errorCode),
+    reasonCode: nullableEnumeration(input.reasonCode, CATCH_UP_CLASSIFICATION_REASON_CODES),
+    errorCode: nullableEnumeration(input.errorCode, TRANSACTION_INGESTION_ERROR_CODES),
     count: integer(input.count) });
 }
 
-function parseTerminalCounts(value: unknown): Readonly<{ exhausted: number; quarantined: number }> {
-  const input = exactObject(value, ['exhausted', 'quarantined']);
-  return Object.freeze({ exhausted: integer(input.exhausted), quarantined: integer(input.quarantined) });
+function parseTerminalCounts(value: unknown): TerminalCounts {
+  const input = exactObject(value, ['failed', 'quarantined', 'exhausted']);
+  return Object.freeze({ failed: integer(input.failed), quarantined: integer(input.quarantined),
+    exhausted: integer(input.exhausted) });
 }
 
 function parseVersionCounts(value: unknown): VersionCounts {
@@ -694,6 +813,10 @@ function nullableCode(value: unknown): string | null {
   return value === null ? null : code(value);
 }
 
+function nullableEnumeration<const T extends readonly string[]>(value: unknown, allowed: T): T[number] | null {
+  return value === null ? null : enumeration(value, allowed);
+}
+
 function providerId(value: unknown): string {
   if (typeof value !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(value)) invalid();
   return value;
@@ -730,6 +853,11 @@ function nonDecreasing(values: readonly number[]): boolean {
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function safeAdd(left: number, right: number): number | null {
+  const total = left + right;
+  return Number.isSafeInteger(total) ? total : null;
 }
 
 function invalid(): never {

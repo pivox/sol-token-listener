@@ -4,6 +4,7 @@
   "snapshots": {
     "T0": {
       "observedAtMs": 1790313410003,
+      "startedAtMs": 1790313390116,
       "status": "OK",
       "pipelinePumpfun": "RUNNING",
       "pipelinePumpswap": "IDLE",
@@ -15,6 +16,7 @@
       "backlogCount": 209,
       "leasedCount": 2,
       "websocket": { "phase": "RUNNING", "providerId": "primary", "recoveryStatus": "RECOVERED", "recoveryReasonCode": "STARTUP" },
+      "periodicPauseEvidence": null,
       "catchUpAdmission": {
         "version": 1, "enabled": true, "providerId": "primary", "scanActive": false, "workerClaimReady": true,
         "source": { "websocketOnly": 209, "catchUpOnly": 0, "websocketAndCatchUp": 0 },
@@ -30,12 +32,14 @@
           { "providerId": "fallback-3", "configured": false, "attempts": 0, "http429Responses": 0 }
         ]
       },
+      "firstProcessingCanary": { "version": 1, "thresholdMs": 45000, "cohortCapacity": 50000, "cohortStartedAtMs": 1790313390116, "cohortEndsAtMs": 1790314290116, "sampledAtMs": 1790313406533, "overflowed": false, "eligibleCount": 226, "completedCount": 31, "underThresholdCount": 31, "atOrAboveThresholdCount": 0, "pendingCount": 188, "rightCensoredCount": 188, "tailCensoredCount": 0, "terminalCount": 7, "unavailableCount": 0, "invalidDurationCount": 0, "p95Ms": 4307, "verdict": "INCONCLUSIVE" },
       "decoderQuarantine": { "version": 1, "unresolvedCount": 0 },
       "inbox": { "total": 924, "distinctSignatures": 924, "exhausted": 0, "quarantined": 0, "overlapCount": 0, "finalityContradictions": 0, "replayReceiptViolations": 0, "admissionReceiptViolations": 0, "terminalRetentionViolations": 0 },
       "rssBytes": 659312640
     },
     "T_PLUS_5": {
       "observedAtMs": 1790313692691,
+      "startedAtMs": 1790313390116,
       "status": "OK",
       "pipelinePumpfun": "RUNNING",
       "pipelinePumpswap": "IDLE",
@@ -47,6 +51,7 @@
       "backlogCount": 7818,
       "leasedCount": 2,
       "websocket": { "phase": "RUNNING", "providerId": "primary", "recoveryStatus": "RECOVERED", "recoveryReasonCode": "STARTUP" },
+      "periodicPauseEvidence": null,
       "catchUpAdmission": {
         "version": 1, "enabled": true, "providerId": "primary", "scanActive": true, "workerClaimReady": true,
         "source": { "websocketOnly": 7508, "catchUpOnly": 0, "websocketAndCatchUp": 310 },
@@ -62,12 +67,14 @@
           { "providerId": "fallback-3", "configured": false, "attempts": 0, "http429Responses": 0 }
         ]
       },
+      "firstProcessingCanary": { "version": 1, "thresholdMs": 45000, "cohortCapacity": 50000, "cohortStartedAtMs": 1790313390116, "cohortEndsAtMs": 1790314290116, "sampledAtMs": 1790313691015, "overflowed": false, "eligibleCount": 9088, "completedCount": 637, "underThresholdCount": 230, "atOrAboveThresholdCount": 407, "pendingCount": 7810, "rightCensoredCount": 1553, "tailCensoredCount": 6257, "terminalCount": 641, "unavailableCount": 0, "invalidDurationCount": 0, "p95Ms": 204328, "verdict": "FAIL" },
       "decoderQuarantine": { "version": 1, "unresolvedCount": 0 },
       "inbox": { "total": 16884, "distinctSignatures": 16884, "exhausted": 1, "quarantined": 52, "overlapCount": 1699, "finalityContradictions": 0, "replayReceiptViolations": 0, "admissionReceiptViolations": 0, "terminalRetentionViolations": 0 },
       "rssBytes": 687837184
     },
     "T_PLUS_15": {
       "observedAtMs": 1790314294667,
+      "startedAtMs": 1790313390116,
       "status": "OK",
       "pipelinePumpfun": "RUNNING",
       "pipelinePumpswap": "IDLE",
@@ -79,6 +86,7 @@
       "backlogCount": 25549,
       "leasedCount": 2,
       "websocket": { "phase": "RUNNING", "providerId": "primary", "recoveryStatus": "RECOVERED", "recoveryReasonCode": "STARTUP" },
+      "periodicPauseEvidence": null,
       "catchUpAdmission": {
         "version": 1, "enabled": true, "providerId": "primary", "scanActive": true, "workerClaimReady": true,
         "source": { "websocketOnly": 25312, "catchUpOnly": 0, "websocketAndCatchUp": 237 },
@@ -94,12 +102,14 @@
           { "providerId": "fallback-3", "configured": false, "attempts": 0, "http429Responses": 0 }
         ]
       },
+      "firstProcessingCanary": { "version": 1, "thresholdMs": 45000, "cohortCapacity": 50000, "cohortStartedAtMs": 1790313390116, "cohortEndsAtMs": 1790314290116, "sampledAtMs": 1790314294118, "overflowed": false, "eligibleCount": 29879, "completedCount": 2147, "underThresholdCount": 351, "atOrAboveThresholdCount": 1796, "pendingCount": 25349, "rightCensoredCount": 2234, "tailCensoredCount": 23115, "terminalCount": 2383, "unavailableCount": 0, "invalidDurationCount": 0, "p95Ms": 698594, "verdict": "FAIL" },
       "decoderQuarantine": { "version": 1, "unresolvedCount": 0 },
       "inbox": { "total": 51472, "distinctSignatures": 51472, "exhausted": 2, "quarantined": 187, "overlapCount": 5873, "finalityContradictions": 0, "replayReceiptViolations": 0, "admissionReceiptViolations": 0, "terminalRetentionViolations": 0 },
       "rssBytes": 736944128
     },
     "FINAL_PRESTOP": {
       "observedAtMs": 1790314338244,
+      "startedAtMs": 1790313390116,
       "status": "DEGRADED",
       "pipelinePumpfun": "DEGRADED",
       "pipelinePumpswap": "IDLE",
@@ -111,6 +121,7 @@
       "backlogCount": 26658,
       "leasedCount": 2,
       "websocket": { "phase": "RECOVERING", "providerId": "primary", "recoveryStatus": "IN_PROGRESS", "recoveryReasonCode": "RPC_UNAVAILABLE" },
+      "periodicPauseEvidence": null,
       "catchUpAdmission": {
         "version": 1, "enabled": true, "providerId": "primary", "scanActive": true, "workerClaimReady": true,
         "source": { "websocketOnly": 26564, "catchUpOnly": 0, "websocketAndCatchUp": 94 },
@@ -126,12 +137,14 @@
           { "providerId": "fallback-3", "configured": false, "attempts": 0, "http429Responses": 0 }
         ]
       },
+      "firstProcessingCanary": { "version": 1, "thresholdMs": 45000, "cohortCapacity": 50000, "cohortStartedAtMs": 1790313390116, "cohortEndsAtMs": 1790314290116, "sampledAtMs": 1790314335732, "overflowed": false, "eligibleCount": 29881, "completedCount": 2299, "underThresholdCount": 351, "atOrAboveThresholdCount": 1948, "pendingCount": 24955, "rightCensoredCount": 0, "tailCensoredCount": 24955, "terminalCount": 2627, "unavailableCount": 0, "invalidDurationCount": 0, "p95Ms": 738128, "verdict": "FAIL" },
       "decoderQuarantine": { "version": 1, "unresolvedCount": 0 },
       "inbox": { "total": 57709, "distinctSignatures": 57709, "exhausted": 2, "quarantined": 190, "overlapCount": 6214, "finalityContradictions": 0, "replayReceiptViolations": 0, "admissionReceiptViolations": 0, "terminalRetentionViolations": 0 },
       "rssBytes": 722137088
     }
   },
   "stoppedHeartbeat": {
+    "startedAtMs": 1790313390116,
     "runtimeState": "STOPPED", "subscriberState": "STOPPED", "scannerState": "STOPPED", "workerState": "STOPPED", "reconcilerState": "STOPPED",
     "backlogCount": 26742, "leasedCount": 0,
     "catchUpAdmission": {
@@ -157,8 +170,8 @@
   ],
   "providerMixingEvidenceCount": 0,
   "terminalEvidence": {
-    "baseline": { "exhausted": 0, "quarantined": 0 },
-    "final": { "exhausted": 2, "quarantined": 190 },
+    "baseline": { "failed": 10, "quarantined": 0, "exhausted": 0 },
+    "final": { "failed": 54, "quarantined": 190, "exhausted": 2 },
     "groups": []
   },
   "postStopActionableCount": 26742,

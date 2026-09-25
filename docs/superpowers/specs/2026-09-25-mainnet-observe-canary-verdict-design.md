@@ -6,6 +6,8 @@ Issue: #169
 
 Status: approved for implementation
 
+Contract revision: 1.1.0
+
 ## Purpose
 
 The `main@32c9bf4` Mainnet observe-only run was a real failure: actionable
@@ -89,41 +91,54 @@ log line.
 
 ### Runtime
 
-All required observation snapshots must belong to one process. A final
-snapshot with unresolved `RPC_UNAVAILABLE`, subscriber recovery, or scanner
-degradation is `FAIL`. A precisely identified periodic catch-up pause with no
-unresolved transport recovery is `INCONCLUSIVE`. Malformed or missing state is
-`INCONCLUSIVE`; it is never `PASS`.
+All required observation snapshots must belong to one process. Recovery status
+and reason are related exactly: `NOT_REQUIRED` iff the reason is null. A final
+snapshot with unresolved `RPC_UNAVAILABLE` or subscriber recovery is `FAIL`.
+A periodic catch-up pause is `INCONCLUSIVE` only when a closed reason, provider,
+timestamp, healthy transport, and exact degraded scanner state authenticate it;
+generic degradation is `FAIL`. Malformed or missing state is `INCONCLUSIVE`;
+it is never `PASS`.
 
 ### HTTP 429
 
 Provider membership and configuration must remain stable, counters must be
-monotone, evidence must not overflow, and the attempt delta must be positive.
-A positive 429 delta is `FAIL`. Missing, malformed, reset, membership-changing,
-overflowed, or zero-traffic evidence is `INCONCLUSIVE`; otherwise the gate is
-`PASS`.
+monotone, evidence must not overflow, responses never exceed attempts, and an
+unconfigured provider must remain at zero attempts and zero responses. A
+positive 429 delta proved between adjacent observations of a common configured
+provider is `FAIL` before zero-traffic or membership-drift classification.
+Missing, malformed, reset, membership-changing, overflowed, or zero-traffic
+evidence is otherwise `INCONCLUSIVE`; otherwise the gate is `PASS`.
 
 ### Backlog and first processing
 
 Actionable backlog must be non-growing across T0, T+5, T+15, and final. The
 first-processing evidence keeps the existing closed V1 semantics and the
-45,000 ms failure boundary. Neither gate is weakened by #169.
+45,000 ms failure boundary. Every snapshot plus `STOPPED` must carry the same
+process start and cohort; sample times are strictly increasing through
+`STOPPED`, after T+15/final and before the retention boundary. An internally
+passing but old, restarted, or non-progressing cohort is `INCONCLUSIVE`.
+Neither gate is weakened by #169.
 
 ### Terminal failures
 
-The input includes baseline and final totals plus bounded groups by processing
-status and stable reason/error code. A positive exhausted delta is `FAIL`. A
-positive explained terminal delta is also `FAIL`. A positive terminal delta
-without complete grouping is `INCONCLUSIVE` unless another terminal condition
-already proves `FAIL`. Counts that do not reconcile are `INCONCLUSIVE`.
+The input includes baseline and final `failed`, `quarantined`, and `exhausted`
+totals plus bounded groups by processing status and stable reason/error code.
+Reason and error taxonomies are the exact enums persisted by classification
+and ingestion. Groups reconcile `FAILED` and `QUARANTINED` deltas separately;
+`exhausted` may never exceed `failed`. A positive exhausted delta is the
+priority `FAIL`. Any other positive fully explained terminal delta is `FAIL`.
+A positive terminal delta with absent, incomplete, null, unknown, or mismatched
+grouping is `INCONCLUSIVE`. Counter resets and impossible totals are
+`INCONCLUSIVE`.
 
 ### Block hydration
 
 The existing bounds remain unchanged for this PR: active V1 metrics,
 `callerConcurrency=1`, queue and in-flight at most one, positive fetch delta,
 average fetch rate at most four per second, no fetch-failure delta, and at most
-one oversize bypass. The known oversize product debt in #149 is not hidden or
-silently relaxed here.
+one oversize bypass. Fetch, oversize, failure, and epoch counters must be
+monotone over all snapshots and `STOPPED`; a reset is `INCONCLUSIVE`. The known
+oversize product debt in #149 is not hidden or silently relaxed here.
 
 ### Catch-up admission
 
@@ -144,11 +159,11 @@ mixing is `INCONCLUSIVE`.
 ### Finality
 
 Structured degraded/recovered diagnostics are paired in order. An incident
-recovered before T0 does not fail the gate. Every sampled reconciler must be
-`RUNNING`, at least one WebSocket/catch-up overlap must exist, and finality
-contradictions plus replay-receipt violations must remain zero. An unresolved
-incident or explicit contradiction is `FAIL`; malformed or unpairable evidence
-is `INCONCLUSIVE`.
+recovered before or during the window does not fail the gate when every sampled
+reconciler remains `RUNNING` and no contradiction exists. At least one
+WebSocket/catch-up overlap must exist, and finality contradictions plus
+replay-receipt violations must remain zero. An unresolved incident or explicit
+contradiction is `FAIL`; malformed or unpairable evidence is `INCONCLUSIVE`.
 
 ### Shutdown
 

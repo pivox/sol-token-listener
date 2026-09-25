@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.2.8 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
+Version : 1.2.9 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -37,8 +37,10 @@ Les règles provider-affines corrigées sont les suivantes :
   providers produit `FAIL`; un changement sans preuve suffisante reste
   `INCONCLUSIVE` ;
 - les diagnostics finality `degraded` et `recovered` sont appariés
-  structurellement et chronologiquement. Un incident refermé avant T0 est
-  compatible avec `PASS`; un incident ouvert ou une contradiction est `FAIL` ;
+  structurellement et chronologiquement. Un incident finality rétabli pendant
+  la fenêtre est compatible avec `PASS` lorsque tous les snapshots conservent
+  le réconciliateur `RUNNING` et qu'aucune contradiction ne subsiste ; un
+  incident ouvert est `FAIL` et une paire malformée est `INCONCLUSIVE` ;
 - un backlog durable peut rester après le shutdown. Les cinq composants doivent
   être `STOPPED`, tandis que leases, admission scan, admission worker,
   `queuedFetches`, fetches `in-flight` et cache mémoire doivent être à zéro ;
@@ -46,6 +48,29 @@ Les règles provider-affines corrigées sont les suivantes :
   deux partitions du backlog, par source et par priorité. Un désaccord est
   `INCONCLUSIVE`; il ne faut jamais supprimer les lignes durables pour obtenir
   artificiellement zéro.
+
+Le manifeste V1 applique en plus les invariants fail-closed suivants :
+
+- `terminalEvidence` conserve les totaux `failed`, `quarantined` et `exhausted`
+  dans `baseline` et `final`. Les groupes sont réconciliés séparément pour
+  `FAILED` et `QUARANTINED`, avec des taxonomies fermées issues des reason codes
+  de classification et des error codes d'ingestion. Tout delta expliqué est
+  `FAIL`, `exhausted` est prioritaire, et tout groupe absent, incomplet, nul ou
+  inconnu est `INCONCLUSIVE` ;
+- la preuve first-processing doit appartenir au même processus et à la même
+  cohorte ; les `sampledAtMs` sont strictement croissants de T0 au heartbeat
+  `STOPPED`, lequel doit être postérieur à T+15 et au snapshot final, mais
+  strictement antérieur à la frontière de rétention ;
+- pour chaque provider, `http429Responses <= attempts`; un provider non
+  configuré doit rester exactement à `0/0`, et un delta HTTP 429 positif prouvé
+  est prioritaire sur l'insuffisance de trafic ou une dérive de membership ;
+- les compteurs cumulatifs de `blockHydration` sont contrôlés sur chaque
+  snapshot et sur `STOPPED`; toute régression produit `INCONCLUSIVE` ;
+- une pause périodique authentifiée par un motif fermé, le même provider et le
+  même instant produit `INCONCLUSIVE`; une dégradation générique reste `FAIL` ;
+- `recoveryStatus=NOT_REQUIRED` exige `recoveryReasonCode=null`, si et seulement
+  si aucune récupération n'est requise. Tout autre statut exige un reason code
+  fermé non nul.
 
 ## Quarantaine du décodeur Pump.fun
 

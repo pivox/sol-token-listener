@@ -8,6 +8,12 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js `node:test`, immutable JSON contracts, existing first-processing validator, npm scripts, Markdown deployment contracts.
 
+**Plan revision:** 1.1.0. Cycle-1 corrections extend Task 2 and Task 4 with
+exact terminal totals/taxonomies, same-process first-processing chronology,
+HTTP counter invariants and positive-429 priority, hydration monotonicity,
+authenticated periodic-pause evidence, nullable recovery coherence, and
+paired finality recovery during the observation window.
+
 ---
 
 ### Task 1: Freeze the redacted evidence contract with failing tests
