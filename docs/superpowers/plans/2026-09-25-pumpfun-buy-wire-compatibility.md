@@ -20,13 +20,14 @@ Files:
 
 Steps:
 
-1. Add exact accepted cases for legacy zero-byte, official one-byte and
-   historical two-byte `track_volume` suffixes.
-2. Add `buy_exact_quote_in_v2` current and one-byte historical cases.
+1. Add the official historical zero-byte `buy`, the current one-byte layouts,
+   and only the finalized Mainnet `[1, 0]` `buy_exact_sol_in` layout.
+2. Add current `buy_exact_quote_in_v2` and only its finalized Mainnet `[1]`
+   suffix.
 3. Add exact rejection cases for unknown lengths, invalid booleans and invalid
    two-byte option tags.
-4. Prove at least one full inner-instruction fixture and catch-up classifier
-   case are RED for the compatibility gap.
+4. Require immutable authority per non-current layout, full transaction tests
+   for external and inner paths, and a catch-up classifier RED case.
 5. Run only the focused tests and record the expected failures.
 
 ## Task 2 — Minimal decoder implementation
@@ -69,4 +70,3 @@ Steps:
 - Priority separation and bounded worker/RPC capacity.
 - Oversize hydration cache policy, already deferred until after the first
   microtrade by the tracked product decision.
-

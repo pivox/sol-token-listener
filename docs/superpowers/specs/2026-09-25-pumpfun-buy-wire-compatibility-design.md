@@ -13,8 +13,10 @@ Mainnet, while keeping unknown encodings fail-closed.
 
 The canonical schema remains the official `pump-fun/pump-public-docs` IDL.
 The current upstream revision checked for this change is
-`81091419e4457566469d4e2a27f64ed84d42419c`. The repository-pinned generated
-IDL and discriminator provenance remain unchanged.
+`81091419e4457566469d4e2a27f64ed84d42419c`. The historical official revision
+`df5013e0f9253aa8039300964f1e0076da90c83d` proves that legacy `buy` contained
+only its two `u64` arguments. The repository-pinned generated IDL and
+discriminator provenance remain unchanged.
 
 The compatibility cases come from finalized public Mainnet transactions
 captured by the exact `main@e12d301` observe-only canary. They are evidence of
@@ -28,23 +30,27 @@ index provenance.
 The eight-byte official discriminator is always decoded first. No new or
 third-party discriminator is introduced.
 
-For legacy `buy` and `buy_exact_sol_in`, the two required `u64` arguments are
-followed by exactly one of these suffixes:
+For legacy `buy`, the two required `u64` arguments are followed by exactly one
+of these suffixes:
 
 | Suffix bytes | Meaning |
 | ---: | --- |
-| 0 | historical omission; normalize `track_volume` to `[false]` |
+| 0 | historical official layout; do not synthesize `track_volume` |
 | 1 | current official `OptionBool` struct; byte must be `0` or `1` |
-| 2 | historical Borsh option; bytes must be `[1, 0]` or `[1, 1]` |
 
-The two-byte form normalizes its second byte to `track_volume`. A two-byte
-`None` or any non-boolean byte is rejected: the one-byte omission already
-provides the only supported absent/default representation.
+For `buy_exact_sol_in`, the current one-byte official `OptionBool` remains
+accepted. One additional finalized Mainnet layout is accepted: the exact
+two-byte suffix `[1, 0]`. It is decoded as a historical `Some(false)` and
+retained as `track_volume: [false]`. Zero bytes, `[1, 1]`, a `None` tag, and
+all other lengths or values remain rejected until they have their own
+versioned authority or finalized fixture. This does not call the current
+one-byte `OptionBool` a Borsh `Option<bool>`: those are distinct layouts.
 
 For `buy_exact_quote_in_v2`, the two official `u64` arguments are followed by
-either no suffix, as in the current IDL, or one historical boolean byte `0` or
-`1`. When present, the compatibility flag is retained as
-`track_volume: [boolean]`; when absent, no synthetic field is added.
+either no suffix, as in the current IDL, or the exact finalized Mainnet suffix
+`[1]`. When present, the compatibility flag is retained as
+`track_volume: [true]`; when absent, no synthetic field is added. A zero byte
+or any other suffix remains rejected pending independent evidence.
 
 `buy_v2`, all SELL instructions, CREATE instructions and migration
 instructions retain their existing exact-EOF behavior. Every unlisted length
@@ -65,14 +71,15 @@ wire payload.
 ## Tests and operational proof
 
 TDD starts with RED unit cases for the exact observed layouts, plus rejection
-of unknown lengths, invalid booleans and malformed two-byte options. Public
-Mainnet fixtures cover at least one inner `buy_exact_quote_in_v2` and one
-legacy BUY form. Transaction and catch-up classifier tests prove that the
-payloads no longer become `PUMP_BORSH_INVALID` or
+of unknown lengths, invalid booleans and malformed two-byte options. Every
+non-current layout has either an immutable official historical revision or a
+dedicated finalized Mainnet fixture with signature, slot, transaction index
+and exact instruction bytes. Full transaction tests cover both external and
+inner compatibility paths. Transaction and catch-up classifier tests prove
+that the payloads no longer become `PUMP_BORSH_INVALID` or
 `PUMP_SCHEMA_UNSUPPORTED`.
 
 The local and CI gates remain build, TypeScript check, lint, docs check,
 backend/frontend tests and diff check. A later fresh observe-only Mainnet run
 must report the decoder-quarantine effect separately from backlog, worker
 capacity, first-processing eligibility and oversize-cache debt.
-

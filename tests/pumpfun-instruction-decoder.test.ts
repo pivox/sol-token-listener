@@ -93,6 +93,55 @@ void test('classe les variantes par famille métier', () => {
   assert.equal(decodePumpInstruction(pumpInstruction('migrate_v2'))?.family, 'MIGRATE');
 });
 
+void test('normalise les suffixes historiques bornés de buy et buy_exact_sol_in', () => {
+  const omitted = decodePumpInstruction(
+    buyInstructionWithSuffix('buy', Buffer.alloc(0)),
+  );
+  assert.ok(omitted);
+  assert.equal(Object.hasOwn(omitted.args, 'track_volume'), false);
+
+  const legacyFalse = decodePumpInstruction(
+    buyInstructionWithSuffix('buy_exact_sol_in', Buffer.from([1, 0])),
+  );
+  assert.ok(legacyFalse);
+  assert.deepEqual(legacyFalse.args.track_volume, [false]);
+});
+
+void test('conserve le booléen historique borné de buy_exact_quote_in_v2', () => {
+  const decoded = decodePumpInstruction(
+    buyInstructionWithSuffix('buy_exact_quote_in_v2', Buffer.from([1])),
+  );
+  assert.ok(decoded);
+  assert.deepEqual(decoded.args.track_volume, [true]);
+});
+
+void test('refuse les suffixes BUY historiques ambigus ou non booléens', () => {
+  for (const suffix of [Buffer.from([2]), Buffer.alloc(2), Buffer.from([1, 0]), Buffer.alloc(3)]) {
+    assert.throws(
+      () => decodePumpInstruction(buyInstructionWithSuffix('buy', suffix)),
+      isPumpError('PUMP_BORSH_INVALID'),
+    );
+  }
+
+  for (const suffix of [Buffer.alloc(0), Buffer.from([2]), Buffer.from([0, 0]), Buffer.from([1, 1]), Buffer.from([1, 2]), Buffer.alloc(3)]) {
+    assert.throws(
+      () => decodePumpInstruction(
+        buyInstructionWithSuffix('buy_exact_sol_in', suffix),
+      ),
+      isPumpError('PUMP_BORSH_INVALID'),
+    );
+  }
+
+  for (const suffix of [Buffer.from([0]), Buffer.from([2]), Buffer.alloc(2)]) {
+    assert.throws(
+      () => decodePumpInstruction(
+        buyInstructionWithSuffix('buy_exact_quote_in_v2', suffix),
+      ),
+      isPumpError('PUMP_BORSH_INVALID'),
+    );
+  }
+});
+
 void test('décode les trois remaining accounts multi-quote de create_v2', () => {
   const instruction = pumpInstruction('create_v2');
   const remaining = ['quote-mint', 'quote-curve-account', 'quote-token-program'];
@@ -257,6 +306,18 @@ function createV2InstructionWithSuffix(suffix: Uint8Array): NormalizedInstructio
   return normalizedInstruction(Uint8Array.from([
     ...definition.discriminator,
     ...encodeFields(definition.args.slice(0, 5), VALUES.create_v2),
+    ...suffix,
+  ]), definition.accounts.map((account, index) => `${account.name}-${index}`));
+}
+
+function buyInstructionWithSuffix(
+  name: 'buy' | 'buy_exact_quote_in_v2' | 'buy_exact_sol_in',
+  suffix: Uint8Array,
+): NormalizedInstruction {
+  const definition = PUMP_INSTRUCTIONS[name];
+  return normalizedInstruction(Uint8Array.from([
+    ...definition.discriminator,
+    ...encodeFields(definition.args.slice(0, 2), VALUES[name]),
     ...suffix,
   ]), definition.accounts.map((account, index) => `${account.name}-${index}`));
 }
