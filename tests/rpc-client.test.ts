@@ -13,6 +13,7 @@ import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-eviden
 type FetchInput = Parameters<FetchFn>[0];
 
 void test('bounded RPC fetch aborts a physically pending request at its deadline', async () => {
+  const keepAlive = setTimeout(() => undefined, 100);
   let aborted = false;
   const bounded = createBoundedRpcFetch(async (_input, init) => {
     const observedSignal = init?.signal;
@@ -24,11 +25,16 @@ void test('bounded RPC fetch aborts a physically pending request at its deadline
     });
   }, 5);
 
-  await assert.rejects(bounded('https://primary.invalid/rpc'), /aborted/u);
-  assert.equal(aborted, true);
+  try {
+    await assert.rejects(bounded('https://primary.invalid/rpc'), /aborted/u);
+    assert.equal(aborted, true);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 void test('one deadline bounds the complete failover operation across every endpoint', async () => {
+  const keepAlive = setTimeout(() => undefined, 100);
   let calls = 0;
   const config = createSolanaConnectionConfig({
     httpRpcUrl: 'https://primary.invalid/rpc',
@@ -50,8 +56,12 @@ void test('one deadline bounds the complete failover operation across every endp
   });
   if (config.fetch === undefined) throw new Error('Bounded failover fetch is unavailable.');
 
-  await assert.rejects(config.fetch('https://primary.invalid/rpc'), /deadline/u);
-  assert.equal(calls, 1);
+  try {
+    await assert.rejects(config.fetch('https://primary.invalid/rpc'), /deadline/u);
+    assert.equal(calls, 1);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 void test('counts one mono-endpoint physical attempt and returned HTTP 429 with a recorder', async () => {
