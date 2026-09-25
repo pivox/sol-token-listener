@@ -275,6 +275,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         MAX_PAPER_FINALITY_RAW_ROWS+1,MAX_PAPER_FINALITY_PREFLIGHT_JOBS,
         new Date(effectiveNowMs + this.retentionMs),
       ]);
+      await reclaimExhaustedCreationReservations(client, effectiveNowMs, this.retentionMs);
       await client.query('COMMIT');
       const row = result.rows[0];
       return row === undefined ? null : claimedJob(row);
@@ -458,7 +459,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     if (failure.terminalResult !== null) assertDecisionResult(job, failure.terminalResult);
     const client = await this.connect('fail');
     try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      // A ledger open may commit while this transaction waits for the qualification
+      // lock. READ COMMITTED makes the subsequent absence check see that position.
+      await client.query('BEGIN');
       await lockMint(client, job.mint);
       await lockQualificationMint(client,job.mint);
       const selected = await client.query(`SELECT status,lease_token,lease_expires_at,
@@ -495,6 +498,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
           new Date(nowMs + this.retentionMs),failure.terminalResult === null
             ? null : toJsonValue(decisionPayload(job, failure.terminalResult)),
         ]);
+        await retractUnopenedCreationSession(client, job, failure, nowMs, this.retentionMs);
       }
       await client.query('COMMIT');
     } catch (error: unknown) {
@@ -604,6 +608,96 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     } catch (error: unknown) {
       throw repositoryError(operation, error);
     }
+  }
+}
+
+async function reclaimExhaustedCreationReservations(
+  client: Client,
+  nowMs: number,
+  retentionMs: number,
+): Promise<void> {
+  const pending = await client.query(`SELECT job.job_id,job.mint,job.source_event_id,
+      job.source_confirmation_status,session.session_id
+    FROM paper_strategy_sessions session
+    JOIN paper_decision_jobs job ON job.mint=session.mint
+      AND job.payload #>> '{result,sessionId}'=session.session_id
+    WHERE session.strategy_id='creation-entry-v1' AND session.state='BUY_PENDING'
+      AND session.position_id IS NULL AND job.status='CANCELLED'
+      AND job.retry_exhausted_at IS NOT NULL
+    ORDER BY job.terminal_at,job.job_id LIMIT 16`);
+  for (const row of pending.rows) {
+    const mint = textField(row, 'mint');
+    // Never wait behind a worker holding mint/qualification locks while claim
+    // owns the scheduler lock. A busy reservation is retried on the next poll.
+    const locks = await client.query(`SELECT
+      pg_try_advisory_xact_lock(hashtextextended('paper-decision:' || $1,0)) AS mint_lock,
+      pg_try_advisory_xact_lock(hashtextextended('qualification-projection:' || $1,0)) AS qualification_lock`, [mint]);
+    if (!booleanField(locks.rows[0], 'mint_lock') || !booleanField(locks.rows[0], 'qualification_lock')) continue;
+    const jobId = textField(row, 'job_id');
+    const locked = await client.query(`SELECT job_id FROM paper_decision_jobs
+      WHERE job_id=$1 AND status='CANCELLED' AND retry_exhausted_at IS NOT NULL
+      FOR UPDATE SKIP LOCKED`, [jobId]);
+    if (locked.rows.length !== 1) continue;
+    await retractUnopenedCreationSession(client, {
+      jobId, mint,
+      sourceEventId:textField(row, 'source_event_id'),
+      sourceConfirmationStatus:textField(row, 'source_confirmation_status') as ChainConfirmationStatus,
+    }, { code:'LEASE_EXPIRED', retryable:true, terminalResult:null }, nowMs, retentionMs,
+    textField(row, 'session_id'));
+  }
+}
+
+async function retractUnopenedCreationSession(
+  client: Client,
+  job: Pick<ClaimedPaperDecisionJob, 'jobId' | 'mint' | 'sourceEventId' | 'sourceConfirmationStatus'>,
+  failure: PaperDecisionFailure,
+  nowMs: number,
+  retentionMs: number,
+  sessionId: string | null = null,
+): Promise<void> {
+  const selected = await client.query(`SELECT session.payload AS session_payload,event.*
+    FROM paper_strategy_sessions session
+    JOIN domain_events event ON event.event_id=session.session_event_id
+    WHERE session.mint=$1 AND session.strategy_id='creation-entry-v1'
+      AND session.state='BUY_PENDING' AND session.position_id IS NULL
+      AND ($2::text IS NULL OR session.session_id=$2)
+      AND NOT EXISTS (SELECT 1 FROM paper_positions position
+        WHERE position.mint=session.mint AND position.strategy_id=session.strategy_id
+          AND (position.candidate_id=session.candidate_id OR position.status='PAPER_HOLDING'))
+    FOR UPDATE OF session`, [job.mint,sessionId]);
+  for (const row of selected.rows) {
+    const trigger = decodeDomainEvent(row);
+    const session = decoded(field(row, 'session_payload'), 'Pending session is invalid.') as PaperStrategySession;
+    if (session.payloadVersion !== 2 || session.state !== 'BUY_PENDING'
+      || session.positionId !== null
+      || canonicalStringifyJson(session) !== canonicalStringifyJson(payloadProperty(trigger.payload, 'session'))) {
+      throw new TypeError('Pending creation session audit is inconsistent.');
+    }
+    const updatedAtMs = Math.max(nowMs, session.updatedAtMs);
+    const retracted: PaperStrategySessionV2 = Object.freeze({
+      ...session, state:'PAPER_RETRACTED', reasonCode:'CREATION_ENTRY_REJECTED',
+      lastError:Object.freeze({
+        code:failure.retryable ? 'ENTRY_DECISION_EXHAUSTED' : 'ENTRY_DECISION_FAILED',
+        message:'Paper entry abandoned without a committed position.', retryable:false,
+      }), updatedAtMs, purgeAfterMs:updatedAtMs + retentionMs,
+    });
+    const event:DomainEvent = Object.freeze({
+      ...trigger,
+      id:createDeterministicDerivedEventId({
+        type:'PaperStrategySessionUpdated', mint:job.mint, source:'paper-decision',
+        program:trigger.program, signature:trigger.signature, cursor:trigger.cursor,
+        qualifier:`${session.id}:entry-abandoned:${job.jobId}`,
+      }), observedAtMs:updatedAtMs, payload:Object.freeze({ session:retracted }),
+    });
+    await insertDomainEventWithRaw(client, textField(row, 'raw_event_id'), event);
+    if (!await upsertSession(client, job, retracted, event.id)) {
+      throw new TypeError('Pending creation session abandonment was not persisted.');
+    }
+    await client.query(`UPDATE paper_decision_jobs SET payload=payload || $2::jsonb
+      WHERE job_id=$1`, [job.jobId, toJsonValue({ entryCancellation:{
+        sessionId:session.id, sessionEventId:event.id, state:retracted.state,
+        reasonCode:retracted.reasonCode, errorCode:retracted.lastError?.code,
+      } })]);
   }
 }
 
@@ -999,7 +1093,7 @@ function assertCandidateEvent(result:PaperDecisionResult):void{
 
 async function upsertSession(
   client: Client,
-  job: ClaimedPaperDecisionJob,
+  job: Pick<ClaimedPaperDecisionJob, 'mint' | 'sourceEventId' | 'sourceConfirmationStatus'>,
   session: PaperStrategySession,
   sessionEventId: string,
 ): Promise<boolean> {

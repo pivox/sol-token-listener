@@ -128,6 +128,16 @@ void test('rejects creation entry after excessive slot lag or a creator sell', (
   assert.equal(underConfirmedLaunch.candidate.state, 'NOT_ELIGIBLE');
 });
 
+void test('rejects a creator sell learned after the qualification cursor', () => {
+  const sell = creatorSell();
+  const result = creationCandidateService().create(
+    candidateInput({ snapshot:snapshot({ activeLaunchTrades:[{
+      ...sell, cursor:{ ...sell.cursor, slot:1_000n },
+    }] }) }),
+  );
+  assert.equal(result.candidate.state, 'NOT_ELIGIBLE');
+});
+
 function candidateService(): TradingCandidateService {
   return new TradingCandidateService({
     strategy: Object.freeze({ id: 'validated-external-buys', version: 1 }),

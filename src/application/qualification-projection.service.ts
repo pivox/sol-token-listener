@@ -5,6 +5,7 @@ import type { RebuiltQualification } from './qualification-rebuild.service.js';
 import type { MissingCanonicalLaunchPolicy } from '../domain/projection-reconciliation.js';
 import type {
   CanonicalQualificationProjection,
+  QualificationCanonicalSnapshot,
   QualificationProjectionRepository,
 } from '../ports/qualification-projection-repository.js';
 
@@ -14,6 +15,7 @@ export type QualificationProjectionRebuildResult =
   | Readonly<{
     kind: 'UPDATED' | 'UNCHANGED';
     projection: CanonicalQualificationProjection;
+    snapshot: QualificationCanonicalSnapshot;
   }>
   | Readonly<{
     kind: 'DISSOLVED';
@@ -26,6 +28,13 @@ export class QualificationProjectionLaunchNotFoundError extends Error {
   public constructor(public readonly mint: string) {
     super(`Qualification projection launch not found for mint ${mint}.`);
     this.name = 'QualificationProjectionLaunchNotFoundError';
+  }
+}
+
+export class QualificationProjectionStaleQuotesError extends Error {
+  public constructor() {
+    super('Qualification projection quotes precede canonical evidence.');
+    this.name = 'QualificationProjectionStaleQuotesError';
   }
 }
 
@@ -106,7 +115,7 @@ export class QualificationProjectionService {
         qualificationEvent:rebuilt.event,
       });
       const kind = await transaction.replaceProjection(projection);
-      return Object.freeze({ kind,projection });
+      return Object.freeze({ kind,projection,snapshot });
     });
     if (result === MISSING_CANONICAL_LAUNCH) {
       throw new QualificationProjectionLaunchNotFoundError(mint);
@@ -136,6 +145,12 @@ function assertQuotePair(
   );
   if (!buyValid || !reverseValid) {
     throw new TypeError('Qualification projection quote pair is invalid.');
+  }
+  for (const quote of [buyQuote, reverseSellQuote]) {
+    if (quote !== null && (
+      quote.observedSlot < snapshot.asOfEvent.cursor.slot
+      || quote.observedAtMs < snapshot.asOfEvent.observedAtMs
+    )) throw new QualificationProjectionStaleQuotesError();
   }
 }
 

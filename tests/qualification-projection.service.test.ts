@@ -191,12 +191,29 @@ void test('persists a quote-backed qualification under the canonical projection 
 
   assert.equal(result.kind, 'UPDATED');
   assert.ok(result.projection);
+  assert.deepEqual('snapshot' in result ? result.snapshot : undefined, snapshot());
   assert.equal(result.projection.evaluation.calibrationFacts?.buySimulationSucceeded, true);
   assert.equal(result.projection.evaluation.calibrationFacts?.sellQuoteAvailable, true);
   assert.equal(result.projection.evaluation.calibrationFacts?.roundTripLossBps, 2_000n);
   assert.deepEqual(repository.transactedMints, ['MINT']);
   assert.equal(repository.replacements.length, 1);
 });
+
+for (const side of ['BUY', 'SELL'] as const) {
+for (const field of ['observedSlot', 'observedAtMs'] as const) {
+  void test(`rejects ${side} quotes older than canonical ${field} without persisting a report`, async () => {
+    const repository = new FakeRepository(snapshot(), ['UPDATED']);
+    const buy = quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n);
+    const sell = quote('sell', 'MINT', 'SOL', 900n, 800n, 800n);
+    const stale = { [field]: field === 'observedSlot' ? 0n : 0 };
+    await assert.rejects(() => service(repository, ['SOL']).rebuildWithQuotes(
+      'MINT', side === 'BUY' ? { ...buy, ...stale } : buy,
+      side === 'SELL' ? { ...sell, ...stale } : sell,
+    ));
+    assert.deepEqual(repository.replacements, []);
+  });
+}
+}
 
 void test('rejects an unrelated quote pair before replacing the canonical projection', async () => {
   const repository = new FakeRepository(snapshot(), []);

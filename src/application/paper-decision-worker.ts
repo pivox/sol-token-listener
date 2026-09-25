@@ -5,7 +5,7 @@ import type { PaperStrategySession } from '../domain/paper-strategy.js';
 import { PaperTradingError,type PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type { QuoteAsset } from '../domain/types.js';
-import type { CanonicalQualificationProjection } from '../ports/qualification-projection-repository.js';
+import type { CanonicalQualificationProjection, QualificationCanonicalSnapshot } from '../ports/qualification-projection-repository.js';
 import type {
   ClaimedPaperDecisionJob,
   PaperDecisionFailure,
@@ -74,6 +74,7 @@ interface QualificationRebuilder {
   ) => Promise<Readonly<{
     kind: 'UPDATED' | 'UNCHANGED' | 'DISSOLVED';
     projection: CanonicalQualificationProjection | null;
+    snapshot?: QualificationCanonicalSnapshot;
   }>>;
 }
 
@@ -278,6 +279,7 @@ export class PaperDecisionWorker {
       }
       if (!this.paperReady()) return this.readinessLost(job, lease);
     }
+    let candidateSnapshot: Parameters<CandidateBuilder['create']>[0]['snapshot'] = snapshot;
     if (paperEnabled) {
       if (this.qualification.rebuildWithQuotes === undefined) {
         return this.fail(job,lease,'DECISION_INVALID',false,null);
@@ -286,14 +288,24 @@ export class PaperDecisionWorker {
         const quoteBacked=await this.qualification.rebuildWithQuotes(
           snapshot.mint,buyQuote ?? null,reverseSellQuote ?? null,
         );
-        if (quoteBacked.projection === null || quoteBacked.kind === 'DISSOLVED') {
+        if (quoteBacked.projection === null || quoteBacked.kind === 'DISSOLVED'
+          || quoteBacked.snapshot === undefined) {
           return await this.fail(job,lease,'RPC_TRANSIENT',true,null);
         }
+        const refreshed = await this.repository.loadSnapshot(job);
+        if (canonicalStringifyJson(refreshed.currentQualification)
+          !== canonicalStringifyJson(quoteBacked.projection)
+          || !refreshed.canonicalLaunchActive
+          || refreshed.currentSession !== null || refreshed.activePosition !== null) {
+          return await this.fail(job,lease,'RPC_TRANSIENT',true,null);
+        }
+        candidateSnapshot = Object.freeze({ ...refreshed, ...quoteBacked.snapshot });
         rebuilt=authorizedQualification(
           this.qualification.reauthorize(quoteBacked.projection),quoteBacked.projection,
         );
-      } catch {
-        return this.fail(job,lease,'DECISION_INVALID',false,null);
+      } catch (error: unknown) {
+        const invalid = error instanceof TypeError;
+        return this.fail(job,lease,invalid ? 'DECISION_INVALID' : 'RPC_TRANSIENT',!invalid,null);
       }
       if (!this.paperReady()) return this.readinessLost(job, lease);
     }
@@ -301,7 +313,7 @@ export class PaperDecisionWorker {
     if (!this.paperReady()) return this.readinessLost(job, lease);
     try {
       candidateResult=await this.candidates.create({
-        snapshot,report:rebuilt.report,reportId:rebuilt.reportId,
+        snapshot:candidateSnapshot,report:rebuilt.report,reportId:rebuilt.reportId,
         qualificationEvent:rebuilt.event,evidenceFingerprint:rebuilt.evidenceFingerprint,
         quoteAsset:quoteAsset ?? snapshot.launch.quoteAssets[0] ?? fallbackQuoteAsset(),
         buyQuote:buyQuote ?? null,reverseSellQuote:reverseSellQuote ?? null,

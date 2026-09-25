@@ -876,6 +876,77 @@ void test('retry-only reconciliation failure preserves every paper domain row',a
   });
 });
 
+for (const committedPosition of [false, true]) {
+void test(`terminal creation decision releases reservation only without a ledger position (${committedPosition})`, async (context) => {
+  if (databaseUrl === undefined) { context.skip('TEST_DATABASE_URL is not configured'); return; }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    let nowMs = 1_000;
+    const repository = paperDecisionRepository(pool, { maxAttempts:2, baseDelayMs:100, clock:() => nowMs });
+    const pending = pendingCreationDecision();
+    await repository.enqueue(jobInput());
+    const first = await repository.claim({ nowMs, leaseMs:1_000 });
+    assert.ok(first);
+    await repository.stageDecision(first, pending);
+    await repository.fail(first, { code:'RPC_TRANSIENT', retryable:true, terminalResult:null });
+    assert.equal((await pool.query('SELECT state FROM paper_strategy_sessions')).rows[0]?.state, 'BUY_PENDING');
+    nowMs = 1_100;
+    const last = await repository.claim({ nowMs, leaseMs:1_000 });
+    assert.ok(last);
+    if (committedPosition) await insertPosition(pool, closedPosition(pending));
+    await repository.fail(last, { code:'RPC_TRANSIENT', retryable:true, terminalResult:null });
+    const stored = (await pool.query(`SELECT state,reason_code,payload->'lastError' AS error,
+      EXTRACT(EPOCH FROM purge_after-terminal_at)::int AS retention FROM paper_strategy_sessions`)).rows[0];
+    if (committedPosition) {
+      assert.equal(stored?.state, 'BUY_PENDING');
+      assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM domain_events
+        WHERE type='PaperStrategySessionUpdated' AND payload #>> '{session,state}'='PAPER_RETRACTED'`)).rows[0]?.count, 0);
+      return;
+    }
+    assert.equal(stored?.state, 'PAPER_RETRACTED');
+    assert.equal(stored?.reason_code, 'CREATION_ENTRY_REJECTED');
+    assert.equal(stored?.error.code, 'ENTRY_DECISION_EXHAUSTED');
+    assert.equal(stored?.retention, 14_400);
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM domain_events
+      WHERE type='PaperStrategySessionUpdated' AND payload #>> '{session,state}'='PAPER_RETRACTED'`)).rows[0]?.count, 1);
+    assert.equal((await pool.query(`SELECT payload #>> '{entryCancellation,state}' AS state
+      FROM paper_decision_jobs WHERE job_id=$1`, [last.jobId])).rows[0]?.state, 'PAPER_RETRACTED');
+  });
+});
+}
+
+for (const busyQualification of [false, true]) {
+void test(`reclaims an expired creation reservation without waiting on qualification (${busyQualification})`, async (context) => {
+  if (databaseUrl === undefined) { context.skip('TEST_DATABASE_URL is not configured'); return; }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    let nowMs = 1_000;
+    const repository = paperDecisionRepository(pool, { maxAttempts:1, clock:() => nowMs });
+    await repository.enqueue(jobInput());
+    const job = await repository.claim({ nowMs, leaseMs:100 });
+    assert.ok(job);
+    await repository.stageDecision(job, pendingCreationDecision());
+    nowMs = 1_101;
+    if (busyQualification) {
+      const owner = await pool.connect();
+      try {
+        await owner.query('BEGIN');
+        await owner.query("SELECT pg_advisory_xact_lock(hashtextextended('qualification-projection:' || $1,0))", [MINT]);
+        assert.equal(await repository.claim({ nowMs, leaseMs:100 }), null);
+        assert.equal((await pool.query('SELECT state FROM paper_strategy_sessions')).rows[0]?.state, 'BUY_PENDING');
+      } finally {
+        await owner.query('ROLLBACK');
+        owner.release();
+      }
+    }
+    assert.equal(await repository.claim({ nowMs, leaseMs:100 }), null);
+    assert.equal((await pool.query('SELECT state FROM paper_strategy_sessions')).rows[0]?.state, 'PAPER_RETRACTED');
+    assert.equal((await pool.query(`SELECT payload #>> '{entryCancellation,state}' AS state
+      FROM paper_decision_jobs WHERE job_id=$1`, [job.jobId])).rows[0]?.state, 'PAPER_RETRACTED');
+  });
+});
+}
+
 void test('claim waits for every relevant inbox replay state and exact confirmation alignment',async(context)=>{
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
@@ -2086,6 +2157,20 @@ function creationDecisionWithEvidence(tradeId: string, updatedAtMs: number): Pap
     })]),
     requestedAction:'NONE' as const,
   });
+}
+
+function pendingCreationDecision(): PaperDecisionResult {
+  const base = creationDecisionWithEvidence('unused', 1_000);
+  assert.ok(base.session?.payloadVersion === 2);
+  const session = createCreationEntrySession({ ...base.session, candidate:base.candidate,
+    state:'BUY_PENDING', reasonCode:'QUALIFIED_ENTRY', positionId:null,
+    externalBuyCount:0, countedTradeIds:[], countedBuyerWallets:[], lastCountedCursor:null,
+    entryBoundary:null,
+  });
+  return { ...base, session, countedExternalBuys:[], requestedAction:'OPEN',
+    sessionEvent:derivedEvent('PaperStrategySessionUpdated', session.id, { session },
+      'confirmed', base.candidate.asOf.cursor, 1_000),
+  };
 }
 
 function creationDecisionWithoutEvidence(
