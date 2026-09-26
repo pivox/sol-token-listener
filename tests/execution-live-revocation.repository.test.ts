@@ -535,7 +535,7 @@ async function createPersistedBuyFixture(
   await migrateDatabase({ pool });
   const fixture = await createBuyFixture(pool);
   const live = new PostgresExecutionLiveRepository(pool);
-  const signed = await authorizeAndSignBuy(live, fixture);
+  const signed = await authorizeAndSignBuy(pool, live, fixture);
   await live.persistSigned({
     payloadVersion: 1, claim: fixture.claim, preSignatureLockId: signed.preSignatureLockId,
     qualificationId: signed.qualificationId, reservationId: signed.reservationId,
@@ -579,7 +579,7 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   await migrateDatabase({ pool });
   const buyFixture = await createBuyFixture(pool);
   const live = new PostgresExecutionLiveRepository(pool);
-  const signedBuy = await authorizeAndSignBuy(live, buyFixture);
+  const signedBuy = await authorizeAndSignBuy(pool, live, buyFixture);
   const buy = Object.freeze({ ...buyFixture, ...signedBuy });
   await live.persistSigned({
     payloadVersion: 1, claim: buy.claim, preSignatureLockId: buy.preSignatureLockId,
@@ -905,7 +905,7 @@ async function createBuyFixture(
     generationId, payloadVersion: 1, walletPublicKey, cluster: 'mainnet-beta',
     genesisHash: walletPublicKey, generation: 1,
   });
-  const nowMs = Date.now();
+  const nowMs = await databaseNowMs(pool);
   const walletSnapshot = createExecutionWalletSnapshot({
     generationId, providerId: 'primary', stateRevision: 0n, slot: 123n,
     blockTimeMs: nowMs - 100, observedAtMs: nowMs - 50, commitment: 'finalized',
@@ -1006,7 +1006,7 @@ async function createBuyFixture(
   }).compileToV0Message());
   const messageBytes = Object.freeze([...unsigned.message.serialize()]);
   const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
-  const quoteObservedAtMs = Date.now();
+  const quoteObservedAtMs = await databaseNowMs(pool);
   const messageHash = createHash('sha256').update(Uint8Array.from(messageBytes)).digest('hex');
   const unsignedSimulation = Object.freeze({
     outcome: 'SUCCESS' as const, snapshotFingerprint: '6'.repeat(64),
@@ -1045,7 +1045,21 @@ async function createBuyFixture(
   });
 }
 
+async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number> {
+  const result = await pool.query<{ readonly now_ms: string }>(`SELECT
+    trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+      AS now_ms`);
+  assert.equal(result.rows.length, 1);
+  const rawNowMs = result.rows[0]?.now_ms;
+  assert.ok(typeof rawNowMs === 'string');
+  assert.match(rawNowMs, /^(0|[1-9]\d*)$/u);
+  const nowMs = Number(rawNowMs);
+  assert.ok(Number.isSafeInteger(nowMs));
+  return nowMs;
+}
+
 async function authorizeAndSignBuy(
+  pool: InstanceType<typeof pg.Pool>,
   live: PostgresExecutionLiveRepository,
   fixture: Awaited<ReturnType<typeof createBuyFixture>>,
 ) {
@@ -1059,6 +1073,7 @@ async function authorizeAndSignBuy(
     Uint8Array.from(authorization.material.unsignedTransactionBytes),
   );
   transaction.sign([signingKeypair]);
+  const signedAtMs = await databaseNowMs(pool);
   const artifact = createSignedTransactionArtifact({
     payloadVersion: 1, specificationVersion: 1, intentId: fixture.claim.intent.id,
     attemptNumber: fixture.attempt.attemptNumber, generationId,
@@ -1075,7 +1090,7 @@ async function authorizeAndSignBuy(
     blockhash: authorization.material.blockhash,
     lastValidBlockHeight: authorization.material.lastValidBlockHeight,
     signature: bs58.encode(transaction.signatures[0] ?? new Uint8Array(64)),
-    signedTransactionBytes: transaction.serialize(), signedAtMs: Date.now(),
+    signedTransactionBytes: transaction.serialize(), signedAtMs,
   });
   return Object.freeze({
     preSignatureLockId: authorization.preSignatureLockId,
