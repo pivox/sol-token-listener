@@ -2916,6 +2916,7 @@ async function exactBuyPersistenceFixture(
     Uint8Array.from(authorization.material.unsignedTransactionBytes),
   );
   signed.sign([exactBuyWallet]);
+  const signedAtMs = await databaseNowMs(pool);
   const artifact = createSignedTransactionArtifact({
     payloadVersion: 1, specificationVersion: 1, intentId: begun.claim.intent.id,
     attemptNumber: begun.attempt.attemptNumber, generationId,
@@ -2932,7 +2933,7 @@ async function exactBuyPersistenceFixture(
     blockhash: authorization.material.blockhash,
     lastValidBlockHeight: authorization.material.lastValidBlockHeight,
     signature: bs58.encode(signed.signatures[0] ?? new Uint8Array(64)),
-    signedTransactionBytes: signed.serialize(), signedAtMs: Date.now(),
+    signedTransactionBytes: signed.serialize(), signedAtMs,
   });
   const input = Object.freeze({
     payloadVersion: 1 as const, claim: begun.claim,

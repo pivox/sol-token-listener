@@ -535,7 +535,7 @@ async function createPersistedBuyFixture(
   await migrateDatabase({ pool });
   const fixture = await createBuyFixture(pool);
   const live = new PostgresExecutionLiveRepository(pool);
-  const signed = await authorizeAndSignBuy(live, fixture);
+  const signed = await authorizeAndSignBuy(pool, live, fixture);
   await live.persistSigned({
     payloadVersion: 1, claim: fixture.claim, preSignatureLockId: signed.preSignatureLockId,
     qualificationId: signed.qualificationId, reservationId: signed.reservationId,
@@ -579,7 +579,7 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   await migrateDatabase({ pool });
   const buyFixture = await createBuyFixture(pool);
   const live = new PostgresExecutionLiveRepository(pool);
-  const signedBuy = await authorizeAndSignBuy(live, buyFixture);
+  const signedBuy = await authorizeAndSignBuy(pool, live, buyFixture);
   const buy = Object.freeze({ ...buyFixture, ...signedBuy });
   await live.persistSigned({
     payloadVersion: 1, claim: buy.claim, preSignatureLockId: buy.preSignatureLockId,
@@ -1059,6 +1059,7 @@ async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number
 }
 
 async function authorizeAndSignBuy(
+  pool: InstanceType<typeof pg.Pool>,
   live: PostgresExecutionLiveRepository,
   fixture: Awaited<ReturnType<typeof createBuyFixture>>,
 ) {
@@ -1072,6 +1073,7 @@ async function authorizeAndSignBuy(
     Uint8Array.from(authorization.material.unsignedTransactionBytes),
   );
   transaction.sign([signingKeypair]);
+  const signedAtMs = await databaseNowMs(pool);
   const artifact = createSignedTransactionArtifact({
     payloadVersion: 1, specificationVersion: 1, intentId: fixture.claim.intent.id,
     attemptNumber: fixture.attempt.attemptNumber, generationId,
@@ -1088,7 +1090,7 @@ async function authorizeAndSignBuy(
     blockhash: authorization.material.blockhash,
     lastValidBlockHeight: authorization.material.lastValidBlockHeight,
     signature: bs58.encode(transaction.signatures[0] ?? new Uint8Array(64)),
-    signedTransactionBytes: transaction.serialize(), signedAtMs: Date.now(),
+    signedTransactionBytes: transaction.serialize(), signedAtMs,
   });
   return Object.freeze({
     preSignatureLockId: authorization.preSignatureLockId,
