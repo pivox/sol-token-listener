@@ -905,7 +905,7 @@ async function createBuyFixture(
     generationId, payloadVersion: 1, walletPublicKey, cluster: 'mainnet-beta',
     genesisHash: walletPublicKey, generation: 1,
   });
-  const nowMs = Date.now();
+  const nowMs = await databaseNowMs(pool);
   const walletSnapshot = createExecutionWalletSnapshot({
     generationId, providerId: 'primary', stateRevision: 0n, slot: 123n,
     blockTimeMs: nowMs - 100, observedAtMs: nowMs - 50, commitment: 'finalized',
@@ -1043,6 +1043,19 @@ async function createBuyFixture(
     claim: begun.claim, attempt: begun.attempt, material, runtime,
     qualificationId: qualification.qualificationId,
   });
+}
+
+async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number> {
+  const result = await pool.query<{ readonly now_ms: string }>(`SELECT
+    trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+      AS now_ms`);
+  assert.equal(result.rows.length, 1);
+  const rawNowMs = result.rows[0]?.now_ms;
+  assert.ok(typeof rawNowMs === 'string');
+  assert.match(rawNowMs, /^(0|[1-9]\d*)$/u);
+  const nowMs = Number(rawNowMs);
+  assert.ok(Number.isSafeInteger(nowMs));
+  return nowMs;
 }
 
 async function authorizeAndSignBuy(
