@@ -8,7 +8,7 @@ import {
   createPumpFunWorkerAdmissionPolicy,
 } from '../src/domain/worker-admission.js';
 
-void test('the inactive Pump.fun worker admission policy exposes exact frozen V1 defaults', () => {
+void test('the Pump.fun worker admission policy exposes exact frozen V1 values', () => {
   assert.equal(
     PUMPFUN_WORKER_ADMISSION_POLICY_SCHEMA_VERSION,
     'pumpfun-worker-admission-policy.v1',
@@ -17,24 +17,26 @@ void test('the inactive Pump.fun worker admission policy exposes exact frozen V1
   assert.equal(DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS, 45);
   assert.equal(MAX_PUMPFUN_TRACKING_WINDOW_SECONDS, 3_600);
 
-  const policy = createPumpFunWorkerAdmissionPolicy({
-    enabled: false,
-    trackingWindowSeconds: DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
-  });
+  for (const enabled of [false, true] as const) {
+    const policy = createPumpFunWorkerAdmissionPolicy({
+      enabled,
+      trackingWindowSeconds: DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+    });
 
-  assert.deepEqual(policy, {
-    schemaVersion: 'pumpfun-worker-admission-policy.v1',
-    enabled: false,
-    trackingWindowSeconds: 45,
-  });
-  assert.equal(Object.isFrozen(policy), true);
+    assert.deepEqual(policy, {
+      schemaVersion: 'pumpfun-worker-admission-policy.v1',
+      enabled,
+      trackingWindowSeconds: 45,
+    });
+    assert.equal(Object.isFrozen(policy), true);
+  }
 });
 
-void test('the inactive policy rejects enabled, non-boolean and non-canonical windows', () => {
-  for (const enabled of [true, 'false', 0, null, undefined]) {
+void test('the policy rejects every non-boolean and non-canonical window', () => {
+  for (const enabled of ['false', 'true', 0, 1, null, undefined]) {
     assert.throws(
       () => createPumpFunWorkerAdmissionPolicy({ enabled, trackingWindowSeconds: 45 }),
-      /inactive Pump\.fun worker admission policy requires enabled=false/iu,
+      /enabled must be a boolean/iu,
     );
   }
   for (const trackingWindowSeconds of [0, 3_601, 1.5, Number.NaN, Number.POSITIVE_INFINITY,

@@ -32,15 +32,15 @@ void test('bounded Pump.fun worker admission is inactive with an exact validated
   }).listenerPumpFunTrackingWindowSeconds, 3_600);
 });
 
-void test('bounded worker admission remains fail-closed until admission/classification ships', () => {
-  const activationError =
-    'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED is not available until the admission/classification delivery.';
+void test('bounded worker admission requires the catch-up page classifier', () => {
+  const classifierDependencyError =
+    'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED requires LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true.';
   assert.throws(
     () => parseConfig({
       ...base,
       LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: 'true',
     }),
-    (error: unknown) => error instanceof Error && error.message === activationError,
+    (error: unknown) => error instanceof Error && error.message === classifierDependencyError,
   );
   for (const value of ['TRUE', '1', ' true', 'true ', ' ', '']) {
     assert.throws(
@@ -49,6 +49,34 @@ void test('bounded worker admission remains fail-closed until admission/classifi
         LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: value,
       }),
       /LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED must be true or false\./u,
+    );
+  }
+});
+
+void test('bounded worker admission inherits the complete catch-up classifier safety envelope', () => {
+  const enabled = {
+    ...base,
+    LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: 'true',
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+    EXECUTION_MODE: 'observe',
+  };
+  assert.equal(parseConfig(enabled).listenerPumpFunBoundedWorkerAdmissionEnabled, true);
+
+  for (const override of [
+    { LISTENER_ENABLED: 'false' },
+    { EXECUTION_MODE: 'paper' },
+    { LISTENER_INGESTION_SCOPE: 'launchpad-and-market' },
+    { LISTENER_CATCH_UP_POLICY: 'strict' },
+    { LISTENER_BLOCK_HYDRATION_ENABLED: 'false' },
+    { SOLANA_EXPECTED_GENESIS_HASH: undefined },
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...enabled, ...override }),
+      (error: unknown) => error instanceof Error
+        && error.message === 'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED requires a safe observation envelope.',
     );
   }
 });
