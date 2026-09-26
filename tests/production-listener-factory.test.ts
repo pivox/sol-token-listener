@@ -438,6 +438,7 @@ void test('production creates one bounded admission policy and injects it as the
   assert.equal(count(source, /new PostgresTransactionInboxRepository\(/gu), 1);
   assert.match(source, /createPumpFunWorkerAdmissionPolicy\(\{\s*enabled: config\.listenerPumpFunBoundedWorkerAdmissionEnabled,\s*trackingWindowSeconds: config\.listenerPumpFunTrackingWindowSeconds,\s*\}\)/u);
   assert.match(source, /new PostgresTransactionInboxRepository\(databasePool, Object\.freeze\(\{[^}]*\}\), workerAdmissionPolicy\)/u);
+  assert.match(source, /openWsProgramSession\(\s*endpoint,\s*observe,\s*signal,\s*\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*\}/u);
 });
 
 void test('multi-worker startup fails before members when durable PumpSwap work is non-terminal', async (context) => {
@@ -1990,7 +1991,7 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /strictCheckpointKeys\s*=\s*Object\.freeze\(ingestionPrograms\.map/u);
   assert.match(
     source,
-    /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{ programs: ingestionPrograms \}/u,
+    /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*\}/u,
   );
   assert.match(source, /const recoveryScanner\s*=\s*new StrictCatchUpScanner\([\s\S]*?policy:\s*'strict'[\s\S]*?programs:\s*ingestionPrograms/u);
   assert.match(source, /const baselineScanner\s*=\s*new StrictCatchUpScanner\([\s\S]*?policy:\s*'live-edge'[\s\S]*?programs:\s*ingestionPrograms/u);

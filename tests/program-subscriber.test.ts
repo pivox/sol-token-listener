@@ -11,6 +11,7 @@ import {
   SolanaProgramSubscriber,
   type ProgramLogsCallback,
   type ProgramLogsConnection,
+  type ProgramSubscriberOptions,
 } from '../src/solana/rpc/program-subscriber.js';
 
 const signature = '1'.repeat(64);
@@ -53,10 +54,54 @@ void test('enqueues a shared signature twice with distinct frozen program proven
   assert.ok(inbox.notifications.every((value) => Object.isFrozen(value.programIds)));
 });
 
-void test('classifies canonical Pump.fun create and trade logs into immutable hints', async () => {
+void test('OFF and omitted admission preserve null direct-subscriber hints without reading logs', async () => {
+  for (const enabled of [undefined, false]) {
+    const connection = new FakeConnection();
+    const inbox = new FakeInbox();
+    const subscriber = makeSubscriber(connection, inbox, enabled);
+    await subscriber.start();
+    for (const logMessages of [[createLine()], [tradeLine(firstTradeMint)],
+      [createLine(), tradeLine(firstTradeMint), 'Log truncated']]) {
+      connection.emit(PUMP_PROGRAM_ID, logs(signature, null, logMessages), context(42));
+    }
+    let logReads = 0;
+    const unreadableLogs = new Proxy(logs(signature) as object, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'logs') { logReads += 1; throw new Error('logs must not be inspected in OFF mode'); }
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    connection.emit(PUMP_PROGRAM_ID, unreadableLogs, context(42));
+    await tick();
+    assert.deepEqual(inbox.notifications, Array.from({ length: 4 }, () => notification(PUMP_PROGRAM_ID)));
+    assert.equal(logReads, 0);
+    assert.equal(subscriber.state, 'RUNNING');
+    await subscriber.close();
+  }
+});
+
+void test('rejects invalid or hostile direct-subscriber admission options before subscriptions', () => {
+  let reads = 0;
+  const hostile = Object.defineProperty({}, 'workerAdmissionEnabled', {
+    enumerable: true, get() { reads += 1; return true; },
+  });
+  const proxy = new Proxy({}, { getOwnPropertyDescriptor() { reads += 1; return undefined; } });
+  for (const options of [
+    ...['true', 'false', 1, 0, null, {}, new Boolean(true)].map((workerAdmissionEnabled) => ({ workerAdmissionEnabled })),
+    hostile, proxy, Object.defineProperty({}, 'workerAdmissionEnabled', { value: true }),
+  ]) {
+    const connection = new FakeConnection();
+    assert.throws(() => new SolanaProgramSubscriber(connection, new FakeInbox(), options as ProgramSubscriberOptions),
+      { name: 'TypeError', message: 'Program subscriber options are invalid.' });
+    assert.equal(connection.subscriptions.length, 0);
+  }
+  assert.equal(reads, 0);
+});
+
+void test('ON classifies canonical Pump.fun create and trade logs into immutable hints', async () => {
   const connection = new FakeConnection();
   const inbox = new FakeInbox();
-  const subscriber = makeSubscriber(connection, inbox);
+  const subscriber = makeSubscriber(connection, inbox, true);
   await subscriber.start();
 
   connection.emit(PUMP_PROGRAM_ID, logs(signature, null, [createLine()]), context(42));
@@ -75,7 +120,7 @@ void test('classifies canonical Pump.fun create and trade logs into immutable hi
   assert.ok(inbox.notifications.every((value) => Object.isFrozen(value.programIds)));
 });
 
-void test('does not let a canonical create override genuinely ambiguous evidence', async () => {
+void test('ON does not let a canonical create override genuinely ambiguous evidence', async () => {
   const cases: readonly [string, readonly string[]][] = [
     ['PumpSwap veto', [
       createLine(), tradeLine(firstTradeMint), `Program ${PUMPSWAP_PROGRAM_ID} invoke [1]`,
@@ -98,7 +143,7 @@ void test('does not let a canonical create override genuinely ambiguous evidence
   for (const [condition, logMessages] of cases) {
     const connection = new FakeConnection();
     const inbox = new FakeInbox();
-    const subscriber = makeSubscriber(connection, inbox);
+    const subscriber = makeSubscriber(connection, inbox, true);
     await subscriber.start();
     connection.emit(PUMP_PROGRAM_ID, logs(signature, null, logMessages), context(42));
     await tick();
@@ -109,7 +154,7 @@ void test('does not let a canonical create override genuinely ambiguous evidence
   }
 });
 
-void test('keeps PumpSwap, vetoed, truncated, conflicting, and malformed logs unhinted', async () => {
+void test('ON keeps PumpSwap, vetoed, truncated, conflicting, and malformed logs unhinted', async () => {
   const cases: readonly [string, unknown][] = [
     [PUMPSWAP_PROGRAM_ID, logs(signature, null, [tradeLine(firstTradeMint)])],
     [PUMP_PROGRAM_ID, logs(signature, null, [
@@ -128,7 +173,7 @@ void test('keeps PumpSwap, vetoed, truncated, conflicting, and malformed logs un
   for (const [programId, value] of cases) {
     const connection = new FakeConnection();
     const inbox = new FakeInbox();
-    const subscriber = makeSubscriber(connection, inbox);
+    const subscriber = makeSubscriber(connection, inbox, true);
     await subscriber.start();
     connection.emit(programId, value, context(42));
     await tick();
@@ -417,8 +462,13 @@ class FakeInbox {
   }
 }
 
-function makeSubscriber(connection: FakeConnection, inbox: FakeInbox): SolanaProgramSubscriber {
-  return new SolanaProgramSubscriber(connection, inbox, { now: () => 1_720_000_000_000 });
+function makeSubscriber(
+  connection: FakeConnection, inbox: FakeInbox, workerAdmissionEnabled?: boolean,
+): SolanaProgramSubscriber {
+  return new SolanaProgramSubscriber(connection, inbox, {
+    now: () => 1_720_000_000_000,
+    ...(workerAdmissionEnabled === undefined ? {} : { workerAdmissionEnabled }),
+  });
 }
 
 function logs(value: string, err: unknown = null, logMessages: unknown = ['untrusted']): unknown {

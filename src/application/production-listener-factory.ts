@@ -392,7 +392,10 @@ export function createProductionListenerRuntime(
         endpoint,
         observe,
         signal,
-        { programs: ingestionPrograms },
+        {
+          programs: ingestionPrograms,
+          workerAdmissionEnabled: workerAdmissionPolicy.enabled,
+        },
       ),
       runStrictScan: (providerId, signal): ReturnType<StrictCatchUpCoordinator['run']> => {
         const coordinator = strictCoordinators.get(providerId);

@@ -9,7 +9,10 @@ durable Pump.fun admission/classification boundary without activating it in any
 environment.
 
 **Architecture:** A frozen V1 policy is parsed once and injected into the inbox
-repository. The disabled branch preserves legacy SQL. The enabled branch uses
+repository and its enabled boolean is threaded into production ingress. The
+disabled branch preserves legacy SQL and ingress OFF-equivalence: production
+legacy CREATE precedence and direct subscriber null hints. ON-only strict parity
+uses a shared named `strict-admission` mode. The enabled branch uses
 shared WebSocket hints, current tracked-mint authority, durable catch-up
 classification and an admission-gated claim predicate. No new migration or
 runtime worker is added.
@@ -17,7 +20,7 @@ runtime worker is added.
 **Tech stack:** TypeScript strict ESM, Node.js `node:test`, PostgreSQL 16,
 Solana WebSocket logs, existing migration 053 and Docker deployment contracts.
 
-**Plan revision:** 1.0.0
+**Plan revision:** 1.0.1
 
 ---
 
@@ -40,19 +43,25 @@ Solana WebSocket logs, existing migration 053 and Docker deployment contracts.
 - [ ] Run the two targeted suites, backend check and lint.
 - [ ] Commit as `feat(capacity): activate worker admission policy`.
 
-### Task 2: Unify WebSocket Pump.fun hints
+### Task 2: Preserve OFF-equivalence and provide ON-only strict parity
 
 **Files:**
 
 - Modify: `src/solana/rpc/program-subscriber.ts`
 - Modify: `tests/program-subscriber.test.ts`
-- Verify: `src/solana/rpc/ws-program-session.ts`
-- Verify: `src/launchpads/pumpfun/websocket-create-hint.ts`
+- Modify: `src/solana/rpc/ws-program-session.ts`
+- Modify: `src/launchpads/pumpfun/websocket-create-hint.ts`
+- Modify: `tests/ws-program-session.test.ts`
+- Modify: `tests/pumpfun-websocket-create-hint.test.ts`
 - Modify tests only where parity evidence is missing.
 
-- [ ] Add RED tests for canonical CREATE, canonical TRADE mint, PumpSwap, veto,
-  truncation, conflicting mints and malformed logs through the direct
-  subscriber.
+- [ ] Add RED tests at helper, session, direct subscriber and factory boundaries
+  for omitted/false/true policy: preserve legacy CREATE precedence in production
+  OFF and direct subscriber null hints in OFF without inspecting logs.
+- [ ] Add RED tests for ON canonical CREATE (including same-mint trade), canonical
+  TRADE mint, PumpSwap, veto, truncation, conflicting mints and malformed logs.
+- [ ] Use explicit `legacy` (default) and `strict-admission` helper modes;
+  fail closed on malformed admission options without accessors or proxy traps.
 - [ ] Reuse `pumpFunWebSocketHintFromLogs` and the existing veto program set;
   do not create a second parser or copy discriminators.
 - [ ] Prove immutable notification snapshots and unchanged lifecycle/error
@@ -103,9 +112,12 @@ Solana WebSocket logs, existing migration 053 and Docker deployment contracts.
 
 - [ ] Add RED architecture tests proving one policy is passed to one inbox and
   no worker/RPC/cache/executor composition changes.
-- [ ] Wire the validated policy; do not add a timer, scanner or background job.
+- [ ] Wire `workerAdmissionPolicy.enabled` explicitly into production session
+  dependencies and retain the direct subscriber's default-false option;
+  do not add a timer, scanner or background job.
 - [ ] Document restart-only behavior, classifier dependency, false defaults,
-  OFF/ON semantics, four-hour retention and the explicit ban on canary
+  ingress OFF-equivalence and ON-only strict parity, OFF/ON semantics,
+  four-hour retention and the explicit ban on canary
   activation before #177.
 - [ ] Run deployment tests, smoke contracts, docs, check and lint.
 - [ ] Commit as `docs(capacity): document bounded admission classification`.

@@ -360,6 +360,8 @@ void test('deployment keeps executable bounded admission disabled until the foll
     assert.match(document, /#176/u);
     assert.match(document, /restart-only/iu);
     assert.match(document, /OFF[^.]{0,240}sélection[^.]{0,80}ordre[^.]{0,80}équité[^.]{0,80}SQL legacy de lease[^.]{0,80}inchangés/iu);
+    assert.match(document, /OFF[^.]{0,200}CREATE[^.]{0,140}ambigu[^.]{0,200}SolanaProgramSubscriber[^.]{0,120}null/iu);
+    assert.match(document, /ON uniquement[^.]{0,200}strict-admission[^.]{0,120}deux chemins/iu);
     assert.match(document, /ON → OFF[^.]{0,240}PENDING[^.]{0,80}null[^.]{0,240}worker_admitted_at[^.]{0,80}monotone/iu);
     assert.match(document, /seule ligne sélectionnée et verrouillée[^.]{0,100}avant[^.]{0,80}lease/iu);
     assert.match(document, /sans backfill global[^.]{0,120}blocage/iu);
@@ -384,6 +386,22 @@ void test('deployment keeps executable bounded admission disabled until the foll
   assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
   assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
   assert.doesNotMatch(overview, /45-second policy[^.]{0,120}(?:active|enabled)/iu);
+});
+
+void test('versioned admission design and plan restrict strict ingress parity to ON', async () => {
+  const [spec, plan] = await Promise.all([
+    readArtifact('docs/superpowers/specs/2026-09-26-pumpfun-worker-admission-classification-design.md'),
+    readArtifact('docs/superpowers/plans/2026-09-26-pumpfun-worker-admission-classification.md'),
+  ]);
+  assert.match(spec, /Contract revision: 1\.0\.1/u);
+  assert.match(plan, /Plan revision:\*\* 1\.0\.1/u);
+  for (const document of [spec, plan]) {
+    assert.match(document, /OFF-equivalence/u);
+    assert.match(document, /ON-only strict parity/u);
+    assert.match(document, /legacy CREATE precedence/u);
+    assert.match(document, /direct subscriber[^.]{0,120}null hints/iu);
+    assert.match(document, /workerAdmissionPolicy\.enabled/u);
+  }
 });
 
 void test('Compose resolves catch-up scan limit defaults and overrides only for app', (context) => {

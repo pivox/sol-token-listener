@@ -26,6 +26,12 @@ Cette dépendance technique n'autorise aucune activation opérationnelle.
 
 En mode OFF (flag absent ou false), la sélection des candidats, l'ordre,
 les ratios d'équité et le SQL legacy de lease restent inchangés.
+À l'entrée WebSocket OFF, la priorité legacy de CREATE sur les logs ambigus
+reste inchangée et le chemin direct `SolanaProgramSubscriber` conserve ses hints
+`null`, sans analyser les logs.
+En mode ON uniquement, le mode partagé `strict-admission` assure la parité des
+deux chemins : CREATE canonique (même avec trade du même mint), TRADE fiable
+avec mint, aucun hint pour une preuve tronquée, vetoée, malformée ou conflictuelle.
 En mode ON, chaque sélection de claim
 exige `worker_admitted_at IS NOT NULL`, sans changer les ratios urgents 32:1 et
 création/trade suivi 3:1 ni l'ordre des retries.

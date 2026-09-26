@@ -6,7 +6,7 @@ Issue: #176 (part B of #171)
 
 Status: approved for implementation
 
-Contract revision: 1.0.0
+Contract revision: 1.0.1
 
 ## Purpose
 
@@ -24,7 +24,9 @@ alone is prohibited.
 
 Keep the legacy path and the bounded path explicit:
 
-- flag absent or false uses the existing SQL and behavior;
+- flag absent or false preserves OFF-equivalence: existing SQL and ingress
+  behavior, including production legacy CREATE precedence and direct subscriber
+  null hints;
 - flag true classifies WebSocket evidence before admitting it, admits only
   canonical launches and trades already covered by the current tracked-mint
   authority, and makes claims conditional on durable admission;
@@ -74,9 +76,17 @@ tests and non-production consumers preserve legacy behavior.
 
 ## WebSocket classification
 
-Both WebSocket ingress implementations must produce the same immutable hints:
+OFF-equivalence is an ingress contract, not only a repository contract. With
+the policy omitted or false, `openWsProgramSession` retains legacy CREATE
+precedence: a canonical CREATE can win over ambiguous, truncated, vetoed,
+malformed or conflicting evidence, exactly as before #176. The direct subscriber
+continues emitting null hints and does not inspect logs for classification.
 
-- Pump.fun logs containing one unambiguous canonical create instruction:
+ON-only strict parity requires both WebSocket ingress implementations to
+produce the same immutable hints only when worker admission is enabled:
+
+- Pump.fun logs containing an unambiguous canonical create event, including
+  ordinary same-mint trade evidence:
   `PUMPFUN_CREATE`, no mint hint;
 - Pump.fun logs containing one unambiguous canonical trade event:
   `PUMPFUN_TRADE` and its canonical mint;
@@ -84,9 +94,14 @@ Both WebSocket ingress implementations must produce the same immutable hints:
   no trusted hint;
 - PumpSwap notifications: no Pump.fun hint.
 
-`openWsProgramSession` already uses `pumpFunWebSocketHintFromLogs`. The direct
-`SolanaProgramSubscriber` path must reach parity by using the same helper and
-the same veto program IDs rather than implementing another decoder.
+`pumpFunWebSocketHintFromLogs` has named `legacy` (default) and
+`strict-admission` modes. The production factory explicitly passes
+`workerAdmissionPolicy.enabled` into `openWsProgramSession` dependencies;
+`SolanaProgramSubscriber` has an explicit default-false `workerAdmissionEnabled`
+option. ON selects the same helper's strict mode and the same veto program IDs
+in both paths rather than implementing another decoder. Invalid option values
+are rejected before opening a socket or subscribing, without running accessors
+or proxy traps; an unknown helper mode produces no hint.
 
 Hints are preparation evidence, not a substitute for catch-up classification.
 Contradictory reliable evidence must fail closed instead of silently replacing
@@ -155,10 +170,13 @@ path because enabled mode requires `launchpad-only` ingestion.
 
 Tests must prove:
 
-- disabled domain/config/repository behavior is unchanged;
+- disabled domain/config/repository behavior and ingress OFF-equivalence are
+  unchanged for both omitted and explicit-false policy;
 - enabled config requires the strict catch-up classifier and all its existing
   safe dependencies;
-- direct and production WebSocket paths agree on CREATE, TRADE and ambiguity;
+- ON-only strict parity: direct and production WebSocket paths agree on CREATE,
+  TRADE and ambiguity, with legacy CREATE precedence retained only in production
+  OFF mode and direct subscriber null hints retained in OFF mode;
 - enabled admission implements every row in the table above;
 - ambiguous rows survive replay/restart but never become claimable early;
 - the three claim branches filter admission without changing fairness/order;

@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import { PublicKey, type LogsCallback } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { TransactionNotification } from '../../domain/transaction-ingestion.js';
@@ -38,6 +39,7 @@ export type ProgramSubscriberRepository = Pick<TransactionInboxRepository, 'enqu
 
 export interface ProgramSubscriberOptions {
   readonly now?: () => number;
+  readonly workerAdmissionEnabled?: boolean;
 }
 
 export class ProgramSubscriberError extends Error {
@@ -56,6 +58,7 @@ const PUMPFUN_HINT_VETO_PROGRAM_IDS = Object.freeze([PUMPSWAP_PROGRAM_ID]);
 
 export class SolanaProgramSubscriber {
   private readonly now: () => number;
+  private readonly workerAdmissionEnabled: boolean;
   private readonly listenerIds: number[] = [];
   private readonly inFlight = new Set<Promise<void>>();
   private startPromise: Promise<void> | null = null;
@@ -70,6 +73,7 @@ export class SolanaProgramSubscriber {
     private readonly repository: ProgramSubscriberRepository,
     options: ProgramSubscriberOptions = {},
   ) {
+    this.workerAdmissionEnabled = admissionOption(options);
     const now = clockOption(options);
     this.now = now ?? Date.now;
   }
@@ -164,7 +168,9 @@ export class SolanaProgramSubscriber {
     if (!this.accepting) return;
     let notification: TransactionNotification | null;
     try {
-      notification = snapshotNotification(programId, value, context, this.readNow());
+      notification = snapshotNotification(
+        programId, value, context, this.readNow(), this.workerAdmissionEnabled,
+      );
     } catch {
       this.report('notification');
       return;
@@ -220,6 +226,7 @@ function snapshotNotification(
   value: unknown,
   context: unknown,
   observedAtMs: number,
+  workerAdmissionEnabled: boolean,
 ): TransactionNotification | null {
   const record = objectRecord(value);
   const signature = dataProperty(record, 'signature');
@@ -234,10 +241,11 @@ function snapshotNotification(
     throw new ProgramSubscriberError('notification');
   }
   if (failure !== null) return null;
-  const hintResult = programId === PUMP_PROGRAM_ID
+  const hintResult = workerAdmissionEnabled && programId === PUMP_PROGRAM_ID
     ? pumpFunWebSocketHintFromLogs(
       optionalDataProperty(record, 'logs'),
       PUMPFUN_HINT_VETO_PROGRAM_IDS,
+      'strict-admission',
     )
     : null;
   const ingestionHint = hintResult?.hint === 'PUMPFUN_CREATE'
@@ -308,6 +316,21 @@ async function removeListeners(
     await connection.removeOnLogsListener(id);
   }));
   return Object.freeze(ids.filter((_, index) => results[index]?.status === 'rejected'));
+}
+
+function admissionOption(options: unknown): boolean {
+  if (isProxy(options) || typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw new TypeError('Program subscriber options are invalid.');
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(options, 'workerAdmissionEnabled');
+  if (descriptor === undefined) return false;
+  if (!('value' in descriptor) || descriptor.enumerable !== true) {
+    throw new TypeError('Program subscriber options are invalid.');
+  }
+  const value: unknown = descriptor.value;
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw new TypeError('Program subscriber options are invalid.');
+  return value;
 }
 
 function clockOption(options: ProgramSubscriberOptions): (() => number) | undefined {

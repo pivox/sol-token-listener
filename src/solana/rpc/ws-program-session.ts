@@ -1,6 +1,7 @@
 import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
 import {
   pumpFunWebSocketHintFromLogs,
+  type PumpFunWebSocketClassificationMode,
   type PumpFunWebSocketHint,
 } from '../../launchpads/pumpfun/websocket-create-hint.js';
 import { PUMPSWAP_PROGRAM_ID } from '../../markets/pumpswap/constants.js';
@@ -92,6 +93,7 @@ export interface WsProgramSessionDependencies {
   readonly createWebSocket?: WsProgramSessionWebSocketFactory;
   readonly scheduler?: WsProgramSessionScheduler;
   readonly programs?: readonly ListenerIngestionProgram[];
+  readonly workerAdmissionEnabled?: boolean;
 }
 
 interface ProgramDefinition {
@@ -130,7 +132,9 @@ export function openWsProgramSession(
   dependencies: WsProgramSessionDependencies = {},
 ): Promise<WsProgramSession> {
   let programs: readonly ProgramDefinition[];
+  let classificationMode: PumpFunWebSocketClassificationMode;
   try {
+    classificationMode = admissionOption(dependencies) ? 'strict-admission' : 'legacy';
     programs = snapshotPrograms(dependencies.programs ?? DEFAULT_PROGRAMS);
   } catch {
     return Promise.reject(new WsProgramSessionError('PROTOCOL_INVALID'));
@@ -447,7 +451,9 @@ export function openWsProgramSession(
         return;
       }
       const hintResult = program === 'pumpfun'
-        ? pumpFunWebSocketHintFromLogs(ownData(value, 'logs'), PUMPFUN_HINT_VETO_PROGRAM_IDS)
+        ? pumpFunWebSocketHintFromLogs(
+          ownData(value, 'logs'), PUMPFUN_HINT_VETO_PROGRAM_IDS, classificationMode,
+        )
         : null;
       const hint = hintResult?.hint ?? 'NONE';
       const hintMint = hintResult?.hintMint ?? null;
@@ -509,6 +515,22 @@ export function openWsProgramSession(
     );
     if (signal.aborted) onAbort();
   });
+}
+
+function admissionOption(dependencies: unknown): boolean {
+  if (isProxy(dependencies) || typeof dependencies !== 'object'
+    || dependencies === null || Array.isArray(dependencies)) {
+    throw new WsProgramSessionError('PROTOCOL_INVALID');
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(dependencies, 'workerAdmissionEnabled');
+  if (descriptor === undefined) return false;
+  if (!('value' in descriptor) || descriptor.enumerable !== true) {
+    throw new WsProgramSessionError('PROTOCOL_INVALID');
+  }
+  const value: unknown = descriptor.value;
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw new WsProgramSessionError('PROTOCOL_INVALID');
+  return value;
 }
 
 function snapshotPrograms(value: unknown): readonly ProgramDefinition[] {
