@@ -24,10 +24,19 @@ La validation ON exige le classifier strict de catch-up avec
 et `SOLANA_EXPECTED_GENESIS_HASH` égal au hash canonique du cluster.
 Cette dépendance technique n'autorise aucune activation opérationnelle.
 
-En mode OFF (flag absent ou false), le chemin legacy et le claim restent inchangés,
-y compris l'ordre et les ratios d'équité. En mode ON, chaque sélection de claim
+En mode OFF (flag absent ou false), la sélection des candidats, l'ordre,
+les ratios d'équité et le SQL legacy de lease restent inchangés.
+En mode ON, chaque sélection de claim
 exige `worker_admitted_at IS NOT NULL`, sans changer les ratios urgents 32:1 et
 création/trade suivi 3:1 ni l'ordre des retries.
+
+Le retour ON → OFF avec le nouveau binaire prend en charge une ligne persistée
+en mode ON comme `PENDING` non admise (`worker_admitted_at=null`) : OFF renseigne
+`worker_admitted_at` de manière monotone pour la seule ligne sélectionnée et verrouillée,
+avant de lui attribuer un lease, sans backfill global, afin d'éviter le blocage
+du rollback par la barrière d'admission. Ce pont opérationnel est distinct du
+rollback vers un ancien binaire sur le schéma 053, qui reste non supporté ;
+il ne constitue aucune autorisation d'activation.
 
 | Preuve en mode ON | État durable | Priorité | Admission worker |
 | --- | --- | --- | --- |

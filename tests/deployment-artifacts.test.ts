@@ -359,7 +359,11 @@ void test('deployment keeps executable bounded admission disabled until the foll
   for (const document of [readme, overview]) {
     assert.match(document, /#176/u);
     assert.match(document, /restart-only/iu);
-    assert.match(document, /OFF[^.]{0,240}legacy[^.]{0,240}claim[^.]{0,240}(?:unchanged|inchangé)/iu);
+    assert.match(document, /OFF[^.]{0,240}sélection[^.]{0,80}ordre[^.]{0,80}équité[^.]{0,80}SQL legacy de lease[^.]{0,80}inchangés/iu);
+    assert.match(document, /ON → OFF[^.]{0,240}PENDING[^.]{0,80}null[^.]{0,240}worker_admitted_at[^.]{0,80}monotone/iu);
+    assert.match(document, /seule ligne sélectionnée et verrouillée[^.]{0,100}avant[^.]{0,80}lease/iu);
+    assert.match(document, /sans backfill global[^.]{0,120}blocage/iu);
+    assert.match(document, /distinct[^.]{0,120}rollback[^.]{0,80}ancien binaire/iu);
     assert.match(document, /ON[^.]{0,240}worker_admitted_at IS NOT NULL/u);
     assert.match(document, /terminal_at[^.]{0,100}(?:4 hours|quatre heures)/iu);
     assert.match(document, /until #177 is merged AND post-merge CI is green/u);
