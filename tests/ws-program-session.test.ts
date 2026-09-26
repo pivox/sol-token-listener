@@ -201,7 +201,7 @@ void test('keeps the create hint when a Pump.fun notification contains both trad
   await closing;
 });
 
-void test('supplies the PumpSwap runtime veto to Pump.fun hints without losing creation priority', async () => {
+void test('supplies the PumpSwap runtime veto even when Pump.fun logs contain a create event', async () => {
   const socket = new FakeWebSocket();
   const frames: unknown[] = [];
   const session = await acknowledge(openWsProgramSession(
@@ -218,7 +218,7 @@ void test('supplies the PumpSwap runtime veto to Pump.fun hints without losing c
   await new Promise<void>((resolve) => { setImmediate(resolve); });
   assert.deepEqual(frames, [
     { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 43n, hint: 'NONE', hintMint: null },
-    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 44n, hint: 'PUMPFUN_CREATE', hintMint: null },
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 44n, hint: 'NONE', hintMint: null },
   ]);
   const closing = session.close(new AbortController().signal);
   socket.message({ jsonrpc: '2.0', id: 3, result: true });

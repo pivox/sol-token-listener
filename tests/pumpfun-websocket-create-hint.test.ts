@@ -58,7 +58,7 @@ void test('keeps composed real Pump.fun and PumpSwap trades on the normal path',
   }
   assert.deepEqual(pumpFunWebSocketHintFromLogs(lines, [PUMPSWAP_PROGRAM_ID]), { hint: 'NONE', hintMint: null });
   assert.deepEqual(pumpFunWebSocketHintFromLogs([...lines, createLine], [PUMPSWAP_PROGRAM_ID]),
-    { hint: 'PUMPFUN_CREATE', hintMint: null });
+    { hint: 'NONE', hintMint: null });
 });
 
 void test('only an exact PumpSwap runtime invocation vetoes a trade hint', () => {
@@ -130,19 +130,31 @@ void test('fails safe on every truncated CreateEvent discriminator prefix after 
     );
     assert.deepEqual(
       pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), truncated, createLine]),
-      { hint: 'PUMPFUN_CREATE', hintMint: null },
+      { hint: 'NONE', hintMint: null },
     );
   }
 });
 
-void test('gives CreateEvent precedence even after ambiguous TradeEvents', () => {
-  assert.deepEqual(
-    pumpFunWebSocketHintFromLogs([
-      tradeLine(firstTradeMint), 'Program data: not-base64',
-      programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []), createLine,
-    ]),
-    { hint: 'PUMPFUN_CREATE', hintMint: null },
-  );
+void test('does not let CreateEvent override malformed or truncated TradeEvent data', () => {
+  for (const ambiguous of [
+    'Program data: not-base64',
+    programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []),
+    programDataLine(
+      PUMP_EVENTS.TradeEvent.discriminator,
+      firstTradeMint.toBytes().subarray(0, 31),
+    ),
+  ]) {
+    assert.deepEqual(
+      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), ambiguous, createLine]),
+      { hint: 'NONE', hintMint: null },
+    );
+  }
+});
+
+void test('keeps CreateEvent precedence over ordinary same-mint TradeEvents', () => {
+  assert.deepEqual(pumpFunWebSocketHintFromLogs([
+    tradeLine(firstTradeMint), createLine, tradeLine(firstTradeMint),
+  ]), { hint: 'PUMPFUN_CREATE', hintMint: null });
 });
 
 void test('keeps a trade hint when repeated TradeEvents use the same mint', () => {
@@ -157,6 +169,12 @@ void test('fails safe when valid TradeEvents use distinct mints', () => {
     pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), tradeLine(secondTradeMint)]),
     { hint: 'NONE', hintMint: null },
   );
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([
+      tradeLine(firstTradeMint), createLine, tradeLine(secondTradeMint),
+    ]),
+    { hint: 'NONE', hintMint: null },
+  );
 });
 
 void test('requires canonical bounded base64 rather than a textual discriminator prefix', () => {
@@ -169,14 +187,14 @@ void test('requires canonical bounded base64 rather than a textual discriminator
   ]), 'NONE');
 });
 
-void test('treats the exact runtime truncation marker as ambiguous unless a full CreateEvent exists', () => {
+void test('treats the exact runtime truncation marker as ambiguous even with CreateEvent', () => {
   assert.deepEqual(
     pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), 'Log truncated']),
     { hint: 'NONE', hintMint: null },
   );
   assert.deepEqual(
     pumpFunWebSocketHintFromLogs(['Log truncated', tradeLine(firstTradeMint), createLine]),
-    { hint: 'PUMPFUN_CREATE', hintMint: null },
+    { hint: 'NONE', hintMint: null },
   );
 });
 

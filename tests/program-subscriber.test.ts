@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import type { Connection, Context, Logs, PublicKey } from '@solana/web3.js';
+import { PublicKey, type Connection, type Context, type Logs } from '@solana/web3.js';
 import type { TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { PUMP_EVENTS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import {
   ProgramSubscriberError,
@@ -13,6 +14,8 @@ import {
 } from '../src/solana/rpc/program-subscriber.js';
 
 const signature = '1'.repeat(64);
+const firstTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+const secondTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 2));
 const web3ConnectionSatisfiesPort: Connection extends ProgramLogsConnection ? true : false = true;
 
 void test('subscribes exactly once to both official programs at processed commitment', async () => {
@@ -48,6 +51,92 @@ void test('enqueues a shared signature twice with distinct frozen program proven
   ]);
   assert.ok(inbox.notifications.every((value) => Object.isFrozen(value)));
   assert.ok(inbox.notifications.every((value) => Object.isFrozen(value.programIds)));
+});
+
+void test('classifies canonical Pump.fun create and trade logs into immutable hints', async () => {
+  const connection = new FakeConnection();
+  const inbox = new FakeInbox();
+  const subscriber = makeSubscriber(connection, inbox);
+  await subscriber.start();
+
+  connection.emit(PUMP_PROGRAM_ID, logs(signature, null, [createLine()]), context(42));
+  connection.emit(PUMP_PROGRAM_ID, logs(signature, null, [tradeLine(firstTradeMint)]), context(42));
+  connection.emit(PUMP_PROGRAM_ID, logs(signature, null, [
+    tradeLine(firstTradeMint), createLine(), tradeLine(firstTradeMint),
+  ]), context(42));
+  await tick();
+
+  assert.deepEqual(inbox.notifications, [
+    notification(PUMP_PROGRAM_ID, 'PUMPFUN_CREATE'),
+    notification(PUMP_PROGRAM_ID, 'PUMPFUN_TRADE', firstTradeMint.toBase58()),
+    notification(PUMP_PROGRAM_ID, 'PUMPFUN_CREATE'),
+  ]);
+  assert.ok(inbox.notifications.every((value) => Object.isFrozen(value)));
+  assert.ok(inbox.notifications.every((value) => Object.isFrozen(value.programIds)));
+});
+
+void test('does not let a canonical create override genuinely ambiguous evidence', async () => {
+  const cases: readonly [string, readonly string[]][] = [
+    ['PumpSwap veto', [
+      createLine(), tradeLine(firstTradeMint), `Program ${PUMPSWAP_PROGRAM_ID} invoke [1]`,
+    ]],
+    ['runtime truncation', [createLine(), tradeLine(firstTradeMint), 'Log truncated']],
+    ['malformed Program data', [
+      createLine(), tradeLine(firstTradeMint), 'Program data: not-base64',
+    ]],
+    ['truncated Program data', [
+      createLine(), tradeLine(firstTradeMint), programDataLine(
+        PUMP_EVENTS.TradeEvent.discriminator,
+        firstTradeMint.toBytes().subarray(0, 31),
+      ),
+    ]],
+    ['conflicting TradeEvent mints', [
+      createLine(), tradeLine(firstTradeMint), tradeLine(secondTradeMint),
+    ]],
+  ];
+
+  for (const [condition, logMessages] of cases) {
+    const connection = new FakeConnection();
+    const inbox = new FakeInbox();
+    const subscriber = makeSubscriber(connection, inbox);
+    await subscriber.start();
+    connection.emit(PUMP_PROGRAM_ID, logs(signature, null, logMessages), context(42));
+    await tick();
+    assert.deepEqual(inbox.notifications, [notification(PUMP_PROGRAM_ID)], condition);
+    assert.equal(subscriber.state, 'RUNNING');
+    assert.equal(subscriber.lastError, null);
+    await subscriber.close();
+  }
+});
+
+void test('keeps PumpSwap, vetoed, truncated, conflicting, and malformed logs unhinted', async () => {
+  const cases: readonly [string, unknown][] = [
+    [PUMPSWAP_PROGRAM_ID, logs(signature, null, [tradeLine(firstTradeMint)])],
+    [PUMP_PROGRAM_ID, logs(signature, null, [
+      tradeLine(firstTradeMint), `Program ${PUMPSWAP_PROGRAM_ID} invoke [1]`,
+    ])],
+    [PUMP_PROGRAM_ID, logs(signature, null, [tradeLine(firstTradeMint), 'Log truncated'])],
+    [PUMP_PROGRAM_ID, logs(signature, null, [
+      tradeLine(firstTradeMint), tradeLine(secondTradeMint),
+    ])],
+    [PUMP_PROGRAM_ID, logs(signature, null, [
+      tradeLine(firstTradeMint), 'Program data: not-base64',
+    ])],
+    [PUMP_PROGRAM_ID, logs(signature, null, null)],
+  ];
+
+  for (const [programId, value] of cases) {
+    const connection = new FakeConnection();
+    const inbox = new FakeInbox();
+    const subscriber = makeSubscriber(connection, inbox);
+    await subscriber.start();
+    connection.emit(programId, value, context(42));
+    await tick();
+    assert.deepEqual(inbox.notifications, [notification(programId)]);
+    assert.equal(subscriber.state, 'RUNNING');
+    assert.equal(subscriber.lastError, null);
+    await subscriber.close();
+  }
 });
 
 void test('deliberately ignores failed log notifications', async () => {
@@ -332,25 +421,46 @@ function makeSubscriber(connection: FakeConnection, inbox: FakeInbox): SolanaPro
   return new SolanaProgramSubscriber(connection, inbox, { now: () => 1_720_000_000_000 });
 }
 
-function logs(value: string, err: unknown = null): unknown {
-  return { signature: value, err, logs: ['untrusted'] };
+function logs(value: string, err: unknown = null, logMessages: unknown = ['untrusted']): unknown {
+  return { signature: value, err, logs: logMessages };
 }
 
 function context(slot: number): unknown {
   return { slot };
 }
 
-function notification(programId: string): TransactionNotification {
+function notification(
+  programId: string,
+  ingestionHint: TransactionNotification['ingestionHint'] = null,
+  ingestionHintMint: string | null = null,
+): TransactionNotification {
   return Object.freeze({
     signature,
     slot: 42n,
     source: 'WEBSOCKET',
-    ingestionHint: null,
-    ingestionHintMint: null,
+    ingestionHint,
+    ingestionHintMint,
     programIds: Object.freeze([programId]),
     confirmationStatus: 'processed',
     observedAtMs: 1_720_000_000_000,
   });
+}
+
+function createLine(): string {
+  return programDataLine(PUMP_EVENTS.CreateEvent.discriminator, [0, 1, 2, 3]);
+}
+
+function tradeLine(mint: PublicKey): string {
+  return programDataLine(PUMP_EVENTS.TradeEvent.discriminator, mint.toBytes());
+}
+
+function programDataLine(
+  discriminator: readonly number[],
+  payload: readonly number[] | Uint8Array,
+): string {
+  return `Program data: ${Buffer.concat([
+    Buffer.from(discriminator), Buffer.from(payload),
+  ]).toString('base64')}`;
 }
 
 function assertStableError(

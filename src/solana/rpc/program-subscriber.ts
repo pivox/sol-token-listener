@@ -2,6 +2,7 @@ import { PublicKey, type LogsCallback } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { TransactionNotification } from '../../domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
+import { pumpFunWebSocketHintFromLogs } from '../../launchpads/pumpfun/websocket-create-hint.js';
 import { PUMPSWAP_PROGRAM_ID } from '../../markets/pumpswap/constants.js';
 import type { TransactionInboxRepository } from '../../ports/transaction-inbox-repository.js';
 
@@ -51,6 +52,7 @@ export class ProgramSubscriberError extends Error {
 }
 
 const PROGRAM_IDS = Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID] as const);
+const PUMPFUN_HINT_VETO_PROGRAM_IDS = Object.freeze([PUMPSWAP_PROGRAM_ID]);
 
 export class SolanaProgramSubscriber {
   private readonly now: () => number;
@@ -232,12 +234,22 @@ function snapshotNotification(
     throw new ProgramSubscriberError('notification');
   }
   if (failure !== null) return null;
+  const hintResult = programId === PUMP_PROGRAM_ID
+    ? pumpFunWebSocketHintFromLogs(
+      optionalDataProperty(record, 'logs'),
+      PUMPFUN_HINT_VETO_PROGRAM_IDS,
+    )
+    : null;
+  const ingestionHint = hintResult?.hint === 'PUMPFUN_CREATE'
+    || hintResult?.hint === 'PUMPFUN_TRADE'
+    ? hintResult.hint
+    : null;
   return Object.freeze({
     signature,
     slot: BigInt(slot),
     source: 'WEBSOCKET',
-    ingestionHint: null,
-    ingestionHintMint: null,
+    ingestionHint,
+    ingestionHintMint: ingestionHint === 'PUMPFUN_TRADE' ? hintResult?.hintMint ?? null : null,
     programIds: Object.freeze([programId]),
     confirmationStatus: PROGRAM_SUBSCRIBER_COMMITMENT,
     observedAtMs,
@@ -257,6 +269,13 @@ function dataProperty(value: object, key: string): unknown {
     throw new ProgramSubscriberError('notification');
   }
   return descriptor.value as unknown;
+}
+
+function optionalDataProperty(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && 'value' in descriptor && descriptor.enumerable === true
+    ? descriptor.value as unknown
+    : undefined;
 }
 
 function validSignature(value: unknown): value is string {

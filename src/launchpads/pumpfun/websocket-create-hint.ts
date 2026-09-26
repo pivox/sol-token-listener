@@ -88,7 +88,7 @@ export function pumpFunWebSocketHintFromLogs(
       }
     }
   }
-  if (hasCreateEvent) return CREATE_HINT;
+  if (hasCreateEvent && !hasAmbiguousEvent) return CREATE_HINT;
   return firstTradeMint === null || hasAmbiguousEvent
     ? NONE_HINT
     : Object.freeze({ hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint });
