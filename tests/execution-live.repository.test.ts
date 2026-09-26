@@ -2783,7 +2783,7 @@ async function exactBuyPersistenceFixture(
     generationId, payloadVersion: 1, walletPublicKey: exactBuyWalletPublicKey,
     cluster: 'mainnet-beta', genesisHash: exactBuyWalletPublicKey, generation: 1,
   });
-  const snapshotNowMs = Date.now();
+  const snapshotNowMs = await databaseNowMs(pool);
   const walletSnapshot = createExecutionWalletSnapshot({
     generationId, providerId: 'primary', stateRevision: 0n, slot: 123n,
     blockTimeMs: snapshotNowMs - 100, observedAtMs: snapshotNowMs - 50,
@@ -2798,7 +2798,7 @@ async function exactBuyPersistenceFixture(
     provenance: 'OPERATOR_REPORT',
   });
   const simulation = await seedSuccessfulSimulation(pool, exactBuyWalletPublicKey);
-  const nowMs = Date.now();
+  const nowMs = await databaseNowMs(pool);
   const qualification = qualificationWithCanarySnapshots(
     safetyQualification(nowMs, simulation, exactBuyWalletPublicKey),
     walletSnapshot,
@@ -2874,7 +2874,7 @@ async function exactBuyPersistenceFixture(
   }).compileToV0Message());
   const messageBytes = Object.freeze([...unsigned.message.serialize()]);
   const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
-  const quoteObservedAtMs = Date.now();
+  const quoteObservedAtMs = await databaseNowMs(pool);
   const material = Object.freeze({
     payloadVersion: 1 as const, walletPublicKey: exactBuyWalletPublicKey, providerId: 'primary',
     side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const, snapshotSlot: 125n,
@@ -2916,6 +2916,7 @@ async function exactBuyPersistenceFixture(
     Uint8Array.from(authorization.material.unsignedTransactionBytes),
   );
   signed.sign([exactBuyWallet]);
+  const signedAtMs = await databaseNowMs(pool);
   const artifact = createSignedTransactionArtifact({
     payloadVersion: 1, specificationVersion: 1, intentId: begun.claim.intent.id,
     attemptNumber: begun.attempt.attemptNumber, generationId,
@@ -2932,7 +2933,7 @@ async function exactBuyPersistenceFixture(
     blockhash: authorization.material.blockhash,
     lastValidBlockHeight: authorization.material.lastValidBlockHeight,
     signature: bs58.encode(signed.signatures[0] ?? new Uint8Array(64)),
-    signedTransactionBytes: signed.serialize(), signedAtMs: Date.now(),
+    signedTransactionBytes: signed.serialize(), signedAtMs,
   });
   const input = Object.freeze({
     payloadVersion: 1 as const, claim: begun.claim,
@@ -3168,7 +3169,11 @@ async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number
   const result = await pool.query<{ readonly now_ms: string }>(`SELECT
     trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
       AS now_ms`);
-  const nowMs = Number(result.rows[0]?.now_ms);
+  assert.equal(result.rows.length, 1);
+  const rawNowMs = result.rows[0]?.now_ms;
+  assert.ok(typeof rawNowMs === 'string');
+  assert.match(rawNowMs, /^(0|[1-9]\d*)$/u);
+  const nowMs = Number(rawNowMs);
   assert.ok(Number.isSafeInteger(nowMs));
   return nowMs;
 }
