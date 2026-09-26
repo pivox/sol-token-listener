@@ -1006,7 +1006,7 @@ async function createBuyFixture(
   }).compileToV0Message());
   const messageBytes = Object.freeze([...unsigned.message.serialize()]);
   const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
-  const quoteObservedAtMs = Date.now();
+  const quoteObservedAtMs = await databaseNowMs(pool);
   const messageHash = createHash('sha256').update(Uint8Array.from(messageBytes)).digest('hex');
   const unsignedSimulation = Object.freeze({
     outcome: 'SUCCESS' as const, snapshotFingerprint: '6'.repeat(64),

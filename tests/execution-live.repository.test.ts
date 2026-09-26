@@ -2874,7 +2874,7 @@ async function exactBuyPersistenceFixture(
   }).compileToV0Message());
   const messageBytes = Object.freeze([...unsigned.message.serialize()]);
   const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
-  const quoteObservedAtMs = Date.now();
+  const quoteObservedAtMs = await databaseNowMs(pool);
   const material = Object.freeze({
     payloadVersion: 1 as const, walletPublicKey: exactBuyWalletPublicKey, providerId: 'primary',
     side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const, snapshotSlot: 125n,

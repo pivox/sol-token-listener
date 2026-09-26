@@ -2,21 +2,21 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-// These positive fixtures must share PostgreSQL's clock with persistQualification.
+// Positive qualification and quote evidence must share PostgreSQL's guard clock.
 // A source contract catches host/DB skew deterministically, without timing sleeps.
 for (const fixture of [
   {
     file: 'execution-live.repository.test.ts',
     name: 'exactBuyPersistenceFixture',
-    clocks: ['snapshotNowMs', 'nowMs'],
+    clocks: ['snapshotNowMs', 'nowMs', 'quoteObservedAtMs'],
   },
   {
     file: 'execution-live-revocation.repository.test.ts',
     name: 'createBuyFixture',
-    clocks: ['nowMs'],
+    clocks: ['nowMs', 'quoteObservedAtMs'],
   },
 ]) {
-  void test(`${fixture.name} uses the database clock for positive qualification evidence`, async () => {
+  void test(`${fixture.name} uses the database clock for positive evidence`, async () => {
     const source = await readFile(new URL(fixture.file, import.meta.url), 'utf8');
     const start = source.indexOf(`async function ${fixture.name}(`);
     assert.notEqual(start, -1);
