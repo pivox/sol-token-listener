@@ -13,6 +13,7 @@ import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import { FinalityReconciler } from '../src/application/finality-reconciler.js';
 import { createCatchUpClassification } from '../src/domain/catch-up-classification.js';
+import { createPumpFunWorkerAdmissionPolicy } from '../src/domain/worker-admission.js';
 import type {
   IngestionFailure,
   FinalityCandidate,
@@ -56,6 +57,309 @@ import {
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
+
+const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
+
+void test('worker admission snapshots and validates the optional policy without changing retry compatibility', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const policy = { ...enabledAdmission };
+    const repository = new PostgresTransactionInboxRepository(pool, { maxAttempts: 2, baseDelayMs: 25 }, policy);
+    policy.enabled = false;
+    await repository.enqueue(notification('admission-policy-snapshot', 1n));
+    const stored = await row(pool, 'admission-policy-snapshot');
+    assert.equal(stored.worker_admitted_at, null);
+    assert.equal(stored.retry_max_attempts, 2);
+    assert.equal(stored.retry_base_delay_ms, 25);
+    assert.throws(() => new PostgresTransactionInboxRepository(pool, undefined,
+      { ...enabledAdmission, trackingWindowSeconds: 0 }), TypeError);
+  });
+});
+
+void test('omitted and explicit false worker admission execute identical legacy writes and claims', async (context) => {
+  const executions: string[][] = [];
+  for (const policy of [undefined, createPumpFunWorkerAdmissionPolicy({ enabled: false, trackingWindowSeconds: 45 })]) {
+    await withDatabase(context, async (pool) => {
+      const queries: string[] = [];
+      const repository = new PostgresTransactionInboxRepository({
+        query: (sql, values) => pool.query(sql, values === undefined ? undefined : [...values]),
+        connect: async () => {
+          const client = await pool.connect();
+          return {
+            release: () => { client.release(); },
+            query: (sql, values) => {
+              queries.push(sql);
+              return client.query(sql, values === undefined ? undefined : [...values]);
+            },
+          };
+        },
+      }, undefined, policy);
+      await repository.enqueue(notification('off-ambiguous', 1n));
+      await repository.enqueue(notification('off-ambiguous', 1n, 'WEBSOCKET', 'confirmed', 1_001));
+      assert.equal((await row(pool, 'off-ambiguous')).worker_admitted_at.getTime(), 1_000);
+      const receipt = await repository.recordCatchUpClassification(catchUpClassification('off-ambiguous'));
+      assert.equal(receipt.admission, 'NOT_ENQUEUED');
+      await repository.recordCatchUpClassification(catchUpClassification('off-ambiguous'));
+      await repository.recordCatchUpClassification(catchUpClassification('off-new'));
+      await repository.enqueue(tradeNotification('off-deferred', 1n));
+      assert.equal((await repository.recordCatchUpClassification(catchUpClassification('off-deferred'))).admission, 'ENQUEUED');
+      assert.ok(await repository.claim(2_000, 30));
+      executions.push(queries);
+    });
+  }
+  assert.deepEqual(executions[0], executions[1]);
+});
+
+void test('enabled admission preserves durable 32-to-1 and 3-to-1 fairness and slot-signature ordering', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const legacy = new PostgresTransactionInboxRepository(pool);
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    await legacy.enqueue(notification('admitted-normal', 0n));
+    await repository.enqueue(notification('unadmitted-normal', 0n));
+    await insertTrackedLaunch(pool);
+    for (let index = 0; index < 25; index += 1) {
+      await repository.enqueue(notification(`admitted-launch-${String(index).padStart(2, '0')}`,
+        BigInt(1_000 + Math.floor(index / 2)), 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE'));
+      if (index < 8) await repository.enqueue(tradeNotification(`admitted-tracked-${index}`, BigInt(index + 1)));
+    }
+    const restarted = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    for (let group = 0; group < 8; group += 1) {
+      for (let offset = 0; offset < 3; offset += 1) {
+        assert.equal((await repository.claim(Date.now(), 120))?.signature,
+          `admitted-launch-${String(group * 3 + offset).padStart(2, '0')}`);
+      }
+      assert.equal((await restarted.claim(Date.now(), 120))?.signature, `admitted-tracked-${group}`);
+    }
+    assert.equal((await restarted.claim(Date.now(), 120))?.signature, 'admitted-normal');
+    assert.equal((await repository.claim(Date.now(), 120))?.signature, 'admitted-launch-24');
+    assert.equal(await restarted.claim(Date.now(), 120), null);
+    assert.equal((await row(pool, 'unadmitted-normal')).attempts, 0);
+  });
+});
+
+void test('enabled admission preserves retry due-time ordering and expired lease reclamation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    for (const [signature, slot] of [['admission-retry-low', 1n], ['admission-retry-high', 2n]] as const) {
+      await repository.enqueue(notification(signature, slot, 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE'));
+    }
+    const first = await repository.claim(Date.now(), 30);
+    assert.equal(first?.signature, 'admission-retry-low');
+    await repository.markFailed(first.signature, first.leaseToken,
+      Object.freeze({ code: 'RPC_TRANSIENT', errorName: 'TransientFailure', retryable: true }));
+    const due = new Date((await row(pool, first.signature)).next_attempt_at).getTime();
+    assert.equal((await repository.claim(due - 1, 1))?.signature, 'admission-retry-high');
+    assert.equal((await repository.claim(due + 1, 30))?.signature, 'admission-retry-low');
+    assert.equal((await repository.claim(due + 2_000, 30))?.signature, 'admission-retry-high');
+    assert.equal((await row(pool, 'admission-retry-low')).attempts, 2);
+    assert.equal((await row(pool, 'admission-retry-high')).attempts, 2);
+  });
+});
+
+void test('enabled admission never turns ambiguous catch-up PENDING into an admission on insert, merge or replay', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    for (const existing of [false, true]) {
+      const signature = `admission-ambiguous-classification-${existing}`;
+      if (existing) await repository.enqueue(notification(signature, 1n));
+      const classification = createCatchUpClassification({ ...catchUpClassificationInput(signature),
+        disposition: existing ? 'ACTIONABLE' : 'DEFERRED',
+        reasonCode: existing ? 'PUMP_ACTION_SUPPORTED' : 'PUMP_TRADE_UNTRACKED',
+        programIds: [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort(),
+        ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint });
+      for (const classifiedAtMs of [1_001, 2_001]) {
+        const receipt = await repository.recordCatchUpClassification(createCatchUpClassification({
+          ...classification, classifiedAtMs,
+        }));
+        assert.equal(receipt.admission, 'NOT_ENQUEUED');
+        const stored = await row(pool, signature);
+        assert.equal(stored.processing_status, 'PENDING');
+        assert.equal(stored.ingestion_priority, 'NORMAL');
+        assert.equal(stored.worker_admitted_at, null);
+        assert.equal(stored.catch_up_enqueued, false);
+      }
+    }
+    assert.equal(await repository.claim(Date.now(), 30), null);
+  });
+});
+
+for (const firstIngress of ['WEBSOCKET', 'CATCH_UP'] as const) {
+  void test(`enabled admission preserves finality replay with ${firstIngress} first`, async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      const signature = `admission-finality-${firstIngress}`;
+      if (firstIngress === 'WEBSOCKET') {
+        await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'confirmed', 1_000, 'PUMPFUN_CREATE'));
+      } else {
+        await repository.recordCatchUpClassification(catchUpClassification(signature));
+      }
+      const initial = await row(pool, signature);
+      const claim = await repository.claim(Date.now(), 30);
+      assert.ok(claim);
+      await repository.saveSnapshot(signature, claim.leaseToken, normalized(signature, 1n));
+      await repository.markProcessed(signature, claim.leaseToken, 'confirmed');
+      if (firstIngress === 'WEBSOCKET') {
+        const receipt = await repository.recordCatchUpClassification(createCatchUpClassification({
+          ...catchUpClassificationInput(signature), confirmationStatus: 'finalized',
+          observedAtMs: 2_000, classifiedAtMs: 2_001,
+        }));
+        assert.equal(receipt.admission, 'NOT_ENQUEUED');
+      } else {
+        await repository.enqueue(notification(signature, 1n, 'WEBSOCKET', 'finalized', 2_000, 'PUMPFUN_CREATE'));
+      }
+      const replay = await row(pool, signature);
+      assert.equal(replay.processing_status, 'PENDING');
+      assert.equal(replay.target_confirmation_status, 'finalized');
+      assert.equal(replay.worker_admitted_at.getTime(), initial.worker_admitted_at.getTime());
+      assert.equal(replay.first_detected_at.getTime(), initial.first_detected_at.getTime());
+      const finalClaim = await repository.claim(Date.now(), 30);
+      assert.ok(finalClaim);
+      await repository.markProcessed(signature, finalClaim.leaseToken, 'finalized');
+      assert.equal((await row(pool, signature)).processing_status, 'PROCESSED');
+    });
+  });
+}
+
+void test('enabled admission merges ambiguous duplicate finality without admitting or touching worker evidence', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    await repository.enqueue(notification('admission-ambiguous-duplicate', 1n));
+    const before = await row(pool, 'admission-ambiguous-duplicate');
+    await repository.enqueue(notification('admission-ambiguous-duplicate', 1n, 'WEBSOCKET', 'finalized', 2_000));
+    const stored = await row(pool, 'admission-ambiguous-duplicate');
+    assert.equal(stored.target_confirmation_status, 'finalized');
+    assert.equal(stored.worker_admitted_at, null);
+    assert.equal(stored.finality_evidence_version, '0');
+    assert.equal(stored.first_detected_at.getTime(), before.first_detected_at.getTime());
+    assert.equal(stored.observed_at.getTime(), before.observed_at.getTime());
+    assert.equal(await repository.claim(Date.now(), 30), null);
+  });
+});
+
+void test('enabled admission fences null admission in all priority claim branches without scheduler mutation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    for (const [signature, priority, hint, mint] of [
+      ['fence-normal', 'NORMAL', 'NONE', null],
+      ['fence-launch', 'LAUNCH_CANDIDATE', 'PUMPFUN_CREATE', null],
+      ['fence-tracked', 'TRACKED_TRADE', 'PUMPFUN_TRADE', tradeMint],
+    ]) {
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+        processing_status, observed_at, ingestion_priority, ingestion_hint, ingestion_hint_mint
+      ) VALUES ($1,1,ARRAY['WEBSOCKET'],ARRAY[$2],'processed','PENDING',to_timestamp(1),$3,$4,$5)`,
+      [signature, PUMP_PROGRAM_ID, priority, hint, mint]);
+    }
+    const scheduler = (await pool.query('SELECT * FROM chain_transaction_inbox_claim_scheduler')).rows;
+    assert.equal(await repository.claim(Date.now(), 30), null);
+    assert.deepEqual((await pool.query('SELECT * FROM chain_transaction_inbox_claim_scheduler')).rows, scheduler);
+    for (const signature of ['fence-normal', 'fence-launch', 'fence-tracked']) {
+      const stored = await row(pool, signature);
+      assert.equal(stored.attempts, 0);
+      assert.equal(stored.lease_token, null);
+      assert.equal(stored.normalized_transaction, null);
+    }
+  });
+});
+
+void test('enabled admission leaves ambiguous work unadmitted and admits only canonical actionable hints', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    await repository.enqueue(notification('admission-ambiguous', 1n));
+    await repository.enqueue(tradeNotification('admission-untracked', 2n));
+    await repository.enqueue(notification('admission-create', 3n, 'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE'));
+    await insertTrackedLaunch(pool);
+    await repository.enqueue(tradeNotification('admission-tracked', 4n));
+    for (const [signature, status, priority, admitted] of [
+      ['admission-ambiguous', 'PENDING', 'NORMAL', false],
+      ['admission-untracked', 'DEFERRED', 'NORMAL', false],
+      ['admission-create', 'PENDING', 'LAUNCH_CANDIDATE', true],
+      ['admission-tracked', 'PENDING', 'TRACKED_TRADE', true],
+    ] as const) {
+      const stored = await row(pool, signature);
+      assert.equal(stored.processing_status, status);
+      assert.equal(stored.ingestion_priority, priority);
+      assert.equal(stored.worker_admitted_at !== null, admitted, signature);
+    }
+    assert.equal((await repository.claim(Date.now(), 30))?.signature, 'admission-create');
+    assert.equal((await repository.claim(Date.now(), 30))?.signature, 'admission-tracked');
+    assert.equal(await repository.claim(Date.now(), 30), null);
+    const ambiguous = await row(pool, 'admission-ambiguous');
+    assert.equal(ambiguous.attempts, 0);
+    assert.equal(ambiguous.lease_token, null);
+    assert.equal(ambiguous.normalized_transaction, null);
+  });
+});
+
+void test('enabled admission catch-up truthfully admits ambiguous pending and deferred WebSocket work', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    for (const deferred of [false, true]) {
+      const signature = `admission-classification-${deferred}`;
+      await repository.enqueue(deferred ? tradeNotification(signature, 1n) : notification(signature, 1n));
+      const before = await row(pool, signature);
+      const classification = catchUpClassification(signature);
+      const receipt = await repository.recordCatchUpClassification(classification);
+      assert.equal(receipt.admission, 'ENQUEUED');
+      const admitted = await row(pool, signature);
+      assert.equal(admitted.worker_admitted_at.getTime(), classification.classifiedAtMs);
+      assert.equal(admitted.catch_up_enqueued, true);
+      assert.equal(admitted.catch_up_admission_priority, 'LAUNCH_CANDIDATE');
+      assert.equal(admitted.first_detected_at.getTime(), before.first_detected_at.getTime());
+      assert.equal(admitted.observed_at.getTime(), before.observed_at.getTime());
+      await repository.recordCatchUpClassification(createCatchUpClassification({ ...classification,
+        observedAtMs: 2_000, classifiedAtMs: 2_001 }));
+      assert.equal((await row(pool, signature)).worker_admitted_at.getTime(), classification.classifiedAtMs);
+    }
+  });
+});
+
+void test('enabled admission semantic replay promotes once using the persisted classification clock', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    const classification = createCatchUpClassification({ ...catchUpClassificationInput('admission-replay'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint });
+    assert.equal((await repository.recordCatchUpClassification(classification)).admission, 'NOT_ENQUEUED');
+    const before = await row(pool, classification.signature);
+    await insertTrackedLaunch(pool);
+    for (const clock of [2_001, 3_001]) {
+      const receipt = await repository.recordCatchUpClassification(createCatchUpClassification({
+        ...classification, observedAtMs: clock - 1, classifiedAtMs: clock,
+      }));
+      assert.equal(receipt.admission, 'ENQUEUED');
+      assert.equal(receipt.ingestionPriority, 'TRACKED_TRADE');
+      const stored = await row(pool, classification.signature);
+      assert.equal(stored.worker_admitted_at.getTime(), classification.classifiedAtMs);
+      assert.equal(stored.catch_up_classified_at.getTime(), classification.classifiedAtMs);
+      assert.equal(stored.first_detected_at.getTime(), before.first_detected_at.getTime());
+      assert.equal(stored.observed_at.getTime(), before.observed_at.getTime());
+      assert.equal(stored.terminal_at, null);
+      assert.equal(stored.purge_after, null);
+    }
+  });
+});
+
+void test('enabled admission protects terminal deferred classification from contradictory WebSocket CREATE', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    const classification = createCatchUpClassification({ ...catchUpClassificationInput('admission-terminal'),
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint });
+    await repository.recordCatchUpClassification(classification);
+    const before = await row(pool, classification.signature);
+    await repository.enqueue(notification(classification.signature, 1n, 'WEBSOCKET', 'finalized', 2_000, 'PUMPFUN_CREATE'));
+    const stored = await row(pool, classification.signature);
+    assert.equal(stored.processing_status, 'DEFERRED');
+    assert.equal(stored.worker_admitted_at, null);
+    assert.equal(stored.target_confirmation_status, 'finalized');
+    assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.equal(stored.terminal_at.getTime(), before.terminal_at.getTime());
+    assert.equal(stored.purge_after.getTime(), before.purge_after.getTime());
+    await insertTrackedLaunch(pool);
+    await repository.syncTrackedMint(tradeMint);
+    assert.equal((await row(pool, classification.signature)).processing_status, 'PENDING');
+  });
+});
 
 void test('schedules one retained worker decoder quarantine from its immutable snapshot', async (context) => {
   await withDatabase(context, async (pool) => {

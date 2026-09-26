@@ -15,6 +15,11 @@ import {
 } from '../domain/confirmation-status.js';
 import { isDecoderQuarantineFailure } from '../domain/observed-pipeline-failure.js';
 import {
+  createPumpFunWorkerAdmissionPolicy,
+  DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  type PumpFunWorkerAdmissionPolicyV1,
+} from '../domain/worker-admission.js';
+import {
   assertValidCatchUpClassification,
   createCatchUpClassification,
   createCatchUpClassificationReceipt,
@@ -113,6 +118,7 @@ interface InboxIdentityRow extends QueryResultRow {
   readonly finality_evidence_version: unknown;
   readonly catch_up_enqueued: unknown;
   readonly catch_up_admission_priority: unknown;
+  readonly worker_admitted_at: unknown;
 }
 
 interface FirstProcessingCanaryRow extends QueryResultRow {
@@ -211,6 +217,44 @@ const CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = 
     ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
 });
 
+// Keep the legacy queries byte-for-byte stable; enabled queries add only the
+// durable admission fence, including the retry and expired-lease branches.
+const ADMITTED_CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = Object.freeze({
+  NORMAL: `SELECT signature, ingestion_priority
+    FROM chain_transaction_inbox
+    WHERE ingestion_priority='NORMAL' AND worker_admitted_at IS NOT NULL AND (
+      (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='FAILED' AND error_retryable=TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+    )
+    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+  LAUNCH_CANDIDATE: `SELECT signature, ingestion_priority
+    FROM chain_transaction_inbox
+    WHERE ingestion_priority='LAUNCH_CANDIDATE' AND worker_admitted_at IS NOT NULL AND (
+      (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='FAILED' AND error_retryable=TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+    )
+    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+  TRACKED_TRADE: `SELECT signature, ingestion_priority
+    FROM chain_transaction_inbox
+    WHERE ingestion_priority='TRACKED_TRADE' AND worker_admitted_at IS NOT NULL AND (
+      (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='FAILED' AND error_retryable=TRUE
+        AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+      OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+        AND attempts_in_cycle<retry_max_attempts)
+    )
+    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+});
+
 export interface TransactionInboxRetryPolicy {
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
@@ -253,12 +297,17 @@ export class TransactionInboxLeaseError extends TransactionInboxRepositoryError 
 export class PostgresTransactionInboxRepository implements TransactionInboxRepository,
   StrictCatchUpRepository, CatchUpClassificationRepository, CatchUpAdmissionCoverageRepository {
   private readonly retryPolicy: TransactionInboxRetryPolicy;
+  private readonly workerAdmissionPolicy: PumpFunWorkerAdmissionPolicyV1;
 
   public constructor(
     private readonly pool: InboxPool = getDatabasePool(),
     retryPolicy: TransactionInboxRetryPolicy = DEFAULT_RETRY_POLICY,
+    workerAdmissionPolicy: PumpFunWorkerAdmissionPolicyV1 = createPumpFunWorkerAdmissionPolicy({
+      enabled: false, trackingWindowSeconds: DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+    }),
   ) {
     this.retryPolicy = snapshotRetryPolicy(retryPolicy);
+    this.workerAdmissionPolicy = createPumpFunWorkerAdmissionPolicy(workerAdmissionPolicy);
   }
 
   public async beginFirstProcessingCanary(): Promise<number> {
@@ -552,7 +601,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         programs.sort(lexicalOrder);
         if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
         const terminalCatchUpClassification = row !== undefined
-          && (row.catch_up_disposition === 'IGNORED' || row.catch_up_disposition === 'QUARANTINED');
+          && (row.catch_up_disposition === 'IGNORED' || row.catch_up_disposition === 'QUARANTINED'
+            || (this.workerAdmissionPolicy.enabled && row.catch_up_disposition === 'DEFERRED'));
         if (terminalCatchUpClassification && row.processing_status === row.catch_up_disposition) {
           if (value.source === 'WEBSOCKET'
             && row.catch_up_reason_code === 'SOLANA_TRANSACTION_FAILED') {
@@ -596,7 +646,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ) SELECT $1,$2,ARRAY[$3]::TEXT[],$4,$5,$12,$6,$7,$8,$9,$10,$11,
               CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) END,
               CASE WHEN $12='DEFERRED' THEN GREATEST(decision_clock.at,$6) + INTERVAL '4 hours' END,
-              CASE WHEN $12='PENDING' THEN $6 END
+              ${this.workerAdmissionPolicy.enabled
+                ? "CASE WHEN $12='PENDING' AND $9::chain_transaction_inbox_priority<>'NORMAL' THEN GREATEST(decision_clock.at,$6) END"
+                : "CASE WHEN $12='PENDING' THEN $6 END"}
               FROM decision_clock`,
             [
               value.signature,
@@ -668,13 +720,17 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              retry_exhausted_at = CASE WHEN $5 THEN NULL ELSE retry_exhausted_at END,
              missing_finality_polls = 0,
              last_missing_finality_provider_id = NULL,
-             finality_evidence_version = CASE WHEN $10='DEFERRED' THEN 0 ELSE finality_evidence_version + 1 END,
+             finality_evidence_version = ${this.workerAdmissionPolicy.enabled
+               ? "CASE WHEN $10='DEFERRED' OR (worker_admitted_at IS NULL AND $7='NORMAL') THEN 0 ELSE finality_evidence_version + 1 END"
+               : "CASE WHEN $10='DEFERRED' THEN 0 ELSE finality_evidence_version + 1 END"},
              ingestion_priority = $7::chain_transaction_inbox_priority,
              ingestion_hint = $8,
              ingestion_hint_mint = $9,
              worker_admitted_at = CASE
                WHEN worker_admitted_at IS NULL
-                 AND (CASE WHEN $5 THEN 'PENDING' ELSE $10 END)='PENDING'
+                 ${this.workerAdmissionPolicy.enabled
+                   ? "AND $7<>'NORMAL' AND (CASE WHEN $5 THEN 'PENDING' ELSE $10 END)='PENDING'"
+                   : "AND (CASE WHEN $5 THEN 'PENDING' ELSE $10 END)='PENDING'"}
                  THEN GREATEST(decision_clock.at,observed_at)
                ELSE worker_admitted_at END,
              updated_at = GREATEST(updated_at, $6)
@@ -732,7 +788,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              missing_finality_polls, last_missing_finality_provider_id, finality_evidence_version,
              catch_up_classification_version, catch_up_disposition, catch_up_reason_code,
              catch_up_action_key, catch_up_mints, catch_up_evidence_fingerprint, catch_up_classified_at,
-             catch_up_enqueued, catch_up_admission_priority
+             catch_up_enqueued, catch_up_admission_priority, worker_admitted_at
            FROM chain_transaction_inbox WHERE signature=$1 FOR UPDATE`,
           [value.signature],
         );
@@ -786,11 +842,18 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           const currentDecision = storedIngestionDecision(row);
           const pristine = isPristineInbox(row);
           const replayDecision = pristine ? decision : currentDecision;
-          const catchUpEnqueued = storedCatchUpEnqueued(row.catch_up_enqueued);
-          const catchUpAdmissionPriority = storedCatchUpAdmissionPriority(
+          const storedEnqueued = storedCatchUpEnqueued(row.catch_up_enqueued);
+          const storedPriority = storedCatchUpAdmissionPriority(
             row.catch_up_admission_priority,
-            catchUpEnqueued,
+            storedEnqueued,
           );
+          // The receipt records the first durable admission, not merely a
+          // PENDING status (which can still be awaiting classification).
+          const newlyAdmitted = this.workerAdmissionPolicy.enabled && !storedEnqueued
+            && row.worker_admitted_at === null && replayDecision.status === 'PENDING'
+            && replayDecision.priority !== 'NORMAL';
+          const catchUpEnqueued = storedEnqueued || newlyAdmitted;
+          const catchUpAdmissionPriority = newlyAdmitted ? replayDecision.priority : storedPriority;
           const currentStatus = confirmation(row.target_confirmation_status);
           const shouldReplay = currentDecision.status === 'PROCESSED' && status !== currentStatus;
           if (shouldReplay && row.normalized_transaction === null) {
@@ -826,23 +889,32 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                  ELSE $9::TIMESTAMPTZ+INTERVAL '4 hours' END,
                worker_admitted_at=CASE
                  WHEN worker_admitted_at IS NULL
-                   AND (CASE WHEN $11 THEN 'PENDING' ELSE $5 END)='PENDING'
+                   ${this.workerAdmissionPolicy.enabled
+                     ? "AND $6<>'NORMAL' AND (CASE WHEN $11 THEN 'PENDING' ELSE $5 END)='PENDING'"
+                     : "AND (CASE WHEN $11 THEN 'PENDING' ELSE $5 END)='PENDING'"}
                    THEN $12::TIMESTAMPTZ
                  ELSE worker_admitted_at END,
-               updated_at=GREATEST(updated_at,$10)
+               ${this.workerAdmissionPolicy.enabled
+                 ? 'catch_up_enqueued=$13,catch_up_admission_priority=$14,\n               updated_at=GREATEST(updated_at,$10)'
+                 : 'updated_at=GREATEST(updated_at,$10)'}
              WHERE signature=$1`,
             [
               value.signature, sources, programs, status, replayDecision.status,
               replayDecision.priority, replayDecision.hint, replayDecision.mint,
               replayTerminalAt, dateFromMs(value.observedAtMs), shouldReplay,
-              dateFromMs(value.classifiedAtMs),
+              // Semantic replays retain the first classification's clock.
+              this.workerAdmissionPolicy.enabled
+                ? dateFromMs(dateMs(row.catch_up_classified_at, 'catch-up classified at'))
+                : dateFromMs(value.classifiedAtMs),
+              ...(this.workerAdmissionPolicy.enabled ? [catchUpEnqueued, catchUpAdmissionPriority] : []),
             ],
           );
           requireOne(updated.rowCount);
           return classificationReceipt(value, 'REPLAYED', catchUpEnqueued, catchUpAdmissionPriority);
         }
         if (row === undefined) {
-          const catchUpEnqueued = decision.status === 'PENDING';
+          const catchUpEnqueued = decision.status === 'PENDING'
+            && (!this.workerAdmissionPolicy.enabled || decision.priority !== 'NORMAL');
           const catchUpAdmissionPriority = catchUpEnqueued ? decision.priority : null;
           const inserted = await client.query(
             `INSERT INTO chain_transaction_inbox (
@@ -855,7 +927,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              ) VALUES ($1,$2,ARRAY['CATCH_UP']::TEXT[],$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                CASE WHEN $12::TIMESTAMPTZ IS NULL THEN NULL ELSE $12::TIMESTAMPTZ+INTERVAL '4 hours' END,
                $13,$14,$15,$16,$17,$18,$19,$20,$21,
-               CASE WHEN $5='PENDING' THEN $19::TIMESTAMPTZ END)`,
+               ${this.workerAdmissionPolicy.enabled
+                 ? "CASE WHEN $5='PENDING' AND $9::chain_transaction_inbox_priority<>'NORMAL' THEN $19::TIMESTAMPTZ END)"
+                 : "CASE WHEN $5='PENDING' THEN $19::TIMESTAMPTZ END)"}`,
             [
               value.signature, value.slot.toString(), value.programIds, value.confirmationStatus,
               decision.status, dateFromMs(value.observedAtMs), this.retryPolicy.maxAttempts,
@@ -879,11 +953,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         sources.sort(sourceOrder);
         const status = reconciledStatus(confirmation(row.target_confirmation_status), value.confirmationStatus);
         const currentDecision = storedIngestionDecision(row);
-        const catchUpEnqueued = currentDecision.status === 'DEFERRED' && decision.status === 'PENDING';
-        const catchUpAdmissionPriority = catchUpEnqueued ? decision.priority : null;
         const pristine = isPristineInbox(row);
         const currentStatus = confirmation(row.target_confirmation_status);
         const shouldReplay = currentDecision.status === 'PROCESSED' && status !== currentStatus;
+        const catchUpEnqueued = this.workerAdmissionPolicy.enabled
+          ? row.worker_admitted_at === null && decision.priority !== 'NORMAL'
+            && (shouldReplay || (pristine ? decision.status : currentDecision.status) === 'PENDING')
+          : currentDecision.status === 'DEFERRED' && decision.status === 'PENDING';
+        const catchUpAdmissionPriority = catchUpEnqueued ? decision.priority : null;
         if (shouldReplay && row.normalized_transaction === null) {
           throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
         }
@@ -913,7 +990,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              catch_up_classified_at=$16,catch_up_enqueued=$19,catch_up_admission_priority=$20,
              worker_admitted_at=CASE
                WHEN worker_admitted_at IS NULL
-                 AND (CASE WHEN $17 THEN 'PENDING' WHEN $18 THEN $5 ELSE processing_status END)='PENDING'
+                 ${this.workerAdmissionPolicy.enabled
+                   ? "AND $6<>'NORMAL' AND (CASE WHEN $17 THEN 'PENDING' WHEN $18 THEN $5 ELSE processing_status END)='PENDING'"
+                   : "AND (CASE WHEN $17 THEN 'PENDING' WHEN $18 THEN $5 ELSE processing_status END)='PENDING'"}
                  THEN $16::TIMESTAMPTZ
                ELSE worker_admitted_at END,
              updated_at=GREATEST(updated_at,$16)
@@ -1135,8 +1214,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (launchStreak > MAX_LAUNCH_CLAIMS_BEFORE_TRACKED) {
           throw new TypeError('Transaction inbox claim scheduler is invalid.');
         }
+        const claimCandidateSql = this.workerAdmissionPolicy.enabled
+          ? ADMITTED_CLAIM_CANDIDATE_SQL : CLAIM_CANDIDATE_SQL;
         let selected = urgentStreak === MAX_CONSECUTIVE_URGENT_CLAIMS
-          ? await client.query(CLAIM_CANDIDATE_SQL.NORMAL, [now])
+          ? await client.query(claimCandidateSql.NORMAL, [now])
           : { rows: [], rowCount: 0 };
         if (selected.rows.length === 0) {
           const urgentOrder: readonly TransactionInboxPriority[] = launchStreak
@@ -1144,12 +1225,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ? ['TRACKED_TRADE', 'LAUNCH_CANDIDATE']
             : ['LAUNCH_CANDIDATE', 'TRACKED_TRADE'];
           for (const priority of urgentOrder) {
-            selected = await client.query(CLAIM_CANDIDATE_SQL[priority], [now]);
+            selected = await client.query(claimCandidateSql[priority], [now]);
             if (selected.rows.length > 0) break;
           }
         }
         if (selected.rows.length === 0) {
-          selected = await client.query(CLAIM_CANDIDATE_SQL.NORMAL, [now]);
+          selected = await client.query(claimCandidateSql.NORMAL, [now]);
         }
         const selectedRow = selected.rows[0];
         const signature = optionalText(selectedRow?.signature, 'claim signature');
