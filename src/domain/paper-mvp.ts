@@ -141,6 +141,7 @@ export type PaperMvpOneShotGateCode =
   | 'UNKNOWN_TERMINAL_POSITION'
   | 'DUPLICATE_LOGICAL_BUY'
   | 'DUPLICATE_LOGICAL_SELL'
+  | 'CREATION_PRECEDES_RUN'
   | 'CAUSAL_EVIDENCE_MISSING_OR_INCONSISTENT';
 
 export interface CreatePaperMvpOneShotReportInput extends CreatePaperMvpReportInput {
@@ -381,6 +382,9 @@ export function createPaperMvpOneShotReport(
   const sample = logicalSellCount === 1 && input.samples[0] !== undefined
     ? validateSample(input.samples[0])
     : null;
+  if (sample !== null && sample.creationDetectedAtMs < input.startedAtMs) {
+    failedGateCodes.push('CREATION_PRECEDES_RUN');
+  }
   const inspected = sample === null ? null : inspectPaperMvpCausalEvidence(
     input.causalEvidence, sample, input.qualificationProfileFingerprint, input.externalUniqueBuyersTarget,
   );

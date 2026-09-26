@@ -65,6 +65,18 @@ export interface QualificationUpstreamCondition {
   readonly triggered: boolean;
 }
 
+export interface QualificationQuoteObservation {
+  readonly quoteId: string;
+  readonly observedSlot: bigint;
+  readonly observedAtMs: number;
+}
+
+export interface QualificationQuoteLineage {
+  readonly schemaVersion: 1;
+  readonly buy: QualificationQuoteObservation | null;
+  readonly reverseSell: QualificationQuoteObservation | null;
+}
+
 export interface QualificationCalibrationFacts {
   readonly top1HolderBps: bigint | null;
   readonly top5HoldersBps: bigint | null;
@@ -75,6 +87,7 @@ export interface QualificationCalibrationFacts {
   readonly sellQuoteAvailable: boolean | null;
   readonly roundTripLossBps: bigint | null;
   readonly upstreamConditions: readonly QualificationUpstreamCondition[];
+  readonly quoteLineage?: QualificationQuoteLineage;
 }
 
 export interface QualificationConditionPolicy {
@@ -116,7 +129,16 @@ const QUALIFICATION_FACT_FIELDS = [
   'upstreamConditions',
 ] as const;
 
+const QUALIFICATION_FACT_FIELDS_WITH_QUOTE_LINEAGE = [
+  ...QUALIFICATION_FACT_FIELDS,
+  'quoteLineage',
+] as const;
+
 const QUALIFICATION_UPSTREAM_CONDITION_FIELDS = ['code', 'triggered'] as const;
+const QUALIFICATION_QUOTE_LINEAGE_FIELDS = ['schemaVersion', 'buy', 'reverseSell'] as const;
+const QUALIFICATION_QUOTE_OBSERVATION_FIELDS = [
+  'quoteId', 'observedSlot', 'observedAtMs',
+] as const;
 const BASIS_POINTS_MAXIMUM = 10_000n;
 const QUALIFICATION_REASON_CODE_SET: ReadonlySet<string> = new Set(QUALIFICATION_REASON_CODES);
 
@@ -124,7 +146,14 @@ export function assertValidQualificationFacts(
   facts: QualificationCalibrationFacts,
 ): void {
   assertFrozenPlainObject(facts, 'Qualification facts');
-  const values = assertExactDataFields(facts, QUALIFICATION_FACT_FIELDS, 'Qualification facts');
+  const includesQuoteLineage = Object.hasOwn(facts, 'quoteLineage');
+  const values = assertExactDataFields(
+    facts,
+    includesQuoteLineage
+      ? QUALIFICATION_FACT_FIELDS_WITH_QUOTE_LINEAGE
+      : QUALIFICATION_FACT_FIELDS,
+    'Qualification facts',
+  );
 
   for (const field of [
     'top1HolderBps',
@@ -140,6 +169,44 @@ export function assertValidQualificationFacts(
   assertNullableBoolean(values.buySimulationSucceeded, 'buySimulationSucceeded');
   assertNullableBoolean(values.sellQuoteAvailable, 'sellQuoteAvailable');
   assertValidUpstreamConditions(values.upstreamConditions);
+  if (includesQuoteLineage) assertValidQuoteLineage(values.quoteLineage);
+}
+
+function assertValidQuoteLineage(value: unknown): void {
+  assertFrozenPlainObject(value, 'Qualification quote lineage');
+  const fields = assertExactDataFields(
+    value,
+    QUALIFICATION_QUOTE_LINEAGE_FIELDS,
+    'Qualification quote lineage',
+  );
+  if (fields.schemaVersion !== 1) {
+    throw new TypeError('Qualification quote lineage schema version is invalid.');
+  }
+  assertValidQuoteObservation(fields.buy, 'buy');
+  assertValidQuoteObservation(fields.reverseSell, 'reverse sell');
+}
+
+function assertValidQuoteObservation(value: unknown, side: string): void {
+  if (value === null) return;
+  assertFrozenPlainObject(value, `Qualification ${side} quote observation`);
+  const fields = assertExactDataFields(
+    value,
+    QUALIFICATION_QUOTE_OBSERVATION_FIELDS,
+    `Qualification ${side} quote observation`,
+  );
+  if (
+    typeof fields.quoteId !== 'string'
+    || fields.quoteId.trim() === ''
+  ) throw new TypeError(`Qualification ${side} quote id is invalid.`);
+  if (typeof fields.observedSlot !== 'bigint' || fields.observedSlot < 0n) {
+    throw new TypeError(`Qualification ${side} quote observed slot is invalid.`);
+  }
+  if (
+    typeof fields.observedAtMs !== 'number'
+    || !Number.isSafeInteger(fields.observedAtMs)
+    || fields.observedAtMs < 0
+    || Object.is(fields.observedAtMs, -0)
+  ) throw new TypeError(`Qualification ${side} quote observation time is invalid.`);
 }
 
 function assertValidUpstreamConditions(value: unknown): void {

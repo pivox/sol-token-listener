@@ -6,6 +6,8 @@ import type { PaperExecutionQuote } from '../domain/paper-trading.js';
 import type {
   QualificationCalibrationFacts,
   QualificationEvaluationInput,
+  QualificationQuoteLineage,
+  QualificationQuoteObservation,
   QualificationReport,
   QualificationSignalKey,
   QualificationUpstreamCondition,
@@ -335,10 +337,36 @@ function evaluationFrom(input: QualificationRebuildInput): QualificationEvaluati
     upstreamConditions:Object.freeze([...upstream.entries()]
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([code,triggered]) => Object.freeze({ code,triggered }))),
+    ...quoteLineage(input.buyQuote, input.reverseSellQuote),
   });
   return Object.freeze({
     evaluatedAtMs:snapshot.asOfEvent.observedAtMs,
     signals:Object.freeze(signals),blockers:Object.freeze([]),calibrationFacts:facts,
+  });
+}
+
+function quoteLineage(
+  buy: PaperExecutionQuote | null | undefined,
+  reverseSell: PaperExecutionQuote | null | undefined,
+): Readonly<{ readonly quoteLineage?: QualificationQuoteLineage }> {
+  if (buy === undefined && reverseSell === undefined) return Object.freeze({});
+  return Object.freeze({
+    quoteLineage:Object.freeze({
+      schemaVersion:1 as const,
+      buy:quoteObservation(buy),
+      reverseSell:quoteObservation(reverseSell),
+    }),
+  });
+}
+
+function quoteObservation(
+  quote: PaperExecutionQuote | null | undefined,
+): QualificationQuoteObservation | null {
+  if (quote === null || quote === undefined) return null;
+  return Object.freeze({
+    quoteId:quote.id,
+    observedSlot:quote.observedSlot,
+    observedAtMs:quote.observedAtMs,
   });
 }
 

@@ -199,6 +199,45 @@ void test('persists a quote-backed qualification under the canonical projection 
   assert.equal(repository.replacements.length, 1);
 });
 
+void test('binds each quote-backed projection to the exact quote identities and coordinates', async () => {
+  const repository = new FakeRepository(snapshot(), ['UPDATED', 'UPDATED']);
+  const projectionService = service(repository, ['SOL']);
+  const firstBuy = quote('buy-first', 'SOL', 'MINT', 1_000n, 900n, 900n);
+  const firstSell = quote('sell-first', 'MINT', 'SOL', 900n, 800n, 800n);
+  const laterBuy = Object.freeze({
+    ...firstBuy, id:'buy-later', observedSlot:11n, observedAtMs:1_100,
+  });
+  const laterSell = Object.freeze({
+    ...firstSell, id:'sell-later', observedSlot:12n, observedAtMs:1_200,
+  });
+
+  const first = await projectionService.rebuildWithQuotes('MINT', firstBuy, firstSell);
+  const later = await projectionService.rebuildWithQuotes('MINT', laterBuy, laterSell);
+
+  assert.ok(first.projection);
+  assert.ok(later.projection);
+  assert.notEqual(later.projection.evidenceFingerprint, first.projection.evidenceFingerprint);
+  assert.notEqual(later.projection.reportId, first.projection.reportId);
+  assert.notEqual(later.projection.qualificationEvent.id, first.projection.qualificationEvent.id);
+  assert.deepEqual(first.projection.evaluation.calibrationFacts?.quoteLineage, {
+    schemaVersion: 1,
+    buy: { quoteId:'buy-first', observedSlot:10n, observedAtMs:1_000 },
+    reverseSell: { quoteId:'sell-first', observedSlot:10n, observedAtMs:1_000 },
+  });
+  assert.deepEqual(later.projection.evaluation.calibrationFacts?.quoteLineage, {
+    schemaVersion: 1,
+    buy: { quoteId:'buy-later', observedSlot:11n, observedAtMs:1_100 },
+    reverseSell: { quoteId:'sell-later', observedSlot:12n, observedAtMs:1_200 },
+  });
+  const persistedPayload = later.projection.qualificationEvent.payload as Readonly<{
+    evaluation: { calibrationFacts: { quoteLineage: unknown } };
+  }>;
+  assert.deepEqual(
+    persistedPayload.evaluation.calibrationFacts.quoteLineage,
+    later.projection.evaluation.calibrationFacts?.quoteLineage,
+  );
+});
+
 for (const side of ['BUY', 'SELL'] as const) {
 for (const field of ['observedSlot', 'observedAtMs'] as const) {
   void test(`rejects ${side} quotes older than canonical ${field} without persisting a report`, async () => {

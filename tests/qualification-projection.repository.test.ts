@@ -970,6 +970,35 @@ void test('returns UNCHANGED for an exact current replay without event or outbox
   assert.match(currentSql, /purge_after > clock_timestamp\(\)/u);
 });
 
+void test('round-trips exact quote lineage bigint coordinates from durable JSON', async () => {
+  const projection = projectionFixture({ withQuoteLineage: true });
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_current_report')) {
+      return rows([{ report_id: projection.reportId }]);
+    }
+    if (text.includes('qualification_stored_report')) {
+      return rows([storedProjectionRow(projection)]);
+    }
+    return rows([]);
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  const outcome = await repository.transact('mint', (transaction) => (
+    transaction.replaceProjection(projection)
+  ));
+
+  assert.equal(outcome, 'UNCHANGED');
+  assert.deepEqual(projection.evaluation.calibrationFacts?.quoteLineage, {
+    schemaVersion: 1,
+    buy: { quoteId:'buy-exact', observedSlot:11n, observedAtMs:1_100 },
+    reverseSell: { quoteId:'sell-exact', observedSlot:12n, observedAtMs:1_200 },
+  });
+});
+
 void test('recreates a purged report by reusing an exact retained qualification event', async () => {
   const projection = projectionFixture({ observedAtMs: Date.now() });
   const database = new ScriptedPool((text) => {
@@ -2239,6 +2268,7 @@ function projectionFixture(options: Readonly<{
   descriptionAvailable?: boolean;
   observedAtMs?: number;
   walletGraph?: WalletGraphAnalysis;
+  withQuoteLineage?: boolean;
 }> = {}): CanonicalQualificationProjection {
   const service = qualificationService();
   const confirmationStatus = options.confirmationStatus ?? 'confirmed';
@@ -2254,6 +2284,20 @@ function projectionFixture(options: Readonly<{
     blockchainTimeMs: observedAtMs - 100, observedAtMs, payloadVersion: 1,
     payload: Object.freeze({}),
   });
+  const buyQuote = options.withQuoteLineage === true
+    ? Object.freeze({
+      id:'buy-exact', inputMint:'SOL', outputMint:'mint', amountInRaw:1_000n,
+      amountOutRaw:900n, minimumAmountOutRaw:900n, feesRaw:1n,
+      slippageBps:100n, priceImpactBps:10n, observedAtMs:1_100, observedSlot:11n,
+    })
+    : undefined;
+  const reverseSellQuote = options.withQuoteLineage === true
+    ? Object.freeze({
+      id:'sell-exact', inputMint:'mint', outputMint:'SOL', amountInRaw:900n,
+      amountOutRaw:800n, minimumAmountOutRaw:800n, feesRaw:1n,
+      slippageBps:100n, priceImpactBps:10n, observedAtMs:1_200, observedSlot:12n,
+    })
+    : undefined;
   const rebuilt = service.rebuild({
     snapshot: Object.freeze({
       mint: 'mint', asOfEvent,
@@ -2280,8 +2324,8 @@ function projectionFixture(options: Readonly<{
       social: null, creatorProfile: null,
       holderSnapshot: null, walletGraph: options.walletGraph ?? null,
     }),
-    buyQuote: undefined,
-    reverseSellQuote: undefined,
+    buyQuote,
+    reverseSellQuote,
   });
   return Object.freeze({
     reportId: rebuilt.reportId,

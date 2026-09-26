@@ -134,6 +134,40 @@ void test('reports a completed one-shot cycle for configurable N independently o
   });
 });
 
+void test('fails a one-shot cycle whose launch predates the inclusive run boundary', () => {
+  const input = {
+    runId: 'paper_mvp_run_boundary', completionReason: 'TARGET_REACHED' as const,
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 1,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 1,
+    entriesRejected: 0, openedPositions: 1, openPositions: 0,
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: {
+      status: 'AVAILABLE' as const, creditsUsedStart: 10n, creditsUsedEnd: 11n,
+      rateLimitedCount: 0,
+    },
+    maxDurationMs: 60_000,
+    externalUniqueBuyersTarget: 3,
+    qualificationProfileFingerprint: 'a'.repeat(64),
+    causalEvidence: paperMvpCycleEvidence(),
+  };
+  const atBoundary = createPaperMvpOneShotReport({
+    ...input,
+    samples: [createPaperMvpPositionSample(sampleInput({ creationDetectedAtMs: 100 }))],
+  });
+  const beforeBoundary = createPaperMvpOneShotReport({
+    ...input,
+    samples: [createPaperMvpPositionSample(sampleInput({ creationDetectedAtMs: 99 }))],
+  });
+
+  assert.equal(atBoundary.oneShotCycle.functionalStatus, 'COMPLETED');
+  assert.deepEqual(atBoundary.oneShotCycle.failedGateCodes, []);
+  assert.equal(beforeBoundary.oneShotCycle.functionalStatus, 'INCOMPLETE');
+  assert.deepEqual(beforeBoundary.oneShotCycle.failedGateCodes, ['CREATION_PRECEDES_RUN']);
+  assert.equal(beforeBoundary.technicalStatus, 'DEGRADED');
+  assert.equal(beforeBoundary.verdict, 'FAIL');
+  assert.equal(beforeBoundary.historicalCampaignReport.verdict, 'PASS');
+});
+
 void test('does not infer counted buyers from the sell reason without exact causal evidence', () => {
   const evidence = paperMvpCycleEvidence();
   const input = {
