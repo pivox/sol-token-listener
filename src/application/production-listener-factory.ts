@@ -1,4 +1,5 @@
 import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
+import { createPumpFunWorkerAdmissionPolicy } from '../domain/worker-admission.js';
 import {
   requireSolanaGenesisHash,
   SolanaGenesisHashError,
@@ -257,10 +258,14 @@ export function createProductionListenerRuntime(
         signal?: AbortSignal,
       ) { return gatedBlockRpc.getBlockTransactions(slot, status, signal); },
     });
+  const workerAdmissionPolicy = createPumpFunWorkerAdmissionPolicy({
+    enabled: config.listenerPumpFunBoundedWorkerAdmissionEnabled,
+    trackingWindowSeconds: config.listenerPumpFunTrackingWindowSeconds,
+  });
   const inbox = new PostgresTransactionInboxRepository(databasePool, Object.freeze({
     maxAttempts: config.rpcRetryMaxAttempts,
     baseDelayMs: config.rpcRetryBaseDelayMs,
-  }));
+  }), workerAdmissionPolicy);
   const promoted = new PromotedProviderSelector(
     providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId, undefined, recorder)),
   );

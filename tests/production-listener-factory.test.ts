@@ -53,6 +53,7 @@ import { ProviderAffineCatchUpHydration } from '../src/application/provider-affi
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import type { ListenerRuntimeDependencies } from '../src/application/listener-runtime.js';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
+import type { PumpFunWorkerAdmissionPolicyV1 } from '../src/domain/worker-admission.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
@@ -387,6 +388,56 @@ void test('configured inbox workers share one repository, pipeline and gated loc
   assert.equal(members[0]?.locator, members[1]?.locator);
   assert.equal(members[0]?.pipeline, members[1]?.pipeline);
   await dependencies.worker.close();
+});
+
+void test('bounded admission composes one frozen policy without changing workers or opening the database', async (context) => {
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  context.mock.method(PostgresTransactionInboxRepository.prototype, 'hasNonTerminalProgramWork', async () => false);
+  let composition: string[] | undefined;
+  for (const enabled of [undefined, 'false', 'true']) {
+    const runtime = createProductionListenerRuntime(config({
+      EXECUTION_MODE: 'observe',
+      LISTENER_WORKER_COUNT: '2',
+      LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+      LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+      LISTENER_INGESTION_SCOPE: 'launchpad-only',
+      LISTENER_CATCH_UP_POLICY: 'live-edge',
+      LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS: '73',
+      ...(enabled === undefined ? {} : { LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: enabled }),
+    }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+    assert.equal(runtime.state(), 'STOPPED');
+    const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+    const currentComposition = Object.entries(dependencies).map(([key, value]) => `${key}:${value.constructor.name}`);
+    composition ??= currentComposition;
+    assert.deepEqual(currentComposition, composition);
+    const previousStarts = starts.mock.callCount();
+    await dependencies.worker.start();
+    const members = starts.mock.calls.slice(previousStarts).map(({ this: worker }) => worker as unknown as {
+      repository: PostgresTransactionInboxRepository; locator: unknown; pipeline: unknown;
+    });
+    assert.equal(members.length, 2);
+    assert.equal(members[0]?.repository, members[1]?.repository);
+    assert.equal(members[0]?.locator, members[1]?.locator);
+    assert.equal(members[0]?.pipeline, members[1]?.pipeline);
+    const policy = (members[0]?.repository as unknown as {
+      workerAdmissionPolicy: PumpFunWorkerAdmissionPolicyV1;
+    }).workerAdmissionPolicy;
+    assert.deepEqual(policy, {
+      schemaVersion: 'pumpfun-worker-admission-policy.v1',
+      enabled: enabled === 'true',
+      trackingWindowSeconds: 73,
+    });
+    assert.ok(Object.isFrozen(policy));
+    await dependencies.worker.close();
+  }
+});
+
+void test('production creates one bounded admission policy and injects it as the sole inbox third argument', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.equal(count(source, /createPumpFunWorkerAdmissionPolicy\(/gu), 1);
+  assert.equal(count(source, /new PostgresTransactionInboxRepository\(/gu), 1);
+  assert.match(source, /createPumpFunWorkerAdmissionPolicy\(\{\s*enabled: config\.listenerPumpFunBoundedWorkerAdmissionEnabled,\s*trackingWindowSeconds: config\.listenerPumpFunTrackingWindowSeconds,\s*\}\)/u);
+  assert.match(source, /new PostgresTransactionInboxRepository\(databasePool, Object\.freeze\(\{[^}]*\}\), workerAdmissionPolicy\)/u);
 });
 
 void test('multi-worker startup fails before members when durable PumpSwap work is non-terminal', async (context) => {
