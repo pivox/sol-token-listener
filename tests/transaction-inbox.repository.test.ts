@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
+import { PumpFunCatchUpBlockClassifier } from '../src/application/pumpfun-catch-up-block-classifier.js';
+import { PumpFunStrictCatchUpPageAdmitter } from '../src/application/pumpfun-strict-catch-up-page-admitter.js';
+import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import { createPumpDecodingError, PUMP_DECODING_ERROR_CODES } from '../src/launchpads/pumpfun/errors.js';
@@ -59,6 +62,114 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
+
+void test('admission review: strict coverage hydrates unadmitted WebSocket work once then covers the durable classification', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    const fixture = (await loadPumpFixture('create-v2-current-initial-buy-mainnet.json')).transaction;
+    const transaction = Object.freeze({ ...fixture, confirmationStatus: 'CONFIRMED' as const });
+    await repository.enqueue(notification(transaction.signature, transaction.slot, 'WEBSOCKET', 'confirmed'));
+    const candidate = catchUpCoverageCandidate(transaction.signature, transaction.slot, 'confirmed');
+    assert.deepEqual(await new PostgresTransactionInboxRepository(pool).readExistingCatchUpCoverage(
+      [candidate], new AbortController().signal,
+    ), [catchUpCoverageReceipt(candidate)]);
+    let hydrations = 0;
+    const classifier = new PumpFunCatchUpBlockClassifier({
+      async locate(target) {
+        hydrations += 1;
+        assert.equal(target.signature, transaction.signature);
+        return transaction;
+      },
+    }, repository, () => 2_000, { coverageFastPathEnabled: true, coverageRepository: repository });
+    const admitter = new PumpFunStrictCatchUpPageAdmitter(classifier);
+    const program = Object.freeze({ key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID } as const);
+    const page = Object.freeze([Object.freeze({ signature: transaction.signature, slot: transaction.slot,
+      confirmationStatus: 'confirmed' as const, blockTimeMs: transaction.blockTimeMs, transactionFailed: false })]);
+    const signal = new AbortController().signal;
+    const result = await admitter.admitPage(program, page, signal);
+    assert.equal(hydrations, 1);
+    assert.equal(result.signaturesClassified, 1n);
+    assert.equal(result.signaturesEnqueued, 1n);
+    assert.equal(result.receipts[0]?.disposition, 'ACTIONABLE');
+    const admitted = await row(pool, transaction.signature);
+    assert.equal(admitted.worker_admitted_at.getTime(), 2_000);
+    assert.equal(admitted.catch_up_enqueued, true);
+    const replay = await admitter.admitPage(program, page, signal);
+    assert.equal(hydrations, 1);
+    assert.equal(replay.receipts[0]?.persistence, 'ALREADY_ADMITTED');
+    assert.equal(replay.signaturesClassified, 0n);
+    assert.deepEqual(await row(pool, transaction.signature), admitted);
+    assert.equal((await repository.claim(Date.now(), 30))?.signature, transaction.signature);
+  });
+});
+
+void test('admission review: enabled coverage retains admitted, classified-unadmitted and purged terminal semantics', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    const terminal = catchUpCoverageCandidate('enabled-coverage-terminal', 3n, 'finalized');
+    await repository.enqueue(notification(terminal.signature, terminal.slot, 'WEBSOCKET', 'finalized', 1_000, 'PUMPFUN_CREATE'));
+    const claim = await repository.claim(Date.now(), 30);
+    assert.ok(claim);
+    await repository.saveSnapshot(terminal.signature, claim.leaseToken, normalized(terminal.signature, terminal.slot));
+    await repository.markProcessed(terminal.signature, claim.leaseToken, 'finalized');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [terminal.signature]);
+    const admitted = catchUpCoverageCandidate('enabled-coverage-admitted', 1n, 'confirmed');
+    await repository.enqueue(notification(admitted.signature, admitted.slot, 'WEBSOCKET', 'confirmed', 1_000, 'PUMPFUN_CREATE'));
+    const deferred = catchUpCoverageCandidate('enabled-coverage-deferred', 2n, 'confirmed');
+    await repository.recordCatchUpClassification(createCatchUpClassification({
+      ...catchUpClassificationInput(deferred.signature), slot: deferred.slot,
+      disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+    }));
+    assert.equal((await row(pool, deferred.signature)).worker_admitted_at, null);
+    const candidates = [admitted, deferred, terminal];
+    assert.deepEqual(await repository.readExistingCatchUpCoverage(candidates, new AbortController().signal),
+      candidates.map(catchUpCoverageReceipt));
+  });
+});
+
+void test('admission review: rollback to OFF admits only the selected pending row and does not wedge the scheduler', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const enabled = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    await enabled.enqueue(notification('rollback-first', 1n));
+    await enabled.enqueue(notification('rollback-second', 2n));
+    const firstBefore = await row(pool, 'rollback-first');
+    const secondBefore = await row(pool, 'rollback-second');
+    const disabled = new PostgresTransactionInboxRepository(pool);
+    const now = Date.now();
+    const first = await disabled.claim(now, 1);
+    assert.equal(first?.signature, 'rollback-first');
+    assert.equal(first.attempts, 1);
+    const admitted = await row(pool, first.signature);
+    assert.ok(admitted.worker_admitted_at instanceof Date);
+    assert.equal(admitted.first_detected_at.getTime(), firstBefore.first_detected_at.getTime());
+    assert.equal(admitted.observed_at.getTime(), firstBefore.observed_at.getTime());
+    assert.deepEqual(await row(pool, 'rollback-second'), secondBefore);
+    assert.equal((await new PostgresTransactionInboxRepository(pool).claim(now + 1_001, 30))?.signature, first.signature);
+    assert.equal((await row(pool, first.signature)).worker_admitted_at.getTime(), admitted.worker_admitted_at.getTime());
+    assert.equal((await disabled.claim(now + 1_002, 30))?.signature, 'rollback-second');
+    assert.equal(await disabled.claim(now + 1_003, 30), null);
+    assert.deepEqual((await pool.query(`SELECT consecutive_urgent_claims,launch_claims_since_tracked
+      FROM chain_transaction_inbox_claim_scheduler`)).rows[0], {
+      consecutive_urgent_claims: 0, launch_claims_since_tracked: 0,
+    });
+  });
+});
+
+void test('admission review: fresh multi-program ACTIONABLE ambiguity fails with a typed classification conflict and no row', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    const classification = createCatchUpClassification({ ...catchUpClassificationInput('ambiguous-actionable-conflict'),
+      programIds: [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort(),
+      ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await assert.rejects(repository.recordCatchUpClassification(classification),
+        (error: unknown) => error instanceof TransactionInboxConflictError && error.conflict === 'classification');
+      assert.equal((await pool.query('SELECT COUNT(*)::INTEGER AS count FROM chain_transaction_inbox')).rows[0]?.count, 0);
+    }
+    assert.equal(await repository.claim(Date.now(), 30), null);
+  });
+});
 
 void test('worker admission snapshots and validates the optional policy without changing retry compatibility', async (context) => {
   await withDatabase(context, async (pool) => {

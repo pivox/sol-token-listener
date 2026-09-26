@@ -830,6 +830,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
         const actionKey = catchUpActionKey(value);
         const decision = classificationDecision(value, tracked, programs);
+        // Migration 049 requires fresh catch-up-only ACTIONABLE evidence to
+        // represent an admission. Multi-program ambiguity is not admissible
+        // under the enabled policy; reject it deliberately before any write.
+        if (this.workerAdmissionPolicy.enabled && row === undefined
+          && value.disposition === 'ACTIONABLE' && decision.priority === 'NORMAL') {
+          throw internalRepositoryError(new TransactionInboxConflictError('classification'));
+        }
         const terminalAt = decision.status === 'PENDING' ? null : dateFromMs(value.classifiedAtMs);
         if (row !== undefined && row.catch_up_classification_version !== null) {
           if (!storedClassificationMatches(row, value, actionKey)) {
@@ -1042,6 +1049,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            inbox.program_ids AS inbox_program_ids,
            inbox.target_confirmation_status AS inbox_confirmation_status,
            inbox.observed_at AS inbox_observed_at,
+           inbox.worker_admitted_at AS inbox_worker_admitted_at,
            inbox.finality_evidence_version AS inbox_finality_evidence_version,
            inbox.immutable_fingerprint AS inbox_immutable_fingerprint,
            inbox.processed_at AS inbox_processed_at,
@@ -1081,7 +1089,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           || !sameProgramIds(storedProgramIds(row.candidate_program_ids), candidate.programIds)) {
           throw internalRepositoryError(new TransactionInboxConflictError('identity'));
         }
-        const covered = assertAndReadCoverage(row, candidate);
+        const covered = assertAndReadCoverage(row, candidate, this.workerAdmissionPolicy.enabled);
         if (covered) {
           receipts.push(createCatchUpClassificationReceipt({
             signature: candidate.signature,
@@ -1236,6 +1244,17 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const signature = optionalText(selectedRow?.signature, 'claim signature');
         if (signature === null) return null;
         const ingestionPriority = storedInboxPriority(selectedRow?.ingestion_priority);
+        if (!this.workerAdmissionPolicy.enabled) {
+          // Rollback to OFF may encounter unadmitted PENDING rows written by
+          // ON. Admit only the already locked legacy candidate before leasing;
+          // ordinary legacy rows and the scheduler selection remain unchanged.
+          await client.query(
+            `UPDATE chain_transaction_inbox SET
+               worker_admitted_at=GREATEST(clock_timestamp(),observed_at)
+             WHERE signature=$1 AND worker_admitted_at IS NULL AND processing_status='PENDING'`,
+            [signature],
+          );
+        }
         const token = randomUUID();
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
@@ -3127,6 +3146,7 @@ function descriptorValue(descriptor: PropertyDescriptor | undefined): unknown {
 function assertAndReadCoverage(
   row: QueryResultRow,
   candidate: CatchUpAdmissionCoverageCandidate,
+  workerAdmissionEnabled: boolean,
 ): boolean {
   const hasInbox = row.inbox_signature !== null;
   const hasReceipt = row.receipt_signature !== null;
@@ -3134,6 +3154,7 @@ function assertAndReadCoverage(
 
   let inbox: InboxIdentityRow | undefined;
   let inboxAdvances = false;
+  let requiresClassification = false;
   if (hasInbox) {
     if (row.inbox_signature !== candidate.signature
       || numericBigInt(row.inbox_observed_slot, 'catch-up coverage inbox slot') !== candidate.slot) {
@@ -3145,6 +3166,8 @@ function assertAndReadCoverage(
     const hasClassification = validateStoredCoverageClassification(
       row, sources, candidate, storedPrograms, storedStatus,
     );
+    requiresClassification = workerAdmissionEnabled && !hasClassification
+      && row.inbox_worker_admitted_at === null;
     if (!sources.includes('WEBSOCKET') && !hasClassification) {
       throw internalRepositoryError(new TransactionInboxConflictError('classification'));
     }
@@ -3179,7 +3202,7 @@ function assertAndReadCoverage(
     assertTerminalReceiptAcceptsNotification(receipt, candidate);
     if (inbox !== undefined) assertTerminalReceiptMatchesInbox(receipt, inbox);
   }
-  return !inboxAdvances;
+  return !inboxAdvances && !requiresClassification;
 }
 
 function validateStoredCoverageClassification(
