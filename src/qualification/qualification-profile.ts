@@ -64,6 +64,14 @@ export function loadQualificationProfile(options: LoadQualificationProfileOption
   return parseQualificationProfileJson(contents, options.minimumScoreOverride);
 }
 
+export function loadBundledTechnicalMvpQualificationProfile(): EffectiveQualificationProfile {
+  const contents = readProfileBytes(
+    new URL('../../config/qualification/pumpfun-mvp-technical-v1.json', import.meta.url),
+    undefined,
+  );
+  return parseQualificationProfileJson(contents, null);
+}
+
 export function parseQualificationProfileJson(contents: Buffer, minimumScoreOverride: number | null): EffectiveQualificationProfile {
   if (isProxy(contents) || !Buffer.isBuffer(contents)) throw new QualificationProfileError('PROFILE_JSON_INVALID');
   if (contents.byteLength > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');

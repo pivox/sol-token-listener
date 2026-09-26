@@ -27,13 +27,14 @@ void test('acquires the relation-scoped scheduler lock before the claim statemen
   );
 
   assert.equal(await repository.claim({ nowMs: 100_000, leaseMs: 10_000 }), null);
-  assert.equal(statements.length, 4);
+  assert.equal(statements.length, 5);
   assert.equal(statements[0], 'BEGIN ISOLATION LEVEL READ COMMITTED');
   assert.match(statements[1] ?? '', /pg_advisory_xact_lock/u);
   assert.match(statements[1] ?? '', /paper-decision-claim-scheduler:v1/u);
   assert.match(statements[1] ?? '', /'paper_decision_jobs'::regclass::oid/u);
   assert.match(statements[2] ?? '', /^WITH inspection AS MATERIALIZED/u);
-  assert.equal(statements[3], 'COMMIT');
+  assert.match(statements[3] ?? '', /^SELECT job\.job_id,job\.mint,job\.source_event_id/u);
+  assert.equal(statements[4], 'COMMIT');
 });
 
 void test('extends claim timestamps by the elapsed scheduler-lock wait', async () => {

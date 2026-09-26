@@ -34,6 +34,7 @@ import {
 } from '../src/application/paper-decision-worker.js';
 import { CreationEntryV1Strategy } from '../src/application/creation-entry-v1.strategy.js';
 import { ValidatedExternalBuysStrategy } from '../src/application/validated-external-buys.strategy.js';
+import { QualificationProjectionRepositoryError } from '../src/storage/qualification-projection.repository.js';
 
 void test('persists explainable observe decisions without requesting quotes or paper actions', async () => {
   const repository = new FakeRepository([claim()]);
@@ -231,6 +232,26 @@ void test('quotes both directions, stages BUY_PENDING before the ledger and comp
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
+void test('persists and authorizes the quote-backed qualification before paper candidate creation', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('ELIGIBLE');
+  const quotes = new FakeQuotes();
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind, 'completed');
+  assert.equal(services.qualification.quoteBackedCalls.length, 1);
+  assert.equal(services.qualification.quoteBackedCalls[0]?.mint, 'MINT');
+  assert.equal(services.qualification.quoteBackedCalls[0]?.buyQuote?.id, 'buy');
+  assert.equal(services.qualification.quoteBackedCalls[0]?.reverseSellQuote?.id, 'reverse');
+  assert.equal(
+    services.candidates.calls[0]?.reportId,
+    canonicalQualification().reportId,
+  );
+});
+
 void test('turns a typed transient quote error into a bounded repository retry', async () => {
   const repository = new FakeRepository([claim()]);
   const quotes = new FakeQuotes();
@@ -245,6 +266,50 @@ void test('turns a typed transient quote error into a bounded repository retry',
   assert.equal(repository.failures[0]?.failure.code, 'QUOTE_UNAVAILABLE');
   assert.equal(repository.failures[0]?.failure.retryable, true);
   assert.ok(repository.failures[0]?.failure.terminalResult);
+});
+
+void test('retries a quote-backed projection storage failure without creating a candidate', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('ELIGIBLE');
+  services.qualification.rebuildWithQuotes = async () => { throw new QualificationProjectionRepositoryError(); };
+  const worker = new PaperDecisionWorker(repository, new FakeQuotes(), services.qualification,
+    services.candidates, services.strategy, options(), new ManualScheduler());
+  assert.equal((await worker.runOnce()).kind, 'failed');
+  assert.deepEqual(repository.failures[0]?.failure, {
+    code:'RPC_TRANSIENT', retryable:true, terminalResult:null,
+  });
+  assert.equal(services.candidates.calls.length, 0);
+});
+
+void test('uses the canonical report snapshot and reloads trade evidence after quoting', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('ELIGIBLE');
+  const canonical = snapshot({ launch:{ ...snapshot().launch, creator:'canonical-creator' } });
+  services.qualification.rebuildWithQuotes = async () => {
+    return { kind:'UPDATED', projection:canonicalQualification(), snapshot:{ ...canonical, asOfRawEventId:'raw_source' } };
+  };
+  const worker = new PaperDecisionWorker(repository, new FakeQuotes(), services.qualification,
+    services.candidates, services.strategy, options(), new ManualScheduler());
+  assert.equal((await worker.runOnce()).kind, 'completed');
+  assert.equal(services.candidates.calls[0]?.snapshot.launch.creator, 'canonical-creator');
+});
+
+void test('defers entry when canonical trades advanced again after the quote-backed report', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('ELIGIBLE');
+  const rebuild = services.qualification.rebuildWithQuotes.bind(services.qualification);
+  services.qualification.rebuildWithQuotes = async (...args) => {
+    const result = await rebuild(...args);
+    repository.snapshotValue = snapshot({ currentQualification:{
+      ...canonicalQualification(), sourceEventId:'new-creator-sell',
+    } });
+    return result;
+  };
+  const worker = new PaperDecisionWorker(repository, new FakeQuotes(), services.qualification,
+    services.candidates, services.strategy, options(), new ManualScheduler());
+  assert.equal((await worker.runOnce()).kind, 'failed');
+  assert.equal(repository.failures[0]?.failure.retryable, true);
+  assert.equal(services.candidates.calls.length, 0);
 });
 
 void test('retries only a typed stale qualification rejected at paper open',async()=>{
@@ -1209,6 +1274,11 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   };
   const qualification = {
     calls:[] as CanonicalQualificationProjection[],
+    quoteBackedCalls:[] as Readonly<{
+      mint:string;
+      buyQuote:PaperExecutionQuote|null;
+      reverseSellQuote:PaperExecutionQuote|null;
+    }>[],
     rejected:null as CanonicalQualificationProjection|null,
     beforeReauthorize:()=>undefined,
     authorizedReport:rebuilt.report,
@@ -1219,6 +1289,18 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       return Object.freeze({
         ...rebuilt,reportId:'qreport_authorized',reportEventId:'evt_authorized',
         evidenceFingerprint:'e'.repeat(64),event:event('QualificationUpdated','evt_authorized'),
+      });
+    },
+    async rebuildWithQuotes(
+      mint:string,
+      buyQuote:PaperExecutionQuote|null,
+      reverseSellQuote:PaperExecutionQuote|null,
+    ) {
+      this.quoteBackedCalls.push(Object.freeze({ mint,buyQuote,reverseSellQuote }));
+      return Object.freeze({
+        kind:'UPDATED' as const,
+        projection:canonicalQualification(),
+        snapshot:{ ...snapshot(), asOfRawEventId:'raw_source' },
       });
     },
   };

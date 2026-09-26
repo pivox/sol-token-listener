@@ -113,6 +113,8 @@ export type PaperMvpTerminalization =
   }>;
 
 export interface PaperMvpRunSnapshot {
+  /** Additive live relational evidence, read in the same consistent snapshot. Never part of legacy V2. */
+  readonly causalEvidence?: unknown;
   readonly run: PaperMvpRun;
   readonly samples: readonly PaperMvpPositionSample[];
   readonly unknownPositions: readonly PaperMvpUnknownPosition[];

@@ -110,9 +110,11 @@ void test('bounded reader rejects a file that grows after reading starts', async
     const padding = ' '.repeat(MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES
       - Buffer.byteLength(fixtureText, 'utf8'));
     await writeFile(mutable, `${fixtureText}${padding}`, 'utf8');
-    const reading = readBoundedRegularFile(mutable, MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES);
+    const rejection = assert.rejects(
+      readBoundedRegularFile(mutable, MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES),
+    );
     await appendFile(mutable, 'x', 'utf8');
-    await assert.rejects(reading);
+    await rejection;
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

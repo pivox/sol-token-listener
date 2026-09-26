@@ -60,6 +60,18 @@ export interface PaperStrategyErrorEvidence {
   readonly retryable: boolean;
 }
 
+/**
+ * A paper BUY is not an on-chain instruction, so its quote only provides a
+ * slot watermark. The whole slot is intentionally considered pre-entry: this
+ * prevents same-slot trades with unknowable ordering from being counted.
+ */
+export interface PaperEntryBoundary {
+  readonly kind: 'PAPER_BUY_QUOTE_SLOT';
+  readonly slot: bigint;
+  readonly quoteId: string;
+  readonly observedAtMs: number;
+}
+
 export interface PaperStrategySessionV1 {
   readonly id: string;
   readonly mint: string;
@@ -96,6 +108,7 @@ PaperStrategySessionV1,
   readonly countedBuyerWallets: readonly string[];
   readonly pendingExitReason: CreationExitReason | null;
   readonly pendingExitTriggerAtMs?: number | null;
+  readonly entryBoundary: PaperEntryBoundary | null;
   readonly payloadVersion: 2;
 }
 
@@ -124,6 +137,7 @@ export interface CreateCreationEntrySessionInput extends CreatePaperStrategySess
   readonly countedBuyerWallets: readonly string[];
   readonly pendingExitReason: CreationExitReason | null;
   readonly pendingExitTriggerAtMs?: number | null;
+  readonly entryBoundary?: PaperEntryBoundary | null;
 }
 
 export interface PaperExternalBuyEvidence {
@@ -245,6 +259,14 @@ export function createCreationEntrySession(
       throw new TypeError('Creation session manual exit trigger is inconsistent.');
     }
   }
+  const entryBoundary = input.entryBoundary == null
+    ? null
+    : validateAndSnapshotEntryBoundary(input.entryBoundary);
+  if (
+    entryBoundary !== null
+    && input.lastCountedCursor !== null
+    && input.lastCountedCursor.slot <= entryBoundary.slot
+  ) throw new TypeError('Creation session counted cursor predates its paper entry boundary.');
 
   const strategy = Object.freeze({ id: 'creation-entry-v1' as const, version: 1 as const });
   const quoteAsset = Object.freeze({ ...input.candidate.quoteAsset });
@@ -293,6 +315,7 @@ export function createCreationEntrySession(
     lastError,
     pendingExitReason: input.pendingExitReason,
     pendingExitTriggerAtMs,
+    entryBoundary,
     createdAtMs: input.createdAtMs,
     updatedAtMs: input.updatedAtMs,
     purgeAfterMs: input.purgeAfterMs,
@@ -476,11 +499,47 @@ function validateExternalBuy(
   if (
     input.mint !== session.mint
     || input.quoteMint !== session.quoteAsset.mint
-    || compareCursors(input.cursor, session.entryCursor) <= 0
+    || (session.payloadVersion === 2
+      ? !isStrictlyAfterPaperEntry(session, input.cursor)
+      : compareCursors(input.cursor, session.entryCursor) <= 0)
     || !confirmationReached(input.confirmationStatus, session.minimumConfirmation)
     || (input.trader !== null && input.trader.length === 0)
   ) throw new TypeError('External buy evidence is inconsistent.');
   assertValidTimestampMs('observedAtMs', input.observedAtMs);
+}
+
+export function isStrictlyAfterPaperEntry(
+  session: PaperStrategySessionV2,
+  cursor: ChainCursor,
+): boolean {
+  assertValidChainCursor(cursor);
+  if (session.entryBoundary === null) {
+    throw new TypeError('Creation session paper entry boundary is missing.');
+  }
+  return cursor.slot > validateAndSnapshotEntryBoundary(session.entryBoundary).slot;
+}
+
+function validateAndSnapshotEntryBoundary(boundary: unknown): PaperEntryBoundary {
+  if (boundary === null || typeof boundary !== 'object' || Array.isArray(boundary)) {
+    throw new TypeError('Creation session paper entry boundary is invalid.');
+  }
+  const value = boundary as Partial<Record<keyof PaperEntryBoundary, unknown>>;
+  if (
+    value.kind !== 'PAPER_BUY_QUOTE_SLOT'
+    || typeof value.slot !== 'bigint'
+    || value.slot < 0n
+    || typeof value.quoteId !== 'string'
+  ) {
+    throw new TypeError('Creation session paper entry boundary is invalid.');
+  }
+  text(value.quoteId, 'entry boundary quote id');
+  assertValidTimestampMs('observedAtMs', value.observedAtMs);
+  return Object.freeze({
+    kind: value.kind,
+    slot: value.slot,
+    quoteId: value.quoteId,
+    observedAtMs: value.observedAtMs,
+  });
 }
 
 function confirmationReached(

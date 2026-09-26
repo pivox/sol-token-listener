@@ -761,7 +761,7 @@ void test('production composes one canonical qualification writer before paper d
   assert.match(source, /new PostgresQualificationProjectionRepository\(databasePool,\s*qualificationRebuilder\)/u);
   assert.match(source, /new QualificationProjectionService\([\s\S]*?qualificationRebuilder,[\s\S]*?config\.paperQuoteMintAllowlist[\s\S]*?\)/u);
   assert.match(source,/new SocialQualificationRefreshService\(qualification,paperRepository\)/u);
-  assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualificationRebuilder,/u);
+  assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualification,/u);
   assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*\)/u);
 });
 

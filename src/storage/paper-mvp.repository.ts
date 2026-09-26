@@ -22,6 +22,7 @@ import type {
 } from '../ports/paper-mvp-repository.js';
 import { canonicalStringifyJson } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import { loadPaperMvpCausalEvidence } from './paper-mvp-causal-evidence.js';
 
 type Row = Readonly<Record<string, unknown>>;
 interface Result { readonly rows: readonly Row[]; readonly rowCount: number | null }
@@ -221,7 +222,12 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       if (run === null) return null;
       const observations = await selectObservations(client, runId);
       assertObservationCounts(run, observations);
+      const onlySample = run.configuration.targetClosedPositions === 1
+        && observations.samples.length === 1 ? observations.samples[0] : undefined;
+      const causalEvidence = onlySample === undefined ? null
+        : await loadPaperMvpCausalEvidence(client, onlySample.positionId);
       return Object.freeze({
+        causalEvidence,
         run,
         samples: observations.samples,
         unknownPositions: observations.unknownPositions,

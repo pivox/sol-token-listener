@@ -70,6 +70,25 @@ void test('ouvre avec le rapport exact produit par l’autorité et rejoue sans 
   assert.deepEqual([...repository.eventStatuses.values()], ['confirmed']);
 });
 
+void test('opens from the explicit technical MVP profile without metadata or social evidence', async () => {
+  const repository = new MemoryPaperRepository();
+  const profile = technicalMvpProfile();
+  const authority = new QualificationEngine(profile);
+  const command = openCommand(authority, {
+    signals: Object.freeze({
+      creatorHasNotSold: true,
+      reverseQuoteAvailable: true,
+    }),
+    calibrationFacts: OPEN_CALIBRATION_FACTS,
+  });
+
+  const position = await makeEngine(repository, 'paper', profile, authority).open(command);
+
+  assert.equal(command.qualification.verdict, 'QUALIFIED');
+  assert.equal(position.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('attache la lignée décisionnelle complète à la position paper', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -1089,6 +1108,14 @@ function reportOnlyExecutionProfile(): EffectiveQualificationProfile {
     ...policy,
     ...(executionCodes.has(String(policy.code)) ? { mode: 'REPORT_ONLY' } : {}),
   }));
+  return parseQualificationProfile(deepFreeze(raw), null);
+}
+
+function technicalMvpProfile(): EffectiveQualificationProfile {
+  const raw = JSON.parse(readFileSync(
+    new URL('../config/qualification/pumpfun-mvp-technical-v1.json', import.meta.url),
+    'utf8',
+  )) as unknown;
   return parseQualificationProfile(deepFreeze(raw), null);
 }
 

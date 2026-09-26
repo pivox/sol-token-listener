@@ -1,33 +1,48 @@
 # Runbook de validation paper MVP Mainnet
 
-Cette procédure produit une preuve `paper-mvp.v2` autour du runtime paper
-existant. Elle ne signe et ne soumet aucune transaction.
+Cette procédure produit une preuve one-shot `paper-mvp.v3` autour du runtime
+paper existant. Elle ne charge aucune clé, ne signe et ne soumet aucune
+transaction. La campagne historique de 50 positions reste distincte et non
+validée.
 
 ## Préparation
 
 1. Appliquer les migrations avec `npm run db:migrate`.
 2. Configurer `SOLANA_CLUSTER=mainnet-beta`, `EXECUTION_MODE=paper`,
    `LISTENER_ENABLED=true`, `CREATION_STRATEGY_ENABLED=true`,
-   `PAPER_STRATEGY_ENABLED=false`, `PAPER_STRATEGY_VERSION=1` et
+   `PAPER_STRATEGY_ENABLED=false`, `PAPER_STRATEGY_ID=validated-external-buys`,
+   `PAPER_STRATEGY_VERSION=1` et
    `PAPER_QUOTE_MINT_ALLOWLIST` avec exactement `WSOL_MINT`.
-3. Configurer les seuils paper/création requis décrits dans le README, sans
-   clé privée ni capacité de signature/soumission. Le runner exige exactement
-   `EXTERNAL_UNIQUE_BUYERS_TARGET=10` et
-   `CREATION_TAKE_PROFIT_MULTIPLIER_BPS=20000` avant tout bootstrap ou accès
-   PostgreSQL.
-4. Choisir un chemin `.json` inexistant. La commande ne l'écrase jamais.
+   `CREATION_STRATEGY_ENABLED` sélectionne `creation-entry-v1`; les deux flags
+   d'activation ne doivent jamais être vrais simultanément.
+3. Sélectionner explicitement
+   `QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-mvp-technical-v1.json`.
+   Ne pas définir `QUALIFICATION_MIN_SCORE` : le minimum appartient au profil
+   versionné et à son fingerprint.
+4. Configurer explicitement le montant d'entrée, le slippage, la perte
+   aller-retour, `EXTERNAL_UNIQUE_BUYERS_TARGET` (1–1000), le minimum par achat
+   externe et la prise de profit (10000–1000000 bps). Aucun de ces nombres ne
+   constitue une recommandation financière.
+5. Choisir un chemin `.json` inexistant. La commande ne l'écrase jamais.
 
 Lancer :
 
 ```bash
 npm run paper:mvp -- \
-  --target-closed=50 \
+  --target-closed=1 \
   --max-duration-seconds=14400 \
   --poll-seconds=5 \
   --initial-capital-raw=1000000000 \
   --network-fee-raw-per-transaction=5000 \
   --report-file=paper-mvp.json
 ```
+
+Dans l'image de production déjà compilée, utiliser la même liste d'arguments
+avec `npm run paper:mvp:compiled --` et sélectionner le profil empaqueté via
+`QUALIFICATION_PROFILE_PATH=dist/config/qualification/pumpfun-mvp-technical-v1.json`.
+Le run one-shot exige
+`--target-closed=1`; toute autre cible produit honnêtement un cycle fonctionnel
+`INCOMPLETE` dans le rapport v3.
 
 Les bornes inclusives sont : cible 1–1000, durée 60–14400 secondes, poll
 1–60 secondes, capital initial positif et frais réseau non négatifs sur au
@@ -55,7 +70,15 @@ secret. Une ligne v1 ou v2 ne contient pas tous ces faits et est refusée sans
 revendication ni backfill. Une configuration différente ou un second runner
 échoue sans adopter ni faire progresser le run.
 
-La cible produit le rapport terminal. Deadline, `SIGINT` et `SIGTERM` demandent
+La cible produit le rapport terminal historique v2 durable, puis l'export
+additif v3. `oneShotCycle.functionalStatus=COMPLETED` exige exactement un BUY,
+un SELL, aucune position restante, aucune terminalité inconnue et aucun
+doublon logique. Le PnL est séparé dans `profitability`; une perte n'est jamais
+masquée, mais ne transforme pas à elle seule une preuve fonctionnelle complète
+en cycle incomplet. Le seuil N effectif et son atteinte figurent dans
+`externalUniqueBuyers`.
+
+Deadline, `SIGINT` et `SIGTERM` demandent
 une dernière collecte bornée à cinq secondes, puis produisent toujours un run
 `COMPLETED` et un rapport exporté non-PASS. Le champ `completionReason` vaut `TARGET_REACHED`, `TIMEOUT`,
 `SIGINT` ou `SIGTERM`. `TIMEOUT` ajoute la gate `RUN_TIMED_OUT`; les deux signaux

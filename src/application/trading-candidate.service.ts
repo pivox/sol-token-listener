@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { PaperExecutionQuote, PaperStrategyIdentity } from '../domain/paper-trading.js';
 import type { QualificationReport } from '../domain/qualification.js';
@@ -10,6 +9,7 @@ import {
 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, QuoteAsset } from '../domain/types.js';
 import type { PaperDecisionSnapshot } from '../ports/paper-decision-repository.js';
+import type { QualificationHolderSummary } from '../ports/qualification-projection-repository.js';
 import { canonicalStringifyJson } from '../utils/json.js';
 
 export interface TradingCandidateServiceOptions {
@@ -25,7 +25,9 @@ export interface TradingCandidateServiceOptions {
 }
 
 export interface TradingCandidateInput {
-  readonly snapshot: PaperDecisionSnapshot;
+  readonly snapshot: Omit<PaperDecisionSnapshot, 'holderSnapshot'> & Readonly<{
+    holderSnapshot: QualificationHolderSummary | null;
+  }>;
   readonly report: QualificationReport;
   readonly reportId: string;
   readonly qualificationEvent: DomainEvent;
@@ -165,12 +167,10 @@ export class TradingCandidateService {
       event.payload.trade.kind === 'SELL'
       && event.payload.trade.trader === input.snapshot.launch.creator
       && event.confirmationStatus !== 'orphaned'
-      && compareCursors(event.cursor, input.qualificationEvent.cursor) <= 0
     )) || input.snapshot.activeMarketTrades.some((trade) => (
       trade.kind === 'SELL'
       && trade.trader === input.snapshot.launch.creator
       && trade.confirmationStatus !== 'orphaned'
-      && compareCursors(trade.cursor, input.qualificationEvent.cursor) <= 0
     ));
   }
 }

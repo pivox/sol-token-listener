@@ -89,6 +89,8 @@ const canonicalMigrations = Object.freeze([
   '051_transaction_inbox_decoder_quarantine_recovery.sql',
   '052_transaction_inbox_urgent_fairness.sql',
   '053_transaction_inbox_worker_admission_foundation.sql',
+  '054_paper_entry_boundary.sql',
+  '055_creation_entry_single_active_session.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',

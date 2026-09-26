@@ -6,6 +6,7 @@ import {
 } from '../src/application/qualification-projection.service.js';
 import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { DomainEvent } from '../src/domain/events.js';
+import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../src/domain/participant-analytics.js';
 import type { QuoteAsset } from '../src/domain/types.js';
 import type { WalletGraphAnalysis } from '../src/domain/wallet-graph.js';
@@ -180,6 +181,95 @@ void test('marks unsupported quote mint only when no launch quote asset is allow
   assert.equal(condition(unsupportedResult.projection, 'UNSUPPORTED_QUOTE_MINT').status, 'TRIGGERED');
 });
 
+void test('persists a quote-backed qualification under the canonical projection transaction', async () => {
+  const repository = new FakeRepository(snapshot(), ['UPDATED']);
+  const projectionService = service(repository, ['SOL']);
+  const buy = quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n);
+  const sell = quote('sell', 'MINT', 'SOL', 900n, 800n, 800n);
+
+  const result = await projectionService.rebuildWithQuotes('MINT', buy, sell);
+
+  assert.equal(result.kind, 'UPDATED');
+  assert.ok(result.projection);
+  assert.deepEqual('snapshot' in result ? result.snapshot : undefined, snapshot());
+  assert.equal(result.projection.evaluation.calibrationFacts?.buySimulationSucceeded, true);
+  assert.equal(result.projection.evaluation.calibrationFacts?.sellQuoteAvailable, true);
+  assert.equal(result.projection.evaluation.calibrationFacts?.roundTripLossBps, 2_000n);
+  assert.deepEqual(repository.transactedMints, ['MINT']);
+  assert.equal(repository.replacements.length, 1);
+});
+
+void test('binds each quote-backed projection to the exact quote identities and coordinates', async () => {
+  const repository = new FakeRepository(snapshot(), ['UPDATED', 'UPDATED']);
+  const projectionService = service(repository, ['SOL']);
+  const firstBuy = quote('buy-first', 'SOL', 'MINT', 1_000n, 900n, 900n);
+  const firstSell = quote('sell-first', 'MINT', 'SOL', 900n, 800n, 800n);
+  const laterBuy = Object.freeze({
+    ...firstBuy, id:'buy-later', observedSlot:11n, observedAtMs:1_100,
+  });
+  const laterSell = Object.freeze({
+    ...firstSell, id:'sell-later', observedSlot:12n, observedAtMs:1_200,
+  });
+
+  const first = await projectionService.rebuildWithQuotes('MINT', firstBuy, firstSell);
+  const later = await projectionService.rebuildWithQuotes('MINT', laterBuy, laterSell);
+
+  assert.ok(first.projection);
+  assert.ok(later.projection);
+  assert.notEqual(later.projection.evidenceFingerprint, first.projection.evidenceFingerprint);
+  assert.notEqual(later.projection.reportId, first.projection.reportId);
+  assert.notEqual(later.projection.qualificationEvent.id, first.projection.qualificationEvent.id);
+  assert.deepEqual(first.projection.evaluation.calibrationFacts?.quoteLineage, {
+    schemaVersion: 1,
+    buy: { quoteId:'buy-first', observedSlot:10n, observedAtMs:1_000 },
+    reverseSell: { quoteId:'sell-first', observedSlot:10n, observedAtMs:1_000 },
+  });
+  assert.deepEqual(later.projection.evaluation.calibrationFacts?.quoteLineage, {
+    schemaVersion: 1,
+    buy: { quoteId:'buy-later', observedSlot:11n, observedAtMs:1_100 },
+    reverseSell: { quoteId:'sell-later', observedSlot:12n, observedAtMs:1_200 },
+  });
+  const persistedPayload = later.projection.qualificationEvent.payload as Readonly<{
+    evaluation: { calibrationFacts: { quoteLineage: unknown } };
+  }>;
+  assert.deepEqual(
+    persistedPayload.evaluation.calibrationFacts.quoteLineage,
+    later.projection.evaluation.calibrationFacts?.quoteLineage,
+  );
+});
+
+for (const side of ['BUY', 'SELL'] as const) {
+for (const field of ['observedSlot', 'observedAtMs'] as const) {
+  void test(`rejects ${side} quotes older than canonical ${field} without persisting a report`, async () => {
+    const repository = new FakeRepository(snapshot(), ['UPDATED']);
+    const buy = quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n);
+    const sell = quote('sell', 'MINT', 'SOL', 900n, 800n, 800n);
+    const stale = { [field]: field === 'observedSlot' ? 0n : 0 };
+    await assert.rejects(() => service(repository, ['SOL']).rebuildWithQuotes(
+      'MINT', side === 'BUY' ? { ...buy, ...stale } : buy,
+      side === 'SELL' ? { ...sell, ...stale } : sell,
+    ));
+    assert.deepEqual(repository.replacements, []);
+  });
+}
+}
+
+void test('rejects an unrelated quote pair before replacing the canonical projection', async () => {
+  const repository = new FakeRepository(snapshot(), []);
+  const projectionService = service(repository, ['SOL']);
+
+  await assert.rejects(
+    () => projectionService.rebuildWithQuotes(
+      'MINT',
+      quote('buy', 'USDC', 'OTHER', 1_000n, 900n, 900n),
+      quote('sell', 'OTHER', 'USDC', 900n, 800n, 800n),
+    ),
+    (error: unknown) => error instanceof TypeError
+      && error.message === 'Qualification projection quote pair is invalid.',
+  );
+  assert.deepEqual(repository.replacements, []);
+});
+
 void test('snapshots a valid quote allowlist and rejects unsafe allowlist inputs', async () => {
   const allowlist = ['SOL'];
   const repository = new FakeRepository(snapshot(), ['UPDATED']);
@@ -342,6 +432,20 @@ function launch(quoteAssets: readonly QuoteAsset[]): QualificationCanonicalSnaps
 
 function quoteAsset(mint: string): QuoteAsset {
   return Object.freeze({ mint, decimals: 9, tokenProgram: 'SPL_TOKEN' });
+}
+
+function quote(
+  id: string,
+  inputMint: string,
+  outputMint: string,
+  amountInRaw: bigint,
+  amountOutRaw: bigint,
+  minimumAmountOutRaw: bigint,
+): PaperExecutionQuote {
+  return Object.freeze({
+    id,inputMint,outputMint,amountInRaw,amountOutRaw,minimumAmountOutRaw,
+    feesRaw:1n,slippageBps:100n,priceImpactBps:10n,observedAtMs:1_000,observedSlot:10n,
+  });
 }
 
 function holderDistribution(): HolderDistribution {

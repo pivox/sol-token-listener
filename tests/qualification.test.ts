@@ -71,6 +71,33 @@ function completeInput() {
   };
 }
 
+function technicalInput() {
+  return deepFreeze({
+    evaluatedAtMs: 1,
+    signals: {
+      creatorHasNotSold: true,
+      reverseQuoteAvailable: true,
+    },
+    blockers: [] as QualificationReasonCode[],
+    calibrationFacts: {
+      top1HolderBps: null,
+      top5HoldersBps: null,
+      top10HoldersBps: null,
+      maximumRelatedClusterBps: null,
+      maximumSharedFunderCount: null,
+      buySimulationSucceeded: true,
+      sellQuoteAvailable: true,
+      roundTripLossBps: 2_000n,
+      upstreamConditions: [
+        { code: 'CREATOR_EARLY_SELL' as const, triggered: false },
+        { code: 'STALE_DATA' as const, triggered: false },
+        { code: 'UNSUPPORTED_TOKEN_EXTENSION' as const, triggered: false },
+        { code: 'UNSUPPORTED_QUOTE_MINT' as const, triggered: false },
+      ],
+    },
+  });
+}
+
 void test('imports the qualification engine without reading the bundled profile', () => {
   const script = `
     import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -145,6 +172,69 @@ void test('creates an engine from the selected custom profile without reading th
     assert.equal(result.status, 0, result.stderr);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+void test('qualifies technical evidence without social evidence only under the explicit MVP profile', () => {
+  const technical = createQualificationEngine({
+    qualificationProfilePath: 'config/qualification/pumpfun-mvp-technical-v1.json',
+    qualificationMinimumScore: null,
+  });
+  const input = technicalInput();
+
+  const technicalReport = technical.evaluate(input);
+  const historicalReport = new QualificationEngine(defaultQualificationRuleSet).evaluate(input);
+
+  assert.equal(technicalReport.verdict, 'QUALIFIED');
+  assert.equal(technicalReport.scores.total.score, 40);
+  assert.equal(
+    technicalReport.evidence.find((item) => item.signal === 'imageValid')?.status,
+    'UNKNOWN',
+  );
+  assert.equal(
+    technicalReport.evidence.find((item) => item.signal === 'socialCrossLinkConfirmed')?.status,
+    'UNKNOWN',
+  );
+  assert.equal(
+    technicalReport.evidence.find((item) => item.signal === 'externalBuyersObserved')?.status,
+    'UNKNOWN',
+  );
+  assert.equal(historicalReport.verdict, 'WATCHLISTED');
+});
+
+void test('rejects every enforced technical blocker under the MVP profile', () => {
+  const engine = createQualificationEngine({
+    qualificationProfilePath: 'config/qualification/pumpfun-mvp-technical-v1.json',
+    qualificationMinimumScore: null,
+  });
+  const cases = [
+    ['CREATOR_EARLY_SELL', { signals: { creatorHasNotSold: false }, upstream: true }],
+    ['BUY_SIMULATION_FAILED', { facts: { buySimulationSucceeded: false } }],
+    ['SELL_QUOTE_UNAVAILABLE', { facts: { sellQuoteAvailable: false } }],
+    ['ROUND_TRIP_LOSS_EXCEEDED', { facts: { roundTripLossBps: 3_001n } }],
+    ['STALE_DATA', { upstream: true }],
+    ['UNSUPPORTED_TOKEN_EXTENSION', { upstream: true }],
+    ['UNSUPPORTED_QUOTE_MINT', { upstream: true }],
+  ] as const;
+
+  for (const [code, change] of cases) {
+    const input = technicalInput();
+    const report = engine.evaluate(deepFreeze({
+      ...input,
+      signals: { ...input.signals, ...('signals' in change ? change.signals : {}) },
+      calibrationFacts: {
+        ...input.calibrationFacts,
+        ...('facts' in change ? change.facts : {}),
+        upstreamConditions: input.calibrationFacts.upstreamConditions.map((condition) => (
+          condition.code === code && 'upstream' in change
+            ? { ...condition, triggered: change.upstream }
+            : condition
+        )),
+      },
+    }));
+
+    assert.equal(report.verdict, 'REJECTED', code);
+    assert.deepEqual(report.blockers.map((blocker) => blocker.code), [code], code);
   }
 });
 
