@@ -2,7 +2,7 @@
 
 Status: approved by the observed Mainnet evidence and issue #191
 
-Revision: 1.0.0
+Revision: 1.0.1
 
 ## Problem
 
@@ -25,16 +25,18 @@ versus inbox target `finalized`.
 
 ## Decision
 
-Before launchpad observation, the pipeline loads the active launchpad events
-already persisted for the exact transaction signature. Their mints are united
-with the globally tracked mints in a request-local immutable set. This union is
-used only for decoding that transaction. The pipeline then keeps the existing
-post-write reload as the authoritative context for funding and downstream
-projections.
+Before launchpad observation, the pipeline requests a signature-aware tracking
+set from its projection reader. The reader unites the globally tracked mints
+with the distinct active launchpad mints already persisted for the exact
+transaction signature. This request-local immutable set is used only for
+decoding that transaction. Reading only distinct mints avoids loading complete
+event payloads twice on the high-throughput path. The pipeline then keeps the
+existing post-write event reload as the authoritative context for funding and
+downstream projections.
 
-The pre-read and the global tracking read remain inside the existing
-`load_tracked_mints` failure boundary. Both results cross the same bounded,
-immutable validation boundary already used by the pipeline.
+The signature-aware read remains inside the existing `load_tracked_mints`
+failure boundary. Its result crosses the same bounded, immutable validation
+boundary already used by the pipeline.
 
 ## Invariants
 
@@ -71,9 +73,9 @@ does not establish the exact-signature reconciliation invariant.
 
 ## Test strategy
 
-1. Pipeline regression: global tracking is empty, the pre-read returns a frozen
-   `confirmed` trade for the same signature, and the transaction is `finalized`.
-   The launchpad observer must receive the persisted mint, the post-read must
+1. Pipeline regression: the transaction is `finalized`; the reader proves that
+   the exact signature adds its persisted mint even when global tracking is
+   empty. The launchpad observer must receive that mint, the post-read must
    return `finalized`, and funding must succeed.
 2. Scope regression: a mint absent from the exact signature is not added.
 3. PostgreSQL integration: persist a confirmed launch/trade, age the launch past
