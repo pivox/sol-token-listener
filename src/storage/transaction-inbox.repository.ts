@@ -1278,7 +1278,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const claimCandidateSql = this.workerAdmissionPolicy.enabled
           ? ADMITTED_CLAIM_CANDIDATE_SQL : CLAIM_CANDIDATE_SQL;
         let selected = urgentStreak === MAX_CONSECUTIVE_URGENT_CLAIMS
-          ? await client.query(claimCandidateSql.NORMAL, [now])
+          ? await this.selectClaimCandidate(client, claimCandidateSql, 'NORMAL', now)
           : { rows: [], rowCount: 0 };
         if (selected.rows.length === 0) {
           const urgentOrder: readonly TransactionInboxPriority[] = launchStreak
@@ -1286,12 +1286,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ? ['TRACKED_TRADE', 'LAUNCH_CANDIDATE']
             : ['LAUNCH_CANDIDATE', 'TRACKED_TRADE'];
           for (const priority of urgentOrder) {
-            selected = await client.query(claimCandidateSql[priority], [now]);
+            selected = await this.selectClaimCandidate(client, claimCandidateSql, priority, now);
             if (selected.rows.length > 0) break;
           }
         }
         if (selected.rows.length === 0) {
-          selected = await client.query(claimCandidateSql.NORMAL, [now]);
+          selected = await this.selectClaimCandidate(client, claimCandidateSql, 'NORMAL', now);
         }
         const selectedRow = selected.rows[0];
         const signature = optionalText(selectedRow?.signature, 'claim signature');
@@ -1348,6 +1348,58 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         return claimFromRow(requiredRow(updated.rows[0]));
       });
     });
+  }
+
+  private async selectClaimCandidate(
+    client: InboxClient,
+    claimCandidateSql: Readonly<Record<TransactionInboxPriority, string>>,
+    priority: TransactionInboxPriority,
+    now: Date,
+  ): Promise<{ readonly rows: readonly QueryResultRow[]; readonly rowCount: number | null }> {
+    if (!this.workerAdmissionPolicy.enabled || priority !== 'TRACKED_TRADE') {
+      return client.query(claimCandidateSql[priority], [now]);
+    }
+    const preview = await client.query(
+      `SELECT signature,ingestion_hint_mint AS mint
+       FROM chain_transaction_inbox
+       WHERE ingestion_priority='TRACKED_TRADE' AND worker_admitted_at IS NOT NULL AND (
+         (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+         OR (processing_status='FAILED' AND error_retryable=TRUE
+           AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+           AND attempts_in_cycle<retry_max_attempts)
+         OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+           AND attempts_in_cycle<retry_max_attempts)
+       )
+       ORDER BY observed_slot,signature LIMIT 1`,
+      [now],
+    );
+    const previewRow = preview.rows[0];
+    if (previewRow === undefined) return { rows: [], rowCount: 0 };
+    const signature = requiredText(previewRow.signature, 'tracked trade claim signature');
+    assertCanonicalMint(previewRow.mint);
+    await lockWorkerTrackingMints(client, [previewRow.mint]);
+    const authority = await readWorkerTrackingAuthority(
+      client,
+      previewRow.mint,
+      this.workerAdmissionPolicy.trackingWindowSeconds,
+    );
+    if (!authority.active) return { rows: [], rowCount: 0 };
+    return client.query(
+      `SELECT signature,ingestion_priority
+       FROM chain_transaction_inbox
+       WHERE signature=$2 AND ingestion_priority='TRACKED_TRADE'
+         AND ingestion_hint='PUMPFUN_TRADE' AND ingestion_hint_mint=$3
+         AND worker_admitted_at IS NOT NULL AND (
+           (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
+           OR (processing_status='FAILED' AND error_retryable=TRUE
+             AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
+             AND attempts_in_cycle<retry_max_attempts)
+           OR (processing_status='PROCESSING' AND lease_expires_at<=$1
+             AND attempts_in_cycle<retry_max_attempts)
+         )
+       ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+      [now, signature, previewRow.mint],
+    );
   }
 
   private async demoteExpiredPristineTrades(client: InboxClient): Promise<void> {

@@ -68,6 +68,39 @@ const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
 
+void test('enabled claim never leases an out-of-authority tracked trade beyond the demotion batch',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      await replaceAuthorityWithTask4Tables(pool);
+      const protectedMints = Array.from(
+        { length: MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM },
+        (_, index) => canonicalTestMint(index + 300),
+      );
+      await insertExpiredAdmittedTradesAcrossMints(pool, 'demotion-authority-saturation',
+        protectedMints);
+      await pool.query(`INSERT INTO paper_strategy_sessions(mint,state)
+        SELECT mint,'BUY_PENDING' FROM UNNEST($1::TEXT[]) AS mint`, [protectedMints]);
+      const unsafeMint = canonicalTestMint(900);
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+        worker_admitted_at
+      ) VALUES ('demotion-authority-overflow',0,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+        'PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$2,TIMESTAMPTZ '2026-01-02 00:00:00+00',
+        TIMESTAMPTZ '2026-01-02 00:00:00+00')`, [PUMP_PROGRAM_ID, unsafeMint]);
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+
+      assert.equal(await repository.claim(Date.now(), 30), null);
+      const unsafe = await row(pool, 'demotion-authority-overflow');
+      assert.notEqual(unsafe.processing_status, 'PROCESSING');
+      assert.equal(unsafe.attempts, 0);
+      assert.deepEqual(await schedulerState(pool), {
+        consecutive_urgent_claims: 0,
+        launch_claims_since_tracked: 0,
+      });
+    });
+  });
+
 void test('enabled claim demotes exactly 256 expired pristine trades oldest first without consuming fairness',
   async (context) => {
     await withDatabase(context, async (pool) => {
