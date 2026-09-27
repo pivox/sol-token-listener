@@ -21,6 +21,7 @@ import {
 } from '../src/solana/rpc/transaction-locator.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { trustedTerminalAttribution, trustedTerminalAttributionContext } from '../src/domain/terminal-attribution.js';
+import { createPumpSwapDecodingError } from '../src/markets/pumpswap/errors.js';
 import { failurePipeline, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
 
 void test('claims one row and processes it in durable order with claim finality', async () => {
@@ -337,6 +338,29 @@ void test('adds immutable transaction locator to UNKNOWN failures without changi
   assert.deepEqual(marked, failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineFailure.v1.launchpad_observation.UNKNOWN', true));
   assert.deepEqual(trustedTerminalAttributionContext(marked), {
     originCode: null, locator: { signature: 'sig', slot: 1n, transactionIndex: 3,
+      confirmationStatus: 'processed', instructionIndex: null, innerInstructionIndex: null },
+  });
+});
+
+void test('preserves an authenticated PumpSwap origin when the worker adds its locator', async () => {
+  let marked: IngestionFailure | null = null;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim(); },
+    async markFailed(_signature, _token, value) { marked = value; },
+  }), locator(), failurePipeline(() => {
+    throw createPumpSwapDecodingError('PUMPSWAP_EVENT_MISMATCH', 'private details');
+  }, 'pumpswap_observation'), options());
+
+  await worker.runOnce();
+
+  assert.deepEqual(marked, failure(
+    'PIPELINE_STAGE_FAILED',
+    'ObservedPipelineFailure.v1.pumpswap_observation.PUMPSWAP_EVENT_MISMATCH',
+    false,
+  ));
+  assert.deepEqual(trustedTerminalAttributionContext(marked), {
+    originCode: 'PUMPSWAP_EVENT_MISMATCH',
+    locator: { signature: 'sig', slot: 1n, transactionIndex: 3,
       confirmationStatus: 'processed', instructionIndex: null, innerInstructionIndex: null },
   });
 });

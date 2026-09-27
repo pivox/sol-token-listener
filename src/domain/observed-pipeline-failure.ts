@@ -32,7 +32,8 @@ export function trustedObservedPipelineOrigin(value: unknown): Exclude<ObservedP
 }
 
 /** @internal Wrapping can only preserve authority already present on the exact cause. */
-export function inheritObservedPipelineOrigin(wrapper: Error, cause: unknown): void {
+export function inheritObservedPipelineOrigin(wrapper: object, cause: unknown): void {
+  if (isProxy(wrapper)) return;
   const code = trustedObservedPipelineOrigin(cause);
   if (code !== null) trustedOrigins.set(wrapper, code);
   inheritTrustedTerminalAttribution(wrapper, cause);

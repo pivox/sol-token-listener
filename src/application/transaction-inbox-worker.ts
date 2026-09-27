@@ -14,6 +14,7 @@ import {
 } from '../solana/rpc/transaction-locator.js';
 import type { LegacyConfirmationStatus, NormalizedTransaction } from '../solana/rpc/types.js';
 import { trustedObservedPipelineFailure } from './observed-transaction-pipeline.js';
+import { trustedObservedPipelineOrigin } from '../domain/observed-pipeline-failure.js';
 import {
   registerTrustedTerminalAttributionContext, trustedTerminalAttributionContext,
 } from '../domain/terminal-attribution.js';
@@ -300,7 +301,7 @@ export class TransactionInboxWorker {
       if (trustedTerminalAttributionContext(pipelineFailed) === null) {
         try {
           registerTrustedTerminalAttributionContext(pipelineFailed, {
-            originCode: null,
+            originCode: trustedObservedPipelineOrigin(pipelineFailed),
             locator: {
               signature: transaction.signature, slot: transaction.slot,
               transactionIndex: transaction.transactionIndex,

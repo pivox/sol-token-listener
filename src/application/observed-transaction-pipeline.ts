@@ -1,8 +1,10 @@
 import { isDeepStrictEqual } from 'node:util';
 import type { IngestionFailure } from '../domain/transaction-ingestion.js';
-import { trustedObservedPipelineOrigin } from '../domain/observed-pipeline-failure.js';
+import {
+  inheritObservedPipelineOrigin,
+  trustedObservedPipelineOrigin,
+} from '../domain/observed-pipeline-failure.js';
 import type { ObservedPipelineStage } from '../domain/observed-pipeline-failure.js';
-import { inheritTrustedTerminalAttribution } from '../domain/terminal-attribution.js';
 import {
   createBondingCurveTradeObservedEvent,
   createTokenLaunchDetectedEvent,
@@ -230,7 +232,7 @@ export class ObservedTransactionPipeline {
         errorName: `ObservedPipelineFailure.v1.${stage}.${originCode}`,
         retryable: originCode === 'UNKNOWN',
       } as const);
-      inheritTrustedTerminalAttribution(failure, cause);
+      inheritObservedPipelineOrigin(failure, cause);
       trustedPipelineErrors.set(error, failure);
       throw error;
     }
