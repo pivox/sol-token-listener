@@ -389,7 +389,13 @@ function createDiagnosticGroup(
   }
   if (diagnosticCode === 'PUMP_BORSH_INVALID') {
     if ((source === 'CATCH_UP' && catchUpCauseKind !== 'PUMP_DECODER')
+      || (originCode !== null && originCode !== 'PUMP_BORSH_INVALID')
       || completeness !== 'COMPLETE' || pumpWire === null || representative === null) {
+      invalidEvidence();
+    }
+    if (representative.transactionIndex === null || representative.instructionIndex === null
+      || (pumpWire.location === 'OUTER' && representative.innerInstructionIndex !== null)
+      || (pumpWire.location === 'INNER' && representative.innerInstructionIndex === null)) {
       invalidEvidence();
     }
   } else if (pumpWire !== null || representative !== null) invalidEvidence();

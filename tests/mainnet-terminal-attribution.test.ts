@@ -324,6 +324,24 @@ void test('keeps Pump decoder cause provenance source-specific', () => {
     })],
     incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
   }));
+  for (const invalid of [
+    pumpOccurrence({ origin: 'PUMP_SCHEMA_UNSUPPORTED' }),
+    pumpOccurrence({ representative_transaction_index: null }),
+    pumpOccurrence({ representative_instruction_index: null,
+      representative_inner_instruction_index: null }),
+    pumpOccurrence({ wire_location: 'OUTER' }),
+  ]) {
+    assert.throws(() => buildMainnetTerminalAttribution({
+      currentPopulationRows: [],
+      diagnosticOccurrenceRows: [invalid],
+      incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+    }), TypeError);
+  }
+  assert.doesNotThrow(() => buildMainnetTerminalAttribution({
+    currentPopulationRows: [],
+    diagnosticOccurrenceRows: [pumpOccurrence({ origin: null })],
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  }));
 });
 
 void test('keeps the canonical artifact below one MiB', () => {
