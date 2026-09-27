@@ -74,6 +74,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
     /REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT SELECT,INSERT ON TABLE transaction_inbox_terminal_attributions\s+TO sol_token_listener_writer/iu);
+  assert.doesNotMatch(sql, /GRANT[^;]*\b(?:UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)\b[^;]*transaction_inbox_terminal_attributions[^;]*TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT SELECT,DELETE ON TABLE transaction_inbox_terminal_attributions\s+TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT SELECT ON TABLE listener_worker_tracking_live_mints\s+TO sol_token_listener_writer/iu);
   assert.doesNotMatch(sql,
     /GRANT[^;]*\b(?:INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)\b[^;]*listener_worker_tracking_live_mints[^;]*TO sol_token_listener_writer/iu);
@@ -195,6 +198,11 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       assert.deepEqual((await listener.query(
         `SELECT mint FROM listener_worker_tracking_live_mints WHERE FALSE`,
       )).rows, []);
+      for (const privilege of ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) {
+        assert.equal((await listener.query<{ readonly allowed: boolean }>(`SELECT
+          has_table_privilege(current_user,'transaction_inbox_terminal_attributions',$1) AS allowed`,
+        [privilege])).rows[0]?.allowed, privilege === 'SELECT' || privilege === 'INSERT', privilege);
+      }
       assert.equal((await listener.query<{ readonly allowed: boolean }>(`SELECT
         has_table_privilege(current_user,'listener_worker_tracking_live_mints','SELECT')
           AS allowed`)).rows[0]?.allowed, true);

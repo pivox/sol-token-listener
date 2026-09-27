@@ -64,6 +64,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       '054_paper_entry_boundary.sql',
       '055_creation_entry_single_active_session.sql',
       '056_transaction_inbox_bounded_tracking.sql',
+      '057_transaction_inbox_terminal_attribution.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

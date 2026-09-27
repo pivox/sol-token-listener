@@ -14,6 +14,8 @@ import {
   reconcileConfirmationStatus,
 } from '../domain/confirmation-status.js';
 import { isDecoderQuarantineFailure } from '../domain/observed-pipeline-failure.js';
+import { OBSERVED_PIPELINE_STAGES } from '../domain/observed-pipeline-taxonomy.js';
+import { trustedTerminalAttribution, trustedTerminalAttributionContext } from '../domain/terminal-attribution.js';
 import {
   createPumpFunWorkerAdmissionPolicy,
   DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
@@ -974,6 +976,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ],
           );
           requireOne(updated.rowCount);
+          await persistCatchUpAttribution(client, value);
           return classificationReceipt(value, 'REPLAYED', catchUpEnqueued, catchUpAdmissionPriority);
         }
         if (row === undefined) {
@@ -1004,6 +1007,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ],
           );
           requireOne(inserted.rowCount);
+          await persistCatchUpAttribution(client, value);
           return classificationReceipt(value, 'RECORDED', catchUpEnqueued, catchUpAdmissionPriority);
         }
         if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot) {
@@ -1070,6 +1074,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           ],
         );
         requireOne(updated.rowCount);
+        await persistCatchUpAttribution(client, value);
         return classificationReceipt(
           value,
           'RECORDED',
@@ -1908,6 +1913,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           ],
         );
         requireLease(result.rowCount);
+        await persistTerminalAttribution(client, {
+          identity: failure, signature, source: 'WORKER',
+          occurrenceNumber: safeCount(row.attempts, 'attempts'), cycleAttempt: attemptsInCycle,
+          recoveryCount: safeCount(row.manual_recovery_count, 'manual recovery count'),
+          retryable: failure.retryable, exhausted,
+          slot: numericBigInt(row.observed_slot, 'observed slot'),
+          confirmationStatus: confirmation(row.target_confirmation_status),
+          stage: terminalAttributionStage(failure.errorName), reason: null,
+        });
       });
     });
   }
@@ -3114,6 +3128,85 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       ]);
     }
   }
+}
+
+function terminalAttributionStage(errorName: string): string | null {
+  const fields = errorName.split('.');
+  if (fields.length !== 4 || fields[0] !== 'ObservedPipelineFailure' || fields[1] !== 'v1') return null;
+  const stage = fields[2];
+  return stage !== undefined && (stage === 'unclassified'
+    || OBSERVED_PIPELINE_STAGES.some((candidate) => candidate === stage)) ? stage : null;
+}
+
+async function persistCatchUpAttribution(client: Queryable, value: CatchUpClassification): Promise<void> {
+  if (value.disposition !== 'QUARANTINED') return;
+  await persistTerminalAttribution(client, {
+    identity: value, signature: value.signature, source: 'CATCH_UP', occurrenceNumber: value.classificationVersion,
+    cycleAttempt: null, recoveryCount: null, retryable: null, exhausted: null,
+    slot: value.slot, confirmationStatus: value.confirmationStatus, stage: null, reason: value.reasonCode,
+  });
+}
+
+/** The parent business write precedes this savepoint; only journal rejection is recoverable. */
+async function persistTerminalAttribution(client: Queryable, value: {
+  readonly identity: object; readonly signature: string; readonly source: 'WORKER' | 'CATCH_UP';
+  readonly occurrenceNumber: number; readonly cycleAttempt: number | null; readonly recoveryCount: number | null;
+  readonly retryable: boolean | null; readonly exhausted: boolean | null; readonly slot: bigint;
+  readonly confirmationStatus: ChainConfirmationStatus; readonly stage: string | null; readonly reason: string | null;
+}): Promise<void> {
+  // Exact identities only: never inspect an untrusted thrown value's properties.
+  const evidence = trustedTerminalAttribution(value.identity);
+  const registeredContext = trustedTerminalAttributionContext(value.identity);
+  const context = registeredContext !== null && registeredContext.locator.signature === value.signature
+    && registeredContext.locator.slot === value.slot ? registeredContext : null;
+  const complete = context !== null && (value.source === 'WORKER'
+    ? evidence !== null || context.originCode !== null
+    : evidence?.causeKind !== null && evidence?.causeKind !== undefined);
+  const wire = complete ? evidence?.pumpWire ?? null : null;
+  await client.query('SAVEPOINT terminal_attribution_write');
+  try {
+    await client.query(
+      `WITH capture_clock AS MATERIALIZED (
+         SELECT CASE WHEN $2='WORKER' THEN updated_at ELSE clock_timestamp() END AS at
+         FROM chain_transaction_inbox WHERE signature=$1
+       )
+       INSERT INTO transaction_inbox_terminal_attributions (
+         signature,source,occurrence_number,processing_outcome,worker_cycle_attempt,
+         worker_recovery_count,retryable,retry_exhausted,stage,origin,diagnostic_code,
+         catch_up_cause_kind,catch_up_reason_code,slot,transaction_index,confirmation_status,
+         instruction_index,inner_instruction_index,wire_surface,wire_location,wire_discriminator,
+         wire_idl_name,wire_total_bytes,wire_payload_bytes,wire_suffix_bytes,completeness,captured_at,purge_after
+       ) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+         $21,$22,$23,$24,$25,$26,at,at+INTERVAL '4 hours' FROM capture_clock
+       ON CONFLICT(signature,source,occurrence_number) DO NOTHING`,
+      [value.signature, value.source, value.occurrenceNumber,
+        value.source === 'WORKER' ? 'FAILED' : 'QUARANTINED', value.cycleAttempt, value.recoveryCount,
+        value.retryable, value.exhausted, value.stage, complete ? context.originCode : null,
+        complete ? evidence?.diagnosticCode ?? 'UNAVAILABLE' : 'UNAVAILABLE',
+        complete && value.source === 'CATCH_UP' ? evidence?.causeKind ?? null : null, value.reason,
+        value.slot.toString(), complete ? context.locator.transactionIndex : null,
+        complete ? context.locator.confirmationStatus : value.confirmationStatus,
+        complete ? context.locator.instructionIndex : null,
+        complete ? context.locator.innerInstructionIndex : null,
+        wire?.surface ?? null, wire?.location ?? null, wire?.discriminatorHex ?? null, wire?.idlName ?? null,
+        wire?.totalBytes ?? null, wire?.payloadBytes ?? null, wire?.suffixBytes ?? null,
+        complete ? 'COMPLETE' : 'UNAVAILABLE'],
+    );
+  } catch {
+    // Statement aborts recover; connection loss or marker rejection still propagates.
+    await client.query('ROLLBACK TO SAVEPOINT terminal_attribution_write');
+    await client.query('RELEASE SAVEPOINT terminal_attribution_write');
+    const marked = await client.query(
+      `UPDATE chain_transaction_inbox SET terminal_attribution_incomplete_count=CASE
+         WHEN terminal_attribution_incomplete_count<2147483647
+           THEN terminal_attribution_incomplete_count+1 ELSE terminal_attribution_incomplete_count END,
+         terminal_attribution_incomplete_at=clock_timestamp()
+       WHERE signature=$1`, [value.signature],
+    );
+    requireOne(marked.rowCount);
+    return;
+  }
+  await client.query('RELEASE SAVEPOINT terminal_attribution_write');
 }
 
 async function leasedRow(

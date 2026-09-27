@@ -387,6 +387,8 @@ TO sol_token_listener_writer;
 
 GRANT SELECT ON TABLE chain_transaction_inbox_claim_scheduler
 TO sol_token_listener_writer;
+GRANT SELECT,INSERT ON TABLE transaction_inbox_terminal_attributions
+TO sol_token_listener_writer;
 GRANT UPDATE (consecutive_urgent_claims,launch_claims_since_tracked,updated_at)
 ON TABLE chain_transaction_inbox_claim_scheduler
 TO sol_token_listener_writer;
@@ -1500,6 +1502,10 @@ GRANT UPDATE (disconnect_occurred_at,disconnect_reason_code,recovery_status,
   last_observation_at,last_observation_slot,evidence_purge_after)
 ON TABLE listener_websocket_health TO sol_token_retention_worker;
 GRANT UPDATE (terminal_at,purge_after,updated_at)
+ON TABLE chain_transaction_inbox TO sol_token_retention_worker;
+GRANT SELECT,DELETE ON TABLE transaction_inbox_terminal_attributions
+TO sol_token_retention_worker;
+GRANT UPDATE (terminal_attribution_incomplete_count,terminal_attribution_incomplete_at)
 ON TABLE chain_transaction_inbox TO sol_token_retention_worker;
 GRANT UPDATE (expired_through_sequence)
 ON TABLE api_event_stream_state TO sol_token_retention_worker;
