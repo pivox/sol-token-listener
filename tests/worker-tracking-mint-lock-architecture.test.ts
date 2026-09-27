@@ -92,10 +92,16 @@ void test('claim and recovery paths acquire or bind the exact mint before proof-
       /UNNEST\(\$2::TEXT\[\],\$3::TEXT\[\]\)[\s\S]*?FOR UPDATE OF lock,intent/u);
   });
 
-void test('market observation is not a V1 tracking-proof producer', async () => {
+void test('market observation serializes indirect candidate-proof orphaning before its private locks', async () => {
   const source = await readFile('src/storage/market-observation.repository.ts', 'utf8');
+  assert.match(source,
+    /import\s*\{[^}]*\blockWorkerTrackingMints\b[^}]*\}\s*from '\.\/worker-tracking-mint-lock\.js';/u);
+  assert.match(source,
+    /await lockWorkerTrackingMints\(client,[\s\S]*?\);[\s\S]*?await this\.lockTransactions\(client, batch\.rawEvents\);[\s\S]*?await this\.lockPools\(client, batch\);/u);
+  assert.match(source,
+    /batch\.matches\.map\(\(match\) => match\.migrationEvent\.mint\)[\s\S]*?batch\.trades\.map\(\(trade\) => trade\.mint\)/u);
   assert.doesNotMatch(source,
     /(?:INSERT INTO|UPDATE)\s+(?:trading_candidates|paper_strategy_sessions|paper_positions|execution_intents|execution_live_positions)\b/u);
-  assert.doesNotMatch(source,
-    /UPDATE\s+token_launches[\s\S]{0,240}?current_state\s*=\s*'RETRACTED'/u);
+  assert.match(source,
+    /UPDATE domain_events SET confirmation_status='orphaned'/u);
 });
