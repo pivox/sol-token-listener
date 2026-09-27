@@ -81,6 +81,13 @@ independent proofs exists at the materialized database time.
 fresh only while the exact boundary above is not reached. A `RETRACTED` launch
 or orphaned launch event never grants authority.
 
+The V1 time-origin hypothesis is explicit and versioned: the existing launch
+projection writes `detected_at = blockchainTime` when Solana supplies it and
+falls back to `observedAt` only when blockchain time is absent. Part C does not
+rewrite that durable timestamp. A launch discovered late by catch-up may
+therefore already be outside the fresh window, which is safer than inventing a
+new 45-second opportunity at observation time.
+
 The canonical event match uses mint, `created_signature`, slot, transaction
 index, instruction index and null-safe inner instruction index. It does not
 infer finality from `token_launches.current_state` alone.
@@ -134,6 +141,14 @@ not interrupt the trades required to resolve exposure.
 An `execution_live_positions` row grants authority in `OPEN`, `EXIT_PENDING` or
 `UNKNOWN`. A `CLOSED` position does not.
 
+The listener role never receives access to `execution_live_positions`.
+Migration 056 publishes a definer-owned, `security_barrier` view exposing only
+one `mint` column for active rows. `PUBLIC` receives no privilege and the
+provisioning script grants `SELECT` on that view alone to
+`sol_token_listener_writer`. Wallet, generation, armament, amounts, deadlines,
+state details and every other live column remain inaccessible. Authority SQL
+reads the view, never the base table.
+
 ### Union semantics
 
 The SQL authority is an `EXISTS`/union-of-proofs decision keyed by mint. One
@@ -165,6 +180,27 @@ For a classified `PUMPFUN_TRADE`:
 Replay, restart and finality reconciliation never alter an established
 admission timestamp.
 
+## Proof/demotion serialization
+
+`SKIP LOCKED` on inbox rows alone cannot close the race with a candidate,
+position or intent becoming active concurrently. Every transaction that
+creates, removes or changes a V1 tracking proof acquires the existing
+namespaced mint advisory lock before locking or mutating proof rows:
+
+```text
+hashtextextended('transaction-inbox-mint:' || mint, 0)
+```
+
+A shared storage helper owns that exact namespace. Launch, candidate, paper
+session/position, execution-intent and live-position repositories acquire mint
+locks in canonical lexical order before their existing row locks. The demotion
+transaction first snapshots at most 256 candidate mints, acquires their
+advisory locks in lexical order, then reselects and locks inbox candidates and
+revalidates every proof at its one database clock. A proof committed before the
+listener mint lock is visible to revalidation; a producer that follows the
+listener lock is linearized after demotion. No path holds a business-row lock
+while waiting for the shared mint lock.
+
 ## Bounded pristine demotion
 
 Before scheduler selection in every enabled `claim()` transaction, select at
@@ -189,7 +225,8 @@ is still strictly pristine:
 - no `processed_at`;
 - no missing-finality polls, finality provider or finality revision;
 - no manual-recovery evidence;
-- no `first_processed_at`;
+- no `first_processed_at` and
+  `first_processing_evidence_unavailable=FALSE`;
 - no decoder-quarantine or decoder-recovery evidence.
 
 The update preserves signature, sources, programs, hint mint, observation,
@@ -216,22 +253,24 @@ claim. Demotion alone does not consume a claim or mutate fairness.
 ## Migration 056
 
 `056_transaction_inbox_bounded_tracking.sql` is required. Migration 053 is
-never edited. Migration 056 adds only drift-strict, replay-safe partial indexes:
+never edited, and its admitted-claim index already covers the bounded inbox
+candidate scan. Migration 056 adds these drift-strict, replay-safe partial
+indexes:
 
-- `chain_transaction_inbox_worker_demotion_idx` on
-  `(observed_at, observed_slot, signature)` for admitted
-  `PENDING/TRACKED_TRADE/PUMPFUN_TRADE` rows;
-- `execution_intents_worker_tracking_mint_idx` on `(mint)` for statuses other
-  than `SUCCEEDED`, `FAILED`, `EXPIRED`, `CANCELLED`;
+- `trading_candidates_worker_tracking_expiry_idx` on
+  `(eligible_until, mint)` for current `ELIGIBLE`, non-orphaned candidates;
+- `execution_intents_worker_tracking_mint_idx` on `(mint)` where
+  `terminal_at IS NULL`;
 - `execution_live_positions_worker_tracking_mint_idx` on `(mint)` for
   `OPEN`, `EXIT_PENDING`, `UNKNOWN`.
 
-Existing indexes already cover current candidates, active paper sessions,
-holding positions, canonical launch lookup and deferred trades. Duplicating
-those indexes is unnecessary. The migration validates exact index ownership,
-access method, keys, predicates and readiness on first install and replay;
-partial or incompatible named objects fail closed. It deletes or rewrites no
-business data.
+It also creates the exact one-column active-live-mint `security_barrier` view.
+Existing indexes cover inbox admission, active paper sessions, holding
+positions, canonical launch lookup and deferred trades. Duplicating them is
+unnecessary. The migration validates exact index and view ownership, access
+method, keys, predicates, view definition, security option and readiness on
+first install and replay; partial or incompatible named objects fail closed. It
+deletes or rewrites no business data.
 
 ## `workerAdmission.v1`
 
@@ -284,10 +323,12 @@ frontend Zod field are additive and optional. Projection rules are:
 - valid field: detached, frozen, exact V1 data.
 
 When the bounded policy is enabled, the first-processing cohort excludes every
-`worker_admitted_at IS NULL` row until it receives canonical classification.
-When disabled, the current cohort SQL and results are unchanged. An admitted
-trade later demoted at the 45-second boundary remains eligible evidence; the
-canary must not hide admitted work that missed its processing objective.
+`worker_admitted_at IS NULL` row until it receives canonical classification and
+also excludes an admitted row once bounded demotion terminalizes it as
+`DEFERRED/NORMAL/PUMPFUN_TRADE`. When disabled, the current cohort SQL and
+results are unchanged. A row carrying
+`first_processing_evidence_unavailable=TRUE` is never eligible for demotion and
+keeps the existing explicit unavailable semantics.
 
 `catchUpAdmission` remains unchanged and separately answers catch-up/provider
 questions. `workerAdmission` answers business authority and worker-claimability
@@ -360,16 +401,22 @@ Tests must prove:
   sufficient;
 - union-distinct metrics do not double-count a mint;
 - batch cap, deterministic order and real two-connection `SKIP LOCKED` behavior;
+- shared mint-lock ordering and proof revalidation under concurrent proof
+  insert/update/removal;
 - every pristine fence blocks demotion independently;
 - immediate CREATE and CREATE-plus-initial-BUY are unchanged;
 - replay, restart, finality, retention and decoder quarantine remain correct;
 - migration 056 installs on an empty database, upgrades from 055, replays with
-  stable object identities, and rejects drift;
+  stable object identities, rejects drift, and exposes only active mint through
+  the restricted live-position view;
 - heartbeat storage, API projection, JSON contract, Zod schema and frontend
   rendering are rolling-compatible;
-- first-processing excludes only unclassified null admissions in enabled mode;
+- first-processing excludes unclassified null admissions and admitted-then-
+  demoted rows in enabled mode, while OFF remains exact legacy;
 - the canary gate is fail-closed and all existing independent gates remain;
-- no wallet, RPC budget, executor, signer or submission source changes.
+- no wallet, RPC budget, signer or submission behavior changes; executor
+  persistence changes are limited to acquiring the shared mint lock before an
+  execution-intent or live-position proof mutation.
 
 ## Acceptance criteria
 
