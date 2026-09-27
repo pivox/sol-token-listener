@@ -4,7 +4,11 @@ import test, { type TestContext } from 'node:test';
 import pg from 'pg';
 import { captureMainnetTerminalAttribution } from '../scripts/capture-mainnet-terminal-attribution.js';
 import { createCatchUpClassification } from '../src/domain/catch-up-classification.js';
-import { registerTrustedTerminalAttribution, registerTrustedTerminalAttributionContext } from '../src/domain/terminal-attribution.js';
+import {
+  registerTrustedTerminalAttribution,
+  registerTrustedTerminalAttributionContext,
+  type TerminalDiagnosticCode,
+} from '../src/domain/terminal-attribution.js';
 import type { IngestionFailure, TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
@@ -35,6 +39,68 @@ void test('terminal journal separates worker attempts and survives retry clearin
     await repository.markProcessed('retry', last.leaseToken, 'confirmed');
     assert.equal((await parent(pool, 'retry')).processing_status, 'PROCESSED');
     assert.equal((await occurrences(pool)).length, 2);
+  });
+});
+
+void test('funding diagnostics retain retry-pending evidence and exact fifth-attempt exhaustion', async (context) => {
+  await withDatabase(context, async (pool, repository) => {
+    const cases = [
+      ['funding-validate', 'FUNDING_OBSERVATION_VALIDATE'],
+      ['funding-extract', 'FUNDING_OBSERVATION_EXTRACT'],
+      ['funding-record', 'FUNDING_OBSERVATION_RECORD'],
+    ] as const;
+
+    for (const [signature, diagnosticCode] of cases) {
+      await repository.enqueue(notification(signature));
+      const claim = await repository.claim(Date.now(), 30);
+      assert.ok(claim);
+      await repository.markFailed(signature, claim.leaseToken,
+        fundingFailure(signature, diagnosticCode));
+      const stored = await parent(pool, signature);
+      assert.equal(stored.processing_status, 'FAILED');
+      assert.equal(stored.error_code, 'PIPELINE_STAGE_FAILED');
+      assert.equal(stored.error_name,
+        'ObservedPipelineFailure.v1.funding_observation.UNKNOWN');
+      assert.equal(stored.error_retryable, true);
+      assert.equal(stored.attempts_in_cycle, 1);
+      assert.equal(stored.retry_exhausted_at, null);
+      if (signature !== 'funding-record') {
+        await pool.query(`UPDATE chain_transaction_inbox
+          SET next_attempt_at='2100-01-01T00:00:00.000Z'
+          WHERE signature=$1`, [signature]);
+      }
+    }
+
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      const claim = await claimRetry(pool, repository, 'funding-record');
+      await repository.markFailed('funding-record', claim.leaseToken,
+        fundingFailure('funding-record', 'FUNDING_OBSERVATION_RECORD'));
+    }
+
+    const rows = await occurrences(pool);
+    for (const [signature, diagnosticCode] of cases) {
+      const diagnosticRows = rows.filter((row) => row.signature === signature);
+      assert.equal(diagnosticRows.length, signature === 'funding-record' ? 5 : 1);
+      for (const [index, row] of diagnosticRows.entries()) {
+        assert.equal(row.source, 'WORKER');
+        assert.equal(row.processing_outcome, 'FAILED');
+        assert.equal(row.worker_cycle_attempt, index + 1);
+        assert.equal(row.retryable, true);
+        assert.equal(row.retry_exhausted,
+          signature === 'funding-record' && index === 4);
+        assert.equal(row.stage, 'funding_observation');
+        assert.equal(row.origin, null);
+        assert.equal(row.diagnostic_code, diagnosticCode);
+        assert.equal(row.catch_up_cause_kind, null);
+        assert.equal(row.completeness, 'COMPLETE');
+        assert.equal(row.wire_surface, null);
+      }
+    }
+
+    const exhausted = await parent(pool, 'funding-record');
+    assert.equal(exhausted.attempts_in_cycle, 5);
+    assert.ok(exhausted.retry_exhausted_at instanceof Date);
+    assert.equal(exhausted.error_retryable, true);
   });
 });
 
@@ -266,6 +332,35 @@ function failure(signature: string, trusted: boolean): IngestionFailure {
   return value;
 }
 
+function fundingFailure(
+  signature: string,
+  diagnosticCode: TerminalDiagnosticCode,
+): IngestionFailure {
+  const value: IngestionFailure = Object.freeze({
+    code: 'PIPELINE_STAGE_FAILED',
+    errorName: 'ObservedPipelineFailure.v1.funding_observation.UNKNOWN',
+    retryable: true,
+  });
+  registerTrustedTerminalAttribution(value, {
+    version: 1,
+    diagnosticCode,
+    causeKind: null,
+    pumpWire: null,
+  });
+  registerTrustedTerminalAttributionContext(value, {
+    originCode: null,
+    locator: {
+      signature,
+      slot: 1n,
+      transactionIndex: 0,
+      confirmationStatus: 'confirmed',
+      instructionIndex: null,
+      innerInstructionIndex: null,
+    },
+  });
+  return value;
+}
+
 function classification(signature: string, classifiedAtMs = 1_000) {
   const value = createCatchUpClassification({ signature, slot: 1n,
     programIds: [PUMP_PROGRAM_ID], confirmationStatus: 'confirmed', observedAtMs: 1_000,
@@ -294,7 +389,9 @@ function transaction(signature: string): NormalizedTransaction {
 
 async function parent(pool: pg.Pool, signature: string) {
   const result = await pool.query<{
-    processing_status: string; error_code: string | null; next_attempt_at: Date;
+    processing_status: string; error_code: string | null; error_name: string | null;
+    error_retryable: boolean | null; attempts_in_cycle: number;
+    next_attempt_at: Date; retry_exhausted_at: Date | null;
     terminal_attribution_incomplete_count: number; terminal_attribution_incomplete_at: Date | null;
   }>('SELECT * FROM chain_transaction_inbox WHERE signature=$1', [signature]);
   const row = result.rows[0];

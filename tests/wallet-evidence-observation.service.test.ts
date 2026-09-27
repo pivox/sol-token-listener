@@ -11,6 +11,10 @@ import {
   type WalletFundingExtractionResult,
 } from '../src/domain/wallet-funding.js';
 import {
+  trustedTerminalAttribution,
+  type TerminalDiagnosticCode,
+} from '../src/domain/terminal-attribution.js';
+import {
   createBondingCurveTradeObservedEvent,
   type BondingCurveTradeObservedEventV1,
 } from '../src/domain/launchpad-events.js';
@@ -65,6 +69,7 @@ void test('sorts canonical known buys, extracts once and records one frozen batc
   assert.equal(recorded[0]?.confirmationStatus, 'confirmed');
   assert.ok(Object.isFrozen(recorded[0]));
   assert.equal(recorded[0]?.assessments, result.assessments);
+  assert.equal(trustedTerminalAttribution(result), null);
 });
 
 void test('ignores sells and unknown traders and performs no empty write', async () => {
@@ -96,6 +101,7 @@ void test('ignores sells and unknown traders and performs no empty write', async
   assert.deepEqual(result, emptyResult());
   assert.equal(extractorCalls, 0);
   assert.equal(repositoryCalls, 0);
+  assert.equal(trustedTerminalAttribution(result), null);
 });
 
 void test('rejects duplicate identities before extraction', async () => {
@@ -145,33 +151,65 @@ void test('rejects foreign signatures and transaction cursors before extraction'
   );
 });
 
-void test('wraps extractor and repository failures with their exact stage and cause', async () => {
-  const transaction = observedTransaction();
-  const event = tradeEvent(transaction, trade('buy', 2));
-  const extractCause = new Error('extract failed');
-  const extractService = new WalletEvidenceObservationService(
-    { extract: () => { throw extractCause; } },
-    noOpRepository(),
-  );
-  await assert.rejects(
-    extractService.observe(transaction, Object.freeze([event])),
-    (error) =>
-      error instanceof WalletEvidenceObservationError
-      && error.stage === 'extract'
-      && error.cause === extractCause,
-  );
+void test('attributes validate, extract and record on the exact internal wrapper identity', async () => {
+  const cases = [
+    ['validate', 'FUNDING_OBSERVATION_VALIDATE'],
+    ['extract', 'FUNDING_OBSERVATION_EXTRACT'],
+    ['record', 'FUNDING_OBSERVATION_RECORD'],
+  ] as const satisfies readonly (readonly [
+    WalletEvidenceObservationError['stage'],
+    TerminalDiagnosticCode,
+  ])[];
 
-  const recordCause = new Error('record failed');
-  const recordService = new WalletEvidenceObservationService(
-    { extract: (_raw, buys) => noEvidenceResult(buys) },
-    { record: async () => { throw recordCause; } },
-  );
-  await assert.rejects(
-    recordService.observe(transaction, Object.freeze([event])),
-    (error) =>
-      error instanceof WalletEvidenceObservationError
-      && error.stage === 'record'
-      && error.cause === recordCause,
+  for (const [stage, diagnosticCode] of cases) {
+    let causeReads = 0;
+    const cause = new Proxy(Object.freeze({ stage }), {
+      get() { causeReads += 1; throw new Error('cause inspected'); },
+      getPrototypeOf() { causeReads += 1; throw new Error('cause inspected'); },
+      ownKeys() { causeReads += 1; throw new Error('cause inspected'); },
+      getOwnPropertyDescriptor() {
+        causeReads += 1;
+        throw new Error('cause inspected');
+      },
+    });
+    const error = await observationFailure(stage, cause);
+
+    assert.ok(error instanceof WalletEvidenceObservationError);
+    assert.equal(error.stage, stage);
+    assert.equal(error.cause, cause);
+    assert.deepEqual(trustedTerminalAttribution(error), {
+      version: 1,
+      diagnosticCode,
+      causeKind: null,
+      pumpWire: null,
+    });
+    assert.equal(causeReads, 0);
+  }
+});
+
+void test('public wallet observation errors and lookalike identities cannot forge authority', async () => {
+  const authentic = await observationFailure('extract', new Error('internal'));
+  class ForgedObservationError extends WalletEvidenceObservationError {}
+  const direct = new WalletEvidenceObservationError('extract', { cause: authentic });
+  const forged = new ForgedObservationError('extract', { cause: authentic });
+  const clone = Object.assign(Object.create(Object.getPrototypeOf(authentic)), authentic);
+  const lookalike = Object.freeze({
+    stage: 'extract',
+    cause: authentic,
+    terminalAttribution: trustedTerminalAttribution(authentic),
+  });
+  const proxy = new Proxy(authentic as object, {});
+  const revoked = Proxy.revocable(authentic as object, {});
+  revoked.revoke();
+
+  for (const value of [direct, forged, clone, lookalike, proxy, revoked.proxy]) {
+    assert.equal(trustedTerminalAttribution(value), null);
+  }
+  assert.equal(
+    trustedTerminalAttribution(
+      new WalletEvidenceObservationError('validate', { cause: authentic }),
+    ),
+    null,
   );
 });
 
@@ -189,6 +227,36 @@ void test('passes orphaned observations to the repository for reconciliation', a
   assert.equal(recorded[0]?.confirmationStatus, 'orphaned');
   assert.equal(recorded[0]?.assessments[0]?.buy.confirmationStatus, 'orphaned');
 });
+
+async function observationFailure(
+  stage: WalletEvidenceObservationError['stage'],
+  cause: unknown,
+): Promise<unknown> {
+  const transaction = observedTransaction();
+  const event = tradeEvent(transaction, trade(`failure-${stage}`, 2));
+  const service = new WalletEvidenceObservationService(
+    {
+      extract: (_raw, buys) => {
+        if (stage === 'extract') throw cause;
+        return noEvidenceResult(buys);
+      },
+    },
+    {
+      record: async () => {
+        if (stage === 'record') throw cause;
+      },
+    },
+  );
+  const observed = stage === 'validate'
+    ? new Proxy(transaction, { get: () => { throw cause; } })
+    : transaction;
+  try {
+    await service.observe(observed, Object.freeze([event]));
+  } catch (error) {
+    return error;
+  }
+  assert.fail(`Expected ${stage} observation failure.`);
+}
 
 function noEvidenceResult(
   buys: readonly WalletFundingBuy[],

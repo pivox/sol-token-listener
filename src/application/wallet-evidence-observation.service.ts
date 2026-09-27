@@ -17,6 +17,10 @@ import {
 import type {
   ChainConfirmationStatus,
 } from '../domain/types.js';
+import {
+  registerTrustedTerminalAttribution,
+  type TerminalDiagnosticCode,
+} from '../domain/terminal-attribution.js';
 import type {
   WalletFundingEvidenceExtractor,
 } from '../ports/wallet-funding-evidence-extractor.js';
@@ -60,6 +64,28 @@ export class WalletEvidenceObservationError extends Error {
   }
 }
 
+const FUNDING_OBSERVATION_DIAGNOSTIC: Readonly<
+  Record<WalletEvidenceObservationStage, TerminalDiagnosticCode>
+> = Object.freeze({
+  validate: 'FUNDING_OBSERVATION_VALIDATE',
+  extract: 'FUNDING_OBSERVATION_EXTRACT',
+  record: 'FUNDING_OBSERVATION_RECORD',
+});
+
+function createWalletEvidenceObservationError(
+  stage: WalletEvidenceObservationStage,
+  cause: unknown,
+): WalletEvidenceObservationError {
+  const error = new WalletEvidenceObservationError(stage, { cause });
+  registerTrustedTerminalAttribution(error, {
+    version: 1,
+    diagnosticCode: FUNDING_OBSERVATION_DIAGNOSTIC[stage],
+    causeKind: null,
+    pumpWire: null,
+  });
+  return error;
+}
+
 export class WalletEvidenceObservationService {
   public constructor(
     private readonly extractor:
@@ -75,7 +101,7 @@ export class WalletEvidenceObservationService {
     try {
       buys = validateAndSnapshot(transaction, events);
     } catch (cause) {
-      throw new WalletEvidenceObservationError('validate', { cause });
+      throw createWalletEvidenceObservationError('validate', cause);
     }
     if (buys.length === 0) return EMPTY_RESULT;
 
@@ -84,7 +110,7 @@ export class WalletEvidenceObservationService {
       result = this.extractor.extract(transaction.raw, buys);
       assertValidWalletFundingExtractionResult(result);
     } catch (cause) {
-      throw new WalletEvidenceObservationError('extract', { cause });
+      throw createWalletEvidenceObservationError('extract', cause);
     }
 
     const batch: WalletEvidenceBatch = Object.freeze({
@@ -96,7 +122,7 @@ export class WalletEvidenceObservationService {
     try {
       await this.repository.record(batch);
     } catch (cause) {
-      throw new WalletEvidenceObservationError('record', { cause });
+      throw createWalletEvidenceObservationError('record', cause);
     }
     return result;
   }

@@ -77,6 +77,7 @@ void test('adds replay-safe terminal receipts and bounded finality preflight ind
       '055_creation_entry_single_active_session.sql',
       '056_transaction_inbox_bounded_tracking.sql',
       '057_transaction_inbox_terminal_attribution.sql',
+      '058_transaction_inbox_funding_attribution.sql',
     ]);
     assert.deepEqual((await pool.query(`SELECT signature,observed_slot::text AS observed_slot,
       confirmation_status,finality_evidence_version::text AS finality_evidence_version,
