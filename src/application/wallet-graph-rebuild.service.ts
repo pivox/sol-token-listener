@@ -19,6 +19,11 @@ import {
 } from '../domain/wallet-graph.js';
 import type { WalletGraphRepository } from '../ports/wallet-graph-repository.js';
 import type { MissingCanonicalLaunchPolicy } from '../domain/projection-reconciliation.js';
+import {
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+  type TerminalDiagnosticCode,
+} from '../domain/terminal-attribution.js';
 
 interface WalletGraphAnalysisProvider {
   analyze(input: WalletGraphInput): WalletGraphAnalysis;
@@ -42,31 +47,107 @@ export class WalletGraphRebuildService {
     missingLaunchPolicy: MissingCanonicalLaunchPolicy = 'ERROR',
   ): Promise<WalletGraphProjection | null> {
     if (mint.length === 0) throw new TypeError('Wallet graph mint is required.');
-    return this.repository.transact(mint, async (transaction) => {
-      const input = await transaction.loadCanonicalInput(mint);
-      if (input === null) {
-        if (missingLaunchPolicy === 'ERROR') throw new WalletGraphLaunchNotFoundError(mint);
-        await transaction.dissolveCurrent(mint);
-        return null;
-      }
-      assertValidWalletGraphInput(input);
-      const analysis = this.analyzer.analyze(input);
-      const projection: WalletGraphProjection = Object.freeze({
-        launch: input.launch,
-        inputFingerprint: input.inputFingerprint,
-        methodology: WALLET_GRAPH_METHODOLOGY,
-        asOf: createAsOf(input),
-        confirmationStatus: minimumConfirmation(input),
-        confirmationCounts: confirmationCounts(input),
-        ...analysis,
+    try {
+      return await this.repository.transact(mint, async (transaction) => {
+        const input = await withDiagnostic(
+          'WALLET_GRAPH_PERSISTENCE_UNKNOWN',
+          () => transaction.loadCanonicalInput(mint),
+        );
+        if (input === null) {
+          if (missingLaunchPolicy === 'ERROR') {
+            const error = new WalletGraphLaunchNotFoundError(mint);
+            registerWalletGraphDiagnostic(error, 'WALLET_GRAPH_LAUNCH_MISSING');
+            throw error;
+          }
+          await withDiagnostic(
+            'WALLET_GRAPH_PERSISTENCE_UNKNOWN',
+            () => transaction.dissolveCurrent(mint),
+          );
+          return null;
+        }
+        withSynchronousDiagnostic(
+          'WALLET_GRAPH_DATA_INVALID',
+          () => { assertValidWalletGraphInput(input); },
+        );
+        const analysis = withSynchronousDiagnostic(
+          'WALLET_GRAPH_ANALYSIS_INVALID',
+          () => this.analyzer.analyze(input),
+        );
+        const projection: WalletGraphProjection = Object.freeze({
+          launch: input.launch,
+          inputFingerprint: input.inputFingerprint,
+          methodology: WALLET_GRAPH_METHODOLOGY,
+          asOf: createAsOf(input),
+          confirmationStatus: minimumConfirmation(input),
+          confirmationCounts: confirmationCounts(input),
+          ...analysis,
+        });
+        withSynchronousDiagnostic(
+          'WALLET_GRAPH_ANALYSIS_INVALID',
+          () => { assertValidWalletGraphProjection(projection); },
+        );
+        await withDiagnostic(
+          'WALLET_GRAPH_PERSISTENCE_UNKNOWN',
+          () => transaction.replaceProjection(
+            projection,
+            createWalletClusterDetectedEvent(projection),
+          ),
+        );
+        return projection;
       });
-      assertValidWalletGraphProjection(projection);
-      await transaction.replaceProjection(
-        projection,
-        createWalletClusterDetectedEvent(projection),
-      );
-      return projection;
+    } catch (error) {
+      registerWalletGraphDiagnostic(error, 'WALLET_GRAPH_PERSISTENCE_UNKNOWN');
+      throw error;
+    }
+  }
+}
+
+async function withDiagnostic<TResult>(
+  diagnosticCode: WalletGraphDiagnosticCode,
+  operation: () => Promise<TResult>,
+): Promise<TResult> {
+  try {
+    return await operation();
+  } catch (error) {
+    registerWalletGraphDiagnostic(error, diagnosticCode);
+    throw error;
+  }
+}
+
+function withSynchronousDiagnostic<TResult>(
+  diagnosticCode: WalletGraphDiagnosticCode,
+  operation: () => TResult,
+): TResult {
+  try {
+    return operation();
+  } catch (error) {
+    registerWalletGraphDiagnostic(error, diagnosticCode);
+    throw error;
+  }
+}
+
+type WalletGraphDiagnosticCode = Extract<TerminalDiagnosticCode,
+  | 'WALLET_GRAPH_LAUNCH_MISSING'
+  | 'WALLET_GRAPH_DATA_INVALID'
+  | 'WALLET_GRAPH_ANALYSIS_INVALID'
+  | 'WALLET_GRAPH_PERSISTENCE_UNKNOWN'>;
+
+function registerWalletGraphDiagnostic(
+  identity: unknown,
+  diagnosticCode: WalletGraphDiagnosticCode,
+): void {
+  if (typeof identity !== 'object'
+    || identity === null
+    || trustedTerminalAttribution(identity) !== null) return;
+  try {
+    registerTrustedTerminalAttribution(identity, {
+      version: 1,
+      diagnosticCode,
+      causeKind: null,
+      pumpWire: null,
     });
+  } catch {
+    // Hostile/proxied/revoked failures keep their existing runtime behavior.
   }
 }
 

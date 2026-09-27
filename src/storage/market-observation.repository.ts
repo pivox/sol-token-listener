@@ -20,6 +20,10 @@ import type {
   MarketObservationResult,
   MarketReserveObservation,
 } from '../ports/market-observation-repository.js';
+import {
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+} from '../domain/terminal-attribution.js';
 import { canonicalStringifyJson, fromJsonValue, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
@@ -68,7 +72,13 @@ implements MarketObservationRepository {
   }
 
   public async record(batch: MarketObservationBatch): Promise<MarketObservationResult> {
-    const client = await this.pool.connect();
+    let client: QueryClient;
+    try {
+      client = await this.pool.connect();
+    } catch (error) {
+      persistenceDiagnostic(error);
+      throw error;
+    }
     try {
       await client.query('BEGIN');
       await lockWorkerTrackingMints(client, [
@@ -137,7 +147,13 @@ implements MarketObservationRepository {
         ])].sort()),
       });
     } catch (error) {
-      await client.query('ROLLBACK');
+      persistenceDiagnostic(error);
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        persistenceDiagnostic(rollbackError);
+        throw rollbackError;
+      }
       throw error;
     } finally {
       client.release();
@@ -145,7 +161,13 @@ implements MarketObservationRepository {
   }
 
   public async loadActivePools(): Promise<readonly CanonicalMarketPool[]> {
-    const client = await this.pool.connect();
+    let client: QueryClient;
+    try {
+      client = await this.pool.connect();
+    } catch (error) {
+      persistenceDiagnostic(error);
+      throw error;
+    }
     try {
       const result = await client.query(
         `SELECT payload FROM market_pools
@@ -154,6 +176,9 @@ implements MarketObservationRepository {
            COALESCE(inner_instruction_index, -1)`,
       );
       return Object.freeze(result.rows.map(decodePoolRow));
+    } catch (error) {
+      persistenceDiagnostic(error);
+      throw error;
     } finally {
       client.release();
     }
@@ -599,6 +624,22 @@ implements MarketObservationRepository {
       terminalAt: new Date(terminalAtMs),
       purgeAfter: new Date(purgeAfterMs),
     };
+  }
+}
+
+function persistenceDiagnostic(error: unknown): void {
+  if (typeof error !== 'object'
+    || error === null
+    || trustedTerminalAttribution(error) !== null) return;
+  try {
+    registerTrustedTerminalAttribution(error, {
+      version: 1,
+      diagnosticCode: 'PUMPSWAP_PERSISTENCE_UNKNOWN',
+      causeKind: null,
+      pumpWire: null,
+    });
+  } catch {
+    // Hostile/proxied/revoked repository failures preserve runtime behavior.
   }
 }
 

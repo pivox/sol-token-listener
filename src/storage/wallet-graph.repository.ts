@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { QueryResultRow } from 'pg';
+import {
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+  type TerminalDiagnosticCode,
+} from '../domain/terminal-attribution.js';
 import {
   assertValidWalletGraphInput,
   assertValidWalletGraphProjection,
@@ -80,7 +86,7 @@ export class PostgresWalletGraphRepository implements WalletGraphRepository {
     operation: (transaction: WalletGraphTransaction) => Promise<TResult>,
   ): Promise<TResult> {
     if (mint.length === 0) throw new TypeError('Wallet graph mint is required.');
-    const client = await this.database.connect();
+    const client = new AttributedGraphClient(await this.database.connect());
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await client.query(
@@ -288,7 +294,7 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
       this.loadedFingerprint === null
       || projection.inputFingerprint !== this.loadedFingerprint
     ) {
-      throw new WalletGraphDataError(
+      throw dataError(
         'Wallet graph projection does not match the locked canonical input.',
       );
     }
@@ -362,7 +368,7 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
       || nullableIndex(row.inner_instruction_index)
         !== event.cursor.innerInstructionIndex
     ) {
-      throw new WalletGraphDataError('Wallet graph domain event identity conflicts.');
+      throw dataError('Wallet graph domain event identity conflicts.');
     }
   }
 
@@ -549,7 +555,7 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
 
   private assertLockedMint(mint: string): void {
     if (mint !== this.lockedMint) {
-      throw new WalletGraphDataError(
+      throw dataError(
         'Wallet graph transaction mint does not match its lock.',
       );
     }
@@ -899,5 +905,75 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function invalid(): WalletGraphDataError {
-  return new WalletGraphDataError();
+  return dataError();
+}
+
+class AttributedGraphClient implements GraphClient {
+  public constructor(private readonly client: GraphClient) {}
+
+  public async query(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<QueryResult> {
+    try {
+      return await this.client.query(text, values);
+    } catch (error) {
+      const sqlState = trustedSqlState(error);
+      if (sqlState === '40001') {
+        registerWalletGraphDiagnostic(
+          error,
+          'WALLET_GRAPH_POSTGRES_SERIALIZATION',
+        );
+      } else if (sqlState === '40P01') {
+        registerWalletGraphDiagnostic(error, 'WALLET_GRAPH_POSTGRES_DEADLOCK');
+      }
+      throw error;
+    }
+  }
+
+  public release(): void {
+    this.client.release();
+  }
+}
+
+function trustedSqlState(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null || isProxy(error)) return null;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+    return descriptor !== undefined
+      && 'value' in descriptor
+      && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function dataError(message?: string): WalletGraphDataError {
+  const error = new WalletGraphDataError(message);
+  registerWalletGraphDiagnostic(error, 'WALLET_GRAPH_DATA_INVALID');
+  return error;
+}
+
+function registerWalletGraphDiagnostic(
+  identity: unknown,
+  diagnosticCode: Extract<TerminalDiagnosticCode,
+    | 'WALLET_GRAPH_POSTGRES_SERIALIZATION'
+    | 'WALLET_GRAPH_POSTGRES_DEADLOCK'
+    | 'WALLET_GRAPH_DATA_INVALID'>,
+): void {
+  if (typeof identity !== 'object'
+    || identity === null
+    || trustedTerminalAttribution(identity) !== null) return;
+  try {
+    registerTrustedTerminalAttribution(identity, {
+      version: 1,
+      diagnosticCode,
+      causeKind: null,
+      pumpWire: null,
+    });
+  } catch {
+    // Hostile/proxied/revoked query failures preserve their existing behavior.
+  }
 }

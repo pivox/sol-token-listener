@@ -20,7 +20,10 @@ import type { ReadonlyAccountSnapshot } from '../../ports/market-rpc-reader.js';
 import type { MarketRpcReader } from '../../ports/market-rpc-reader.js';
 import type { SolanaObservedTransaction } from '../../solana/rpc/observed-transaction.js';
 import { decodePumpSwapPoolAccount } from './pool-account-decoder.js';
-import { rethrowMutablePumpSwapRpcFailure } from './errors.js';
+import {
+  registerPumpSwapTerminalDiagnostic,
+  rethrowMutablePumpSwapRpcFailure,
+} from './errors.js';
 import type {
   DecodedPumpSwapPoolAccount,
   DecodedPumpSwapPoolCreation,
@@ -114,9 +117,10 @@ export function validateCanonicalPumpSwapPool(
   const { decoded } = input;
   if (input.account.owner !== PUMPSWAP_PROGRAM_ID) mismatch('pool owner');
   if (decoded.index !== 0) {
-    throw new MarketError(
+    throw marketFailure(
       'MARKET_POOL_NON_CANONICAL',
       `Pool PumpSwap non canonique: index ${decoded.index}.`,
+      'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
     );
   }
   if (decoded.quoteMint !== input.quoteAsset.mint) mismatch('quote mint');
@@ -143,9 +147,10 @@ export function validateCanonicalPumpSwapPool(
     new PublicKey(decoded.quoteMint),
   ).toBase58();
   if (expected !== input.account.address) {
-    throw new MarketError(
+    throw marketFailure(
       'MARKET_POOL_NON_CANONICAL',
       'Adresse PDA du pool PumpSwap non canonique.',
+      'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
     );
   }
   return Object.freeze({
@@ -223,9 +228,10 @@ function decodeMint(
   ]);
   for (const extension of getExtensionTypes(mint.tlvData)) {
     if (!allowed.has(extension)) {
-      throw new MarketError(
+      throw marketFailure(
         'UNSUPPORTED_TOKEN_EXTENSION',
         `Extension Token-2022 non supportée: ${ExtensionType[extension]}.`,
+        'PUMPSWAP_UNSUPPORTED_TOKEN_EXTENSION',
       );
     }
   }
@@ -282,8 +288,22 @@ function safeLamports(value: bigint): number {
 }
 
 function mismatch(field: string): never {
-  throw new MarketError(
+  throw marketFailure(
     'MARKET_POOL_MISMATCH',
     `Preuve de pool PumpSwap contradictoire: ${field}.`,
+    'PUMPSWAP_MARKET_POOL_MISMATCH',
   );
+}
+
+function marketFailure(
+  code: ConstructorParameters<typeof MarketError>[0],
+  message: string,
+  diagnosticCode:
+    | 'PUMPSWAP_MARKET_POOL_MISMATCH'
+    | 'PUMPSWAP_MARKET_POOL_NON_CANONICAL'
+    | 'PUMPSWAP_UNSUPPORTED_TOKEN_EXTENSION',
+): MarketError {
+  const error = new MarketError(code, message);
+  registerPumpSwapTerminalDiagnostic(error, diagnosticCode);
+  return error;
 }

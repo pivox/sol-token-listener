@@ -13,7 +13,10 @@ import type {
   ReadonlyAccountSnapshot,
 } from '../../ports/market-rpc-reader.js';
 import { decodePumpSwapPoolAccount } from './pool-account-decoder.js';
-import { rethrowMutablePumpSwapRpcFailure } from './errors.js';
+import {
+  registerPumpSwapTerminalDiagnostic,
+  rethrowMutablePumpSwapRpcFailure,
+} from './errors.js';
 import {
   computeEffectiveQuoteReservesRaw,
   InvalidEffectiveQuoteReservesError,
@@ -53,8 +56,9 @@ export class PumpSwapReserveReader {
       poolAccount.slot !== baseVault.slot
       || poolAccount.slot !== quoteVault.slot
     ) {
-      throw new InvalidPumpSwapReserveError(
+      throw reserveFailure(
         'Les réserves PumpSwap ne partagent pas le même slot RPC.',
+        'PUMPSWAP_RPC_CONTEXT_INVALID',
       );
     }
     let decodedPool: ReturnType<typeof decodePumpSwapPoolAccount>;
@@ -69,7 +73,7 @@ export class PumpSwapReserveReader {
       || decodedPool.baseMint !== pool.baseMint
       || decodedPool.quoteMint !== pool.quoteAsset.mint
     ) {
-      throw new InvalidPumpSwapReserveError(
+      throw reserveMismatch(
         'Le compte pool contredit le pool canonique.',
       );
     }
@@ -91,13 +95,18 @@ export class PumpSwapReserveReader {
       );
     } catch (error) {
       if (error instanceof InvalidEffectiveQuoteReservesError) {
-        throw new InvalidEffectiveQuoteReserveError(error.amountRaw);
+        const invalid = new InvalidEffectiveQuoteReserveError(error.amountRaw);
+        registerPumpSwapTerminalDiagnostic(
+          invalid,
+          'PUMPSWAP_MARKET_POOL_MISMATCH',
+        );
+        throw invalid;
       }
       throw error;
     }
     const observedAtMs = this.now();
     if (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0) {
-      throw new InvalidPumpSwapReserveError('Horodatage d’observation invalide.');
+      throw reserveFailure('Horodatage d’observation invalide.', 'UNAVAILABLE');
     }
     return Object.freeze({
       pool: pool.address,
@@ -115,8 +124,17 @@ function required(
   account: ReadonlyAccountSnapshot | null | undefined,
   address: string,
 ): ReadonlyAccountSnapshot {
-  if (account?.address !== address) {
-    throw new InvalidPumpSwapReserveError(`Compte requis absent: ${address}.`);
+  if (account === null || account === undefined) {
+    throw reserveFailure(
+      `Compte requis absent: ${address}.`,
+      'PUMPSWAP_MUTABLE_RPC_UNAVAILABLE',
+    );
+  }
+  if (account.address !== address) {
+    throw reserveFailure(
+      `Compte RPC inattendu: ${address}.`,
+      'PUMPSWAP_RPC_CONTEXT_INVALID',
+    );
   }
   return account;
 }
@@ -127,21 +145,43 @@ function decodeVault(
   expectedProgram: PublicKey,
 ): { readonly amountRaw: bigint } {
   if (account.owner !== expectedProgram.toBase58()) {
-    throw new InvalidPumpSwapReserveError(
+    throw reserveFailure(
       `Programme token du vault ${account.address} incohérent.`,
+      'PUMPSWAP_MUTABLE_ACCOUNT_DECODING',
     );
   }
   if (account.data.length < AccountLayout.span) {
-    throw new InvalidPumpSwapReserveError(`Vault ${account.address} tronqué.`);
+    throw reserveFailure(
+      `Vault ${account.address} tronqué.`,
+      'PUMPSWAP_MUTABLE_ACCOUNT_DECODING',
+    );
   }
   const decoded = AccountLayout.decode(account.data);
   const mint = new PublicKey(decoded.mint).toBase58();
   if (mint !== expectedMint) {
-    throw new InvalidPumpSwapReserveError(
+    throw reserveMismatch(
       `Mint du vault ${account.address} incohérent.`,
     );
   }
   return Object.freeze({ amountRaw: decoded.amount });
+}
+
+function reserveMismatch(message: string): InvalidPumpSwapReserveError {
+  return reserveFailure(message, 'PUMPSWAP_MARKET_POOL_MISMATCH');
+}
+
+function reserveFailure(
+  message: string,
+  diagnosticCode:
+    | 'PUMPSWAP_MUTABLE_RPC_UNAVAILABLE'
+    | 'PUMPSWAP_RPC_CONTEXT_INVALID'
+    | 'PUMPSWAP_MUTABLE_ACCOUNT_DECODING'
+    | 'PUMPSWAP_MARKET_POOL_MISMATCH'
+    | 'UNAVAILABLE',
+): InvalidPumpSwapReserveError {
+  const error = new InvalidPumpSwapReserveError(message);
+  registerPumpSwapTerminalDiagnostic(error, diagnosticCode);
+  return error;
 }
 
 function tokenProgram(kind: CanonicalMarketPool['baseTokenProgram']): PublicKey {

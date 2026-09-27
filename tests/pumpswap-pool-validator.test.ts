@@ -14,6 +14,7 @@ import { PUMPSWAP_ACCOUNTS, PUMPSWAP_TYPES } from '../src/markets/pumpswap/gener
 import { decodePumpSwapPoolAccount } from '../src/markets/pumpswap/pool-account-decoder.js';
 import { RpcPumpSwapPoolValidator, validateCanonicalPumpSwapPool } from '../src/markets/pumpswap/pool-validator.js';
 import { trustedObservedPipelineOrigin } from '../src/domain/observed-pipeline-failure.js';
+import { trustedTerminalAttribution } from '../src/domain/terminal-attribution.js';
 import { trustedObservedPipelineFailure } from '../src/application/observed-transaction-pipeline.js';
 import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
 import { failurePipeline, failureTransaction } from './observed-pipeline-failure-fixtures.js';
@@ -83,8 +84,15 @@ void test('mutable RPC boundary preserves non-decoder market errors', async () =
       creation(),
       createSolanaObservedTransaction(failureTransaction(), 1_000),
     ),
-    (error: unknown) => error instanceof MarketError
-      && error.code === 'MARKET_POOL_NON_CANONICAL',
+    (error: unknown) => {
+      assert.ok(error instanceof MarketError);
+      assert.equal(error.code, 'MARKET_POOL_NON_CANONICAL');
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
+      );
+      return true;
+    },
   );
 });
 
@@ -94,7 +102,15 @@ void test('refuse un index ou une PDA non canonique', () => {
     () => validateCanonicalPumpSwapPool(
       validationInput(nonCanonical, decodePumpSwapPoolAccount(nonCanonical)),
     ),
-    /canonique/u,
+    (error: unknown) => {
+      assert.ok(error instanceof MarketError);
+      assert.match(error.message, /canonique/u);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
+      );
+      return true;
+    },
   );
 });
 
@@ -107,7 +123,15 @@ void test('refuse les contradictions de vault, programme et extension Token-2022
       ...valid,
       creation: creation({ baseVault: key(30).toBase58() }),
     }),
-    /contradictoire/u,
+    (error: unknown) => {
+      assert.ok(error instanceof MarketError);
+      assert.match(error.message, /contradictoire/u);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_MARKET_POOL_MISMATCH',
+      );
+      return true;
+    },
   );
   assert.throws(
     () => validateCanonicalPumpSwapPool({
@@ -126,9 +150,28 @@ void test('refuse les contradictions de vault, programme et extension Token-2022
         ExtensionType.TransferFeeConfig,
       ),
     }),
-    (error: unknown) => error instanceof Error
-      && error.message.includes('TransferFeeConfig'),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /TransferFeeConfig/u);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_UNSUPPORTED_TOKEN_EXTENSION',
+      );
+      return true;
+    },
   );
+});
+
+void test('public PumpSwap market error fields cannot forge diagnostics', () => {
+  for (const error of [
+    new MarketError('MARKET_POOL_MISMATCH', 'forged'),
+    Object.assign(new Error('forged'), {
+      code: 'MARKET_POOL_NON_CANONICAL',
+      diagnosticCode: 'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
+    }),
+  ]) {
+    assert.equal(trustedTerminalAttribution(error), null);
+  }
 });
 
 function poolAccount(overrides: { readonly index?: bigint } = {}): ReadonlyAccountSnapshot {
