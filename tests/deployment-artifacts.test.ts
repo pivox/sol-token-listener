@@ -386,6 +386,8 @@ void test('deployment keeps executable bounded admission disabled until the foll
   for (const document of [readme, overview]) {
     assert.match(document, /migration 057[^.]{0,120}tête courante/iu);
   }
+  assert.match(readme, /appliquer toutes les migrations\s+jusqu'à 057/iu);
+  assert.doesNotMatch(readme, /jusqu'à 056/iu);
   assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
   assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
   assert.doesNotMatch(overview, /45-second policy[^.]{0,120}(?:active|enabled)/iu);
@@ -1053,7 +1055,8 @@ void test('versioned canary verdict documents provider-affine and durable shutdo
 
   assert.match(overview,
     /href="superpowers\/specs\/2026-09-25-mainnet-observe-canary-verdict-design\.md"/u);
-  assert.match(overview, /npm run canary:evaluate/u);
+  assert.match(overview,
+    /npm run canary:evaluate -- \/absolute\/path\/to\/redacted-canary-input\.v1\.json \/absolute\/path\/to\/mainnet-terminal-attribution\.v1\.json/u);
 });
 
 void test('terminal attribution runbook captures before teardown and keeps provenance local', async () => {

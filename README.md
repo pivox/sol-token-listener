@@ -84,7 +84,7 @@ La migration 057 est la tête courante du dépôt ; la migration 053 conserve la
 preuve monotone `worker_admitted_at`, immuable et jamais effacée après admission.
 Déploiement : drain → migrations 053 à 057 → deploy avec le flag false → restart ;
 arrêter et drainer le listener, mesurer l'inbox, appliquer toutes les migrations
-jusqu'à 056 puis vérifier ordre et compteurs avant reprise. Un old binary contre
+jusqu'à 057 puis vérifier ordre et compteurs avant reprise. Un old binary contre
 schema 053 is not supported :
 conserver le nouveau binaire avec le flag désactivé, ou restaurer dans une
 fenêtre drainée selon la procédure opérateur, sans ancienne réplique sur ce schéma.
