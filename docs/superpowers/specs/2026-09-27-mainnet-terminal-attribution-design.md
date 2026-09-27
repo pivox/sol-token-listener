@@ -6,7 +6,7 @@ Issue: #170
 
 Status: approved for implementation
 
-Contract revision: 1.0.0
+Contract revision: 1.0.1
 
 ## Purpose
 
@@ -62,14 +62,23 @@ and bounded columns:
 - observed pipeline stage and authenticated origin when available;
 - one closed diagnostic code or explicit `UNAVAILABLE`;
 - optional bounded Pump wire identity;
+- immutable public-chain locator: slot, transaction index,
+  confirmation-at-observation and instruction cursor when available;
 - completeness state and database capture time.
 
-The table cascades with inbox retention. Repository writes are in the same
-transaction as `markFailed` or catch-up classification. A duplicate replay
-upserts the same deterministic occurrence; it cannot multiply evidence.
+The table cascades with inbox retention. Repository writes use a fixed
+savepoint inside the same transaction as `markFailed` or catch-up
+classification. A duplicate replay upserts the same deterministic occurrence;
+it cannot multiply evidence. A statement-level journal rejection rolls back to
+that savepoint, increments a bounded incomplete-attribution counter on the
+parent inbox row and commits the unchanged terminal result. A lost or already
+aborted PostgreSQL transaction remains a normal repository failure: no design
+can commit the terminal result without a viable transaction.
+
 Failure to derive optional runtime evidence stores an explicit unavailable
-record when the terminal write itself can safely do so. It never turns a
-successful terminal write into a different business decision.
+record. Failure to persist it while the transaction remains viable is therefore
+observable after a later retry or success and prevents canary PASS. Attribution
+never turns a successful terminal write into a different business decision.
 
 Occurrences are deliberately separate from current inbox rows. A later claim
 clears current error fields, and a later success can make the inbox row
@@ -136,7 +145,9 @@ suffix boundary. Generic reader remainder after a failed field is not called a
 suffix.
 
 The transaction decoder attaches cursor identity only to the exact instruction
-that threw. Unknown discriminators keep their current null/no-error behavior.
+that threw. The sidecar carries the immutable transaction locator through
+catch-up before normalized transaction data disappears, and the journal stores
+it explicitly. Unknown discriminators keep their current null/no-error behavior.
 No new layout or discriminator is accepted by this PR.
 
 One canonical public-chain provenance locator may be retained per diagnostic
@@ -167,6 +178,8 @@ single read-only `REPEATABLE READ` PostgreSQL snapshot. It:
 
 - reads all current `FAILED` and `QUARANTINED`, not only exhausted rows;
 - reads the bounded diagnostic occurrence journal;
+- reconciles the parent incomplete-attribution counters even when a later retry
+  has cleared its current error or has succeeded;
 - validates exact schemas and safe integers;
 - sorts keys and representatives by canonical bytewise tuples;
 - retains at most 128 groups per section and one representative per wire group;
@@ -210,8 +223,9 @@ separate proof-driven PR.
 
 Migration 057 supports empty install, upgrade from 056, immediate replay and
 strict named-object drift detection. It creates the journal, bounded indexes,
-constraints, four-hour purge integration and minimum listener grants. `PUBLIC`
-has no access. Raw-chain and business projections are unchanged.
+constraints, a bounded incomplete-attribution counter on the parent inbox,
+four-hour purge integration and minimum listener grants. `PUBLIC` has no
+access. Raw-chain and business projections are unchanged.
 
 ## Acceptance
 
@@ -221,6 +235,9 @@ has no access. Raw-chain and business projections are unchanged.
 - worker/catch-up, instruction/CPI and outer/inner are distinct;
 - closed wallet/PumpSwap diagnostics cannot be forged;
 - hostile values and logger/observer failures do not affect pipeline outcome;
+- a real rejected journal statement rolls back only its savepoint, preserves
+  the inbox result and makes capture fail closed, including after later success;
+- catch-up provenance remains exportable after runtime objects are gone;
 - deterministic two-worker PostgreSQL reproduction passes without sleep;
 - migration install/upgrade/replay/drift and four-hour retention pass;
 - terminal and decoder canary gates enforce the rules above;
