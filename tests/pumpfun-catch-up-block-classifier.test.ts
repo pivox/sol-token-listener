@@ -406,6 +406,8 @@ void test('classifies bounded historical BUY layouts as supported untracked trad
   for (const name of [
     'buy-exact-quote-v2-track-volume-mainnet.json',
     'buy-exact-sol-in-option-mainnet.json',
+    'buy-exact-sol-in-omitted-mainnet.json',
+    'buy-option-true-mainnet.json',
   ]) {
     const transaction = await fixtureTransaction(name);
     const repository = new RecordingRepository();

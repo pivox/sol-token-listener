@@ -130,32 +130,32 @@ function decodeLegacyBuyArgs(
   observeSuffix: (length: number) => void,
 ): Readonly<Record<string, PumpIdlValue>> {
   const required = decodeIdlFields(definition.args.slice(0, 2), reader);
-  const suffixLength = reader.remaining;
-  observeSuffix(suffixLength);
-  if (name === 'buy') {
-    if (suffixLength === 0) return required;
-    if (suffixLength !== 1) throw invalidBuySuffix(name, suffixLength);
-    return Object.freeze({
-      ...required,
-      track_volume: Object.freeze([reader.readBool()]),
-    });
-  }
-
-  if (suffixLength === 1) {
-    return Object.freeze({
-      ...required,
-      track_volume: Object.freeze([reader.readBool()]),
-    });
-  }
-  if (suffixLength !== 2) throw invalidBuySuffix(name, suffixLength);
-  const historicalSuffix = reader.readBytes(2);
-  if (historicalSuffix[0] !== 1 || historicalSuffix[1] !== 0) {
-    throw invalidBuySuffix(name, suffixLength);
-  }
+  const trackVolume = decodeLegacyBuySuffix(name, reader, observeSuffix);
+  if (trackVolume === undefined) return required;
   return Object.freeze({
     ...required,
-    track_volume: Object.freeze([false]),
+    track_volume: Object.freeze([trackVolume]),
   });
+}
+
+function decodeLegacyBuySuffix(
+  name: 'buy' | 'buy_exact_sol_in',
+  reader: PumpBorshReader,
+  observeSuffix: (length: number) => void,
+): boolean | undefined {
+  const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
+  if (suffixLength === 0) return undefined;
+  if (suffixLength === 1) return reader.readBool();
+  if (suffixLength !== 2) throw invalidBuySuffix(name, suffixLength);
+  const historicalSuffix = reader.readBytes(2);
+  if (
+    historicalSuffix[0] !== 1
+    || (historicalSuffix[1] !== 0 && historicalSuffix[1] !== 1)
+  ) {
+    throw invalidBuySuffix(name, suffixLength);
+  }
+  return historicalSuffix[1] === 1;
 }
 
 function decodeExactQuoteBuyArgs(

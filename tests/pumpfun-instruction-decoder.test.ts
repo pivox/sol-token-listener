@@ -93,18 +93,41 @@ void test('classe les variantes par famille métier', () => {
   assert.equal(decodePumpInstruction(pumpInstruction('migrate_v2'))?.family, 'MIGRATE');
 });
 
-void test('normalise les suffixes historiques bornés de buy et buy_exact_sol_in', () => {
-  const omitted = decodePumpInstruction(
-    buyInstructionWithSuffix('buy', Buffer.alloc(0)),
-  );
-  assert.ok(omitted);
-  assert.equal(Object.hasOwn(omitted.args, 'track_volume'), false);
+void test('omet track_volume pour les deux suffixes BUY absents', () => {
+  for (const name of ['buy', 'buy_exact_sol_in'] as const) {
+    const decoded = decodePumpInstruction(
+      buyInstructionWithSuffix(name, Buffer.alloc(0)),
+    );
+    assert.ok(decoded);
+    assert.equal(Object.hasOwn(decoded.args, 'track_volume'), false);
+  }
+});
 
-  const legacyFalse = decodePumpInstruction(
-    buyInstructionWithSuffix('buy_exact_sol_in', Buffer.from([1, 0])),
-  );
-  assert.ok(legacyFalse);
-  assert.deepEqual(legacyFalse.args.track_volume, [false]);
+void test('normalise les deux booléens OptionBool courants des BUY historiques', () => {
+  for (const name of ['buy', 'buy_exact_sol_in'] as const) {
+    for (const trackVolume of [false, true]) {
+      const decoded = decodePumpInstruction(
+        buyInstructionWithSuffix(name, Buffer.from([Number(trackVolume)])),
+      );
+      assert.ok(decoded);
+      assert.deepEqual(decoded.args.track_volume, [trackVolume]);
+    }
+  }
+});
+
+void test('normalise les deux booléens Some historiques des BUY', () => {
+  for (const name of ['buy', 'buy_exact_sol_in'] as const) {
+    for (const trackVolume of [false, true]) {
+      const decoded = decodePumpInstruction(
+        buyInstructionWithSuffix(
+          name,
+          Buffer.from([1, Number(trackVolume)]),
+        ),
+      );
+      assert.ok(decoded);
+      assert.deepEqual(decoded.args.track_volume, [trackVolume]);
+    }
+  }
 });
 
 void test('conserve le booléen historique borné de buy_exact_quote_in_v2', () => {
@@ -116,20 +139,19 @@ void test('conserve le booléen historique borné de buy_exact_quote_in_v2', () 
 });
 
 void test('refuse les suffixes BUY historiques ambigus ou non booléens', () => {
-  for (const suffix of [Buffer.from([2]), Buffer.alloc(2), Buffer.from([1, 0]), Buffer.alloc(3)]) {
-    assert.throws(
-      () => decodePumpInstruction(buyInstructionWithSuffix('buy', suffix)),
-      isPumpError('PUMP_BORSH_INVALID'),
-    );
-  }
-
-  for (const suffix of [Buffer.alloc(0), Buffer.from([2]), Buffer.from([0, 0]), Buffer.from([1, 1]), Buffer.from([1, 2]), Buffer.alloc(3)]) {
-    assert.throws(
-      () => decodePumpInstruction(
-        buyInstructionWithSuffix('buy_exact_sol_in', suffix),
-      ),
-      isPumpError('PUMP_BORSH_INVALID'),
-    );
+  for (const name of ['buy', 'buy_exact_sol_in'] as const) {
+    for (const suffix of [
+      Buffer.from([2]),
+      Buffer.from([0, 0]),
+      Buffer.from([0, 1]),
+      Buffer.from([1, 2]),
+      Buffer.alloc(3),
+    ]) {
+      assert.throws(
+        () => decodePumpInstruction(buyInstructionWithSuffix(name, suffix)),
+        isPumpError('PUMP_BORSH_INVALID'),
+      );
+    }
   }
 
   for (const suffix of [Buffer.from([0]), Buffer.from([2]), Buffer.alloc(2)]) {
@@ -258,7 +280,7 @@ void test('refuse les octets résiduels après les arguments', () => {
   assert.throws(
     () => decodePumpInstruction({
       ...buy,
-      data: Uint8Array.from([...buy.data, 1]),
+      data: Uint8Array.from([...buy.data, 2]),
     }),
     isPumpError('PUMP_BORSH_INVALID'),
   );
