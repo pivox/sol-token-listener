@@ -2954,10 +2954,17 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
 
   public async workerAdmissionMetrics(): Promise<RuntimeWorkerAdmissionMetricsV1> {
     return this.safely(async () => {
-      const retryable = `inbox.processing_status='FAILED' AND inbox.error_retryable=TRUE
-        AND inbox.retry_exhausted_at IS NULL AND inbox.next_attempt_at IS NOT NULL`;
-      const actionable = `(inbox.processing_status IN ('PENDING','PROCESSING')
-        OR (${retryable}))`;
+      const claimable = `(
+        (inbox.processing_status='PENDING'
+          AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
+        OR (inbox.processing_status='FAILED' AND inbox.error_retryable=TRUE
+          AND inbox.retry_exhausted_at IS NULL
+          AND inbox.next_attempt_at<=database_clock.at
+          AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
+        OR (inbox.processing_status='PROCESSING'
+          AND inbox.lease_expires_at<=database_clock.at
+          AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
+      )`;
       const result = await this.pool.query(this.workerAdmissionPolicy.enabled
         ? `WITH database_clock AS MATERIALIZED (
              SELECT date_trunc('milliseconds',clock_timestamp()) AS at
@@ -2996,7 +3003,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                  AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
              UNION SELECT live.mint FROM listener_worker_tracking_live_mints AS live
            ) SELECT
-             COUNT(*) FILTER (WHERE ${actionable}
+             COUNT(*) FILTER (WHERE ${claimable}
                AND inbox.worker_admitted_at IS NOT NULL) AS claimable_backlog_count,
              COUNT(*) FILTER (WHERE inbox.processing_status='PENDING'
                AND inbox.worker_admitted_at IS NULL) AS classification_pending_count,
@@ -3009,20 +3016,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              END AS oldest_classification_pending_age_ms,
              (SELECT COUNT(*) FROM fresh_launch) AS fresh_mint_count,
              (SELECT COUNT(*) FROM extended_mint) AS extended_mint_count,
-             COUNT(*) FILTER (WHERE inbox.processing_status='DEFERRED'
-               AND inbox.ingestion_priority='NORMAL'
-               AND inbox.ingestion_hint='PUMPFUN_TRADE'
-               AND inbox.ingestion_hint_mint IS NOT NULL
-               AND inbox.worker_admitted_at IS NOT NULL
-               AND inbox.terminal_at IS NOT NULL
-               AND inbox.terminal_at<=database_clock.at
-               AND inbox.purge_after=inbox.terminal_at+INTERVAL '4 hours'
-               AND inbox.purge_after>database_clock.at) AS demoted_count
+             COUNT(*) FILTER (WHERE ${workerAdmissionRetainedDemotionSql(
+               'inbox',
+               'database_clock.at',
+             )}) AS demoted_count
            FROM chain_transaction_inbox AS inbox CROSS JOIN database_clock`
         : `WITH database_clock AS MATERIALIZED (
              SELECT date_trunc('milliseconds',clock_timestamp()) AS at
            ) SELECT
-             COUNT(*) FILTER (WHERE ${actionable}) AS claimable_backlog_count,
+             COUNT(*) FILTER (WHERE ${claimable}) AS claimable_backlog_count,
              0::BIGINT AS classification_pending_count,
              NULL::BIGINT AS oldest_classification_pending_age_ms,
              0::BIGINT AS fresh_mint_count,
@@ -4083,7 +4085,8 @@ function workerAdmissionDemotionPristineSql(alias: string): string {
 }
 
 function workerAdmissionRetainedDemotionSql(alias: string, sampledAt: string): string {
-  if (alias !== 'inbox' || sampledAt !== 'sampled.sampled_at') {
+  if (alias !== 'inbox'
+    || (sampledAt !== 'sampled.sampled_at' && sampledAt !== 'database_clock.at')) {
     throw new TypeError('Worker admission retained demotion SQL identity is invalid.');
   }
   return `${alias}.processing_status='DEFERRED'

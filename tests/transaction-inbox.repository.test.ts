@@ -150,6 +150,58 @@ void test('worker admission metrics use one PostgreSQL clock and exact enabled a
     });
   });
 
+void test('worker admission metrics use exact scheduler claims and retained demotion shape',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const fixedAt = new Date('2026-01-02T00:00:00.000Z');
+      const detectedAt = new Date(fixedAt.getTime() - 10_000);
+      await dropInboxIntegrityGuards(pool);
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+        first_detected_at,worker_admitted_at,attempts,attempts_in_cycle,retry_max_attempts,
+        lease_token,lease_expires_at,error_code,error_name,error_retryable,next_attempt_at,
+        retry_exhausted_at,terminal_at,purge_after,first_processing_evidence_unavailable
+      ) VALUES
+        ('metrics-claim-control',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'PENDING','NORMAL','NONE',NULL,$2,$2,$2,0,0,5,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+          NULL,NULL,FALSE),
+        ('metrics-active-lease',2,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'PROCESSING','NORMAL','NONE',NULL,$2,$2,$2,1,1,5,'active-lease',
+          $3::TIMESTAMPTZ+INTERVAL '1 minute',NULL,NULL,NULL,NULL,NULL,NULL,NULL,FALSE),
+        ('metrics-expired-exhausted-lease',3,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'PROCESSING','NORMAL','NONE',NULL,$2,$2,$2,5,5,5,'expired-lease',
+          $3::TIMESTAMPTZ-INTERVAL '1 second',NULL,NULL,NULL,NULL,NULL,NULL,NULL,FALSE),
+        ('metrics-future-backoff',4,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'FAILED','NORMAL','NONE',NULL,$2,$2,$2,1,1,5,NULL,NULL,'RPC_TRANSIENT','future',TRUE,
+          $3::TIMESTAMPTZ+INTERVAL '1 minute',NULL,NULL,NULL,FALSE),
+        ('metrics-failed-budget-exhausted',5,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'FAILED','NORMAL','NONE',NULL,$2,$2,$2,5,5,5,NULL,NULL,'RPC_TRANSIENT','exhausted',TRUE,
+          $3::TIMESTAMPTZ-INTERVAL '1 second',NULL,NULL,NULL,FALSE),
+        ('metrics-invalid-retained-demotion',6,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'DEFERRED','NORMAL','PUMPFUN_TRADE',$4,$2,$2,$2,0,0,5,NULL,NULL,NULL,NULL,NULL,NULL,
+          NULL,$3::TIMESTAMPTZ-INTERVAL '1 hour',
+          $3::TIMESTAMPTZ+INTERVAL '3 hours',TRUE)`,
+      [PUMP_PROGRAM_ID, detectedAt, fixedAt, tradeMint]);
+      await freezeSchemaClock(pool, fixedAt);
+
+      const enabled = await new PostgresTransactionInboxRepository(
+        pool, undefined, enabledAdmission,
+      ).workerAdmissionMetrics();
+      const disabled = await new PostgresTransactionInboxRepository(pool).workerAdmissionMetrics();
+
+      assert.deepEqual({
+        enabledClaimableBacklogCount: enabled.claimableBacklogCount,
+        disabledClaimableBacklogCount: disabled.claimableBacklogCount,
+        enabledDemotedCount: enabled.demotedCount,
+      }, {
+        enabledClaimableBacklogCount: 1,
+        disabledClaimableBacklogCount: 1,
+        enabledDemotedCount: 0,
+      });
+    });
+  });
+
 void test('enabled first-processing requires admission, admits without moving detection, and excludes demotion',
   async (context) => {
     await withDatabase(context, async (pool) => {
