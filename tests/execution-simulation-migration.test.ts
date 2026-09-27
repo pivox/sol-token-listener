@@ -135,6 +135,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '053_transaction_inbox_worker_admission_foundation.sql',
       '054_paper_entry_boundary.sql',
       '055_creation_entry_single_active_session.sql',
+      '056_transaction_inbox_bounded_tracking.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);

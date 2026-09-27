@@ -69,11 +69,12 @@ void test('real journal SQL rejection commits failure, survives later success an
 
 void test('catch-up replay keeps immutable locator after runtime identity disappears and rejects no business writes', async (context) => {
   await withDatabase(context, async (pool, repository) => {
-    await Promise.all([repository.recordCatchUpClassification(classification('catch-up')),
-      repository.recordCatchUpClassification(classification('catch-up'))]);
+    const signature = '1'.repeat(64);
+    await Promise.all([repository.recordCatchUpClassification(classification(signature)),
+      repository.recordCatchUpClassification(classification(signature))]);
     const first = (await occurrences(pool))[0];
     assert.ok(first);
-    await repository.recordCatchUpClassification(classification('catch-up', Date.now() + 100));
+    await repository.recordCatchUpClassification(classification(signature, Date.now() + 100));
     const rows = await occurrences(pool);
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0], first);
@@ -87,7 +88,7 @@ void test('catch-up replay keeps immutable locator after runtime identity disapp
     const artifact = await capture(pool, repository);
     assert.equal(artifact.diagnosticOccurrences.totalOccurrences, 1);
     assert.deepEqual(artifact.diagnosticOccurrences.groups[0]?.representative, {
-      signature: 'catch-up', slot: 1, transactionIndex: 7, confirmationStatus: 'confirmed',
+      signature, slot: 1, transactionIndex: 7, confirmationStatus: 'confirmed',
       instructionIndex: 3, innerInstructionIndex: 2,
     });
 
@@ -192,18 +193,19 @@ void test('recent catch-up rejection retains its parent marker despite an old te
 
 void test('trusted worker wire remains exportable when a wrapper removes decoder origin authority', async (context) => {
   await withDatabase(context, async (pool, repository) => {
-    await repository.enqueue(notification('wire-no-origin'));
+    const signature = `${'1'.repeat(63)}2`;
+    await repository.enqueue(notification(signature));
     const claim = await repository.claim(Date.now(), 30);
     assert.ok(claim);
-    const value = failure('wire-no-origin', false);
+    const value = failure(signature, false);
     registerTrustedTerminalAttribution(value, { version: 1, diagnosticCode: 'PUMP_BORSH_INVALID',
       causeKind: 'PUMP_DECODER', pumpWire: { surface: 'INSTRUCTION', location: 'OUTER',
         discriminatorHex: '0000000000000000', idlName: 'buy', totalBytes: 12, payloadBytes: 4, suffixBytes: null } });
     registerTrustedTerminalAttributionContext(value, { originCode: null, locator: {
-      signature: 'wire-no-origin', slot: 1n, transactionIndex: 0, confirmationStatus: 'confirmed',
+      signature, slot: 1n, transactionIndex: 0, confirmationStatus: 'confirmed',
       instructionIndex: 1, innerInstructionIndex: null,
     } });
-    await repository.markFailed('wire-no-origin', claim.leaseToken, value);
+    await repository.markFailed(signature, claim.leaseToken, value);
     assert.equal((await occurrences(pool)).length, 1);
     const artifact = await capture(pool, repository);
     const group = artifact.diagnosticOccurrences.groups[0];
