@@ -690,6 +690,33 @@ void test('enabled authority uses one PostgreSQL clock at the exact 44.999/45.00
     });
   });
 
+void test('enabled claim shares one PostgreSQL clock across preview, demotion and tracked selection',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-09-27T12:00:00.000Z');
+      await withAuthoritySession(pool, clock, async ({
+        repository, client, authorityClockReads,
+      }) => {
+        await seedCanonicalAuthorityLaunch(client, new Date(clock.getTime() - 44_999));
+        await repository.enqueue(tradeNotification('claim-clock-fresh-44999', 1n));
+        const beforeFreshClaim = authorityClockReads();
+        assert.equal((await repository.claim(clock.getTime(), 30))?.signature,
+          'claim-clock-fresh-44999');
+        assert.equal(authorityClockReads() - beforeFreshClaim, 1);
+
+        await pool.query("DELETE FROM chain_transaction_inbox WHERE signature='claim-clock-fresh-44999'");
+        await repository.enqueue(tradeNotification('claim-clock-expired-45000', 2n));
+        await client.query('UPDATE token_launches SET detected_at=$1', [
+          new Date(clock.getTime() - 45_000),
+        ]);
+        const beforeExpiredClaim = authorityClockReads();
+        assert.equal(await repository.claim(clock.getTime(), 30), null);
+        assert.equal(authorityClockReads() - beforeExpiredClaim, 1);
+        assert.equal((await row(pool, 'claim-clock-expired-45000')).processing_status, 'DEFERRED');
+      });
+    });
+  });
+
 void test('enabled authority is the same union for enqueue, catch-up, sync and listTrackedMints',
   async (context) => {
     await withDatabase(context, async (pool) => {
@@ -7196,10 +7223,10 @@ async function withAuthoritySession(
   let authorityClockReadCount = 0;
   const query = (text: string, values?: readonly unknown[]) => {
     authorityClockReadCount += text.match(
-      /date_trunc\('milliseconds', clock_timestamp\(\)\)/gu,
+      /date_trunc\('milliseconds',\s*clock_timestamp\(\)\)/gu,
     )?.length ?? 0;
     return connection.query(
-      text.replaceAll("date_trunc('milliseconds', clock_timestamp())", literal),
+      text.replaceAll(/date_trunc\('milliseconds',\s*clock_timestamp\(\)\)/gu, literal),
       values === undefined ? undefined : [...values],
     );
   };

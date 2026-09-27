@@ -193,6 +193,7 @@ type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED
 type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE';
 
 interface WorkerAdmissionClaimPlan {
+  readonly authorityAt: Date;
   readonly demotionSignatures: readonly string[];
   readonly demotionMints: readonly string[];
   readonly trackedSignatures: readonly string[];
@@ -1227,9 +1228,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       if (!Number.isSafeInteger(leaseMs)) throw new TypeError('Lease duration is unsafe.');
       const expires = dateFromMs(nowMs + leaseMs);
       return this.transaction(async (client) => {
-        const workerAdmissionClaimPlan = this.workerAdmissionPolicy.enabled
-          ? await this.prepareWorkerAdmissionClaim(client, now)
+        const workerAdmissionClock = this.workerAdmissionPolicy.enabled
+          ? await readWorkerTrackingDatabaseClock(client)
           : null;
+        const workerAdmissionClaimPlan = workerAdmissionClock === null
+          ? null
+          : await this.prepareWorkerAdmissionClaim(client, now, workerAdmissionClock);
         await client.query(
           `WITH exhausted AS (
              SELECT signature
@@ -1394,7 +1398,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     return client.query(
       `WITH
        database_clock AS MATERIALIZED (
-         SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+         SELECT $5::TIMESTAMPTZ AS at
        ), tracked_preview AS MATERIALIZED (
          SELECT signature,mint FROM UNNEST($2::TEXT[],$3::TEXT[]) AS preview(signature,mint)
        ), candidate_mints AS MATERIALIZED (
@@ -1463,19 +1467,21 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
        FOR UPDATE OF inbox SKIP LOCKED LIMIT 1`,
       [now, workerAdmissionClaimPlan.trackedSignatures,
         workerAdmissionClaimPlan.trackedMints,
-        this.workerAdmissionPolicy.trackingWindowSeconds],
+        this.workerAdmissionPolicy.trackingWindowSeconds,
+        workerAdmissionClaimPlan.authorityAt],
     );
   }
 
   private async prepareWorkerAdmissionClaim(
     client: InboxClient,
     now: Date,
+    authorityAt: Date,
   ): Promise<WorkerAdmissionClaimPlan> {
     // Keep authoritative rows from permanently occupying the bounded preview;
     // demotion still revalidates this advisory decision after the mint locks.
     const demotionPreview = await client.query(
       `WITH database_clock AS MATERIALIZED (
-         SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+         SELECT $1::TIMESTAMPTZ AS at
        ) SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
        FROM chain_transaction_inbox AS inbox
        CROSS JOIN database_clock
@@ -1496,7 +1502,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE launch.mint=inbox.ingestion_hint_mint
              AND launch.current_state<>'RETRACTED'
              AND launch_event.confirmation_status<>'orphaned'
-             AND launch.detected_at+($1::INTEGER*INTERVAL '1 second')>database_clock.at
+             AND launch.detected_at+($2::INTEGER*INTERVAL '1 second')>database_clock.at
          ) AND NOT EXISTS (
            SELECT 1
            FROM trading_candidates AS candidate
@@ -1523,8 +1529,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE live.mint=inbox.ingestion_hint_mint
          )
        ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
-       LIMIT $2`,
-      [this.workerAdmissionPolicy.trackingWindowSeconds,
+       LIMIT $3`,
+      [authorityAt, this.workerAdmissionPolicy.trackingWindowSeconds,
         MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
     const trackedPreview = await client.query(
@@ -1559,6 +1565,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
     await lockWorkerTrackingMints(client, [...demotionMints, ...trackedMints]);
     return Object.freeze({
+      authorityAt: new Date(authorityAt.getTime()),
       demotionSignatures: Object.freeze(demotionSignatures),
       demotionMints: Object.freeze(demotionMints),
       trackedSignatures: Object.freeze(trackedSignatures),
@@ -1574,7 +1581,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     await client.query(
       `WITH
        database_clock AS MATERIALIZED (
-         SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+         SELECT $5::TIMESTAMPTZ AS at
        ), demotion_preview AS MATERIALIZED (
          SELECT signature,mint FROM UNNEST($1::TEXT[],$2::TEXT[]) AS preview(signature,mint)
        ), candidates AS MATERIALIZED (
@@ -1649,7 +1656,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       ) SELECT COUNT(*)::INTEGER AS demoted_count FROM demoted`,
       [workerAdmissionClaimPlan.demotionSignatures, workerAdmissionClaimPlan.demotionMints,
         this.workerAdmissionPolicy.trackingWindowSeconds,
-        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM,
+        workerAdmissionClaimPlan.authorityAt],
     );
   }
 
