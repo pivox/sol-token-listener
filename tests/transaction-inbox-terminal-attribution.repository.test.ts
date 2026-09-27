@@ -64,6 +64,11 @@ void test('funding diagnostics retain retry-pending evidence and exact fifth-att
       assert.equal(stored.error_retryable, true);
       assert.equal(stored.attempts_in_cycle, 1);
       assert.equal(stored.retry_exhausted_at, null);
+      if (signature !== 'funding-record') {
+        await pool.query(`UPDATE chain_transaction_inbox
+          SET next_attempt_at='2100-01-01T00:00:00.000Z'
+          WHERE signature=$1`, [signature]);
+      }
     }
 
     for (let attempt = 2; attempt <= 5; attempt += 1) {
