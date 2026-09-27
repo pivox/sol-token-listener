@@ -1721,6 +1721,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
       blockHydration: blockHydrationMetrics(),
       catchUpAdmission: null,
+      workerAdmission: null,
       rpcHttpEvidence: null,
       firstProcessingCanary: null,
       decoderQuarantine: null,
@@ -2120,6 +2121,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
     websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
+    workerAdmission: null,
     rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
   });
   assert.equal(health.lagSlots, null);
@@ -2390,6 +2392,90 @@ function catchUpAdmissionMetrics() {
     deferredCount: 4, ignoredCount: 5, quarantinedCount: 6,
   };
 }
+
+function workerAdmissionMetrics() {
+  return {
+    version: 1, enabled: true, trackingWindowSeconds: 45,
+    claimableBacklogCount: 8, classificationPendingCount: 2,
+    oldestClassificationPendingAgeMs: 4_999, freshMintCount: 3,
+    extendedMintCount: 2, demotedCount: 5,
+  };
+}
+
+async function projectWorkerAdmission(payload: unknown) {
+  return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow(), false, healthyHeartbeatRow({ payload }),
+  ))).getHealth();
+}
+
+void test('worker admission projects exact detached frozen V1 metrics and legacy absence as null', async () => {
+  for (const payload of [null, {}, { decoderQuarantine: { version: 1, unresolvedCount: 2 } }]) {
+    const health = await projectWorkerAdmission(payload);
+    assert.equal(health.status, 'OK');
+    assert.equal(health.heartbeat.workerAdmission, null);
+  }
+  const source = workerAdmissionMetrics();
+  const health = await projectWorkerAdmission({ workerAdmission: source });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.workerAdmission, source);
+  assert.ok(Object.isFrozen(health.heartbeat.workerAdmission));
+  assert.notEqual(health.heartbeat.workerAdmission, source);
+  assert.deepEqual(Object.keys(health.heartbeat.workerAdmission ?? {}).sort(), [
+    'claimableBacklogCount', 'classificationPendingCount', 'demotedCount',
+    'enabled', 'extendedMintCount', 'freshMintCount',
+    'oldestClassificationPendingAgeMs', 'trackingWindowSeconds', 'version',
+  ]);
+});
+
+void test('worker admission rejects malformed, identifying and non-canonical metrics fail closed', async () => {
+  const metrics = workerAdmissionMetrics();
+  const invalid: unknown[] = [
+    null, undefined, [], 'https://secret.invalid',
+    { ...metrics, version: 2 }, { ...metrics, enabled: 1 },
+    { ...metrics, trackingWindowSeconds: 0 }, { ...metrics, trackingWindowSeconds: 3_601 },
+    { ...metrics, classificationPendingCount: 0 },
+    { ...metrics, classificationPendingCount: 0, oldestClassificationPendingAgeMs: 0 },
+    { ...metrics, oldestClassificationPendingAgeMs: null },
+    { ...metrics, signature: 'secret-signature' }, { ...metrics, mint: 'secret-mint' },
+    { ...metrics, wallet: 'secret-wallet' }, { ...metrics, rpcUrl: 'https://secret.invalid' },
+    {
+      ...metrics, enabled: false, classificationPendingCount: 0,
+      oldestClassificationPendingAgeMs: null, freshMintCount: 1,
+    },
+  ];
+  for (const field of [
+    'trackingWindowSeconds', 'claimableBacklogCount', 'classificationPendingCount',
+    'oldestClassificationPendingAgeMs', 'freshMintCount', 'extendedMintCount', 'demotedCount',
+  ] as const) {
+    for (const value of [-1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, '1', 1n]) {
+      invalid.push({ ...metrics, [field]: value });
+    }
+  }
+  for (const field of Object.keys(metrics)) {
+    invalid.push(Object.fromEntries(Object.entries(metrics).filter(([key]) => key !== field)));
+  }
+  for (const candidate of invalid) {
+    const health = await projectWorkerAdmission({ workerAdmission: candidate });
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.equal(health.heartbeat.workerAdmission, null);
+    assert.doesNotMatch(JSON.stringify(health), /secret|https?:\/\//u);
+  }
+});
+
+void test('worker admission does not execute hostile payload accessors or proxy traps', async () => {
+  let calls = 0;
+  const accessor = Object.defineProperty({}, 'workerAdmission', {
+    enumerable: true, get() { calls += 1; throw new Error('secret'); },
+  });
+  const proxy = new Proxy(workerAdmissionMetrics(), {
+    ownKeys() { calls += 1; throw new Error('secret'); },
+  });
+  for (const payload of [accessor, { workerAdmission: proxy }]) {
+    assert.equal((await projectWorkerAdmission(payload)).status, 'DEGRADED');
+  }
+  assert.equal(calls, 0);
+});
 
 async function projectDecoderQuarantine(payload: unknown) {
   return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(

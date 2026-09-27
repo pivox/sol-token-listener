@@ -285,6 +285,81 @@ describe('frontend-owned API V1 schemas', () => {
     expect(parseCatchUpAdmission(maximum, Number.MAX_SAFE_INTEGER).heartbeat.catchUpAdmission).toEqual(maximum);
   });
 
+  it('accepts exact worker admission V1 metrics and rolling-deployment absence', () => {
+    const parsed = apiHealthEnvelopeSchema.parse(success(health)).data;
+    expect(parsed.heartbeat.workerAdmission).toEqual(health.heartbeat.workerAdmission);
+    expect(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: Object.fromEntries(Object.entries(health.heartbeat)
+        .filter(([key]) => key !== 'workerAdmission')),
+    })).data.heartbeat.workerAdmission).toBeUndefined();
+    expect(apiHealthEnvelopeSchema.parse(success({
+      ...health, heartbeat: { ...health.heartbeat, workerAdmission: null },
+    })).data.heartbeat.workerAdmission).toBeNull();
+
+    for (const metrics of [
+      {
+        ...health.heartbeat.workerAdmission,
+        classificationPendingCount: 0,
+        oldestClassificationPendingAgeMs: null,
+        freshMintCount: 0,
+        extendedMintCount: 0,
+        demotedCount: 0,
+      },
+      {
+        ...health.heartbeat.workerAdmission,
+        enabled: false,
+        classificationPendingCount: 0,
+        oldestClassificationPendingAgeMs: null,
+        freshMintCount: 0,
+        extendedMintCount: 0,
+        demotedCount: 0,
+      },
+    ]) {
+      expect(apiHealthEnvelopeSchema.parse(success({
+        ...health, heartbeat: { ...health.heartbeat, workerAdmission: metrics },
+      })).data.heartbeat.workerAdmission).toEqual(metrics);
+    }
+  });
+
+  it('keeps outer health additive but rejects malformed or extra worker admission fields', () => {
+    expect(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      futureHealthField: 'accepted',
+      heartbeat: { ...health.heartbeat, futureHeartbeatField: 'accepted' },
+    })).data.status).toBe(health.status);
+
+    const metrics = health.heartbeat.workerAdmission;
+    const invalid: unknown[] = [
+      [], 'https://secret.invalid', { ...metrics, version: 2 },
+      { ...metrics, enabled: 1 }, { ...metrics, trackingWindowSeconds: 0 },
+      { ...metrics, trackingWindowSeconds: 3_601 },
+      { ...metrics, classificationPendingCount: 0 },
+      { ...metrics, oldestClassificationPendingAgeMs: null },
+      { ...metrics, signature: 'secret-signature' }, { ...metrics, mint: 'secret-mint' },
+      {
+        ...metrics, enabled: false, classificationPendingCount: 0,
+        oldestClassificationPendingAgeMs: null, freshMintCount: 1,
+      },
+    ];
+    for (const field of [
+      'trackingWindowSeconds', 'claimableBacklogCount', 'classificationPendingCount',
+      'oldestClassificationPendingAgeMs', 'freshMintCount', 'extendedMintCount', 'demotedCount',
+    ] as const) {
+      for (const value of [-1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, '1', 1n]) {
+        invalid.push({ ...metrics, [field]: value });
+      }
+    }
+    for (const field of Object.keys(metrics)) {
+      invalid.push(Object.fromEntries(Object.entries(metrics).filter(([key]) => key !== field)));
+    }
+    for (const workerAdmission of invalid) {
+      expect(() => apiHealthEnvelopeSchema.parse(success({
+        ...health, heartbeat: { ...health.heartbeat, workerAdmission },
+      }))).toThrow();
+    }
+  });
+
   it('rejects malformed catch-up admission exact keys, states, bounded counts and sums', () => {
     const metrics = catchUpAdmissionMetrics();
     const invalid: unknown[] = [

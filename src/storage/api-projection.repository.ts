@@ -10,6 +10,7 @@ import {
   type ApiDecoderQuarantineMetricsV1,
   type ApiFirstProcessingCanaryEvidenceV1,
   type ApiRpcHttpEvidenceV1,
+  type ApiWorkerAdmissionMetricsV1,
   type ApiWebSocketHealth,
   type ApiHolders,
   type ApiHolderSnapshot,
@@ -50,6 +51,7 @@ import {
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
 import { createFirstProcessingCanaryEvidence } from '../domain/first-processing-canary.js';
+import { snapshotRuntimeWorkerAdmissionMetrics } from '../domain/worker-admission-metrics.js';
 import {
   SOCIAL_COLLECTION_STATUSES,
   SOCIAL_EVIDENCE_OUTCOMES,
@@ -2109,7 +2111,8 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null, catchUpAdmission: null, rpcHttpEvidence: null,
+    websocket, blockHydration: null, catchUpAdmission: null, workerAdmission: null,
+    rpcHttpEvidence: null,
     firstProcessingCanary: null, decoderQuarantine: null });
 }
 
@@ -2196,10 +2199,29 @@ function heartbeatFromRow(
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
+    workerAdmission: workerAdmissionFromPayload(row.heartbeat_payload),
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
     firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
     decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
   });
+}
+
+function workerAdmissionFromPayload(value: unknown): ApiWorkerAdmissionMetricsV1 | null {
+  if (value === null || value === undefined) return null;
+  try {
+    if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'workerAdmission');
+    if (descriptor === undefined) return null;
+    if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+    const metrics = exactDataRecord(descriptor.value, [
+      'version', 'enabled', 'trackingWindowSeconds', 'claimableBacklogCount',
+      'classificationPendingCount', 'oldestClassificationPendingAgeMs',
+      'freshMintCount', 'extendedMintCount', 'demotedCount',
+    ], 'Worker admission metrics');
+    return snapshotRuntimeWorkerAdmissionMetrics(freeze(metrics));
+  } catch {
+    throw invalid();
+  }
 }
 
 function decoderQuarantineFromPayload(

@@ -545,12 +545,26 @@ export interface ApiHeartbeat {
   readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
   /** Optional during rolling deployment; null when admission metrics are absent. */
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
+  /** Optional during rolling deployment; null when worker-admission metrics are absent. */
+  readonly workerAdmission?: ApiWorkerAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when RPC HTTP evidence is absent. */
   readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
   /** Optional during rolling deployment; null when first-processing evidence is absent. */
   readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
   /** Optional during rolling deployment; null when decoder-quarantine evidence is absent. */
   readonly decoderQuarantine?: ApiDecoderQuarantineMetricsV1 | null;
+}
+
+export interface ApiWorkerAdmissionMetricsV1 {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly trackingWindowSeconds: number;
+  readonly claimableBacklogCount: number;
+  readonly classificationPendingCount: number;
+  readonly oldestClassificationPendingAgeMs: number | null;
+  readonly freshMintCount: number;
+  readonly extendedMintCount: number;
+  readonly demotedCount: number;
 }
 
 export interface ApiDecoderQuarantineMetricsV1 {
