@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
   MAX_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM,
   MIN_PUMPFUN_TRACKING_WINDOW_SECONDS,
   PUMPFUN_WORKER_ADMISSION_POLICY_SCHEMA_VERSION,
   createPumpFunWorkerAdmissionPolicy,
@@ -16,6 +17,9 @@ void test('the Pump.fun worker admission policy exposes exact frozen V1 values',
   assert.equal(MIN_PUMPFUN_TRACKING_WINDOW_SECONDS, 1);
   assert.equal(DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS, 45);
   assert.equal(MAX_PUMPFUN_TRACKING_WINDOW_SECONDS, 3_600);
+  assert.equal(MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM, 256);
+  assert.equal(Number.isSafeInteger(MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM), true);
+  assert.ok(MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM > 0);
 
   for (const enabled of [false, true] as const) {
     const policy = createPumpFunWorkerAdmissionPolicy({
