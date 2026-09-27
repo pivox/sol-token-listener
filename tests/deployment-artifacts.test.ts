@@ -381,14 +381,64 @@ void test('deployment keeps executable bounded admission disabled until the foll
   }
   assert.match(
     overview,
-    /drain[^.]{0,200}migrations[^.]{0,120}055[^.]{0,200}deploy[^.]{0,200}restart/iu,
+    /drain[^.]{0,200}migrations[^.]{0,120}056[^.]{0,200}deploy[^.]{0,200}restart/iu,
   );
   for (const document of [readme, overview]) {
-    assert.match(document, /migration 055[^.]{0,120}tête courante/iu);
+    assert.match(document, /migration 056[^.]{0,120}tête courante/iu);
   }
   assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
   assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
   assert.doesNotMatch(overview, /45-second policy[^.]{0,120}(?:active|enabled)/iu);
+});
+
+void test('bounded worker admission canary remains post-merge, observe-only and fail-closed', async () => {
+  const [compose, environment, localEnvironment, runbook, readme, architecture, overview] =
+    await Promise.all([
+      readArtifact('deploy/compose.yaml'),
+      readArtifact('deploy/env.example'),
+      readArtifact('.env.example'),
+      readArtifact('docs/operations/block-hydration-canary.md'),
+      readArtifact('README.md'),
+      readArtifact('docs/architecture/pumpfun-v1.md'),
+      readArtifact('docs/system-overview.html'),
+    ]);
+
+  assert.match(
+    composeService(compose, 'app'),
+    /LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: "\$\{LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED:-false\}"/u,
+  );
+  for (const example of [environment, localEnvironment]) {
+    assert.match(example, /^LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false$/mu);
+    assert.doesNotMatch(example, /^LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=true$/mu);
+  }
+
+  assert.match(runbook, /#177[^.]{0,180}(?:merged|fusionnée)[^.]{0,180}(?:post-merge CI|CI post-merge)[^.]{0,80}(?:green|verte)/iu);
+  for (const checkpoint of ['T0', 'T+5', 'T+15', 'FINAL_PRESTOP', 'STOPPED']) {
+    assert.ok(runbook.includes(checkpoint), `missing canary checkpoint ${checkpoint}`);
+  }
+  assert.match(runbook, /44[ ,.\u202f]?999[^.]{0,100}PASS/iu);
+  assert.match(runbook, /45[ ,.\u202f]?000[^.]{0,100}FAIL/iu);
+  assert.match(runbook, /T\+5[^.]{0,240}(?:non-growing|non croissant)[^.]{0,160}(?:classification|classement)[^.]{0,160}(?:backlog|claimable)/iu);
+  assert.match(runbook, /rollback[^.]{0,180}LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false/iu);
+  for (const gate of [
+    'workerAdmission', 'catchUpAdmission', 'firstProcessing', 'http429', 'finality',
+    'idempotence', 'retention', 'rss', 'shutdown',
+  ]) assert.ok(runbook.includes(gate), `missing independent gate ${gate}`);
+  for (const forbiddenAuthority of ['wallet', 'signer', 'executor', 'submission', 'trade']) {
+    assert.match(runbook, new RegExp(`(?:aucun|no)[^.]{0,160}${forbiddenAuthority}`, 'iu'));
+  }
+
+  for (const document of [readme, architecture, overview]) {
+    assert.match(document, /#177/u);
+    assert.match(document, /migration 056/iu);
+    assert.match(document, /MANUAL_REVIEW/u);
+    assert.match(document, /cinq preuves|five (?:authority )?proofs/iu);
+    assert.match(document, /démotion bornée|bounded demotion/iu);
+    assert.match(document, /workerAdmission\.v1/u);
+    assert.match(document, /first-processing/iu);
+  }
+  assert.match(overview, /#177[^<]{0,160}(?:livré|delivered)[^<]{0,100}(?:désactivé|disabled)/iu);
+  assert.match(overview, /class="(?:card|alert)[^"]*"/u);
 });
 
 void test('versioned admission design and plan restrict strict ingress parity to ON', async () => {
@@ -876,7 +926,7 @@ void test('decoder quarantine runbook documents bounded observation-only recover
 void test('block hydration runbook defines the corrected worker-eligible cohort and mandatory replay', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.3\.0/u);
+  assert.match(runbook, /Version : 1\.4\.0/u);
   assert.match(runbook, /population worker-éligible/iu);
   for (const exclusion of [
     'IGNORED / SOLANA_TRANSACTION_FAILED',
@@ -903,7 +953,7 @@ void test('block hydration runbook defines the corrected worker-eligible cohort 
 void test('block hydration runbook keeps catch-up refresh continuation bounded and fail-closed', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.3\.0/u);
+  assert.match(runbook, /Version : 1\.4\.0/u);
   assert.match(runbook, /CATCH_UP_REFRESH_REQUIRED[\s\S]{0,400}exactement un scan supplémentaire/iu);
   assert.match(runbook, /même provider[\s\S]{0,180}même session WebSocket[\s\S]{0,180}même signal d'arrêt/iu);
   assert.match(runbook, /ne promeut jamais[\s\S]{0,180}avant la réussite[\s\S]{0,120}seconde passe/iu);
@@ -921,7 +971,7 @@ void test('finality reconciler diagnostics are composed and documented as a non-
     readArtifact('src/application/production-listener-factory.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.3\.0/u);
+  assert.match(runbook, /Version : 1\.4\.0/u);
   assert.match(runbook, /listener\.finality_reconciler_degraded/u);
   assert.match(runbook, /listener\.finality_reconciler_recovered/u);
   for (const reasonCode of [
@@ -966,7 +1016,7 @@ void test('versioned canary verdict documents provider-affine and durable shutdo
   assert.match(runbook,
     /npm run canary:evaluate -- \/absolute\/path\/to\/redacted-canary-input\.v1\.json/u);
   assert.match(runbook, /FAIL[^.]{0,160}INCONCLUSIVE[^.]{0,240}bloquent[^.]{0,160}wallet/iu);
-  assert.match(runbook, /Version : 1\.3\.0/u);
+  assert.match(runbook, /Version : 1\.4\.0/u);
   assert.match(runbook,
     /terminalEvidence[^.]{0,300}failed[^.]{0,120}quarantined[^.]{0,120}exhausted[^.]{0,300}baseline[^.]{0,120}final/iu);
   assert.match(runbook,

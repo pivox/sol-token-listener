@@ -16,6 +16,10 @@ const fixture = JSON.parse(await readFile(fixtureUrl, 'utf8')) as unknown;
 void test('keeps the real failed run failed while correcting four obsolete assertions', () => {
   const result = evaluateMainnetObserveCanary(fixture);
   assert.equal(result.overallVerdict, 'FAIL');
+  assert.deepEqual(result.gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_EVIDENCE_MISSING',
+  });
   for (const gate of ['catchUpAdmission', 'providerAffinity', 'finality', 'shutdown'] as const) {
     assert.equal(result.gates[gate].verdict, 'PASS');
   }
@@ -24,6 +28,116 @@ void test('keeps the real failed run failed while correcting four obsolete asser
   ] as const) {
     assert.equal(result.gates[gate].verdict, 'FAIL');
   }
+});
+
+void test('passes coherent bounded worker admission evidence through durable STOPPED', () => {
+  const copy = passingWorkerAdmissionFixture();
+
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+    verdict: 'PASS',
+    reasonCode: 'WORKER_ADMISSION_BOUNDED',
+  });
+});
+
+void test('fails worker admission at the exact 45-second pending boundary', () => {
+  const eligible = passingWorkerAdmissionFixture();
+  nested(eligible, 'snapshots', 'FINAL_PRESTOP', 'workerAdmission')
+    .oldestClassificationPendingAgeMs = 44_999;
+  assert.equal(evaluateMainnetObserveCanary(eligible).gates.workerAdmission.verdict, 'PASS');
+
+  const expired = passingWorkerAdmissionFixture();
+  nested(expired, 'snapshots', 'FINAL_PRESTOP', 'workerAdmission')
+    .oldestClassificationPendingAgeMs = 45_000;
+  assert.deepEqual(evaluateMainnetObserveCanary(expired).gates.workerAdmission, {
+    verdict: 'FAIL',
+    reasonCode: 'WORKER_ADMISSION_PENDING_EXPIRED',
+  });
+});
+
+void test('fails classification debt or claimable backlog growth after T+5', () => {
+  const pendingGrowth = passingWorkerAdmissionFixture();
+  nested(pendingGrowth, 'snapshots', 'T_PLUS_15', 'workerAdmission')
+    .classificationPendingCount = 2;
+  assert.deepEqual(evaluateMainnetObserveCanary(pendingGrowth).gates.workerAdmission, {
+    verdict: 'FAIL',
+    reasonCode: 'WORKER_ADMISSION_CLASSIFICATION_GREW',
+  });
+
+  const backlogGrowth = passingWorkerAdmissionFixture();
+  setClaimableBacklog(backlogGrowth, 'T_PLUS_15', 10);
+  assert.deepEqual(evaluateMainnetObserveCanary(backlogGrowth).gates.workerAdmission, {
+    verdict: 'FAIL',
+    reasonCode: 'WORKER_ADMISSION_BACKLOG_GREW',
+  });
+});
+
+void test('keeps STOPPED SQL count disagreement inconclusive', () => {
+  const copy = passingWorkerAdmissionFixture();
+  copy.postStopActionableCount = 7;
+
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_STOPPED_COUNT_INCOHERENT',
+  });
+});
+
+void test('keeps missing, malformed, disabled and non-chronological worker evidence inconclusive', () => {
+  const missing = passingWorkerAdmissionFixture();
+  delete nested(missing, 'snapshots', 'T_PLUS_15').workerAdmission;
+  const malformed = passingWorkerAdmissionFixture();
+  nested(malformed, 'snapshots', 'T_PLUS_15', 'workerAdmission').version = 2;
+  const disabled = passingWorkerAdmissionFixture();
+  nested(disabled, 'snapshots', 'T_PLUS_15').workerAdmission = {
+    version: 1, enabled: false, trackingWindowSeconds: 45, claimableBacklogCount: 8,
+    classificationPendingCount: 0, oldestClassificationPendingAgeMs: null,
+    freshMintCount: 0, extendedMintCount: 0, demotedCount: 0,
+  };
+  const nonChronological = passingWorkerAdmissionFixture();
+  nested(nonChronological, 'stoppedHeartbeat').observedAtMs =
+    nested(nonChronological, 'snapshots', 'FINAL_PRESTOP').observedAtMs;
+
+  for (const [name, candidate] of [
+    ['missing', missing], ['malformed', malformed], ['disabled', disabled],
+    ['non-chronological', nonChronological],
+  ] as const) {
+    assert.equal(
+      evaluateMainnetObserveCanary(candidate).gates.workerAdmission.verdict,
+      'INCONCLUSIVE',
+      name,
+    );
+  }
+});
+
+void test('rejects identifiers and arbitrary labels from worker admission evidence', () => {
+  for (const [field, value] of [
+    ['signature', 'private-signature'],
+    ['mint', 'private-mint'],
+    ['wallet', 'private-wallet'],
+    ['label', 'private-label'],
+  ] as const) {
+    const copy = passingWorkerAdmissionFixture();
+    nested(copy, 'snapshots', 'T0', 'workerAdmission')[field] = value;
+    const result = evaluateMainnetObserveCanary(copy);
+    assert.equal(result.gates.workerAdmission.verdict, 'INCONCLUSIVE', field);
+    assert.equal(JSON.stringify(result).includes(value), false, field);
+  }
+});
+
+void test('contains a hostile worker admission accessor without degrading independent gates', () => {
+  let reads = 0;
+  const copy = passingWorkerAdmissionFixture();
+  Object.defineProperty(nested(copy, 'snapshots', 'T0'), 'workerAdmission', {
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error('worker evidence accessor must not run');
+    },
+  });
+
+  const result = evaluateMainnetObserveCanary(copy);
+  assert.equal(reads, 0);
+  assert.equal(result.gates.workerAdmission.verdict, 'INCONCLUSIVE');
+  assert.equal(result.gates.catchUpAdmission.verdict, 'PASS');
 });
 
 void test('accepts same-provider scan and worker sharing with coherent partitions', () => {
@@ -533,6 +647,75 @@ void test('returns bounded inconclusive output for hostile or non-exact input wi
 
 function cloneFixture(): Record<string, unknown> {
   return JSON.parse(JSON.stringify(fixture)) as Record<string, unknown>;
+}
+
+const WORKER_ADMISSION_SNAPSHOT_NAMES = [
+  'T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP',
+] as const;
+
+function passingWorkerAdmissionFixture(): Record<string, unknown> {
+  const copy = cloneFixture();
+  const claimable = [10, 9, 8, 7] as const;
+  const pending = [2, 1, 1, 1] as const;
+  const ages = [1_000, 2_000, 30_000, 44_999] as const;
+  WORKER_ADMISSION_SNAPSHOT_NAMES.forEach((name, index) => {
+    const snapshot = nested(copy, 'snapshots', name);
+    const claimableBacklogCount = claimable[index] ?? 0;
+    snapshot.workerAdmission = workerAdmissionEvidence({
+      claimableBacklogCount,
+      classificationPendingCount: pending[index] ?? 0,
+      oldestClassificationPendingAgeMs: ages[index] ?? null,
+      freshMintCount: 3,
+      extendedMintCount: 2,
+      demotedCount: index,
+    });
+    setHeartbeatBacklog(snapshot, claimableBacklogCount);
+  });
+  const stopped = nested(copy, 'stoppedHeartbeat');
+  stopped.workerAdmission = workerAdmissionEvidence({
+    claimableBacklogCount: 6,
+    classificationPendingCount: 0,
+    oldestClassificationPendingAgeMs: null,
+    freshMintCount: 2,
+    extendedMintCount: 1,
+    demotedCount: 4,
+  });
+  setHeartbeatBacklog(stopped, 6);
+  copy.postStopActionableCount = 6;
+  return copy;
+}
+
+function workerAdmissionEvidence(overrides: Readonly<Record<string, unknown>>):
+Record<string, unknown> {
+  return {
+    version: 1,
+    enabled: true,
+    trackingWindowSeconds: 45,
+    claimableBacklogCount: 0,
+    classificationPendingCount: 0,
+    oldestClassificationPendingAgeMs: null,
+    freshMintCount: 0,
+    extendedMintCount: 0,
+    demotedCount: 0,
+    ...overrides,
+  };
+}
+
+function setClaimableBacklog(
+  copy: Record<string, unknown>,
+  name: (typeof WORKER_ADMISSION_SNAPSHOT_NAMES)[number],
+  count: number,
+): void {
+  const snapshot = nested(copy, 'snapshots', name);
+  nested(snapshot, 'workerAdmission').claimableBacklogCount = count;
+  setHeartbeatBacklog(snapshot, count);
+}
+
+function setHeartbeatBacklog(heartbeat: Record<string, unknown>, count: number): void {
+  heartbeat.backlogCount = count;
+  const admission = nested(heartbeat, 'catchUpAdmission');
+  admission.source = { websocketOnly: count, catchUpOnly: 0, websocketAndCatchUp: 0 };
+  admission.priority = { normal: count, launchCandidate: 0, trackedTrade: 0 };
 }
 
 function nested(root: Record<string, unknown>, ...keys: readonly string[]): Record<string, unknown> {

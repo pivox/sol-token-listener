@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.3.0 — 2026-09-25 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163 et #169.
+Version : 1.4.0 — 2026-09-27 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169 et #177.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -10,6 +10,40 @@ readiness Mainnet n'est déclarée avant que cette fenêtre ait passé. Utiliser
 seule réplique avec `LISTENER_INGESTION_SCOPE=launchpad-only`, en mode `observe`.
 Archiver le health, les compteurs inbox, le RSS et le tableau fournisseur avant
 activation.
+
+## Activation bornée #177
+
+Les exemples et Compose doivent conserver
+`LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false`. L'opérateur ne peut
+mettre cette valeur à `true` dans son environnement externe qu'après la
+livraison #177 fusionnée et une CI post-merge verte. Le flag est restart-only :
+un changement exige un arrêt propre puis un nouveau processus. Cette activation
+est limitée à cette fenêtre Mainnet observe-only de quinze minutes.
+
+Capturer le health complet et expurgé aux cinq frontières exactes `T0`, `T+5`,
+`T+15`, `FINAL_PRESTOP` puis dans le heartbeat PostgreSQL durable `STOPPED`.
+Chacune porte un objet exact `workerAdmission.v1`; l'absence, une forme
+malformée, `enabled=false`, une fenêtre différente de 45 secondes ou une
+chronologie non monotone donne `INCONCLUSIVE`. Depuis T+5 : non croissant pour
+classification puis backlog claimable jusqu'à `STOPPED`. La dette la plus
+ancienne à 44 999 ms reste éligible à `PASS`; 45 000 ms exactement produit
+`FAIL`. Le compte claimable `STOPPED` doit correspondre au backlog du heartbeat
+et au compte SQL frais `postStopActionableCount`, sinon le verdict est
+`INCONCLUSIVE`.
+
+Le gate `workerAdmission` reste indépendant de `catchUpAdmission`,
+`firstProcessing`, `http429`, `finality`, `idempotence`, `retention`, `rss` et
+`shutdown`, ainsi que de runtime, backlog, erreurs terminales, quarantaine,
+hydratation, affinité provider, PumpSwap, replay de versions et cleanup. Tous
+doivent passer : un score ou un gate vert n'en compense jamais un autre.
+
+En cas de `FAIL`, `INCONCLUSIVE`, dérive de ressources ou arrêt incomplet,
+effectuer le rollback vers
+`LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false`, redémarrer en
+observe-only et archiver le verdict échoué. Ne jamais supprimer de lignes pour
+fabriquer un backlog nul. Aucun wallet, aucun signer, aucun executor, aucune
+submission et aucun trade ne sont autorisés par ce canary ; il ne lit aucune
+clé, n'arme aucune intention et ne soumet aucune transaction.
 
 ## Verdict V1 versionné
 
@@ -240,6 +274,8 @@ peut être réutilisée pour déclarer un `PASS`.
    LISTENER_BLOCK_HYDRATION_ENABLED=true
    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true
    LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=true
+   LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=true
+   LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS=45
    ```
 
    `LISTENER_WORKER_COUNT=2` est la première valeur de canary. Le pool reste
@@ -255,13 +291,23 @@ peut être réutilisée pour déclarer un `PASS`.
    Compose transmet ce flag restart-only uniquement à `app`; contrôler la
    configuration résolue avant le démarrage.
 2. Redémarrer exactement une réplique. Aucun flag n'est modifiable à chaud.
-3. Capturer l’état health, le backlog/les échecs terminaux et le RSS à T0, T+5
-   min et T+15 min. Les trois premiers relevés viennent de l’API pendant que
-   l’application tourne. Capturer ensuite un relevé `final` depuis le heartbeat
-   PostgreSQL persistant après l’arrêt borné de la seule application : l’API du
-   même processus est alors fermée et ne peut pas servir ce relevé. Les quatre
-   relevés appartiennent au même processus : un redémarrage entre deux relevés
-   invalide la fenêtre.
+3. Capturer l’état health, le backlog/les échecs terminaux, le RSS et
+   `workerAdmission` à T0, T+5 min et T+15 min, puis une dernière fois dans
+   `FINAL_PRESTOP` immédiatement avant l'arrêt. Ces quatre relevés viennent de
+   l’API pendant que l’application tourne. Capturer ensuite `STOPPED` depuis le
+   heartbeat PostgreSQL persistant après l’arrêt borné de la seule application :
+   l’API du même processus est alors fermée et ne peut pas servir ce relevé. Les
+   cinq relevés appartiennent au même processus : un redémarrage entre deux
+   relevés invalide la fenêtre. Pour compatibilité des artefacts historiques,
+   le fichier HTTP `final` reste l'alias de `FINAL_PRESTOP`, jamais de `STOPPED`.
+
+   Dans chaque artefact, conserver exactement les neuf champs V1
+   `version`, `enabled`, `trackingWindowSeconds`, `claimableBacklogCount`,
+   `classificationPendingCount`, `oldestClassificationPendingAgeMs`,
+   `freshMintCount`, `extendedMintCount` et `demotedCount`. Le manifeste ne
+   doit contenir aucun identifiant, signature, mint, wallet ou label. Le CLI
+   `canary:evaluate` réapplique le snapshotter domaine exact et rejette toute
+   absence, clé additionnelle, valeur non entière ou relation zéro/null invalide.
    Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
    projection fixe suivante de la réponse health :
 
@@ -337,7 +383,8 @@ peut être réutilisée pour déclarer un `PASS`.
        'heartbeat', jsonb_build_object(
          'startedAt', to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
          'rpcHttpEvidence', payload -> 'rpcHttpEvidence',
-         'firstProcessingCanary', payload -> 'firstProcessingCanary'
+         'firstProcessingCanary', payload -> 'firstProcessingCanary',
+         'workerAdmission', payload -> 'workerAdmission'
        )
      )
    )
@@ -538,6 +585,10 @@ eux aussi indépendants, avec leurs snapshots et critères propres.
   cohérent et `workerClaimReady`/`scanActive` cohérents avec la phase observée;
   les catégories de backlog source sont disjointes et les priorités totalisent
   le backlog actionnable;
+- `heartbeat.workerAdmission.version=1`, `enabled=true` et
+  `trackingWindowSeconds=45` aux cinq frontières ; depuis T+5, dette de
+  classification et backlog claimable non croissants, aucun âge pending à
+  45 000 ms ou davantage, et compte `STOPPED` identique au SQL frais;
 - l'affinité provider est conservée pendant chaque scan strict : aucun résultat
   ou cache d'un provider remplacé n'est réutilisé, et le cache unique reste à
   quatre fetches démarrés/s ou moins globalement;
@@ -554,6 +605,11 @@ existent. Avant ces deux niveaux, le rollback isolé #146 consiste à remettre
 `LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED=false` puis redémarrer :
 l'admission B3b reste active et toutes les signatures reprennent le chemin
 d'hydratation complet.
+
+0. **Rollback #177 admission worker bornée.** Remettre
+   `LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false`, conserver la
+   fenêtre à `45`, puis redémarrer la réplique. Les métriques bornées repassent
+   au contrat OFF et aucun état durable n'est effacé.
 
 1. **Rollback B3b admission-only.** Remettre
    `LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false` puis redémarrer la

@@ -4,13 +4,17 @@ import {
   createFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from '../../src/domain/first-processing-canary.js';
+import {
+  snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionMetricsV1,
+} from '../../src/domain/worker-admission-metrics.js';
 
 export type MainnetObserveCanaryVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
 export const MAINNET_OBSERVE_CANARY_GATE_NAMES = [
   'runtime', 'http429', 'backlog', 'terminalFailures', 'idempotence', 'retention',
   'decoderQuarantine', 'firstProcessing', 'blockHydration', 'catchUpAdmission',
-  'providerAffinity', 'rss', 'pumpswap', 'finality', 'versionsAndFreshReplay',
+  'workerAdmission', 'providerAffinity', 'rss', 'pumpswap', 'finality', 'versionsAndFreshReplay',
   'shutdown', 'cleanup',
 ] as const;
 
@@ -64,9 +68,17 @@ const MAX_TERMINAL_GROUPS = 128;
 const MAX_HYDRATION_RETAINED_ENTRIES = 64;
 const MAX_HYDRATION_RETAINED_BYTES = 67_108_864;
 const MIN_RSS_HEADROOM_BYTES = 134_217_728;
+const WORKER_ADMISSION_KEYS = [
+  'version', 'enabled', 'trackingWindowSeconds', 'claimableBacklogCount',
+  'classificationPendingCount', 'oldestClassificationPendingAgeMs', 'freshMintCount',
+  'extendedMintCount', 'demotedCount',
+] as const;
 type SnapshotName = (typeof SNAPSHOT_NAMES)[number];
 type VersionCounts = Readonly<{ legacy: number; v0: number; v1: number }>;
 type TerminalCounts = Readonly<{ failed: number; quarantined: number; exhausted: number }>;
+type WorkerAdmissionEvidence =
+  | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
+  | Readonly<{ state: 'VALID'; value: RuntimeWorkerAdmissionMetricsV1 }>;
 
 interface Admission {
   readonly version: 1;
@@ -126,6 +138,7 @@ interface Snapshot {
   }>;
   readonly periodicPauseEvidence: PeriodicPauseEvidence | null;
   readonly catchUpAdmission: Admission;
+  readonly workerAdmission: WorkerAdmissionEvidence;
   readonly blockHydration: Hydration;
   readonly rpcHttpEvidence: RpcEvidence;
   readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
@@ -155,6 +168,7 @@ interface StoppedHeartbeat {
   readonly backlogCount: number;
   readonly leasedCount: number;
   readonly catchUpAdmission: Admission;
+  readonly workerAdmission: WorkerAdmissionEvidence;
   readonly blockHydration: Hydration;
   readonly rpcHttpEvidence: RpcEvidence;
   readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
@@ -223,6 +237,7 @@ export function evaluateMainnetObserveCanary(input: unknown): MainnetObserveCana
     firstProcessing: evaluateFirstProcessing(evidence),
     blockHydration: evaluateHydration(evidence),
     catchUpAdmission: evaluateAdmission(evidence),
+    workerAdmission: evaluateWorkerAdmission(evidence),
     providerAffinity: evaluateAffinity(evidence),
     rss: evaluateRss(evidence),
     pumpswap: evaluatePumpSwap(evidence),
@@ -479,6 +494,64 @@ function evaluateAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1
   return gate('PASS', 'ADMISSION_PROVIDER_AFFINE');
 }
 
+function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+  const snapshots = orderedSnapshots(input);
+  const evidence = [...snapshots.map((snapshot) => snapshot.workerAdmission),
+    input.stoppedHeartbeat.workerAdmission];
+  if (evidence.some((item) => item.state === 'MALFORMED')) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_EVIDENCE_MALFORMED');
+  }
+  if (evidence.some((item) => item.state === 'MISSING')) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_EVIDENCE_MISSING');
+  }
+  const metrics = evidence.flatMap((item) => item.state === 'VALID' ? [item.value] : []);
+  if (metrics.length !== evidence.length) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_EVIDENCE_MALFORMED');
+  }
+  if (metrics.some((item) => !item.enabled)) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_DISABLED');
+  }
+  if (metrics.some((item) => item.trackingWindowSeconds !== 45)) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_WINDOW_INCOHERENT');
+  }
+  const startedAtMs = [...snapshots.map((snapshot) => snapshot.startedAtMs),
+    input.stoppedHeartbeat.startedAtMs];
+  const observedAtMs = [
+    ...snapshots.map((snapshot) => snapshot.observedAtMs),
+    input.stoppedHeartbeat.observedAtMs,
+  ];
+  const processStartedAtMs = startedAtMs[0];
+  if (processStartedAtMs === undefined || processStartedAtMs === 0
+    || startedAtMs.some((value) => value !== processStartedAtMs)
+    || observedAtMs.some((value) => value < processStartedAtMs)
+    || !strictlyIncreasing(observedAtMs)) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_TIMELINE_INCOHERENT');
+  }
+  const stoppedMetrics = metrics[4];
+  if (stoppedMetrics === undefined) return gate('INCONCLUSIVE', 'WORKER_ADMISSION_EVIDENCE_MISSING');
+  const thresholdMs = stoppedMetrics.trackingWindowSeconds * 1_000;
+  if (metrics.some((item) => item.oldestClassificationPendingAgeMs !== null
+    && item.oldestClassificationPendingAgeMs >= thresholdMs)) {
+    return gate('FAIL', 'WORKER_ADMISSION_PENDING_EXPIRED');
+  }
+  const afterFiveMinutes = metrics.slice(1);
+  if (!nonIncreasing(afterFiveMinutes.map((item) => item.classificationPendingCount))) {
+    return gate('FAIL', 'WORKER_ADMISSION_CLASSIFICATION_GREW');
+  }
+  if (!nonIncreasing(afterFiveMinutes.map((item) => item.claimableBacklogCount))) {
+    return gate('FAIL', 'WORKER_ADMISSION_BACKLOG_GREW');
+  }
+  if (snapshots.some((snapshot, index) =>
+    metrics[index]?.claimableBacklogCount !== snapshot.backlogCount)) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_BACKLOG_INCOHERENT');
+  }
+  if (stoppedMetrics.claimableBacklogCount !== input.stoppedHeartbeat.backlogCount
+    || stoppedMetrics.claimableBacklogCount !== input.postStopActionableCount) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_STOPPED_COUNT_INCOHERENT');
+  }
+  return gate('PASS', 'WORKER_ADMISSION_BOUNDED');
+}
+
 function evaluateAffinity(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   if (input.providerMixingEvidenceCount > 0) return gate('FAIL', 'PROVIDER_MIXING_OBSERVED');
   const snapshots = orderedSnapshots(input);
@@ -607,12 +680,12 @@ function parseInput(value: unknown): CanaryInput {
 }
 
 function parseSnapshot(value: unknown): Snapshot {
-  const input = exactObject(value, [
+  const input = exactObjectWithOptional(value, [
     'observedAtMs', 'startedAtMs', 'status', 'pipelinePumpfun', 'pipelinePumpswap', 'runtimeState',
     'subscriberState', 'scannerState', 'workerState', 'reconcilerState', 'backlogCount',
     'leasedCount', 'websocket', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary', 'periodicPauseEvidence', 'decoderQuarantine', 'inbox', 'rssBytes',
-  ]);
+  ], ['workerAdmission']);
   const websocket = exactObject(input.websocket,
     ['phase', 'providerId', 'recoveryStatus', 'recoveryReasonCode']);
   const decoder = exactObject(input.decoderQuarantine, ['version', 'unresolvedCount']);
@@ -641,7 +714,9 @@ function parseSnapshot(value: unknown): Snapshot {
       providerId: nullableProviderId(websocket.providerId),
       recoveryStatus, recoveryReasonCode }),
     periodicPauseEvidence: parsePeriodicPause(input.periodicPauseEvidence),
-    catchUpAdmission: parseAdmission(input.catchUpAdmission), blockHydration: parseHydration(input.blockHydration),
+    catchUpAdmission: parseAdmission(input.catchUpAdmission),
+    workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
+    blockHydration: parseHydration(input.blockHydration),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary),
     decoderQuarantine: Object.freeze({ version: 1, unresolvedCount: integer(decoder.unresolvedCount) }),
@@ -656,12 +731,12 @@ function parseSnapshot(value: unknown): Snapshot {
 }
 
 function parseStopped(value: unknown): StoppedHeartbeat {
-  const input = exactObject(value, [
+  const input = exactObjectWithOptional(value, [
     'observedAtMs', 'startedAtMs', 'runtimeState', 'subscriberState', 'scannerState', 'workerState',
     'reconcilerState',
     'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary',
-  ]);
+  ], ['workerAdmission']);
   return Object.freeze({ observedAtMs: integer(input.observedAtMs),
     startedAtMs: integer(input.startedAtMs),
     runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
@@ -671,9 +746,36 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     reconcilerState: enumeration(input.reconcilerState, RUNTIME_STATES),
     backlogCount: integer(input.backlogCount),
     leasedCount: integer(input.leasedCount), catchUpAdmission: parseAdmission(input.catchUpAdmission),
+    workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
     blockHydration: parseHydration(input.blockHydration),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary) });
+}
+
+function parseOptionalWorkerAdmission(
+  input: Readonly<Record<string, unknown>>,
+  key: string,
+): WorkerAdmissionEvidence {
+  if (!Object.hasOwn(input, key)) {
+    return Object.freeze({ state: 'MISSING', value: null });
+  }
+  try {
+    const source = exactObject(input[key], WORKER_ADMISSION_KEYS);
+    const value = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+      version: source.version,
+      enabled: source.enabled,
+      trackingWindowSeconds: source.trackingWindowSeconds,
+      claimableBacklogCount: source.claimableBacklogCount,
+      classificationPendingCount: source.classificationPendingCount,
+      oldestClassificationPendingAgeMs: source.oldestClassificationPendingAgeMs,
+      freshMintCount: source.freshMintCount,
+      extendedMintCount: source.extendedMintCount,
+      demotedCount: source.demotedCount,
+    }));
+    return Object.freeze({ state: 'VALID', value });
+  } catch {
+    return Object.freeze({ state: 'MALFORMED', value: null });
+  }
 }
 
 function parseAdmission(value: unknown): Admission {
@@ -773,6 +875,38 @@ function exactObject<const K extends readonly string[]>(value: unknown, keys: K)
       result[key as K[number]] = descriptor.value as unknown;
     }
     return result;
+  } catch (error) {
+    if (error instanceof InvalidEvidence) throw error;
+    invalid();
+  }
+}
+
+function exactObjectWithOptional<
+  const K extends readonly string[],
+  const O extends readonly string[],
+>(value: unknown, keys: K, optionalKeys: O):
+Record<K[number], unknown> & Partial<Record<O[number], unknown>> {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value) || types.isProxy(value)
+      || Object.getPrototypeOf(value) !== Object.prototype) invalid();
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const actual = Reflect.ownKeys(descriptors);
+    const allowed = [...keys, ...optionalKeys];
+    if (actual.length < keys.length || actual.length > allowed.length
+      || actual.some((key) => typeof key !== 'string' || !allowed.includes(key))
+      || keys.some((key) => !Object.hasOwn(descriptors, key))) invalid();
+    const result: Record<string, unknown> = {};
+    for (const key of allowed) {
+      if (!Object.hasOwn(descriptors, key)) continue;
+      const descriptor = descriptors[key];
+      if (!('value' in descriptor) || !descriptor.enumerable) {
+        if (keys.includes(key)) invalid();
+        result[key] = undefined;
+        continue;
+      }
+      result[key] = descriptor.value as unknown;
+    }
+    return result as Record<K[number], unknown> & Partial<Record<O[number], unknown>>;
   } catch (error) {
     if (error instanceof InvalidEvidence) throw error;
     invalid();

@@ -1029,6 +1029,33 @@ signatures gardent l'hydratation et la classification existantes. Les erreurs de
 transaction Solana sont réduites à un booléen et classées sans conserver le
 payload d'erreur. Toute contradiction d'issue ou de finalité échoue fermée.
 
+### Autorité d'admission worker bornée (#177, livrée et désactivée)
+
+La migration 056 remplace, uniquement lorsque le flag restart-only est actif,
+le suivi non borné d'un lancement par une autorité calculée avec une unique
+horloge PostgreSQL. Les cinq preuves d'autorité sont indépendantes : lancement
+canonique frais, candidat courant éligible, travail ou holding paper actif,
+intention d'exécution non terminale et position live active. La vue
+`security_barrier` de la migration 056 ne révèle au rôle listener que le mint
+d'une position live active. `MANUAL_REVIEW` seul est insuffisant ; un
+`PAPER_HOLDING` indépendant continue en revanche à protéger le mint.
+
+Chaque producteur et chaque retrait de preuve partage le verrou advisory du
+mint. Avant un claim, la démotion bornée relit sous ce verrou au plus 256 trades
+`PENDING/TRACKED_TRADE` strictement vierges, puis les conserve comme
+`DEFERRED/NORMAL` pendant quatre heures. Le gate de premier traitement exclut
+une ligne encore non classée et une ligne admise puis démise ; le marqueur
+first-processing historique indisponible interdit toute démotion rassurante.
+
+Le diagnostic exact `workerAdmission.v1` sépare le backlog réclamable de la
+dette de classification et publie les comptes union-distinct de mints frais,
+prolongés et démis. Il ne contient ni signature, mint, wallet, URL ou label.
+Cette métrique ne remplace ni `catchUpAdmission`, ni la preuve first-processing.
+Le flag reste `false` dans les exemples et Compose : l'activation n'est permise
+qu'après fusion de #177, CI post-merge verte, puis dans le canary Mainnet
+observe-only documenté. Aucun wallet, signer, executor, ordre ou transport de
+soumission n'est ajouté par cette architecture.
+
 ## Console opérateur indépendante
 
 Le frontend React est un consommateur externe des ports HTTP/SSE : il n’importe
