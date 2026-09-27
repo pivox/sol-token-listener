@@ -112,6 +112,70 @@ void test('décode le suffixe option historique de buy_exact_sol_in externe', as
   assert.deepEqual(trade.action.args.track_volume, [false]);
 });
 
+void test('décode le buy_exact_sol_in Mainnet sans suffixe', async () => {
+  const fixture = await loadPumpFixture(
+    'buy-exact-sol-in-omitted-mainnet.json',
+  );
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const trade = decoded.trades[0];
+
+  assert.equal(
+    fixture.provenance.signature,
+    'EYKWHsAcnkDbr9AkNFSwrLKNqkr17EbrMK7HcFqtAyvrFDQ6ssYZmcMsLkkmHFLNSCkxum2cSPWNN7t1F9DWsvv',
+  );
+  assert.equal(fixture.provenance.slot, 451_001_703n);
+  assert.equal(fixture.provenance.transactionIndex, 540);
+  assert.equal(decoded.trades.length, 1);
+  assert.ok(trade);
+  assert.equal(trade.action.name, 'buy_exact_sol_in');
+  assert.equal(Object.hasOwn(trade.action.args, 'track_volume'), false);
+  assert.equal(
+    Buffer.from(trade.action.instruction.data).toString('hex'),
+    '38fc74089edfcd5f0065cd1d000000000100000000000000',
+  );
+  assert.equal(trade.event.isBuy, true);
+  assert.equal(trade.action.accounts.mint, trade.event.mint);
+  assert.equal(
+    trade.action.instruction.instructionIndex,
+    trade.eventCpi.instruction.instructionIndex,
+  );
+  assert.equal(trade.action.args.spendable_sol_in, 500_000_000n);
+  assert.equal(trade.action.args.min_tokens_out, 1n);
+  assert.equal(trade.event.solAmount, 493_827_159n);
+  assert.equal(trade.event.tokenAmount, 12_048_581_000_247n);
+});
+
+void test('décode le Some(true) historique du buy Mainnet', async () => {
+  const fixture = await loadPumpFixture('buy-option-true-mainnet.json');
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const trade = decoded.trades[0];
+
+  assert.equal(
+    fixture.provenance.signature,
+    '3chxQscqoPW9sFxo7RMj17YHKJYKj3K4dMFXLTrJd2VB2NrnSqkwxNbA1mEbv2GJNBe7gVqTvrGxXMmd1Uqbf7V9',
+  );
+  assert.equal(fixture.provenance.slot, 451_001_714n);
+  assert.equal(fixture.provenance.transactionIndex, 751);
+  assert.equal(decoded.trades.length, 1);
+  assert.ok(trade);
+  assert.equal(trade.action.name, 'buy');
+  assert.deepEqual(trade.action.args.track_volume, [true]);
+  assert.equal(
+    Buffer.from(trade.action.instruction.data).toString('hex'),
+    '66063d1201daebeacf3b52ec9e010000fcb1f006000000000101',
+  );
+  assert.equal(trade.event.isBuy, true);
+  assert.equal(trade.action.accounts.mint, trade.event.mint);
+  assert.equal(
+    trade.action.instruction.instructionIndex,
+    trade.eventCpi.instruction.instructionIndex,
+  );
+  assert.equal(trade.action.args.amount, trade.event.tokenAmount);
+  assert.equal(trade.action.args.amount, 1_782_081_272_783n);
+  assert.equal(trade.action.args.max_sol_cost, 116_437_500n);
+  assert.equal(trade.event.solAmount, 100_472_247n);
+});
+
 void test('refuse une provenance qui ne correspond pas à la transaction', async () => {
   const path = new URL(
     './fixtures/pumpfun/sell-cpi-mainnet.json',
