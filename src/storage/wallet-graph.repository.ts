@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as wait } from 'node:timers/promises';
 import { isProxy } from 'node:util/types';
 import type { QueryResultRow } from 'pg';
 import {
@@ -68,6 +69,13 @@ interface LoadedBuy {
 
 const MEMBER_INSERT_BATCH_SIZE = 3_000;
 const NO_PARTICIPANT_PROJECTION = 'NO_PARTICIPANT_PROJECTION';
+const TRANSACTION_RETRY_DELAYS_MS = Object.freeze([10, 20] as const);
+
+type Wait = (delayMs: number) => Promise<void>;
+
+const DEFAULT_WAIT: Wait = async (delayMs) => {
+  await wait(delayMs);
+};
 
 export class WalletGraphDataError extends Error {
   public constructor(message = 'Stored wallet graph data is invalid.') {
@@ -79,6 +87,7 @@ export class WalletGraphDataError extends Error {
 export class PostgresWalletGraphRepository implements WalletGraphRepository {
   public constructor(
     private readonly database: WalletGraphPool = getDatabasePool(),
+    private readonly waitFor: Wait = DEFAULT_WAIT,
   ) {}
 
   public async transact<TResult>(
@@ -88,21 +97,37 @@ export class PostgresWalletGraphRepository implements WalletGraphRepository {
     if (mint.length === 0) throw new TypeError('Wallet graph mint is required.');
     const client = new AttributedGraphClient(await this.database.connect());
     try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
-      await client.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('wallet-graph:' || $1, 0))",
-        [mint],
-      );
-      const result = await operation(new PostgresWalletGraphTransaction(client, mint));
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('wallet-graph:' || $1, 0))",
+            [mint],
+          );
+          const result = await operation(
+            new PostgresWalletGraphTransaction(client, mint),
+          );
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK');
+          const delayMs = TRANSACTION_RETRY_DELAYS_MS[attempt];
+          if (delayMs === undefined || !isRetryableTransactionConflict(error)) {
+            throw error;
+          }
+          await this.waitFor(delayMs);
+        }
+      }
     } finally {
       client.release();
     }
   }
+}
+
+function isRetryableTransactionConflict(error: unknown): boolean {
+  const diagnosticCode = trustedTerminalAttribution(error)?.diagnosticCode;
+  return diagnosticCode === 'WALLET_GRAPH_POSTGRES_SERIALIZATION'
+    || diagnosticCode === 'WALLET_GRAPH_POSTGRES_DEADLOCK';
 }
 
 class PostgresWalletGraphTransaction implements WalletGraphTransaction {

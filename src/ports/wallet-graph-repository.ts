@@ -16,6 +16,11 @@ export interface WalletGraphTransaction {
 }
 
 export interface WalletGraphRepository {
+  /**
+   * Runs one atomic wallet-graph unit. The callback may be replayed up to two
+   * times after a complete rollback of an authenticated database transaction
+   * conflict, so it must contain only replay-safe transactional work.
+   */
   transact<TResult>(
     mint: string,
     operation: (transaction: WalletGraphTransaction) => Promise<TResult>,
