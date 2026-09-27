@@ -324,6 +324,8 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO sol_token_listener_writer;
 
 GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer;
+GRANT SELECT ON TABLE listener_worker_tracking_live_mints
+TO sol_token_listener_writer;
 
 GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE
   api_event_stream,
