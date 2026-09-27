@@ -28,6 +28,30 @@ void test('retains expired deferred trades across creation commit and a restarte
   });
 });
 
+void test('launch proof commits before a waiting trade admission under the shared mint lock',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const blocker = await pool.connect();
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox-mint:' || $1,0))",
+          [mint],
+        );
+        const launch = new PostgresLaunchpadEventRepository(pool).record(creation());
+        await waitForMintLockWaiters(pool, 1);
+        const tradeAdmission = new PostgresTransactionInboxRepository(pool).enqueue(notification());
+        await waitForMintLockWaiters(pool, 2);
+        await blocker.query('COMMIT');
+        await Promise.all([launch, tradeAdmission]);
+        assert.equal((await trade(pool)).ingestion_priority, 'TRACKED_TRADE');
+      } finally {
+        await blocker.query('ROLLBACK');
+        blocker.release();
+      }
+    });
+  });
+
 void test('creation projection holding the retention fence wins against an overlapping purge', async (context) => {
   await withDatabase(context, async (pool) => {
     await seedExpiredTrade(pool);
@@ -273,6 +297,19 @@ async function waitsFor(pool: Pool, waiter: { pid: number }, holder: { pid: numb
     if (result.rows[0]?.blocked === true) return true;
   }
   return false;
+}
+
+async function waitForMintLockWaiters(pool: Pool, minimum: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(`SELECT COUNT(*)::TEXT AS count
+      FROM pg_stat_activity
+      WHERE datname=current_database() AND wait_event_type='Lock'
+        AND query LIKE '%transaction-inbox-mint:%'`);
+    if (Number(result.rows[0]?.count ?? 0) >= minimum) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`Expected at least ${minimum} mint-lock waiters.`);
 }
 
 async function withDatabase(context: { skip(message?: string): void }, run: (pool: Pool) => Promise<void>): Promise<void> {

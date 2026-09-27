@@ -43,6 +43,63 @@ function renderHealth(value: ApiHealth): ReturnType<typeof vi.fn<ApiClient['getH
 }
 
 describe('technical health page', () => {
+  it('renders the separate Pump.fun worker admission aggregate without readiness or identifiers', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        signature: 'secret-signature',
+        mint: 'secret-mint',
+      },
+    })).data);
+    const card = (await screen.findByRole('heading', {
+      name: 'Admission worker Pump.fun',
+    })).closest('section');
+    const diagnostic = within(card!);
+    for (const text of [
+      'Activé ; fenêtre : 45 s',
+      'Backlog réclamable : 8',
+      'Classification en attente : 2 ; plus ancienne : 4999 ms',
+      'Mints frais : 3 ; étendus : 2',
+      'Démotions : 5',
+    ]) expect(diagnostic.getByText(text)).toBeVisible();
+    expect(card).not.toHaveTextContent(/prêt/iu);
+    expect(document.body).not.toHaveTextContent('secret-signature');
+    expect(document.body).not.toHaveTextContent('secret-mint');
+  });
+
+  it('renders no oldest age when worker classification pending count is zero', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        workerAdmission: {
+          ...health.heartbeat.workerAdmission,
+          classificationPendingCount: 0,
+          oldestClassificationPendingAgeMs: null,
+        },
+      },
+    })).data);
+    const card = (await screen.findByRole('heading', {
+      name: 'Admission worker Pump.fun',
+    })).closest('section');
+    expect(within(card!).getByText('Classification en attente : 0 ; plus ancienne : Aucune')).toBeVisible();
+  });
+
+  it.each([
+    [undefined, 'Non disponible — backend antérieur'],
+    [null, 'Non disponible — heartbeat antérieur ou invalide'],
+  ] as const)('renders worker admission rolling absence for %s without readiness', async (value, message) => {
+    const heartbeat: Record<string, unknown> = { ...health.heartbeat, workerAdmission: value };
+    if (value === undefined) delete heartbeat.workerAdmission;
+    renderHealth(apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat })).data);
+    const card = (await screen.findByRole('heading', {
+      name: 'Admission worker Pump.fun',
+    })).closest('section');
+    expect(within(card!).getByText(message)).toBeVisible();
+    expect(card).not.toHaveTextContent(/prêt/iu);
+  });
+
   it('renders only the decoder quarantine aggregate without identifiers', async () => {
     renderHealth(apiHealthEnvelopeSchema.parse(success({
       ...health,

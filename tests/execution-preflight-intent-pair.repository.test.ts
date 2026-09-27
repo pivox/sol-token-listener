@@ -21,6 +21,7 @@ void test('creates an immutable pair through the caller transaction client', asy
   const pair = createExecutionPreflightIntentPairDraft(target);
   const client = new ScriptedClient([
     lineage(true),
+    result([], 0),
     result([intentRow(pair.simulationIntent)], 1),
     result([], 0),
     result([pairRow(pair)], 1),
@@ -30,8 +31,8 @@ void test('creates an immutable pair through the caller transaction client', asy
 
   assert.equal(outcome.kind, 'CREATED');
   assert.deepEqual(outcome.pair, pair);
-  assert.equal(client.calls.length, 4);
-  const insert = required(client.calls[3]);
+  assert.equal(client.calls.length, 5);
+  const insert = required(client.calls[4]);
   assert.match(insert.text, /^INSERT INTO execution_preflight_intent_pairs/mu);
   assert.match(insert.text, /ON CONFLICT DO NOTHING/u);
   assert.deepEqual(insert.values, [
@@ -53,9 +54,8 @@ void test('refuses to pair a newly created target with any pre-existing sibling'
     lineage(true),
     result([], 0),
     result([], 0),
-    result([intentRow(pair.simulationIntent)], 1),
     result([], 0),
-    result([pairRow(pair)], 1),
+    result([intentRow(pair.simulationIntent)], 1),
   ]);
 
   await assert.rejects(
@@ -63,7 +63,7 @@ void test('refuses to pair a newly created target with any pre-existing sibling'
     (error: unknown) => error instanceof ExecutionPreflightIntentPairRepositoryError
       && error.code === 'PAIR_DUPLICATE',
   );
-  assert.equal(client.calls.length, 4);
+  assert.equal(client.calls.length, 5);
 });
 
 void test('rejects collisions and contradictory database results with a fixed typed error', async () => {
@@ -72,17 +72,20 @@ void test('rejects collisions and contradictory database results with a fixed ty
   const cases = [
     new ScriptedClient([
       lineage(true),
+      result([], 0),
       result([intentRow(pair.simulationIntent)], 1), result([], 0),
       result([], 0), result([], 0),
     ]),
     new ScriptedClient([
       lineage(true),
+      result([], 0),
       result([intentRow(pair.simulationIntent)], 1), result([], 0),
       result([], 0),
       result([{ ...pairRow(pair), pair_fingerprint: 'b'.repeat(64) }], 1),
     ]),
     new ScriptedClient([
       lineage(true),
+      result([], 0),
       result([intentRow(pair.simulationIntent)], 1), result([], 0),
       result([pairRow(pair)], 0),
     ]),

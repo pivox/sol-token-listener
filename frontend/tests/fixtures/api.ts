@@ -284,6 +284,12 @@ export const health = {
     lastSignature: null, pendingTransactions: 1, activeSessions: 1,
     firstProcessingCanary,
     decoderQuarantine: { version: 1, unresolvedCount: 2 },
+    workerAdmission: {
+      version: 1, enabled: true, trackingWindowSeconds: 45,
+      claimableBacklogCount: 8, classificationPendingCount: 2,
+      oldestClassificationPendingAgeMs: 4_999, freshMintCount: 3,
+      extendedMintCount: 2, demotedCount: 5,
+    },
     blockHydration: {
       version: 1, enabled: true, callerConcurrency: 1,
       locates: 10, hits: 6, misses: 4, inFlightJoins: 0, fetches: 4,

@@ -74,6 +74,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
     /REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer/iu);
+  assert.match(sql, /GRANT SELECT ON TABLE listener_worker_tracking_live_mints\s+TO sol_token_listener_writer/iu);
+  assert.doesNotMatch(sql,
+    /GRANT[^;]*\b(?:INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)\b[^;]*listener_worker_tracking_live_mints[^;]*TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT ON TABLE chain_transaction_inbox_claim_scheduler\s+TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT UPDATE \(consecutive_urgent_claims,launch_claims_since_tracked,updated_at\)\s+ON TABLE chain_transaction_inbox_claim_scheduler\s+TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT USAGE ON TYPE chain_transaction_inbox_priority\s+TO sol_token_listener_writer/iu);
@@ -189,6 +192,15 @@ void test('PostgreSQL 16 listener login can write business projections but no li
         current_user: 'sol_token_listener_writer',
         search_path: '"$user", public',
       }]);
+      assert.deepEqual((await listener.query(
+        `SELECT mint FROM listener_worker_tracking_live_mints WHERE FALSE`,
+      )).rows, []);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(`SELECT
+        has_table_privilege(current_user,'listener_worker_tracking_live_mints','SELECT')
+          AS allowed`)).rows[0]?.allowed, true);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(`SELECT
+        has_table_privilege(current_user,'execution_live_positions','SELECT')
+          AS allowed`)).rows[0]?.allowed, false);
       assert.equal((await listener.query<{ readonly allowed: boolean }>(
         `SELECT has_schema_privilege(current_user,'public','CREATE') AS allowed`,
       )).rows[0]?.allowed, false);

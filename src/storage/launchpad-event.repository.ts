@@ -28,6 +28,15 @@ import {
 import { getDatabasePool } from './database.js';
 import { FOUNDATION_RETENTION_SHARED_FENCE_SQL } from './foundation-retention-fence.js';
 import { createRepositoryId } from './repositories.js';
+import {
+  listWorkerTrackingMints,
+  lockWorkerTrackingMints,
+} from './worker-tracking-mint-lock.js';
+import {
+  createPumpFunWorkerAdmissionPolicy,
+  DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  type PumpFunWorkerAdmissionPolicyV1,
+} from '../domain/worker-admission.js';
 
 interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
@@ -61,7 +70,13 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     private readonly retentionHours = 4,
     private readonly now: () => number = Date.now,
     private readonly socialJobPolicy: SocialJobPolicy = DEFAULT_SOCIAL_JOB_POLICY,
+    private readonly workerAdmissionPolicy: PumpFunWorkerAdmissionPolicyV1 =
+      createPumpFunWorkerAdmissionPolicy({
+        enabled: false,
+        trackingWindowSeconds: DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+      }),
   ) {
+    this.workerAdmissionPolicy = createPumpFunWorkerAdmissionPolicy(workerAdmissionPolicy);
     if (
       !Number.isSafeInteger(socialJobPolicy.maxAttempts)
       || socialJobPolicy.maxAttempts < 1
@@ -90,6 +105,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       try {
         await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
         await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
+        await lockWorkerTrackingMints(client, batch.events.map((event) => event.mint));
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [batch.signature]);
         const byId = new Map<string, EventRecordOutcome>();
         const ordered = [...batch.events].sort((left, right) =>
@@ -123,6 +139,12 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
 
   public async listTrackedMints(): Promise<ReadonlySet<string>> {
     return this.read(async (client) => {
+      if (this.workerAdmissionPolicy.enabled) {
+        return immutableSet(await listWorkerTrackingMints(
+          client,
+          this.workerAdmissionPolicy.trackingWindowSeconds,
+        ));
+      }
       const result = await client.query(`SELECT mint FROM token_launches
         WHERE terminal_at IS NULL ORDER BY mint`);
       const values = result.rows.map((row) => requiredText(row, 'mint'));

@@ -9,6 +9,7 @@ import { assertExecutionIntent, type ExecutionIntentV1 } from '../domain/executi
 import type { ExecutionSimulationRepository } from '../ports/execution-simulation-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
+import { workerTrackingMintLockCte } from './worker-tracking-mint-lock.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -145,13 +146,15 @@ const INSERTED_SELECT = ARTIFACT_ROW_KEYS.map((key) => {
 
 const COMPLETE_SQL = `WITH operation AS MATERIALIZED (
   SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+), mint_lock AS MATERIALIZED (
+  ${workerTrackingMintLockCte(13)}
 ), locked AS MATERIALIZED (
   SELECT intent.id,intent.side,intent.state_revision,EXISTS (
     SELECT 1 FROM execution_simulation_artifacts AS existing
     WHERE existing.artifact_id=$27
        OR (existing.intent_id=$1 AND existing.attempt_number=$26)
   ) AS artifact_conflict
-  FROM execution_intents AS intent CROSS JOIN operation
+  FROM execution_intents AS intent CROSS JOIN operation CROSS JOIN mint_lock
   WHERE intent.id=$1 AND intent.status=$2
     AND intent.lease_owner=$3 AND intent.lease_token=$4::UUID
     AND intent.lease_expires_at=TIMESTAMPTZ 'epoch'

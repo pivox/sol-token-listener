@@ -11,6 +11,13 @@ import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
+const MINT_A = '11111111111111111111111111111111';
+const MINT_B = 'So11111111111111111111111111111111111111112';
+const MINT_C = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const MINT_SOCIAL = 'SysvarRent111111111111111111111111111111111';
+const MINT_FINAL_SOCIAL = 'SysvarC1ock11111111111111111111111111111111';
+const MINT_NO_URI = 'SysvarRecentB1ockHashes11111111111111111111';
+
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
 void test('atomically persists creation and initial buy and restores active events', async (context) => {
@@ -28,7 +35,7 @@ void test('atomically persists creation and initial buy and restores active even
   const batch = fixture('confirmed');
   const result = await repository.record(batch);
   assert.deepEqual(result.events.map((item) => item.outcome), ['created', 'created']);
-  assert.deepEqual(result.affectedMints, ['mint-a']);
+  assert.deepEqual(result.affectedMints, [MINT_A]);
   assert.ok(Object.isFrozen(result.affectedMints));
   const counts = await pool.query(`SELECT
     (SELECT COUNT(*)::int FROM raw_chain_events) raw,
@@ -37,8 +44,11 @@ void test('atomically persists creation and initial buy and restores active even
     (SELECT COUNT(*)::int FROM launch_trades) trades,
     (SELECT COUNT(*)::int FROM state_transitions) transitions`);
   assert.deepEqual(counts.rows[0], { raw: 2, domain: 2, launches: 1, trades: 1, transitions: 1 });
+  assert.equal((await pool.query(`SELECT
+    (EXTRACT(EPOCH FROM detected_at)*1000)::BIGINT::TEXT AS detected_at_ms
+    FROM token_launches`)).rows[0]?.detected_at_ms, '1000');
   const tracked = await repository.listTrackedMints();
-  assert.deepEqual([...tracked], ['mint-a']);
+  assert.deepEqual([...tracked], [MINT_A]);
   assert.throws(() => (tracked as Set<string>).add('mutated'), TypeError);
   const ownerValues: ReadonlySet<string>[] = [];
   const thisArg = { marker: true };
@@ -67,13 +77,13 @@ void test('atomically enqueues one durable social job and cancels it on orphanin
       initialSupply: 1_000_000_000_000_000_000n,
       uri: 'https://metadata.example/token.json',
     });
-    const processed = fixture('processed', 'signature-social', 'mint-social', 2_000, 1_000, parameters);
+    const processed = fixture('processed', 'signature-social', MINT_SOCIAL, 2_000, 1_000, parameters);
     await repository.record(processed);
     const first = await pool.query(`SELECT job_id,mint,source_launch_event_id,
       metadata_uri,status,attempts,max_attempts,base_delay_ms,input_fingerprint
       FROM social_enrichment_jobs`);
     assert.equal(first.rowCount, 1);
-    assert.equal(first.rows[0].mint, 'mint-social');
+    assert.equal(first.rows[0].mint, MINT_SOCIAL);
     assert.equal(first.rows[0].source_launch_event_id, processed.events[0]?.id);
     assert.equal(first.rows[0].metadata_uri, 'https://metadata.example/token.json');
     assert.equal(first.rows[0].status, 'PENDING');
@@ -86,12 +96,12 @@ void test('atomically enqueues one durable social job and cancels it on orphanin
     await repository.record(processed);
     assert.equal((await pool.query('SELECT COUNT(*)::int count FROM social_enrichment_jobs')).rows[0].count, 1);
     await repository.record(fixture(
-      'confirmed', 'signature-social', 'mint-social', 3_000, 1_000, parameters,
+      'confirmed', 'signature-social', MINT_SOCIAL, 3_000, 1_000, parameters,
     ));
     assert.equal((await pool.query('SELECT job_id FROM social_enrichment_jobs')).rows[0].job_id, first.rows[0].job_id);
 
     await repository.record(fixture(
-      'orphaned', 'signature-social', 'mint-social', 4_000, 1_000, parameters,
+      'orphaned', 'signature-social', MINT_SOCIAL, 4_000, 1_000, parameters,
     ));
     const cancelled = await pool.query(`SELECT status,terminal_at,purge_after,
       EXTRACT(EPOCH FROM (purge_after-terminal_at))::int retention_seconds
@@ -108,10 +118,10 @@ void test('atomically enqueues one durable social job and cancels it on orphanin
 void test('preserves social job identity when the source launch finalizes', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);
-    const processed = fixture('processed', 'signature-final-social', 'mint-final-social');
+    const processed = fixture('processed', 'signature-final-social', MINT_FINAL_SOCIAL);
     await repository.record(processed);
     const jobId = (await pool.query('SELECT job_id FROM social_enrichment_jobs')).rows[0].job_id;
-    await repository.record(fixture('finalized', 'signature-final-social', 'mint-final-social'));
+    await repository.record(fixture('finalized', 'signature-final-social', MINT_FINAL_SOCIAL));
     const final = await pool.query(`SELECT job.job_id,event.confirmation_status
       FROM social_enrichment_jobs job
       JOIN domain_events event ON event.event_id=job.source_launch_event_id`);
@@ -122,7 +132,7 @@ void test('preserves social job identity when the source launch finalizes', asyn
 void test('enqueues a nullable metadata URI without reading inherited parameters', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);
-    await repository.record(fixture('confirmed', 'signature-no-uri', 'mint-no-uri'));
+    await repository.record(fixture('confirmed', 'signature-no-uri', MINT_NO_URI));
     const job = await pool.query('SELECT metadata_uri FROM social_enrichment_jobs');
     assert.equal(job.rows[0].metadata_uri, null);
   });
@@ -139,7 +149,7 @@ void test('restores only launchpad events when market events share the signature
       payload, processing_status
     ) VALUES (
       'market-raw', 'pumpswap', 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
-      'mint-a', 'signature-a', 10, 4, 3, 'confirmed', NOW(), 1, '{}'::jsonb,
+      '${MINT_A}', 'signature-a', 10, 4, 3, 'confirmed', NOW(), 1, '{}'::jsonb,
       'processed'
     )`);
     await pool.query(`INSERT INTO domain_events (
@@ -147,7 +157,7 @@ void test('restores only launchpad events when market events share the signature
       transaction_index, instruction_index, confirmation_status, observed_at,
       payload_version, payload
     ) VALUES (
-      'market-event', 'market-raw', 'MigrationObserved', 'mint-a', 'pumpswap',
+      'market-event', 'market-raw', 'MigrationObserved', '${MINT_A}', 'pumpswap',
       'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 'signature-a', 10, 4, 3,
       'confirmed', NOW(), 1, '{}'::jsonb
     )`);
@@ -246,8 +256,8 @@ void test('preserves multiple outer and inner events in one transaction and acce
     assert.deepEqual(active.map(event => [event.cursor.instructionIndex, event.cursor.innerInstructionIndex]), [[2, null], [2, null], [2, 1]]);
     assert.equal((active[0]?.id ?? '') < (active[1]?.id ?? ''), true);
 
-    await Promise.all([repository.record(fixture('confirmed', 'signature-b', 'mint-b')), repository.record(fixture('confirmed', 'signature-c', 'mint-c'))]);
-    assert.deepEqual([...await repository.listTrackedMints()], ['mint-a', 'mint-b', 'mint-c']);
+    await Promise.all([repository.record(fixture('confirmed', 'signature-b', MINT_B)), repository.record(fixture('confirmed', 'signature-c', MINT_C))]);
+    assert.deepEqual([...await repository.listTrackedMints()], [MINT_A, MINT_B, MINT_C].sort());
   });
 });
 
@@ -271,7 +281,7 @@ void test('replays exactly, promotes finality, retracts confirmed observations, 
     const repository = new PostgresLaunchpadEventRepository(pool, 4, () => 10_000);
     assert.deepEqual((await repository.record(fixture('processed'))).events.map(x => x.outcome), ['created','created']);
     assert.deepEqual((await repository.record(fixture('processed'))).events.map(x => x.outcome), ['duplicate','duplicate']);
-    assert.deepEqual((await repository.record(fixture('confirmed', 'signature-a', 'mint-a', 3_000))).events.map(x => x.outcome), ['confirmation_updated','confirmation_updated']);
+    assert.deepEqual((await repository.record(fixture('confirmed', 'signature-a', MINT_A, 3_000))).events.map(x => x.outcome), ['confirmation_updated','confirmation_updated']);
     assert.equal((await pool.query("SELECT COUNT(*)::int count FROM domain_events")).rows[0].count, 2);
     assert.deepEqual((await repository.record(fixture('orphaned'))).events.map(x => x.outcome), ['confirmation_updated','confirmation_updated']);
     assert.deepEqual(await repository.listActiveEventsBySignature('signature-a'), []);
@@ -312,19 +322,22 @@ void test('replaying a first-seen orphan remains a duplicate raw proof without p
 void test('reconciles supplied transition occurrences independently of event outcome', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);
-    await repository.record(fixture('processed', 'signature-a', 'mint-a', 5_000, null));
-    await repository.record(fixture('processed', 'signature-a', 'mint-a', 4_000, null));
+    await repository.record(fixture('processed', 'signature-a', MINT_A, 5_000, null));
+    assert.equal((await pool.query(`SELECT
+      (EXTRACT(EPOCH FROM detected_at)*1000)::BIGINT::TEXT AS detected_at_ms
+      FROM token_launches`)).rows[0]?.detected_at_ms, '5000');
+    await repository.record(fixture('processed', 'signature-a', MINT_A, 4_000, null));
     assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4000', occurred_at_source: 'observation' });
 
-    await repository.record(fixture('confirmed', 'signature-a', 'mint-a', 6_000, 4_500));
+    await repository.record(fixture('confirmed', 'signature-a', MINT_A, 6_000, 4_500));
     assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4500', occurred_at_source: 'blockchain' });
 
-    const worse = await repository.record(fixture('confirmed', 'signature-a', 'mint-a', 3_000, null));
+    const worse = await repository.record(fixture('confirmed', 'signature-a', MINT_A, 3_000, null));
     assert.equal(worse.events[0]?.outcome, 'duplicate');
     assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4500', occurred_at_source: 'blockchain' });
 
-    await repository.record(fixture('finalized', 'signature-a', 'mint-a', 7_000, 4_400));
-    await repository.record(fixture('finalized', 'signature-a', 'mint-a', 7_000, 4_600));
+    await repository.record(fixture('finalized', 'signature-a', MINT_A, 7_000, 4_400));
+    await repository.record(fixture('finalized', 'signature-a', MINT_A, 7_000, 4_600));
     assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4400', occurred_at_source: 'blockchain' });
     assert.equal((await pool.query('SELECT COUNT(*)::int count FROM state_transitions')).rows[0].count, 1);
   });
@@ -362,11 +375,11 @@ void test('rejects immutable corruption in every persisted launchpad projection'
     const batch = fixture('confirmed');
     await repository.record(batch);
     const mutations = [
-      { mutate: "UPDATE raw_chain_events SET mint='corrupt' WHERE mint='mint-a'", restore: "UPDATE raw_chain_events SET mint='mint-a' WHERE mint='corrupt'" },
+      { mutate: `UPDATE raw_chain_events SET mint='corrupt' WHERE mint='${MINT_A}'`, restore: `UPDATE raw_chain_events SET mint='${MINT_A}' WHERE mint='corrupt'` },
       { mutate: "UPDATE domain_events SET program='corrupt' WHERE type='TokenLaunchDetected'", restore: "UPDATE domain_events SET program='pump' WHERE program='corrupt'" },
       { mutate: "UPDATE domain_events SET raw_event_id=NULL WHERE type='TokenLaunchDetected'", restore: "UPDATE domain_events SET raw_event_id=(SELECT raw.event_id FROM raw_chain_events raw WHERE raw.payload->>'id'=domain_events.event_id) WHERE type='TokenLaunchDetected'" },
-      { mutate: "UPDATE token_launches SET creator='corrupt' WHERE mint='mint-a'", restore: "UPDATE token_launches SET creator='creator' WHERE mint='mint-a'" },
-      { mutate: "UPDATE launch_trades SET base_amount_raw=2 WHERE mint='mint-a'", restore: "UPDATE launch_trades SET base_amount_raw=9007199254740993 WHERE mint='mint-a'" },
+      { mutate: `UPDATE token_launches SET creator='corrupt' WHERE mint='${MINT_A}'`, restore: `UPDATE token_launches SET creator='creator' WHERE mint='${MINT_A}'` },
+      { mutate: `UPDATE launch_trades SET base_amount_raw=2 WHERE mint='${MINT_A}'`, restore: `UPDATE launch_trades SET base_amount_raw=9007199254740993 WHERE mint='${MINT_A}'` },
     ];
     for (const mutation of mutations) {
       await pool.query(mutation.mutate);
@@ -425,7 +438,7 @@ void test('reader sorts full cursors, restores bigints, and rejects corrupt rows
     const trade = batch.events[1];
     assert.ok(trade?.type === 'BondingCurveTradeObserved');
     await pool.query("UPDATE domain_events SET payload=$1 WHERE type='BondingCurveTradeObserved'", [toJsonValue(trade.payload)]);
-    await pool.query("UPDATE raw_chain_events SET payload='{}'::jsonb WHERE mint='mint-a'");
+    await pool.query("UPDATE raw_chain_events SET payload='{}'::jsonb WHERE mint=$1", [MINT_A]);
     await assert.rejects(
       repository.listActiveEventsBySignature('signature-a'),
       (error: unknown) => (error as Error).name === 'LaunchpadEventRepositoryError',
@@ -501,7 +514,7 @@ async function withDatabase(context: { skip(message?: string): void }, run: (poo
   finally { await pool.end(); await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await admin.end(); }
 }
 
-function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = 'mint-a', observedAtMs = 2_000, blockTimeMs: number | null = 1_000, parameters: LaunchParameterObject = { initialSupply: 1_000_000_000_000_000_000n, nested: { b: 2, a: 1 } }) {
+function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = MINT_A, observedAtMs = 2_000, blockTimeMs: number | null = 1_000, parameters: LaunchParameterObject = { initialSupply: 1_000_000_000_000_000_000n, nested: { b: 2, a: 1 } }) {
   const transaction = { signature, confirmationStatus: status, blockTimeMs, observedAtMs, cursor: { slot: 9_007_199_254_740_993n, transactionIndex: 4 }, raw: null };
   const quoteAsset = { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' as const };
   const launch = createTokenLaunchDetectedEvent({ source: 'pumpfun', program: 'pump', transaction, launch: { mint, creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [quoteAsset], launchpad: 'pumpfun', createdAt: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: null }, parameters } });

@@ -316,6 +316,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '053_transaction_inbox_worker_admission_foundation.sql',
       '054_paper_entry_boundary.sql',
       '055_creation_entry_single_active_session.sql',
+      '056_transaction_inbox_bounded_tracking.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

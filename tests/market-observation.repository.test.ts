@@ -1,14 +1,23 @@
+import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import pg from 'pg';
+import type { PoolClient } from 'pg';
 import { ConfirmationStatusConflictError } from '../src/domain/confirmation-status.js';
 import type { ChainConfirmationStatus } from '../src/domain/types.js';
 import type { MatchedMigration } from '../src/application/pumpswap-migration-matcher.js';
-import type { RawMarketObservation } from '../src/domain/market.js';
+import {
+  marketPoolDefinition,
+  type RawMarketObservation,
+} from '../src/domain/market.js';
 import {
   MarketObservationPayloadConflictError,
   PostgresMarketObservationRepository,
 } from '../src/storage/market-observation.repository.js';
+import { migrateDatabase } from '../src/storage/database.js';
 import { toJsonValue } from '../src/utils/json.js';
+
+const MINT = '11111111111111111111111111111111';
 
 interface QueryCall {
   readonly text: string;
@@ -183,7 +192,7 @@ void test('confirmed orphaning retracts dependent market projections', async () 
     reserveSnapshots: [],
     trades: [],
   });
-  assert.deepEqual(result, { migrations: [], activations: [], affectedMints: ['mint'] });
+  assert.deepEqual(result, { migrations: [], activations: [], affectedMints: [MINT] });
   assert.equal(
     client.calls.some((call) =>
       call.text.includes("pool_state='retracted'")),
@@ -285,6 +294,52 @@ void test('late processed replay keeps finalized projections', async () => {
   );
 });
 
+void test('market orphaning waits on the shared mint lock before removing candidate source proof',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL is not configured');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = orphanedMigrationOnly();
+      await seedCandidateDependingOnMigration(pool, fixture);
+      const blocker = await pool.connect();
+      const market = await pool.connect();
+      const marketPid = await backendPid(market);
+      let record: Promise<unknown> | null = null;
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox-mint:' || $1, 0))",
+          [MINT],
+        );
+        record = new PostgresMarketObservationRepository({
+          connect: () => Promise.resolve(market),
+        }, 4, () => 10_000).record(fixture);
+        await waitForLock(pool, marketPid);
+
+        assert.deepEqual(await candidateSourceState(pool), [{
+          candidate_state: 'ELIGIBLE',
+          source_confirmation_status: 'confirmed',
+        }]);
+
+        await blocker.query('COMMIT');
+        await record;
+        assert.deepEqual(await candidateSourceState(pool), [{
+          candidate_state: 'ELIGIBLE',
+          source_confirmation_status: 'orphaned',
+        }]);
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => undefined);
+        blocker.release();
+        if (record === null) market.release();
+        else await record.catch(() => undefined);
+      }
+    });
+  });
+
 function repositoryWith(client: InstrumentedClient) {
   return new PostgresMarketObservationRepository({
     connect: () => Promise.resolve(client),
@@ -308,7 +363,7 @@ function matched(status: ChainConfirmationStatus): {
   const migrationEvent: MatchedMigration['migrationEvent'] = {
     id: 'migration-event',
     type: 'MigrationObserved',
-    mint: 'mint',
+    mint: MINT,
     source: 'pumpfun',
     program: 'pump',
     signature: 'signature',
@@ -320,7 +375,7 @@ function matched(status: ChainConfirmationStatus): {
     payload: {
       migration: {
         instruction: 'MIGRATE',
-        mint: 'mint',
+        mint: MINT,
         bondingCurve: 'curve',
         announcedPool: 'pool',
         baseTokenProgram: 'SPL_TOKEN',
@@ -340,7 +395,7 @@ function matched(status: ChainConfirmationStatus): {
         address: 'pool',
         market: 'pumpswap',
         programId: 'pumpswap',
-        baseMint: 'mint',
+        baseMint: MINT,
         quoteAsset,
         index: 0,
         creator: 'creator',
@@ -363,12 +418,140 @@ function matched(status: ChainConfirmationStatus): {
   };
 }
 
+function orphanedMigrationOnly() {
+  const fixture = matched('orphaned');
+  const migrationRaw = fixture.rawEvents[0];
+  if (migrationRaw === undefined) throw new Error('Migration raw fixture is unavailable.');
+  return {
+    rawEvents: [migrationRaw],
+    matches: [{ ...fixture.match, activationEvent: null }],
+    reserveSnapshots: [],
+    trades: [],
+  } as const;
+}
+
+async function seedCandidateDependingOnMigration(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: ReturnType<typeof orphanedMigrationOnly>,
+): Promise<void> {
+  const rawEvent = fixture.rawEvents[0];
+  const migration = fixture.matches[0]?.migrationEvent;
+  assert.ok(rawEvent !== undefined && migration !== undefined);
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,current_state,created_signature,
+    created_slot,created_transaction_index,created_instruction_index,detected_at,updated_at
+  ) VALUES ($1,'pumpfun','pump','creator','SPL_TOKEN','MIGRATION_PENDING',$2,10,0,1,
+    to_timestamp(1),to_timestamp(1))`, [MINT, migration.signature]);
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status,blockchain_time,observed_at,
+    payload_version,payload,processing_status
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed',$10,$11,$12,$13,'processed')`, [
+    rawEvent.id, rawEvent.source, rawEvent.program, rawEvent.mint, rawEvent.signature,
+    rawEvent.cursor.slot.toString(), rawEvent.cursor.transactionIndex,
+    rawEvent.cursor.instructionIndex, rawEvent.cursor.innerInstructionIndex,
+    new Date(rawEvent.blockchainTimeMs ?? 0), new Date(rawEvent.observedAtMs),
+    rawEvent.payloadVersion, toJsonValue(rawEvent.payload),
+  ]);
+  for (const [eventId, type] of [
+    [migration.id, 'MigrationObserved'],
+    ['qualification-event', 'QualificationUpdated'],
+    ['candidate-event', 'TradingCandidateUpdated'],
+  ] as const) {
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,inner_instruction_index,confirmation_status,blockchain_time,
+      observed_at,payload_version,payload
+    ) VALUES ($1,$2,$3,$4,'pumpfun','pump',$5,10,0,2,NULL,'confirmed',to_timestamp(1),
+      to_timestamp(2),1,'{}')`, [eventId, rawEvent.id, type, MINT, migration.signature]);
+  }
+  await pool.query(`INSERT INTO qualification_reports (
+    report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+    profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+    preparation_score,social_score,onchain_score,total_score,as_of_slot,
+    as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+    purge_after,payload_version,payload
+  ) VALUES ($1,$2,$3,$4,'qualification-event','market-race',1,$5,$6,'QUALIFIED',
+    0,0,60,60,10,0,2,'confirmed',to_timestamp(2),to_timestamp(2)+INTERVAL '4 hours',1,'{}')`, [
+    `qreport_${'1'.repeat(64)}`, MINT, migration.id, rawEvent.id,
+    '2'.repeat(64), '3'.repeat(64),
+  ]);
+  await pool.query(`INSERT INTO trading_candidates (
+    candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+    strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+    quote_decimals,quote_token_program,reason_codes,eligible_until,created_at,purge_after,
+    payload_version,payload
+  ) VALUES ($1,$2,$3,$4,'candidate-event','market-race',1,$5,'confirmed','ELIGIBLE',
+    'So11111111111111111111111111111111111111112',9,'SPL_TOKEN','["QUALIFIED_ENTRY"]',
+    NOW()+INTERVAL '1 hour',to_timestamp(2),to_timestamp(2)+INTERVAL '4 hours',1,'{}')`, [
+    `candidate_${'4'.repeat(64)}`, MINT, `qreport_${'1'.repeat(64)}`, migration.id,
+    '5'.repeat(64),
+  ]);
+}
+
+async function candidateSourceState(pool: InstanceType<typeof pg.Pool>) {
+  const result = await pool.query<{
+    readonly candidate_state: string;
+    readonly source_confirmation_status: string;
+  }>(`SELECT candidate.state AS candidate_state,
+      source.confirmation_status AS source_confirmation_status
+    FROM trading_candidates candidate
+    JOIN domain_events source ON source.event_id=candidate.source_event_id`);
+  return result.rows;
+}
+
+async function backendPid(client: PoolClient): Promise<number> {
+  const result = await client.query<{ readonly pid: number }>('SELECT pg_backend_pid() AS pid');
+  const pid = result.rows[0]?.pid;
+  if (pid === undefined) throw new Error('PostgreSQL backend pid is unavailable.');
+  return pid;
+}
+
+async function waitForLock(
+  pool: InstanceType<typeof pg.Pool>,
+  processId: number,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const row = (await pool.query<{ readonly wait_event_type: string | null }>(
+      'SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [processId],
+    )).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+  }
+  assert.fail('Market orphaning did not wait for the shared mint lock.');
+}
+
+async function withTemporarySchema(
+  databaseUrl: string,
+  callback: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+): Promise<void> {
+  const schema = `market_mint_lock_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    max: 4,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await callback(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+}
+
 function raw(
   id: string,
   sourceId: string,
   event: MatchedMigration['migrationEvent'] | NonNullable<MatchedMigration['activationEvent']>,
   status: ChainConfirmationStatus,
 ): RawMarketObservation {
+  const payload = event.type === 'PumpSwapPoolActivated'
+    ? { ...event.payload, pool: marketPoolDefinition(event.payload.pool) }
+    : event.payload;
   return {
     id,
     source: event.source,
@@ -380,7 +563,15 @@ function raw(
     blockchainTimeMs: event.blockchainTimeMs,
     observedAtMs: event.observedAtMs,
     payloadVersion: 1,
-    payload: { kind: event.type, value: { ...toJsonValue(event) as object, id: sourceId } },
+    payload: {
+      kind: event.type,
+      value: {
+        id: sourceId,
+        type: event.type,
+        payloadVersion: event.payloadVersion,
+        payload: toJsonValue(payload),
+      },
+    },
   };
 }
 

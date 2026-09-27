@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
-import { PublicKey } from '@solana/web3.js';
 import { assertValidObservedPipelineFailure } from './observed-pipeline-failure.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
@@ -14,7 +13,14 @@ import {
   assertValidFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from './first-processing-canary.js';
+import {
+  snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionMetricsV1,
+} from './worker-admission-metrics.js';
 import type { ChainConfirmationStatus } from './types.js';
+import { isCanonicalSolanaPublicKey } from './solana-public-key.js';
+
+export const isCanonicalSolanaProgramId = isCanonicalSolanaPublicKey;
 
 export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
 export const MAX_TRANSACTION_SNAPSHOT_NODES = 10_000;
@@ -279,6 +285,7 @@ export interface RuntimeHeartbeat {
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
   readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
+  readonly workerAdmission?: RuntimeWorkerAdmissionMetricsV1;
   readonly decoderQuarantine?: RuntimeDecoderQuarantineMetricsV1;
 }
 
@@ -484,19 +491,6 @@ function assertCanonicalProgramIds(value: unknown): void {
       throw new TypeError('Transaction notification programIds are not canonical.');
     }
     previous = programId;
-  }
-}
-
-export function isCanonicalSolanaProgramId(value: string): boolean {
-  const byteLength = Buffer.byteLength(value, 'utf8');
-  if (byteLength < MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
-    || byteLength > MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
-    || value !== value.trim()
-    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(value)) return false;
-  try {
-    return new PublicKey(value).toBase58() === value;
-  } catch {
-    return false;
   }
 }
 
@@ -721,6 +715,13 @@ export function assertValidRuntimeHeartbeat(
         throw new TypeError('First processing canary is invalid.');
       }
       assertValidFirstProcessingCanaryEvidence(firstProcessingCanary.value);
+    }
+    const workerAdmission = Object.getOwnPropertyDescriptor(value, 'workerAdmission');
+    if (workerAdmission !== undefined) {
+      if (!('value' in workerAdmission) || workerAdmission.enumerable !== true) {
+        throw new TypeError('Worker admission metrics are invalid.');
+      }
+      snapshotRuntimeWorkerAdmissionMetrics(workerAdmission.value);
     }
     const decoderQuarantine = Object.getOwnPropertyDescriptor(value, 'decoderQuarantine');
     if (decoderQuarantine !== undefined) {

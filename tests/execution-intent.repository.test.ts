@@ -320,7 +320,7 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
         );
         assert.match(sql, /blocking_sell\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
         const blockingPredicate = required(
-          /NOT EXISTS\s*\(([\s\S]*?)\)\s*AND\s*\(intent\.lease_expires_at/u.exec(sql)?.[1],
+          /NOT EXISTS\s*\(([\s\S]*?)\)\s*(?:AND intent\.id=\$4\s*)?AND\s*\(intent\.lease_expires_at/u.exec(sql)?.[1],
         );
         assert.doesNotMatch(blockingPredicate, /blocking_sell\.lease_expires_at/u);
       } else {
@@ -451,6 +451,13 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
             if (text === 'BEGIN ISOLATION LEVEL READ COMMITTED' || text === 'ROLLBACK') {
               return result([], null);
             }
+            if (text.includes('worker_tracking_live_buy_preview')) {
+              return result([{
+                id: `execution_intent_${'f'.repeat(64)}`,
+                mint: '11111111111111111111111111111111',
+              }], 1);
+            }
+            if (text.includes("'transaction-inbox-mint:'")) return result([], 1);
             if (text.includes('execution-live-sell-presence:v1')) {
               lockStarted.resolve(true);
               return lockGate.promise;
@@ -477,9 +484,13 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
       assert.deepEqual(calls, [
         'BEGIN ISOLATION LEVEL READ COMMITTED',
         calls[1],
+        calls[2],
+        calls[3],
         'ROLLBACK',
       ]);
-      assert.match(calls[1] ?? '', /execution-live-sell-presence:v1/u);
+      assert.match(calls[1] ?? '', /worker_tracking_live_buy_preview/u);
+      assert.match(calls[2] ?? '', /transaction-inbox-mint:/u);
+      assert.match(calls[3] ?? '', /execution-live-sell-presence:v1/u);
       assert.deepEqual(releaseErrors, [false]);
       });
   }
@@ -2180,7 +2191,7 @@ void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SE
         });
         const outcome = await Promise.race([
           buyClaim.then(() => 'CLAIM_SETTLED' as const),
-          waitForDatabaseQuery(firstPool, '%execution-live-sell-presence:v1%')
+          waitForDatabaseQuery(firstPool, '%transaction-inbox-mint:%')
             .then(() => 'CLAIM_BLOCKED' as const),
         ]);
         assert.equal(outcome, 'CLAIM_BLOCKED');
@@ -2259,7 +2270,7 @@ void test('LIVE_RECOVER BUY waits for an uncommitted SELL creation and observes 
         });
         const outcome = await Promise.race([
           buyRecovery.then(() => 'CLAIM_SETTLED' as const),
-          waitForDatabaseQuery(firstPool, '%execution-live-sell-presence:v1%')
+          waitForDatabaseQuery(firstPool, '%transaction-inbox-mint:%')
             .then(() => 'CLAIM_BLOCKED' as const),
         ]);
         assert.equal(outcome, 'CLAIM_BLOCKED');
@@ -3433,6 +3444,19 @@ class ScriptedClient {
   ) {}
 
   public async query(text: string, values?: readonly unknown[]): Promise<QueryResult> {
+    if (text.includes('worker_tracking_live_buy_preview')) {
+      return result([{
+        id: `execution_intent_${'f'.repeat(64)}`,
+        mint: '11111111111111111111111111111111',
+      }], 1);
+    }
+    if (text.trim().startsWith('SELECT pg_advisory_xact_lock')
+      && text.includes("'transaction-inbox-mint:'")) {
+      return result([], 1);
+    }
+    if (text.trim().startsWith('SELECT intent.id,intent.mint')) {
+      return result([], 0);
+    }
     this.calls.push({ text, values });
     const step = this.steps.shift();
     if (step === undefined) throw new Error(`Unexpected query: ${text}`);

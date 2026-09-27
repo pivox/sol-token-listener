@@ -50,11 +50,51 @@ import {
 } from '../src/domain/transaction-ingestion.js';
 import { RPC_PROVIDER_IDS, isRpcProviderId } from '../src/domain/rpc-provider.js';
 import { createFirstProcessingCanaryEvidence } from '../src/domain/first-processing-canary.js';
+import { snapshotRuntimeWorkerAdmissionMetrics } from '../src/domain/worker-admission-metrics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
+
+void test('heartbeat accepts omitted historical worker admission and only an exact frozen snapshot', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+    version: 1,
+    enabled: true,
+    trackingWindowSeconds: 45,
+    claimableBacklogCount: 8,
+    classificationPendingCount: 2,
+    oldestClassificationPendingAgeMs: 4_999,
+    freshMintCount: 3,
+    extendedMintCount: 2,
+    demotedCount: 5,
+  }));
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, workerAdmission }));
+  });
+
+  let accessorReads = 0;
+  const accessor = Object.freeze({
+    ...workerAdmission,
+    get demotedCount() { accessorReads += 1; return 5; },
+  });
+  for (const malformed of [
+    null,
+    { ...workerAdmission },
+    Object.freeze({ ...workerAdmission, signature: 'must-not-leak' }),
+    Object.freeze({ ...workerAdmission, claimableBacklogCount: -1 }),
+    Object.freeze({ ...workerAdmission, oldestClassificationPendingAgeMs: null }),
+    new Proxy(workerAdmission, {}),
+    accessor,
+  ]) {
+    assert.throws(() => {
+      assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, workerAdmission: malformed }));
+    }, TypeError);
+  }
+  assert.equal(accessorReads, 0);
+});
 
 void test('decoder quarantine metrics are exact, frozen, aggregate-only and rolling-compatible', () => {
   const heartbeat = rpcEvidenceHeartbeat();

@@ -479,6 +479,27 @@ const blockHydrationSchema = z.object({
   || queueDelayMs.maximum === null
   || queueDelayMs.last <= queueDelayMs.maximum);
 const catchUpAdmissionCountSchema = countSchema.refine((value) => !Object.is(value, -0));
+const workerAdmissionCountSchema = countSchema.refine((value) => !Object.is(value, -0));
+const workerAdmissionSchema = z.object({
+  version: z.literal(1),
+  enabled: z.boolean(),
+  trackingWindowSeconds: workerAdmissionCountSchema.min(1).max(3_600),
+  claimableBacklogCount: workerAdmissionCountSchema,
+  classificationPendingCount: workerAdmissionCountSchema,
+  oldestClassificationPendingAgeMs: workerAdmissionCountSchema.nullable(),
+  freshMintCount: workerAdmissionCountSchema,
+  extendedMintCount: workerAdmissionCountSchema,
+  demotedCount: workerAdmissionCountSchema,
+}).strict().refine((value) => (
+  (value.classificationPendingCount === 0)
+    === (value.oldestClassificationPendingAgeMs === null)
+) && (value.enabled || (
+  value.classificationPendingCount === 0
+  && value.oldestClassificationPendingAgeMs === null
+  && value.freshMintCount === 0
+  && value.extendedMintCount === 0
+  && value.demotedCount === 0
+)));
 const decoderQuarantineSchema = z.object({
   version: z.literal(1),
   unresolvedCount: countSchema.refine((value) => !Object.is(value, -0)),
@@ -666,6 +687,7 @@ const healthSchema = z.object({
     websocket: websocketHealthSchema.optional(),
     blockHydration: blockHydrationSchema.nullish(),
     catchUpAdmission: catchUpAdmissionSchema.nullish(),
+    workerAdmission: workerAdmissionSchema.nullish(),
     rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
     firstProcessingCanary: firstProcessingCanarySchema.nullish(),
     decoderQuarantine: decoderQuarantineSchema.nullish(),

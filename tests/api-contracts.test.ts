@@ -11,6 +11,7 @@ import {
   type ApiFirstProcessingCanaryEvidenceV1,
   type ApiHealth,
   type ApiRpcHttpEvidenceV1,
+  type ApiWorkerAdmissionMetricsV1,
   type ApiWebSocketHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
@@ -99,6 +100,28 @@ void test('catch-up admission health contract permits optional V1 bounded JSON m
   const absent: Pick<ApiHealth['heartbeat'], 'catchUpAdmission'> = { catchUpAdmission: null };
   assert.deepEqual(optional, {});
   assert.deepEqual(absent, { catchUpAdmission: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+});
+
+void test('worker admission health contract permits optional nullable aggregate-only V1 metrics', () => {
+  const metrics: ApiWorkerAdmissionMetricsV1 = {
+    version: 1,
+    enabled: true,
+    trackingWindowSeconds: 45,
+    claimableBacklogCount: 8,
+    classificationPendingCount: 2,
+    oldestClassificationPendingAgeMs: 4_999,
+    freshMintCount: 3,
+    extendedMintCount: 2,
+    demotedCount: 5,
+  };
+  const omitted: Pick<ApiHealth['heartbeat'], 'workerAdmission'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'workerAdmission'> = {
+    workerAdmission: null,
+  };
+
+  assert.deepEqual(omitted, {});
+  assert.deepEqual(explicitNull, { workerAdmission: null });
   assert.deepEqual(toApiJson(metrics), metrics);
 });
 

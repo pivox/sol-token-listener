@@ -256,7 +256,8 @@ void test('SELL NO_EFFECT activation fences a concurrent live BUY claim before g
           waitForDatabaseQuery(pool, '%execution-live-sell-presence:v1%')
             .then(() => 'CLAIM_BLOCKED' as const),
         ]);
-        assert.equal(outcome, 'CLAIM_BLOCKED');
+        assert.equal(outcome, 'CLAIM_SETTLED');
+        assert.equal(await buyClaim, null);
 
         await blocker.query('COMMIT');
         blockerOpen = false;
@@ -321,7 +322,8 @@ void test('SELL signed persistence fences a live BUY when PROCESSING expired dur
             waitForDatabaseQuery(pool, '%execution-live-sell-presence:v1%')
               .then(() => 'CLAIM_BLOCKED' as const),
           ]);
-          assert.equal(outcome, 'CLAIM_BLOCKED');
+          assert.equal(outcome, 'CLAIM_SETTLED');
+          assert.equal(await buyClaim, null);
 
           await blocker.query('COMMIT');
           blockerOpen = false;

@@ -20,6 +20,7 @@ import {
   assertPaperFinalityReplayCurrent,
   PaperFinalityBarrierError,
 } from './paper-finality-barrier.js';
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
 
 interface QueryResultLike {
   readonly rows: readonly unknown[];
@@ -61,6 +62,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
   public async requireCurrentQualification(
     identity:PaperCurrentQualificationIdentity,
   ):Promise<void>{
+    await lockWorkerTrackingMints(this.client, [identity.mint]);
     await this.client.query(
       "SELECT pg_advisory_xact_lock(hashtextextended('qualification-projection:' || $1, 0))",
       [identity.mint],
@@ -141,6 +143,13 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
   }
 
   public async findPosition(id: string): Promise<PaperPosition | null> {
+    const identity = await this.client.query(
+      'SELECT mint FROM paper_positions WHERE position_id=$1',
+      [id],
+    );
+    const mint = optionalMint(identity.rows[0]);
+    if (mint === null) return null;
+    await lockWorkerTrackingMints(this.client, [mint]);
     const result = await this.client.query(
       `SELECT payload,entry_decision_at,entry_decision_job_id,close_event_id,exit_trigger_at
        FROM paper_positions WHERE position_id = $1 FOR UPDATE`,
@@ -153,6 +162,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     mint: string,
     strategy: PaperStrategyIdentity,
   ): Promise<PaperPosition | null> {
+    await lockWorkerTrackingMints(this.client, [mint]);
     const lockKey = `${mint}\u001f${strategy.id}\u001f${strategy.version}`;
     await this.client.query(
       'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
@@ -175,6 +185,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     entryDecisionAtMs: number | null,
     entryDecisionJobId: string | null,
   ): Promise<void> {
+    await lockWorkerTrackingMints(this.client, [position.mint]);
     await this.insertPosition(position, entryDecisionAtMs, entryDecisionJobId);
     await this.insertTrade(trade);
     await this.insertEvent(event);
@@ -186,6 +197,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     event: PaperPositionClosedEventV1,
     exitTriggerAtMs: number | null,
   ): Promise<void> {
+    await lockWorkerTrackingMints(this.client, [position.mint]);
     await this.insertEvent(event, position.closedAtMs, position.purgeAfterMs);
     await this.client.query(
       `UPDATE paper_positions SET
@@ -218,6 +230,13 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     eventId: string,
     trigger: PaperConfirmationObservation,
   ): Promise<void> {
+    const identity = await this.client.query(
+      'SELECT mint FROM domain_events WHERE event_id=$1',
+      [eventId],
+    );
+    const mint = optionalMint(identity.rows[0]);
+    if (mint === null) throw new TypeError('Paper event is missing.');
+    await lockWorkerTrackingMints(this.client, [mint]);
     const result = await this.client.query(
       'SELECT confirmation_status FROM domain_events WHERE event_id = $1 FOR UPDATE',
       [eventId],
@@ -246,6 +265,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
   }
 
   public async retractPosition(position: PaperPosition): Promise<void> {
+    await lockWorkerTrackingMints(this.client, [position.mint]);
     await this.client.query(
       `UPDATE paper_positions SET
         status = $2, payload = $3, closed_at = $4, purge_after = $5
@@ -354,6 +374,14 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
       [position.id, date(position.closedAtMs), date(position.purgeAfterMs)],
     );
   }
+}
+
+function optionalMint(row: unknown): string | null {
+  if (row === undefined) return null;
+  if (!isRecord(row) || typeof row.mint !== 'string') {
+    throw new TypeError('Stored paper mint is invalid.');
+  }
+  return row.mint;
 }
 
 function decodePosition(row: unknown): PaperPosition | null {

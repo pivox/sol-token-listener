@@ -5,6 +5,10 @@ import { parseConfig } from '../src/config/env.js';
 import type { RuntimeRpcHttpEvidenceV1 } from '../src/domain/rpc-http-evidence.js';
 import { RPC_PROVIDER_IDS } from '../src/domain/rpc-provider.js';
 import { createFirstProcessingCanaryEvidence, type RuntimeFirstProcessingCanaryEvidenceV1 } from '../src/domain/first-processing-canary.js';
+import {
+  snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionMetricsV1,
+} from '../src/domain/worker-admission-metrics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import {
   ALL_INGESTION_PROGRAMS,
@@ -56,6 +60,81 @@ import { PostgresTransactionInboxRepository } from '../src/storage/transaction-i
 import type { PumpFunWorkerAdmissionPolicyV1 } from '../src/domain/worker-admission.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+function workerAdmissionMetricsFixture(): RuntimeWorkerAdmissionMetricsV1 {
+  return snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+    version: 1,
+    enabled: true,
+    trackingWindowSeconds: 45,
+    claimableBacklogCount: 8,
+    classificationPendingCount: 2,
+    oldestClassificationPendingAgeMs: 4_999,
+    freshMintCount: 3,
+    extendedMintCount: 2,
+    demotedCount: 5,
+  }));
+}
+
+void test('heartbeat snapshots optional worker admission for RUNNING and STOPPED and fails closed', async () => {
+  const metrics = workerAdmissionMetricsFixture();
+  const writes: RuntimeHeartbeat[] = [];
+  let calls = 0;
+  const heartbeat = new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(),
+    counts: heartbeatCounts,
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5,
+    shutdownTimeoutMs: 100,
+    scheduler: new ManualScheduler(),
+    async workerAdmissionMetrics() { calls += 1; return metrics; },
+  });
+
+  await heartbeat.start();
+  await heartbeat.stop();
+
+  assert.equal(calls, 2);
+  assert.deepEqual(writes.map((value) => value.workerAdmission), [metrics, metrics]);
+  for (const write of writes) {
+    assert.notEqual(write.workerAdmission, metrics);
+    assert.ok(Object.isFrozen(write.workerAdmission));
+  }
+
+  let invalidWrites = 0;
+  const invalid = new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(),
+    counts: heartbeatCounts,
+    async writeHeartbeat() { invalidWrites += 1; },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5,
+    shutdownTimeoutMs: 100,
+    scheduler: new ManualScheduler(),
+    async workerAdmissionMetrics() {
+      return Object.freeze({ ...metrics, oldestClassificationPendingAgeMs: null });
+    },
+  });
+  await assert.rejects(invalid.start(), TypeError);
+  assert.equal(invalidWrites, 0);
+
+  const throwing = new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(),
+    counts: heartbeatCounts,
+    async writeHeartbeat() { assert.fail('Failed metrics must not be persisted.'); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5,
+    shutdownTimeoutMs: 100,
+    scheduler: new ManualScheduler(),
+    async workerAdmissionMetrics() { throw new Error('private-worker-admission-secret'); },
+  });
+  await assert.rejects(throwing.start(), (error: unknown) => {
+    assert.ok(error instanceof TypeError);
+    assert.doesNotMatch(String(error), /private-worker-admission-secret/u);
+    return true;
+  });
+});
 
 void test('heartbeat begins one durable first processing cohort and snapshots fresh evidence for RUNNING and STOPPED writes', async () => {
   const writes: RuntimeHeartbeat[] = [];
@@ -439,6 +518,7 @@ void test('production creates one bounded admission policy and injects it as the
   assert.match(source, /createPumpFunWorkerAdmissionPolicy\(\{\s*enabled: config\.listenerPumpFunBoundedWorkerAdmissionEnabled,\s*trackingWindowSeconds: config\.listenerPumpFunTrackingWindowSeconds,\s*\}\)/u);
   assert.match(source, /new PostgresTransactionInboxRepository\(databasePool, Object\.freeze\(\{[^}]*\}\), workerAdmissionPolicy\)/u);
   assert.match(source, /openWsProgramSession\(\s*endpoint,\s*observe,\s*signal,\s*\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*\}/u);
+  assert.match(source, /workerAdmissionMetrics:\s*\(\):\s*Promise<RuntimeWorkerAdmissionMetricsV1>\s*=>\s*inbox\.workerAdmissionMetrics\(\)/u);
 });
 
 void test('multi-worker startup fails before members when durable PumpSwap work is non-terminal', async (context) => {

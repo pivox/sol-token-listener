@@ -22,6 +22,7 @@ import type {
 } from '../ports/market-observation-repository.js';
 import { canonicalStringifyJson, fromJsonValue, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
 
 interface QueryResultLike {
   readonly rows: readonly unknown[];
@@ -70,6 +71,10 @@ implements MarketObservationRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await lockWorkerTrackingMints(client, [
+        ...batch.matches.map((match) => match.migrationEvent.mint),
+        ...batch.trades.map((trade) => trade.mint),
+      ]);
       await this.lockTransactions(client, batch.rawEvents);
       await this.lockPools(client, batch);
       const migrations: MigrationObservedEventV1[] = [];

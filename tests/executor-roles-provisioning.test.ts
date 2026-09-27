@@ -75,6 +75,9 @@ void test('executor role provisioning is explicit, passwordless and least-privil
   assert.match(sql, /TO sol_token_operator_reader/u);
   assert.match(sql, /FROM sol_token_public_api,sol_token_listener_writer,sol_token_executor_worker/u);
   assert.match(sql, /GRANT USAGE ON SCHEMA public\s+TO sol_token_executor_live,sol_token_executor_operations,sol_token_operator_reader/iu);
+  assert.match(sql, /GRANT SELECT ON TABLE listener_worker_tracking_live_mints\s+TO sol_token_listener_writer/iu);
+  assert.doesNotMatch(sql,
+    /GRANT[^;]*\b(?:INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)\b[^;]*listener_worker_tracking_live_mints[^;]*TO sol_token_listener_writer/iu);
   for (const grant of executable.matchAll(/GRANT\s+[^;]*\bDELETE\b[^;]*\bTO\s+(sol_token_[a-z_]+)/giu)) {
     assert.ok(
       grant[1] === 'sol_token_retention_worker'

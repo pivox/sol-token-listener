@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '055_creation_entry_single_active_session.sql';
+const latestMigrationName = '056_transaction_inbox_bounded_tracking.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -134,6 +134,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '052_transaction_inbox_urgent_fairness.sql',
       '053_transaction_inbox_worker_admission_foundation.sql',
       '054_paper_entry_boundary.sql',
+      '055_creation_entry_single_active_session.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);

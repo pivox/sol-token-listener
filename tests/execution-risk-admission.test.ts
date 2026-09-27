@@ -31,11 +31,18 @@ void test('BUY admission transaction primitive delegates locks and transaction b
     const fixture = await createFixture(pool);
     const created = await fixture.intentRepository.create(intentDraft('primitive'));
     const rawClient = await pool.connect();
+    let mintLockCount = 0;
     try {
       await rawClient.query('BEGIN');
       const transactionClient = {
         async query(text: string, values?: readonly unknown[]) {
-          assert.doesNotMatch(text, /(?:^|\\s)(?:BEGIN|COMMIT|ROLLBACK)\\b|pg_advisory_xact_lock/iu);
+          assert.doesNotMatch(text, /(?:^|\\s)(?:BEGIN|COMMIT|ROLLBACK)\\b/iu);
+          if (/pg_advisory_xact_lock/iu.test(text)) {
+            assert.match(text,
+              /^SELECT pg_advisory_xact_lock\(hashtextextended\('transaction-inbox-mint:' \|\| \$1, 0\)\)$/u);
+            assert.deepEqual(values, [walletKey]);
+            mintLockCount += 1;
+          }
           return rawClient.query(text, values === undefined ? undefined : [...values]);
         },
         release() {},
@@ -43,6 +50,7 @@ void test('BUY admission transaction primitive delegates locks and transaction b
       const result = await admitBuyInTransaction(transactionClient,
         admissionInput(created.intent, fixture));
       assert.equal(result.decision, 'ADMITTED');
+      assert.equal(mintLockCount, 1);
     } finally {
       await rawClient.query('ROLLBACK');
       rawClient.release();

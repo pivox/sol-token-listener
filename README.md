@@ -9,7 +9,7 @@ combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
 leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
 secondaire isolé; son code n'est pas activé par ce bootstrap.
 
-## Classification d'admission worker Pump.fun (#176)
+## Admission worker Pump.fun bornée (#176/#177)
 
 La classification est exécutable mais désactivée : les exemples et Compose
 conservent `LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false` et
@@ -60,18 +60,31 @@ L'horloge durable de classification ne réécrit ni `observed_at` ni
 `first_detected_at` : la preuve du premier traitement reste inchangée.
 La rétention terminale reste `terminal_at + quatre heures`.
 
-La fenêtre est seulement parsée, validée et conservée dans la politique figée ;
-elle n'applique aucune limite temporelle métier dans #176. #177 ajoutera
-l'autorité de suivi multi-table bornée à 45 secondes, la démotion des lignes
-vierges, `workerAdmission.v1`, les diagnostics API/frontend et le contrat canary.
+La livraison #177 est présente mais désactivée. En mode ON, l'autorité de suivi
+multi-table reste fraîche strictement moins de 45 secondes ou est prolongée par
+l'une des cinq preuves : lancement canonique frais, candidat courant éligible,
+travail ou position paper active, intention d'exécution non terminale, position
+live active. `MANUAL_REVIEW` seul ne constitue jamais une preuve ; une position
+`PAPER_HOLDING` indépendante le peut. La démotion bornée traite au plus 256
+trades vierges par claim et conserve leur rétention terminale de quatre heures.
+
+La migration 056 ajoute les index d'autorité et une vue `security_barrier`
+limitée au mint live actif. `workerAdmission.v1` expose séparément dette de
+classification, backlog réclamable, mints frais/prolongés et démotions, sans
+identifiant. Son `claimableBacklogCount` est une sous-population du
+`backlogCount` legacy, jamais une valeur tenue égale. Le canary réconcilie le
+STOPPED avec `postStopWorkerAdmissionClaimableCount`, preuve SQL dédiée, tandis
+que `postStopActionableCount` reste réservé au shutdown legacy. La cohorte
+first-processing exclut les lignes non admises et les
+lignes admises puis démises, sans transformer une preuve historique indisponible.
 Un seul repository reçoit la politique ; aucun worker, timer, queue, appel RPC,
 cache, chemin wallet, executor, signature ou soumission supplémentaire n'est ajouté.
 
-La migration 055 est la tête courante du dépôt ; la migration 053 conserve la
+La migration 056 est la tête courante du dépôt ; la migration 053 conserve la
 preuve monotone `worker_admitted_at`, immuable et jamais effacée après admission.
-Déploiement : drain → migrations 053 à 055 → deploy avec le flag false → restart ;
+Déploiement : drain → migrations 053 à 056 → deploy avec le flag false → restart ;
 arrêter et drainer le listener, mesurer l'inbox, appliquer toutes les migrations
-jusqu'à 055 puis vérifier ordre et compteurs avant reprise. Un old binary contre
+jusqu'à 056 puis vérifier ordre et compteurs avant reprise. Un old binary contre
 schema 053 is not supported :
 conserver le nouveau binaire avec le flag désactivé, ou restaurer dans une
 fenêtre drainée selon la procédure opérateur, sans ancienne réplique sur ce schéma.

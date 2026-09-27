@@ -27,6 +27,7 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
         <HealthCard title="Hydratation des blocs"><BlockHydrationDiagnostic value={health.heartbeat.blockHydration} /></HealthCard>
         <HealthCard title="Admission catch-up"><CatchUpAdmissionDiagnostic value={health.heartbeat.catchUpAdmission} /></HealthCard>
+        <HealthCard title="Admission worker Pump.fun"><WorkerAdmissionDiagnostic value={health.heartbeat.workerAdmission} /></HealthCard>
         <HealthCard title="HTTP RPC"><RpcHttpEvidenceDiagnostic value={health.heartbeat.rpcHttpEvidence} /></HealthCard>
         <HealthCard title="Premier traitement"><FirstProcessingCanaryDiagnostic value={health.heartbeat.firstProcessingCanary} /></HealthCard>
         <HealthCard title="Quarantaine décodeur"><DecoderQuarantineDiagnostic value={health.heartbeat.decoderQuarantine} /></HealthCard>
@@ -35,6 +36,22 @@ export function HealthPage(): ReactNode {
       </div>
     </section>
   );
+}
+
+function WorkerAdmissionDiagnostic({
+  value,
+}: {
+  readonly value: ApiHealth['heartbeat']['workerAdmission'];
+}): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  return <>
+    <p>{value.enabled ? 'Activé' : 'Désactivé'} ; fenêtre : {value.trackingWindowSeconds} s</p>
+    <p>Backlog réclamable : {value.claimableBacklogCount}</p>
+    <p>Classification en attente : {value.classificationPendingCount} ; plus ancienne : {value.oldestClassificationPendingAgeMs === null ? 'Aucune' : `${String(value.oldestClassificationPendingAgeMs)} ms`}</p>
+    <p>Mints frais : {value.freshMintCount} ; étendus : {value.extendedMintCount}</p>
+    <p>Démotions : {value.demotedCount}</p>
+  </>;
 }
 
 function FirstProcessingCanaryDiagnostic({

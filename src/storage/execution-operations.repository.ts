@@ -51,6 +51,7 @@ import {
   createExecutionPreflightDraftSource,
   type ExecutionPreflightDraftSourceV2,
 } from '../domain/execution-preflight-draft.js';
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
 
 interface QueryResult {
   readonly rows: readonly Readonly<Record<string, unknown>>[];
@@ -439,6 +440,7 @@ export class PostgresExecutionOperationsRepository implements
       || authorization.contextFingerprint !== request.armamentRequestFingerprint
       || authorization.operatorId !== request.operatorId) throw failure('CONFLICT');
     const outcome = await this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [request.target.mint]);
       await client.query(`SELECT pg_advisory_xact_lock(
         hashtextextended('execution-live-sell-presence:v1', 51008))`);
       await lockGeneration(client, request.qualification.generationId);
