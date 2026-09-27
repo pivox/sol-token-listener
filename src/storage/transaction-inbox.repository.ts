@@ -1473,31 +1473,69 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     client: InboxClient,
     now: Date,
   ): Promise<WorkerAdmissionClaimPlan> {
-    // Timeless authority can be excluded without a clock. Time-bounded launch and
-    // candidate authority is revalidated only after every preview mint is locked.
+    // Timeless authority can be excluded without a clock. Ordering temporal
+    // authority by its structural expiry lets expired mints progress ahead of
+    // active mints; the post-lock clock remains the only authority decision.
     const demotionPreview = await client.query(
-      `SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
-       FROM chain_transaction_inbox AS inbox
-       WHERE ${workerAdmissionDemotionPristineSql('inbox')}
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_strategy_sessions AS session
-           WHERE session.mint=inbox.ingestion_hint_mint
-             AND session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
-               'EXIT_PENDING_QUOTE','SELL_PENDING')
-         ) AND NOT EXISTS (
-           SELECT 1 FROM paper_positions AS position
-           WHERE position.mint=inbox.ingestion_hint_mint AND position.status='PAPER_HOLDING'
-         ) AND NOT EXISTS (
-           SELECT 1 FROM execution_intents AS intent
-           WHERE intent.mint=inbox.ingestion_hint_mint AND intent.terminal_at IS NULL
-             AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
-         ) AND NOT EXISTS (
-           SELECT 1 FROM listener_worker_tracking_live_mints AS live
-           WHERE live.mint=inbox.ingestion_hint_mint
-         )
-       ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
-       LIMIT $1`,
-      [MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+      `WITH preview_rows AS MATERIALIZED (
+         SELECT inbox.signature,inbox.ingestion_hint_mint AS mint,
+           inbox.observed_at,inbox.observed_slot
+         FROM chain_transaction_inbox AS inbox
+         WHERE ${workerAdmissionDemotionPristineSql('inbox')}
+           AND NOT EXISTS (
+             SELECT 1 FROM paper_strategy_sessions AS session
+             WHERE session.mint=inbox.ingestion_hint_mint
+               AND session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+                 'EXIT_PENDING_QUOTE','SELL_PENDING')
+           ) AND NOT EXISTS (
+             SELECT 1 FROM paper_positions AS position
+             WHERE position.mint=inbox.ingestion_hint_mint AND position.status='PAPER_HOLDING'
+           ) AND NOT EXISTS (
+             SELECT 1 FROM execution_intents AS intent
+             WHERE intent.mint=inbox.ingestion_hint_mint AND intent.terminal_at IS NULL
+               AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
+           ) AND NOT EXISTS (
+             SELECT 1 FROM listener_worker_tracking_live_mints AS live
+             WHERE live.mint=inbox.ingestion_hint_mint
+           )
+       ), preview_mints AS MATERIALIZED (
+         SELECT DISTINCT mint FROM preview_rows
+       ), temporal_proof AS MATERIALIZED (
+         SELECT launch.mint,
+           launch.detected_at+($1::INTEGER*INTERVAL '1 second') AS authority_until
+         FROM preview_mints AS preview
+         JOIN token_launches AS launch ON launch.mint=preview.mint
+         JOIN domain_events AS launch_event
+           ON launch_event.type='TokenLaunchDetected'
+          AND launch_event.mint=launch.mint
+          AND launch_event.signature=launch.created_signature
+          AND launch_event.slot=launch.created_slot
+          AND launch_event.transaction_index=launch.created_transaction_index
+          AND launch_event.instruction_index=launch.created_instruction_index
+          AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
+            launch.created_inner_instruction_index
+         WHERE launch.current_state<>'RETRACTED'
+           AND launch_event.confirmation_status<>'orphaned'
+         UNION ALL
+         SELECT candidate.mint,candidate.eligible_until AS authority_until
+         FROM preview_mints AS preview
+         JOIN trading_candidates AS candidate ON candidate.mint=preview.mint
+         JOIN domain_events AS source_event ON source_event.event_id=candidate.source_event_id
+         WHERE candidate.superseded_at IS NULL AND candidate.state='ELIGIBLE'
+           AND candidate.confirmation_status<>'orphaned'
+           AND source_event.confirmation_status<>'orphaned'
+       ), temporal_authority AS MATERIALIZED (
+         SELECT mint,MAX(authority_until) AS authority_until
+         FROM temporal_proof GROUP BY mint
+       ) SELECT preview.signature,preview.mint
+       FROM preview_rows AS preview
+       LEFT JOIN temporal_authority AS authority
+         ON authority.mint=preview.mint
+       ORDER BY authority.authority_until NULLS FIRST,
+         preview.observed_at,preview.observed_slot,preview.signature
+       LIMIT $2`,
+      [this.workerAdmissionPolicy.trackingWindowSeconds,
+        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
     const trackedPreview = await client.query(
       `SELECT signature,ingestion_hint_mint AS mint

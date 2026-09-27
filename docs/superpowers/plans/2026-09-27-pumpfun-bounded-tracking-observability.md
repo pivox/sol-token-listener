@@ -449,7 +449,9 @@ In enabled `claim()`, after exhaustion reconciliation and before scheduler
 selection, snapshot at most 256 candidate mints, acquire their shared advisory
 locks in lexical order, then read exactly one millisecond-truncated PostgreSQL
 clock. Pass that post-lock time to the reselected ordered candidate set,
-business-authority revalidation, demotion update and tracked selection. Limit with
+business-authority revalidation, demotion update and tracked selection. Before
+the limit, order temporal proof mints by their maximum structural expiry and
+put proofless mints first; do not read another clock for this preview. Limit with
 `MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM`, lock inbox candidates using
 `FOR UPDATE OF inbox SKIP LOCKED`, repeat the pristine predicate including the
 unavailable bit in the UPDATE, and preserve `worker_admitted_at`. Reuse

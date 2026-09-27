@@ -69,6 +69,12 @@ void test('the inbox uses the shared helper and has no private duplicate mint lo
   assert.doesNotMatch(source, /function lockTrackedMint/u);
   assert.doesNotMatch(source,
     /hashtextextended\('transaction-inbox-mint:' \|\|/u);
+  assert.match(source,
+    /preview_rows AS MATERIALIZED[\s\S]*?preview_mints AS MATERIALIZED[\s\S]*?FROM preview_mints AS preview[\s\S]*?JOIN token_launches AS launch ON launch\.mint=preview\.mint[\s\S]*?FROM preview_mints AS preview[\s\S]*?JOIN trading_candidates AS candidate ON candidate\.mint=preview\.mint/u,
+    'temporal proof scans must be restricted to previewable inbox mints');
+  assert.match(source,
+    /ORDER BY authority\.authority_until NULLS FIRST[\s\S]*?LIMIT \$2[\s\S]*?await lockWorkerTrackingMints[\s\S]*?await readWorkerTrackingDatabaseClock/u,
+    'claim preview must progress by expiry before locking and sampling its sole authority clock');
 });
 
 void test('claim and recovery paths acquire or bind the exact mint before proof-row locks',

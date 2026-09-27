@@ -63,6 +63,10 @@ An enabled claim snapshots its bounded candidate set, acquires every candidate
 mint lock in lexical order, and only then reads this clock. The same post-lock
 millisecond is passed to demotion revalidation and tracked selection, so time
 spent waiting for a mint lock cannot preserve already expired authority.
+Before the limit, the clock-free preview orders temporal proofs by their
+maximum structural expiry (`detected_at + window` or `eligible_until`) with
+proofless mints first. Thus fresh launch or candidate proofs cannot permanently
+hide expired work while only the post-lock clock makes the authority decision.
 
 The exact boundary is inclusive on expiry:
 

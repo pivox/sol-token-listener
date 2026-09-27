@@ -309,7 +309,7 @@ void test('enabled claim skips an out-of-authority overflow and keeps progressin
     });
   });
 
-void test('enabled demotion bypasses an authoritative saturated head and reaches tracked authority',
+void test('enabled demotion bypasses a temporal-authority saturated head and reaches tracked authority',
   async (context) => {
     await withDatabase(context, async (pool) => {
       await replaceAuthorityWithTask4Tables(pool);
@@ -317,6 +317,8 @@ void test('enabled demotion bypasses an authoritative saturated head and reaches
         { length: MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM },
         (_, index) => canonicalTestMint(index + 1_000),
       );
+      const launchMints = protectedMints.slice(0, protectedMints.length / 2);
+      const candidateMints = protectedMints.slice(protectedMints.length / 2);
       const inactiveMints = Array.from(
         { length: MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM },
         (_, index) => canonicalTestMint(index + 1_300),
@@ -344,9 +346,23 @@ void test('enabled demotion bypasses an authoritative saturated head and reaches
         'processed','PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$2,
         TIMESTAMPTZ '2026-01-03 00:00:00+00',TIMESTAMPTZ '2026-01-03 00:00:00+00')`,
       [PUMP_PROGRAM_ID, activeMint]);
-      await pool.query(`INSERT INTO paper_strategy_sessions(mint,state)
-        SELECT mint,'BUY_PENDING' FROM UNNEST($1::TEXT[]) AS mint`,
-      [[...protectedMints, activeMint]]);
+      await pool.query(`INSERT INTO token_launches
+        SELECT mint,'OBSERVING','fresh-' || value.ordinality,1,0,0,NULL,clock_timestamp()
+        FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS value(mint,ordinality)`, [launchMints]);
+      await pool.query(`INSERT INTO domain_events
+        SELECT 'fresh-event-' || value.ordinality,'TokenLaunchDetected',value.mint,
+          'fresh-' || value.ordinality,1,0,0,NULL,'confirmed'
+        FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS value(mint,ordinality)`, [launchMints]);
+      await pool.query(`INSERT INTO domain_events
+        SELECT 'candidate-event-' || value.ordinality,'QualificationUpdated',value.mint,
+          'candidate-' || value.ordinality,1,0,0,NULL,'confirmed'
+        FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS value(mint,ordinality)`, [candidateMints]);
+      await pool.query(`INSERT INTO trading_candidates
+        SELECT value.mint,'candidate-event-' || value.ordinality,'ELIGIBLE',
+          clock_timestamp()+INTERVAL '1 minute',NULL,'confirmed'
+        FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS value(mint,ordinality)`, [candidateMints]);
+      await pool.query("INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,'BUY_PENDING')",
+        [activeMint]);
       const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
 
       assert.equal(await repository.claim(Date.now(), 30), null);
