@@ -6,7 +6,7 @@ Issue: #170
 
 Status: approved for implementation
 
-Contract revision: 1.0.1
+Contract revision: 1.0.2
 
 ## Purpose
 
@@ -53,9 +53,11 @@ policy.
 
 ### Durable occurrence journal
 
-Migration 057 adds one append-only, four-hour-retained terminal-attribution
-table keyed by a deterministic occurrence identity. A row records only closed
-and bounded columns:
+Migration 057 adds one append-only terminal-attribution table keyed by a
+deterministic occurrence identity. Every occurrence has its own database-owned
+four-hour `purge_after`; retention does not depend on whether its parent inbox
+row later succeeds or remains pending. A row records only closed and bounded
+columns:
 
 - inbox signature foreign key and source `WORKER` or `CATCH_UP`;
 - processing outcome and worker attempt/cycle where applicable;
@@ -70,10 +72,12 @@ The table cascades with inbox retention. Repository writes use a fixed
 savepoint inside the same transaction as `markFailed` or catch-up
 classification. A duplicate replay upserts the same deterministic occurrence;
 it cannot multiply evidence. A statement-level journal rejection rolls back to
-that savepoint, increments a bounded incomplete-attribution counter on the
-parent inbox row and commits the unchanged terminal result. A lost or already
-aborted PostgreSQL transaction remains a normal repository failure: no design
-can commit the terminal result without a viable transaction.
+that savepoint, increments a bounded incomplete-attribution counter and its
+latest database timestamp on the parent inbox row, then commits the unchanged
+terminal result. The marker is visible for four hours even if a later retry
+succeeds, then the retention pass resets it. A lost or already aborted
+PostgreSQL transaction remains a normal repository failure: no design can
+commit the terminal result without a viable transaction.
 
 Failure to derive optional runtime evidence stores an explicit unavailable
 record. Failure to persist it while the transaction remains viable is therefore
@@ -223,9 +227,11 @@ separate proof-driven PR.
 
 Migration 057 supports empty install, upgrade from 056, immediate replay and
 strict named-object drift detection. It creates the journal, bounded indexes,
-constraints, a bounded incomplete-attribution counter on the parent inbox,
-four-hour purge integration and minimum listener grants. `PUBLIC` has no
-access. Raw-chain and business projections are unchanged.
+constraints, a bounded incomplete-attribution counter/timestamp on the parent
+inbox, independent four-hour purge/reset integration and minimum listener
+`SELECT, INSERT` journal grants. The journal is not added to broad business
+table grants; `PUBLIC` has no access. Raw-chain and business projections are
+unchanged.
 
 ## Acceptance
 

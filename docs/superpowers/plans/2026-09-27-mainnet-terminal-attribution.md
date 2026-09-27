@@ -22,9 +22,9 @@ operator runbook.
 
 **Design authority:**
 `docs/superpowers/specs/2026-09-27-mainnet-terminal-attribution-design.md`
-revision 1.0.1.
+revision 1.0.2.
 
-**Plan revision:** 1.0.1
+**Plan revision:** 1.0.2
 
 ---
 
@@ -97,8 +97,9 @@ revision 1.0.1.
   named-object drift and four-hour cascade retention.
 - [ ] Add an append-only occurrence journal with deterministic replay identity,
   closed columns, bounded wire values, the full immutable public-chain locator,
-  one database clock and least privilege; add a bounded incomplete-attribution
-  counter to the parent inbox and revoke `PUBLIC`.
+  one database clock, its own four-hour `purge_after` and least privilege; add a
+  bounded incomplete-attribution counter/latest timestamp to the parent inbox,
+  grant the journal only `SELECT, INSERT` and revoke `PUBLIC`.
 - [ ] Write RED repository tests for each worker attempt, retry clearing,
   eventual success, terminal exhaustion, catch-up replay, concurrent duplicate,
   rollback, purge and explicit unavailable evidence.
@@ -111,6 +112,9 @@ revision 1.0.1.
   result still commits, the incompleteness marker survives later retry/success,
   and capture cannot PASS. Prove catch-up locator export after all runtime
   classifier objects have been discarded.
+- [ ] Purge expired occurrences independently of the parent row and reset stale
+  parent incomplete markers after four hours; prove active/successful parent
+  rows cannot retain diagnostic evidence indefinitely.
 - [ ] Prove no arbitrary error name/text or forged sidecar reaches durable
   diagnostic columns.
 - [ ] Update live migration catalog checksum only after final SQL bytes settle.
