@@ -56,7 +56,7 @@ void test('bounds fresh provider cycles after expired final-attempt leases', asy
   await withDatabase(context, async (pool) => {
     await new PostgresLaunchpadEventRepository(pool, 4, Date.now, {
       maxAttempts: 1, baseDelayMs: 500,
-    }).record(launchBatch('mint-social-expired', 'signature-social-expired', 'confirmed'));
+    }).record(launchBatch(MINT, 'signature-social-expired', 'confirmed'));
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
@@ -84,7 +84,7 @@ void test('bounds fresh provider cycles after expired final-attempt leases', asy
 
 void test('schedules bounded retry and reports durable queue counts', async (context) => {
   await withDatabase(context, async (pool) => {
-    await enqueue(pool, 'mint-social-b', 'signature-social-b');
+    await enqueue(pool, MINT, 'signature-social-b');
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
@@ -104,7 +104,7 @@ void test('schedules bounded retry and reports durable queue counts', async (con
 
 void test('terminalizes permanent failures with exact four-hour retention', async (context) => {
   await withDatabase(context, async (pool) => {
-    await enqueue(pool, 'mint-social-c', 'signature-social-c');
+    await enqueue(pool, MINT, 'signature-social-c');
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
