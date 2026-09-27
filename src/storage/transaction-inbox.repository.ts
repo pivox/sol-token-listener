@@ -188,6 +188,13 @@ type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED
   | 'IGNORED' | 'QUARANTINED';
 type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE';
 
+interface WorkerAdmissionClaimPlan {
+  readonly demotionSignatures: readonly string[];
+  readonly demotionMints: readonly string[];
+  readonly trackedSignatures: readonly string[];
+  readonly trackedMints: readonly string[];
+}
+
 const CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = Object.freeze({
   NORMAL: `SELECT signature, ingestion_priority
     FROM chain_transaction_inbox
@@ -1211,6 +1218,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       if (!Number.isSafeInteger(leaseMs)) throw new TypeError('Lease duration is unsafe.');
       const expires = dateFromMs(nowMs + leaseMs);
       return this.transaction(async (client) => {
+        const workerAdmissionClaimPlan = this.workerAdmissionPolicy.enabled
+          ? await this.prepareWorkerAdmissionClaim(client, now)
+          : null;
         await client.query(
           `WITH exhausted AS (
              SELECT signature
@@ -1249,8 +1259,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE inbox.signature = exhausted.signature`,
           [now, MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM],
         );
-        if (this.workerAdmissionPolicy.enabled) {
-          await this.demoteExpiredPristineTrades(client);
+        if (workerAdmissionClaimPlan !== null) {
+          await this.demoteExpiredPristineTrades(client, workerAdmissionClaimPlan);
         }
         const scheduler = await client.query(
           `SELECT consecutive_urgent_claims, launch_claims_since_tracked
@@ -1278,7 +1288,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const claimCandidateSql = this.workerAdmissionPolicy.enabled
           ? ADMITTED_CLAIM_CANDIDATE_SQL : CLAIM_CANDIDATE_SQL;
         let selected = urgentStreak === MAX_CONSECUTIVE_URGENT_CLAIMS
-          ? await this.selectClaimCandidate(client, claimCandidateSql, 'NORMAL', now)
+          ? await this.selectClaimCandidate(
+            client, claimCandidateSql, 'NORMAL', now, workerAdmissionClaimPlan,
+          )
           : { rows: [], rowCount: 0 };
         if (selected.rows.length === 0) {
           const urgentOrder: readonly TransactionInboxPriority[] = launchStreak
@@ -1286,12 +1298,16 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ? ['TRACKED_TRADE', 'LAUNCH_CANDIDATE']
             : ['LAUNCH_CANDIDATE', 'TRACKED_TRADE'];
           for (const priority of urgentOrder) {
-            selected = await this.selectClaimCandidate(client, claimCandidateSql, priority, now);
+            selected = await this.selectClaimCandidate(
+              client, claimCandidateSql, priority, now, workerAdmissionClaimPlan,
+            );
             if (selected.rows.length > 0) break;
           }
         }
         if (selected.rows.length === 0) {
-          selected = await this.selectClaimCandidate(client, claimCandidateSql, 'NORMAL', now);
+          selected = await this.selectClaimCandidate(
+            client, claimCandidateSql, 'NORMAL', now, workerAdmissionClaimPlan,
+          );
         }
         const selectedRow = selected.rows[0];
         const signature = optionalText(selectedRow?.signature, 'claim signature');
@@ -1355,11 +1371,110 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     claimCandidateSql: Readonly<Record<TransactionInboxPriority, string>>,
     priority: TransactionInboxPriority,
     now: Date,
+    workerAdmissionClaimPlan: WorkerAdmissionClaimPlan | null,
   ): Promise<{ readonly rows: readonly QueryResultRow[]; readonly rowCount: number | null }> {
     if (!this.workerAdmissionPolicy.enabled || priority !== 'TRACKED_TRADE') {
       return client.query(claimCandidateSql[priority], [now]);
     }
-    const preview = await client.query(
+    if (workerAdmissionClaimPlan === null) {
+      throw new TypeError('Worker admission claim plan is missing.');
+    }
+    if (workerAdmissionClaimPlan.trackedSignatures.length === 0) {
+      return { rows: [], rowCount: 0 };
+    }
+    return client.query(
+      `WITH
+       database_clock AS MATERIALIZED (
+         SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+       ), tracked_preview AS MATERIALIZED (
+         SELECT signature,mint FROM UNNEST($2::TEXT[],$3::TEXT[]) AS preview(signature,mint)
+       ), candidate_mints AS MATERIALIZED (
+         SELECT DISTINCT mint FROM tracked_preview
+       ), fresh_launch AS MATERIALIZED (
+         SELECT launch.mint
+         FROM candidate_mints AS candidate
+         JOIN token_launches AS launch ON launch.mint=candidate.mint
+         JOIN domain_events AS launch_event
+           ON launch_event.type='TokenLaunchDetected'
+          AND launch_event.mint=launch.mint
+          AND launch_event.signature=launch.created_signature
+          AND launch_event.slot=launch.created_slot
+          AND launch_event.transaction_index=launch.created_transaction_index
+          AND launch_event.instruction_index=launch.created_instruction_index
+          AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
+            launch.created_inner_instruction_index
+         CROSS JOIN database_clock
+         WHERE launch.current_state<>'RETRACTED'
+           AND launch_event.confirmation_status<>'orphaned'
+           AND launch.detected_at+($4::INTEGER*INTERVAL '1 second')>database_clock.at
+       ), extended_mint AS MATERIALIZED (
+         SELECT candidate.mint
+         FROM trading_candidates AS candidate
+         JOIN candidate_mints AS selected ON selected.mint=candidate.mint
+         JOIN domain_events AS source_event ON source_event.event_id=candidate.source_event_id
+         CROSS JOIN database_clock
+         WHERE candidate.superseded_at IS NULL AND candidate.state='ELIGIBLE'
+           AND candidate.confirmation_status<>'orphaned'
+           AND source_event.confirmation_status<>'orphaned'
+           AND candidate.eligible_until>database_clock.at
+         UNION SELECT session.mint
+           FROM paper_strategy_sessions AS session
+           JOIN candidate_mints AS selected ON selected.mint=session.mint
+           WHERE session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+             'EXIT_PENDING_QUOTE','SELL_PENDING')
+         UNION SELECT position.mint
+           FROM paper_positions AS position
+           JOIN candidate_mints AS selected ON selected.mint=position.mint
+           WHERE position.status='PAPER_HOLDING'
+         UNION SELECT intent.mint
+           FROM execution_intents AS intent
+           JOIN candidate_mints AS selected ON selected.mint=intent.mint
+           WHERE intent.terminal_at IS NULL
+             AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
+         UNION SELECT live.mint
+           FROM listener_worker_tracking_live_mints AS live
+           JOIN candidate_mints AS selected ON selected.mint=live.mint
+       ) SELECT inbox.signature,inbox.ingestion_priority
+       FROM chain_transaction_inbox AS inbox
+       JOIN tracked_preview AS preview
+         ON preview.signature=inbox.signature AND preview.mint=inbox.ingestion_hint_mint
+       WHERE inbox.ingestion_priority='TRACKED_TRADE'
+         AND inbox.ingestion_hint='PUMPFUN_TRADE'
+         AND inbox.ingestion_hint_mint=ANY($3::TEXT[])
+         AND inbox.worker_admitted_at IS NOT NULL AND (
+           (inbox.processing_status='PENDING'
+             AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
+           OR (inbox.processing_status='FAILED' AND inbox.error_retryable=TRUE
+             AND inbox.retry_exhausted_at IS NULL AND inbox.next_attempt_at<=$1
+             AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
+           OR (inbox.processing_status='PROCESSING' AND inbox.lease_expires_at<=$1
+             AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
+         ) AND (
+           NOT (${workerAdmissionDemotionPristineSql('inbox')})
+           OR EXISTS (SELECT 1 FROM fresh_launch WHERE fresh_launch.mint=inbox.ingestion_hint_mint)
+           OR EXISTS (SELECT 1 FROM extended_mint WHERE extended_mint.mint=inbox.ingestion_hint_mint)
+         )
+       ORDER BY inbox.observed_slot,inbox.signature
+       FOR UPDATE OF inbox SKIP LOCKED LIMIT 1`,
+      [now, workerAdmissionClaimPlan.trackedSignatures,
+        workerAdmissionClaimPlan.trackedMints,
+        this.workerAdmissionPolicy.trackingWindowSeconds],
+    );
+  }
+
+  private async prepareWorkerAdmissionClaim(
+    client: InboxClient,
+    now: Date,
+  ): Promise<WorkerAdmissionClaimPlan> {
+    const demotionPreview = await client.query(
+      `SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
+       FROM chain_transaction_inbox AS inbox
+       WHERE ${workerAdmissionDemotionPristineSql('inbox')}
+       ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
+       LIMIT $1`,
+      [MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+    );
+    const trackedPreview = await client.query(
       `SELECT signature,ingestion_hint_mint AS mint
        FROM chain_transaction_inbox
        WHERE ingestion_priority='TRACKED_TRADE' AND worker_admitted_at IS NOT NULL AND (
@@ -1370,68 +1485,52 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
          OR (processing_status='PROCESSING' AND lease_expires_at<=$1
            AND attempts_in_cycle<retry_max_attempts)
        )
-       ORDER BY observed_slot,signature LIMIT 1`,
-      [now],
+       ORDER BY observed_slot,signature LIMIT $2`,
+      [now, MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
-    const previewRow = preview.rows[0];
-    if (previewRow === undefined) return { rows: [], rowCount: 0 };
-    const signature = requiredText(previewRow.signature, 'tracked trade claim signature');
-    assertCanonicalMint(previewRow.mint);
-    await lockWorkerTrackingMints(client, [previewRow.mint]);
-    const authority = await readWorkerTrackingAuthority(
-      client,
-      previewRow.mint,
-      this.workerAdmissionPolicy.trackingWindowSeconds,
-    );
-    if (!authority.active) return { rows: [], rowCount: 0 };
-    return client.query(
-      `SELECT signature,ingestion_priority
-       FROM chain_transaction_inbox
-       WHERE signature=$2 AND ingestion_priority='TRACKED_TRADE'
-         AND ingestion_hint='PUMPFUN_TRADE' AND ingestion_hint_mint=$3
-         AND worker_admitted_at IS NOT NULL AND (
-           (processing_status='PENDING' AND attempts_in_cycle<retry_max_attempts)
-           OR (processing_status='FAILED' AND error_retryable=TRUE
-             AND retry_exhausted_at IS NULL AND next_attempt_at<=$1
-             AND attempts_in_cycle<retry_max_attempts)
-           OR (processing_status='PROCESSING' AND lease_expires_at<=$1
-             AND attempts_in_cycle<retry_max_attempts)
-         )
-       ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
-      [now, signature, previewRow.mint],
-    );
-  }
-
-  private async demoteExpiredPristineTrades(client: InboxClient): Promise<void> {
-    const preview = await client.query(
-      `SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
-       FROM chain_transaction_inbox AS inbox
-       WHERE ${workerAdmissionDemotionPristineSql('inbox')}
-       ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
-       LIMIT $1`,
-      [MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
-    );
-    const signatures = preview.rows.map((row) => requiredText(
+    const demotionSignatures = demotionPreview.rows.map((row) => requiredText(
       row.signature,
       'worker admission demotion signature',
     ));
-    const mints = preview.rows.map((row) => {
+    const demotionMints = demotionPreview.rows.map((row) => {
       assertCanonicalMint(row.mint);
       return row.mint;
     });
-    if (mints.length === 0) return;
-    await lockWorkerTrackingMints(client, mints);
+    const trackedSignatures = trackedPreview.rows.map((row) => requiredText(
+      row.signature,
+      'worker admission tracked claim signature',
+    ));
+    const trackedMints = trackedPreview.rows.map((row) => {
+      assertCanonicalMint(row.mint);
+      return row.mint;
+    });
+    await lockWorkerTrackingMints(client, [...demotionMints, ...trackedMints]);
+    return Object.freeze({
+      demotionSignatures: Object.freeze(demotionSignatures),
+      demotionMints: Object.freeze(demotionMints),
+      trackedSignatures: Object.freeze(trackedSignatures),
+      trackedMints: Object.freeze(trackedMints),
+    });
+  }
+
+  private async demoteExpiredPristineTrades(
+    client: InboxClient,
+    workerAdmissionClaimPlan: WorkerAdmissionClaimPlan,
+  ): Promise<void> {
+    if (workerAdmissionClaimPlan.demotionMints.length === 0) return;
     await client.query(
       `WITH
        database_clock AS MATERIALIZED (
          SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+       ), demotion_preview AS MATERIALIZED (
+         SELECT signature,mint FROM UNNEST($1::TEXT[],$2::TEXT[]) AS preview(signature,mint)
        ), candidates AS MATERIALIZED (
          SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
          FROM chain_transaction_inbox AS inbox
+         JOIN demotion_preview AS preview
+           ON preview.signature=inbox.signature AND preview.mint=inbox.ingestion_hint_mint
          CROSS JOIN database_clock
-         WHERE inbox.signature=ANY($1::TEXT[])
-           AND inbox.ingestion_hint_mint=ANY($2::TEXT[])
-           AND database_clock.at>=inbox.observed_at
+         WHERE database_clock.at>=inbox.observed_at
            AND ${workerAdmissionDemotionPristineSql('inbox')}
          ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
          FOR UPDATE OF inbox SKIP LOCKED
@@ -1494,8 +1593,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            AND NOT EXISTS (SELECT 1 FROM fresh_launch WHERE fresh_launch.mint=candidates.mint)
            AND NOT EXISTS (SELECT 1 FROM extended_mint WHERE extended_mint.mint=candidates.mint)
          RETURNING inbox.signature
-       ) SELECT COUNT(*)::INTEGER AS demoted_count FROM demoted`,
-      [signatures, mints, this.workerAdmissionPolicy.trackingWindowSeconds,
+      ) SELECT COUNT(*)::INTEGER AS demoted_count FROM demoted`,
+      [workerAdmissionClaimPlan.demotionSignatures, workerAdmissionClaimPlan.demotionMints,
+        this.workerAdmissionPolicy.trackingWindowSeconds,
         MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
   }

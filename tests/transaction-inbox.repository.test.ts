@@ -68,7 +68,7 @@ const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
 
-void test('enabled claim never leases an out-of-authority tracked trade beyond the demotion batch',
+void test('enabled claim skips an out-of-authority overflow and keeps progressing active trades',
   async (context) => {
     await withDatabase(context, async (pool) => {
       await replaceAuthorityWithTask4Tables(pool);
@@ -90,14 +90,104 @@ void test('enabled claim never leases an out-of-authority tracked trade beyond t
         TIMESTAMPTZ '2026-01-02 00:00:00+00')`, [PUMP_PROGRAM_ID, unsafeMint]);
       const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
 
-      assert.equal(await repository.claim(Date.now(), 30), null);
+      assert.equal((await repository.claim(Date.now(), 30))?.signature,
+        'demotion-authority-saturation-0001');
+      assert.equal((await repository.claim(Date.now() + 1, 30))?.signature,
+        'demotion-authority-saturation-0002');
       const unsafe = await row(pool, 'demotion-authority-overflow');
-      assert.notEqual(unsafe.processing_status, 'PROCESSING');
+      assert.equal(unsafe.processing_status, 'DEFERRED');
       assert.equal(unsafe.attempts, 0);
       assert.deepEqual(await schedulerState(pool), {
-        consecutive_urgent_claims: 0,
+        consecutive_urgent_claims: 2,
         launch_claims_since_tracked: 0,
       });
+    });
+  });
+
+void test('enabled claim reclaims attempted tracked work after authority expires', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await replaceAuthorityWithTask4Tables(pool);
+    const mint = canonicalTestMint(901);
+    await insertExpiredAdmittedTrade(pool, 'tracked-retry-without-authority', 1n, mint);
+    await insertExpiredAdmittedTrade(pool, 'tracked-expired-lease-without-authority', 2n, mint);
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      processing_status='FAILED',attempts=1,attempts_in_cycle=1,
+      error_code='RPC_TRANSIENT',error_name='TransientFailure',error_retryable=TRUE,
+      next_attempt_at=clock_timestamp()-INTERVAL '1 second'
+      WHERE signature='tracked-retry-without-authority';
+      UPDATE chain_transaction_inbox SET
+      processing_status='PROCESSING',attempts=1,attempts_in_cycle=1,
+      lease_token='expired-lease',lease_expires_at=clock_timestamp()-INTERVAL '1 second'
+      WHERE signature='tracked-expired-lease-without-authority'`);
+    const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+
+    assert.equal((await repository.claim(Date.now(), 30))?.signature,
+      'tracked-retry-without-authority');
+    assert.equal((await repository.claim(Date.now() + 1, 30))?.signature,
+      'tracked-expired-lease-without-authority');
+    assert.equal((await row(pool, 'tracked-retry-without-authority')).attempts, 2);
+    assert.equal((await row(pool, 'tracked-expired-lease-without-authority')).attempts, 2);
+  });
+});
+
+void test('enabled tracked claim skips a row-locked candidate inside its bounded preview',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      await replaceAuthorityWithTask4Tables(pool);
+      const mint = canonicalTestMint(902);
+      await insertExpiredAdmittedTrade(pool, 'tracked-row-lock-first', 1n, mint);
+      await insertExpiredAdmittedTrade(pool, 'tracked-row-lock-second', 2n, mint);
+      await pool.query("INSERT INTO paper_strategy_sessions VALUES ($1,'BUY_PENDING')", [mint]);
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      const blocker = await pool.connect();
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(`SELECT signature FROM chain_transaction_inbox
+          WHERE signature='tracked-row-lock-first' FOR UPDATE`);
+
+        assert.equal((await settlesWithin(repository.claim(Date.now(), 30), 1_000))?.signature,
+          'tracked-row-lock-second');
+        assert.equal((await row(pool, 'tracked-row-lock-first')).attempts, 0);
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        blocker.release();
+      }
+    });
+  });
+
+void test('enabled claim acquires demotion and tracked candidate mints once in lexical order',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      await replaceAuthorityWithTask4Tables(pool);
+      const [firstMint, secondMint] = [canonicalTestMint(903), canonicalTestMint(904)]
+        .sort((left, right) => left.localeCompare(right));
+      assert.ok(firstMint && secondMint);
+      await insertExpiredAdmittedTrade(pool, 'tracked-lock-order-retry', 1n, firstMint);
+      await pool.query(`UPDATE chain_transaction_inbox SET
+        processing_status='FAILED',attempts=1,attempts_in_cycle=1,
+        error_code='RPC_TRANSIENT',error_name='TransientFailure',error_retryable=TRUE,
+        next_attempt_at=clock_timestamp()-INTERVAL '1 second'
+        WHERE signature='tracked-lock-order-retry'`);
+      await insertExpiredAdmittedTrade(pool, 'tracked-lock-order-demotion', 2n, secondMint);
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      const producer = await pool.connect();
+      try {
+        await producer.query('BEGIN');
+        await lockTask4Mint(producer, firstMint);
+        const claim = repository.claim(Date.now(), 30);
+        await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:');
+        await producer.query("SET LOCAL lock_timeout='750ms'");
+        await settlesWithin(lockTask4Mint(producer, secondMint), 1_000);
+        await producer.query('COMMIT');
+
+        assert.equal((await settlesWithin(claim, 2_000))?.signature,
+          'tracked-lock-order-retry');
+        assert.equal((await row(pool, 'tracked-lock-order-demotion')).processing_status,
+          'DEFERRED');
+      } finally {
+        await producer.query('ROLLBACK').catch(() => {});
+        producer.release();
+      }
     });
   });
 
