@@ -10,6 +10,7 @@ import { assertExecutionIntent } from '../domain/execution-intent.js';
 import type { ExecutionDryRunRepository } from '../ports/execution-dry-run-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
+import { workerTrackingMintLockCte } from './worker-tracking-mint-lock.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -92,13 +93,15 @@ const ASSESSMENT_PROJECTION = `
 
 const COMPLETE_SQL = `WITH operation AS MATERIALIZED (
   SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+), mint_lock AS MATERIALIZED (
+  ${workerTrackingMintLockCte(13)}
 ), locked AS MATERIALIZED (
   SELECT intent.id, EXISTS (
     SELECT 1 FROM execution_dry_run_assessments AS existing
     WHERE existing.assessment_id=$28
        OR (existing.intent_id=$1 AND existing.evaluator_version=$31)
   ) AS assessment_conflict
-  FROM execution_intents AS intent CROSS JOIN operation
+  FROM execution_intents AS intent CROSS JOIN operation CROSS JOIN mint_lock
   WHERE intent.id=$1
     AND intent.status=$2
     AND intent.lease_owner=$3

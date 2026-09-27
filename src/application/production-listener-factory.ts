@@ -434,6 +434,7 @@ export function createProductionListenerRuntime(
       maxAttempts: config.socialRetryMaxAttempts,
       baseDelayMs: config.socialRetryBaseDelayMs,
     },
+    workerAdmissionPolicy,
   );
   const publicHttp = new BoundedPublicHttpClient(undefined, undefined, {
     timeoutMs: config.socialHttpTimeoutMs,

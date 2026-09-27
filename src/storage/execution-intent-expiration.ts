@@ -1,3 +1,5 @@
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
+
 export interface ExecutionIntentExpirationClient {
   query(
     text: string,
@@ -12,6 +14,35 @@ export async function expireExecutionIntentsPreSubmissionInTransaction(
   client: ExecutionIntentExpirationClient,
   limit: number,
 ): Promise<number> {
+  const selected = await client.query(
+    `SELECT intent.id,intent.mint
+     FROM execution_intents AS intent
+     WHERE intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
+       AND intent.expires_at <= statement_timestamp()
+       AND (intent.lease_expires_at IS NULL
+         OR intent.lease_expires_at <= statement_timestamp())
+       AND intent.state_revision < 9223372036854775807
+       AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+         WHERE attempt.intent_id=intent.id) = intent.attempt_count
+       AND COALESCE((SELECT MAX(attempt.attempt_number)
+         FROM execution_attempts AS attempt WHERE attempt.intent_id=intent.id),0)
+         = intent.attempt_count
+       AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+         WHERE attempt.intent_id=intent.id AND attempt.status='STARTED') <= 1
+       AND NOT EXISTS (SELECT 1 FROM execution_attempts AS attempt
+         WHERE attempt.intent_id=intent.id AND attempt.status='STARTED'
+           AND attempt.attempt_number<>intent.attempt_count)
+     ORDER BY intent.requested_at,intent.id
+     LIMIT $1`,
+    [limit],
+  );
+  const identities = selected.rows.map((row) => {
+    if (typeof row.id !== 'string' || typeof row.mint !== 'string') {
+      throw new Error('PostgreSQL returned invalid execution intent expiration identities.');
+    }
+    return Object.freeze({ id: row.id, mint: row.mint });
+  });
+  await lockWorkerTrackingMints(client, identities.map((identity) => identity.mint));
   const expired = await client.query(
     `WITH operation AS MATERIALIZED (
        SELECT date_trunc('milliseconds', statement_timestamp()) AS at
@@ -19,6 +50,7 @@ export async function expireExecutionIntentsPreSubmissionInTransaction(
        SELECT intent.id,intent.status,intent.attempt_count,intent.state_revision
        FROM execution_intents AS intent CROSS JOIN operation
        WHERE intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
+         AND intent.id=ANY($2::TEXT[])
          AND intent.expires_at <= statement_timestamp()
          AND (intent.lease_expires_at IS NULL
            OR intent.lease_expires_at <= statement_timestamp())
@@ -73,7 +105,7 @@ export async function expireExecutionIntentsPreSubmissionInTransaction(
        RETURNING intent.id
      )
      SELECT COUNT(*)::INTEGER AS expired_count FROM updated`,
-    [limit],
+    [limit, identities.map((identity) => identity.id)],
   );
   if (expired.rowCount !== 1 || expired.rows.length !== 1) {
     throw new Error('PostgreSQL returned an invalid execution intent expiration result.');

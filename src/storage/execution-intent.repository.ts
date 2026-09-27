@@ -24,6 +24,10 @@ import type {
 } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
 import { expireExecutionIntentsPreSubmissionInTransaction } from './execution-intent-expiration.js';
+import {
+  lockWorkerTrackingMints,
+  workerTrackingPreviewMintLockCte,
+} from './worker-tracking-mint-lock.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -230,7 +234,7 @@ const LIVE_RECOVER_SELL_SQL = claimSql(`intent.side = 'SELL'
       AND intent.status = 'SIGNED_NOT_SUBMITTED'`, false, true);
 const LIVE_RECOVER_BUY_SQL = claimSql(`intent.side = 'BUY'
       AND intent.status = 'SIGNED_NOT_SUBMITTED'
-      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, false, true);
+      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, false, true, 4);
 
 export async function createExecutionIntentInTransaction(
   client: ExecutionIntentTransactionClient,
@@ -240,6 +244,7 @@ export async function createExecutionIntentInTransaction(
   readonly intent: ExecutionIntentV1;
 }>> {
   const draft = draftInput(draftValue);
+  await lockWorkerTrackingMints(client, [draft.mint]);
   if (draft.side === 'SELL') await lockLiveSellPresenceInTransaction(client);
   const inserted = await client.query(
     `INSERT INTO execution_intents AS intent (
@@ -320,8 +325,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const leaseToken = randomUUID();
       const claimFromClient = async (
         client: ExecutionIntentClient,
+        exactIntentId?: string,
       ): Promise<ClaimedExecutionIntent | null> => {
-        const claimed = await client.query(claimSqlFor(options), claimValues(options, leaseToken));
+        const claimed = await client.query(
+          claimSqlFor(options),
+          claimValues(options, leaseToken, exactIntentId),
+        );
         if (claimed.rowCount === 0 && claimed.rows.length === 0) return null;
         if (claimed.rowCount !== 1 || claimed.rows.length !== 1) throw dataError();
         const { claim, claimAtMs } = claimFromRow(requiredRow(claimed.rows));
@@ -340,9 +349,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       if ((options.purpose === 'LIVE_EXECUTE' || options.purpose === 'LIVE_RECOVER')
         && options.side === 'BUY') {
         return this.transaction(async (client) => {
+          const candidate = await selectLiveBuyClaimCandidate(client, options);
+          if (candidate === null) return null;
+          await lockWorkerTrackingMints(client, [candidate.mint]);
           await lockLiveSellPresenceInTransaction(client);
           if (signal?.aborted === true) throw operationAbortedError();
-          return claimFromClient(client);
+          return claimFromClient(client, candidate.id);
         }, signal, 'READ_COMMITTED');
       }
       return this.withClaimClient(signal, options.purpose === 'DRY_RUN', claimFromClient);
@@ -406,6 +418,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const fence = fenceValue === undefined ? null : preflightSimulationFence(fenceValue, claim);
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
       return this.transaction(async (client) => {
+        await lockWorkerTrackingMints(client, [claim.intent.mint]);
         if (fence !== null) await lockExactSimulationMutationFence(client, fence, claim, 0);
         const locked = await lockClaimedIntent(client, claim);
         const ledger = await lockAttemptLedger(client, locked);
@@ -486,6 +499,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const input = finishAttemptInput(inputValue);
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
       return this.transaction(async (client) => {
+        await lockWorkerTrackingMints(client, [claim.intent.mint]);
         const locked = await lockClaimedIntent(client, claim);
         const ledger = await lockAttemptLedger(client, locked);
         if (input.attemptNumber !== locked.intent.attemptCount || locked.intent.attemptCount === 0
@@ -551,6 +565,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const fence = fenceValue === undefined ? null : preflightSimulationFence(fenceValue, claim);
       const leaseMs = positiveInteger(leaseMsValue, MAX_LEASE_MS, 'INVALID_INPUT');
       return this.transaction(async (client) => {
+        await lockWorkerTrackingMints(client, [claim.intent.mint]);
         if (fence !== null) {
           await lockExactSimulationMutationFence(client, fence, claim, leaseMs);
         }
@@ -588,6 +603,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
       return this.transaction(async (client) => {
+        await lockWorkerTrackingMints(client, [claim.intent.mint]);
         await lockClaimedIntent(client, claim);
         const released = await client.query(
           `WITH operation AS MATERIALIZED (
@@ -633,6 +649,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const fence = fenceValue === undefined ? null : preflightSimulationFence(fenceValue, claim);
       const input = transitionInput(inputValue, claim);
       return this.transaction(async (client) => {
+        await lockWorkerTrackingMints(client, [claim.intent.mint]);
         if (fence !== null) await lockExactSimulationMutationFence(client, fence, claim, 0);
         if (claim.intent.side === 'SELL'
           && claim.intent.status === 'UNKNOWN_REQUIRES_RECONCILIATION'
@@ -852,15 +869,34 @@ function claimSql(
   statusPredicate: string,
   requireUnexpiredIntent: boolean,
   liveReserved: boolean,
+  expectedIntentParameter?: number,
 ): string {
   const expirationPredicate = requireUnexpiredIntent
     ? '\n      AND intent.expires_at > statement_timestamp()'
     : '';
-  return `WITH candidate AS MATERIALIZED (
-    SELECT intent.id
+  const exactIntentPredicate = expectedIntentParameter === undefined
+    ? ''
+    : `\n      AND intent.id=$${expectedIntentParameter}`;
+  return `WITH worker_tracking_preview AS MATERIALIZED (
+    SELECT intent.id,intent.mint
     FROM execution_intents AS intent
     WHERE intent.live_reserved = ${liveReserved ? 'TRUE' : 'FALSE'}
       AND ${statusPredicate}${expirationPredicate}
+      ${exactIntentPredicate}
+      AND (intent.lease_expires_at IS NULL
+        OR intent.lease_expires_at <= statement_timestamp())
+    ORDER BY intent.requested_at,intent.id
+    LIMIT 1
+  ), worker_tracking_mint_lock AS MATERIALIZED (
+    ${workerTrackingPreviewMintLockCte()}
+  ), candidate AS MATERIALIZED (
+    SELECT intent.id
+    FROM execution_intents AS intent
+    JOIN worker_tracking_preview AS preview ON preview.id=intent.id
+    CROSS JOIN worker_tracking_mint_lock
+    WHERE intent.live_reserved = ${liveReserved ? 'TRUE' : 'FALSE'}
+      AND ${statusPredicate}${expirationPredicate}
+      ${exactIntentPredicate}
       AND (intent.lease_expires_at IS NULL
         OR intent.lease_expires_at <= statement_timestamp())
     ORDER BY intent.requested_at,intent.id
@@ -972,7 +1008,11 @@ function exactPreflightIntentClaimSql(): string {
 }
 
 function exactPreflightIntentLockSql(): string {
-  return `WITH operation AS MATERIALIZED (
+  return `WITH worker_tracking_preview AS MATERIALIZED (
+    SELECT intent.id,intent.mint FROM execution_intents AS intent WHERE intent.id=$6
+  ), worker_tracking_mint_lock AS MATERIALIZED (
+    ${workerTrackingPreviewMintLockCte()}
+  ), operation AS MATERIALIZED (
     SELECT date_trunc('milliseconds',statement_timestamp()) AS at
   )
   SELECT intent.id
@@ -984,6 +1024,7 @@ function exactPreflightIntentLockSql(): string {
       AND membership.lane=$5
   JOIN execution_intents AS intent
     ON intent.id=membership.intent_id AND intent.id=$6
+  CROSS JOIN worker_tracking_mint_lock
   CROSS JOIN operation
   WHERE preparation.run_id=$1
     AND preparation.state='PREPARING'
@@ -1016,12 +1057,39 @@ function exactPreflightIntentLockSql(): string {
 function liveExecuteBuyClaimSql(): string {
   return `WITH operation AS MATERIALIZED (
     SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+  ), worker_tracking_preview AS MATERIALIZED (
+    ${liveExecuteBuySelectionSql('intent.id,intent.mint', false, 2, 4, 5)}
+  ), worker_tracking_mint_lock AS MATERIALIZED (
+    ${workerTrackingPreviewMintLockCte()}
   ), candidate AS MATERIALIZED (
-    SELECT intent.id
+    ${liveExecuteBuySelectionSql('intent.id', true, 2, 4, 5)}
+  )
+  UPDATE execution_intents AS intent
+  SET lease_owner=$1,
+      lease_token=$3::UUID,
+      lease_expires_at=date_trunc(
+        'milliseconds', operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      ),
+      updated_at=operation.at
+  FROM candidate CROSS JOIN operation
+  WHERE intent.id=candidate.id
+  RETURNING ${CLAIM_PROJECTION}`;
+}
+
+function liveExecuteBuySelectionSql(
+  projection: string,
+  revalidate: boolean,
+  leaseParameter: number,
+  generationParameter: number,
+  expectedIntentParameter: number | null,
+): string {
+  return `SELECT ${projection}
     FROM execution_intents AS intent
+    ${revalidate ? 'JOIN worker_tracking_preview AS preview ON preview.id=intent.id' : ''}
     CROSS JOIN operation
+    ${revalidate ? 'CROSS JOIN worker_tracking_mint_lock' : ''}
     JOIN execution_activation_armaments AS armament
-      ON armament.generation_id=$4
+      ON armament.generation_id=$${generationParameter}
       AND armament.payload_version=2
       AND armament.state='ARMED'
       AND armament.state_revision=0
@@ -1033,12 +1101,12 @@ function liveExecuteBuyClaimSql(): string {
       AND qualification.qualification_fingerprint=armament.qualification_fingerprint
       AND qualification.generation_id=armament.generation_id
       AND qualification.provider_id=armament.provider_id
-      AND qualification.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      AND qualification.expires_at>operation.at+($${leaseParameter}::BIGINT*INTERVAL '1 millisecond')
     JOIN execution_provider_usage_snapshots AS provider_snapshot
       ON provider_snapshot.snapshot_fingerprint=armament.target_provider_snapshot_fingerprint
       AND provider_snapshot.provider_id=armament.provider_id
       AND provider_snapshot.superseded_at IS NULL
-      AND provider_snapshot.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      AND provider_snapshot.expires_at>operation.at+($${leaseParameter}::BIGINT*INTERVAL '1 millisecond')
     JOIN execution_risk_admission_reports AS report
       ON report.report_id=armament.target_admission_report_id
       AND report.intent_id=intent.id
@@ -1065,25 +1133,16 @@ function liveExecuteBuyClaimSql(): string {
     WHERE intent.side='BUY'
       AND intent.live_reserved = TRUE
       AND intent.status='PENDING'
-      AND intent.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      AND intent.expires_at>operation.at+($${leaseParameter}::BIGINT*INTERVAL '1 millisecond')
       AND (intent.lease_expires_at IS NULL OR intent.lease_expires_at<=operation.at)
       AND armament.armed_at<=operation.at
-      AND armament.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      AND armament.expires_at>operation.at+($${leaseParameter}::BIGINT*INTERVAL '1 millisecond')
       AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}
+      ${expectedIntentParameter === null ? '' : `AND intent.id=$${expectedIntentParameter}`}
     ORDER BY intent.requested_at,intent.id
-    FOR UPDATE OF intent SKIP LOCKED
+    ${revalidate ? 'FOR UPDATE OF intent SKIP LOCKED' : ''}
     LIMIT 1
-  )
-  UPDATE execution_intents AS intent
-  SET lease_owner=$1,
-      lease_token=$3::UUID,
-      lease_expires_at=date_trunc(
-        'milliseconds', operation.at+($2::BIGINT*INTERVAL '1 millisecond')
-      ),
-      updated_at=operation.at
-  FROM candidate CROSS JOIN operation
-  WHERE intent.id=candidate.id
-  RETURNING ${CLAIM_PROJECTION}`;
+  `;
 }
 
 function claimSqlFor(options: ExecutionClaimOptions): string {
@@ -1101,19 +1160,74 @@ function claimSqlFor(options: ExecutionClaimOptions): string {
   }
 }
 
-function claimValues(options: ExecutionClaimOptions, leaseToken: string): readonly unknown[] {
+function claimValues(
+  options: ExecutionClaimOptions,
+  leaseToken: string,
+  exactIntentId?: string,
+): readonly unknown[] {
   if (options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY') {
-    return [options.ownerId, options.leaseMs, leaseToken, options.generationId];
+    return [options.ownerId, options.leaseMs, leaseToken, options.generationId, exactIntentId];
+  }
+  if (options.purpose === 'LIVE_RECOVER' && options.side === 'BUY') {
+    return [options.ownerId, options.leaseMs, leaseToken, exactIntentId];
   }
   return [options.ownerId, options.leaseMs, leaseToken];
+}
+
+async function selectLiveBuyClaimCandidate(
+  client: ExecutionIntentClient,
+  options: ExecutionClaimOptions,
+): Promise<Readonly<{ readonly id: string; readonly mint: string }> | null> {
+  if ((options.purpose !== 'LIVE_EXECUTE' && options.purpose !== 'LIVE_RECOVER')
+    || options.side !== 'BUY') throw dataError();
+  const result = options.purpose === 'LIVE_EXECUTE'
+    ? await client.query(`WITH operation AS MATERIALIZED (
+        SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+      ) /* worker_tracking_live_buy_preview */
+      ${liveExecuteBuySelectionSql('intent.id,intent.mint', false, 1, 2, null)}`, [
+      options.leaseMs, options.generationId,
+    ])
+    : await client.query(`/* worker_tracking_live_buy_preview */
+      SELECT intent.id,intent.mint FROM execution_intents AS intent
+      WHERE intent.side='BUY' AND intent.live_reserved=TRUE
+        AND intent.status='SIGNED_NOT_SUBMITTED'
+        AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}
+        AND (intent.lease_expires_at IS NULL
+          OR intent.lease_expires_at<=statement_timestamp())
+      ORDER BY intent.requested_at,intent.id LIMIT 1`);
+  if (result.rowCount === 0 && result.rows.length === 0) return null;
+  if (result.rowCount !== 1 || result.rows.length !== 1) throw dataError();
+  const row = exactRecord(requiredRow(result.rows), ['id', 'mint'], 'INVALID_DATA');
+  if (typeof row.id !== 'string' || typeof row.mint !== 'string') throw dataError();
+  return Object.freeze({ id: row.id, mint: row.mint });
 }
 
 function dryRunClaimSql(): string {
   return `WITH operation AS MATERIALIZED (
     SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+  ), worker_tracking_preview AS MATERIALIZED (
+    ${dryRunSelectionSql('intent.id,intent.mint', false)}
+  ), worker_tracking_mint_lock AS MATERIALIZED (
+    ${workerTrackingPreviewMintLockCte()}
   ), candidate AS MATERIALIZED (
-    SELECT intent.id
+    ${dryRunSelectionSql('intent.id', true)}
+  )
+  UPDATE execution_intents AS intent
+  SET lease_owner=$1,
+      lease_token=$3::UUID,
+      lease_expires_at=date_trunc(
+        'milliseconds', operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
+      )
+  FROM candidate CROSS JOIN operation
+  WHERE intent.id=candidate.id
+  RETURNING ${CLAIM_PROJECTION}`;
+}
+
+function dryRunSelectionSql(projection: string, revalidate: boolean): string {
+  return `SELECT ${projection}
     FROM execution_intents AS intent CROSS JOIN operation
+    ${revalidate ? 'JOIN worker_tracking_preview AS preview ON preview.id=intent.id' : ''}
+    ${revalidate ? 'CROSS JOIN worker_tracking_mint_lock' : ''}
     WHERE intent.status IN ('PENDING', 'RETRY_READY')
       AND intent.live_reserved = FALSE
       AND intent.expires_at > operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
@@ -1131,18 +1245,8 @@ function dryRunClaimSql(): string {
           AND assessment.evaluator_version = 1
       )
     ORDER BY intent.requested_at,intent.id
-    FOR UPDATE OF intent SKIP LOCKED
-    LIMIT 1
-  )
-  UPDATE execution_intents AS intent
-  SET lease_owner=$1,
-      lease_token=$3::UUID,
-      lease_expires_at=date_trunc(
-        'milliseconds', operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
-      )
-  FROM candidate CROSS JOIN operation
-  WHERE intent.id=candidate.id
-  RETURNING ${CLAIM_PROJECTION}`;
+    ${revalidate ? 'FOR UPDATE OF intent SKIP LOCKED' : ''}
+    LIMIT 1`;
 }
 
 function transitionUpdateSql(terminal: boolean): string {

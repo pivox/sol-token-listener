@@ -136,6 +136,8 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
         query.includes("hashtextextended('execution-live-deadline-scan:v1', 51007)"));
       const sellPresenceLock = normalized.findIndex((query) =>
         query.includes("hashtextextended('execution-live-sell-presence:v1', 51008)"));
+      const mintLock = normalized.findIndex((query) =>
+        query.includes("hashtextextended('transaction-inbox-mint:' || $1, 0)"));
       const clock = normalized.findIndex((query) =>
         query.includes('execution_live_deadline_clock'));
       const candidate = normalized.findIndex((query) =>
@@ -145,9 +147,9 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
       const rowLock = normalized.findIndex((query) => query.includes('FOR UPDATE OF position'));
       const intentInsert = normalized.find((query) =>
         query.includes('INSERT INTO execution_intents ('));
-      assert.ok(globalLock >= 0 && globalLock < sellPresenceLock);
-      assert.ok(sellPresenceLock < clock);
-      assert.ok(clock < candidate && candidate < generationLock && generationLock < rowLock);
+      assert.ok(globalLock >= 0 && globalLock < clock);
+      assert.ok(clock < candidate && candidate < mintLock && mintLock < sellPresenceLock);
+      assert.ok(sellPresenceLock < generationLock && generationLock < rowLock);
       assert.ok(intentInsert);
       assert.match(intentInsert, /\blive_reserved\b/u);
       assert.match(intentInsert, /\bTRUE\b/u);

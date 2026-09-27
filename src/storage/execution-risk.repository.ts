@@ -39,6 +39,7 @@ import type {
   WalletSnapshotV1,
 } from '../ports/execution-risk-repository.js';
 import { getDatabasePool } from './database.js';
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -345,6 +346,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async admitBuy(inputValue: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1> {
     const input = admissionFrom(inputValue);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [input.intent.mint]);
       await client.query(
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
         [input.generationId],
@@ -545,10 +547,15 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       } catch {
         throw failure('CONFLICT');
       }
-      const identity = await client.query(`SELECT generation_id FROM execution_exposure_reservations
-        WHERE intent_id=$1`, [evidence.intentId]);
+      const identity = await client.query(`SELECT reservation.generation_id,intent.mint
+        FROM execution_exposure_reservations reservation
+        JOIN execution_intents intent ON intent.id=reservation.intent_id
+        WHERE reservation.intent_id=$1`, [evidence.intentId]);
+      const identityRow = exactRow(singleRow(identity), ['generation_id', 'mint'] as const);
+      if (typeof identityRow.mint !== 'string') throw failure('INVALID_DATA');
+      await lockWorkerTrackingMints(client, [identityRow.mint]);
       const generationId = patternedText(
-        exactRow(singleRow(identity), ['generation_id'] as const).generation_id,
+        identityRow.generation_id,
         /^execution_wallet_generation_[0-9a-f]{64}$/u,
       );
       await client.query(
@@ -844,6 +851,7 @@ export async function admitBuyInTransaction(
   inputValue: ExecutionBuyAdmissionInputV1,
 ): Promise<ExecutionBuyAdmissionResultV1> {
   const input = admissionFrom(inputValue);
+  await lockWorkerTrackingMints(client, [input.intent.mint]);
   const quoteAmountRaw = input.intent.quoteAmountRaw;
   if (quoteAmountRaw === null) throw failure('INVALID_INPUT');
   const operationAtMs = textTimestamp(exactRow(singleRow(await client.query(

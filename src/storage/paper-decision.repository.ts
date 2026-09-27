@@ -56,6 +56,7 @@ import {
   MAX_PAPER_FINALITY_RAW_ROWS,
   paperFinalityRelevantRawSql,
 } from './paper-finality-barrier.js';
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
 
 type Row = Readonly<Record<string, unknown>>;
 interface Result { readonly rows: readonly Row[]; readonly rowCount: number | null }
@@ -260,6 +261,17 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const schedulerWaitStartedAtMs = this.clock();
       timestamp(schedulerWaitStartedAtMs, 'clock');
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      const reclaimable = await client.query(`SELECT DISTINCT session.mint
+        FROM paper_strategy_sessions session
+        JOIN paper_decision_jobs job ON job.mint=session.mint
+          AND job.payload #>> '{result,sessionId}'=session.session_id
+        WHERE session.strategy_id='creation-entry-v1' AND session.state='BUY_PENDING'
+          AND session.position_id IS NULL
+          AND (job.status IN ('PENDING','PROCESSING')
+            OR (job.status='CANCELLED' AND job.retry_exhausted_at IS NOT NULL))
+        ORDER BY session.mint LIMIT 16`);
+      const reclaimableMints = reclaimable.rows.map((row) => textField(row, 'mint'));
+      await lockWorkerTrackingMints(client, reclaimableMints);
       await client.query(PAPER_DECISION_CLAIM_SCHEDULER_LOCK_SQL);
       const schedulerWaitFinishedAtMs = this.clock();
       timestamp(schedulerWaitFinishedAtMs, 'clock');
@@ -275,7 +287,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         MAX_PAPER_FINALITY_RAW_ROWS+1,MAX_PAPER_FINALITY_PREFLIGHT_JOBS,
         new Date(effectiveNowMs + this.retentionMs),
       ]);
-      await reclaimExhaustedCreationReservations(client, effectiveNowMs, this.retentionMs);
+      await reclaimExhaustedCreationReservations(
+        client,
+        effectiveNowMs,
+        this.retentionMs,
+        new Set(reclaimableMints),
+      );
       await client.query('COMMIT');
       const row = result.rows[0];
       return row === undefined ? null : claimedJob(row);
@@ -312,6 +329,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     const client = await this.connect('snapshot');
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await lockWorkerTrackingMints(client, [job.mint]);
       await lockMint(client, job.mint);
       await lockQualificationMint(client,job.mint);
       await assertActiveLease(client, job);
@@ -398,6 +416,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     const client = await this.connect('complete');
     try {
       await client.query('BEGIN');
+      await lockWorkerTrackingMints(client, [job.mint]);
       await lockMint(client,job.mint);
       await lockQualificationMint(client,job.mint);
       const nowMs=this.clock();
@@ -462,6 +481,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       // A ledger open may commit while this transaction waits for the qualification
       // lock. READ COMMITTED makes the subsequent absence check see that position.
       await client.query('BEGIN');
+      await lockWorkerTrackingMints(client, [job.mint]);
       await lockMint(client, job.mint);
       await lockQualificationMint(client,job.mint);
       const selected = await client.query(`SELECT status,lease_token,lease_expires_at,
@@ -543,6 +563,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     const client = await this.connect(operation);
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await lockWorkerTrackingMints(client, [job.mint]);
       await lockMint(client, job.mint);
       await lockQualificationMint(client,job.mint);
       const selected = await client.query(
@@ -615,6 +636,7 @@ async function reclaimExhaustedCreationReservations(
   client: Client,
   nowMs: number,
   retentionMs: number,
+  lockedMints: ReadonlySet<string>,
 ): Promise<void> {
   const pending = await client.query(`SELECT job.job_id,job.mint,job.source_event_id,
       job.source_confirmation_status,session.session_id
@@ -627,6 +649,7 @@ async function reclaimExhaustedCreationReservations(
     ORDER BY job.terminal_at,job.job_id LIMIT 16`);
   for (const row of pending.rows) {
     const mint = textField(row, 'mint');
+    if (!lockedMints.has(mint)) continue;
     // Never wait behind a worker holding mint/qualification locks while claim
     // owns the scheduler lock. A busy reservation is retried on the next poll.
     const locks = await client.query(`SELECT

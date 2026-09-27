@@ -51,6 +51,7 @@ import {
   TransactionInboxLeaseError,
   TransactionInboxRepositoryError,
 } from '../src/storage/transaction-inbox.repository.js';
+import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
 import {
   FIRST_PROCESSING_COHORT_CAPACITY,
   FIRST_PROCESSING_COHORT_DURATION_MS,
@@ -62,6 +63,175 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
+
+void test('enabled authority uses one PostgreSQL clock at the exact 44.999/45.000 launch boundary',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-09-27T12:00:00.000Z');
+      await withAuthoritySession(pool, clock, async ({ repository, client, authorityClockReads }) => {
+        await seedCanonicalAuthorityLaunch(client, new Date(clock.getTime() - 44_999));
+        const beforeFresh = authorityClockReads();
+        await repository.enqueue(tradeNotification('authority-fresh-44999', 1n));
+        assert.equal(authorityClockReads() - beforeFresh, 1);
+        assert.deepEqual(ingestionDecision(await row(pool, 'authority-fresh-44999')), {
+          processing_status: 'PENDING', ingestion_priority: 'TRACKED_TRADE',
+          ingestion_hint: 'PUMPFUN_TRADE', ingestion_hint_mint: tradeMint,
+        });
+
+        await client.query('UPDATE token_launches SET detected_at=$1', [
+          new Date(clock.getTime() - 45_000),
+        ]);
+        await repository.enqueue(Object.freeze({
+          ...tradeNotification('authority-expired-45000', 2n),
+          observedAtMs: clock.getTime() + 3_600_000,
+        }));
+        assert.equal((await row(pool, 'authority-expired-45000')).processing_status, 'DEFERRED');
+
+        await client.query("UPDATE domain_events SET confirmation_status='orphaned'");
+        await client.query('UPDATE token_launches SET detected_at=$1', [
+          new Date(clock.getTime() - 1),
+        ]);
+        await repository.enqueue(tradeNotification('authority-orphaned-launch', 3n));
+        assert.equal((await row(pool, 'authority-orphaned-launch')).processing_status, 'DEFERRED');
+      });
+    });
+  });
+
+void test('enabled authority is the same union for enqueue, catch-up, sync and listTrackedMints',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-09-27T12:00:00.000Z');
+      await withAuthoritySession(pool, clock, async ({
+        repository, launchpad, client, authorityClockReads,
+      }) => {
+        await seedCanonicalAuthorityLaunch(client, new Date(clock.getTime() - 45_000));
+        const proofs = [
+          ["INSERT INTO trading_candidates(mint,source_event_id,state,eligible_until,superseded_at,confirmation_status) VALUES ($1,'candidate-source','ELIGIBLE',$2,NULL,'confirmed')", [tradeMint, new Date(clock.getTime() + 1)]],
+          ["INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,'BUY_PENDING')", [tradeMint]],
+          ["INSERT INTO paper_positions(mint,status) VALUES ($1,'PAPER_HOLDING')", [tradeMint]],
+          ["INSERT INTO execution_intents(mint,status,terminal_at) VALUES ($1,'PENDING',NULL)", [tradeMint]],
+          ["INSERT INTO execution_live_positions(mint,state) VALUES ($1,'OPEN')", [tradeMint]],
+        ] as const;
+        for (const [index, proof] of proofs.entries()) {
+          await clearAuthorityProofs(client);
+          await client.query(proof[0], [...proof[1]]);
+          const signature = `authority-family-${index}`;
+          const beforeEnqueue = authorityClockReads();
+          await repository.enqueue(tradeNotification(signature, BigInt(index + 10)));
+          assert.equal(authorityClockReads() - beforeEnqueue, 1);
+          assert.equal((await row(pool, signature)).ingestion_priority, 'TRACKED_TRADE');
+          const beforeList = authorityClockReads();
+          assert.deepEqual([...await launchpad.listTrackedMints()], [tradeMint]);
+          assert.equal(authorityClockReads() - beforeList, 1);
+
+          await clearAuthorityProofs(client);
+          const beforeUntrackedSync = authorityClockReads();
+          await repository.syncTrackedMint(tradeMint);
+          assert.equal(authorityClockReads() - beforeUntrackedSync, 1);
+          assert.equal((await row(pool, signature)).processing_status, 'DEFERRED');
+          await client.query(proof[0], [...proof[1]]);
+          const beforeTrackedSync = authorityClockReads();
+          await repository.syncTrackedMint(tradeMint);
+          assert.equal(authorityClockReads() - beforeTrackedSync, 1);
+          assert.equal((await row(pool, signature)).ingestion_priority, 'TRACKED_TRADE');
+
+          const catchUpSignature = `authority-catch-up-${index}`;
+          const beforeCatchUp = authorityClockReads();
+          const receipt = await repository.recordCatchUpClassification(createCatchUpClassification({
+            ...catchUpClassificationInput(catchUpSignature),
+            disposition: 'DEFERRED', reasonCode: 'PUMP_TRADE_UNTRACKED',
+            ingestionHint: 'PUMPFUN_TRADE', ingestionHintMint: tradeMint,
+          }));
+          assert.equal(authorityClockReads() - beforeCatchUp, 1);
+          assert.equal(receipt.admission, 'ENQUEUED');
+          assert.equal((await row(pool, catchUpSignature)).ingestion_priority, 'TRACKED_TRADE');
+        }
+      });
+    });
+  });
+
+void test('enabled authority accepts only exact active proof states and MANUAL_REVIEW needs a holding',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-09-27T12:00:00.000Z');
+      await withAuthoritySession(pool, clock, async ({ repository, client }) => {
+        await seedCanonicalAuthorityLaunch(client, new Date(clock.getTime() - 45_000));
+        const activeSessions = ['BUY_PENDING', 'PAPER_HOLDING', 'WAITING_EXTERNAL_BUYS',
+          'EXIT_PENDING_QUOTE', 'SELL_PENDING'];
+        const nonTerminalIntents = ['PENDING', 'PROCESSING', 'SIMULATED', 'RETRY_READY',
+          'SIGNED_NOT_SUBMITTED', 'SUBMITTED', 'CONFIRMED', 'RECONCILING',
+          'UNKNOWN_REQUIRES_RECONCILIATION'];
+        let ordinal = 100;
+        for (const state of activeSessions) {
+          await clearAuthorityProofs(client);
+          await client.query('INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,$2)',
+            [tradeMint, state]);
+          await assertAuthorityAdmission(repository, pool, `authority-session-${state}`, ordinal++);
+        }
+        for (const status of nonTerminalIntents) {
+          await clearAuthorityProofs(client);
+          await client.query('INSERT INTO execution_intents(mint,status,terminal_at) VALUES ($1,$2,NULL)',
+            [tradeMint, status]);
+          await assertAuthorityAdmission(repository, pool, `authority-intent-${status}`, ordinal++);
+        }
+        for (const state of ['OPEN', 'EXIT_PENDING', 'UNKNOWN']) {
+          await clearAuthorityProofs(client);
+          await client.query('INSERT INTO execution_live_positions(mint,state) VALUES ($1,$2)',
+            [tradeMint, state]);
+          await assertAuthorityAdmission(repository, pool, `authority-live-${state}`, ordinal++);
+        }
+
+        const rejected = [
+          ["INSERT INTO trading_candidates(mint,source_event_id,state,eligible_until,superseded_at,confirmation_status) VALUES ($1,'candidate-source','ELIGIBLE',$2,NULL,'confirmed')", [tradeMint, clock]],
+          ["INSERT INTO trading_candidates(mint,source_event_id,state,eligible_until,superseded_at,confirmation_status) VALUES ($1,'candidate-source','ELIGIBLE',$2,$3,'confirmed')", [tradeMint, new Date(clock.getTime() + 1), clock]],
+          ["INSERT INTO trading_candidates(mint,source_event_id,state,eligible_until,superseded_at,confirmation_status) VALUES ($1,'candidate-source','ELIGIBLE',$2,NULL,'orphaned')", [tradeMint, new Date(clock.getTime() + 1)]],
+          ["INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,'MANUAL_REVIEW')", [tradeMint]],
+          ["INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,'PAPER_CLOSED')", [tradeMint]],
+          ["INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,'PAPER_RETRACTED')", [tradeMint]],
+          ["INSERT INTO paper_positions(mint,status) VALUES ($1,'PAPER_CLOSED')", [tradeMint]],
+          ["INSERT INTO paper_positions(mint,status) VALUES ($1,'PAPER_RETRACTED')", [tradeMint]],
+          ["INSERT INTO execution_intents(mint,status,terminal_at) VALUES ($1,'SUCCEEDED',NULL)", [tradeMint]],
+          ["INSERT INTO execution_intents(mint,status,terminal_at) VALUES ($1,'FAILED',NULL)", [tradeMint]],
+          ["INSERT INTO execution_intents(mint,status,terminal_at) VALUES ($1,'EXPIRED',NULL)", [tradeMint]],
+          ["INSERT INTO execution_intents(mint,status,terminal_at) VALUES ($1,'CANCELLED',NULL)", [tradeMint]],
+          ["INSERT INTO execution_live_positions(mint,state) VALUES ($1,'CLOSED')", [tradeMint]],
+        ] as const;
+        for (const [index, proof] of rejected.entries()) {
+          await clearAuthorityProofs(client);
+          await client.query(proof[0], [...proof[1]]);
+          const signature = `authority-rejected-${index}`;
+          await repository.enqueue(tradeNotification(signature, BigInt(ordinal++)));
+          assert.equal((await row(pool, signature)).processing_status, 'DEFERRED');
+        }
+
+        await clearAuthorityProofs(client);
+        await client.query("UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id='candidate-source'");
+        await client.query(`INSERT INTO trading_candidates(
+          mint,source_event_id,state,eligible_until,superseded_at,confirmation_status
+        ) VALUES ($1,'candidate-source','ELIGIBLE',$2,NULL,'confirmed')`, [
+          tradeMint, new Date(clock.getTime() + 1),
+        ]);
+        await repository.enqueue(tradeNotification('authority-orphaned-candidate-source',
+          BigInt(ordinal++)));
+        assert.equal((await row(pool, 'authority-orphaned-candidate-source')).processing_status,
+          'DEFERRED');
+        await client.query("UPDATE domain_events SET confirmation_status='confirmed' WHERE event_id='candidate-source'");
+
+        await clearAuthorityProofs(client);
+        await client.query("INSERT INTO paper_strategy_sessions(mint,state) VALUES ($1,'MANUAL_REVIEW')",
+          [tradeMint]);
+        await client.query("INSERT INTO paper_positions(mint,status) VALUES ($1,'PAPER_HOLDING')",
+          [tradeMint]);
+        await assertAuthorityAdmission(repository, pool, 'authority-manual-with-holding', ordinal++);
+
+        await client.query(`INSERT INTO execution_intents(mint,status,terminal_at)
+          VALUES ($1,'PENDING',NULL)`, [tradeMint]);
+        await client.query(`INSERT INTO execution_live_positions(mint,state)
+          VALUES ($1,'OPEN')`, [tradeMint]);
+        await assertAuthorityAdmission(repository, pool, 'authority-overlapping-proofs', ordinal++);
+      });
+    });
+  });
 
 void test('admission review: strict coverage hydrates unadmitted WebSocket work once then covers the durable classification', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -6352,6 +6522,122 @@ async function insertTrackedLaunch(pool: InstanceType<typeof pg.Pool>): Promise<
     created_slot, created_transaction_index, created_instruction_index, detected_at, updated_at
   ) VALUES ($1,'pumpfun',$2,$1,$2,'OBSERVING','tracked-launch',1,0,0,clock_timestamp(),clock_timestamp())`,
   [tradeMint, PUMP_PROGRAM_ID]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status,observed_at,payload_version,payload
+  ) VALUES ('tracked-launch-event','TokenLaunchDetected',$1,'pumpfun',$2,
+    'tracked-launch',1,0,0,NULL,'confirmed',clock_timestamp(),1,'{}'::jsonb)`,
+  [tradeMint, PUMP_PROGRAM_ID]);
+}
+
+interface AuthoritySession {
+  readonly repository: PostgresTransactionInboxRepository;
+  readonly launchpad: PostgresLaunchpadEventRepository;
+  readonly client: InstanceType<typeof pg.Client>;
+  readonly authorityClockReads: () => number;
+}
+
+async function withAuthoritySession(
+  pool: InstanceType<typeof pg.Pool>,
+  clock: Date,
+  run: (session: AuthoritySession) => Promise<void>,
+): Promise<void> {
+  const connection = await pool.connect();
+  const literal = `TIMESTAMPTZ '${clock.toISOString()}'`;
+  let authorityClockReadCount = 0;
+  const query = (text: string, values?: readonly unknown[]) => {
+    authorityClockReadCount += text.match(
+      /date_trunc\('milliseconds', clock_timestamp\(\)\)/gu,
+    )?.length ?? 0;
+    return connection.query(
+      text.replaceAll("date_trunc('milliseconds', clock_timestamp())", literal),
+      values === undefined ? undefined : [...values],
+    );
+  };
+  const client = {
+    query,
+    release() {},
+  };
+  try {
+    await connection.query(`CREATE TEMP TABLE token_launches (
+      mint TEXT PRIMARY KEY,current_state TEXT NOT NULL,created_signature TEXT NOT NULL,
+      created_slot NUMERIC NOT NULL,created_transaction_index INTEGER NOT NULL,
+      created_instruction_index INTEGER NOT NULL,created_inner_instruction_index INTEGER,
+      detected_at TIMESTAMPTZ NOT NULL,terminal_at TIMESTAMPTZ
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP TABLE domain_events (
+      event_id TEXT NOT NULL,type TEXT NOT NULL,mint TEXT NOT NULL,signature TEXT NOT NULL,slot NUMERIC NOT NULL,
+      transaction_index INTEGER NOT NULL,instruction_index INTEGER NOT NULL,
+      inner_instruction_index INTEGER,confirmation_status TEXT NOT NULL
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP TABLE trading_candidates (
+      mint TEXT NOT NULL,source_event_id TEXT NOT NULL,state TEXT NOT NULL,eligible_until TIMESTAMPTZ,
+      superseded_at TIMESTAMPTZ,confirmation_status TEXT NOT NULL
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP TABLE paper_strategy_sessions (
+      mint TEXT NOT NULL,state TEXT NOT NULL
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP TABLE paper_positions (
+      mint TEXT NOT NULL,status TEXT NOT NULL
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP TABLE execution_intents (
+      mint TEXT NOT NULL,status TEXT NOT NULL,terminal_at TIMESTAMPTZ
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP TABLE execution_live_positions (
+      mint TEXT NOT NULL,state TEXT NOT NULL
+    ) ON COMMIT PRESERVE ROWS`);
+    await connection.query(`CREATE TEMP VIEW listener_worker_tracking_live_mints AS
+      SELECT mint FROM execution_live_positions
+      WHERE state IN ('OPEN','EXIT_PENDING','UNKNOWN')`);
+    const database = {
+      query,
+      connect: async () => client,
+    };
+    await run({
+      repository: new PostgresTransactionInboxRepository(database, undefined, enabledAdmission),
+      launchpad: new PostgresLaunchpadEventRepository(
+        database,
+        4,
+        Date.now,
+        undefined,
+        enabledAdmission,
+      ),
+      client: connection,
+      authorityClockReads: () => authorityClockReadCount,
+    });
+  } finally {
+    connection.release();
+  }
+}
+
+async function seedCanonicalAuthorityLaunch(
+  client: InstanceType<typeof pg.Client>,
+  detectedAt: Date,
+): Promise<void> {
+  await client.query(`INSERT INTO token_launches (
+    mint,current_state,created_signature,created_slot,created_transaction_index,
+    created_instruction_index,created_inner_instruction_index,detected_at,terminal_at
+  ) VALUES ($1,'OBSERVING','authority-launch',1,0,0,NULL,$2,NULL)`, [tradeMint, detectedAt]);
+  await client.query(`INSERT INTO domain_events (
+    event_id,type,mint,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status
+  ) VALUES ('authority-launch-event','TokenLaunchDetected',$1,'authority-launch',1,0,0,NULL,'confirmed'),
+    ('candidate-source','QualificationUpdated',$1,'candidate-source',2,0,0,NULL,'confirmed')`, [tradeMint]);
+}
+
+async function clearAuthorityProofs(client: InstanceType<typeof pg.Client>): Promise<void> {
+  await client.query(`TRUNCATE trading_candidates,paper_strategy_sessions,paper_positions,
+    execution_intents,execution_live_positions`);
+}
+
+async function assertAuthorityAdmission(
+  repository: PostgresTransactionInboxRepository,
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+  slot: number,
+): Promise<void> {
+  await repository.enqueue(tradeNotification(signature, BigInt(slot)));
+  assert.equal((await row(pool, signature)).ingestion_priority, 'TRACKED_TRADE');
 }
 
 function checkpoint(

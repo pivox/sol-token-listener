@@ -9,6 +9,8 @@ import type {
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
+const MINT = '11111111111111111111111111111111';
+
 void test('persiste position, trade et événement dans une transaction', async () => {
   const client = new RecordingClient();
   const repository = new PostgresPaperTradingRepository({
@@ -21,6 +23,7 @@ void test('persiste position, trade et événement dans une transaction', async 
 
   assert.deepEqual(client.commands, [
     'BEGIN',
+    'SELECT unknown',
     'INSERT paper_positions',
     'INSERT paper_trades',
     'INSERT domain_events',
@@ -28,9 +31,9 @@ void test('persiste position, trade et événement dans une transaction', async 
   ]);
   assert.equal(client.released, true);
   assert.equal(client.values.flat().some((value) => typeof value === 'bigint'), false);
-  assert.equal((client.values[1]?.at(-2) as Date).getTime(), 500);
-  assert.equal(client.values[1]?.at(-1), 'job-open');
-  assert.equal((client.values[2]?.at(-1) as Date).getTime(), 1);
+  assert.equal((client.values[2]?.at(-2) as Date).getTime(), 500);
+  assert.equal(client.values[2]?.at(-1), 'job-open');
+  assert.equal((client.values[3]?.at(-1) as Date).getTime(), 1);
 });
 
 void test('persiste et relit la lignée de stratégie sans casser les anciennes positions', async () => {
@@ -42,7 +45,7 @@ void test('persiste et relit la lignée de stratégie sans casser les anciennes 
   await repository.transact(async (transaction) => {
     await transaction.insertOpened(lineagePosition, trade(), event(), 500, 'job-open');
   });
-  assert.deepEqual(writer.values[1]?.slice(-5, -2), ['paper-session','report','candidate']);
+  assert.deepEqual(writer.values[2]?.slice(-5, -2), ['paper-session','report','candidate']);
 
   const reader = new RecordingClient(false, [{ payload:toJsonValue(lineagePosition) }]);
   const readRepository = new PostgresPaperTradingRepository({ connect:async () => reader });
@@ -74,14 +77,15 @@ void test('sérialise les ouvertures concurrentes pour une stratégie et un mint
   });
 
   await repository.transact(async (transaction) => (
-    transaction.findActivePosition('MINT', { id: 'strategy', version: 1 })
+    transaction.findActivePosition(MINT, { id: 'strategy', version: 1 })
   ));
 
   assert.match(
     client.texts[1] ?? '',
-    /pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)/u,
+    /transaction-inbox-mint:/u,
   );
-  assert.deepEqual(client.values[1], ['MINT\u001fstrategy\u001f1']);
+  assert.match(client.texts[2] ?? '', /pg_advisory_xact_lock/u);
+  assert.deepEqual(client.values[2], [`${MINT}\u001fstrategy\u001f1`]);
 });
 
 void test('locks and verifies the exact current qualification before paper writes',async()=>{
@@ -96,45 +100,47 @@ void test('locks and verifies the exact current qualification before paper write
 
   await repository.transact(async(transaction)=>{
     await transaction.requireCurrentQualification({
-      mint:'MINT',reportId:'report',qualificationEventId:'qualification-event',
+      mint:MINT,reportId:'report',qualificationEventId:'qualification-event',
     });
   });
 
-  assert.match(client.texts[1] ?? '',/qualification-projection:/u);
-  assert.match(client.texts[1] ?? '',/pg_advisory_xact_lock/u);
-  assert.match(client.texts[2] ?? '',/superseded_at IS NULL/u);
-  assert.match(client.texts[2] ?? '',/purge_after > clock_timestamp\(\)/u);
-  assert.match(client.texts[2] ?? '',/qualification_event_id/u);
-  assert.match(client.texts[2] ?? '',/report\.confirmation_status <> 'orphaned'/u);
-  assert.match(client.texts[2] ?? '',/event\.confirmation_status <> 'orphaned'/u);
-  assert.match(client.texts[3] ?? '',/FROM raw_chain_events raw/u);
-  assert.match(client.texts[3] ?? '',/raw\.event_id=\$1/u);
-  assert.match(client.texts[3] ?? '',/raw\.confirmation_status <> 'orphaned'/u);
-  assert.match(client.texts[3] ?? '',/FOR SHARE OF raw/u);
-  assert.match(client.texts[4] ?? '',/FROM domain_events source/u);
-  assert.match(client.texts[4] ?? '',/source\.event_id=\$1/u);
-  assert.match(client.texts[4] ?? '',/source\.raw_event_id=\$2/u);
-  assert.match(client.texts[4] ?? '',/source\.confirmation_status <> 'orphaned'/u);
-  assert.match(client.texts[4] ?? '',/source\.type IN/u);
-  assert.match(client.texts[4] ?? '',/raw\.source=source\.source/u);
-  assert.match(client.texts[4] ?? '',/FOR SHARE OF source,raw/u);
-  assert.match(client.texts[5] ?? '',/\$3::integer/u);
-  assert.match(client.texts[5] ?? '',/LIMIT \$3::integer/u);
+  assert.match(client.texts[1] ?? '',/transaction-inbox-mint:/u);
+  assert.match(client.texts[2] ?? '',/qualification-projection:/u);
+  assert.match(client.texts[2] ?? '',/pg_advisory_xact_lock/u);
+  assert.match(client.texts[3] ?? '',/superseded_at IS NULL/u);
+  assert.match(client.texts[3] ?? '',/purge_after > clock_timestamp\(\)/u);
+  assert.match(client.texts[3] ?? '',/qualification_event_id/u);
+  assert.match(client.texts[3] ?? '',/report\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[3] ?? '',/event\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[4] ?? '',/FROM raw_chain_events raw/u);
+  assert.match(client.texts[4] ?? '',/raw\.event_id=\$1/u);
+  assert.match(client.texts[4] ?? '',/raw\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[4] ?? '',/FOR SHARE OF raw/u);
+  assert.match(client.texts[5] ?? '',/FROM domain_events source/u);
+  assert.match(client.texts[5] ?? '',/source\.event_id=\$1/u);
+  assert.match(client.texts[5] ?? '',/source\.raw_event_id=\$2/u);
+  assert.match(client.texts[5] ?? '',/source\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[5] ?? '',/source\.type IN/u);
+  assert.match(client.texts[5] ?? '',/raw\.source=source\.source/u);
+  assert.match(client.texts[5] ?? '',/FOR SHARE OF source,raw/u);
+  assert.match(client.texts[6] ?? '',/\$3::integer/u);
+  assert.match(client.texts[6] ?? '',/LIMIT \$3::integer/u);
   assert.doesNotMatch(
-    client.texts[5] ?? '',
+    client.texts[6] ?? '',
     /active_limit|UNION ALL|raw\.confirmation_status\s*<>/u,
   );
-  assert.match(client.texts[5] ?? '',/COALESCE\(raw\.inner_instruction_index,-1\)/u);
-  assert.match(client.texts[6] ?? '',/ORDER BY signature COLLATE "C"/u);
-  assert.match(client.texts[6] ?? '',/FOR SHARE/u);
-  assert.deepEqual(client.values[1],['MINT']);
-  assert.deepEqual(client.values[2],['MINT','report','qualification-event']);
-  assert.deepEqual(client.values[3],['raw','MINT']);
-  assert.deepEqual(client.values[4],[
-    'source','raw','MINT','report','qualification-event',
+  assert.match(client.texts[6] ?? '',/COALESCE\(raw\.inner_instruction_index,-1\)/u);
+  assert.match(client.texts[7] ?? '',/ORDER BY signature COLLATE "C"/u);
+  assert.match(client.texts[7] ?? '',/FOR SHARE/u);
+  assert.deepEqual(client.values[1],[MINT]);
+  assert.deepEqual(client.values[2],[MINT]);
+  assert.deepEqual(client.values[3],[MINT,'report','qualification-event']);
+  assert.deepEqual(client.values[4],['raw',MINT]);
+  assert.deepEqual(client.values[5],[
+    'source','raw',MINT,'report','qualification-event',
   ]);
-  assert.deepEqual(client.values[5],['MINT','raw',4097]);
-  assert.deepEqual(client.values[6],[['signature']]);
+  assert.deepEqual(client.values[6],[MINT,'raw',4097]);
+  assert.deepEqual(client.values[7],[['signature']]);
 });
 
 void test('rolls back a stale current qualification before paper writes',async()=>{
@@ -143,7 +149,7 @@ void test('rolls back a stale current qualification before paper writes',async()
 
   await assert.rejects(repository.transact(async(transaction)=>{
     await transaction.requireCurrentQualification({
-      mint:'MINT',reportId:'report',qualificationEventId:'qualification-event',
+      mint:MINT,reportId:'report',qualificationEventId:'qualification-event',
     });
     await transaction.insertOpened(position(),trade(),event(),null,null);
   }),hasCode('QUALIFICATION_NOT_CURRENT'));
@@ -164,18 +170,19 @@ void test('rend les événements paper purgeables à la fermeture', async () => 
 
   assert.deepEqual(client.commands, [
     'BEGIN',
+    'SELECT unknown',
     'INSERT domain_events',
     'UPDATE paper_positions',
     'INSERT paper_trades',
     'UPDATE domain_events',
     'COMMIT',
   ]);
-  assert.equal(client.values[1]?.[12] instanceof Date, true);
-  assert.deepEqual(client.values[4]?.slice(0, 1), ['position']);
-  assert.equal(client.values[4]?.[1] instanceof Date, true);
-  assert.equal(client.values[4]?.[2] instanceof Date, true);
-  assert.equal(client.values[2]?.includes('closed-event'), true);
-  assert.equal(client.values[2]?.some((value) => value instanceof Date && value.getTime() === 900), true);
+  assert.equal(client.values[2]?.[12] instanceof Date, true);
+  assert.deepEqual(client.values[5]?.slice(0, 1), ['position']);
+  assert.equal(client.values[5]?.[1] instanceof Date, true);
+  assert.equal(client.values[5]?.[2] instanceof Date, true);
+  assert.equal(client.values[3]?.includes('closed-event'), true);
+  assert.equal(client.values[3]?.some((value) => value instanceof Date && value.getTime() === 900), true);
 });
 
 void test('réconcilie durablement la finalité d’un événement paper', async () => {
@@ -194,11 +201,12 @@ void test('réconcilie durablement la finalité d’un événement paper', async
 
   assert.deepEqual(client.commands, [
     'BEGIN',
+    'SELECT unknown',
     'SELECT domain_events',
     'UPDATE domain_events',
     'COMMIT',
   ]);
-  assert.equal(client.values[2]?.[1], 'finalized');
+  assert.equal(client.values[3]?.[1], 'finalized');
 });
 
 void test('termine une projection paper rétractée sans inventer de trade', async () => {
@@ -219,6 +227,7 @@ void test('termine une projection paper rétractée sans inventer de trade', asy
 
   assert.deepEqual(client.commands, [
     'BEGIN',
+    'SELECT unknown',
     'UPDATE paper_positions',
     'UPDATE domain_events',
     'COMMIT',
@@ -275,7 +284,7 @@ void test('refuse les invariants financiers corrompus relus en base', async () =
 
 function position(): PaperPosition {
   return {
-    id: 'position', mint: 'MINT',
+    id: 'position', mint: MINT,
     quoteAsset: { mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' },
     strategy: { id: 'strategy', version: 1 },
     status: 'PAPER_HOLDING',
@@ -307,7 +316,7 @@ function trade(): PaperTrade {
   return {
     id: 'trade', positionId: 'position', side: 'BUY',
     quote: {
-      id: 'quote', inputMint: 'SOL', outputMint: 'MINT',
+      id: 'quote', inputMint: 'SOL', outputMint: MINT,
       amountInRaw: 100n, amountOutRaw: 95n, minimumAmountOutRaw: 90n,
       feesRaw: 1n, slippageBps: 100n, priceImpactBps: 50n,
       observedAtMs: 1, observedSlot: 1n,
@@ -325,7 +334,7 @@ function sellTrade(): PaperTrade {
     quote: {
       ...trade().quote,
       id: 'sell-quote',
-      inputMint: 'MINT',
+      inputMint: MINT,
       outputMint: 'SOL',
       amountInRaw: 90n,
       amountOutRaw: 120n,
@@ -339,7 +348,7 @@ function sellTrade(): PaperTrade {
 
 function event(): PaperPositionOpenedEventV1 {
   return {
-    id: 'event', type: 'PaperPositionOpened', mint: 'MINT',
+    id: 'event', type: 'PaperPositionOpened', mint: MINT,
     source: 'paper-trading', program: 'pump', signature: 'signature',
     cursor: {
       slot: 1n, transactionIndex: 0, instructionIndex: 0,
@@ -372,6 +381,9 @@ class RecordingClient {
   ) {}
 
   public async query(text: string, values?: readonly unknown[]) {
+    if (/SELECT\s+(?:domain\.)?mint\s+FROM\s+(?:domain_events|paper_positions)/iu.test(text)) {
+      return { rows: [{ mint: MINT }], rowCount: 1, command: '', oid: 0, fields: [] };
+    }
     const command = classify(text);
     this.commands.push(command);
     this.texts.push(text);

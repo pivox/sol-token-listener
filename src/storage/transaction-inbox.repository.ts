@@ -82,6 +82,12 @@ import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 import { FOUNDATION_RETENTION_SHARED_FENCE_SQL } from './foundation-retention-fence.js';
+import {
+  lockWorkerTrackingMints,
+  readWorkerTrackingDatabaseClock,
+  readWorkerTrackingAuthority,
+  type WorkerTrackingAuthority,
+} from './worker-tracking-mint-lock.js';
 
 interface Queryable {
   query(
@@ -556,22 +562,37 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         // All trade paths lock mint -> signature -> inbox row. The projection
         // synchronizer locks mint -> rows, so no row holder waits for a mint.
         if (value.ingestionHint === 'PUMPFUN_TRADE') {
-          await lockTrackedMint(client, value.ingestionHintMint);
+          if (value.ingestionHintMint === null) throw new TypeError('Tracked mint is missing.');
+          await lockWorkerTrackingMints(client, [value.ingestionHintMint]);
         }
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
           [value.signature],
         );
         let tracked = false;
+        let authority: WorkerTrackingAuthority | null = null;
         if (value.ingestionHint === 'PUMPFUN_TRADE') {
-          const membership = await client.query(
-            'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
-            [value.ingestionHintMint],
-          );
-          const active: unknown = requiredRow(membership.rows[0]).active;
-          if (typeof active !== 'boolean') throw new TypeError('Stored tracked mint membership is invalid.');
-          tracked = active;
+          if (value.ingestionHintMint === null) throw new TypeError('Tracked mint is missing.');
+          if (this.workerAdmissionPolicy.enabled) {
+            authority = await readWorkerTrackingAuthority(
+              client,
+              value.ingestionHintMint,
+              this.workerAdmissionPolicy.trackingWindowSeconds,
+            );
+            tracked = authority.active;
+          } else {
+            const membership = await client.query(
+              'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
+              [value.ingestionHintMint],
+            );
+            const active: unknown = requiredRow(membership.rows[0]).active;
+            if (typeof active !== 'boolean') throw new TypeError('Stored tracked mint membership is invalid.');
+            tracked = active;
+          }
         }
+        const authorityClock = this.workerAdmissionPolicy.enabled
+          ? authority?.at ?? await readWorkerTrackingDatabaseClock(client)
+          : null;
         const existing = await client.query(
           `SELECT observed_slot, ingestion_priority, ingestion_hint, ingestion_hint_mint,
              attempts, attempts_in_cycle, lease_token, lease_expires_at,
@@ -637,7 +658,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             return;
           }
           const inserted = await client.query(
-            `WITH decision_clock AS MATERIALIZED (SELECT clock_timestamp() AS at)
+            `WITH decision_clock AS MATERIALIZED (${this.workerAdmissionPolicy.enabled
+              ? 'SELECT $13::TIMESTAMPTZ AS at'
+              : 'SELECT clock_timestamp() AS at'})
             INSERT INTO chain_transaction_inbox (
               signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
               processing_status, observed_at, retry_max_attempts, retry_base_delay_ms,
@@ -663,6 +686,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               decision.hint,
               decision.mint,
               decision.status,
+              ...(this.workerAdmissionPolicy.enabled ? [authorityClock] : []),
             ],
           );
           requireOne(inserted.rowCount);
@@ -703,7 +727,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
         }
         const updated = await client.query(
-          `WITH decision_clock AS MATERIALIZED (SELECT clock_timestamp() AS at)
+          `WITH decision_clock AS MATERIALIZED (${this.workerAdmissionPolicy.enabled
+            ? 'SELECT $11::TIMESTAMPTZ AS at'
+            : 'SELECT clock_timestamp() AS at'})
            UPDATE chain_transaction_inbox SET
              discovery_sources = $2,
              program_ids = $3,
@@ -746,6 +772,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             decision.hint,
             decision.mint,
             decision.status,
+            ...(this.workerAdmissionPolicy.enabled ? [authorityClock] : []),
           ],
         );
         requireOne(updated.rowCount);
@@ -762,21 +789,33 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       return this.transaction(async (client) => {
         await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
         let tracked = false;
+        let authority: WorkerTrackingAuthority | null = null;
         if (value.ingestionHint === 'PUMPFUN_TRADE') {
-          await lockTrackedMint(client, value.ingestionHintMint);
+          if (value.ingestionHintMint === null) throw new TypeError('Tracked mint is missing.');
+          await lockWorkerTrackingMints(client, [value.ingestionHintMint]);
         }
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
           [value.signature],
         );
         if (value.ingestionHint === 'PUMPFUN_TRADE') {
-          const membership = await client.query(
-            'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
-            [value.ingestionHintMint],
-          );
-          const active: unknown = requiredRow(membership.rows[0]).active;
-          if (typeof active !== 'boolean') throw new TypeError('Stored tracked mint membership is invalid.');
-          tracked = active;
+          if (value.ingestionHintMint === null) throw new TypeError('Tracked mint is missing.');
+          if (this.workerAdmissionPolicy.enabled) {
+            authority = await readWorkerTrackingAuthority(
+              client,
+              value.ingestionHintMint,
+              this.workerAdmissionPolicy.trackingWindowSeconds,
+            );
+            tracked = authority.active;
+          } else {
+            const membership = await client.query(
+              'SELECT EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active',
+              [value.ingestionHintMint],
+            );
+            const active: unknown = requiredRow(membership.rows[0]).active;
+            if (typeof active !== 'boolean') throw new TypeError('Stored tracked mint membership is invalid.');
+            tracked = active;
+          }
         }
         const selected = await client.query(
           `SELECT observed_slot, ingestion_priority, ingestion_hint, ingestion_hint_mint,
@@ -1111,11 +1150,19 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       assertCanonicalMint(mint);
       await this.transaction(async (client) => {
         await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
-        await lockTrackedMint(client, mint);
+        await lockWorkerTrackingMints(client, [mint]);
+        const authority = this.workerAdmissionPolicy.enabled
+          ? await readWorkerTrackingAuthority(
+            client,
+            mint,
+            this.workerAdmissionPolicy.trackingWindowSeconds,
+          )
+          : null;
         await client.query(
-          `WITH decision AS MATERIALIZED (
-             SELECT clock_timestamp() AS at,
-               EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active
+          `WITH decision AS MATERIALIZED (${this.workerAdmissionPolicy.enabled
+            ? 'SELECT $2::TIMESTAMPTZ AS at,$3::BOOLEAN AS active'
+            : `SELECT clock_timestamp() AS at,
+               EXISTS (SELECT 1 FROM token_launches WHERE mint=$1 AND terminal_at IS NULL) AS active`}
            )
            UPDATE chain_transaction_inbox inbox SET
              processing_status=CASE WHEN decision.active OR CARDINALITY(inbox.program_ids)>1 THEN 'PENDING' ELSE 'DEFERRED' END,
@@ -1145,7 +1192,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                  AND inbox.normalized_transaction IS NULL AND inbox.immutable_fingerprint IS NULL
                  AND inbox.processed_at IS NULL AND inbox.manual_recovery_count=0
                  AND inbox.last_manual_recovery_at IS NULL))`,
-          [mint],
+          this.workerAdmissionPolicy.enabled
+            ? [mint, authority?.at, authority?.active]
+            : [mint],
         );
       });
     });
@@ -3618,13 +3667,6 @@ function assertCanonicalMint(value: unknown): asserts value is string {
     || !isCanonicalSolanaProgramId(value)) {
     throw new TypeError('Tracked mint must be a canonical Solana public key.');
   }
-}
-
-async function lockTrackedMint(client: Queryable, mint: string | null): Promise<void> {
-  await client.query(
-    "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox-mint:' || $1, 0))",
-    [mint],
-  );
 }
 
 function storedInboxPriority(value: unknown): TransactionInboxPriority {

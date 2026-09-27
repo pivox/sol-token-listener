@@ -68,6 +68,7 @@ import {
   PostgresExecutionRiskRepository,
   type ExecutionRiskClient,
 } from './execution-risk.repository.js';
+import { lockWorkerTrackingMints } from './worker-tracking-mint-lock.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -231,9 +232,20 @@ export class PostgresExecutionLiveRepository {
   ): Promise<ExecutionPreSignatureRecoveryResultV1> {
     const generationId = liveGenerationId(generationIdValue);
     return this.transaction(async (client) => {
+      const stranded = await client.query(`SELECT lock.lock_id,lock.intent_id,intent.mint
+        FROM execution_pre_signature_locks lock
+        JOIN execution_intents intent ON intent.id=lock.intent_id
+        WHERE lock.generation_id=$1 AND lock.state='AUTHORIZED'
+        ORDER BY lock.authorized_at,lock.lock_id LIMIT 2`, [generationId]);
+      const snapshot = stranded.rows.map((row) => Object.freeze({
+        lockId: text(row.lock_id),
+        intentId: text(row.intent_id),
+        mint: text(row.mint),
+      }));
+      await lockWorkerTrackingMints(client, snapshot.map((row) => row.mint));
       await lockLiveSellPresenceInTransaction(client);
       await lockGeneration(client, generationId);
-      return recoverStrandedPreSignatureLock(client, generationId);
+      return recoverStrandedPreSignatureLock(client, generationId, snapshot);
     });
   }
 
@@ -279,6 +291,7 @@ export class PostgresExecutionLiveRepository {
   ): Promise<ExecutionExactSigningAuthorizationV1> {
     const input = exactSigningInputFrom(inputValue);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [input.claim.intent.mint]);
       await lockLiveSellPresenceInTransaction(client);
       await lockGeneration(client, input.generationId);
       await lockProvider(client, input.runtime.providerId);
@@ -540,6 +553,7 @@ export class PostgresExecutionLiveRepository {
   ): Promise<ExecutionLivePersistSignedResultV1> {
     const input = persistInputFrom(inputValue);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [input.claim.intent.mint]);
       if (input.artifact.side === 'SELL') {
         await lockLiveSellPresenceInTransaction(client);
       }
@@ -607,6 +621,7 @@ export class PostgresExecutionLiveRepository {
   ): Promise<ExecutionLiveRpcCallReservationV1> {
     const input = rpcCallReservationInputFrom(inputValue);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [input.claim.intent.mint]);
       const row = exactRow(singleRow(await client.query(`SELECT
         budget.intent_id,budget.attempt_number,budget.artifact_id,budget.provider_id,
         budget.calls_reserved,budget.calls_limit,
@@ -669,6 +684,7 @@ export class PostgresExecutionLiveRepository {
     const claim = claimFrom(input.claim);
     if (!ARTIFACT_ID.test(input.artifactId)) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const row = await findArtifact(client, input.artifactId, false);
       if (row?.intent_id !== claim.intent.id
         || row.intent_status !== 'SIGNED_NOT_SUBMITTED'
@@ -697,6 +713,7 @@ export class PostgresExecutionLiveRepository {
       throw failure('INVALID_INPUT');
     }
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const row = input.artifactId === undefined
         ? await findArtifactForClaim(client, claim.intent.id, claim.intent.attemptCount)
         : await findArtifact(client, input.artifactId, false);
@@ -755,6 +772,7 @@ export class PostgresExecutionLiveRepository {
       throw failure('INVALID_INPUT');
     }
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const identity = await artifactIdentity(client, evidence.artifactId);
       await lockGeneration(client, identity.generationId);
       const row = await findArtifact(client, evidence.artifactId, true);
@@ -798,6 +816,7 @@ export class PostgresExecutionLiveRepository {
   ): Promise<ExecutionPreSubmissionRevocationResultV1> {
     const input = revocationInputFrom(inputValue);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [input.claim.intent.mint]);
       const identity = await artifactIdentity(client, input.artifactId);
       await lockGeneration(client, identity.generationId);
       const row = await findArtifact(client, input.artifactId, true);
@@ -858,6 +877,7 @@ export class PostgresExecutionLiveRepository {
       || !validRuntimeBinding(input.runtime)
       || !validBlockhashEvidence(input.blockhashValidity)) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const identity = await artifactIdentity(client, input.artifactId);
       await lockGeneration(client, identity.generationId);
       const current = await findArtifact(client, input.artifactId, true);
@@ -1010,6 +1030,7 @@ export class PostgresExecutionLiveRepository {
     const claim = claimFrom(claimValue);
     validateSubmissionOutcome(outcome);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const identity = await artifactIdentity(client, outcome.artifactId);
       await lockGeneration(client, identity.generationId);
       const row = await findArtifact(client, outcome.artifactId, true);
@@ -1096,6 +1117,7 @@ export class PostgresExecutionLiveRepository {
       throw failure('INVALID_INPUT');
     }
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const generationId = await workerGenerationId(client, claim);
       await lockGeneration(client, generationId);
       const row = exactRow(singleRow(await client.query(`SELECT
@@ -1170,6 +1192,7 @@ export class PostgresExecutionLiveRepository {
       throw failure('INVALID_INPUT');
     }
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const generationId = await workerGenerationId(client, claim);
       await lockGeneration(client, generationId);
       const row = exactRow(singleRow(await client.query(`SELECT
@@ -1316,6 +1339,7 @@ export class PostgresExecutionLiveRepository {
     const claim = claimFrom(claimValue);
     validateConfirmation(confirmation);
     return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
       const identity = await artifactIdentity(client, confirmation.artifactId);
       await lockGeneration(client, identity.generationId);
       const row = await findArtifactReference(client, confirmation.artifactId, true);
@@ -1386,6 +1410,7 @@ export class PostgresExecutionLiveRepository {
     if (claim.intent.id !== evidence.intentId) throw failure('INVALID_INPUT');
     if (evidence.side === 'SELL') {
       return this.transaction(async (client) => {
+        await lockWorkerTrackingMints(client, [claim.intent.mint]);
         await lockLiveSellPresenceInTransaction(client);
         return commitSellReconciliation(client, claim, evidence);
       });
@@ -1428,10 +1453,13 @@ export class PostgresExecutionLiveRepository {
     if (!/^execution_live_position_[0-9a-f]{64}$/u.test(input.positionId)
       || !validTimestamp(input.observedAtMs)) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
+      const identity = await deadlinePositionIdentity(client, input.positionId);
+      await lockWorkerTrackingMints(client, [identity.mint]);
       await lockLiveSellPresenceInTransaction(client);
-      const generationId = await deadlinePositionGeneration(client, input.positionId);
-      await lockGeneration(client, generationId);
-      return createDeadlineExitIntentLocked(client, { ...input, generationId });
+      await lockGeneration(client, identity.generationId);
+      return createDeadlineExitIntentLocked(client, {
+        ...input, generationId: identity.generationId,
+      });
     });
   }
 
@@ -1439,13 +1467,13 @@ export class PostgresExecutionLiveRepository {
     return this.transaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(
         hashtextextended('execution-live-deadline-scan:v1', 51007))`);
-      await lockLiveSellPresenceInTransaction(client);
       const clock = exactRow(singleRow(await client.query(`SELECT
         /* execution_live_deadline_clock */
         trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
           AS deadline_clock_ms`)), ['deadline_clock_ms'] as const);
       const observedAtMs = timestampText(clock.deadline_clock_ms);
-      const candidates = await client.query(`SELECT position.position_id,position.generation_id
+      const candidates = await client.query(`SELECT
+          position.position_id,position.generation_id,position.mint
         FROM execution_live_positions position
         WHERE position.state='OPEN'
           AND position.exit_deadline_at <= TIMESTAMPTZ 'epoch'
@@ -1454,13 +1482,18 @@ export class PostgresExecutionLiveRepository {
         observedAtMs,
       ]);
       if (candidates.rows.length === 0) return null;
-      const candidate = exactRow(singleRow(candidates), ['position_id', 'generation_id'] as const);
+      const candidate = exactRow(singleRow(candidates), [
+        'position_id', 'generation_id', 'mint',
+      ] as const);
       const positionId = text(candidate.position_id);
       const generationId = text(candidate.generation_id);
+      const mint = solanaAddress(candidate.mint);
       if (!/^execution_live_position_[0-9a-f]{64}$/u.test(positionId)
         || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
         throw failure('INVALID_DATA');
       }
+      await lockWorkerTrackingMints(client, [mint]);
+      await lockLiveSellPresenceInTransaction(client);
       await lockGeneration(client, generationId);
       const result = await createDeadlineExitIntentLocked(client, {
         positionId, observedAtMs, generationId,
@@ -1797,6 +1830,7 @@ async function insertRevocationProof(
 async function recoverStrandedPreSignatureLock(
   client: DatabaseClient,
   generationId: string,
+  snapshot: readonly Readonly<{ readonly lockId: string; readonly intentId: string }>[],
 ): Promise<ExecutionPreSignatureRecoveryResultV1> {
   const result = await client.query(`SELECT
     lock.lock_id,lock.intent_id,lock.attempt_number,
@@ -1833,8 +1867,16 @@ async function recoverStrandedPreSignatureLock(
     JOIN execution_wallet_risk_state risk ON risk.generation_id=lock.generation_id
     JOIN execution_control_state control ON control.generation_id=lock.generation_id
     WHERE lock.generation_id=$1 AND lock.state='AUTHORIZED'
+      AND (lock.lock_id,lock.intent_id) IN (
+        SELECT identity.lock_id,identity.intent_id
+        FROM UNNEST($2::TEXT[],$3::TEXT[]) AS identity(lock_id,intent_id)
+      )
     ORDER BY lock.authorized_at,lock.lock_id LIMIT 2
-    FOR UPDATE OF lock,intent,attempt,armament,reservation,risk,control`, [generationId]);
+    FOR UPDATE OF lock,intent,attempt,armament,reservation,risk,control`, [
+    generationId,
+    snapshot.map((identity) => identity.lockId),
+    snapshot.map((identity) => identity.intentId),
+  ]);
   if (result.rows.length === 0) {
     return Object.freeze({ payloadVersion: 1, kind: 'IDLE' });
   }
@@ -4925,19 +4967,19 @@ async function commitSellReconciliation(
   });
 }
 
-async function deadlinePositionGeneration(
+async function deadlinePositionIdentity(
   client: DatabaseClient,
   positionId: string,
-): Promise<string> {
-  const identity = exactRow(singleRow(await client.query(`SELECT generation_id
+): Promise<Readonly<{ readonly generationId: string; readonly mint: string }>> {
+  const identity = exactRow(singleRow(await client.query(`SELECT generation_id,mint
     FROM execution_live_positions WHERE position_id=$1`, [positionId])), [
-    'generation_id',
+    'generation_id', 'mint',
   ] as const);
   const generationId = text(identity.generation_id);
   if (!/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
     throw failure('INVALID_DATA');
   }
-  return generationId;
+  return Object.freeze({ generationId, mint: solanaAddress(identity.mint) });
 }
 
 async function createDeadlineExitIntentLocked(
