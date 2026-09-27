@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { isProxy } from 'node:util/types';
 import test from 'node:test';
+import { trustedTerminalAttribution, trustedTerminalAttributionContext } from '../src/domain/terminal-attribution.js';
 import { PublicKey } from '@solana/web3.js';
 import {
   PumpFunCatchUpBlockClassifier,
@@ -36,6 +37,7 @@ import {
 } from '../src/solana/rpc/transaction-locator.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { loadMainnetFixture, loadPumpFixture } from './helpers/pumpfun-fixture.js';
+import { malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
 
 type LocatorHandler = (
   target: TransactionLocationTarget,
@@ -388,10 +390,13 @@ void test('quarantines trade-only multi-mint evidence and bounds overflow at six
 
   assert.equal(multi.disposition, 'QUARANTINED');
   assert.equal(multi.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(trustedTerminalAttribution(multi)?.causeKind, 'PUMP_MULTI_MINT');
+  assert.equal(trustedTerminalAttributionContext(multi)?.locator.transactionIndex, transaction.transactionIndex);
   assert.equal(multi.mints.length, 2);
   assert.deepEqual(multi.mints, [...multi.mints].sort());
   assert.equal(overflow.disposition, 'QUARANTINED');
   assert.equal(overflow.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(trustedTerminalAttribution(overflow)?.causeKind, 'PUMP_MINT_LIMIT');
   assert.deepEqual(overflow.mints, []);
   assert.notEqual(overflow.evidenceFingerprint, largerOverflow.evidenceFingerprint);
 });
@@ -447,6 +452,9 @@ void test('maps exact trusted locator failures once and rejects retryable or unt
       .classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
     assert.equal(repository.values[0]?.disposition, 'QUARANTINED');
     assert.equal(repository.values[0]?.reasonCode, reason);
+    assert.equal(trustedTerminalAttribution(repository.values[0])?.causeKind,
+      reason === 'PROVIDER_SIGNATURE_MISSING' ? 'LOCATOR' : 'NORMALIZATION');
+    assert.equal(trustedTerminalAttributionContext(repository.values[0])?.locator.transactionIndex, null);
     assert.equal(trustedTransactionLocatorFailure(failure), null);
   }
 
@@ -496,10 +504,42 @@ void test('quarantines trusted decoder origins with distinct semantic fingerprin
 
   assert.equal(firstRepository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
   assert.equal(secondRepository.values[0]?.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(trustedTerminalAttribution(firstRepository.values[0])?.causeKind, 'PUMP_DECODER');
+  assert.equal(trustedTerminalAttribution(secondRepository.values[0])?.causeKind, 'PUMP_DECODER');
+  assert.equal(trustedTerminalAttributionContext(firstRepository.values[0])?.originCode, 'PUMP_TRANSACTION_INDEX_REQUIRED');
+  assert.equal(trustedTerminalAttributionContext(secondRepository.values[0])?.originCode, 'PUMP_STACK_HEIGHT_REQUIRED');
   assert.notEqual(
     firstRepository.values[0]?.evidenceFingerprint,
     secondRepository.values[0]?.evidenceFingerprint,
   );
+});
+
+void test('keeps decoder wire provenance on the exact classification after normalized evidence disappears', async () => {
+  const transaction = malformedPumpTransaction('PUMP_BORSH_INVALID');
+  const repository = new RecordingRepository();
+  const input = Object.freeze({ ...discovery(transaction), confirmationStatus: 'processed' as const });
+  await new PumpFunCatchUpBlockClassifier(returning(new Map([[transaction.signature, transaction]])),
+    repository, () => 60_000).classify([input], NEVER_ABORTED);
+  const classification = repository.values[0];
+  assert.ok(classification);
+  assert.deepEqual(Reflect.ownKeys(classification), [
+    'signature', 'slot', 'programIds', 'confirmationStatus', 'observedAtMs', 'ingestionHint',
+    'ingestionHintMint', 'classificationVersion', 'disposition', 'reasonCode', 'mints',
+    'evidenceFingerprint', 'classifiedAtMs',
+  ]);
+  assert.equal(classification.reasonCode, 'PUMP_SCHEMA_UNSUPPORTED');
+  assert.equal(classification.confirmationStatus, 'processed');
+  assert.equal(trustedTerminalAttribution(classification)?.diagnosticCode, 'PUMP_BORSH_INVALID');
+  const context = trustedTerminalAttributionContext(classification);
+  assert.deepEqual(context, { originCode: 'PUMP_BORSH_INVALID', locator: {
+    signature: 'sig', slot: 1n, transactionIndex: 0, confirmationStatus: 'confirmed',
+    instructionIndex: 0, innerInstructionIndex: null,
+  } });
+  transaction.confirmationStatus = 'FINALIZED';
+  transaction.instructions[0]?.data.fill(0);
+  assert.equal(context?.locator.confirmationStatus, 'confirmed');
+  assert.equal(trustedTerminalAttribution(classification)?.pumpWire?.discriminatorHex, '66063d1201daebea');
+  assert.equal(trustedTerminalAttributionContext({ ...classification }), null);
 });
 
 void test('validates and snapshots the complete input before clock, locator or repository effects', async () => {

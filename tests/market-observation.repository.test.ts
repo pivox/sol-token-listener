@@ -4,6 +4,7 @@ import test from 'node:test';
 import pg from 'pg';
 import type { PoolClient } from 'pg';
 import { ConfirmationStatusConflictError } from '../src/domain/confirmation-status.js';
+import { trustedTerminalAttribution } from '../src/domain/terminal-attribution.js';
 import type { ChainConfirmationStatus } from '../src/domain/types.js';
 import type { MatchedMigration } from '../src/application/pumpswap-migration-matcher.js';
 import {
@@ -30,11 +31,14 @@ class InstrumentedClient {
   public readonly reserveRows = new Map<string, Record<string, unknown>>();
   public readonly launchStates: string[] = ['OBSERVING', 'MIGRATION_PENDING'];
   public throwOn: RegExp | null = null;
+  public readonly databaseFailure = Object.assign(new Error('database failure'), {
+    code: 'PUMPSWAP_PERSISTENCE_UNKNOWN',
+  });
   public released = false;
 
   public query(text: string, values: readonly unknown[] = []) {
     this.calls.push({ text, values });
-    if (this.throwOn?.test(text) === true) throw new Error('database failure');
+    if (this.throwOn?.test(text) === true) throw this.databaseFailure;
     if (text.includes('SELECT confirmation_status, payload FROM raw_chain_events')) {
       const row = this.rawRows.get(String(values[0]));
       return Promise.resolve({ rows: row === undefined ? [] : [row], rowCount: row === undefined ? 0 : 1 });
@@ -217,10 +221,38 @@ void test('intermediate repository errors rollback the whole batch', async () =>
       reserveSnapshots: [],
       trades: [],
     }),
-    /database failure/u,
+    (error) => {
+      assert.equal(error, client.databaseFailure);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_PERSISTENCE_UNKNOWN',
+      );
+      return true;
+    },
   );
   assert.equal(client.calls.at(-1)?.text, 'ROLLBACK');
   assert.equal(client.released, true);
+});
+
+void test('market repository connection failures receive only the persistence diagnostic', async () => {
+  const failure = Object.assign(new Error('connect failed'), {
+    code: '40001',
+    name: 'MarketObservationPayloadConflictError',
+  });
+  const repository = new PostgresMarketObservationRepository({
+    async connect() { throw failure; },
+  });
+  await assert.rejects(
+    repository.record({ rawEvents: [], matches: [], reserveSnapshots: [], trades: [] }),
+    (error) => {
+      assert.equal(error, failure);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_PERSISTENCE_UNKNOWN',
+      );
+      return true;
+    },
+  );
 });
 
 void test('reserve replay rejects contradictory immutable amounts', async () => {

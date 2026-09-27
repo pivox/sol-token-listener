@@ -63,12 +63,12 @@ const SIMULATION_ONLY_ALLOWED_BARE_MODULES = new Set([
 const AUDITED_PUMPFUN_SDK_PATH = /^(?:dist\/)?src\/launchpads\/pumpfun\/official-sdk\.(?:js|ts)$/u;
 const AUDITED_PUMPSWAP_SDK_PATH = /^(?:dist\/)?src\/markets\/pumpswap\/official-sdk\.(?:js|ts)$/u;
 const SIMULATION_ONLY_ALLOWED_NODE_BUILTINS = new Set([
-  'node:crypto', 'node:fs/promises', 'node:path', 'node:url', 'node:util/types',
+  'node:buffer', 'node:crypto', 'node:fs/promises', 'node:path', 'node:url', 'node:util/types',
 ]);
 const SIMULATION_ONLY_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor\/(?:main|config|database|dry-run-worker|simulation-worker|logger|runtime)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor-simulation\/(?:attempt-evaluator|build-plan|build-receipt|instruction-inspector|message-compiler|provider-session|pumpfun-adapter|pumpfun-quote|pumpswap-adapter|solana-simulation-gateway|venue-router)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/(?:execution-(?:dry-run|intent|simulation)|market|market-errors|observed-pipeline-failure|solana-public-key|types)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/(?:execution-(?:dry-run|intent|simulation)|market|market-errors|observed-pipeline-(?:failure|taxonomy)|solana-public-key|terminal-attribution|types)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/(?:execution-(?:dry-run-repository|intent-repository|market-gateway|simulation-gateway|simulation-repository|venue-repository)|market-rpc-reader|pumpswap-quote-provider)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/(?:database|execution-(?:dry-run\.repository|intent(?:-expiration|\.repository)|simulation\.repository|venue\.repository))\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/foundation-retention-fence\.(?:js|ts)$/u,

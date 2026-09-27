@@ -1,33 +1,18 @@
 import { isProxy } from 'node:util/types';
 import type { IngestionFailure } from './transaction-ingestion.js';
+import { inheritTrustedTerminalAttribution } from './terminal-attribution.js';
 
-/** Durable wire contract v1.0.0. Keep provider text and adapter objects outside this module. */
-export const OBSERVED_PIPELINE_STAGES = [
-  'create_observation', 'load_tracked_mints', 'launchpad_observation',
-  'sync_tracked_mint', 'reload_active_events', 'funding_observation',
-  'participant_analytics', 'wallet_graph', 'pumpswap_observation',
-  'qualification', 'paper_decision_enqueue',
-] as const;
-
-export type ObservedPipelineStage = (typeof OBSERVED_PIPELINE_STAGES)[number];
-
-export const OBSERVED_PIPELINE_ORIGIN_CODES = [
-  'PUMP_TRANSACTION_INDEX_REQUIRED', 'PUMP_SCHEMA_UNSUPPORTED',
-  'PUMP_BORSH_TRUNCATED', 'PUMP_BORSH_INVALID', 'PUMP_ACCOUNT_MISSING',
-  'PUMP_STACK_HEIGHT_REQUIRED', 'PUMP_STACK_HEIGHT_INVALID',
-  'PUMP_EVENT_MISSING', 'PUMP_EVENT_DUPLICATE', 'PUMP_EVENT_ORPHANED',
-  'PUMP_EVENT_AMBIGUOUS', 'PUMP_EVENT_MISMATCH', 'PUMP_QUOTE_ASSET_UNRESOLVED',
-  'PUMP_QUOTE_ASSET_CONFLICT', 'PUMP_TOKEN_PROGRAM_UNSUPPORTED',
-  'PUMPSWAP_ACCOUNT_MISSING', 'PUMPSWAP_BORSH_INVALID', 'PUMPSWAP_BORSH_TRUNCATED',
-  'PUMPSWAP_EVENT_AMBIGUOUS', 'PUMPSWAP_EVENT_DUPLICATE', 'PUMPSWAP_EVENT_MISMATCH',
-  'PUMPSWAP_EVENT_MISSING', 'PUMPSWAP_EVENT_ORPHANED', 'PUMPSWAP_SCHEMA_UNSUPPORTED',
-  'PUMPSWAP_STACK_HEIGHT_REQUIRED', 'PUMPSWAP_TOKEN_PROGRAM_UNSUPPORTED',
-  'UNKNOWN',
-] as const;
+import {
+  OBSERVED_PIPELINE_STAGES, OBSERVED_PIPELINE_ORIGIN_CODES,
+  type ObservedPipelineOriginCode,
+} from './observed-pipeline-taxonomy.js';
+export {
+  OBSERVED_PIPELINE_STAGES, OBSERVED_PIPELINE_ORIGIN_CODES,
+  type ObservedPipelineStage, type ObservedPipelineOriginCode,
+} from './observed-pipeline-taxonomy.js';
 
 const stages = new Set<string>(OBSERVED_PIPELINE_STAGES);
 const codes = new Set<string>(OBSERVED_PIPELINE_ORIGIN_CODES);
-export type ObservedPipelineOriginCode = (typeof OBSERVED_PIPELINE_ORIGIN_CODES)[number];
 const trustedOrigins = new WeakMap<object, Exclude<ObservedPipelineOriginCode, 'UNKNOWN'>>();
 const decoderQuarantineErrorNames = new Set<string>([
   'ObservedPipelineFailure.v1.launchpad_observation.PUMP_SCHEMA_UNSUPPORTED',
@@ -47,9 +32,11 @@ export function trustedObservedPipelineOrigin(value: unknown): Exclude<ObservedP
 }
 
 /** @internal Wrapping can only preserve authority already present on the exact cause. */
-export function inheritObservedPipelineOrigin(wrapper: Error, cause: unknown): void {
+export function inheritObservedPipelineOrigin(wrapper: object, cause: unknown): void {
+  if (isProxy(wrapper)) return;
   const code = trustedObservedPipelineOrigin(cause);
   if (code !== null) trustedOrigins.set(wrapper, code);
+  inheritTrustedTerminalAttribution(wrapper, cause);
 }
 
 export function assertValidObservedPipelineFailure(errorName: string, retryable: boolean): void {

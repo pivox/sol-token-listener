@@ -5852,6 +5852,10 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
           purge_after = retained.terminal_at + INTERVAL '4 hours'
       FROM (SELECT clock_timestamp() - INTERVAL '5 hours' AS terminal_at) retained
       WHERE inbox.signature = 'failed-purge-me'`);
+    await pool.query(`UPDATE transaction_inbox_terminal_attributions attribution
+      SET captured_at=inbox.terminal_at,purge_after=inbox.purge_after
+      FROM chain_transaction_inbox inbox
+      WHERE attribution.signature=inbox.signature AND inbox.signature='failed-purge-me'`);
     await pool.query(`WITH recovery_clock AS MATERIALIZED (
       SELECT clock_timestamp() AS recovered_at
     )
@@ -5865,6 +5869,7 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
     const firstPurge = await purgeExpiredFoundationData(pool);
     assert.equal(firstPurge.websocketHealthEvidence, 0);
     assert.equal(firstPurge.transactionInbox, 2);
+    assert.equal(firstPurge.transactionInboxTerminalAttributions, 1);
     assert.equal(firstPurge.transactionInboxRecoveries, 0);
     assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'keep-me'")).rows[0]?.count, '1');
     assert.equal((await pool.query(

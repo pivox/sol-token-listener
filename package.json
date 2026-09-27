@@ -60,6 +60,7 @@
     "paper:mvp:compiled": "node dist/src/cli/paper-mvp.js",
     "pool:diagnose": "tsx scripts/diagnose-pool.ts",
     "canary:evaluate": "tsx scripts/evaluate-mainnet-observe-canary.ts",
+    "canary:capture-terminal-attribution": "node dist/scripts/capture-mainnet-terminal-attribution.js",
     "tx:diagnose": "tsx scripts/diagnose-transaction.ts",
     "fixture:capture": "tsx scripts/capture-fixture.ts",
     "inbox:recover": "tsx scripts/recover-inbox.ts",

@@ -226,6 +226,11 @@ void test('ignored and quarantined classifications purge after exactly four hour
       new URL('051_transaction_inbox_decoder_quarantine_recovery.sql', migrationsDirectory),
       'utf8',
     ));
+    // Current retention also expires attribution; preserve the historical 048 fixture rows.
+    await pool.query(await readFile(
+      new URL('057_transaction_inbox_terminal_attribution.sql', migrationsDirectory),
+      'utf8',
+    ));
     assert.deepEqual((await pool.query(`SELECT first_detected_at FROM chain_transaction_inbox
       WHERE signature LIKE 'purge-%' ORDER BY signature`)).rows, [
       { first_detected_at: null }, { first_detected_at: null },

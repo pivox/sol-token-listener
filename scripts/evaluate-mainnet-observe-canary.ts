@@ -24,15 +24,24 @@ export async function runMainnetObserveCanaryCommand(
   args: readonly string[],
   dependencies: MainnetObserveCanaryCommandDependencies = defaultDependencies,
 ): Promise<0 | 1 | 2> {
-  if (args.length !== 1 || args[0] === undefined || args[0].length === 0) {
+  if (args.length !== 2 || args[0] === undefined || args[0].length === 0
+    || args[1] === undefined || args[1].length === 0) {
     dependencies.writeStderr(FIXED_ERROR);
     return 1;
   }
   try {
     const input = await dependencies.readInput(args[0], MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES);
+    const terminalAttribution = await dependencies.readInput(
+      args[1],
+      MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES,
+    );
     if (Buffer.byteLength(input, 'utf8') > MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES) throw new Error();
+    if (Buffer.byteLength(terminalAttribution, 'utf8') > MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES) {
+      throw new Error();
+    }
     const parsed: unknown = JSON.parse(input);
-    const result = evaluateMainnetObserveCanary(parsed);
+    const parsedTerminalAttribution: unknown = JSON.parse(terminalAttribution);
+    const result = evaluateMainnetObserveCanary(parsed, parsedTerminalAttribution);
     dependencies.writeStdout(`${JSON.stringify(result)}\n`);
     return result.overallVerdict === 'PASS' ? 0 : 2;
   } catch {

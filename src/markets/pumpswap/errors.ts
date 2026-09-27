@@ -1,4 +1,10 @@
 import { registerInternalDecodingFailure, trustedObservedPipelineOrigin } from '../../domain/observed-pipeline-failure.js';
+import {
+  inheritTrustedTerminalAttribution,
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+  type TerminalDiagnosticCode,
+} from '../../domain/terminal-attribution.js';
 import type { ChainCursor } from '../../domain/types.js';
 export const PUMPSWAP_DECODING_ERROR_CODES = [
   'PUMPSWAP_ACCOUNT_MISSING',
@@ -27,6 +33,17 @@ export function createPumpSwapDecodingError(
   return error;
 }
 
+/** @internal Adds diagnostics only to an error authenticated by the internal factory. */
+export function registerPumpSwapDecodingTerminalAttribution(
+  error: PumpSwapDecodingError,
+  attribution: unknown,
+): void {
+  if (trustedPumpSwapDecodingCode(error) === null) {
+    throw new TypeError('PumpSwap decoding error identity is not trusted.');
+  }
+  registerTrustedTerminalAttribution(error, attribution);
+}
+
 export function trustedPumpSwapDecodingCode(value: unknown): PumpSwapDecodingErrorCode | null {
   const code = trustedObservedPipelineOrigin(value);
   return knownCodes.has(code) ? code as PumpSwapDecodingErrorCode : null;
@@ -42,9 +59,43 @@ export class PumpSwapMutableRpcDecodingError extends Error {
 /** Remove terminal authority only from a trusted decoder error at a mutable RPC boundary. */
 export function rethrowMutablePumpSwapRpcFailure(cause: unknown): never {
   if (trustedPumpSwapDecodingCode(cause) !== null) {
-    throw new PumpSwapMutableRpcDecodingError(cause);
+    registerPumpSwapTerminalDiagnostic(
+      cause,
+      'PUMPSWAP_MUTABLE_ACCOUNT_DECODING',
+    );
+    const error = new PumpSwapMutableRpcDecodingError(cause);
+    inheritTrustedTerminalAttribution(error, cause);
+    throw error;
   }
   throw cause;
+}
+
+/** @internal Registers a closed diagnostic only at a trusted PumpSwap boundary. */
+export function registerPumpSwapTerminalDiagnostic(
+  identity: unknown,
+  diagnosticCode: Extract<TerminalDiagnosticCode,
+    | 'PUMPSWAP_MUTABLE_RPC_UNAVAILABLE'
+    | 'PUMPSWAP_RPC_CONTEXT_INVALID'
+    | 'PUMPSWAP_MUTABLE_ACCOUNT_DECODING'
+    | 'PUMPSWAP_MARKET_POOL_MISMATCH'
+    | 'PUMPSWAP_MARKET_POOL_NON_CANONICAL'
+    | 'PUMPSWAP_UNSUPPORTED_TOKEN_EXTENSION'
+    | 'PUMPSWAP_PERSISTENCE_UNKNOWN'
+    | 'UNAVAILABLE'>,
+): void {
+  if (typeof identity !== 'object'
+    || identity === null
+    || trustedTerminalAttribution(identity) !== null) return;
+  try {
+    registerTrustedTerminalAttribution(identity, {
+      version: 1,
+      diagnosticCode,
+      causeKind: null,
+      pumpWire: null,
+    });
+  } catch {
+    // Hostile/proxied/revoked identities keep their existing runtime behavior.
+  }
 }
 
 export class PumpSwapDecodingError extends Error {

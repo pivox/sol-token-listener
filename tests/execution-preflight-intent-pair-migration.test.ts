@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '041_execution_preflight_intent_pairs.sql';
-const migrationHeadName = '056_transaction_inbox_bounded_tracking.sql';
+const migrationHeadName = '057_transaction_inbox_terminal_attribution.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const wsolMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = 'a'.repeat(64);

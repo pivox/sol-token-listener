@@ -7,6 +7,7 @@ import {
 import { PublicKey } from '@solana/web3.js';
 import type { CanonicalMarketPool } from '../src/domain/market.js';
 import { trustedObservedPipelineOrigin } from '../src/domain/observed-pipeline-failure.js';
+import { trustedTerminalAttribution } from '../src/domain/terminal-attribution.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { PUMPSWAP_ACCOUNTS, PUMPSWAP_TYPES } from '../src/markets/pumpswap/generated/pumpswap-idl.js';
 import {
@@ -15,7 +16,10 @@ import {
   PumpSwapReserveReader,
 } from '../src/markets/pumpswap/pumpswap-reserve-reader.js';
 import type { ReadonlyAccountSnapshot } from '../src/ports/market-rpc-reader.js';
-import { SolanaMarketRpcReader } from '../src/solana/rpc/market-rpc-reader.js';
+import {
+  MarketRpcContextError,
+  SolanaMarketRpcReader,
+} from '../src/solana/rpc/market-rpc-reader.js';
 
 const POOL = key(1);
 const CREATOR = key(2);
@@ -39,15 +43,42 @@ void test('PumpSwap reserves include signed virtual quote reserves', async () =>
 
 void test('PumpSwap reserves reject inconsistent slot, owner and mint', async () => {
   const valid = fixtures();
-  for (const accounts of [
-    [valid[0], { ...valid[1], slot: 124n }, valid[2]],
-    [valid[0], { ...valid[1], owner: TOKEN_PROGRAM_ID.toBase58() }, valid[2]],
-    [valid[0], tokenAccount(BASE_VAULT, QUOTE, 10_000_000n, TOKEN_2022_PROGRAM_ID), valid[2]],
+  for (const [accounts, expected] of [
+    [[valid[0], { ...valid[1], slot: 124n }, valid[2]], 'PUMPSWAP_RPC_CONTEXT_INVALID'],
+    [[valid[0], { ...valid[1], owner: TOKEN_PROGRAM_ID.toBase58() }, valid[2]],
+      'PUMPSWAP_MUTABLE_ACCOUNT_DECODING'],
+    [[valid[0], tokenAccount(BASE_VAULT, QUOTE, 10_000_000n, TOKEN_2022_PROGRAM_ID), valid[2]],
+      'PUMPSWAP_MARKET_POOL_MISMATCH'],
   ] as const) {
     const reader = new PumpSwapReserveReader({
       readAccountsAtSameSlot: () => Promise.resolve(accounts),
     });
-    await assert.rejects(reader.read(canonicalPool()), InvalidPumpSwapReserveError);
+    await assert.rejects(reader.read(canonicalPool()), (error: unknown) => {
+      assert.ok(error instanceof InvalidPumpSwapReserveError);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        expected,
+      );
+      return true;
+    });
+  }
+});
+
+void test('distinguishes absent mutable accounts from malformed vault bytes', async () => {
+  const valid = fixtures();
+  for (const [accounts, expected] of [
+    [[null, valid[1], valid[2]], 'PUMPSWAP_MUTABLE_RPC_UNAVAILABLE'],
+    [[valid[0], { ...valid[1], data: new Uint8Array(1) }, valid[2]],
+      'PUMPSWAP_MUTABLE_ACCOUNT_DECODING'],
+  ] as const) {
+    const reader = new PumpSwapReserveReader({
+      readAccountsAtSameSlot: () => Promise.resolve(accounts),
+    });
+    await assert.rejects(reader.read(canonicalPool()), (error: unknown) => {
+      assert.ok(error instanceof InvalidPumpSwapReserveError);
+      assert.equal(trustedTerminalAttribution(error)?.diagnosticCode, expected);
+      return true;
+    });
   }
 });
 
@@ -61,6 +92,20 @@ void test('PumpSwap reserves reject non-positive effective quote liquidity', asy
     (error: unknown) => error instanceof InvalidEffectiveQuoteReserveError
       && error.amountRaw === 0n,
   );
+});
+
+void test('invalid injected observation clocks remain explicitly unavailable', async () => {
+  const reader = new PumpSwapReserveReader({
+    readAccountsAtSameSlot: () => Promise.resolve(fixtures()),
+  }, () => -1);
+  await assert.rejects(reader.read(canonicalPool()), (error: unknown) => {
+    assert.ok(error instanceof InvalidPumpSwapReserveError);
+    assert.equal(
+      trustedTerminalAttribution(error)?.diagnosticCode,
+      'UNAVAILABLE',
+    );
+    return true;
+  });
 });
 
 void test('PumpSwap reserve RPC decoding failures lose terminal authority and can be retried', async () => {
@@ -81,10 +126,57 @@ void test('PumpSwap reserve RPC decoding failures lose terminal authority and ca
       trustedObservedPipelineOrigin(error.cause),
       'PUMPSWAP_BORSH_TRUNCATED',
     );
+    assert.equal(
+      trustedTerminalAttribution(error)?.diagnosticCode,
+      'PUMPSWAP_MUTABLE_ACCOUNT_DECODING',
+    );
     return true;
   });
   assert.equal((await reader.read(canonicalPool())).observedSlot, 123n);
   assert.equal(calls, 2);
+});
+
+void test('classifies mutable RPC availability and context only at the reader boundary', async () => {
+  const rpcFailure = Object.assign(new Error('provider unavailable'), {
+    name: 'MarketRpcContextError',
+    diagnosticCode: 'PUMPSWAP_RPC_CONTEXT_INVALID',
+  });
+  const unavailable = new SolanaMarketRpcReader({
+    async getMultipleAccountsInfoAndContext() { throw rpcFailure; },
+  });
+  await assert.rejects(
+    unavailable.readAccountsAtSameSlot([key(20).toBase58()]),
+    (error) => {
+      assert.equal(error, rpcFailure);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_MUTABLE_RPC_UNAVAILABLE',
+      );
+      return true;
+    },
+  );
+
+  const invalidContext = new SolanaMarketRpcReader({
+    async getMultipleAccountsInfoAndContext() {
+      return { context: { slot: -1 }, value: [null] };
+    },
+  });
+  await assert.rejects(
+    invalidContext.readAccountsAtSameSlot([key(21).toBase58()]),
+    (error) => {
+      assert.ok(error instanceof MarketRpcContextError);
+      assert.equal(
+        trustedTerminalAttribution(error)?.diagnosticCode,
+        'PUMPSWAP_RPC_CONTEXT_INVALID',
+      );
+      return true;
+    },
+  );
+
+  assert.equal(
+    trustedTerminalAttribution(new MarketRpcContextError('forged')),
+    null,
+  );
 });
 
 void test('Solana market RPC reader snapshots one immutable context without writes', async () => {

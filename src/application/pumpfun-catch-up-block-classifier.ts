@@ -11,6 +11,14 @@ import {
 } from '../domain/catch-up-classification.js';
 import { trustedObservedPipelineOrigin } from '../domain/observed-pipeline-failure.js';
 import {
+  inheritTrustedTerminalAttribution,
+  registerTrustedTerminalAttribution,
+  registerTrustedTerminalAttributionContext,
+  trustedTerminalAttribution,
+  trustedTerminalAttributionContext,
+  type TerminalAttributionCauseKind,
+} from '../domain/terminal-attribution.js';
+import {
   isCanonicalSolanaProgramId,
   type TransactionNotificationIngestionHint,
 } from '../domain/transaction-ingestion.js';
@@ -242,20 +250,20 @@ export class PumpFunCatchUpBlockClassifier {
       if (trusted === null) throw failure('LOCATOR_UNTRUSTED');
       if (trusted.retryable) throw failure('LOCATOR_RETRYABLE');
       if (trusted.code === 'TRANSACTION_INDEX_NOT_FOUND') {
-        return Object.freeze({
+        return attributeCatchUp(Object.freeze({
           kind: 'QUARANTINE',
           discovery: row.discovery,
           reasonCode: 'PROVIDER_SIGNATURE_MISSING',
           marker: `LOCATOR:${trusted.code}`,
-        });
+        } as const), 'LOCATOR', null, row.discovery);
       }
       if (trusted.code === 'NORMALIZATION_FAILED') {
-        return Object.freeze({
+        return attributeCatchUp(Object.freeze({
           kind: 'QUARANTINE',
           discovery: row.discovery,
           reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
           marker: `LOCATOR:${trusted.code}`,
-        });
+        } as const), 'NORMALIZATION', null, row.discovery);
       }
       throw failure('LOCATOR_UNSUPPORTED_FAILURE');
     }
@@ -326,7 +334,7 @@ function classificationForOutcome(
   classifiedAtMs: number,
 ): CatchUpClassification {
   if (outcome.kind === 'QUARANTINE') {
-    return classificationFromDecision(outcome.discovery, Object.freeze({
+    const classification = classificationFromDecision(outcome.discovery, Object.freeze({
       disposition: 'QUARANTINED',
       reasonCode: outcome.reasonCode,
       ingestionHint: null,
@@ -335,6 +343,8 @@ function classificationForOutcome(
       marker: outcome.marker,
       actions: Object.freeze([]),
     }), classifiedAtMs);
+    inheritTrustedTerminalAttribution(classification, outcome);
+    return classification;
   }
   if (!outcome.discovery.transactionFailed && outcome.transaction.error !== null) {
     throw failure('TRANSACTION_OUTCOME_MISMATCH');
@@ -358,7 +368,7 @@ function classificationForOutcome(
     if (origin === null || !trustedPumpCodes.has(origin)) {
       throw failure('DECODER_UNTRUSTED');
     }
-    return classificationFromDecision(outcome.discovery, Object.freeze({
+    return attributeCatchUp(classificationFromDecision(outcome.discovery, Object.freeze({
       disposition: 'QUARANTINED',
       reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
       ingestionHint: null,
@@ -366,7 +376,7 @@ function classificationForOutcome(
       mints: Object.freeze([]),
       marker: `DECODER:${origin}`,
       actions: Object.freeze([]),
-    }), classifiedAtMs);
+    }), classifiedAtMs), 'PUMP_DECODER', outcome.transaction, null, error);
   }
   return createPumpFunCatchUpClassificationFromDecoded(
     outcome.discovery,
@@ -404,11 +414,11 @@ function decisionFromDecoded(decoded: DecodedPumpTransaction): ClassificationDec
     ...decoded.trades.map(({ event }) => event.mint),
   ]);
   if (evidenceMints.length > MAX_CLASSIFICATION_MINTS) {
-    return Object.freeze({
+    return attributeCatchUp(Object.freeze({
       disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
       ingestionHint: null, ingestionHintMint: null, mints: Object.freeze([]),
       marker: `MINT_LIMIT_EXCEEDED:${evidenceMints.length}`, actions,
-    });
+    } as const), 'PUMP_MINT_LIMIT', decoded.transaction, null);
   }
   if (decoded.creations.length > 0) {
     return Object.freeze({
@@ -428,11 +438,11 @@ function decisionFromDecoded(decoded: DecodedPumpTransaction): ClassificationDec
     });
   }
   if (tradeMints.length > 1) {
-    return Object.freeze({
+    return attributeCatchUp(Object.freeze({
       disposition: 'QUARANTINED', reasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
       ingestionHint: null, ingestionHintMint: null,
       mints: tradeMints, marker: `TRADE_MULTI_MINT:${tradeMints.length}`, actions,
-    });
+    } as const), 'PUMP_MULTI_MINT', decoded.transaction, null);
   }
   return Object.freeze({
     disposition: 'IGNORED', reasonCode: 'NO_SUPPORTED_PUMP_ACTION',
@@ -446,7 +456,7 @@ function classificationFromDecision(
   decision: ClassificationDecision,
   classifiedAtMs: number,
 ): CatchUpClassification {
-  return createCatchUpClassification(Object.freeze({
+  const classification = createCatchUpClassification(Object.freeze({
     signature: discovery.signature,
     slot: discovery.slot,
     programIds: discovery.programIds,
@@ -461,6 +471,39 @@ function classificationFromDecision(
     evidenceFingerprint: evidenceFingerprint(discovery, decision),
     classifiedAtMs,
   }));
+  inheritTrustedTerminalAttribution(classification, decision);
+  return classification;
+}
+
+/** Evidence follows exact private decisions; it never participates in their fingerprint. */
+function attributeCatchUp<T extends object>(
+  identity: T,
+  causeKind: TerminalAttributionCauseKind,
+  transaction: NormalizedTransaction | null,
+  discovery: MergedCatchUpDiscovery | null,
+  source?: unknown,
+): T {
+  try {
+    inheritTrustedTerminalAttribution(identity, source);
+    if (trustedTerminalAttribution(identity) === null) {
+      registerTrustedTerminalAttribution(identity, {
+        version: 1, diagnosticCode: 'UNAVAILABLE', causeKind, pumpWire: null,
+      });
+    }
+    if (trustedTerminalAttributionContext(identity) === null) {
+      registerTrustedTerminalAttributionContext(identity, {
+        originCode: trustedObservedPipelineOrigin(source),
+        locator: {
+          signature: transaction?.signature ?? discovery?.signature,
+          slot: transaction?.slot ?? discovery?.slot,
+          transactionIndex: transaction?.transactionIndex ?? null,
+          confirmationStatus: transaction?.confirmationStatus.toLowerCase() ?? discovery?.confirmationStatus,
+          instructionIndex: null, innerInstructionIndex: null,
+        },
+      });
+    }
+  } catch { /* Attribution is observational; preserve the original catch-up decision. */ }
+  return identity;
 }
 
 function evidenceFingerprint(

@@ -1,4 +1,9 @@
 import { PublicKey } from '@solana/web3.js';
+import { trustedObservedPipelineOrigin } from '../../domain/observed-pipeline-failure.js';
+import {
+  registerTrustedTerminalAttributionContext,
+  trustedTerminalAttributionContext,
+} from '../../domain/terminal-attribution.js';
 import type { TokenProgramKind } from '../../domain/types.js';
 import type {
   NormalizedInstruction,
@@ -47,6 +52,36 @@ const HOLDER_REWARDS_SEED = Buffer.from('holder-rewards');
 export function decodePumpTransaction(
   transaction: NormalizedTransaction,
 ): DecodedPumpTransaction {
+  try {
+    return decodeTransaction(transaction);
+  } catch (error) {
+    attributeTransactionFailure(error, transaction, null);
+    throw error;
+  }
+}
+
+function attributeTransactionFailure(
+  error: unknown,
+  transaction: NormalizedTransaction,
+  instruction: NormalizedInstruction | null,
+): void {
+  const originCode = trustedObservedPipelineOrigin(error);
+  if (originCode === null || trustedTerminalAttributionContext(error) !== null) return;
+  try {
+    registerTrustedTerminalAttributionContext(error as object, {
+      originCode,
+      locator: {
+        signature: transaction.signature, slot: transaction.slot,
+        transactionIndex: transaction.transactionIndex,
+        confirmationStatus: transaction.confirmationStatus.toLowerCase(),
+        instructionIndex: instruction?.instructionIndex ?? null,
+        innerInstructionIndex: instruction?.innerInstructionIndex ?? null,
+      },
+    });
+  } catch { /* Optional provenance cannot replace the original decoder failure. */ }
+}
+
+function decodeTransaction(transaction: NormalizedTransaction): DecodedPumpTransaction {
   if (transaction.error !== null) return emptyResult(transaction);
   if (transaction.transactionIndex === null) {
     throw createPumpDecodingError(
@@ -60,10 +95,15 @@ export function decodePumpTransaction(
   const actions: DecodedPumpInstruction[] = [];
   const events: IndexedEvent[] = [];
   transaction.instructions.forEach((instruction, index) => {
-    const action = decodePumpInstruction(instruction);
-    if (action !== null) actions.push(action);
-    const event = decodePumpCpiEvent(instruction);
-    if (event !== null) events.push({ index, decoded: event });
+    try {
+      const action = decodePumpInstruction(instruction);
+      if (action !== null) actions.push(action);
+      const event = decodePumpCpiEvent(instruction);
+      if (event !== null) events.push({ index, decoded: event });
+    } catch (error) {
+      attributeTransactionFailure(error, transaction, instruction);
+      throw error;
+    }
   });
   validateStackHeights(actions, events, transaction);
 

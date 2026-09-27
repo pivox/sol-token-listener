@@ -392,7 +392,7 @@ void test('applies migrations 001-052 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '056_transaction_inbox_bounded_tracking.sql');
+    assert.equal(applied.at(-1), '057_transaction_inbox_terminal_attribution.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
@@ -726,7 +726,7 @@ void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL
       else await assert.rejects(operation, /chain_transaction_inbox_.+_check/u, item.name);
     }
 
-    await pool.query('TRUNCATE transaction_inbox_recoveries, chain_transaction_inbox');
+    await pool.query('TRUNCATE transaction_inbox_terminal_attributions, transaction_inbox_recoveries, chain_transaction_inbox');
     await insertInbox(pool, inboxValue('purge-finalized', terminalState(
       'finalized', snapshot, fingerprint, '2020-01-01T00:00:01Z',
       '2020-01-01T00:00:02Z', '2020-01-01T04:00:02Z',

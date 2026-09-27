@@ -60,8 +60,8 @@ void test('053 remains installed beneath the replay-safe clean database head', a
   await withDatabase(context, async (pool) => {
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '056_transaction_inbox_bounded_tracking.sql');
-    assert.equal(applied.length, 56);
+    assert.equal(applied.at(-1), '057_transaction_inbox_terminal_attribution.sql');
+    assert.equal(applied.length, 57);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await assertCatalog(pool);
   });

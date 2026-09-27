@@ -200,6 +200,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly walletGraphSnapshots: number;
   readonly transactionInboxRecoveries: number;
   readonly transactionInboxDecoderRecoveries: number;
+  readonly transactionInboxTerminalAttributions: number;
+  readonly transactionInboxIncompleteAttributions: number;
   readonly listenerCatchUpGaps: number;
   readonly listenerStrictCatchUpFailures: number;
   readonly listenerStrictCatchUpRuns: number;
@@ -936,6 +938,14 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `DELETE FROM creator_profiles profile USING token_launches launch
        WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
+    const transactionInboxTerminalAttributions = await client.query(
+      `DELETE FROM transaction_inbox_terminal_attributions WHERE purge_after<=clock_timestamp()`,
+    );
+    const transactionInboxIncompleteAttributions = await client.query(
+      `UPDATE chain_transaction_inbox SET terminal_attribution_incomplete_count=0,
+         terminal_attribution_incomplete_at=NULL
+       WHERE terminal_attribution_incomplete_at+INTERVAL '4 hours'<=clock_timestamp()`,
+    );
     const transactionInboxRecoveries = await client.query(
       'DELETE FROM transaction_inbox_recoveries WHERE purge_after <= clock_timestamp()',
     );
@@ -995,6 +1005,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `DELETE FROM chain_transaction_inbox
        WHERE terminal_at IS NOT NULL
          AND purge_after <= clock_timestamp()
+         AND (terminal_attribution_incomplete_at IS NULL
+           OR terminal_attribution_incomplete_at + INTERVAL '4 hours' <= clock_timestamp())
+         AND NOT EXISTS (
+           SELECT 1 FROM transaction_inbox_terminal_attributions attribution
+           WHERE attribution.signature=chain_transaction_inbox.signature
+             AND attribution.purge_after>clock_timestamp()
+         )
          AND (first_detected_at IS NULL
            OR first_detected_at + INTERVAL '4 hours' <= clock_timestamp())
          AND NOT (
@@ -1275,6 +1292,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       walletGraphSnapshots: walletGraphSnapshots.rowCount ?? 0,
       transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
       transactionInboxDecoderRecoveries: transactionInboxDecoderRecoveries.rowCount ?? 0,
+      transactionInboxTerminalAttributions: transactionInboxTerminalAttributions.rowCount ?? 0,
+      transactionInboxIncompleteAttributions: transactionInboxIncompleteAttributions.rowCount ?? 0,
       listenerCatchUpGaps: listenerCatchUpGaps.rowCount ?? 0,
       listenerStrictCatchUpFailures: listenerStrictCatchUpFailures.rowCount ?? 0,
       listenerStrictCatchUpRuns: listenerStrictCatchUpRuns.rowCount ?? 0,

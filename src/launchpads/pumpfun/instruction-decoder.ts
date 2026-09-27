@@ -1,4 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
+import { trustedObservedPipelineOrigin } from '../../domain/observed-pipeline-failure.js';
+import { registerTrustedTerminalAttribution } from '../../domain/terminal-attribution.js';
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpBorshReader } from './borsh-reader.js';
 import { PUMP_PROGRAM_ID } from './constants.js';
@@ -53,14 +55,42 @@ export function decodePumpInstruction(
   );
   if (matched === undefined) return null;
 
+  let suffixBytes: number | null = null;
+  try {
+    return decodeMatchedInstruction(instruction, matched, (length) => { suffixBytes = length; });
+  } catch (error) {
+    if (trustedObservedPipelineOrigin(error) === 'PUMP_BORSH_INVALID') {
+      try {
+        registerTrustedTerminalAttribution(error as object, {
+          version: 1, diagnosticCode: 'PUMP_BORSH_INVALID', causeKind: 'PUMP_DECODER',
+          pumpWire: {
+            surface: 'INSTRUCTION',
+            location: instruction.innerInstructionIndex === null ? 'OUTER' : 'INNER',
+            discriminatorHex: toHex(instruction.data.subarray(0, 8)), idlName: matched.name,
+            totalBytes: instruction.data.length, payloadBytes: instruction.data.length - 8,
+            suffixBytes,
+          },
+        });
+      } catch { /* Attribution cannot change the decoder decision. */ }
+    }
+    throw error;
+  }
+}
+
+function decodeMatchedInstruction(
+  instruction: NormalizedInstruction,
+  matched: { readonly name: PumpInstructionName; readonly definition: InstructionDefinition },
+  observeSuffix: (length: number) => void,
+): DecodedPumpInstruction {
   const accounts = mapAccounts(
     matched.name,
     matched.definition,
     instruction,
   );
   const reader = new PumpBorshReader(instruction.data.subarray(8));
-  const args = decodeInstructionArgs(matched.name, matched.definition, reader);
+  const args = decodeInstructionArgs(matched.name, matched.definition, reader, observeSuffix);
   if (reader.remaining !== 0) {
+    observeSuffix(reader.remaining);
     throw createPumpDecodingError(
       'PUMP_BORSH_INVALID',
       false,
@@ -81,13 +111,14 @@ function decodeInstructionArgs(
   name: PumpInstructionName,
   definition: InstructionDefinition,
   reader: PumpBorshReader,
+  observeSuffix: (length: number) => void,
 ): Readonly<Record<string, PumpIdlValue>> {
-  if (name === 'create_v2') return decodeCreateV2Args(definition, reader);
+  if (name === 'create_v2') return decodeCreateV2Args(definition, reader, observeSuffix);
   if (name === 'buy' || name === 'buy_exact_sol_in') {
-    return decodeLegacyBuyArgs(name, definition, reader);
+    return decodeLegacyBuyArgs(name, definition, reader, observeSuffix);
   }
   if (name === 'buy_exact_quote_in_v2') {
-    return decodeExactQuoteBuyArgs(definition, reader);
+    return decodeExactQuoteBuyArgs(definition, reader, observeSuffix);
   }
   return decodeIdlFields(definition.args, reader);
 }
@@ -96,9 +127,11 @@ function decodeLegacyBuyArgs(
   name: 'buy' | 'buy_exact_sol_in',
   definition: InstructionDefinition,
   reader: PumpBorshReader,
+  observeSuffix: (length: number) => void,
 ): Readonly<Record<string, PumpIdlValue>> {
   const required = decodeIdlFields(definition.args.slice(0, 2), reader);
   const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
   if (name === 'buy') {
     if (suffixLength === 0) return required;
     if (suffixLength !== 1) throw invalidBuySuffix(name, suffixLength);
@@ -128,9 +161,11 @@ function decodeLegacyBuyArgs(
 function decodeExactQuoteBuyArgs(
   definition: InstructionDefinition,
   reader: PumpBorshReader,
+  observeSuffix: (length: number) => void,
 ): Readonly<Record<string, PumpIdlValue>> {
   const required = decodeIdlFields(definition.args, reader);
   const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
   if (suffixLength === 0) return required;
   if (suffixLength !== 1) {
     throw invalidBuySuffix('buy_exact_quote_in_v2', suffixLength);
@@ -157,12 +192,14 @@ function invalidBuySuffix(
 function decodeCreateV2Args(
   definition: InstructionDefinition,
   reader: PumpBorshReader,
+  observeSuffix: (length: number) => void,
 ): Readonly<Record<string, PumpIdlValue>> {
   const required = decodeIdlFields(
     definition.args.slice(0, CREATE_V2_REQUIRED_ARGUMENT_COUNT),
     reader,
   );
   const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
   if (!CREATE_V2_SUFFIX_LENGTHS.has(suffixLength)) {
     throw createPumpDecodingError(
       'PUMP_BORSH_INVALID',

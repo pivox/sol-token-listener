@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
@@ -12,6 +13,7 @@ const fixtureUrl = new URL(
   import.meta.url,
 );
 const fixture = JSON.parse(await readFile(fixtureUrl, 'utf8')) as unknown;
+const representativeSignature = '1'.repeat(64);
 
 void test('keeps the real failed run failed while correcting four obsolete assertions', () => {
   const result = evaluateMainnetObserveCanary(fixture);
@@ -237,7 +239,10 @@ void test('fails explained terminal deltas and keeps incomplete grouping inconcl
   completeTerminal.final = { failed: 11, quarantined: 0, exhausted: 0 };
   completeTerminal.groups = [{ processingStatus: 'FAILED', reasonCode: 'PUMP_ACTION_SUPPORTED',
     errorCode: 'RPC_TRANSIENT', count: 1 }];
-  assert.equal(evaluateMainnetObserveCanary(complete).gates.terminalFailures.verdict, 'FAIL');
+  assert.equal(evaluateMainnetObserveCanary(
+    complete,
+    terminalAttribution({ terminalFailed: 11 }),
+  ).gates.terminalFailures.verdict, 'FAIL');
 
   for (const mutate of [
     (copy: Record<string, unknown>) => { nested(copy, 'terminalEvidence').groups = []; },
@@ -276,7 +281,7 @@ void test('reconciles terminal groups per status and rejects exhausted greater t
       errorCode: 'RPC_TRANSIENT', count: 2 },
   ];
   assert.equal(evaluateMainnetObserveCanary(statusMismatch).gates.terminalFailures.verdict,
-    'INCONCLUSIVE');
+    'FAIL');
 
   const impossibleExhaustion = cloneFixture();
   nested(impossibleExhaustion, 'terminalEvidence').baseline = {
@@ -287,6 +292,216 @@ void test('reconciles terminal groups per status and rejects exhausted greater t
   };
   assert.equal(evaluateMainnetObserveCanary(impossibleExhaustion).gates.terminalFailures.verdict,
     'INCONCLUSIVE');
+});
+
+void test('fails a proven new terminal worker failure but does not mislabel retry-pending work', () => {
+  const terminal = terminalNeutralFixture();
+  nested(terminal, 'terminalEvidence').baseline = {
+    failed: 0, quarantined: 0, exhausted: 0,
+  };
+  nested(terminal, 'terminalEvidence').final = {
+    failed: 1, quarantined: 0, exhausted: 0,
+  };
+
+  const provenTerminal = terminalAttribution({ terminalFailed: 1 });
+  assert.deepEqual(evaluateMainnetObserveCanary(terminal, provenTerminal).gates.terminalFailures, {
+    verdict: 'FAIL',
+    reasonCode: 'TERMINAL_FAILURES_OBSERVED',
+  });
+  assert.deepEqual(evaluateMainnetObserveCanary(
+    terminal,
+    terminalAttribution({ terminalFailed: 1, incompleteOccurrences: 1 }),
+  ).gates.terminalFailures, {
+    verdict: 'FAIL',
+    reasonCode: 'TERMINAL_FAILURES_OBSERVED',
+  });
+
+  const retryPending = terminalAttribution({ retryPendingFailed: 1 });
+  assert.deepEqual(evaluateMainnetObserveCanary(terminal, retryPending).gates.terminalFailures, {
+    verdict: 'PASS',
+    reasonCode: 'TERMINAL_NONE',
+  });
+});
+
+void test('keeps an ambiguous terminal composition inconclusive without a baseline by state', () => {
+  const growth = terminalNeutralFixture();
+  nested(growth, 'terminalEvidence').baseline = {
+    failed: 10, quarantined: 0, exhausted: 0,
+  };
+  nested(growth, 'terminalEvidence').final = {
+    failed: 11, quarantined: 0, exhausted: 0,
+  };
+  assert.deepEqual(evaluateMainnetObserveCanary(
+    growth,
+    terminalAttribution({ terminalFailed: 1, retryPendingFailed: 10 }),
+  ).gates.terminalFailures, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'TERMINAL_ATTRIBUTION_BASELINE_STATE_UNKNOWN',
+  });
+
+  const stableTotal = terminalNeutralFixture();
+  nested(stableTotal, 'terminalEvidence').baseline = {
+    failed: 1, quarantined: 0, exhausted: 0,
+  };
+  nested(stableTotal, 'terminalEvidence').final = {
+    failed: 1, quarantined: 0, exhausted: 0,
+  };
+  assert.deepEqual(evaluateMainnetObserveCanary(
+    stableTotal,
+    terminalAttribution({ terminalFailed: 1 }),
+  ).gates.terminalFailures, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'TERMINAL_ATTRIBUTION_BASELINE_STATE_UNKNOWN',
+  });
+});
+
+void test('keeps proven exhaustion and quarantine FAIL even without usable attribution', () => {
+  const exhausted = terminalNeutralFixture();
+  nested(exhausted, 'terminalEvidence').baseline = {
+    failed: 1, quarantined: 0, exhausted: 0,
+  };
+  nested(exhausted, 'terminalEvidence').final = {
+    failed: 2, quarantined: 0, exhausted: 1,
+  };
+  assert.deepEqual(evaluateMainnetObserveCanary(exhausted).gates.terminalFailures, {
+    verdict: 'FAIL',
+    reasonCode: 'TERMINAL_RETRIES_EXHAUSTED',
+  });
+
+  const quarantined = terminalNeutralFixture();
+  nested(quarantined, 'terminalEvidence').final = {
+    failed: 0, quarantined: 1, exhausted: 0,
+  };
+  assert.deepEqual(
+    evaluateMainnetObserveCanary(quarantined, { privateKey: 'must-not-leak' }).gates.terminalFailures,
+    { verdict: 'FAIL', reasonCode: 'TERMINAL_FAILURES_OBSERVED' },
+  );
+});
+
+void test('fails closed when required terminal attribution is missing, malformed or unreconciled', () => {
+  const neutral = terminalNeutralFixture();
+  const cases: readonly [string, unknown][] = [
+    ['missing', undefined],
+    ['malformed', { schemaVersion: 'mainnet-terminal-attribution.v1', rpcUrl: 'secret' }],
+    ['unreconciled', terminalAttribution({ retryPendingFailed: 1 })],
+    ['current overflow', terminalAttribution({ currentOverflowRows: 1 })],
+    ['diagnostic overflow', terminalAttribution({ diagnosticOverflowOccurrences: 1 })],
+    ['unavailable', terminalAttribution({ unavailableOccurrences: 1 })],
+    ['incomplete', terminalAttribution({ incompleteOccurrences: 1 })],
+  ];
+
+  for (const [name, attribution] of cases) {
+    const result = evaluateMainnetObserveCanary(neutral, attribution);
+    assert.equal(result.gates.terminalFailures.verdict, 'INCONCLUSIVE', name);
+    assert.equal(result.gates.decoderQuarantine.verdict, 'INCONCLUSIVE', name);
+    assert.equal(JSON.stringify(result).includes('secret'), false, name);
+  }
+});
+
+void test('keeps positive exhaustion and quarantine deltas ahead of population decreases', () => {
+  for (const kind of ['exhausted', 'quarantined'] as const) {
+    const input = terminalNeutralFixture();
+    nested(input, 'terminalEvidence').baseline = { failed: 10, exhausted: 0, quarantined: 0 };
+    nested(input, 'terminalEvidence').final = { failed: 9, exhausted: 0, quarantined: 0, [kind]: 1 };
+    assert.deepEqual(evaluateMainnetObserveCanary(input).gates.terminalFailures, {
+      verdict: 'FAIL',
+      reasonCode: kind === 'exhausted' ? 'TERMINAL_RETRIES_EXHAUSTED' : 'TERMINAL_FAILURES_OBSERVED',
+    });
+  }
+});
+
+void test('keeps proven current terminal failure despite missing or malformed diagnostic sections', () => {
+  const input = terminalNeutralFixture();
+  nested(input, 'terminalEvidence', 'final').failed = 1;
+  for (const section of ['diagnosticOccurrences', 'incompleteAttribution']) {
+    for (const malformed of [false, true]) {
+      const attribution = terminalAttribution({ terminalFailed: 1 });
+      if (malformed) attribution[section] = { invalid: true };
+      else Reflect.deleteProperty(attribution, section);
+      assert.deepEqual(evaluateMainnetObserveCanary(input, attribution).gates.terminalFailures, {
+        verdict: 'FAIL', reasonCode: 'TERMINAL_FAILURES_OBSERVED',
+      });
+    }
+  }
+});
+
+void test('fails decoder on current authenticated Borsh even without usable occurrences', () => {
+  const input = terminalNeutralFixture();
+  nested(input, 'terminalEvidence', 'final').failed = 1;
+  for (const occurrenceState of ['empty', 'missing', 'malformed']) {
+    const attribution = terminalAttribution({ terminalFailed: 1 });
+    const groups = nested(attribution, 'currentPopulation').groups as Record<string, unknown>[];
+    const group = groups[0];
+    assert.ok(group);
+    group.normalizedErrorName = 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_INVALID';
+    if (occurrenceState === 'missing') delete attribution.diagnosticOccurrences;
+    if (occurrenceState === 'malformed') attribution.diagnosticOccurrences = { invalid: true };
+    assert.deepEqual(evaluateMainnetObserveCanary(input, attribution).gates.decoderQuarantine, {
+      verdict: 'FAIL', reasonCode: 'DECODER_PUMP_BORSH_INVALID',
+    });
+  }
+});
+
+void test('keeps decoder occurrence failure despite missing or malformed current population', () => {
+  for (const diagnostic of [pumpInvalidWorkerGroup(), catchUpDecoderQuarantineGroup()]) {
+    for (const malformed of [false, true]) {
+      const attribution = terminalAttribution({ diagnosticGroups: [diagnostic] });
+      if (malformed) attribution.currentPopulation = { invalid: true };
+      else delete attribution.currentPopulation;
+      assert.equal(evaluateMainnetObserveCanary(terminalNeutralFixture(), attribution)
+        .gates.decoderQuarantine.verdict, 'FAIL');
+    }
+  }
+});
+
+void test('requires every valid attribution section before either gate can pass', () => {
+  for (const section of ['currentPopulation', 'diagnosticOccurrences', 'incompleteAttribution']) {
+    for (const malformed of [false, true]) {
+      const attribution = terminalAttribution();
+      if (malformed) attribution[section] = { invalid: true };
+      else Reflect.deleteProperty(attribution, section);
+      const result = evaluateMainnetObserveCanary(terminalNeutralFixture(), attribution);
+      for (const gate of ['terminalFailures', 'decoderQuarantine'] as const) {
+        assert.deepEqual(result.gates[gate], {
+          verdict: 'INCONCLUSIVE',
+          reasonCode: malformed ? 'TERMINAL_ATTRIBUTION_MALFORMED' : 'TERMINAL_ATTRIBUTION_MISSING',
+        });
+      }
+    }
+  }
+});
+
+void test('keeps a proven terminal lower bound despite overflow or unreconciled population', () => {
+  for (const currentOverflowRows of [0, 1]) {
+    const attribution = terminalAttribution({ terminalFailed: 1, currentOverflowRows });
+    assert.deepEqual(evaluateMainnetObserveCanary(terminalNeutralFixture(), attribution)
+      .gates.terminalFailures, {
+      verdict: 'FAIL', reasonCode: 'TERMINAL_FAILURES_OBSERVED',
+    });
+  }
+  const decreased = terminalNeutralFixture();
+  nested(decreased, 'terminalEvidence', 'baseline').failed = 1;
+  assert.equal(evaluateMainnetObserveCanary(decreased, terminalAttribution({ terminalFailed: 2 }))
+    .gates.terminalFailures.verdict, 'FAIL');
+});
+
+void test('fails decoder gate on Pump Borsh worker evidence and catch-up decoder quarantine', () => {
+  const neutral = terminalNeutralFixture();
+  const workerInvalid = terminalAttribution({ diagnosticGroups: [pumpInvalidWorkerGroup()] });
+  const workerResult = evaluateMainnetObserveCanary(neutral, workerInvalid);
+  assert.deepEqual(workerResult.gates.decoderQuarantine, {
+    verdict: 'FAIL',
+    reasonCode: 'DECODER_PUMP_BORSH_INVALID',
+  });
+  assert.equal(JSON.stringify(workerResult).includes(representativeSignature), false);
+
+  const catchUpDecoder = terminalAttribution({
+    diagnosticGroups: [catchUpDecoderQuarantineGroup()],
+  });
+  assert.deepEqual(evaluateMainnetObserveCanary(neutral, catchUpDecoder).gates.decoderQuarantine, {
+    verdict: 'FAIL',
+    reasonCode: 'DECODER_CATCH_UP_QUARANTINE',
+  });
 });
 
 void test('captures one process and a strictly advancing first-processing cohort in every snapshot', () => {
@@ -645,7 +860,7 @@ void test('classifies unsafe and incomplete gate evidence without allowing unrel
     ['terminal reasons missing', (copy) => {
       nested(copy, 'terminalEvidence').groups = [];
       nested(copy, 'terminalEvidence', 'final').exhausted = 0;
-    }, 'terminalFailures', 'INCONCLUSIVE'],
+    }, 'terminalFailures', 'FAIL'],
   ];
 
   for (const [name, mutate, gate, verdict] of cases) {
@@ -696,6 +911,146 @@ void test('returns bounded inconclusive output for hostile or non-exact input wi
 
 function cloneFixture(): Record<string, unknown> {
   return JSON.parse(JSON.stringify(fixture)) as Record<string, unknown>;
+}
+
+function terminalNeutralFixture(): Record<string, unknown> {
+  const copy = cloneFixture();
+  nested(copy, 'terminalEvidence').baseline = { failed: 0, quarantined: 0, exhausted: 0 };
+  nested(copy, 'terminalEvidence').final = { failed: 0, quarantined: 0, exhausted: 0 };
+  nested(copy, 'terminalEvidence').groups = [];
+  for (const name of WORKER_ADMISSION_SNAPSHOT_NAMES) {
+    nested(copy, 'snapshots', name, 'decoderQuarantine').unresolvedCount = 0;
+  }
+  return copy;
+}
+
+function terminalAttribution(options: Readonly<{
+  terminalFailed?: number;
+  retryPendingFailed?: number;
+  currentOverflowRows?: number;
+  diagnosticOverflowOccurrences?: number;
+  unavailableOccurrences?: number;
+  incompleteOccurrences?: number;
+  diagnosticGroups?: readonly Record<string, unknown>[];
+}> = {}): Record<string, unknown> {
+  const terminalFailed = options.terminalFailed ?? 0;
+  const retryPendingFailed = options.retryPendingFailed ?? 0;
+  const currentOverflowRows = options.currentOverflowRows ?? 0;
+  const diagnosticOverflowOccurrences = options.diagnosticOverflowOccurrences ?? 0;
+  const requestedUnavailableOccurrences = options.unavailableOccurrences ?? 0;
+  const incompleteOccurrences = options.incompleteOccurrences ?? 0;
+  const diagnosticGroups = [...(options.diagnosticGroups ?? [])];
+  const existingUnavailableOccurrences = diagnosticGroups.reduce(
+    (sum, group) => sum + (group.diagnosticCode === 'UNAVAILABLE'
+      || group.completeness === 'UNAVAILABLE' ? group.count as number : 0),
+    0,
+  );
+  if (requestedUnavailableOccurrences > existingUnavailableOccurrences) {
+    diagnosticGroups.push({
+      source: 'WORKER', processingOutcome: 'FAILED', workerCycleAttempt: 1,
+      workerRecoveryCount: 0, retryable: true, retryExhausted: false,
+      stage: null, originCode: null, diagnosticCode: 'UNAVAILABLE',
+      catchUpCauseKind: null, catchUpReasonCode: null, completeness: 'UNAVAILABLE',
+      pumpWire: null, count: requestedUnavailableOccurrences - existingUnavailableOccurrences,
+      representative: null,
+    });
+  }
+  const unavailableOccurrences = diagnosticGroups.reduce(
+    (sum, group) => sum + (group.diagnosticCode === 'UNAVAILABLE'
+      || group.completeness === 'UNAVAILABLE' ? group.count as number : 0),
+    0,
+  );
+  const currentGroups: Record<string, unknown>[] = [];
+  if (retryPendingFailed > 0) {
+    currentGroups.push({
+      processingStatus: 'FAILED',
+      normalizedErrorName: 'LEGACY_RPC_ERROR',
+      retryable: true,
+      failureState: 'RETRY_PENDING',
+      attempts: 1,
+      attemptsInCycle: 1,
+      catchUpReasonCode: null,
+      count: retryPendingFailed,
+    });
+  }
+  if (terminalFailed > 0) {
+    currentGroups.push({
+      processingStatus: 'FAILED',
+      normalizedErrorName: 'LEGACY_LEASE_EXPIRED',
+      retryable: false,
+      failureState: 'TERMINAL',
+      attempts: 3,
+      attemptsInCycle: 3,
+      catchUpReasonCode: null,
+      count: terminalFailed,
+    });
+  }
+  currentGroups.sort((left, right) => Buffer.compare(
+    Buffer.from(String(left.normalizedErrorName), 'utf8'),
+    Buffer.from(String(right.normalizedErrorName), 'utf8'),
+  ));
+  const retainedCurrentRows = terminalFailed + retryPendingFailed;
+  const retainedOccurrences = diagnosticGroups.reduce(
+    (sum, group) => sum + (group.count as number),
+    0,
+  );
+  return {
+    schemaVersion: 'mainnet-terminal-attribution.v1',
+    currentPopulation: {
+      totalRows: retainedCurrentRows + currentOverflowRows,
+      retainedRows: retainedCurrentRows,
+      unavailableRows: 0,
+      overflow: {
+        groupCount: currentOverflowRows > 0 ? 1 : 0,
+        rowCount: currentOverflowRows,
+      },
+      groups: currentGroups,
+    },
+    diagnosticOccurrences: {
+      totalOccurrences: retainedOccurrences + diagnosticOverflowOccurrences,
+      retainedOccurrences,
+      unavailableOccurrences,
+      overflow: {
+        groupCount: diagnosticOverflowOccurrences > 0 ? 1 : 0,
+        occurrenceCount: diagnosticOverflowOccurrences,
+      },
+      groups: diagnosticGroups,
+    },
+    incompleteAttribution: {
+      parentRows: incompleteOccurrences > 0 ? 1 : 0,
+      missingOccurrences: incompleteOccurrences,
+    },
+  };
+}
+
+function pumpInvalidWorkerGroup(): Record<string, unknown> {
+  return {
+    source: 'WORKER', processingOutcome: 'FAILED', workerCycleAttempt: 1,
+    workerRecoveryCount: 0, retryable: false, retryExhausted: false,
+    stage: 'launchpad_observation', originCode: 'PUMP_BORSH_INVALID',
+    diagnosticCode: 'PUMP_BORSH_INVALID',
+    catchUpCauseKind: null, catchUpReasonCode: null, completeness: 'COMPLETE',
+    pumpWire: {
+      surface: 'INSTRUCTION', location: 'OUTER', discriminatorHex: '181ec828051c0777',
+      idlName: 'buy', totalBytes: 24, payloadBytes: 16, suffixBytes: null,
+    },
+    count: 1,
+    representative: {
+      signature: representativeSignature, slot: 1, transactionIndex: 0,
+      confirmationStatus: 'finalized', instructionIndex: 1, innerInstructionIndex: null,
+    },
+  };
+}
+
+function catchUpDecoderQuarantineGroup(): Record<string, unknown> {
+  return {
+    source: 'CATCH_UP', processingOutcome: 'QUARANTINED', workerCycleAttempt: null,
+    workerRecoveryCount: null, retryable: null, retryExhausted: null,
+    stage: 'launchpad_observation', originCode: 'PUMP_BORSH_INVALID',
+    diagnosticCode: 'UNAVAILABLE',
+    catchUpCauseKind: 'PUMP_DECODER', catchUpReasonCode: 'PUMP_SCHEMA_UNSUPPORTED',
+    completeness: 'COMPLETE', pumpWire: null, count: 1, representative: null,
+  };
 }
 
 const WORKER_ADMISSION_SNAPSHOT_NAMES = [
