@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import bs58 from 'bs58';
 import {
   MAINNET_TERMINAL_ATTRIBUTION_MAX_BYTES,
   buildMainnetTerminalAttribution,
   parseMainnetTerminalAttribution,
+  parseMainnetTerminalCurrentPopulation,
+  parseMainnetTerminalDiagnosticOccurrences,
+  parseMainnetTerminalIncompleteAttribution,
   serializeMainnetTerminalAttribution,
 } from '../scripts/lib/mainnet-terminal-attribution.js';
 
@@ -142,7 +146,7 @@ void test('uses canonical bytewise ordering and is byte-identical after input sh
     currentRow({ error_name: observedBorsh, row_count: 1 }),
   ];
   const occurrences = [
-    pumpOccurrence({ representative_signature: 'z-signature' }),
+    pumpOccurrence({ representative_signature: solanaSignature(250) }),
     occurrence({
       source: 'CATCH_UP',
       processing_outcome: 'QUARANTINED',
@@ -299,6 +303,77 @@ void test('allows a fully unavailable catch-up occurrence without forged cause p
   assert.equal(artifact.diagnosticOccurrences.groups[0]?.catchUpCauseKind, null);
 });
 
+void test('accepts UNKNOWN only as retryable for any observed stage', () => {
+  const artifact = buildMainnetTerminalAttribution({
+    currentPopulationRows: [currentRow({
+      error_name: 'ObservedPipelineFailure.v1.wallet_graph.UNKNOWN',
+      error_retryable: true,
+      failure_state: 'RETRY_PENDING',
+    })],
+    diagnosticOccurrenceRows: [],
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  });
+  assert.equal(
+    artifact.currentPopulation.groups[0]?.normalizedErrorName,
+    'ObservedPipelineFailure.v1.wallet_graph.UNKNOWN',
+  );
+  assert.throws(() => buildMainnetTerminalAttribution({
+    currentPopulationRows: [currentRow({
+      error_name: 'ObservedPipelineFailure.v1.wallet_graph.UNKNOWN',
+      error_retryable: false,
+    })],
+    diagnosticOccurrenceRows: [],
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  }), TypeError);
+});
+
+void test('requires a canonical 64-byte Solana signature for local representatives', () => {
+  for (const representativeSignature of [
+    'https://rpc.invalid/key?token=secret',
+    bs58.encode(new Uint8Array(63)),
+    `${solanaSignature(1)} `,
+  ]) {
+    assert.throws(() => buildMainnetTerminalAttribution({
+      currentPopulationRows: [],
+      diagnosticOccurrenceRows: [pumpOccurrence({
+        representative_signature: representativeSignature,
+      })],
+      incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+    }), TypeError);
+  }
+});
+
+void test('section parsers validate the exact root and only their requested section', () => {
+  const artifact = buildMainnetTerminalAttribution({
+    currentPopulationRows: [currentRow()],
+    diagnosticOccurrenceRows: [pumpOccurrence()],
+    incompleteAttributionRows: [{ parent_count: 1, incomplete_count: 1 }],
+  });
+  assert.deepEqual(parseMainnetTerminalCurrentPopulation({
+    ...artifact,
+    diagnosticOccurrences: 'malformed-but-unrequested',
+    incompleteAttribution: 'malformed-but-unrequested',
+  }), artifact.currentPopulation);
+  assert.deepEqual(parseMainnetTerminalDiagnosticOccurrences({
+    ...artifact,
+    currentPopulation: 'malformed-but-unrequested',
+    incompleteAttribution: 'malformed-but-unrequested',
+  }), artifact.diagnosticOccurrences);
+  assert.deepEqual(parseMainnetTerminalIncompleteAttribution({
+    ...artifact,
+    currentPopulation: 'malformed-but-unrequested',
+    diagnosticOccurrences: 'malformed-but-unrequested',
+  }), artifact.incompleteAttribution);
+  assert.throws(() => parseMainnetTerminalCurrentPopulation({
+    ...artifact,
+    schemaVersion: 'mainnet-terminal-attribution.v2',
+  }), TypeError);
+  assert.throws(() => parseMainnetTerminalDiagnosticOccurrences({
+    ...artifact,
+    privateKey: 'forbidden-extra-root-field',
+  }), TypeError);
+});
+
 void test('keeps Pump decoder cause provenance source-specific', () => {
   assert.doesNotThrow(() => buildMainnetTerminalAttribution({
     currentPopulationRows: [],
@@ -356,7 +431,7 @@ void test('keeps the canonical artifact below one MiB', () => {
     diagnosticOccurrenceRows: Array.from({ length: 128 }, (_unused, index) => pumpOccurrence({
       worker_cycle_attempt: index,
       worker_recovery_count: index,
-      representative_signature: `signature-${index}-${'z'.repeat(100)}`,
+      representative_signature: solanaSignature(index),
     })),
     incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
   });
@@ -421,7 +496,7 @@ function pumpOccurrence(overrides: Record<string, unknown> = {}): Record<string,
     wire_total_bytes: 24,
     wire_payload_bytes: 16,
     wire_suffix_bytes: null,
-    representative_signature: 'signature-a',
+    representative_signature: solanaSignature(1),
     representative_slot: '123',
     representative_transaction_index: 4,
     representative_confirmation_status: 'finalized',
@@ -429,4 +504,8 @@ function pumpOccurrence(overrides: Record<string, unknown> = {}): Record<string,
     representative_inner_instruction_index: 1,
     ...overrides,
   });
+}
+
+function solanaSignature(seed: number): string {
+  return bs58.encode(Uint8Array.from({ length: 64 }, (_unused, index) => (seed + index) % 256));
 }

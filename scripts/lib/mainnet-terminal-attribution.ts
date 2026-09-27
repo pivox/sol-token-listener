@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import bs58 from 'bs58';
 import {
   PUMP_WIRE_IDL_NAMES,
   TERMINAL_ATTRIBUTION_CAUSE_KINDS,
@@ -164,11 +165,10 @@ export function serializeMainnetTerminalAttribution(
   return serialized;
 }
 
-export function parseMainnetTerminalAttribution(input: unknown): MainnetTerminalAttributionV1 {
-  const root = exactRecord(input, [
-    'schemaVersion', 'currentPopulation', 'diagnosticOccurrences', 'incompleteAttribution',
-  ]);
-  if (root.schemaVersion !== 'mainnet-terminal-attribution.v1') invalidEvidence();
+export function parseMainnetTerminalCurrentPopulation(
+  input: unknown,
+): MainnetTerminalAttributionV1['currentPopulation'] {
+  const root = parseArtifactRoot(input);
   const current = exactRecord(root.currentPopulation, [
     'totalRows', 'retainedRows', 'unavailableRows', 'overflow', 'groups',
   ]);
@@ -188,6 +188,23 @@ export function parseMainnetTerminalAttribution(input: unknown): MainnetTerminal
     || unavailableRows < sumCounts(currentGroups.filter(isCurrentUnavailable))
     || currentOverflowGroupCount > 0 !== (currentOverflowRowCount > 0)) invalidEvidence();
 
+  assertCanonicalOrder(currentGroups, currentSortKey);
+  return Object.freeze({
+    totalRows,
+    retainedRows,
+    unavailableRows,
+    overflow: Object.freeze({
+      groupCount: currentOverflowGroupCount,
+      rowCount: currentOverflowRowCount,
+    }),
+    groups: Object.freeze(currentGroups),
+  });
+}
+
+export function parseMainnetTerminalDiagnosticOccurrences(
+  input: unknown,
+): MainnetTerminalAttributionV1['diagnosticOccurrences'] {
+  const root = parseArtifactRoot(input);
   const diagnostics = exactRecord(root.diagnosticOccurrences, [
     'totalOccurrences', 'retainedOccurrences', 'unavailableOccurrences', 'overflow', 'groups',
   ]);
@@ -214,47 +231,48 @@ export function parseMainnetTerminalAttribution(input: unknown): MainnetTerminal
     || diagnosticOverflowGroupCount > 0 !== (diagnosticOverflowOccurrenceCount > 0)) {
     invalidEvidence();
   }
+  assertCanonicalOrder(diagnosticGroups, diagnosticSortKey);
+  return Object.freeze({
+    totalOccurrences,
+    retainedOccurrences,
+    unavailableOccurrences,
+    overflow: Object.freeze({
+      groupCount: diagnosticOverflowGroupCount,
+      occurrenceCount: diagnosticOverflowOccurrenceCount,
+    }),
+    groups: Object.freeze(diagnosticGroups),
+  });
+}
 
+export function parseMainnetTerminalIncompleteAttribution(
+  input: unknown,
+): MainnetTerminalAttributionV1['incompleteAttribution'] {
+  const root = parseArtifactRoot(input);
   const incomplete = exactRecord(root.incompleteAttribution, ['parentRows', 'missingOccurrences']);
-  const incompleteParentRows = safeInteger(incomplete.parentRows);
-  const incompleteMissingOccurrences = safeInteger(incomplete.missingOccurrences);
-  if ((incompleteParentRows === 0) !== (incompleteMissingOccurrences === 0)
-    || incompleteMissingOccurrences < incompleteParentRows) invalidEvidence();
+  const parentRows = safeInteger(incomplete.parentRows);
+  const missingOccurrences = safeInteger(incomplete.missingOccurrences);
+  if ((parentRows === 0) !== (missingOccurrences === 0)
+    || missingOccurrences < parentRows) invalidEvidence();
+  return Object.freeze({ parentRows, missingOccurrences });
+}
+
+export function parseMainnetTerminalAttribution(input: unknown): MainnetTerminalAttributionV1 {
   const artifact: MainnetTerminalAttributionV1 = Object.freeze({
     schemaVersion: 'mainnet-terminal-attribution.v1',
-    currentPopulation: Object.freeze({
-      totalRows,
-      retainedRows,
-      unavailableRows,
-      overflow: Object.freeze({
-        groupCount: currentOverflowGroupCount,
-        rowCount: currentOverflowRowCount,
-      }),
-      groups: Object.freeze(currentGroups),
-    }),
-    diagnosticOccurrences: Object.freeze({
-      totalOccurrences,
-      retainedOccurrences,
-      unavailableOccurrences,
-      overflow: Object.freeze({
-        groupCount: diagnosticOverflowGroupCount,
-        occurrenceCount: diagnosticOverflowOccurrenceCount,
-      }),
-      groups: Object.freeze(diagnosticGroups),
-    }),
-    incompleteAttribution: Object.freeze({
-      parentRows: incompleteParentRows,
-      missingOccurrences: incompleteMissingOccurrences,
-    }),
+    currentPopulation: parseMainnetTerminalCurrentPopulation(input),
+    diagnosticOccurrences: parseMainnetTerminalDiagnosticOccurrences(input),
+    incompleteAttribution: parseMainnetTerminalIncompleteAttribution(input),
   });
-  if (artifact.currentPopulation.groups.length > MAINNET_TERMINAL_ATTRIBUTION_MAX_GROUPS
-    || artifact.diagnosticOccurrences.groups.length > MAINNET_TERMINAL_ATTRIBUTION_MAX_GROUPS) {
-    invalidEvidence();
-  }
-  assertCanonicalOrder(artifact.currentPopulation.groups, currentSortKey);
-  assertCanonicalOrder(artifact.diagnosticOccurrences.groups, diagnosticSortKey);
   assertArtifactSize(artifact);
   return artifact;
+}
+
+function parseArtifactRoot(input: unknown): Readonly<Record<string, unknown>> {
+  const root = exactRecord(input, [
+    'schemaVersion', 'currentPopulation', 'diagnosticOccurrences', 'incompleteAttribution',
+  ]);
+  if (root.schemaVersion !== 'mainnet-terminal-attribution.v1') invalidEvidence();
+  return root;
 }
 
 function parseCurrentRow(input: unknown): MainnetTerminalCurrentPopulationGroupV1 {
@@ -493,6 +511,7 @@ function parseNullableRepresentative(input: unknown): MainnetTerminalRepresentat
   if (typeof value.signature !== 'string' || value.signature.length === 0
     || value.signature.trim() !== value.signature
     || Buffer.byteLength(value.signature, 'utf8') > 128
+    || !isCanonicalSolanaSignature(value.signature)
     || typeof value.confirmationStatus !== 'string'
     || !confirmationStatuses.has(value.confirmationStatus)
     || (instructionIndex === null && innerInstructionIndex !== null)) invalidEvidence();
@@ -621,7 +640,16 @@ function validObservedErrorName(value: string): boolean {
   return name === 'ObservedPipelineFailure' && version === 'v1' && extra === undefined
     && stage !== undefined && origin !== undefined
     && ((stage === 'unclassified' && origin === 'UNKNOWN')
-      || (observedStages.has(stage) && observedOrigins.has(origin) && origin !== 'UNKNOWN'));
+      || (observedStages.has(stage) && observedOrigins.has(origin)));
+}
+
+function isCanonicalSolanaSignature(value: string): boolean {
+  try {
+    const decoded = bs58.decode(value);
+    return decoded.length === 64 && bs58.encode(decoded) === value;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeCatchUpReason(value: unknown): string | null {

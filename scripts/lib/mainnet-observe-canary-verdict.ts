@@ -9,7 +9,9 @@ import {
   type RuntimeWorkerAdmissionMetricsV1,
 } from '../../src/domain/worker-admission-metrics.js';
 import {
-  parseMainnetTerminalAttribution,
+  parseMainnetTerminalCurrentPopulation,
+  parseMainnetTerminalDiagnosticOccurrences,
+  parseMainnetTerminalIncompleteAttribution,
   type MainnetTerminalAttributionV1,
 } from './mainnet-terminal-attribution.js';
 
@@ -225,9 +227,15 @@ interface CanaryInput {
   readonly cleanupComplete: boolean;
 }
 
-type TerminalAttributionEvidence =
+type AttributionSectionEvidence<T> =
   | Readonly<{ readonly state: 'MISSING' | 'MALFORMED'; readonly value: null }>
-  | Readonly<{ readonly state: 'VALID'; readonly value: MainnetTerminalAttributionV1 }>;
+  | Readonly<{ readonly state: 'VALID'; readonly value: T }>;
+
+interface TerminalAttributionEvidence {
+  readonly currentPopulation: AttributionSectionEvidence<MainnetTerminalAttributionV1['currentPopulation']>;
+  readonly diagnosticOccurrences: AttributionSectionEvidence<MainnetTerminalAttributionV1['diagnosticOccurrences']>;
+  readonly incompleteAttribution: AttributionSectionEvidence<MainnetTerminalAttributionV1['incompleteAttribution']>;
+}
 
 class InvalidEvidence extends Error {}
 
@@ -389,22 +397,29 @@ function evaluateTerminal(
   attribution: TerminalAttributionEvidence,
 ): MainnetObserveCanaryGateResultV1 {
   const { baseline, final } = input.terminalEvidence;
-  if (baseline.exhausted > baseline.failed || final.exhausted > final.failed
-    || final.failed < baseline.failed || final.exhausted < baseline.exhausted
-    || final.quarantined < baseline.quarantined) {
+  if (baseline.exhausted > baseline.failed || final.exhausted > final.failed) {
     return gate('INCONCLUSIVE', 'TERMINAL_COUNTER_RESET');
   }
   const exhaustedDelta = final.exhausted - baseline.exhausted;
   const quarantinedDelta = final.quarantined - baseline.quarantined;
   if (exhaustedDelta > 0) return gate('FAIL', 'TERMINAL_RETRIES_EXHAUSTED');
   if (quarantinedDelta > 0) return gate('FAIL', 'TERMINAL_FAILURES_OBSERVED');
-  if (attribution.state !== 'VALID') return attributionUnavailableGate(attribution.state);
-  const reconciliation = reconcileTerminalAttribution(input, attribution.value);
-  if (reconciliation.currentPopulationReconciled
-    && reconciliation.terminalFailedCount > baseline.failed) {
+  const current = attribution.currentPopulation;
+  const reconciliation = current.state === 'VALID'
+    ? reconcileTerminalAttribution(input, current.value) : null;
+  // Retained groups are a lower bound even when other rows overflow or do not reconcile.
+  if (reconciliation !== null && reconciliation.terminalFailedCount > baseline.failed) {
     return gate('FAIL', 'TERMINAL_FAILURES_OBSERVED');
   }
-  const integrityFailure = attributionIntegrityFailure(attribution.value, reconciliation);
+  if (final.failed < baseline.failed || final.exhausted < baseline.exhausted
+    || final.quarantined < baseline.quarantined) {
+    return gate('INCONCLUSIVE', 'TERMINAL_COUNTER_RESET');
+  }
+  if (current.state !== 'VALID') return attributionUnavailableGate(current.state);
+  if (reconciliation === null) return attributionUnavailableGate('MALFORMED');
+  const complete = completeTerminalAttribution(attribution);
+  if (complete.state !== 'VALID') return attributionUnavailableGate(complete.state);
+  const integrityFailure = attributionIntegrityFailure(complete.value, reconciliation);
   if (integrityFailure !== null) return integrityFailure;
   if (reconciliation.terminalFailedCount > 0) {
     return gate('INCONCLUSIVE', 'TERMINAL_ATTRIBUTION_BASELINE_STATE_UNKNOWN');
@@ -430,8 +445,13 @@ function evaluateDecoder(
   if (orderedSnapshots(input).some(
     (snapshot) => snapshot.decoderQuarantine.unresolvedCount !== 0,
   )) return gate('FAIL', 'DECODER_QUARANTINE_UNRESOLVED');
-  if (attribution.state !== 'VALID') return attributionUnavailableGate(attribution.state);
-  const diagnosticGroups = attribution.value.diagnosticOccurrences.groups;
+  const current = attribution.currentPopulation;
+  if (current.state === 'VALID' && current.value.groups.some((group) =>
+    group.normalizedErrorName === 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_INVALID')) {
+    return gate('FAIL', 'DECODER_PUMP_BORSH_INVALID');
+  }
+  const occurrences = attribution.diagnosticOccurrences;
+  const diagnosticGroups = occurrences.state === 'VALID' ? occurrences.value.groups : [];
   if (diagnosticGroups.some((group) => group.diagnosticCode === 'PUMP_BORSH_INVALID')) {
     return gate('FAIL', 'DECODER_PUMP_BORSH_INVALID');
   }
@@ -440,8 +460,10 @@ function evaluateDecoder(
     && group.catchUpCauseKind === 'PUMP_DECODER')) {
     return gate('FAIL', 'DECODER_CATCH_UP_QUARANTINE');
   }
-  const reconciliation = reconcileTerminalAttribution(input, attribution.value);
-  const integrityFailure = attributionIntegrityFailure(attribution.value, reconciliation);
+  const complete = completeTerminalAttribution(attribution);
+  if (complete.state !== 'VALID') return attributionUnavailableGate(complete.state);
+  const reconciliation = reconcileTerminalAttribution(input, complete.value.currentPopulation);
+  const integrityFailure = attributionIntegrityFailure(complete.value, reconciliation);
   return integrityFailure ?? gate('PASS', 'DECODER_QUARANTINE_EMPTY');
 }
 
@@ -713,19 +735,67 @@ interface TerminalAttributionReconciliation {
 }
 
 function parseTerminalAttributionEvidence(value: unknown): TerminalAttributionEvidence {
-  if (value === undefined) return Object.freeze({ state: 'MISSING', value: null });
+  const unavailable = (state: 'MISSING' | 'MALFORMED'): TerminalAttributionEvidence => {
+    const section = Object.freeze({ state, value: null });
+    return Object.freeze({ currentPopulation: section, diagnosticOccurrences: section,
+      incompleteAttribution: section });
+  };
+  if (value === undefined) return unavailable('MISSING');
   try {
-    return Object.freeze({ state: 'VALID', value: parseMainnetTerminalAttribution(value) });
+    const root = exactObjectWithOptional(value, ['schemaVersion'],
+      ['currentPopulation', 'diagnosticOccurrences', 'incompleteAttribution']);
+    if (root.schemaVersion !== 'mainnet-terminal-attribution.v1') return unavailable('MALFORMED');
+    return Object.freeze({
+      currentPopulation: parseAttributionSection(root, 'currentPopulation', parseMainnetTerminalCurrentPopulation),
+      diagnosticOccurrences: parseAttributionSection(root, 'diagnosticOccurrences', parseMainnetTerminalDiagnosticOccurrences),
+      incompleteAttribution: parseAttributionSection(root, 'incompleteAttribution', parseMainnetTerminalIncompleteAttribution),
+    });
+  } catch {
+    return unavailable('MALFORMED');
+  }
+}
+
+function parseAttributionSection<T>(
+  root: Readonly<Record<string, unknown>>,
+  key: string,
+  parser: (input: unknown) => T,
+): AttributionSectionEvidence<T> {
+  if (!Object.hasOwn(root, key)) return Object.freeze({ state: 'MISSING', value: null });
+  try {
+    return Object.freeze({ state: 'VALID', value: parser({
+      schemaVersion: root.schemaVersion,
+      currentPopulation: root.currentPopulation,
+      diagnosticOccurrences: root.diagnosticOccurrences,
+      incompleteAttribution: root.incompleteAttribution,
+    }) });
   } catch {
     return Object.freeze({ state: 'MALFORMED', value: null });
   }
 }
 
+function completeTerminalAttribution(
+  evidence: TerminalAttributionEvidence,
+): AttributionSectionEvidence<MainnetTerminalAttributionV1> {
+  const { currentPopulation, diagnosticOccurrences, incompleteAttribution } = evidence;
+  if (currentPopulation.state === 'VALID' && diagnosticOccurrences.state === 'VALID'
+    && incompleteAttribution.state === 'VALID') {
+    return Object.freeze({ state: 'VALID', value: Object.freeze({
+      schemaVersion: 'mainnet-terminal-attribution.v1',
+      currentPopulation: currentPopulation.value,
+      diagnosticOccurrences: diagnosticOccurrences.value,
+      incompleteAttribution: incompleteAttribution.value,
+    }) });
+  }
+  const malformed = [currentPopulation, diagnosticOccurrences, incompleteAttribution]
+    .some((section) => section.state === 'MALFORMED');
+  return Object.freeze({ state: malformed ? 'MALFORMED' : 'MISSING', value: null });
+}
+
 function reconcileTerminalAttribution(
   input: CanaryInput,
-  attribution: MainnetTerminalAttributionV1,
+  currentPopulation: MainnetTerminalAttributionV1['currentPopulation'],
 ): TerminalAttributionReconciliation {
-  const groups = attribution.currentPopulation.groups;
+  const groups = currentPopulation.groups;
   const failed = sum(groups.filter((group) => group.processingStatus === 'FAILED')
     .map((group) => group.count));
   const quarantined = sum(groups.filter((group) => group.processingStatus === 'QUARANTINED')
@@ -735,12 +805,12 @@ function reconcileTerminalAttribution(
   const final = input.terminalEvidence.final;
   const expectedTotal = safeAdd(final.failed, final.quarantined);
   return Object.freeze({
-    currentPopulationReconciled: attribution.currentPopulation.overflow.groupCount === 0
-      && attribution.currentPopulation.overflow.rowCount === 0
+    currentPopulationReconciled: currentPopulation.overflow.groupCount === 0
+      && currentPopulation.overflow.rowCount === 0
       && failed === final.failed
       && quarantined === final.quarantined
       && expectedTotal !== null
-      && attribution.currentPopulation.totalRows === expectedTotal,
+      && currentPopulation.totalRows === expectedTotal,
     terminalFailedCount: terminalFailed ?? Number.MAX_SAFE_INTEGER,
   });
 }

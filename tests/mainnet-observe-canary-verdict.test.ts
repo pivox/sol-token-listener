@@ -13,6 +13,7 @@ const fixtureUrl = new URL(
   import.meta.url,
 );
 const fixture = JSON.parse(await readFile(fixtureUrl, 'utf8')) as unknown;
+const representativeSignature = '1'.repeat(64);
 
 void test('keeps the real failed run failed while correcting four obsolete assertions', () => {
   const result = evaluateMainnetObserveCanary(fixture);
@@ -382,7 +383,7 @@ void test('fails closed when required terminal attribution is missing, malformed
   const cases: readonly [string, unknown][] = [
     ['missing', undefined],
     ['malformed', { schemaVersion: 'mainnet-terminal-attribution.v1', rpcUrl: 'secret' }],
-    ['unreconciled', terminalAttribution({ terminalFailed: 1 })],
+    ['unreconciled', terminalAttribution({ retryPendingFailed: 1 })],
     ['current overflow', terminalAttribution({ currentOverflowRows: 1 })],
     ['diagnostic overflow', terminalAttribution({ diagnosticOverflowOccurrences: 1 })],
     ['unavailable', terminalAttribution({ unavailableOccurrences: 1 })],
@@ -397,6 +398,93 @@ void test('fails closed when required terminal attribution is missing, malformed
   }
 });
 
+void test('keeps positive exhaustion and quarantine deltas ahead of population decreases', () => {
+  for (const kind of ['exhausted', 'quarantined'] as const) {
+    const input = terminalNeutralFixture();
+    nested(input, 'terminalEvidence').baseline = { failed: 10, exhausted: 0, quarantined: 0 };
+    nested(input, 'terminalEvidence').final = { failed: 9, exhausted: 0, quarantined: 0, [kind]: 1 };
+    assert.deepEqual(evaluateMainnetObserveCanary(input).gates.terminalFailures, {
+      verdict: 'FAIL',
+      reasonCode: kind === 'exhausted' ? 'TERMINAL_RETRIES_EXHAUSTED' : 'TERMINAL_FAILURES_OBSERVED',
+    });
+  }
+});
+
+void test('keeps proven current terminal failure despite missing or malformed diagnostic sections', () => {
+  const input = terminalNeutralFixture();
+  nested(input, 'terminalEvidence', 'final').failed = 1;
+  for (const section of ['diagnosticOccurrences', 'incompleteAttribution']) {
+    for (const malformed of [false, true]) {
+      const attribution = terminalAttribution({ terminalFailed: 1 });
+      if (malformed) attribution[section] = { invalid: true };
+      else Reflect.deleteProperty(attribution, section);
+      assert.deepEqual(evaluateMainnetObserveCanary(input, attribution).gates.terminalFailures, {
+        verdict: 'FAIL', reasonCode: 'TERMINAL_FAILURES_OBSERVED',
+      });
+    }
+  }
+});
+
+void test('fails decoder on current authenticated Borsh even without usable occurrences', () => {
+  const input = terminalNeutralFixture();
+  nested(input, 'terminalEvidence', 'final').failed = 1;
+  for (const occurrenceState of ['empty', 'missing', 'malformed']) {
+    const attribution = terminalAttribution({ terminalFailed: 1 });
+    const groups = nested(attribution, 'currentPopulation').groups as Record<string, unknown>[];
+    const group = groups[0];
+    assert.ok(group);
+    group.normalizedErrorName = 'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_INVALID';
+    if (occurrenceState === 'missing') delete attribution.diagnosticOccurrences;
+    if (occurrenceState === 'malformed') attribution.diagnosticOccurrences = { invalid: true };
+    assert.deepEqual(evaluateMainnetObserveCanary(input, attribution).gates.decoderQuarantine, {
+      verdict: 'FAIL', reasonCode: 'DECODER_PUMP_BORSH_INVALID',
+    });
+  }
+});
+
+void test('keeps decoder occurrence failure despite missing or malformed current population', () => {
+  for (const diagnostic of [pumpInvalidWorkerGroup(), catchUpDecoderQuarantineGroup()]) {
+    for (const malformed of [false, true]) {
+      const attribution = terminalAttribution({ diagnosticGroups: [diagnostic] });
+      if (malformed) attribution.currentPopulation = { invalid: true };
+      else delete attribution.currentPopulation;
+      assert.equal(evaluateMainnetObserveCanary(terminalNeutralFixture(), attribution)
+        .gates.decoderQuarantine.verdict, 'FAIL');
+    }
+  }
+});
+
+void test('requires every valid attribution section before either gate can pass', () => {
+  for (const section of ['currentPopulation', 'diagnosticOccurrences', 'incompleteAttribution']) {
+    for (const malformed of [false, true]) {
+      const attribution = terminalAttribution();
+      if (malformed) attribution[section] = { invalid: true };
+      else Reflect.deleteProperty(attribution, section);
+      const result = evaluateMainnetObserveCanary(terminalNeutralFixture(), attribution);
+      for (const gate of ['terminalFailures', 'decoderQuarantine'] as const) {
+        assert.deepEqual(result.gates[gate], {
+          verdict: 'INCONCLUSIVE',
+          reasonCode: malformed ? 'TERMINAL_ATTRIBUTION_MALFORMED' : 'TERMINAL_ATTRIBUTION_MISSING',
+        });
+      }
+    }
+  }
+});
+
+void test('keeps a proven terminal lower bound despite overflow or unreconciled population', () => {
+  for (const currentOverflowRows of [0, 1]) {
+    const attribution = terminalAttribution({ terminalFailed: 1, currentOverflowRows });
+    assert.deepEqual(evaluateMainnetObserveCanary(terminalNeutralFixture(), attribution)
+      .gates.terminalFailures, {
+      verdict: 'FAIL', reasonCode: 'TERMINAL_FAILURES_OBSERVED',
+    });
+  }
+  const decreased = terminalNeutralFixture();
+  nested(decreased, 'terminalEvidence', 'baseline').failed = 1;
+  assert.equal(evaluateMainnetObserveCanary(decreased, terminalAttribution({ terminalFailed: 2 }))
+    .gates.terminalFailures.verdict, 'FAIL');
+});
+
 void test('fails decoder gate on Pump Borsh worker evidence and catch-up decoder quarantine', () => {
   const neutral = terminalNeutralFixture();
   const workerInvalid = terminalAttribution({ diagnosticGroups: [pumpInvalidWorkerGroup()] });
@@ -405,7 +493,7 @@ void test('fails decoder gate on Pump Borsh worker evidence and catch-up decoder
     verdict: 'FAIL',
     reasonCode: 'DECODER_PUMP_BORSH_INVALID',
   });
-  assert.equal(JSON.stringify(workerResult).includes('public-chain-signature'), false);
+  assert.equal(JSON.stringify(workerResult).includes(representativeSignature), false);
 
   const catchUpDecoder = terminalAttribution({
     diagnosticGroups: [catchUpDecoderQuarantineGroup()],
@@ -948,7 +1036,7 @@ function pumpInvalidWorkerGroup(): Record<string, unknown> {
     },
     count: 1,
     representative: {
-      signature: 'public-chain-signature', slot: 1, transactionIndex: 0,
+      signature: representativeSignature, slot: 1, transactionIndex: 0,
       confirmationStatus: 'finalized', instructionIndex: 1, innerInstructionIndex: null,
     },
   };
