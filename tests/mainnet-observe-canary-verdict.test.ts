@@ -378,6 +378,32 @@ void test('keeps proven exhaustion and quarantine FAIL even without usable attri
   );
 });
 
+void test('keeps funding retry-pending neutral and fifth-attempt exhaustion terminal', () => {
+  const retryPending = terminalNeutralFixture();
+  nested(retryPending, 'terminalEvidence').final = {
+    failed: 1, quarantined: 0, exhausted: 0,
+  };
+  assert.deepEqual(evaluateMainnetObserveCanary(retryPending, terminalAttribution({
+    retryPendingFailed: 1,
+    diagnosticGroups: [fundingDiagnosticGroup('FUNDING_OBSERVATION_VALIDATE', false)],
+  })).gates.terminalFailures, {
+    verdict: 'PASS',
+    reasonCode: 'TERMINAL_NONE',
+  });
+
+  const exhausted = terminalNeutralFixture();
+  nested(exhausted, 'terminalEvidence').final = {
+    failed: 1, quarantined: 0, exhausted: 1,
+  };
+  assert.deepEqual(evaluateMainnetObserveCanary(exhausted, terminalAttribution({
+    terminalFailed: 1,
+    diagnosticGroups: [fundingDiagnosticGroup('FUNDING_OBSERVATION_RECORD', true)],
+  })).gates.terminalFailures, {
+    verdict: 'FAIL',
+    reasonCode: 'TERMINAL_RETRIES_EXHAUSTED',
+  });
+});
+
 void test('fails closed when required terminal attribution is missing, malformed or unreconciled', () => {
   const neutral = terminalNeutralFixture();
   const cases: readonly [string, unknown][] = [
@@ -1039,6 +1065,19 @@ function pumpInvalidWorkerGroup(): Record<string, unknown> {
       signature: representativeSignature, slot: 1, transactionIndex: 0,
       confirmationStatus: 'finalized', instructionIndex: 1, innerInstructionIndex: null,
     },
+  };
+}
+
+function fundingDiagnosticGroup(
+  diagnosticCode: string,
+  retryExhausted: boolean,
+): Record<string, unknown> {
+  return {
+    source: 'WORKER', processingOutcome: 'FAILED', workerCycleAttempt: retryExhausted ? 5 : 1,
+    workerRecoveryCount: 0, retryable: true, retryExhausted,
+    stage: 'funding_observation', originCode: null, diagnosticCode,
+    catchUpCauseKind: null, catchUpReasonCode: null, completeness: 'COMPLETE',
+    pumpWire: null, count: 1, representative: null,
   };
 }
 

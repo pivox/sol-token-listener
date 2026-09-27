@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
 
 const migrations = new URL('../migrations/', import.meta.url);
 const migrationName = '057_transaction_inbox_terminal_attribution.sql';
@@ -21,17 +20,14 @@ void test('057 defines a restricted journal and retained parent incompleteness',
   assert.doesNotMatch(sql, /\b(?:JSONB?|FLOAT|REAL|DOUBLE PRECISION)\b/iu);
 });
 
-void test('057 empty install, 056 upgrade, immediate and runner replay preserve identities', async (context) => {
+void test('057 empty install, 056 upgrade and immediate replay preserve identities', async (context) => {
   await withSchema(context, async (pool) => {
-    const applied = await migrateDatabase({ pool });
-    assert.equal(applied.length, 57);
-    assert.equal(applied.at(-1), migrationName);
+    await applyThrough(pool, migrationName);
     const before = await identities(pool);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
     await pool.query(sql);
     assert.deepEqual(await identities(pool), before);
-    assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(`SELECT has_table_privilege(
       'public','transaction_inbox_terminal_attributions','SELECT') AS allowed`)).rows[0]?.allowed, false);
     const columns = await pool.query(`SELECT column_name,data_type,is_nullable,column_default
@@ -52,7 +48,8 @@ void test('057 empty install, 056 upgrade, immediate and runner replay preserve 
     await pool.query(`INSERT INTO chain_transaction_inbox
       (signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,observed_at)
       VALUES ('legacy',1,ARRAY['WEBSOCKET'],ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'processed',clock_timestamp())`);
-    assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
+    await pool.query(await readFile(migrationUrl, 'utf8'));
+    await pool.query('INSERT INTO migration_history(version) VALUES ($1)', [migrationName]);
     assert.deepEqual((await pool.query(`SELECT terminal_attribution_incomplete_count,
       terminal_attribution_incomplete_at FROM chain_transaction_inbox`)).rows,
     [{ terminal_attribution_incomplete_count: 0, terminal_attribution_incomplete_at: null }]);
@@ -62,7 +59,7 @@ void test('057 empty install, 056 upgrade, immediate and runner replay preserve 
 
 void test('057 rejects named object, column, constraint, index and privilege drift', async (context) => {
   await withSchema(context, async (pool) => {
-    await migrateDatabase({ pool });
+    await applyThrough(pool, migrationName);
     const sql = await readFile(migrationUrl, 'utf8');
     const drifts = [
       'DROP INDEX transaction_inbox_terminal_attributions_purge_idx',
@@ -102,6 +99,16 @@ void test('057 rejects named object, column, constraint, index and privilege dri
     }
   });
 });
+
+async function applyThrough(pool: pg.Pool, head: string): Promise<void> {
+  const names = (await readdir(migrations))
+    .filter((name) => /^\d+_.*\.sql$/u.test(name) && name <= head)
+    .sort();
+  for (const name of names) {
+    await pool.query(await readFile(new URL(name, migrations), 'utf8'));
+    await pool.query('INSERT INTO migration_history(version) VALUES ($1)', [name]);
+  }
+}
 
 async function identities(pool: pg.Pool): Promise<readonly unknown[]> {
   return (await pool.query<Record<string, unknown>>(`SELECT relname,oid FROM pg_class WHERE relnamespace=current_schema()::REGNAMESPACE

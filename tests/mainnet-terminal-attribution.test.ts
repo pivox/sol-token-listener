@@ -194,6 +194,54 @@ void test('uses canonical bytewise ordering and is byte-identical after input sh
   );
 });
 
+void test('groups and round-trips funding diagnostics in canonical bytewise order', () => {
+  const diagnosticOccurrenceRows = [
+    fundingOccurrence('FUNDING_OBSERVATION_VALIDATE', 3),
+    fundingOccurrence('FUNDING_OBSERVATION_RECORD', 2),
+    fundingOccurrence('FUNDING_OBSERVATION_EXTRACT', 1),
+  ];
+  const currentPopulationRows = [currentRow({
+    error_name: 'ObservedPipelineFailure.v1.funding_observation.UNKNOWN',
+    error_retryable: true,
+    failure_state: 'RETRY_PENDING',
+    row_count: 3,
+  })];
+  const left = buildMainnetTerminalAttribution({
+    currentPopulationRows,
+    diagnosticOccurrenceRows,
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  });
+  const right = buildMainnetTerminalAttribution({
+    currentPopulationRows: [...currentPopulationRows].reverse(),
+    diagnosticOccurrenceRows: [...diagnosticOccurrenceRows].reverse(),
+    incompleteAttributionRows: [{ parent_count: '0', incomplete_count: '0' }],
+  });
+  const serialized = serializeMainnetTerminalAttribution(left);
+
+  assert.deepEqual(left.diagnosticOccurrences.groups.map((group) => group.diagnosticCode), [
+    'FUNDING_OBSERVATION_EXTRACT',
+    'FUNDING_OBSERVATION_RECORD',
+    'FUNDING_OBSERVATION_VALIDATE',
+  ]);
+  assert.deepEqual(left.diagnosticOccurrences.groups.map((group) => ({
+    stage: group.stage,
+    originCode: group.originCode,
+    retryable: group.retryable,
+    completeness: group.completeness,
+    pumpWire: group.pumpWire,
+  })), Array.from({ length: 3 }, () => ({
+    stage: 'funding_observation',
+    originCode: null,
+    retryable: true,
+    completeness: 'COMPLETE',
+    pumpWire: null,
+  })));
+  assert.equal(serialized, serializeMainnetTerminalAttribution(right));
+  assert.equal(serialized, serializeMainnetTerminalAttribution(
+    parseMainnetTerminalAttribution(JSON.parse(serialized) as unknown),
+  ));
+});
+
 void test('retains 128 canonical groups and reports exact overflow groups and occurrences', () => {
   const currentRows = Array.from({ length: 130 }, (_unused, index) => currentRow({
     error_name: observedBorsh,
@@ -503,6 +551,18 @@ function pumpOccurrence(overrides: Record<string, unknown> = {}): Record<string,
     representative_instruction_index: 5,
     representative_inner_instruction_index: 1,
     ...overrides,
+  });
+}
+
+function fundingOccurrence(diagnosticCode: string, occurrenceCount: number): Record<string, unknown> {
+  return occurrence({
+    worker_cycle_attempt: occurrenceCount,
+    retryable: true,
+    retry_exhausted: false,
+    stage: 'funding_observation',
+    origin: null,
+    diagnostic_code: diagnosticCode,
+    occurrence_count: occurrenceCount,
   });
 }
 
