@@ -67,11 +67,12 @@ vierges, `workerAdmission.v1`, les diagnostics API/frontend et le contrat canary
 Un seul repository reçoit la politique ; aucun worker, timer, queue, appel RPC,
 cache, chemin wallet, executor, signature ou soumission supplémentaire n'est ajouté.
 
-La migration 053 reste la tête courante : elle conserve la preuve monotone
-`worker_admitted_at`, immuable et jamais effacée après admission. Déploiement :
-drain → migration 053 → deploy avec le flag false → restart ; arrêter et drainer
-le listener, mesurer l'inbox, appliquer la migration puis vérifier ordre et
-compteurs avant reprise. Un old binary contre schema 053 is not supported :
+La migration 055 est la tête courante du dépôt ; la migration 053 conserve la
+preuve monotone `worker_admitted_at`, immuable et jamais effacée après admission.
+Déploiement : drain → migrations 053 à 055 → deploy avec le flag false → restart ;
+arrêter et drainer le listener, mesurer l'inbox, appliquer toutes les migrations
+jusqu'à 055 puis vérifier ordre et compteurs avant reprise. Un old binary contre
+schema 053 is not supported :
 conserver le nouveau binaire avec le flag désactivé, ou restaurer dans une
 fenêtre drainée selon la procédure opérateur, sans ancienne réplique sur ce schéma.
 

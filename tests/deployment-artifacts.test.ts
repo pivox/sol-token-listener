@@ -381,8 +381,11 @@ void test('deployment keeps executable bounded admission disabled until the foll
   }
   assert.match(
     overview,
-    /drain[^.]{0,200}migration 053[^.]{0,200}deploy[^.]{0,200}restart/iu,
+    /drain[^.]{0,200}migrations[^.]{0,120}055[^.]{0,200}deploy[^.]{0,200}restart/iu,
   );
+  for (const document of [readme, overview]) {
+    assert.match(document, /migration 055[^.]{0,120}tête courante/iu);
+  }
   assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
   assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
   assert.doesNotMatch(overview, /45-second policy[^.]{0,120}(?:active|enabled)/iu);
