@@ -6,7 +6,7 @@ export const MAX_PUMPFUN_TRACKING_WINDOW_SECONDS = 3_600;
 
 export interface PumpFunWorkerAdmissionPolicyV1 {
   readonly schemaVersion: typeof PUMPFUN_WORKER_ADMISSION_POLICY_SCHEMA_VERSION;
-  readonly enabled: false;
+  readonly enabled: boolean;
   readonly trackingWindowSeconds: number;
 }
 
@@ -18,8 +18,8 @@ export interface PumpFunWorkerAdmissionPolicyInput {
 export function createPumpFunWorkerAdmissionPolicy(
   input: PumpFunWorkerAdmissionPolicyInput,
 ): PumpFunWorkerAdmissionPolicyV1 {
-  if (input.enabled !== false) {
-    throw new TypeError('The inactive Pump.fun worker admission policy requires enabled=false.');
+  if (typeof input.enabled !== 'boolean') {
+    throw new TypeError('The Pump.fun worker admission policy enabled must be a boolean.');
   }
   if (
     typeof input.trackingWindowSeconds !== 'number'
@@ -31,7 +31,7 @@ export function createPumpFunWorkerAdmissionPolicy(
   }
   return Object.freeze({
     schemaVersion: PUMPFUN_WORKER_ADMISSION_POLICY_SCHEMA_VERSION,
-    enabled: false,
+    enabled: input.enabled,
     trackingWindowSeconds: input.trackingWindowSeconds,
   });
 }

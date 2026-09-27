@@ -19,6 +19,35 @@ const createLine = programDataLine(PUMP_EVENTS.CreateEvent.discriminator, [0, 1,
 const firstTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
 const secondTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 2));
 
+void test('OFF helper mode preserves legacy CREATE precedence while ON alone rejects ambiguity', () => {
+  const ambiguousLines = [
+    'Log truncated',
+    'Program data: not-base64',
+    programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []),
+    programDataLine(PUMP_EVENTS.CreateEvent.discriminator.slice(0, -1), []),
+    programDataLine(PUMP_EVENTS.TradeEvent.discriminator, firstTradeMint.toBytes().subarray(0, 31)),
+    tradeLine(secondTradeMint),
+    `Program ${PUMPSWAP_PROGRAM_ID} invoke [1]`,
+  ];
+  for (const ambiguous of ambiguousLines) {
+    const logs = [tradeLine(firstTradeMint), ambiguous, createLine];
+    assert.deepEqual(pumpFunWebSocketHintFromLogs(logs, [PUMPSWAP_PROGRAM_ID]),
+      { hint: 'PUMPFUN_CREATE', hintMint: null }, ambiguous);
+    assert.deepEqual(pumpFunWebSocketHintFromLogs(logs, [PUMPSWAP_PROGRAM_ID], 'legacy'),
+      { hint: 'PUMPFUN_CREATE', hintMint: null }, ambiguous);
+    assert.deepEqual(pumpFunWebSocketHintFromLogs(logs, [PUMPSWAP_PROGRAM_ID], 'strict-admission'),
+      { hint: 'NONE', hintMint: null }, ambiguous);
+    assert.equal(pumpFunCreateHintFromLogs(logs), 'PUMPFUN_CREATE', ambiguous);
+  }
+});
+
+void test('helper classification mode fails closed for unrecognized runtime values', () => {
+  for (const mode of [null, true, false, 0, 'strict', {}, new String('legacy')]) {
+    assert.deepEqual(pumpFunWebSocketHintFromLogs([createLine], [], mode as 'legacy'),
+      { hint: 'NONE', hintMint: null });
+  }
+});
+
 void test('exports the exact closed hint vocabulary and creates frozen exact results', () => {
   assert.deepEqual(PUMPFUN_WEBSOCKET_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE']);
   assert.ok(Object.isFrozen(PUMPFUN_WEBSOCKET_HINTS));
@@ -57,8 +86,8 @@ void test('keeps composed real Pump.fun and PumpSwap trades on the normal path',
       `Program ${program} success`);
   }
   assert.deepEqual(pumpFunWebSocketHintFromLogs(lines, [PUMPSWAP_PROGRAM_ID]), { hint: 'NONE', hintMint: null });
-  assert.deepEqual(pumpFunWebSocketHintFromLogs([...lines, createLine], [PUMPSWAP_PROGRAM_ID]),
-    { hint: 'PUMPFUN_CREATE', hintMint: null });
+  assert.deepEqual(pumpFunWebSocketHintFromLogs([...lines, createLine], [PUMPSWAP_PROGRAM_ID], 'strict-admission'),
+    { hint: 'NONE', hintMint: null });
 });
 
 void test('only an exact PumpSwap runtime invocation vetoes a trade hint', () => {
@@ -129,20 +158,32 @@ void test('fails safe on every truncated CreateEvent discriminator prefix after 
       { hint: 'NONE', hintMint: null },
     );
     assert.deepEqual(
-      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), truncated, createLine]),
-      { hint: 'PUMPFUN_CREATE', hintMint: null },
+      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), truncated, createLine], [], 'strict-admission'),
+      { hint: 'NONE', hintMint: null },
     );
   }
 });
 
-void test('gives CreateEvent precedence even after ambiguous TradeEvents', () => {
-  assert.deepEqual(
-    pumpFunWebSocketHintFromLogs([
-      tradeLine(firstTradeMint), 'Program data: not-base64',
-      programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []), createLine,
-    ]),
-    { hint: 'PUMPFUN_CREATE', hintMint: null },
-  );
+void test('does not let CreateEvent override malformed or truncated TradeEvent data', () => {
+  for (const ambiguous of [
+    'Program data: not-base64',
+    programDataLine(PUMP_EVENTS.TradeEvent.discriminator, []),
+    programDataLine(
+      PUMP_EVENTS.TradeEvent.discriminator,
+      firstTradeMint.toBytes().subarray(0, 31),
+    ),
+  ]) {
+    assert.deepEqual(
+      pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), ambiguous, createLine], [], 'strict-admission'),
+      { hint: 'NONE', hintMint: null },
+    );
+  }
+});
+
+void test('keeps CreateEvent precedence over ordinary same-mint TradeEvents', () => {
+  assert.deepEqual(pumpFunWebSocketHintFromLogs([
+    tradeLine(firstTradeMint), createLine, tradeLine(firstTradeMint),
+  ]), { hint: 'PUMPFUN_CREATE', hintMint: null });
 });
 
 void test('keeps a trade hint when repeated TradeEvents use the same mint', () => {
@@ -157,6 +198,12 @@ void test('fails safe when valid TradeEvents use distinct mints', () => {
     pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), tradeLine(secondTradeMint)]),
     { hint: 'NONE', hintMint: null },
   );
+  assert.deepEqual(
+    pumpFunWebSocketHintFromLogs([
+      tradeLine(firstTradeMint), createLine, tradeLine(secondTradeMint),
+    ], [], 'strict-admission'),
+    { hint: 'NONE', hintMint: null },
+  );
 });
 
 void test('requires canonical bounded base64 rather than a textual discriminator prefix', () => {
@@ -169,14 +216,14 @@ void test('requires canonical bounded base64 rather than a textual discriminator
   ]), 'NONE');
 });
 
-void test('treats the exact runtime truncation marker as ambiguous unless a full CreateEvent exists', () => {
+void test('treats the exact runtime truncation marker as ambiguous even with CreateEvent', () => {
   assert.deepEqual(
     pumpFunWebSocketHintFromLogs([tradeLine(firstTradeMint), 'Log truncated']),
     { hint: 'NONE', hintMint: null },
   );
   assert.deepEqual(
-    pumpFunWebSocketHintFromLogs(['Log truncated', tradeLine(firstTradeMint), createLine]),
-    { hint: 'PUMPFUN_CREATE', hintMint: null },
+    pumpFunWebSocketHintFromLogs(['Log truncated', tradeLine(firstTradeMint), createLine], [], 'strict-admission'),
+    { hint: 'NONE', hintMint: null },
   );
 });
 

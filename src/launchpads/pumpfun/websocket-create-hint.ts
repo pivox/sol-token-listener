@@ -9,6 +9,7 @@ export const PUMPFUN_WEBSOCKET_HINTS = Object.freeze([
 ] as const);
 
 export type PumpFunWebSocketHint = (typeof PUMPFUN_WEBSOCKET_HINTS)[number];
+export type PumpFunWebSocketClassificationMode = 'legacy' | 'strict-admission';
 
 export interface PumpFunWebSocketCreateHint {
   readonly hint: PumpFunWebSocketHint;
@@ -40,7 +41,9 @@ export function pumpFunCreateHintFromLogs(logs: unknown): PumpFunWebSocketHint {
 export function pumpFunWebSocketHintFromLogs(
   logs: unknown,
   vetoProgramIds: unknown = [],
+  mode: PumpFunWebSocketClassificationMode = 'legacy',
 ): PumpFunWebSocketCreateHint {
+  if (!isClassificationMode(mode)) return NONE_HINT;
   const snapshot = snapshotLogs(logs);
   const vetoPrograms = snapshotVetoPrograms(vetoProgramIds);
   if (snapshot === null || vetoPrograms === null) return NONE_HINT;
@@ -88,10 +91,15 @@ export function pumpFunWebSocketHintFromLogs(
       }
     }
   }
-  if (hasCreateEvent) return CREATE_HINT;
+  // OFF preserves the pre-admission CREATE precedence, including ambiguous logs.
+  if (hasCreateEvent && (mode === 'legacy' || !hasAmbiguousEvent)) return CREATE_HINT;
   return firstTradeMint === null || hasAmbiguousEvent
     ? NONE_HINT
     : Object.freeze({ hint: 'PUMPFUN_TRADE', hintMint: firstTradeMint });
+}
+
+function isClassificationMode(value: unknown): value is PumpFunWebSocketClassificationMode {
+  return value === 'legacy' || value === 'strict-admission';
 }
 
 function snapshotVetoPrograms(value: unknown): ReadonlySet<string> | null {

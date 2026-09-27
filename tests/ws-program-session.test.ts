@@ -7,6 +7,8 @@ import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import {
   WsProgramSessionError,
   openWsProgramSession,
+  type WsProgramSessionDependencies,
+  type WsProgramNotification,
   type WsProgramSessionScheduler,
   type WsProgramSessionWebSocket,
 } from '../src/solana/rpc/ws-program-session.js';
@@ -201,13 +203,13 @@ void test('keeps the create hint when a Pump.fun notification contains both trad
   await closing;
 });
 
-void test('supplies the PumpSwap runtime veto to Pump.fun hints without losing creation priority', async () => {
+void test('ON supplies the PumpSwap runtime veto even when Pump.fun logs contain a create event', async () => {
   const socket = new FakeWebSocket();
   const frames: unknown[] = [];
   const session = await acknowledge(openWsProgramSession(
     { id: 'primary', url: 'wss://rpc.invalid/private' },
     async (frame) => { frames.push(frame); }, new AbortController().signal,
-    { createWebSocket: () => socket, scheduler: new ManualScheduler() },
+    { createWebSocket: () => socket, scheduler: new ManualScheduler(), workerAdmissionEnabled: true },
   ), socket);
   const trade = Buffer.concat([Buffer.from(PUMP_EVENTS.TradeEvent.discriminator),
     new PublicKey('So11111111111111111111111111111111111111112').toBytes()]).toString('base64');
@@ -218,12 +220,79 @@ void test('supplies the PumpSwap runtime veto to Pump.fun hints without losing c
   await new Promise<void>((resolve) => { setImmediate(resolve); });
   assert.deepEqual(frames, [
     { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 43n, hint: 'NONE', hintMint: null },
-    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 44n, hint: 'PUMPFUN_CREATE', hintMint: null },
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 44n, hint: 'NONE', hintMint: null },
   ]);
   const closing = session.close(new AbortController().signal);
   socket.message({ jsonrpc: '2.0', id: 3, result: true });
   socket.message({ jsonrpc: '2.0', id: 4, result: true });
   await closing;
+});
+
+void test('session OFF preserves legacy CREATE precedence and ON alone uses strict admission hints', async () => {
+  const mint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+  const otherMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 2));
+  const create = `Program data: ${Buffer.from(PUMP_EVENTS.CreateEvent.discriminator).toString('base64')}`;
+  const trade = `Program data: ${Buffer.concat([
+    Buffer.from(PUMP_EVENTS.TradeEvent.discriminator), mint.toBytes(),
+  ]).toString('base64')}`;
+  const ambiguousLines = [
+    'Log truncated', 'Program data: not-base64',
+    `Program ${PUMPSWAP_PROGRAM_ID} invoke [1]`,
+    `Program data: ${Buffer.from(PUMP_EVENTS.CreateEvent.discriminator.slice(0, -1)).toString('base64')}`,
+    `Program data: ${Buffer.from(PUMP_EVENTS.TradeEvent.discriminator).toString('base64')}`,
+    `Program data: ${Buffer.concat([Buffer.from(PUMP_EVENTS.TradeEvent.discriminator), otherMint.toBytes()]).toString('base64')}`,
+  ];
+  for (const enabled of [undefined, false, true]) {
+    const socket = new FakeWebSocket();
+    const frames: WsProgramNotification[] = [];
+    const session = await acknowledge(openWsProgramSession(
+      { id: 'primary', url: 'wss://rpc.invalid/private' },
+      async (frame) => { frames.push(frame); }, new AbortController().signal,
+      { createWebSocket: () => socket, scheduler: new ManualScheduler(),
+        ...(enabled === undefined ? {} : { workerAdmissionEnabled: enabled }) },
+    ), socket);
+    for (const ambiguous of ambiguousLines) {
+      socket.message(notification(101, 42, '1'.repeat(64), null, [trade, ambiguous, create]));
+    }
+    socket.message(notification(101, 42, '1'.repeat(64), null, [create]));
+    socket.message(notification(101, 42, '1'.repeat(64), null, [trade, create, trade]));
+    socket.message(notification(101, 42, '1'.repeat(64), null, [trade]));
+    socket.message(notification(102, 42, '1'.repeat(64), null, [create]));
+    assert.deepEqual(frames.map(({ hint, hintMint }) => [hint, hintMint]), [
+      ...ambiguousLines.map(() => [enabled === true ? 'NONE' : 'PUMPFUN_CREATE', null]),
+      ['PUMPFUN_CREATE', null], ['PUMPFUN_CREATE', null],
+      ['PUMPFUN_TRADE', mint.toBase58()], ['NONE', null],
+    ]);
+    const closing = session.close(new AbortController().signal);
+    socket.message({ jsonrpc: '2.0', id: 3, result: true });
+    socket.message({ jsonrpc: '2.0', id: 4, result: true });
+    await closing;
+  }
+});
+
+void test('rejects invalid or hostile session admission options before opening a socket', async () => {
+  let reads = 0;
+  let socketCalls = 0;
+  const createWebSocket = (): FakeWebSocket => { socketCalls += 1; return new FakeWebSocket(); };
+  const hostile = Object.defineProperty({ createWebSocket }, 'workerAdmissionEnabled', {
+    enumerable: true, get() { reads += 1; return true; },
+  });
+  const proxy = new Proxy({ createWebSocket }, { getOwnPropertyDescriptor() { reads += 1; return undefined; } });
+  for (const dependencies of [
+    ...['true', 'false', 1, 0, null, {}, new Boolean(true)].map((workerAdmissionEnabled) => ({ createWebSocket, workerAdmissionEnabled })),
+    hostile, proxy, Object.defineProperty({ createWebSocket }, 'workerAdmissionEnabled', { value: true }),
+  ]) {
+    const opening = openWsProgramSession(
+      { id: 'primary', url: 'wss://rpc.invalid/private' }, async () => undefined,
+      new AbortController().signal, dependencies as WsProgramSessionDependencies,
+    );
+    assert.equal(socketCalls, 0);
+    await assert.rejects(opening, (error: unknown) => {
+      assertStableError(error, 'PROTOCOL_INVALID');
+      return true;
+    });
+  }
+  assert.equal(reads, 0);
 });
 
 void test('rejects accessor-backed ingestion programs before opening a socket', async () => {

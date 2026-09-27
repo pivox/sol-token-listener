@@ -9,9 +9,77 @@ combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
 leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
 secondaire isolé; son code n'est pas activé par ce bootstrap.
 
-## Priorité des trades Pump.fun suivis (#102)
+## Classification d'admission worker Pump.fun (#176)
 
-La migration `047_transaction_inbox_tracked_trade_priority.sql` ajoute l'indice
+La classification est exécutable mais désactivée : les exemples et Compose
+conservent `LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false` et
+`LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS=45`. Ces réglages sont
+**restart-only**. Operational activation is prohibited until #177 is merged AND post-merge CI is green.
+Ce contrat décrit le comportement livré, pas une recette d'activation ou de canary.
+
+La validation ON exige le classifier strict de catch-up avec
+`LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true`,
+`EXECUTION_MODE=observe`, `LISTENER_INGESTION_SCOPE=launchpad-only`,
+`LISTENER_CATCH_UP_POLICY=live-edge`, `LISTENER_BLOCK_HYDRATION_ENABLED=true`
+et `SOLANA_EXPECTED_GENESIS_HASH` égal au hash canonique du cluster.
+Cette dépendance technique n'autorise aucune activation opérationnelle.
+
+En mode OFF (flag absent ou false), la sélection des candidats, l'ordre,
+les ratios d'équité et le SQL legacy de lease restent inchangés.
+À l'entrée WebSocket OFF, la priorité legacy de CREATE sur les logs ambigus
+reste inchangée et le chemin direct `SolanaProgramSubscriber` conserve ses hints
+`null`, sans analyser les logs.
+En mode ON uniquement, le mode partagé `strict-admission` assure la parité des
+deux chemins : CREATE canonique (même avec trade du même mint), TRADE fiable
+avec mint, aucun hint pour une preuve tronquée, vetoée, malformée ou conflictuelle.
+En mode ON, chaque sélection de claim
+exige `worker_admitted_at IS NOT NULL`, sans changer les ratios urgents 32:1 et
+création/trade suivi 3:1 ni l'ordre des retries.
+
+Le retour ON → OFF avec le nouveau binaire prend en charge une ligne persistée
+en mode ON comme `PENDING` non admise (`worker_admitted_at=null`) : OFF renseigne
+`worker_admitted_at` de manière monotone pour la seule ligne sélectionnée et verrouillée,
+avant de lui attribuer un lease, sans backfill global, afin d'éviter le blocage
+du rollback par la barrière d'admission. Ce pont opérationnel est distinct du
+rollback vers un ancien binaire sur le schéma 053, qui reste non supporté ;
+il ne constitue aucune autorisation d'activation.
+
+| Preuve en mode ON | État durable | Priorité | Admission worker |
+| --- | --- | --- | --- |
+| CREATE canonique, même avec achat initial | `PENDING` | `LAUNCH_CANDIDATE` | immédiate |
+| TRADE canonique d'un mint actuellement suivi | `PENDING` | `TRACKED_TRADE` | immédiate |
+| TRADE canonique d'un mint non suivi | `DEFERRED` | `NORMAL` | `null` |
+| Hint absent ou ambigu | `PENDING` | `NORMAL` | `null`, durable et non réclamable avant classification stricte catch-up |
+
+La classification catch-up admet une seule fois la transition
+`worker_admitted_at: null → non-null`, même si l'état reste `PENDING` ;
+`catchUpEnqueued` et `catchUpAdmissionPriority` reflètent cette première admission,
+pas simplement une promotion `DEFERRED → PENDING`. Le replay conserve l'admission
+et son reçu ; une preuve contradictoire ne réactive pas une décision terminale.
+L'horloge durable de classification ne réécrit ni `observed_at` ni
+`first_detected_at` : la preuve du premier traitement reste inchangée.
+La rétention terminale reste `terminal_at + quatre heures`.
+
+La fenêtre est seulement parsée, validée et conservée dans la politique figée ;
+elle n'applique aucune limite temporelle métier dans #176. #177 ajoutera
+l'autorité de suivi multi-table bornée à 45 secondes, la démotion des lignes
+vierges, `workerAdmission.v1`, les diagnostics API/frontend et le contrat canary.
+Un seul repository reçoit la politique ; aucun worker, timer, queue, appel RPC,
+cache, chemin wallet, executor, signature ou soumission supplémentaire n'est ajouté.
+
+La migration 055 est la tête courante du dépôt ; la migration 053 conserve la
+preuve monotone `worker_admitted_at`, immuable et jamais effacée après admission.
+Déploiement : drain → migrations 053 à 055 → deploy avec le flag false → restart ;
+arrêter et drainer le listener, mesurer l'inbox, appliquer toutes les migrations
+jusqu'à 055 puis vérifier ordre et compteurs avant reprise. Un old binary contre
+schema 053 is not supported :
+conserver le nouveau binaire avec le flag désactivé, ou restaurer dans une
+fenêtre drainée selon la procédure opérateur, sans ancienne réplique sur ce schéma.
+
+## Priorité des trades Pump.fun suivis (#102, mode OFF)
+
+En mode OFF de l'admission bornée, la migration
+`047_transaction_inbox_tracked_trade_priority.sql` ajoute l'indice
 fermé `PUMPFUN_TRADE` et sa priorité durable `TRACKED_TRADE`. PostgreSQL compare
 le mint public indiqué à la projection canonique : un trade d'un lancement
 actif reste réclamable dans la cohorte urgente, tandis qu'un trade explicitement
@@ -90,7 +158,7 @@ frontières et l'état non activé.
 `executor:preflight-source:start` reçoit uniquement le
 `EXECUTOR_PREFLIGHT_PREPARATION_RUN_ID` produit par H2k-b, reconstruit et
 vérifie toute la lignée run/pair/candidate/assessment/artifact avant d'écrire
-un fichier owner-only hors Git. Le head de migration est 047.
+un fichier owner-only hors Git. Le head de migration est 053.
 
 #51-H2k-b ajoute la préparation one-shot exacte : sélection d'une seule paire
 target/probe finalisée, dry-run non consommant, simulation du probe, puis run

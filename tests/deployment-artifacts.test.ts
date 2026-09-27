@@ -321,12 +321,13 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
 });
 
-void test('deployment documents the inactive bounded worker admission foundation', async () => {
-  const [compose, environment, localEnvironment, overview] = await Promise.all([
+void test('deployment keeps executable bounded admission disabled until the follow-up delivery gates', async () => {
+  const [compose, environment, localEnvironment, overview, readme] = await Promise.all([
     readArtifact('deploy/compose.yaml'),
     readArtifact('deploy/env.example'),
     readArtifact('.env.example'),
     readArtifact('docs/system-overview.html'),
+    readArtifact('README.md'),
   ]);
   const app = composeService(compose, 'app');
   const settings = Object.freeze([
@@ -346,22 +347,64 @@ void test('deployment documents the inactive bounded worker admission foundation
   }
 
   for (const example of [environment, localEnvironment]) {
-    assert.match(example, /inactive foundation[^.]{0,180}restart-only/iu);
-    assert.match(example, /true[^.]{0,180}(?:rejected|refused)[^.]{0,120}#171-B/iu);
+    assert.match(example, /restart-only/iu);
+    assert.match(example, /classifier/iu);
+    assert.match(example, /until #177 is merged AND post-merge CI is green/u);
+    assert.doesNotMatch(example, /^LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=true$/mu);
+    assert.doesNotMatch(example, /Part A cannot activate|true is rejected fail-closed until #171-B/u);
   }
 
   assert.match(overview, /migration 053[^.]{0,200}worker_admitted_at/iu);
   assert.match(overview, /worker_admitted_at[^.]{0,240}monotone[^.]{0,160}(?:never cleared|jamais effacé)/iu);
-  assert.match(overview, /Part A[^.]{0,240}(?:cannot|ne peut pas)[^.]{0,120}activ(?:ate|er)/iu);
-  assert.match(overview, /restart-only/iu);
-  assert.match(overview, /legacy[^.]{0,240}claim[^.]{0,240}(?:unchanged|inchangé)/iu);
+  for (const document of [readme, overview]) {
+    assert.match(document, /#176/u);
+    assert.match(document, /restart-only/iu);
+    assert.match(document, /OFF[^.]{0,240}sélection[^.]{0,80}ordre[^.]{0,80}équité[^.]{0,80}SQL legacy de lease[^.]{0,80}inchangés/iu);
+    assert.match(document, /OFF[^.]{0,200}CREATE[^.]{0,140}ambigu[^.]{0,200}SolanaProgramSubscriber[^.]{0,120}null/iu);
+    assert.match(document, /ON uniquement[^.]{0,200}strict-admission[^.]{0,120}deux chemins/iu);
+    assert.match(document, /ON → OFF[^.]{0,240}PENDING[^.]{0,80}null[^.]{0,240}worker_admitted_at[^.]{0,80}monotone/iu);
+    assert.match(document, /seule ligne sélectionnée et verrouillée[^.]{0,100}avant[^.]{0,80}lease/iu);
+    assert.match(document, /sans backfill global[^.]{0,120}blocage/iu);
+    assert.match(document, /distinct[^.]{0,120}rollback[^.]{0,80}ancien binaire/iu);
+    assert.match(document, /ON[^.]{0,240}worker_admitted_at IS NOT NULL/u);
+    assert.match(document, /terminal_at[^.]{0,100}(?:4 hours|quatre heures)/iu);
+    assert.match(document, /until #177 is merged AND post-merge CI is green/u);
+    for (const dependency of [
+      'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true', 'EXECUTION_MODE=observe',
+      'LISTENER_INGESTION_SCOPE=launchpad-only', 'LISTENER_CATCH_UP_POLICY=live-edge',
+      'LISTENER_BLOCK_HYDRATION_ENABLED=true', 'SOLANA_EXPECTED_GENESIS_HASH',
+    ]) assert.ok(document.includes(dependency), `missing classifier dependency: ${dependency}`);
+    assert.match(document, /PENDING[^.]{0,80}NORMAL[^.]{0,80}null/iu);
+    assert.match(document, /first_detected_at/u);
+    assert.match(document, /workerAdmission\.v1/u);
+    assert.doesNotMatch(document, /Part A ne peut pas activer/u);
+  }
   assert.match(
     overview,
-    /drain[^.]{0,200}migration 053[^.]{0,200}deploy[^.]{0,200}restart/iu,
+    /drain[^.]{0,200}migrations[^.]{0,120}055[^.]{0,200}deploy[^.]{0,200}restart/iu,
   );
+  for (const document of [readme, overview]) {
+    assert.match(document, /migration 055[^.]{0,120}tête courante/iu);
+  }
   assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
   assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
   assert.doesNotMatch(overview, /45-second policy[^.]{0,120}(?:active|enabled)/iu);
+});
+
+void test('versioned admission design and plan restrict strict ingress parity to ON', async () => {
+  const [spec, plan] = await Promise.all([
+    readArtifact('docs/superpowers/specs/2026-09-26-pumpfun-worker-admission-classification-design.md'),
+    readArtifact('docs/superpowers/plans/2026-09-26-pumpfun-worker-admission-classification.md'),
+  ]);
+  assert.match(spec, /Contract revision: 1\.0\.1/u);
+  assert.match(plan, /Plan revision:\*\* 1\.0\.1/u);
+  for (const document of [spec, plan]) {
+    assert.match(document, /OFF-equivalence/u);
+    assert.match(document, /ON-only strict parity/u);
+    assert.match(document, /legacy CREATE precedence/u);
+    assert.match(document, /direct subscriber[^.]{0,120}null hints/iu);
+    assert.match(document, /workerAdmissionPolicy\.enabled/u);
+  }
 });
 
 void test('Compose resolves catch-up scan limit defaults and overrides only for app', (context) => {

@@ -16,8 +16,8 @@ const PUMPFUN_CATCH_UP_PAGE_ADMISSION_ERROR =
   'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED requires a safe observation envelope.';
 const PUMPFUN_CATCH_UP_COVERAGE_ERROR =
   'LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED requires observe-only launchpad page admission.';
-const PUMPFUN_BOUNDED_WORKER_ADMISSION_ACTIVATION_ERROR =
-  'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED is not available until the admission/classification delivery.';
+const PUMPFUN_BOUNDED_WORKER_ADMISSION_CLASSIFIER_DEPENDENCY_ERROR =
+  'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED requires LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=true.';
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
@@ -190,8 +190,13 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     false,
     'LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED',
   );
-  if (boundedWorkerAdmissionEnabled) {
-    throw new Error(PUMPFUN_BOUNDED_WORKER_ADMISSION_ACTIVATION_ERROR);
+  const listenerPumpFunCatchUpPageAdmissionEnabled = parseStrictBoolean(
+    environment.LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED,
+    false,
+    'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED',
+  );
+  if (boundedWorkerAdmissionEnabled && !listenerPumpFunCatchUpPageAdmissionEnabled) {
+    throw new Error(PUMPFUN_BOUNDED_WORKER_ADMISSION_CLASSIFIER_DEPENDENCY_ERROR);
   }
   if (environment.LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS === '') {
     throw new Error(
@@ -208,11 +213,6 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       MAX_PUMPFUN_TRACKING_WINDOW_SECONDS,
     ),
   });
-  const listenerPumpFunCatchUpPageAdmissionEnabled = parseStrictBoolean(
-    environment.LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED,
-    false,
-    'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED',
-  );
   const listenerPumpFunCatchUpCoverageFastPathEnabled = parseStrictBoolean(
     environment.LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED,
     false,
