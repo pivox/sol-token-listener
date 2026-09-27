@@ -104,6 +104,60 @@ void test('enabled claim skips an out-of-authority overflow and keeps progressin
     });
   });
 
+void test('enabled demotion bypasses an authoritative saturated head and reaches tracked authority',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      await replaceAuthorityWithTask4Tables(pool);
+      const protectedMints = Array.from(
+        { length: MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM },
+        (_, index) => canonicalTestMint(index + 1_000),
+      );
+      const inactiveMints = Array.from(
+        { length: MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM },
+        (_, index) => canonicalTestMint(index + 1_300),
+      );
+      const activeMint = canonicalTestMint(1_600);
+      await insertExpiredAdmittedTradesAcrossMints(pool, 'demotion-protected-head', protectedMints);
+      await pool.query(`UPDATE chain_transaction_inbox SET observed_slot=observed_slot+10000
+        WHERE signature LIKE 'demotion-protected-head-%'`);
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+        worker_admitted_at
+      ) SELECT 'demotion-inactive-middle-' || LPAD(value.ordinality::TEXT,4,'0'),
+        value.ordinality,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING','TRACKED_TRADE',
+        'PUMPFUN_TRADE',value.mint,
+        TIMESTAMPTZ '2026-01-02 00:00:00+00' + value.ordinality * INTERVAL '1 millisecond',
+        TIMESTAMPTZ '2026-01-02 00:00:00+00' + value.ordinality * INTERVAL '1 millisecond'
+        FROM UNNEST($2::TEXT[]) WITH ORDINALITY AS value(mint,ordinality)`,
+      [PUMP_PROGRAM_ID, inactiveMints]);
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+        worker_admitted_at
+      ) VALUES ('demotion-authorized-after-window',257,ARRAY['WEBSOCKET'],ARRAY[$1],
+        'processed','PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$2,
+        TIMESTAMPTZ '2026-01-03 00:00:00+00',TIMESTAMPTZ '2026-01-03 00:00:00+00')`,
+      [PUMP_PROGRAM_ID, activeMint]);
+      await pool.query(`INSERT INTO paper_strategy_sessions(mint,state)
+        SELECT mint,'BUY_PENDING' FROM UNNEST($1::TEXT[]) AS mint`,
+      [[...protectedMints, activeMint]]);
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+
+      assert.equal(await repository.claim(Date.now(), 30), null);
+      assert.equal((await demotionRows(pool, 'demotion-inactive-middle'))
+        .filter((stored) => stored.processing_status === 'DEFERRED').length,
+      MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM);
+      assert.equal((await demotionRows(pool, 'demotion-protected-head'))
+        .every((stored) => stored.processing_status === 'PENDING'), true);
+      assert.equal((await repository.claim(Date.now() + 1, 30))?.signature,
+        'demotion-authorized-after-window');
+      assert.equal((await row(pool, 'demotion-authorized-after-window')).attempts, 1);
+      assert.equal((await demotionRows(pool, 'demotion-inactive-middle'))
+        .every((stored) => stored.attempts === 0), true);
+    });
+  });
+
 void test('enabled claim reclaims attempted tracked work after authority expires', async (context) => {
   await withDatabase(context, async (pool) => {
     await replaceAuthorityWithTask4Tables(pool);
@@ -7166,6 +7220,7 @@ interface DemotionTestRow {
   readonly signature: string;
   readonly processing_status: string;
   readonly ingestion_priority: string;
+  readonly attempts: number;
   readonly worker_admitted_at: Date | null;
   readonly first_detected_at: Date | null;
   readonly observed_at: Date;
@@ -7178,7 +7233,7 @@ async function demotionRows(
   pool: InstanceType<typeof pg.Pool>,
   prefix: string,
 ): Promise<DemotionTestRow[]> {
-  return (await pool.query<DemotionTestRow>(`SELECT signature,processing_status,ingestion_priority,
+  return (await pool.query<DemotionTestRow>(`SELECT signature,processing_status,ingestion_priority,attempts,
     worker_admitted_at,first_detected_at,observed_at,terminal_at,purge_after,updated_at
     FROM chain_transaction_inbox WHERE signature LIKE $1 ORDER BY observed_at,observed_slot,signature`,
   [`${prefix}-%`])).rows;

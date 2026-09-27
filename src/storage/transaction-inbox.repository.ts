@@ -1466,13 +1466,61 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     client: InboxClient,
     now: Date,
   ): Promise<WorkerAdmissionClaimPlan> {
+    // Keep authoritative rows from permanently occupying the bounded preview;
+    // demotion still revalidates this advisory decision after the mint locks.
     const demotionPreview = await client.query(
-      `SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
+      `WITH database_clock AS MATERIALIZED (
+         SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+       ) SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
        FROM chain_transaction_inbox AS inbox
-       WHERE ${workerAdmissionDemotionPristineSql('inbox')}
+       CROSS JOIN database_clock
+       WHERE database_clock.at>=inbox.observed_at
+         AND ${workerAdmissionDemotionPristineSql('inbox')}
+         AND NOT EXISTS (
+           SELECT 1
+           FROM token_launches AS launch
+           JOIN domain_events AS launch_event
+             ON launch_event.type='TokenLaunchDetected'
+            AND launch_event.mint=launch.mint
+            AND launch_event.signature=launch.created_signature
+            AND launch_event.slot=launch.created_slot
+            AND launch_event.transaction_index=launch.created_transaction_index
+            AND launch_event.instruction_index=launch.created_instruction_index
+            AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
+              launch.created_inner_instruction_index
+           WHERE launch.mint=inbox.ingestion_hint_mint
+             AND launch.current_state<>'RETRACTED'
+             AND launch_event.confirmation_status<>'orphaned'
+             AND launch.detected_at+($1::INTEGER*INTERVAL '1 second')>database_clock.at
+         ) AND NOT EXISTS (
+           SELECT 1
+           FROM trading_candidates AS candidate
+           JOIN domain_events AS source_event ON source_event.event_id=candidate.source_event_id
+           WHERE candidate.mint=inbox.ingestion_hint_mint
+             AND candidate.superseded_at IS NULL AND candidate.state='ELIGIBLE'
+             AND candidate.confirmation_status<>'orphaned'
+             AND source_event.confirmation_status<>'orphaned'
+             AND candidate.eligible_until>database_clock.at
+         ) AND NOT EXISTS (
+           SELECT 1 FROM paper_strategy_sessions AS session
+           WHERE session.mint=inbox.ingestion_hint_mint
+             AND session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+               'EXIT_PENDING_QUOTE','SELL_PENDING')
+         ) AND NOT EXISTS (
+           SELECT 1 FROM paper_positions AS position
+           WHERE position.mint=inbox.ingestion_hint_mint AND position.status='PAPER_HOLDING'
+         ) AND NOT EXISTS (
+           SELECT 1 FROM execution_intents AS intent
+           WHERE intent.mint=inbox.ingestion_hint_mint AND intent.terminal_at IS NULL
+             AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
+         ) AND NOT EXISTS (
+           SELECT 1 FROM listener_worker_tracking_live_mints AS live
+           WHERE live.mint=inbox.ingestion_hint_mint
+         )
        ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
-       LIMIT $1`,
-      [MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+       LIMIT $2`,
+      [this.workerAdmissionPolicy.trackingWindowSeconds,
+        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
     const trackedPreview = await client.query(
       `SELECT signature,ingestion_hint_mint AS mint
