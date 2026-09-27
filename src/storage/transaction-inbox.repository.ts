@@ -1458,11 +1458,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
            OR (inbox.processing_status='PROCESSING' AND inbox.lease_expires_at<=$1
              AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
-         ) AND (
-           NOT (${workerAdmissionDemotionPristineSql('inbox')})
-           OR EXISTS (SELECT 1 FROM fresh_launch WHERE fresh_launch.mint=inbox.ingestion_hint_mint)
-           OR EXISTS (SELECT 1 FROM extended_mint WHERE extended_mint.mint=inbox.ingestion_hint_mint)
-         )
+         ) AND ${workerAdmissionClaimAuthoritySql('inbox')}
        ORDER BY inbox.observed_slot,inbox.signature
        FOR UPDATE OF inbox SKIP LOCKED LIMIT 1`,
       [now, workerAdmissionClaimPlan.trackedSignatures,
@@ -3004,7 +3000,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              UNION SELECT live.mint FROM listener_worker_tracking_live_mints AS live
            ) SELECT
              COUNT(*) FILTER (WHERE ${claimable}
-               AND inbox.worker_admitted_at IS NOT NULL) AS claimable_backlog_count,
+               AND inbox.worker_admitted_at IS NOT NULL
+               AND ${workerAdmissionClaimAuthoritySql('inbox')}) AS claimable_backlog_count,
              COUNT(*) FILTER (WHERE inbox.processing_status='PENDING'
                AND inbox.worker_admitted_at IS NULL) AS classification_pending_count,
              CASE WHEN COUNT(*) FILTER (WHERE inbox.processing_status='PENDING'
@@ -4082,6 +4079,19 @@ function workerAdmissionDemotionPristineSql(alias: string): string {
     AND ${alias}.first_processing_evidence_unavailable=FALSE
     AND ${alias}.decoder_quarantine_eligible_at IS NULL
     AND ${alias}.decoder_recovery_used=FALSE`;
+}
+
+function workerAdmissionClaimAuthoritySql(alias: string): string {
+  if (alias !== 'inbox') throw new TypeError('Worker admission claim alias is invalid.');
+  return `(NOT (${alias}.ingestion_priority='TRACKED_TRADE'
+      AND ${alias}.ingestion_hint='PUMPFUN_TRADE')
+    OR NOT (${workerAdmissionDemotionPristineSql(alias)})
+    OR EXISTS (
+      SELECT 1 FROM fresh_launch WHERE fresh_launch.mint=${alias}.ingestion_hint_mint
+    )
+    OR EXISTS (
+      SELECT 1 FROM extended_mint WHERE extended_mint.mint=${alias}.ingestion_hint_mint
+    ))`;
 }
 
 function workerAdmissionRetainedDemotionSql(alias: string, sampledAt: string): string {

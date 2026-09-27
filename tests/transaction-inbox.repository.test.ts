@@ -155,6 +155,8 @@ void test('worker admission metrics use exact scheduler claims and retained demo
     await withDatabase(context, async (pool) => {
       const fixedAt = new Date('2026-01-02T00:00:00.000Z');
       const detectedAt = new Date(fixedAt.getTime() - 10_000);
+      const expiredAt = new Date(fixedAt.getTime() - 60_000);
+      const untrackedMint = canonicalTestMint(2_004);
       await dropInboxIntegrityGuards(pool);
       await pool.query(`INSERT INTO chain_transaction_inbox (
         signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
@@ -181,9 +183,16 @@ void test('worker admission metrics use exact scheduler claims and retained demo
         ('metrics-invalid-retained-demotion',6,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
           'DEFERRED','NORMAL','PUMPFUN_TRADE',$4,$2,$2,$2,0,0,5,NULL,NULL,NULL,NULL,NULL,NULL,
           NULL,$3::TIMESTAMPTZ-INTERVAL '1 hour',
-          $3::TIMESTAMPTZ+INTERVAL '3 hours',TRUE)`,
-      [PUMP_PROGRAM_ID, detectedAt, fixedAt, tradeMint]);
+          $3::TIMESTAMPTZ+INTERVAL '3 hours',TRUE),
+        ('metrics-expired-pristine-untracked',7,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$6,$5,$5,$5,0,0,5,NULL,NULL,NULL,NULL,NULL,
+          NULL,NULL,NULL,NULL,FALSE),
+        ('metrics-expired-pristine-authoritative',8,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+          'PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$4,$5,$5,$5,0,0,5,NULL,NULL,NULL,NULL,NULL,
+          NULL,NULL,NULL,NULL,FALSE)`,
+      [PUMP_PROGRAM_ID, detectedAt, fixedAt, tradeMint, expiredAt, untrackedMint]);
       await freezeSchemaClock(pool, fixedAt);
+      await insertTrackedLaunch(pool);
 
       const enabled = await new PostgresTransactionInboxRepository(
         pool, undefined, enabledAdmission,
@@ -195,8 +204,8 @@ void test('worker admission metrics use exact scheduler claims and retained demo
         disabledClaimableBacklogCount: disabled.claimableBacklogCount,
         enabledDemotedCount: enabled.demotedCount,
       }, {
-        enabledClaimableBacklogCount: 1,
-        disabledClaimableBacklogCount: 1,
+        enabledClaimableBacklogCount: 2,
+        disabledClaimableBacklogCount: 3,
         enabledDemotedCount: 0,
       });
     });
