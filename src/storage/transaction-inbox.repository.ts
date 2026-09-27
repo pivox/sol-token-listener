@@ -17,6 +17,7 @@ import { isDecoderQuarantineFailure } from '../domain/observed-pipeline-failure.
 import {
   createPumpFunWorkerAdmissionPolicy,
   DEFAULT_PUMPFUN_TRACKING_WINDOW_SECONDS,
+  MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM,
   type PumpFunWorkerAdmissionPolicyV1,
 } from '../domain/worker-admission.js';
 import {
@@ -1248,6 +1249,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE inbox.signature = exhausted.signature`,
           [now, MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM],
         );
+        if (this.workerAdmissionPolicy.enabled) {
+          await this.demoteExpiredPristineTrades(client);
+        }
         const scheduler = await client.query(
           `SELECT consecutive_urgent_claims, launch_claims_since_tracked
            FROM chain_transaction_inbox_claim_scheduler
@@ -1344,6 +1348,104 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         return claimFromRow(requiredRow(updated.rows[0]));
       });
     });
+  }
+
+  private async demoteExpiredPristineTrades(client: InboxClient): Promise<void> {
+    const preview = await client.query(
+      `SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
+       FROM chain_transaction_inbox AS inbox
+       WHERE ${workerAdmissionDemotionPristineSql('inbox')}
+       ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
+       LIMIT $1`,
+      [MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+    );
+    const signatures = preview.rows.map((row) => requiredText(
+      row.signature,
+      'worker admission demotion signature',
+    ));
+    const mints = preview.rows.map((row) => {
+      assertCanonicalMint(row.mint);
+      return row.mint;
+    });
+    if (mints.length === 0) return;
+    await lockWorkerTrackingMints(client, mints);
+    await client.query(
+      `WITH
+       database_clock AS MATERIALIZED (
+         SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+       ), candidates AS MATERIALIZED (
+         SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
+         FROM chain_transaction_inbox AS inbox
+         CROSS JOIN database_clock
+         WHERE inbox.signature=ANY($1::TEXT[])
+           AND inbox.ingestion_hint_mint=ANY($2::TEXT[])
+           AND database_clock.at>=inbox.observed_at
+           AND ${workerAdmissionDemotionPristineSql('inbox')}
+         ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
+         FOR UPDATE OF inbox SKIP LOCKED
+         LIMIT $4
+       ), candidate_mints AS MATERIALIZED (
+         SELECT DISTINCT mint FROM candidates
+       ), fresh_launch AS MATERIALIZED (
+         SELECT launch.mint
+         FROM candidate_mints AS candidate
+         JOIN token_launches AS launch ON launch.mint=candidate.mint
+         JOIN domain_events AS launch_event
+           ON launch_event.type='TokenLaunchDetected'
+          AND launch_event.mint=launch.mint
+          AND launch_event.signature=launch.created_signature
+          AND launch_event.slot=launch.created_slot
+          AND launch_event.transaction_index=launch.created_transaction_index
+          AND launch_event.instruction_index=launch.created_instruction_index
+          AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
+            launch.created_inner_instruction_index
+         CROSS JOIN database_clock
+         WHERE launch.current_state<>'RETRACTED'
+           AND launch_event.confirmation_status<>'orphaned'
+           AND launch.detected_at+($3::INTEGER*INTERVAL '1 second')>database_clock.at
+       ), extended_mint AS MATERIALIZED (
+         SELECT candidate.mint
+         FROM trading_candidates AS candidate
+         JOIN candidate_mints AS selected ON selected.mint=candidate.mint
+         JOIN domain_events AS source_event ON source_event.event_id=candidate.source_event_id
+         CROSS JOIN database_clock
+         WHERE candidate.superseded_at IS NULL AND candidate.state='ELIGIBLE'
+           AND candidate.confirmation_status<>'orphaned'
+           AND source_event.confirmation_status<>'orphaned'
+           AND candidate.eligible_until>database_clock.at
+         UNION SELECT session.mint
+           FROM paper_strategy_sessions AS session
+           JOIN candidate_mints AS selected ON selected.mint=session.mint
+           WHERE session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+             'EXIT_PENDING_QUOTE','SELL_PENDING')
+         UNION SELECT position.mint
+           FROM paper_positions AS position
+           JOIN candidate_mints AS selected ON selected.mint=position.mint
+           WHERE position.status='PAPER_HOLDING'
+         UNION SELECT intent.mint
+           FROM execution_intents AS intent
+           JOIN candidate_mints AS selected ON selected.mint=intent.mint
+           WHERE intent.terminal_at IS NULL
+             AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
+         UNION SELECT live.mint
+           FROM listener_worker_tracking_live_mints AS live
+           JOIN candidate_mints AS selected ON selected.mint=live.mint
+       ), demoted AS (
+         UPDATE chain_transaction_inbox AS inbox SET
+           processing_status='DEFERRED',ingestion_priority='NORMAL',
+           terminal_at=database_clock.at,
+           purge_after=database_clock.at+INTERVAL '4 hours',
+           updated_at=GREATEST(inbox.updated_at,database_clock.at)
+         FROM candidates,database_clock
+         WHERE inbox.signature=candidates.signature
+           AND ${workerAdmissionDemotionPristineSql('inbox')}
+           AND NOT EXISTS (SELECT 1 FROM fresh_launch WHERE fresh_launch.mint=candidates.mint)
+           AND NOT EXISTS (SELECT 1 FROM extended_mint WHERE extended_mint.mint=candidates.mint)
+         RETURNING inbox.signature
+       ) SELECT COUNT(*)::INTEGER AS demoted_count FROM demoted`,
+      [signatures, mints, this.workerAdmissionPolicy.trackingWindowSeconds,
+        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+    );
   }
 
   public async hasNonTerminalProgramWork(programId: string): Promise<boolean> {
@@ -3632,6 +3734,29 @@ function isPristineInbox(row: InboxIdentityRow): boolean {
     && row.processed_at === null
     && safeCount(row.manual_recovery_count, 'manual recovery count') === 0
     && row.last_manual_recovery_at === null;
+}
+
+function workerAdmissionDemotionPristineSql(alias: string): string {
+  if (alias !== 'inbox') throw new TypeError('Worker admission demotion alias is invalid.');
+  return `${alias}.processing_status='PENDING'
+    AND ${alias}.ingestion_priority='TRACKED_TRADE'
+    AND ${alias}.ingestion_hint='PUMPFUN_TRADE'
+    AND ${alias}.ingestion_hint_mint IS NOT NULL
+    AND ${alias}.worker_admitted_at IS NOT NULL
+    AND ${alias}.attempts=0 AND ${alias}.attempts_in_cycle=0
+    AND ${alias}.lease_token IS NULL AND ${alias}.lease_expires_at IS NULL
+    AND ${alias}.normalized_transaction IS NULL AND ${alias}.immutable_fingerprint IS NULL
+    AND ${alias}.error_code IS NULL AND ${alias}.error_name IS NULL
+    AND ${alias}.error_retryable IS NULL AND ${alias}.next_attempt_at IS NULL
+    AND ${alias}.retry_exhausted_at IS NULL AND ${alias}.processed_at IS NULL
+    AND ${alias}.missing_finality_polls=0
+    AND ${alias}.last_missing_finality_provider_id IS NULL
+    AND ${alias}.finality_evidence_version=0
+    AND ${alias}.manual_recovery_count=0 AND ${alias}.last_manual_recovery_at IS NULL
+    AND ${alias}.first_processed_at IS NULL
+    AND ${alias}.first_processing_evidence_unavailable=FALSE
+    AND ${alias}.decoder_quarantine_eligible_at IS NULL
+    AND ${alias}.decoder_recovery_used=FALSE`;
 }
 
 function storedIngestionDecision(row: InboxIdentityRow): IngestionDecision {

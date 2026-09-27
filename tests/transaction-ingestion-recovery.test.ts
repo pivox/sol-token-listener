@@ -33,6 +33,7 @@ import type {
 } from '../src/markets/pumpswap/types.js';
 import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
 import { createDefaultQualificationRuleSet, QualificationEngine } from '../src/qualification/qualification-engine.js';
+import { createPumpFunWorkerAdmissionPolicy } from '../src/domain/worker-admission.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../src/solana/wallet-funding-evidence-extractor.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
 import type { FinalityProviderPassSource } from '../src/ports/finality-provider-pass.js';
@@ -52,6 +53,37 @@ import { failurePipeline, malformedPumpTransaction, realPumpPipeline } from
   './observed-pipeline-failure-fixtures.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+const enabledAdmission = createPumpFunWorkerAdmissionPolicy({
+  enabled: true,
+  trackingWindowSeconds: 45,
+});
+
+void test('restart leaves a bounded-admission demotion terminal and replay-safe', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+      processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+      worker_admitted_at
+    ) VALUES ('bounded-restart-demotion',1,ARRAY['WEBSOCKET'],ARRAY[$1],'confirmed',
+      'PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$2,TIMESTAMPTZ '2026-01-01 00:00:00+00',
+      TIMESTAMPTZ '2026-01-01 00:00:00+00')`, [PUMP_PROGRAM_ID,
+      'So11111111111111111111111111111111111111112']);
+    const first = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    assert.equal(await first.claim(Date.now(), 30), null);
+    const demoted = (await pool.query(`SELECT * FROM chain_transaction_inbox
+      WHERE signature='bounded-restart-demotion'`)).rows[0];
+    assert.ok(demoted);
+    assert.equal(demoted.processing_status, 'DEFERRED');
+    assert.equal(demoted.ingestion_priority, 'NORMAL');
+    assert.ok(demoted.worker_admitted_at instanceof Date);
+    assert.equal(demoted.purge_after.getTime() - demoted.terminal_at.getTime(), 14_400_000);
+
+    const restarted = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    assert.equal(await restarted.claim(Date.now() + 1, 30), null);
+    assert.deepEqual((await pool.query(`SELECT * FROM chain_transaction_inbox
+      WHERE signature='bounded-restart-demotion'`)).rows[0], demoted);
+  });
+});
 
 void test('purges deferred decisions after four hours without recovering or purging actionable work', async (context) => {
   await withDatabase(context, async (pool) => {

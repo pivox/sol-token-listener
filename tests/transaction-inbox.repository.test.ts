@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
+import { PublicKey } from '@solana/web3.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import { PumpFunCatchUpBlockClassifier } from '../src/application/pumpfun-catch-up-block-classifier.js';
 import { PumpFunStrictCatchUpPageAdmitter } from '../src/application/pumpfun-strict-catch-up-page-admitter.js';
@@ -16,7 +17,10 @@ import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import { FinalityReconciler } from '../src/application/finality-reconciler.js';
 import { createCatchUpClassification } from '../src/domain/catch-up-classification.js';
-import { createPumpFunWorkerAdmissionPolicy } from '../src/domain/worker-admission.js';
+import {
+  createPumpFunWorkerAdmissionPolicy,
+  MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM,
+} from '../src/domain/worker-admission.js';
 import type {
   IngestionFailure,
   FinalityCandidate,
@@ -63,6 +67,213 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
+
+void test('enabled claim demotes exactly 256 expired pristine trades oldest first without consuming fairness',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      await insertExpiredAdmittedTradesAcrossMints(pool, 'demotion-batch',
+        Array.from({ length: MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM + 1 },
+          (_, index) => canonicalTestMint(index + 10)));
+      await repository.enqueue(notification('demotion-batch-launch', 10_000n,
+        'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE'));
+
+      assert.equal((await repository.claim(Date.now(), 30))?.signature, 'demotion-batch-launch');
+      const firstPass = await demotionRows(pool, 'demotion-batch');
+      assert.equal(firstPass.filter((stored) => stored.processing_status === 'DEFERRED').length,
+        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM);
+      assert.deepEqual(firstPass.filter((stored) => stored.processing_status === 'PENDING')
+        .map((stored) => stored.signature), ['demotion-batch-0257']);
+      const afterActualClaim = await schedulerState(pool);
+      assert.deepEqual(afterActualClaim, {
+        consecutive_urgent_claims: 1,
+        launch_claims_since_tracked: 1,
+      });
+
+      assert.equal(await repository.claim(Date.now() + 1, 30), null);
+      assert.equal((await demotionRows(pool, 'demotion-batch'))
+        .filter((stored) => stored.processing_status === 'DEFERRED').length,
+      MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM + 1);
+      assert.deepEqual(await schedulerState(pool), afterActualClaim);
+    });
+  });
+
+void test('enabled demotion skips a row locked by another worker and converges without double demotion',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      await insertExpiredAdmittedTrades(pool, 'demotion-skip-locked', tradeMint, 2);
+      await repository.enqueue(notification('demotion-skip-locked-launch', 10_000n,
+        'WEBSOCKET', 'processed', 1_000, 'PUMPFUN_CREATE'));
+      const blocker = await pool.connect();
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(`SELECT signature FROM chain_transaction_inbox
+          WHERE signature='demotion-skip-locked-0001' FOR UPDATE`);
+        assert.equal((await settlesWithin(repository.claim(Date.now(), 30), 1_000))?.signature,
+          'demotion-skip-locked-launch');
+        assert.deepEqual((await demotionRows(pool, 'demotion-skip-locked'))
+          .filter((stored) => stored.signature !== 'demotion-skip-locked-launch')
+          .map((stored) => [stored.signature, stored.processing_status]), [
+          ['demotion-skip-locked-0001', 'PENDING'],
+          ['demotion-skip-locked-0002', 'DEFERRED'],
+        ]);
+        await blocker.query('COMMIT');
+        assert.equal(await repository.claim(Date.now() + 1, 30), null);
+        assert.deepEqual((await demotionRows(pool, 'demotion-skip-locked'))
+          .filter((stored) => stored.signature !== 'demotion-skip-locked-launch')
+          .map((stored) => stored.processing_status), ['DEFERRED', 'DEFERRED']);
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        blocker.release();
+      }
+    });
+  });
+
+void test('enabled demotion requires every pristine fence',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      const fences = [
+        ['attempts', 'attempts=1'],
+        ['attempts-in-cycle', 'attempts=1,attempts_in_cycle=1'],
+        ['lease', "lease_token='held',lease_expires_at=clock_timestamp()+INTERVAL '1 minute'"],
+        ['snapshot', `normalized_transaction='{}'::JSONB,immutable_fingerprint='${'a'.repeat(64)}'`],
+        ['fingerprint', `immutable_fingerprint='${'b'.repeat(64)}'`],
+        ['error', "error_code='RPC_TRANSIENT',error_name='prior',error_retryable=TRUE"],
+        ['retry', "next_attempt_at=clock_timestamp()+INTERVAL '1 minute'"],
+        ['exhaustion', 'retry_exhausted_at=clock_timestamp()'],
+        ['processed', 'processed_at=clock_timestamp()'],
+        ['finality-polls', "missing_finality_polls=1,last_missing_finality_provider_id='primary'"],
+        ['finality-provider', "last_missing_finality_provider_id='primary'"],
+        ['finality-version', 'finality_evidence_version=1'],
+        ['manual-recovery', 'manual_recovery_count=1,last_manual_recovery_at=clock_timestamp()'],
+        ['manual-recovery-at', 'last_manual_recovery_at=clock_timestamp()'],
+        ['first-processed', 'first_processed_at=clock_timestamp()'],
+        ['first-processing-unavailable', 'first_processing_evidence_unavailable=TRUE'],
+        ['decoder-quarantine', 'decoder_quarantine_eligible_at=clock_timestamp()'],
+        ['decoder-recovery', 'decoder_recovery_used=TRUE'],
+      ] as const;
+      await insertExpiredAdmittedTrades(pool, 'demotion-fence-control', tradeMint, 1);
+      for (const [index, [name]] of fences.entries()) {
+        await insertExpiredAdmittedTrades(pool, `demotion-fence-${name}`, tradeMint, 1,
+          BigInt(index + 10));
+      }
+      await dropInboxIntegrityGuards(pool);
+      for (const [name, mutation] of fences) {
+        await pool.query(`UPDATE chain_transaction_inbox SET ${mutation} WHERE signature=$1`,
+          [`demotion-fence-${name}-0001`]);
+      }
+
+      await repository.claim(Date.now(), 30);
+      assert.equal((await row(pool, 'demotion-fence-control-0001')).processing_status, 'DEFERRED');
+      for (const [name] of fences) {
+        assert.notEqual((await row(pool, `demotion-fence-${name}-0001`)).processing_status,
+          'DEFERRED', name);
+      }
+    });
+  });
+
+void test('enabled demotion keeps admission and detection immutable and is restart-idempotent',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      await insertExpiredAdmittedTrades(pool, 'demotion-terminal', tradeMint, 1);
+      const before = await row(pool, 'demotion-terminal-0001');
+
+      assert.equal(await repository.claim(Date.now(), 30), null);
+      const demoted = await row(pool, 'demotion-terminal-0001');
+      assert.equal(demoted.processing_status, 'DEFERRED');
+      assert.equal(demoted.ingestion_priority, 'NORMAL');
+      assert.equal(demoted.worker_admitted_at.getTime(), before.worker_admitted_at.getTime());
+      assert.equal(demoted.first_detected_at.getTime(), before.first_detected_at.getTime());
+      assert.equal(demoted.observed_at.getTime(), before.observed_at.getTime());
+      assert.equal(demoted.purge_after.getTime() - demoted.terminal_at.getTime(), 14_400_000);
+      assert.ok(demoted.updated_at.getTime() >= demoted.terminal_at.getTime());
+      const snapshot = await row(pool, 'demotion-terminal-0001');
+      assert.equal(await repository.claim(Date.now() + 1, 30), null);
+      assert.equal(await new PostgresTransactionInboxRepository(
+        pool, undefined, enabledAdmission,
+      ).claim(Date.now() + 2, 30), null);
+      assert.deepEqual(await row(pool, 'demotion-terminal-0001'), snapshot);
+
+      await pool.query(`WITH decision_clock AS MATERIALIZED (
+        SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+      ) INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+        first_detected_at,terminal_at,purge_after
+      ) SELECT 'demotion-unadmitted',999,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+        'DEFERRED','NORMAL','PUMPFUN_TRADE',$2,decision_clock.at,decision_clock.at,
+        decision_clock.at,decision_clock.at+INTERVAL '4 hours' FROM decision_clock`,
+      [PUMP_PROGRAM_ID, tradeMint]);
+      const unadmitted = await row(pool, 'demotion-unadmitted');
+      assert.equal(unadmitted.worker_admitted_at, null);
+      assert.equal(await repository.claim(Date.now() + 3, 30), null);
+      assert.deepEqual(await row(pool, 'demotion-unadmitted'), unadmitted);
+    });
+  });
+
+void test('enabled demotion serializes every authority family and multi-mint locks lexically',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      await replaceAuthorityWithTask4Tables(pool);
+      const repository = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+      const families = ['launch', 'candidate', 'paper', 'intent', 'live'] as const;
+      const orderedMints = [canonicalTestMint(1), canonicalTestMint(2)]
+        .sort((left, right) => left.localeCompare(right));
+      const targetMint = orderedMints[0];
+      const blockerMint = orderedMints[1];
+      if (targetMint === undefined || blockerMint === undefined) {
+        throw new Error('Task 4 lock fixtures are missing.');
+      }
+
+      for (const [index, family] of families.entries()) {
+        const signature = `demotion-proof-before-${family}`;
+        await insertExpiredAdmittedTrade(pool, signature, BigInt(index + 1), targetMint);
+        const producer = await pool.connect();
+        try {
+          await producer.query('BEGIN');
+          await lockTask4Mint(producer, targetMint);
+          await insertTask4Proof(producer, family, targetMint, `before-${family}`);
+          const claim = repository.claim(Date.now(), 30);
+          await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:');
+          await producer.query('COMMIT');
+          await claim;
+          assert.notEqual((await row(pool, signature)).processing_status, 'DEFERRED', family);
+        } finally {
+          await producer.query('ROLLBACK').catch(() => {});
+          producer.release();
+        }
+        await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1', [signature]);
+        await clearTask4Proofs(pool);
+
+        const targetSignature = `demotion-proof-after-${family}`;
+        const blockerSignature = `demotion-proof-blocker-${family}`;
+        await insertExpiredAdmittedTrade(pool, targetSignature, 1n, targetMint);
+        await insertExpiredAdmittedTrade(pool, blockerSignature, 2n, blockerMint);
+        const blocker = await pool.connect();
+        try {
+          await blocker.query('BEGIN');
+          await lockTask4Mint(blocker, blockerMint);
+          const claim = repository.claim(Date.now() + 1, 30);
+          await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:');
+          const producer = insertTask4ProofWithLock(pool, family, targetMint, `after-${family}`);
+          await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:', 2);
+          await blocker.query('COMMIT');
+          await Promise.all([claim, producer]);
+          assert.equal((await row(pool, targetSignature)).processing_status, 'DEFERRED', family);
+          assert.equal((await row(pool, blockerSignature)).processing_status, 'DEFERRED', family);
+        } finally {
+          await blocker.query('ROLLBACK').catch(() => {});
+          blocker.release();
+        }
+        await pool.query('DELETE FROM chain_transaction_inbox WHERE signature IN ($1,$2)',
+          [targetSignature, blockerSignature]);
+        await clearTask4Proofs(pool);
+      }
+    });
+  });
 
 void test('enabled authority uses one PostgreSQL clock at the exact 44.999/45.000 launch boundary',
   async (context) => {
@@ -388,6 +599,8 @@ void test('omitted and explicit false worker admission execute identical legacy 
     });
   }
   assert.deepEqual(executions[0], executions[1]);
+  assert.equal(executions.flat().some((sql) => sql.includes('demoted_count')
+    || sql.includes('first_candidate.mint')), false);
 });
 
 void test('enabled admission preserves durable 32-to-1 and 3-to-1 fairness and slot-signature ordering', async (context) => {
@@ -6769,6 +6982,195 @@ async function finalityRowTuple(
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
   return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
+}
+
+async function insertExpiredAdmittedTrades(
+  pool: InstanceType<typeof pg.Pool>,
+  prefix: string,
+  mint: string,
+  count: number,
+  slotOffset = 0n,
+): Promise<void> {
+  assert.ok(Number.isSafeInteger(count) && count > 0);
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+    worker_admitted_at
+  ) SELECT $1 || '-' || LPAD(value::TEXT,4,'0'),$4::NUMERIC+value,
+    ARRAY['WEBSOCKET'],ARRAY[$2],'processed','PENDING','TRACKED_TRADE','PUMPFUN_TRADE',$3,
+    TIMESTAMPTZ '2026-01-01 00:00:00+00' + value * INTERVAL '1 millisecond',
+    TIMESTAMPTZ '2026-01-01 00:00:00+00' + value * INTERVAL '1 millisecond'
+    FROM generate_series(1,$5::INTEGER) value ORDER BY value DESC`,
+  [prefix, PUMP_PROGRAM_ID, mint, slotOffset.toString(), count]);
+}
+
+async function insertExpiredAdmittedTradesAcrossMints(
+  pool: InstanceType<typeof pg.Pool>,
+  prefix: string,
+  mints: readonly string[],
+): Promise<void> {
+  assert.ok(mints.length > 0);
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+    worker_admitted_at
+  ) SELECT $1 || '-' || LPAD(value.ordinality::TEXT,4,'0'),value.ordinality,
+    ARRAY['WEBSOCKET'],ARRAY[$2],'processed','PENDING','TRACKED_TRADE','PUMPFUN_TRADE',
+    value.mint,TIMESTAMPTZ '2026-01-01 00:00:00+00'
+      + value.ordinality * INTERVAL '1 millisecond',
+    TIMESTAMPTZ '2026-01-01 00:00:00+00' + value.ordinality * INTERVAL '1 millisecond'
+    FROM UNNEST($3::TEXT[]) WITH ORDINALITY AS value(mint,ordinality)
+    ORDER BY value.ordinality DESC`, [prefix, PUMP_PROGRAM_ID, [...mints]]);
+}
+
+async function insertExpiredAdmittedTrade(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+  slot: bigint,
+  mint: string,
+): Promise<void> {
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+    worker_admitted_at
+  ) VALUES ($1,$2,ARRAY['WEBSOCKET'],ARRAY[$3],'processed','PENDING','TRACKED_TRADE',
+    'PUMPFUN_TRADE',$4,TIMESTAMPTZ '2026-01-01 00:00:00+00',
+    TIMESTAMPTZ '2026-01-01 00:00:00+00')`,
+  [signature, slot.toString(), PUMP_PROGRAM_ID, mint]);
+}
+
+interface DemotionTestRow {
+  readonly signature: string;
+  readonly processing_status: string;
+  readonly ingestion_priority: string;
+  readonly worker_admitted_at: Date | null;
+  readonly first_detected_at: Date | null;
+  readonly observed_at: Date;
+  readonly terminal_at: Date | null;
+  readonly purge_after: Date | null;
+  readonly updated_at: Date;
+}
+
+async function demotionRows(
+  pool: InstanceType<typeof pg.Pool>,
+  prefix: string,
+): Promise<DemotionTestRow[]> {
+  return (await pool.query<DemotionTestRow>(`SELECT signature,processing_status,ingestion_priority,
+    worker_admitted_at,first_detected_at,observed_at,terminal_at,purge_after,updated_at
+    FROM chain_transaction_inbox WHERE signature LIKE $1 ORDER BY observed_at,observed_slot,signature`,
+  [`${prefix}-%`])).rows;
+}
+
+async function schedulerState(pool: InstanceType<typeof pg.Pool>): Promise<object> {
+  return (await pool.query(`SELECT consecutive_urgent_claims,launch_claims_since_tracked
+    FROM chain_transaction_inbox_claim_scheduler WHERE scheduler_key='global'`)).rows[0] as object;
+}
+
+function canonicalTestMint(index: number): string {
+  const bytes = new Uint8Array(32);
+  bytes[30] = Math.floor(index / 256);
+  bytes[31] = index % 256;
+  return new PublicKey(bytes).toBase58();
+}
+
+type Task4ProofFamily = 'launch' | 'candidate' | 'paper' | 'intent' | 'live';
+
+async function replaceAuthorityWithTask4Tables(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<void> {
+  await pool.query(`DROP VIEW listener_worker_tracking_live_mints;
+    ALTER TABLE token_launches RENAME TO token_launches_task4_original;
+    ALTER TABLE domain_events RENAME TO domain_events_task4_original;
+    ALTER TABLE trading_candidates RENAME TO trading_candidates_task4_original;
+    ALTER TABLE paper_strategy_sessions RENAME TO paper_strategy_sessions_task4_original;
+    ALTER TABLE paper_positions RENAME TO paper_positions_task4_original;
+    ALTER TABLE execution_intents RENAME TO execution_intents_task4_original;
+    ALTER TABLE execution_live_positions RENAME TO execution_live_positions_task4_original;
+    CREATE TABLE token_launches (
+      mint TEXT PRIMARY KEY,current_state TEXT NOT NULL,created_signature TEXT NOT NULL,
+      created_slot NUMERIC NOT NULL,created_transaction_index INTEGER NOT NULL,
+      created_instruction_index INTEGER NOT NULL,created_inner_instruction_index INTEGER,
+      detected_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE TABLE domain_events (
+      event_id TEXT PRIMARY KEY,type TEXT NOT NULL,mint TEXT NOT NULL,signature TEXT NOT NULL,
+      slot NUMERIC NOT NULL,transaction_index INTEGER NOT NULL,instruction_index INTEGER NOT NULL,
+      inner_instruction_index INTEGER,confirmation_status TEXT NOT NULL
+    );
+    CREATE TABLE trading_candidates (
+      mint TEXT NOT NULL,source_event_id TEXT NOT NULL,state TEXT NOT NULL,
+      eligible_until TIMESTAMPTZ,superseded_at TIMESTAMPTZ,confirmation_status TEXT NOT NULL
+    );
+    CREATE TABLE paper_strategy_sessions (mint TEXT NOT NULL,state TEXT NOT NULL);
+    CREATE TABLE paper_positions (mint TEXT NOT NULL,status TEXT NOT NULL);
+    CREATE TABLE execution_intents (mint TEXT NOT NULL,status TEXT NOT NULL,terminal_at TIMESTAMPTZ);
+    CREATE TABLE execution_live_positions (mint TEXT NOT NULL,state TEXT NOT NULL);
+    CREATE VIEW listener_worker_tracking_live_mints WITH (security_barrier=TRUE) AS
+      SELECT mint FROM execution_live_positions WHERE state IN ('OPEN','EXIT_PENDING','UNKNOWN')`);
+}
+
+async function lockTask4Mint(client: Pick<InstanceType<typeof pg.Client>, 'query'>, mint: string): Promise<void> {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended(
+    'transaction-inbox-mint:' || $1, 0))`, [mint]);
+}
+
+async function insertTask4Proof(
+  client: Pick<InstanceType<typeof pg.Client>, 'query'>,
+  family: Task4ProofFamily,
+  mint: string,
+  suffix: string,
+): Promise<void> {
+  if (family === 'launch') {
+    await client.query(`INSERT INTO token_launches VALUES
+      ($1,'OBSERVING',$2,1,0,0,NULL,clock_timestamp())`, [mint, `launch-${suffix}`]);
+    await client.query(`INSERT INTO domain_events VALUES
+      ($1,'TokenLaunchDetected',$2,$3,1,0,0,NULL,'confirmed')`,
+    [`launch-event-${suffix}`, mint, `launch-${suffix}`]);
+    return;
+  }
+  if (family === 'candidate') {
+    await client.query(`INSERT INTO domain_events VALUES
+      ($1,'QualificationUpdated',$2,$1,1,0,0,NULL,'confirmed')`,
+    [`candidate-source-${suffix}`, mint]);
+    await client.query(`INSERT INTO trading_candidates VALUES
+      ($1,$2,'ELIGIBLE',clock_timestamp()+INTERVAL '1 minute',NULL,'confirmed')`,
+    [mint, `candidate-source-${suffix}`]);
+    return;
+  }
+  if (family === 'paper') {
+    await client.query("INSERT INTO paper_strategy_sessions VALUES ($1,'BUY_PENDING')", [mint]);
+    return;
+  }
+  if (family === 'intent') {
+    await client.query("INSERT INTO execution_intents VALUES ($1,'PENDING',NULL)", [mint]);
+    return;
+  }
+  await client.query("INSERT INTO execution_live_positions VALUES ($1,'OPEN')", [mint]);
+}
+
+async function insertTask4ProofWithLock(
+  pool: InstanceType<typeof pg.Pool>,
+  family: Task4ProofFamily,
+  mint: string,
+  suffix: string,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await lockTask4Mint(client, mint);
+    await insertTask4Proof(client, family, mint, suffix);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function clearTask4Proofs(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  await pool.query(`TRUNCATE token_launches,domain_events,trading_candidates,
+    paper_strategy_sessions,paper_positions,execution_intents,execution_live_positions`);
 }
 
 async function storeWorkerDecoderQuarantine(
