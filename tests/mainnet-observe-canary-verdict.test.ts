@@ -75,6 +75,28 @@ void test('fails classification debt or claimable backlog growth after T+5', () 
   });
 });
 
+void test('checks worker admission population and post-stop proof before failure trends', () => {
+  const impossiblePopulation = passingWorkerAdmissionFixture();
+  const t15 = nested(impossiblePopulation, 'snapshots', 'T_PLUS_15');
+  const t15Backlog = t15.backlogCount as number;
+  nested(t15, 'workerAdmission').claimableBacklogCount = t15Backlog - 2;
+  nested(t15, 'workerAdmission').classificationPendingCount = t15Backlog;
+  nested(t15, 'workerAdmission').oldestClassificationPendingAgeMs = 45_000;
+  assert.deepEqual(evaluateMainnetObserveCanary(impossiblePopulation).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_BACKLOG_INCOHERENT',
+  });
+
+  const missingPostStopProof = passingWorkerAdmissionFixture();
+  delete missingPostStopProof.postStopWorkerAdmissionClaimableCount;
+  nested(missingPostStopProof, 'snapshots', 'FINAL_PRESTOP', 'workerAdmission')
+    .oldestClassificationPendingAgeMs = 45_000;
+  assert.deepEqual(evaluateMainnetObserveCanary(missingPostStopProof).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING',
+  });
+});
+
 void test('keeps STOPPED SQL count disagreement inconclusive', () => {
   const copy = passingWorkerAdmissionFixture();
   copy.postStopWorkerAdmissionClaimableCount = 7;

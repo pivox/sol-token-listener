@@ -533,18 +533,6 @@ function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateRe
   }
   const stoppedMetrics = metrics[4];
   if (stoppedMetrics === undefined) return gate('INCONCLUSIVE', 'WORKER_ADMISSION_EVIDENCE_MISSING');
-  const thresholdMs = stoppedMetrics.trackingWindowSeconds * 1_000;
-  if (metrics.some((item) => item.oldestClassificationPendingAgeMs !== null
-    && item.oldestClassificationPendingAgeMs >= thresholdMs)) {
-    return gate('FAIL', 'WORKER_ADMISSION_PENDING_EXPIRED');
-  }
-  const afterFiveMinutes = metrics.slice(1);
-  if (!nonIncreasing(afterFiveMinutes.map((item) => item.classificationPendingCount))) {
-    return gate('FAIL', 'WORKER_ADMISSION_CLASSIFICATION_GREW');
-  }
-  if (!nonIncreasing(afterFiveMinutes.map((item) => item.claimableBacklogCount))) {
-    return gate('FAIL', 'WORKER_ADMISSION_BACKLOG_GREW');
-  }
   if (snapshots.some((snapshot, index) => {
     const item = metrics[index];
     if (item === undefined) return true;
@@ -576,6 +564,18 @@ function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateRe
   }
   if (stoppedMetrics.claimableBacklogCount !== postStopCount.value) {
     return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT');
+  }
+  const thresholdMs = stoppedMetrics.trackingWindowSeconds * 1_000;
+  if (metrics.some((item) => item.oldestClassificationPendingAgeMs !== null
+    && item.oldestClassificationPendingAgeMs >= thresholdMs)) {
+    return gate('FAIL', 'WORKER_ADMISSION_PENDING_EXPIRED');
+  }
+  const afterFiveMinutes = metrics.slice(1);
+  if (!nonIncreasing(afterFiveMinutes.map((item) => item.classificationPendingCount))) {
+    return gate('FAIL', 'WORKER_ADMISSION_CLASSIFICATION_GREW');
+  }
+  if (!nonIncreasing(afterFiveMinutes.map((item) => item.claimableBacklogCount))) {
+    return gate('FAIL', 'WORKER_ADMISSION_BACKLOG_GREW');
   }
   return gate('PASS', 'WORKER_ADMISSION_BOUNDED');
 }
