@@ -1,4 +1,8 @@
 import { registerInternalDecodingFailure, trustedObservedPipelineOrigin } from '../../domain/observed-pipeline-failure.js';
+import {
+  inheritTrustedTerminalAttribution,
+  registerTrustedTerminalAttribution,
+} from '../../domain/terminal-attribution.js';
 import type { ChainCursor } from '../../domain/types.js';
 export const PUMPSWAP_DECODING_ERROR_CODES = [
   'PUMPSWAP_ACCOUNT_MISSING',
@@ -27,6 +31,17 @@ export function createPumpSwapDecodingError(
   return error;
 }
 
+/** @internal Adds diagnostics only to an error authenticated by the internal factory. */
+export function registerPumpSwapDecodingTerminalAttribution(
+  error: PumpSwapDecodingError,
+  attribution: unknown,
+): void {
+  if (trustedPumpSwapDecodingCode(error) === null) {
+    throw new TypeError('PumpSwap decoding error identity is not trusted.');
+  }
+  registerTrustedTerminalAttribution(error, attribution);
+}
+
 export function trustedPumpSwapDecodingCode(value: unknown): PumpSwapDecodingErrorCode | null {
   const code = trustedObservedPipelineOrigin(value);
   return knownCodes.has(code) ? code as PumpSwapDecodingErrorCode : null;
@@ -42,7 +57,9 @@ export class PumpSwapMutableRpcDecodingError extends Error {
 /** Remove terminal authority only from a trusted decoder error at a mutable RPC boundary. */
 export function rethrowMutablePumpSwapRpcFailure(cause: unknown): never {
   if (trustedPumpSwapDecodingCode(cause) !== null) {
-    throw new PumpSwapMutableRpcDecodingError(cause);
+    const error = new PumpSwapMutableRpcDecodingError(cause);
+    inheritTrustedTerminalAttribution(error, cause);
+    throw error;
   }
   throw cause;
 }

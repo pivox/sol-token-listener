@@ -1,5 +1,6 @@
 import { isProxy } from 'node:util/types';
 import type { IngestionFailure } from './transaction-ingestion.js';
+import { inheritTrustedTerminalAttribution } from './terminal-attribution.js';
 
 /** Durable wire contract v1.0.0. Keep provider text and adapter objects outside this module. */
 export const OBSERVED_PIPELINE_STAGES = [
@@ -50,6 +51,7 @@ export function trustedObservedPipelineOrigin(value: unknown): Exclude<ObservedP
 export function inheritObservedPipelineOrigin(wrapper: Error, cause: unknown): void {
   const code = trustedObservedPipelineOrigin(cause);
   if (code !== null) trustedOrigins.set(wrapper, code);
+  inheritTrustedTerminalAttribution(wrapper, cause);
 }
 
 export function assertValidObservedPipelineFailure(errorName: string, retryable: boolean): void {

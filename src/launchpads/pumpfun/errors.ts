@@ -1,4 +1,10 @@
-import { registerInternalDecodingFailure } from '../../domain/observed-pipeline-failure.js';
+import {
+  registerInternalDecodingFailure,
+  trustedObservedPipelineOrigin,
+} from '../../domain/observed-pipeline-failure.js';
+import {
+  registerTrustedTerminalAttribution,
+} from '../../domain/terminal-attribution.js';
 export const PUMP_DECODING_ERROR_CODES = [
   'PUMP_TRANSACTION_INDEX_REQUIRED',
   'PUMP_SCHEMA_UNSUPPORTED',
@@ -29,6 +35,18 @@ export function createPumpDecodingError(
   const error = new PumpDecodingError(...args);
   if (knownCodes.has(args[0])) registerInternalDecodingFailure(error, args[0]);
   return error;
+}
+
+/** @internal Adds diagnostics only to an error authenticated by the internal factory. */
+export function registerPumpDecodingTerminalAttribution(
+  error: PumpDecodingError,
+  attribution: unknown,
+): void {
+  const code = trustedObservedPipelineOrigin(error);
+  if (code === null || !knownCodes.has(code)) {
+    throw new TypeError('Pump decoding error identity is not trusted.');
+  }
+  registerTrustedTerminalAttribution(error, attribution);
 }
 
 export class PumpDecodingError extends Error {
