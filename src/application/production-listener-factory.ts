@@ -18,6 +18,10 @@ import {
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from '../domain/first-processing-canary.js';
 import {
+  snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionMetricsV1,
+} from '../domain/worker-admission-metrics.js';
+import {
   assertValidInboxCounts,
   assertValidRuntimeHeartbeat,
   snapshotRuntimeCatchUpAdmissionMetrics,
@@ -631,6 +635,8 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
       rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(configuredRpcHttpProviderIds),
+      workerAdmissionMetrics: (): Promise<RuntimeWorkerAdmissionMetricsV1> =>
+        inbox.workerAdmissionMetrics(),
       ...(hydration === null ? {} : {
         catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
           version: 1,
@@ -689,6 +695,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
+  readonly workerAdmissionMetrics?: () => Promise<RuntimeWorkerAdmissionMetricsV1>;
 }
 
 export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
@@ -1069,6 +1076,7 @@ export class PersistentListenerHeartbeat {
   private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
+  private readonly workerAdmissionMetrics: (() => Promise<RuntimeWorkerAdmissionMetricsV1>) | null;
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository,
@@ -1099,6 +1107,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('RPC HTTP evidence metrics provider is invalid.');
     }
     this.rpcHttpEvidenceMetrics = options.rpcHttpEvidenceMetrics ?? null;
+    if (options.workerAdmissionMetrics !== undefined
+      && typeof options.workerAdmissionMetrics !== 'function') {
+      throw new TypeError('Worker admission metrics provider is invalid.');
+    }
+    this.workerAdmissionMetrics = options.workerAdmissionMetrics ?? null;
   }
 
   public async start(): Promise<void> {
@@ -1234,6 +1247,16 @@ export class PersistentListenerHeartbeat {
         throw new TypeError('RPC HTTP evidence metrics are invalid.');
       }
     }
+    let workerAdmission: RuntimeWorkerAdmissionMetricsV1 | undefined;
+    if (this.workerAdmissionMetrics !== null) {
+      try {
+        workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(
+          await this.workerAdmissionMetrics(),
+        );
+      } catch {
+        throw new TypeError('Worker admission metrics are invalid.');
+      }
+    }
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
       subscriberState: runtimeState === 'STOPPED' ? 'STOPPED' : this.subscriberState(),
@@ -1257,6 +1280,7 @@ export class PersistentListenerHeartbeat {
       ...(blockHydration === undefined ? {} : { blockHydration }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
+      ...(workerAdmission === undefined ? {} : { workerAdmission }),
     });
     if (this.catchUpAdmissionMetrics !== null) {
       try { assertValidRuntimeHeartbeat(value); } catch {

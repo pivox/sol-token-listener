@@ -14,6 +14,10 @@ import {
   assertValidFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from './first-processing-canary.js';
+import {
+  snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionMetricsV1,
+} from './worker-admission-metrics.js';
 import type { ChainConfirmationStatus } from './types.js';
 
 export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
@@ -279,6 +283,7 @@ export interface RuntimeHeartbeat {
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
   readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
+  readonly workerAdmission?: RuntimeWorkerAdmissionMetricsV1;
   readonly decoderQuarantine?: RuntimeDecoderQuarantineMetricsV1;
 }
 
@@ -721,6 +726,13 @@ export function assertValidRuntimeHeartbeat(
         throw new TypeError('First processing canary is invalid.');
       }
       assertValidFirstProcessingCanaryEvidence(firstProcessingCanary.value);
+    }
+    const workerAdmission = Object.getOwnPropertyDescriptor(value, 'workerAdmission');
+    if (workerAdmission !== undefined) {
+      if (!('value' in workerAdmission) || workerAdmission.enumerable !== true) {
+        throw new TypeError('Worker admission metrics are invalid.');
+      }
+      snapshotRuntimeWorkerAdmissionMetrics(workerAdmission.value);
     }
     const decoderQuarantine = Object.getOwnPropertyDescriptor(value, 'decoderQuarantine');
     if (decoderQuarantine !== undefined) {

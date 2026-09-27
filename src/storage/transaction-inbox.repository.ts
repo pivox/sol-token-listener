@@ -21,6 +21,10 @@ import {
   type PumpFunWorkerAdmissionPolicyV1,
 } from '../domain/worker-admission.js';
 import {
+  snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionMetricsV1,
+} from '../domain/worker-admission-metrics.js';
+import {
   assertValidCatchUpClassification,
   createCatchUpClassification,
   createCatchUpClassificationReceipt,
@@ -346,6 +350,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       if (!Number.isSafeInteger(cohortEndsAtMs)) {
         throw new TypeError('First processing cohort end is invalid.');
       }
+      const workerAdmissionCohortFence = this.workerAdmissionPolicy.enabled
+        ? `
+             AND inbox.worker_admitted_at IS NOT NULL
+             AND NOT (${workerAdmissionRetainedDemotionSql('inbox', 'sampled.sampled_at')})`
+        : '';
       const result = await this.pool.query(
         `WITH sampled AS MATERIALIZED (
            SELECT date_trunc('milliseconds', clock_timestamp()) AS sampled_at
@@ -358,7 +367,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            FROM chain_transaction_inbox AS inbox
            CROSS JOIN sampled
            WHERE inbox.first_detected_at >= to_timestamp($1 / 1000.0)
-             AND inbox.first_detected_at < LEAST(sampled.sampled_at, to_timestamp($2 / 1000.0))
+             AND inbox.first_detected_at < LEAST(sampled.sampled_at, to_timestamp($2 / 1000.0))${workerAdmissionCohortFence}
              AND NOT COALESCE((
                (
                  (inbox.catch_up_classification_version=1
@@ -2805,6 +2814,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : createRuntimeRpcHttpEvidence(value.rpcHttpEvidence);
       const firstProcessingCanary = value.firstProcessingCanary === undefined ? undefined
         : createFirstProcessingCanaryEvidence(value.firstProcessingCanary);
+      const workerAdmission = value.workerAdmission === undefined ? undefined
+        : snapshotRuntimeWorkerAdmissionMetrics(value.workerAdmission);
       const decoderQuarantine = value.decoderQuarantine === undefined ? undefined
         : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
       const result = await this.pool.query(
@@ -2856,6 +2867,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               : { catchUpAdmission }),
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
+            ...(workerAdmission === undefined ? {} : { workerAdmission }),
             ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
           }),
           value.exhaustedCount,
@@ -2937,6 +2949,117 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       });
       assertValidInboxCounts(counts);
       return counts;
+    });
+  }
+
+  public async workerAdmissionMetrics(): Promise<RuntimeWorkerAdmissionMetricsV1> {
+    return this.safely(async () => {
+      const retryable = `inbox.processing_status='FAILED' AND inbox.error_retryable=TRUE
+        AND inbox.retry_exhausted_at IS NULL AND inbox.next_attempt_at IS NOT NULL`;
+      const actionable = `(inbox.processing_status IN ('PENDING','PROCESSING')
+        OR (${retryable}))`;
+      const result = await this.pool.query(this.workerAdmissionPolicy.enabled
+        ? `WITH database_clock AS MATERIALIZED (
+             SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+           ), fresh_launch AS MATERIALIZED (
+             SELECT DISTINCT launch.mint
+             FROM token_launches AS launch
+             JOIN domain_events AS launch_event
+               ON launch_event.type='TokenLaunchDetected'
+              AND launch_event.mint=launch.mint
+              AND launch_event.signature=launch.created_signature
+              AND launch_event.slot=launch.created_slot
+              AND launch_event.transaction_index=launch.created_transaction_index
+              AND launch_event.instruction_index=launch.created_instruction_index
+              AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
+                launch.created_inner_instruction_index
+             CROSS JOIN database_clock
+             WHERE launch.current_state<>'RETRACTED'
+               AND launch_event.confirmation_status<>'orphaned'
+               AND launch.detected_at+($1::INTEGER*INTERVAL '1 second')>database_clock.at
+           ), extended_mint AS MATERIALIZED (
+             SELECT candidate.mint
+             FROM trading_candidates AS candidate
+             JOIN domain_events AS source_event ON source_event.event_id=candidate.source_event_id
+             CROSS JOIN database_clock
+             WHERE candidate.superseded_at IS NULL AND candidate.state='ELIGIBLE'
+               AND candidate.confirmation_status<>'orphaned'
+               AND source_event.confirmation_status<>'orphaned'
+               AND candidate.eligible_until>database_clock.at
+             UNION SELECT session.mint FROM paper_strategy_sessions AS session
+               WHERE session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+                 'EXIT_PENDING_QUOTE','SELL_PENDING')
+             UNION SELECT position.mint FROM paper_positions AS position
+               WHERE position.status='PAPER_HOLDING'
+             UNION SELECT intent.mint FROM execution_intents AS intent
+               WHERE intent.terminal_at IS NULL
+                 AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
+             UNION SELECT live.mint FROM listener_worker_tracking_live_mints AS live
+           ) SELECT
+             COUNT(*) FILTER (WHERE ${actionable}
+               AND inbox.worker_admitted_at IS NOT NULL) AS claimable_backlog_count,
+             COUNT(*) FILTER (WHERE inbox.processing_status='PENDING'
+               AND inbox.worker_admitted_at IS NULL) AS classification_pending_count,
+             CASE WHEN COUNT(*) FILTER (WHERE inbox.processing_status='PENDING'
+               AND inbox.worker_admitted_at IS NULL)=0 THEN NULL ELSE
+               GREATEST(0,TRUNC(EXTRACT(EPOCH FROM MAX(database_clock.at)-
+                 MIN(COALESCE(inbox.first_detected_at,inbox.observed_at)) FILTER (
+                   WHERE inbox.processing_status='PENDING'
+                     AND inbox.worker_admitted_at IS NULL))*1000))::BIGINT
+             END AS oldest_classification_pending_age_ms,
+             (SELECT COUNT(*) FROM fresh_launch) AS fresh_mint_count,
+             (SELECT COUNT(*) FROM extended_mint) AS extended_mint_count,
+             COUNT(*) FILTER (WHERE inbox.processing_status='DEFERRED'
+               AND inbox.ingestion_priority='NORMAL'
+               AND inbox.ingestion_hint='PUMPFUN_TRADE'
+               AND inbox.ingestion_hint_mint IS NOT NULL
+               AND inbox.worker_admitted_at IS NOT NULL
+               AND inbox.terminal_at IS NOT NULL
+               AND inbox.terminal_at<=database_clock.at
+               AND inbox.purge_after=inbox.terminal_at+INTERVAL '4 hours'
+               AND inbox.purge_after>database_clock.at) AS demoted_count
+           FROM chain_transaction_inbox AS inbox CROSS JOIN database_clock`
+        : `WITH database_clock AS MATERIALIZED (
+             SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+           ) SELECT
+             COUNT(*) FILTER (WHERE ${actionable}) AS claimable_backlog_count,
+             0::BIGINT AS classification_pending_count,
+             NULL::BIGINT AS oldest_classification_pending_age_ms,
+             0::BIGINT AS fresh_mint_count,
+             0::BIGINT AS extended_mint_count,
+             0::BIGINT AS demoted_count
+           FROM chain_transaction_inbox AS inbox CROSS JOIN database_clock`,
+      this.workerAdmissionPolicy.enabled
+        ? [this.workerAdmissionPolicy.trackingWindowSeconds]
+        : undefined);
+      const row = requiredRow(result.rows[0]);
+      const classificationPendingCount = safeCount(
+        row.classification_pending_count,
+        'worker admission classification pending count',
+      );
+      const oldestClassificationPendingAgeMs = row.oldest_classification_pending_age_ms === null
+        ? null
+        : safeCount(
+          row.oldest_classification_pending_age_ms,
+          'worker admission oldest classification pending age',
+        );
+      return snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+        version: 1,
+        enabled: this.workerAdmissionPolicy.enabled,
+        trackingWindowSeconds: this.workerAdmissionPolicy.trackingWindowSeconds,
+        claimableBacklogCount: safeCount(
+          row.claimable_backlog_count,
+          'worker admission claimable backlog count',
+        ),
+        classificationPendingCount,
+        oldestClassificationPendingAgeMs,
+        freshMintCount: safeCount(row.fresh_mint_count, 'worker admission fresh mint count'),
+        extendedMintCount: safeCount(
+          row.extended_mint_count,
+          'worker admission extended mint count',
+        ),
+        demotedCount: safeCount(row.demoted_count, 'worker admission demoted count'),
+      }));
     });
   }
 
@@ -3957,6 +4080,37 @@ function workerAdmissionDemotionPristineSql(alias: string): string {
     AND ${alias}.first_processing_evidence_unavailable=FALSE
     AND ${alias}.decoder_quarantine_eligible_at IS NULL
     AND ${alias}.decoder_recovery_used=FALSE`;
+}
+
+function workerAdmissionRetainedDemotionSql(alias: string, sampledAt: string): string {
+  if (alias !== 'inbox' || sampledAt !== 'sampled.sampled_at') {
+    throw new TypeError('Worker admission retained demotion SQL identity is invalid.');
+  }
+  return `${alias}.processing_status='DEFERRED'
+    AND ${alias}.ingestion_priority='NORMAL'
+    AND ${alias}.ingestion_hint='PUMPFUN_TRADE'
+    AND ${alias}.ingestion_hint_mint IS NOT NULL
+    AND ${alias}.worker_admitted_at IS NOT NULL
+    AND ${alias}.attempts=0 AND ${alias}.attempts_in_cycle=0
+    AND ${alias}.lease_token IS NULL AND ${alias}.lease_expires_at IS NULL
+    AND ${alias}.normalized_transaction IS NULL AND ${alias}.immutable_fingerprint IS NULL
+    AND ${alias}.error_code IS NULL AND ${alias}.error_name IS NULL
+    AND ${alias}.error_retryable IS NULL AND ${alias}.next_attempt_at IS NULL
+    AND ${alias}.retry_exhausted_at IS NULL AND ${alias}.processed_at IS NULL
+    AND ${alias}.missing_finality_polls=0
+    AND ${alias}.last_missing_finality_provider_id IS NULL
+    AND ${alias}.finality_evidence_version=0
+    AND ${alias}.manual_recovery_count=0 AND ${alias}.last_manual_recovery_at IS NULL
+    AND ${alias}.first_processed_at IS NULL
+    AND ${alias}.first_processing_evidence_unavailable=FALSE
+    AND ${alias}.decoder_quarantine_eligible_at IS NULL
+    AND ${alias}.decoder_recovery_used=FALSE
+    AND ${alias}.terminal_at IS NOT NULL
+    AND ${alias}.terminal_at>=${alias}.observed_at
+    AND ${alias}.terminal_at<=${sampledAt}
+    AND ${alias}.purge_after=${alias}.terminal_at+INTERVAL '4 hours'
+    AND ${alias}.purge_after>${sampledAt}
+    AND ${alias}.updated_at>=${alias}.terminal_at`;
 }
 
 function storedIngestionDecision(row: InboxIdentityRow): IngestionDecision {

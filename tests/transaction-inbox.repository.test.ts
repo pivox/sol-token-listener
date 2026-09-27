@@ -62,11 +62,155 @@ import {
   FIRST_PROCESSING_THRESHOLD_MS,
   createFirstProcessingCanaryEvidence,
 } from '../src/domain/first-processing-canary.js';
+import { snapshotRuntimeWorkerAdmissionMetrics } from '../src/domain/worker-admission-metrics.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
+
+void test('worker admission metrics use one PostgreSQL clock and exact enabled and disabled cohorts',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      await replaceAuthorityWithTask4Tables(pool);
+      const freshA = canonicalTestMint(2_001);
+      const freshB = canonicalTestMint(2_002);
+      const extendedOnly = canonicalTestMint(2_003);
+      const fixedAt = new Date('2026-01-02T00:00:00.000Z');
+      await pool.query(`INSERT INTO token_launches VALUES
+        ($1,'OBSERVING','metrics-launch-a',1,0,0,NULL,$3),
+        ($2,'OBSERVING','metrics-launch-b',2,0,0,NULL,$3)`,
+      [freshA, freshB, new Date(fixedAt.getTime() - 1_000)]);
+      await pool.query(`INSERT INTO domain_events VALUES
+        ('metrics-launch-event-a','TokenLaunchDetected',$1,'metrics-launch-a',1,0,0,NULL,'confirmed'),
+        ('metrics-launch-event-b','TokenLaunchDetected',$2,'metrics-launch-b',2,0,0,NULL,'confirmed')`,
+      [freshA, freshB]);
+      await pool.query(`INSERT INTO paper_strategy_sessions VALUES
+        ($1,'BUY_PENDING'),($2,'SELL_PENDING')`, [freshA, extendedOnly]);
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+        first_detected_at,worker_admitted_at,terminal_at,purge_after
+      ) VALUES
+        ('metrics-admitted-a',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING',
+          'LAUNCH_CANDIDATE','PUMPFUN_CREATE',NULL,$2,$2,$2,NULL,NULL),
+        ('metrics-admitted-b',2,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING',
+          'NORMAL','NONE',NULL,$3,$3,$3,NULL,NULL),
+        ('metrics-classification-pending',3,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING',
+          'NORMAL','NONE',NULL,$4,$4,NULL,NULL,NULL),
+        ('metrics-demoted-retained',4,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','DEFERRED',
+          'NORMAL','PUMPFUN_TRADE',$5,$6,$6,$6,$7::TIMESTAMPTZ,$7::TIMESTAMPTZ+INTERVAL '4 hours'),
+        ('metrics-demoted-expired',5,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','DEFERRED',
+          'NORMAL','PUMPFUN_TRADE',$5,$6,$6,$6,$8::TIMESTAMPTZ,$8::TIMESTAMPTZ+INTERVAL '4 hours')`, [
+        PUMP_PROGRAM_ID,
+        new Date(fixedAt.getTime() - 1_000),
+        new Date(fixedAt.getTime() - 2_000),
+        new Date(fixedAt.getTime() - 5_000),
+        extendedOnly,
+        new Date(fixedAt.getTime() - 21_600_000),
+        new Date(fixedAt.getTime() - 3_600_000),
+        new Date(fixedAt.getTime() - 18_000_000),
+      ]);
+      await freezeSchemaClock(pool, fixedAt);
+
+      const enabled = await new PostgresTransactionInboxRepository(
+        pool, undefined, enabledAdmission,
+      ).workerAdmissionMetrics();
+      assert.deepEqual(enabled, {
+        version: 1,
+        enabled: true,
+        trackingWindowSeconds: 45,
+        claimableBacklogCount: 2,
+        classificationPendingCount: 1,
+        oldestClassificationPendingAgeMs: 5_000,
+        freshMintCount: 2,
+        extendedMintCount: 2,
+        demotedCount: 1,
+      });
+      assert.ok(Object.isFrozen(enabled));
+
+      const disabled = await new PostgresTransactionInboxRepository(pool).workerAdmissionMetrics();
+      assert.deepEqual(disabled, {
+        version: 1,
+        enabled: false,
+        trackingWindowSeconds: 45,
+        claimableBacklogCount: 3,
+        classificationPendingCount: 0,
+        oldestClassificationPendingAgeMs: null,
+        freshMintCount: 0,
+        extendedMintCount: 0,
+        demotedCount: 0,
+      });
+      await pool.query("DELETE FROM chain_transaction_inbox WHERE signature='metrics-classification-pending'");
+      const withoutPending = await new PostgresTransactionInboxRepository(
+        pool, undefined, enabledAdmission,
+      ).workerAdmissionMetrics();
+      assert.equal(withoutPending.classificationPendingCount, 0);
+      assert.equal(withoutPending.oldestClassificationPendingAgeMs, null);
+    });
+  });
+
+void test('enabled first-processing requires admission, admits without moving detection, and excludes demotion',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const fixedAt = new Date('2026-01-02T00:00:00.000Z');
+      const detectedAt = new Date(fixedAt.getTime() - 1_000);
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,observed_at,first_detected_at,
+        worker_admitted_at
+      ) VALUES ('bounded-first-processing',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+        'PENDING','NORMAL','NONE',$2,$2,NULL)`, [PUMP_PROGRAM_ID, detectedAt]);
+      await insertTrackedLaunch(pool);
+      await freezeSchemaClock(pool, fixedAt);
+      const enabled = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+
+      assert.equal((await enabled.firstProcessingCanary(detectedAt.getTime())).eligibleCount, 0);
+      await enabled.recordCatchUpClassification(createCatchUpClassification({
+        ...catchUpClassificationInput('bounded-first-processing'),
+        observedAtMs: detectedAt.getTime(),
+        classifiedAtMs: detectedAt.getTime() + 500,
+        ingestionHint: 'PUMPFUN_TRADE',
+        ingestionHintMint: tradeMint,
+      }));
+      const admitted = await enabled.firstProcessingCanary(detectedAt.getTime());
+      assert.equal(admitted.eligibleCount, 1);
+      assert.equal((await row(pool, 'bounded-first-processing')).first_detected_at.getTime(),
+        detectedAt.getTime());
+
+      await pool.query(`UPDATE chain_transaction_inbox SET
+        processing_status='DEFERRED',ingestion_priority='NORMAL',
+        terminal_at=$2::TIMESTAMPTZ,purge_after=$2::TIMESTAMPTZ+INTERVAL '4 hours'
+        WHERE signature=$1`, ['bounded-first-processing', fixedAt]);
+      assert.equal((await enabled.firstProcessingCanary(detectedAt.getTime())).eligibleCount, 0);
+
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+        processing_status,ingestion_priority,ingestion_hint,observed_at,first_detected_at,
+        worker_admitted_at
+      ) VALUES ('bounded-first-processing-legacy',2,ARRAY['WEBSOCKET'],ARRAY[$1],'processed',
+        'PENDING','NORMAL','NONE',$2,$2,NULL)`, [PUMP_PROGRAM_ID,
+        new Date(detectedAt.getTime() + 1)]);
+      const legacySql: string[] = [];
+      const capturingPool = () => ({
+        query: (text: string, values?: readonly unknown[]) => {
+          legacySql.push(text);
+          return pool.query(text, values === undefined ? undefined : [...values]);
+        },
+        connect: () => pool.connect(),
+      });
+      const omitted = await new PostgresTransactionInboxRepository(capturingPool())
+        .firstProcessingCanary(detectedAt.getTime());
+      const explicitFalse = await new PostgresTransactionInboxRepository(capturingPool(), undefined,
+        createPumpFunWorkerAdmissionPolicy({ enabled: false, trackingWindowSeconds: 45 }))
+        .firstProcessingCanary(detectedAt.getTime());
+      assert.equal(legacySql.length, 2);
+      assert.equal(legacySql[0], legacySql[1]);
+      assert.doesNotMatch(legacySql[0] ?? '', /worker_admitted_at/u);
+      assert.deepEqual(explicitFalse, omitted);
+      assert.equal(omitted.eligibleCount, 2);
+    });
+  });
 
 void test('enabled claim skips an out-of-authority overflow and keeps progressing active trades',
   async (context) => {
@@ -1447,6 +1591,60 @@ function firstProcessingHeartbeatEvidence() {
     verdict: 'INCONCLUSIVE',
   });
 }
+
+void test('heartbeat persists a detached worker admission snapshot and rejects malformed evidence before I/O',
+  async () => {
+    const queryCalls: unknown[][] = [];
+    const repository = new PostgresTransactionInboxRepository({
+      async query(_text, values) {
+        queryCalls.push(values === undefined ? [] : [...values]);
+        return { rows: [], rowCount: 1 };
+      },
+      async connect() { throw new Error('not used'); },
+    });
+    const metrics = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+      version: 1,
+      enabled: true,
+      trackingWindowSeconds: 45,
+      claimableBacklogCount: 2,
+      classificationPendingCount: 1,
+      oldestClassificationPendingAgeMs: 5_000,
+      freshMintCount: 1,
+      extendedMintCount: 1,
+      demotedCount: 1,
+    }));
+    const heartbeat = Object.freeze({
+      runtimeState: 'RUNNING' as const,
+      subscriberState: 'RUNNING' as const,
+      scannerState: 'RUNNING' as const,
+      workerState: 'RUNNING' as const,
+      reconcilerState: 'RUNNING' as const,
+      startedAtMs: 1_000,
+      updatedAtMs: 2_000,
+      lastHttpSlot: null,
+      lastWebsocketSlot: null,
+      lastFinalizedSlot: null,
+      lastSignature: null,
+      backlogCount: 2,
+      leasedCount: 0,
+      exhaustedCount: 0,
+      workerAdmission: metrics,
+    });
+    await repository.writeHeartbeat(heartbeat);
+    const payload = queryCalls[0]?.[14] as Record<string, unknown>;
+    assert.deepEqual(payload, {
+      startedAt: '1970-01-01T00:00:01.000Z',
+      workerAdmission: metrics,
+    });
+    assert.notEqual(payload.workerAdmission, metrics);
+
+    await assert.rejects(repository.writeHeartbeat(Object.freeze({
+      ...heartbeat,
+      updatedAtMs: 3_000,
+      workerAdmission: Object.freeze({ ...metrics, classificationPendingCount: 0 }),
+    })), TransactionInboxRepositoryError);
+    assert.equal(queryCalls.length, 1);
+  });
 
 void test('first processing time survives lease loss, finality replay, orphaning, and exhausted recovery', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -7485,6 +7683,21 @@ async function insertTerminal(
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
+}
+
+async function freezeSchemaClock(
+  pool: InstanceType<typeof pg.Pool>,
+  at: Date,
+): Promise<void> {
+  const schema = (await pool.query<{ readonly schema_name: unknown }>(
+    'SELECT current_schema() AS schema_name',
+  )).rows[0]?.schema_name;
+  assert.equal(typeof schema, 'string');
+  if (typeof schema !== 'string') throw new TypeError('Expected an isolated test schema.');
+  await pool.query(`CREATE FUNCTION ${quoteIdentifier(schema)}.clock_timestamp()
+    RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE
+    AS $$ SELECT TIMESTAMPTZ '${at.toISOString()}' $$`);
+  await pool.query(`SET search_path = ${quoteIdentifier(schema)}, pg_catalog`);
 }
 
 function assertNoSecretSurface(value: unknown, ...secrets: readonly string[]): void {
