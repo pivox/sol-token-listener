@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import * as terminal from '../src/domain/terminal-attribution.js';
 import {
   attachTrustedTerminalAttribution,
   createTerminalAttribution,
@@ -286,4 +288,52 @@ void test('terminal attribution never alters legacy observed origin registration
   registerTrustedTerminalAttribution(error, pumpAttribution());
   assert.equal(trustedObservedPipelineOrigin(error), 'PUMP_BORSH_INVALID');
   assert.equal(trustedTerminalAttribution(error)?.diagnosticCode, 'PUMP_BORSH_INVALID');
+});
+
+void test('snapshots and transfers exact bounded transaction context independently of diagnostics', () => {
+  assert.equal(typeof terminal.registerTrustedTerminalAttributionContext, 'function');
+  const source = new Error('source');
+  const locator = { signature: 'signature', slot: 123n, transactionIndex: 4,
+    confirmationStatus: 'confirmed', instructionIndex: 3, innerInstructionIndex: 2 };
+  const context = terminal.registerTrustedTerminalAttributionContext(source, {
+    originCode: 'PUMP_BORSH_TRUNCATED', locator,
+  });
+  locator.instructionIndex = 9;
+  assert.equal(context.locator.instructionIndex, 3);
+  assert.ok(Object.isFrozen(context.locator));
+  const wrapper = new Error('wrapper');
+  inheritTrustedTerminalAttribution(wrapper, source);
+  const target = Object.freeze({ code: 'unchanged' });
+  attachTrustedTerminalAttribution(target, wrapper);
+  assert.equal(terminal.trustedTerminalAttributionContext(target), context);
+  assert.equal(terminal.trustedTerminalAttributionContext({ ...target }), null);
+  assert.equal(trustedTerminalAttribution(target), null);
+  const trap = (): never => { assert.fail('must not inspect hostile identity'); };
+  const hostile = new Proxy({}, { get: trap, getPrototypeOf: trap, ownKeys: trap });
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  for (const value of [hostile, revoked.proxy]) {
+    assert.equal(terminal.trustedTerminalAttributionContext(value), null);
+  }
+  for (const changed of [
+    { signature: 'x'.repeat(129) }, { slot: -1n }, { slot: BigInt(Number.MAX_SAFE_INTEGER) + 1n },
+    { transactionIndex: -0 }, { instructionIndex: -1 }, { innerInstructionIndex: 0.5 },
+    { confirmationStatus: 'forged' }, { instructionIndex: null, innerInstructionIndex: 1 },
+    { extra: 'secret' },
+  ]) {
+    assert.throws(() => terminal.registerTrustedTerminalAttributionContext(new Error(), {
+      originCode: 'PUMP_BORSH_TRUNCATED', locator: { ...locator, ...changed },
+    }), TypeError);
+  }
+  assert.throws(() => terminal.registerTrustedTerminalAttributionContext(new Error(), {
+    originCode: 'forged', locator,
+  }), TypeError);
+});
+
+void test('closed attribution validation and origin registration have no runtime import cycle', async () => {
+  const taxonomy = await readFile(new URL('../src/domain/observed-pipeline-taxonomy.ts', import.meta.url), 'utf8');
+  const attribution = await readFile(new URL('../src/domain/terminal-attribution.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(taxonomy, /^import\s/mu);
+  assert.doesNotMatch(attribution, /from ['"]\.\/observed-pipeline-failure\.js['"]/u);
+  assert.match(attribution, /from ['"]\.\/observed-pipeline-taxonomy\.js['"]/u);
 });

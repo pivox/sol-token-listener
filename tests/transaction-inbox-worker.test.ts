@@ -20,6 +20,8 @@ import {
   type TransactionLocationTarget,
 } from '../src/solana/rpc/transaction-locator.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { trustedTerminalAttribution, trustedTerminalAttributionContext } from '../src/domain/terminal-attribution.js';
+import { failurePipeline, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
 
 void test('claims one row and processes it in durable order with claim finality', async () => {
   const calls: string[] = [];
@@ -302,6 +304,41 @@ void test('does not grant terminal authority to public or forged pipeline wrappe
     await worker.runOnce();
     assert.deepEqual(marked, failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineFailure.v1.unclassified.UNKNOWN', true));
   }
+});
+
+void test('passes exact frozen failure sidecars to persistence on fresh hydration and snapshot replay', async () => {
+  for (const replay of [false, true]) {
+    const tx = malformedPumpTransaction('PUMP_BORSH_INVALID');
+    let marked: IngestionFailure | null = null;
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() { return claim(tx.signature, tx.slot, 'finalized',
+        replay ? createDurableTransactionSnapshot(tx) : null); },
+      async markFailed(_signature, _token, value) { marked = value; },
+    }), { async locate() { return tx; } }, realPumpPipeline(), options());
+    const result = await worker.runOnce();
+    assert.equal(result.kind, 'failed');
+    if (result.kind !== 'failed') assert.fail();
+    assert.equal(result.failure, marked);
+    assert.equal(trustedTerminalAttribution(marked)?.pumpWire?.suffixBytes, 1);
+    assert.deepEqual(trustedTerminalAttributionContext(marked)?.locator, {
+      signature: 'sig', slot: 1n, transactionIndex: 0, confirmationStatus: 'finalized',
+      instructionIndex: 0, innerInstructionIndex: null,
+    });
+  }
+});
+
+void test('adds immutable transaction locator to UNKNOWN failures without changing retryability', async () => {
+  let marked: IngestionFailure | null = null;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim(); },
+    async markFailed(_signature, _token, value) { marked = value; },
+  }), locator(), failurePipeline(() => { throw new Error('private details'); }), options());
+  await worker.runOnce();
+  assert.deepEqual(marked, failure('PIPELINE_STAGE_FAILED', 'ObservedPipelineFailure.v1.launchpad_observation.UNKNOWN', true));
+  assert.deepEqual(trustedTerminalAttributionContext(marked), {
+    originCode: null, locator: { signature: 'sig', slot: 1n, transactionIndex: 3,
+      confirmationStatus: 'processed', instructionIndex: null, innerInstructionIndex: null },
+  });
 });
 
 void test('renews during a long pipeline, uses monotonic expiry, and cleans the timer', async () => {

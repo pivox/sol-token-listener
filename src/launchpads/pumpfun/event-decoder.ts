@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { trustedObservedPipelineOrigin } from '../../domain/observed-pipeline-failure.js';
+import { registerTrustedTerminalAttribution } from '../../domain/terminal-attribution.js';
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
 import { PumpBorshReader } from './borsh-reader.js';
 import { PUMP_PROGRAM_ID } from './constants.js';
@@ -51,25 +53,56 @@ export function decodePumpCpiEvent(
     discriminator,
     Uint8Array.from(PUMP_EVENTS.CreateEvent.discriminator),
   )) {
-    return decodeCreateEvent(instruction, payload);
+    return decodeAttributedEvent('CreateEvent', instruction, payload, decodeCreateEvent);
   }
   if (equalBytes(
     discriminator,
     Uint8Array.from(PUMP_EVENTS.TradeEvent.discriminator),
   )) {
-    return decodeTradeEvent(instruction, payload);
+    return decodeAttributedEvent('TradeEvent', instruction, payload, decodeTradeEvent);
   }
   return null;
+}
+
+function decodeAttributedEvent(
+  name: 'CreateEvent' | 'TradeEvent',
+  instruction: NormalizedInstruction,
+  payload: Uint8Array,
+  decode: (instruction: NormalizedInstruction, payload: Uint8Array,
+    observeSuffix: (length: number) => void) => DecodedPumpCpiEvent,
+): DecodedPumpCpiEvent {
+  let suffixBytes: number | null = null;
+  try {
+    return decode(instruction, payload, (length) => { suffixBytes = length; });
+  } catch (error) {
+    if (trustedObservedPipelineOrigin(error) === 'PUMP_BORSH_INVALID') {
+      try {
+        registerTrustedTerminalAttribution(error as object, {
+          version: 1, diagnosticCode: 'PUMP_BORSH_INVALID', causeKind: 'PUMP_DECODER',
+          pumpWire: {
+            surface: 'CPI_EVENT',
+            location: instruction.innerInstructionIndex === null ? 'OUTER' : 'INNER',
+            discriminatorHex: Buffer.from(instruction.data.subarray(8, 16)).toString('hex'),
+            idlName: name, totalBytes: instruction.data.length, payloadBytes: payload.length,
+            suffixBytes,
+          },
+        });
+      } catch { /* Attribution cannot change the decoder decision. */ }
+    }
+    throw error;
+  }
 }
 
 function decodeCreateEvent(
   instruction: NormalizedInstruction,
   payload: Uint8Array,
+  observeSuffix: (length: number) => void,
 ): DecodedPumpCpiEvent {
   const reader = new PumpBorshReader(payload);
   const definition = PUMP_TYPES.CreateEvent.type.fields;
   const fields = decodeIdlFields(definition.slice(0, -2), reader);
   const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
   if (suffixLength !== 0 && suffixLength !== 8 && suffixLength !== 9) {
     throw invalidEventSuffix('CreateEvent', suffixLength, '0, 8 ou 9');
   }
@@ -110,11 +143,13 @@ function decodeCreateEvent(
 function decodeTradeEvent(
   instruction: NormalizedInstruction,
   payload: Uint8Array,
+  observeSuffix: (length: number) => void,
 ): DecodedPumpCpiEvent {
   const reader = new PumpBorshReader(payload);
   const definition = PUMP_TYPES.TradeEvent.type.fields;
   const fields = decodeIdlFields(definition.slice(0, -2), reader);
   const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
   if (suffixLength !== 0 && suffixLength !== 16) {
     throw invalidEventSuffix('TradeEvent', suffixLength, '0 ou 16');
   }

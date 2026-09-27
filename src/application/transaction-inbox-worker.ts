@@ -14,6 +14,9 @@ import {
 } from '../solana/rpc/transaction-locator.js';
 import type { LegacyConfirmationStatus, NormalizedTransaction } from '../solana/rpc/types.js';
 import { trustedObservedPipelineFailure } from './observed-transaction-pipeline.js';
+import {
+  registerTrustedTerminalAttributionContext, trustedTerminalAttributionContext,
+} from '../domain/terminal-attribution.js';
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -294,6 +297,19 @@ export class TransactionInboxWorker {
       await this.pipeline.process(transaction, claim.observedAtMs);
     } catch (error) {
       pipelineFailed = trustedObservedPipelineFailure(error) ?? pipelineFailure();
+      if (trustedTerminalAttributionContext(pipelineFailed) === null) {
+        try {
+          registerTrustedTerminalAttributionContext(pipelineFailed, {
+            originCode: null,
+            locator: {
+              signature: transaction.signature, slot: transaction.slot,
+              transactionIndex: transaction.transactionIndex,
+              confirmationStatus: transaction.confirmationStatus.toLowerCase(),
+              instructionIndex: null, innerInstructionIndex: null,
+            },
+          });
+        } catch { /* Optional capture cannot affect the failure or lease decision. */ }
+      }
     }
     const owned = await lease.finish();
     if (!owned) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
