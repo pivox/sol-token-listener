@@ -106,6 +106,10 @@ type HydrationOutcome =
     marker: string;
   }>;
 
+type CapturedResult<T> =
+  | Readonly<{ status: 'fulfilled'; value: T }>
+  | Readonly<{ status: 'rejected'; reason: unknown }>;
+
 interface SemanticAction {
   readonly family: PumpInstructionFamily;
   readonly mint: string;
@@ -126,12 +130,14 @@ interface ClassificationDecision {
 export interface PumpFunCatchUpBlockClassifierOptions {
   readonly coverageFastPathEnabled: boolean;
   readonly coverageRepository: CatchUpAdmissionCoverageRepository | null;
+  readonly slotPersistencePipelineEnabled?: boolean;
 }
 
 /** B3b composes this service for provider-affine Pump.fun strict scans when the restart-only flag is enabled. */
 export class PumpFunCatchUpBlockClassifier {
   private readonly coverageFastPathEnabled: boolean;
   private readonly coverageRepository: CatchUpAdmissionCoverageRepository | null;
+  private readonly slotPersistencePipelineEnabled: boolean;
 
   public constructor(
     private readonly locator: PumpFunCatchUpTransactionLocator,
@@ -141,7 +147,9 @@ export class PumpFunCatchUpBlockClassifier {
   ) {
     this.coverageFastPathEnabled = options?.coverageFastPathEnabled ?? false;
     this.coverageRepository = options?.coverageRepository ?? null;
+    this.slotPersistencePipelineEnabled = options?.slotPersistencePipelineEnabled ?? false;
     if (typeof this.coverageFastPathEnabled !== 'boolean'
+      || typeof this.slotPersistencePipelineEnabled !== 'boolean'
       || (this.coverageFastPathEnabled && this.coverageRepository === null)) {
       throw new TypeError('Pump.fun catch-up coverage configuration is invalid.');
     }
@@ -159,6 +167,9 @@ export class PumpFunCatchUpBlockClassifier {
     assertSafeMilliseconds(classifiedAtMs, 'INVALID_CLOCK');
     if (this.coverageFastPathEnabled) {
       return this.classifyWithCoverage(slots, classifiedAtMs, signal);
+    }
+    if (this.slotPersistencePipelineEnabled) {
+      return this.classifyWithSlotPersistencePipeline(slots, classifiedAtMs, signal);
     }
     const receipts: CatchUpClassificationReceipt[] = [];
     for (const slot of slots) {
@@ -200,22 +211,68 @@ export class PumpFunCatchUpBlockClassifier {
         receipts.set(receipt.signature, receipt);
       }
     }
-    for (const slot of slots) {
-      const missing = slot.rows.filter(({ discovery }) =>
-        !discovery.transactionFailed && !receipts.has(discovery.signature));
-      if (missing.length === 0) continue;
-      const classifications = await this.classifySlot(Object.freeze({
-        slot: slot.slot,
-        rows: Object.freeze(missing),
-      }), classifiedAtMs, signal);
-      for (const classification of classifications) {
-        receipts.set(classification.signature, await this.record(classification, signal));
+    if (this.slotPersistencePipelineEnabled) {
+      const missingSlots = slots.flatMap((slot) => {
+        const missing = slot.rows.filter(({ discovery }) =>
+          !discovery.transactionFailed && !receipts.has(discovery.signature));
+        return missing.length === 0 ? [] : [Object.freeze({
+          slot: slot.slot,
+          rows: Object.freeze(missing),
+        })];
+      });
+      for (const receipt of await this.classifyWithSlotPersistencePipeline(
+        missingSlots,
+        classifiedAtMs,
+        signal,
+      )) {
+        receipts.set(receipt.signature, receipt);
+      }
+    } else {
+      for (const slot of slots) {
+        const missing = slot.rows.filter(({ discovery }) =>
+          !discovery.transactionFailed && !receipts.has(discovery.signature));
+        if (missing.length === 0) continue;
+        const classifications = await this.classifySlot(Object.freeze({
+          slot: slot.slot,
+          rows: Object.freeze(missing),
+        }), classifiedAtMs, signal);
+        for (const classification of classifications) {
+          receipts.set(classification.signature, await this.record(classification, signal));
+        }
       }
     }
     assertNotAborted(signal);
     const orderedReceipts = ordered.map(({ discovery }) => receipts.get(discovery.signature));
     if (orderedReceipts.some((receipt) => receipt === undefined)) throw failure('INVALID_RECEIPT');
     return Object.freeze(orderedReceipts as CatchUpClassificationReceipt[]);
+  }
+
+  private async classifyWithSlotPersistencePipeline(
+    slots: readonly SlotGroup[],
+    classifiedAtMs: number,
+    signal: AbortSignal,
+  ): Promise<readonly CatchUpClassificationReceipt[]> {
+    const first = slots[0];
+    if (first === undefined) return Object.freeze([]);
+    let classifications = await this.classifySlot(first, classifiedAtMs, signal);
+    const receipts: CatchUpClassificationReceipt[] = [];
+    for (let index = 0; index < slots.length; index += 1) {
+      const nextSlot = slots[index + 1];
+      const next = nextSlot === undefined
+        ? null
+        : capture(this.classifySlot(nextSlot, classifiedAtMs, signal));
+      try {
+        for (const classification of classifications) {
+          receipts.push(await this.record(classification, signal));
+        }
+      } catch (error) {
+        if (next !== null) await next;
+        throw error;
+      }
+      if (next !== null) classifications = unwrap(await next);
+    }
+    assertNotAborted(signal);
+    return Object.freeze(receipts);
   }
 
   private async classifySlot(
@@ -309,6 +366,18 @@ export class PumpFunCatchUpBlockClassifier {
       assertNotAborted(signal);
     }
   }
+}
+
+function capture<T>(operation: Promise<T>): Promise<CapturedResult<T>> {
+  return operation.then(
+    (value) => Object.freeze({ status: 'fulfilled', value }),
+    (reason: unknown) => Object.freeze({ status: 'rejected', reason }),
+  );
+}
+
+function unwrap<T>(result: CapturedResult<T>): T {
+  if (result.status === 'rejected') throw result.reason;
+  return result.value;
 }
 
 export function createPumpFunCatchUpClassificationFromDecoded(

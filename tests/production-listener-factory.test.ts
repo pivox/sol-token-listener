@@ -521,6 +521,28 @@ void test('production creates one bounded admission policy and injects it as the
   assert.match(source, /workerAdmissionMetrics:\s*\(\):\s*Promise<RuntimeWorkerAdmissionMetricsV1>\s*=>\s*inbox\.workerAdmissionMetrics\(\)/u);
 });
 
+void test('activates slot persistence pipelining only from the bounded admission policy', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.equal(count(source, /slotPersistencePipelineEnabled:/gu), 1);
+  assert.match(source, /slotPersistencePipelineEnabled:\s*workerAdmissionPolicy\.enabled/u);
+  assert.doesNotMatch(source, /listenerPumpFunSlotPersistencePipelineEnabled/u);
+
+  for (const enabled of [undefined, 'false', 'true']) {
+    const parsed = config({
+      EXECUTION_MODE: 'observe',
+      LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+      LISTENER_BLOCK_HYDRATION_ENABLED: 'true',
+      LISTENER_INGESTION_SCOPE: 'launchpad-only',
+      LISTENER_CATCH_UP_POLICY: 'live-edge',
+      ...(enabled === undefined ? {} : {
+        LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: enabled,
+      }),
+    });
+    assert.equal(parsed.listenerPumpFunBoundedWorkerAdmissionEnabled, enabled === 'true');
+    assert.equal('listenerPumpFunSlotPersistencePipelineEnabled' in parsed, false);
+  }
+});
+
 void test('multi-worker startup fails before members when durable PumpSwap work is non-terminal', async (context) => {
   const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
   context.mock.method(
