@@ -6,7 +6,7 @@ Issue: #177 (part C of #171)
 
 Status: approved for implementation
 
-Contract revision: 1.0.0
+Contract revision: 1.0.1
 
 ## Purpose
 
@@ -58,6 +58,11 @@ WITH database_clock AS MATERIALIZED (
 All freshness, expiry, terminal and purge decisions in that transaction use
 `database_clock.at`. JavaScript `Date.now()`, a caller timestamp, transaction
 `now()`, or multiple `clock_timestamp()` calls are not authority.
+
+An enabled claim snapshots its bounded candidate set, acquires every candidate
+mint lock in lexical order, and only then reads this clock. The same post-lock
+millisecond is passed to demotion revalidation and tracked selection, so time
+spent waiting for a mint lock cannot preserve already expired authority.
 
 The exact boundary is inclusive on expiry:
 

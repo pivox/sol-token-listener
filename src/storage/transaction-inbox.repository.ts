@@ -1228,12 +1228,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       if (!Number.isSafeInteger(leaseMs)) throw new TypeError('Lease duration is unsafe.');
       const expires = dateFromMs(nowMs + leaseMs);
       return this.transaction(async (client) => {
-        const workerAdmissionClock = this.workerAdmissionPolicy.enabled
-          ? await readWorkerTrackingDatabaseClock(client)
+        const workerAdmissionClaimPlan = this.workerAdmissionPolicy.enabled
+          ? await this.prepareWorkerAdmissionClaim(client, now)
           : null;
-        const workerAdmissionClaimPlan = workerAdmissionClock === null
-          ? null
-          : await this.prepareWorkerAdmissionClaim(client, now, workerAdmissionClock);
         await client.query(
           `WITH exhausted AS (
              SELECT signature
@@ -1475,44 +1472,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   private async prepareWorkerAdmissionClaim(
     client: InboxClient,
     now: Date,
-    authorityAt: Date,
   ): Promise<WorkerAdmissionClaimPlan> {
-    // Keep authoritative rows from permanently occupying the bounded preview;
-    // demotion still revalidates this advisory decision after the mint locks.
+    // Timeless authority can be excluded without a clock. Time-bounded launch and
+    // candidate authority is revalidated only after every preview mint is locked.
     const demotionPreview = await client.query(
-      `WITH database_clock AS MATERIALIZED (
-         SELECT $1::TIMESTAMPTZ AS at
-       ) SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
+      `SELECT inbox.signature,inbox.ingestion_hint_mint AS mint
        FROM chain_transaction_inbox AS inbox
-       CROSS JOIN database_clock
-       WHERE database_clock.at>=inbox.observed_at
-         AND ${workerAdmissionDemotionPristineSql('inbox')}
+       WHERE ${workerAdmissionDemotionPristineSql('inbox')}
          AND NOT EXISTS (
-           SELECT 1
-           FROM token_launches AS launch
-           JOIN domain_events AS launch_event
-             ON launch_event.type='TokenLaunchDetected'
-            AND launch_event.mint=launch.mint
-            AND launch_event.signature=launch.created_signature
-            AND launch_event.slot=launch.created_slot
-            AND launch_event.transaction_index=launch.created_transaction_index
-            AND launch_event.instruction_index=launch.created_instruction_index
-            AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
-              launch.created_inner_instruction_index
-           WHERE launch.mint=inbox.ingestion_hint_mint
-             AND launch.current_state<>'RETRACTED'
-             AND launch_event.confirmation_status<>'orphaned'
-             AND launch.detected_at+($2::INTEGER*INTERVAL '1 second')>database_clock.at
-         ) AND NOT EXISTS (
-           SELECT 1
-           FROM trading_candidates AS candidate
-           JOIN domain_events AS source_event ON source_event.event_id=candidate.source_event_id
-           WHERE candidate.mint=inbox.ingestion_hint_mint
-             AND candidate.superseded_at IS NULL AND candidate.state='ELIGIBLE'
-             AND candidate.confirmation_status<>'orphaned'
-             AND source_event.confirmation_status<>'orphaned'
-             AND candidate.eligible_until>database_clock.at
-         ) AND NOT EXISTS (
            SELECT 1 FROM paper_strategy_sessions AS session
            WHERE session.mint=inbox.ingestion_hint_mint
              AND session.state IN ('BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
@@ -1529,9 +1496,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE live.mint=inbox.ingestion_hint_mint
          )
        ORDER BY inbox.observed_at,inbox.observed_slot,inbox.signature
-       LIMIT $3`,
-      [authorityAt, this.workerAdmissionPolicy.trackingWindowSeconds,
-        MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
+       LIMIT $1`,
+      [MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
     const trackedPreview = await client.query(
       `SELECT signature,ingestion_hint_mint AS mint
@@ -1564,6 +1530,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       return row.mint;
     });
     await lockWorkerTrackingMints(client, [...demotionMints, ...trackedMints]);
+    const authorityAt = await readWorkerTrackingDatabaseClock(client);
     return Object.freeze({
       authorityAt: new Date(authorityAt.getTime()),
       demotionSignatures: Object.freeze(demotionSignatures),

@@ -717,6 +717,36 @@ void test('enabled claim shares one PostgreSQL clock across preview, demotion an
     });
   });
 
+void test('enabled claim samples authority after a mint-lock wait crosses launch expiry',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const trackingWindowSeconds = 3;
+      await insertTrackedLaunch(pool);
+      await pool.query(`UPDATE token_launches
+        SET detected_at=date_trunc('milliseconds',clock_timestamp())-INTERVAL '1 second'
+        WHERE mint=$1`, [tradeMint]);
+      await insertExpiredAdmittedTrade(pool, 'claim-clock-after-mint-lock', 1n, tradeMint);
+      const repository = new PostgresTransactionInboxRepository(pool, undefined,
+        createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds }));
+      const blocker = await pool.connect();
+      try {
+        await blocker.query('BEGIN');
+        await lockTask4Mint(blocker, tradeMint);
+        const claim = repository.claim(Date.now(), 30);
+        await waitForActiveAdvisoryWait(pool, 'transaction-inbox-mint:');
+        await pool.query("SELECT pg_sleep(2.1)");
+        await blocker.query('COMMIT');
+
+        assert.equal(await settlesWithin(claim, 2_000), null);
+        assert.equal((await row(pool, 'claim-clock-after-mint-lock')).processing_status,
+          'DEFERRED');
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        blocker.release();
+      }
+    });
+  });
+
 void test('enabled authority is the same union for enqueue, catch-up, sync and listTrackedMints',
   async (context) => {
     await withDatabase(context, async (pool) => {

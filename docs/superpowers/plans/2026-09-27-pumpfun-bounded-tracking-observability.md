@@ -18,7 +18,7 @@ new worker.
 **Tech Stack:** TypeScript strict ESM, Node.js `node:test`, PostgreSQL 16,
 React, Zod, Bootstrap, existing V1 health API and redacted canary evaluator.
 
-**Plan revision:** 1.0.0
+**Plan revision:** 1.0.1
 
 ---
 
@@ -447,9 +447,9 @@ not counted as a demotion.
 
 In enabled `claim()`, after exhaustion reconciliation and before scheduler
 selection, snapshot at most 256 candidate mints, acquire their shared advisory
-locks in lexical order, then run one statement whose `database_clock`,
-reselected ordered candidate set, business-authority revalidation and update
-share the same transaction snapshot. Limit with
+locks in lexical order, then read exactly one millisecond-truncated PostgreSQL
+clock. Pass that post-lock time to the reselected ordered candidate set,
+business-authority revalidation, demotion update and tracked selection. Limit with
 `MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM`, lock inbox candidates using
 `FOR UPDATE OF inbox SKIP LOCKED`, repeat the pristine predicate including the
 unavailable bit in the UPDATE, and preserve `worker_admitted_at`. Reuse
