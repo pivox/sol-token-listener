@@ -212,6 +212,93 @@ void test('claims a late prioritized launch before 2,000 normal rows and decodes
   });
 });
 
+void test('finalizes an expired tracked Pump.fun buy from its durable signature without duplicates',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const fixture = await loadPumpFixture('buy-exact-quote-v2-cpi-mainnet.json');
+      const decoded = decodePumpTransaction(fixture.transaction);
+      const trade = decoded.trades[0];
+      assert.ok(trade);
+      const mint = trade.event.mint;
+      await seedTrackedLaunch(pool, mint);
+
+      const repository = new PostgresTransactionInboxRepository(
+        pool,
+        undefined,
+        enabledAdmission,
+      );
+      const confirmed = durablePumpTransaction(
+        fixture.transaction,
+        'CONFIRMED',
+        trade.event.user,
+      );
+      await repository.enqueue(Object.freeze({
+        signature: confirmed.signature,
+        slot: confirmed.slot,
+        source: 'WEBSOCKET' as const,
+        ingestionHint: 'PUMPFUN_TRADE' as const,
+        ingestionHintMint: mint,
+        programIds: Object.freeze([PUMP_PROGRAM_ID]),
+        confirmationStatus: 'confirmed' as const,
+        observedAtMs: Date.now(),
+      }));
+      assert.deepEqual(
+        await worker(repository, confirmed, boundedPumpPipeline(pool)).runOnce(),
+        { kind: 'processed', signature: confirmed.signature },
+      );
+      assert.deepEqual(await pumpReplayProjectionState(pool, confirmed.signature), {
+        raw_count: '1', raw_status: 'confirmed',
+        domain_count: '1', domain_status: 'confirmed',
+        trade_count: '1', trade_status: 'confirmed',
+        funding_count: '1', funding_status: 'confirmed',
+      });
+
+      await pool.query(`UPDATE token_launches
+        SET detected_at=clock_timestamp()-INTERVAL '46 seconds'
+        WHERE mint=$1`, [mint]);
+      const launchpad = new PostgresLaunchpadEventRepository(
+        pool,
+        4,
+        Date.now,
+        undefined,
+        enabledAdmission,
+      );
+      assert.deepEqual([...await launchpad.listTrackedMints('foreign-signature')], []);
+      assert.deepEqual([...await launchpad.listTrackedMints(confirmed.signature)], [mint]);
+
+      await repository.enqueueRevision(Object.freeze({
+        signature: confirmed.signature,
+        confirmationStatus: 'finalized' as const,
+        observedAtMs: Date.now() + 1,
+      }));
+      const finalized = Object.freeze({
+        ...confirmed,
+        confirmationStatus: 'FINALIZED' as const,
+      });
+      assert.deepEqual(
+        await worker(
+          repository,
+          finalized,
+          boundedPumpPipeline(pool),
+          Date.now() + 2,
+          false,
+        ).runOnce(),
+        { kind: 'processed', signature: confirmed.signature },
+      );
+      assert.deepEqual(await pumpReplayProjectionState(pool, confirmed.signature), {
+        raw_count: '1', raw_status: 'finalized',
+        domain_count: '1', domain_status: 'finalized',
+        trade_count: '1', trade_status: 'finalized',
+        funding_count: '1', funding_status: 'finalized',
+      });
+      const inbox = await inboxRow(pool, confirmed.signature);
+      assert.equal(inbox.processing_status, 'PROCESSED');
+      assert.equal(inbox.target_confirmation_status, 'finalized');
+      assert.equal(inbox.attempts, 2);
+      assert.equal(inbox.error_code, null);
+    });
+  });
+
 void test('restarts the production PostgreSQL path at every observation boundary', async (context) => {
   await withDatabase(context, async (pool) => {
     const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
@@ -640,6 +727,44 @@ function pipeline(
   );
 }
 
+function boundedPumpPipeline(
+  pool: InstanceType<typeof pg.Pool>,
+): ObservedTransactionPipeline {
+  const launchpadRepository = new PostgresLaunchpadEventRepository(
+    pool,
+    4,
+    Date.now,
+    undefined,
+    enabledAdmission,
+  );
+  const launchpad = new LaunchpadObservationService(
+    new PumpFunLaunchpadAdapter({
+      read: () => Promise.reject(new Error('unused bonding curve read')),
+    }),
+    launchpadRepository,
+  );
+  const funding = new WalletEvidenceObservationService(
+    new SolanaWalletFundingEvidenceExtractor(),
+    new PostgresWalletEvidenceRepository(pool),
+  );
+  const projection = { rebuild: () => Promise.resolve(Object.freeze({})) };
+  const market = {
+    processObserved: () => Promise.resolve(Object.freeze({
+      migrations: Object.freeze([]),
+      activations: Object.freeze([]),
+      affectedMints: Object.freeze([]),
+    })),
+  };
+  return new ObservedTransactionPipeline(
+    launchpadRepository,
+    launchpad,
+    funding,
+    projection,
+    projection,
+    market,
+  );
+}
+
 function worker(
   repository: PostgresTransactionInboxRepository,
   transaction: NormalizedTransaction,
@@ -863,6 +988,29 @@ function migrationTransaction(transaction: NormalizedTransaction): NormalizedTra
   });
 }
 
+function durablePumpTransaction(
+  transaction: NormalizedTransaction,
+  confirmationStatus: NormalizedTransaction['confirmationStatus'],
+  feePayer: string,
+): NormalizedTransaction {
+  const balances = [...transaction.preTokenBalances, ...transaction.postTokenBalances];
+  const accountCount = Math.max(...balances.map((balance) => balance.accountIndex)) + 1;
+  const accountKeys = Array.from(
+    { length: accountCount },
+    () => '11111111111111111111111111111111',
+  );
+  accountKeys[0] = feePayer;
+  for (const balance of balances) accountKeys[balance.accountIndex] = balance.account;
+  return Object.freeze({
+    ...transaction,
+    confirmationStatus,
+    accountKeys: Object.freeze(accountKeys),
+    signerKeys: Object.freeze([feePayer]),
+    preBalancesLamports: Object.freeze(accountKeys.map(() => 0n)),
+    postBalancesLamports: Object.freeze(accountKeys.map(() => 0n)),
+  });
+}
+
 function instruction(
   programId: string,
   instructionIndex: number,
@@ -895,6 +1043,44 @@ function cloneInstruction(
     innerInstructionIndex: null,
     parentInstructionIndex: null,
   });
+}
+
+async function seedTrackedLaunch(
+  pool: InstanceType<typeof pg.Pool>,
+  mint: string,
+): Promise<void> {
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,current_state,created_signature,
+    created_slot,created_transaction_index,created_instruction_index,
+    created_inner_instruction_index,detected_at,updated_at
+  ) VALUES ($1,'pumpfun',$2,$1,'SPL_TOKEN','OBSERVING','issue-191-seed',1,0,0,NULL,
+    clock_timestamp(),clock_timestamp())`, [mint, PUMP_PROGRAM_ID]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,inner_instruction_index,confirmation_status,observed_at,
+    payload_version,payload
+  ) VALUES ('issue-191-seed-event','TokenLaunchDetected',$1,'pumpfun',$2,
+    'issue-191-seed',1,0,0,NULL,'confirmed',clock_timestamp(),1,'{}'::jsonb)`,
+  [mint, PUMP_PROGRAM_ID]);
+}
+
+async function pumpReplayProjectionState(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+): Promise<Readonly<Record<string, string | null>>> {
+  const result = await pool.query(`SELECT
+    (SELECT COUNT(*)::text FROM raw_chain_events WHERE signature=$1) AS raw_count,
+    (SELECT MIN(confirmation_status) FROM raw_chain_events WHERE signature=$1) AS raw_status,
+    (SELECT COUNT(*)::text FROM domain_events WHERE signature=$1) AS domain_count,
+    (SELECT MIN(confirmation_status) FROM domain_events WHERE signature=$1) AS domain_status,
+    (SELECT COUNT(*)::text FROM launch_trades) AS trade_count,
+    (SELECT MIN(confirmation_status) FROM launch_trades) AS trade_status,
+    (SELECT COUNT(*)::text FROM wallet_funding_observations WHERE signature=$1) AS funding_count,
+    (SELECT MIN(confirmation_status) FROM wallet_funding_observations
+      WHERE signature=$1) AS funding_status`, [signature]);
+  const row = result.rows[0] as Record<string, string | null> | undefined;
+  if (row === undefined) throw new Error('Pump replay projection state missing.');
+  return Object.freeze({ ...row });
 }
 
 async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
@@ -1027,13 +1213,16 @@ async function inboxRow(pool: InstanceType<typeof pg.Pool>, signature: string): 
   processing_status: string; attempts: number; error_code: string | null;
   error_retryable: boolean | null; normalized_transaction: unknown;
   next_attempt_at: Date | null; processed_at: Date | null;
+  target_confirmation_status: string;
 }> {
   const result = await pool.query<{
     processing_status: string; attempts: number; error_code: string | null;
     error_retryable: boolean | null; normalized_transaction: unknown;
     next_attempt_at: Date | null; processed_at: Date | null;
+    target_confirmation_status: string;
   }>(`SELECT processing_status, attempts, error_code,
-    error_retryable, normalized_transaction, next_attempt_at, processed_at
+    error_retryable, normalized_transaction, next_attempt_at, processed_at,
+    target_confirmation_status
     FROM chain_transaction_inbox WHERE signature = $1`, [signature]);
   const row = result.rows[0];
   if (row === undefined) throw new Error('Inbox row missing');

@@ -376,6 +376,62 @@ void test('uses the supplied durable inbox observation timestamp instead of its 
   }
 });
 
+void test('replays an expired mint only for its exact finalized transaction signature', async () => {
+  const h = harness();
+  const confirmedTrade = event('replay-trade', 'ReplayMint');
+  const finalizedTrade = Object.freeze({
+    ...confirmedTrade,
+    confirmationStatus: 'finalized' as const,
+  });
+  const requestedSignatures: string[] = [];
+  let promoted = false;
+  let observedTracking: readonly string[] = [];
+  const pipeline = new ObservedTransactionPipeline(
+    {
+      listTrackedMints: async (...signatures: readonly string[]) => {
+        const signature = signatures[0];
+        requestedSignatures.push(signature ?? '<missing>');
+        return new Set(signature === SIGNATURE ? ['ReplayMint'] : []);
+      },
+      listActiveEventsBySignature: async (signature: string) => {
+        assert.equal(signature, SIGNATURE);
+        return Object.freeze([promoted ? finalizedTrade : confirmedTrade]);
+      },
+    },
+    {
+      observe: async (_observed, trackedMints) => {
+        observedTracking = [...trackedMints];
+        promoted = trackedMints.has('ReplayMint');
+        return Object.freeze({
+          events: Object.freeze(promoted
+            ? [{ eventId: confirmedTrade.id, outcome: 'confirmation_updated' as const }]
+            : []),
+          affectedMints: Object.freeze(promoted ? ['ReplayMint'] : []),
+        });
+      },
+    },
+    {
+      observe: async (observed, events) => {
+        assert.equal(observed.confirmationStatus, 'finalized');
+        assert.equal(events.length, 1);
+        assert.equal(events[0]?.confirmationStatus, observed.confirmationStatus);
+        return Object.freeze({ assessments: Object.freeze([]), evidence: Object.freeze([]) });
+      },
+    },
+    h.dependencies.participants,
+    h.dependencies.graph,
+    h.dependencies.market,
+  );
+
+  const result = await pipeline.process(transaction('FINALIZED'), 1_700_000_000_500);
+
+  assert.deepEqual(requestedSignatures, [SIGNATURE]);
+  assert.deepEqual(observedTracking, ['ReplayMint']);
+  assert.equal(result.launchpadEventCount, 1);
+  assert.equal(result.activeEventCount, 1);
+  assert.equal(result.affectedMintCount, 1);
+});
+
 void test('attributes tracked-mint synchronization failure and stops later stages', async () => {
   const h = harness({
     synchronizer: true,

@@ -139,7 +139,7 @@ export class ObservedTransactionPipeline {
     const observed = await this.stage('create_observation', null, () =>
       createSolanaObservedTransaction(transaction, observedAtMs));
     const trackedMints = await this.stage('load_tracked_mints', null, async () =>
-      boundedMintSet(await this.reader.listTrackedMints()));
+      boundedMintSet(await this.reader.listTrackedMints(observed.signature)));
     const launchpad = await this.stage('launchpad_observation', null, async () =>
       snapshotLaunchpadResult(await this.launchpad.observe(observed, trackedMints)));
     const trackedMintInbox = this.trackedMintInbox;
