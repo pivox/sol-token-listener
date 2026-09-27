@@ -5,6 +5,7 @@ import pg from 'pg';
 import { createTokenLaunchDetectedEvent, createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
 import { ConfirmationStatusConflictError } from '../src/domain/confirmation-status.js';
+import { createPumpFunWorkerAdmissionPolicy } from '../src/domain/worker-admission.js';
 import type { LaunchParameterObject } from '../src/domain/types.js';
 import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
 import { migrateDatabase } from '../src/storage/database.js';
@@ -47,7 +48,7 @@ void test('atomically persists creation and initial buy and restores active even
   assert.equal((await pool.query(`SELECT
     (EXTRACT(EPOCH FROM detected_at)*1000)::BIGINT::TEXT AS detected_at_ms
     FROM token_launches`)).rows[0]?.detected_at_ms, '1000');
-  const tracked = await repository.listTrackedMints();
+  const tracked = await repository.listTrackedMints('signature-a');
   assert.deepEqual([...tracked], [MINT_A]);
   assert.throws(() => (tracked as Set<string>).add('mutated'), TypeError);
   const ownerValues: ReadonlySet<string>[] = [];
@@ -64,6 +65,48 @@ void test('atomically persists creation and initial buy and restores active even
   assert.equal(typeof (restored[1]?.type === 'BondingCurveTradeObserved' ? restored[1].payload.trade.baseAmountRaw : null), 'bigint');
   assert.equal(Object.isFrozen(restored), true);
 });
+
+void test('unites global tracking with active mints from only the exact replay signature',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const repository = new PostgresLaunchpadEventRepository(
+        pool,
+        4,
+        Date.now,
+        undefined,
+        createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 }),
+      );
+      await repository.record(fixture(
+        'confirmed',
+        'expired-signature',
+        MINT_A,
+        Date.now() - 60_000,
+        null,
+      ));
+      await repository.record(fixture(
+        'confirmed',
+        'fresh-signature',
+        MINT_B,
+        Date.now(),
+        null,
+      ));
+
+      assert.deepEqual(
+        [...await repository.listTrackedMints('foreign-signature')],
+        [MINT_B],
+      );
+      const replay = await repository.listTrackedMints('expired-signature');
+      assert.deepEqual([...replay], [MINT_A, MINT_B].sort());
+      assert.throws(() => (replay as Set<string>).add(MINT_C), TypeError);
+
+      await pool.query(`UPDATE domain_events SET terminal_at=clock_timestamp()
+        WHERE signature='expired-signature'`);
+      assert.deepEqual(
+        [...await repository.listTrackedMints('expired-signature')],
+        [MINT_B],
+      );
+    });
+  });
 
 void test('atomically enqueues one durable social job and cancels it on orphaning', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -257,7 +300,7 @@ void test('preserves multiple outer and inner events in one transaction and acce
     assert.equal((active[0]?.id ?? '') < (active[1]?.id ?? ''), true);
 
     await Promise.all([repository.record(fixture('confirmed', 'signature-b', MINT_B)), repository.record(fixture('confirmed', 'signature-c', MINT_C))]);
-    assert.deepEqual([...await repository.listTrackedMints()], [MINT_A, MINT_B, MINT_C].sort());
+    assert.deepEqual([...await repository.listTrackedMints('signature-a')], [MINT_A, MINT_B, MINT_C].sort());
   });
 });
 
@@ -285,7 +328,7 @@ void test('replays exactly, promotes finality, retracts confirmed observations, 
     assert.equal((await pool.query("SELECT COUNT(*)::int count FROM domain_events")).rows[0].count, 2);
     assert.deepEqual((await repository.record(fixture('orphaned'))).events.map(x => x.outcome), ['confirmation_updated','confirmation_updated']);
     assert.deepEqual(await repository.listActiveEventsBySignature('signature-a'), []);
-    assert.deepEqual([...await repository.listTrackedMints()], []);
+    assert.deepEqual([...await repository.listTrackedMints('signature-a')], []);
     const rows = await pool.query("SELECT confirmation_status, terminal_at IS NOT NULL terminal FROM raw_chain_events ORDER BY event_id");
     assert.equal(rows.rows.every(row => row.confirmation_status === 'orphaned' && row.terminal === true), true);
   });

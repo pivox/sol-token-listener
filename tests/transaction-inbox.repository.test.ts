@@ -787,7 +787,10 @@ void test('enabled authority is the same union for enqueue, catch-up, sync and l
           assert.equal(authorityClockReads() - beforeEnqueue, 1);
           assert.equal((await row(pool, signature)).ingestion_priority, 'TRACKED_TRADE');
           const beforeList = authorityClockReads();
-          assert.deepEqual([...await launchpad.listTrackedMints()], [tradeMint]);
+          assert.deepEqual(
+            [...await launchpad.listTrackedMints('authority-union-signature')],
+            [tradeMint],
+          );
           assert.equal(authorityClockReads() - beforeList, 1);
 
           await clearAuthorityProofs(client);
@@ -7295,7 +7298,7 @@ async function withAuthoritySession(
     await connection.query(`CREATE TEMP TABLE domain_events (
       event_id TEXT NOT NULL,type TEXT NOT NULL,mint TEXT NOT NULL,signature TEXT NOT NULL,slot NUMERIC NOT NULL,
       transaction_index INTEGER NOT NULL,instruction_index INTEGER NOT NULL,
-      inner_instruction_index INTEGER,confirmation_status TEXT NOT NULL
+      inner_instruction_index INTEGER,confirmation_status TEXT NOT NULL,terminal_at TIMESTAMPTZ
     ) ON COMMIT PRESERVE ROWS`);
     await connection.query(`CREATE TEMP TABLE trading_candidates (
       mint TEXT NOT NULL,source_event_id TEXT NOT NULL,state TEXT NOT NULL,eligible_until TIMESTAMPTZ,

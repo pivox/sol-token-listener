@@ -137,18 +137,25 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     throw new LaunchpadEventRepositoryError('record');
   }
 
-  public async listTrackedMints(): Promise<ReadonlySet<string>> {
+  public async listTrackedMints(signature: string): Promise<ReadonlySet<string>> {
     return this.read(async (client) => {
-      if (this.workerAdmissionPolicy.enabled) {
-        return immutableSet(await listWorkerTrackingMints(
+      const globallyTracked = this.workerAdmissionPolicy.enabled
+        ? await listWorkerTrackingMints(
           client,
           this.workerAdmissionPolicy.trackingWindowSeconds,
-        ));
-      }
-      const result = await client.query(`SELECT mint FROM token_launches
-        WHERE terminal_at IS NULL ORDER BY mint`);
-      const values = result.rows.map((row) => requiredText(row, 'mint'));
-      return immutableSet(values);
+        )
+        : (await client.query(`SELECT mint FROM token_launches
+          WHERE terminal_at IS NULL ORDER BY mint`)).rows.map((row) =>
+          requiredText(row, 'mint'));
+      const replay = await client.query(`SELECT DISTINCT mint FROM domain_events
+        WHERE signature=$1 AND confirmation_status <> 'orphaned'
+          AND type IN ('TokenLaunchDetected','BondingCurveTradeObserved')
+          AND terminal_at IS NULL
+        ORDER BY mint`, [signature]);
+      return immutableSet([...new Set([
+        ...globallyTracked,
+        ...replay.rows.map((row) => requiredText(row, 'mint')),
+      ])].sort());
     });
   }
 
