@@ -27,9 +27,12 @@ malformée, `enabled=false`, une fenêtre différente de 45 secondes ou une
 chronologie non monotone donne `INCONCLUSIVE`. Depuis T+5 : non croissant pour
 classification puis backlog claimable jusqu'à `STOPPED`. La dette la plus
 ancienne à 44 999 ms reste éligible à `PASS`; 45 000 ms exactement produit
-`FAIL`. Le compte claimable `STOPPED` doit correspondre au backlog du heartbeat
-et au compte SQL frais `postStopActionableCount`, sinon le verdict est
-`INCONCLUSIVE`.
+`FAIL`. À chaque relevé, `claimableBacklogCount <= backlogCount` et la somme
+avec `classificationPendingCount` reste inférieure ou égale au backlog legacy.
+Le compte claimable `STOPPED` doit correspondre à la preuve SQL post-stop dédiée
+`postStopWorkerAdmissionClaimableCount`, sinon le verdict est `INCONCLUSIVE`.
+Le champ distinct `postStopActionableCount` reste exclusivement la preuve du
+gate shutdown legacy et doit toujours égaler le `backlogCount` arrêté.
 
 Le gate `workerAdmission` reste indépendant de `catchUpAdmission`,
 `firstProcessing`, `http429`, `finality`, `idempotence`, `retention`, `rss` et
@@ -308,6 +311,9 @@ peut être réutilisée pour déclarer un `PASS`.
    doit contenir aucun identifiant, signature, mint, wallet ou label. Le CLI
    `canary:evaluate` réapplique le snapshotter domaine exact et rejette toute
    absence, clé additionnelle, valeur non entière ou relation zéro/null invalide.
+   Ajouter au niveau racine le seul entier SQL frais
+   `postStopWorkerAdmissionClaimableCount`; ne jamais le déduire de
+   `postStopActionableCount`, qui conserve la population legacy du shutdown.
    Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
    projection fixe suivante de la réponse health :
 
@@ -429,6 +435,111 @@ peut être réutilisée pour déclarer un `PASS`.
    rm -f "$final_source"
    trap - EXIT
    ```
+
+   Exécuter ensuite la requête SQL post-stop suivante avec le rôle PostgreSQL
+   dédié au listener. Elle reprend exactement la population claimable et les
+   cinq preuves d'autorité utilisées par le repository avec la fenêtre V1 de
+   45 secondes. Son unique sortie agrégée devient
+   `postStopWorkerAdmissionClaimableCount`; elle ne révèle aucune signature,
+   aucun mint, wallet, identifiant ou label :
+
+   ```sql
+   WITH database_clock AS MATERIALIZED (
+     SELECT date_trunc('milliseconds', clock_timestamp()) AS at
+   ), fresh_launch AS MATERIALIZED (
+     SELECT DISTINCT launch.mint
+     FROM token_launches AS launch
+     JOIN domain_events AS launch_event
+       ON launch_event.type = 'TokenLaunchDetected'
+      AND launch_event.mint = launch.mint
+      AND launch_event.signature = launch.created_signature
+      AND launch_event.slot = launch.created_slot
+      AND launch_event.transaction_index = launch.created_transaction_index
+      AND launch_event.instruction_index = launch.created_instruction_index
+      AND launch_event.inner_instruction_index IS NOT DISTINCT FROM
+        launch.created_inner_instruction_index
+     CROSS JOIN database_clock
+     WHERE launch.current_state <> 'RETRACTED'
+       AND launch_event.confirmation_status <> 'orphaned'
+       AND launch.detected_at + (45 * INTERVAL '1 second') > database_clock.at
+   ), extended_mint AS MATERIALIZED (
+     SELECT candidate.mint
+     FROM trading_candidates AS candidate
+     JOIN domain_events AS source_event
+       ON source_event.event_id = candidate.source_event_id
+     CROSS JOIN database_clock
+     WHERE candidate.superseded_at IS NULL
+       AND candidate.state = 'ELIGIBLE'
+       AND candidate.confirmation_status <> 'orphaned'
+       AND source_event.confirmation_status <> 'orphaned'
+       AND candidate.eligible_until > database_clock.at
+     UNION SELECT session.mint FROM paper_strategy_sessions AS session
+       WHERE session.state IN ('BUY_PENDING', 'PAPER_HOLDING',
+         'WAITING_EXTERNAL_BUYS', 'EXIT_PENDING_QUOTE', 'SELL_PENDING')
+     UNION SELECT position.mint FROM paper_positions AS position
+       WHERE position.status = 'PAPER_HOLDING'
+     UNION SELECT intent.mint FROM execution_intents AS intent
+       WHERE intent.terminal_at IS NULL
+         AND intent.status NOT IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
+     UNION SELECT live.mint FROM listener_worker_tracking_live_mints AS live
+   )
+   SELECT COUNT(*) FILTER (
+     WHERE (
+       (inbox.processing_status = 'PENDING'
+         AND inbox.attempts_in_cycle < inbox.retry_max_attempts)
+       OR (inbox.processing_status = 'FAILED'
+         AND inbox.error_retryable = TRUE
+         AND inbox.retry_exhausted_at IS NULL
+         AND inbox.next_attempt_at <= database_clock.at
+         AND inbox.attempts_in_cycle < inbox.retry_max_attempts)
+       OR (inbox.processing_status = 'PROCESSING'
+         AND inbox.lease_expires_at <= database_clock.at
+         AND inbox.attempts_in_cycle < inbox.retry_max_attempts)
+     )
+     AND inbox.worker_admitted_at IS NOT NULL
+     AND (
+       NOT (inbox.ingestion_priority = 'TRACKED_TRADE'
+         AND inbox.ingestion_hint = 'PUMPFUN_TRADE')
+       OR NOT (
+         inbox.processing_status = 'PENDING'
+         AND inbox.ingestion_priority = 'TRACKED_TRADE'
+         AND inbox.ingestion_hint = 'PUMPFUN_TRADE'
+         AND inbox.ingestion_hint_mint IS NOT NULL
+         AND inbox.worker_admitted_at IS NOT NULL
+         AND inbox.attempts = 0 AND inbox.attempts_in_cycle = 0
+         AND inbox.lease_token IS NULL AND inbox.lease_expires_at IS NULL
+         AND inbox.normalized_transaction IS NULL
+         AND inbox.immutable_fingerprint IS NULL
+         AND inbox.error_code IS NULL AND inbox.error_name IS NULL
+         AND inbox.error_retryable IS NULL AND inbox.next_attempt_at IS NULL
+         AND inbox.retry_exhausted_at IS NULL AND inbox.processed_at IS NULL
+         AND inbox.missing_finality_polls = 0
+         AND inbox.last_missing_finality_provider_id IS NULL
+         AND inbox.finality_evidence_version = 0
+         AND inbox.manual_recovery_count = 0
+         AND inbox.last_manual_recovery_at IS NULL
+         AND inbox.first_processed_at IS NULL
+         AND inbox.first_processing_evidence_unavailable = FALSE
+         AND inbox.decoder_quarantine_eligible_at IS NULL
+         AND inbox.decoder_recovery_used = FALSE
+       )
+       OR EXISTS (
+         SELECT 1 FROM fresh_launch
+         WHERE fresh_launch.mint = inbox.ingestion_hint_mint
+       )
+       OR EXISTS (
+         SELECT 1 FROM extended_mint
+         WHERE extended_mint.mint = inbox.ingestion_hint_mint
+       )
+     )
+   ) AS "postStopWorkerAdmissionClaimableCount"
+   FROM chain_transaction_inbox AS inbox
+   CROSS JOIN database_clock;
+   ```
+
+   Archiver seulement cet entier dans le manifeste V1. Une requête absente,
+   échouée, malformée ou exécutée avant `STOPPED` vaut `INCONCLUSIVE`; ne jamais
+   substituer le compte legacy `postStopActionableCount`.
 
    Nommer les quatre fichiers HTTP `T0`, `T+5`, `T+15` et `final`, et les quatre
    fichiers de latence `T0.firstProcessingCanary`,
@@ -588,7 +699,11 @@ eux aussi indépendants, avec leurs snapshots et critères propres.
 - `heartbeat.workerAdmission.version=1`, `enabled=true` et
   `trackingWindowSeconds=45` aux cinq frontières ; depuis T+5, dette de
   classification et backlog claimable non croissants, aucun âge pending à
-  45 000 ms ou davantage, et compte `STOPPED` identique au SQL frais;
+  45 000 ms ou davantage ; à chaque frontière, le claimable et la somme
+  claimable + pending restent inférieurs ou égaux au backlog legacy, et le
+  claimable `STOPPED` égale le SQL frais dédié
+  `postStopWorkerAdmissionClaimableCount`. Le compte distinct
+  `postStopActionableCount` reste la preuve du shutdown legacy;
 - l'affinité provider est conservée pendant chaque scan strict : aucun résultat
   ou cache d'un provider remplacé n'est réutilisé, et le cache unique reste à
   quatre fetches démarrés/s ou moins globalement;

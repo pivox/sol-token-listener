@@ -32,6 +32,10 @@ void test('keeps the real failed run failed while correcting four obsolete asser
 
 void test('passes coherent bounded worker admission evidence through durable STOPPED', () => {
   const copy = passingWorkerAdmissionFixture();
+  const t0 = nested(copy, 'snapshots', 'T0');
+  assert.ok((nested(t0, 'workerAdmission').classificationPendingCount as number) > 0);
+  assert.ok((nested(t0, 'workerAdmission').claimableBacklogCount as number)
+    < (t0.backlogCount as number));
 
   assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
     verdict: 'PASS',
@@ -73,11 +77,34 @@ void test('fails classification debt or claimable backlog growth after T+5', () 
 
 void test('keeps STOPPED SQL count disagreement inconclusive', () => {
   const copy = passingWorkerAdmissionFixture();
-  copy.postStopActionableCount = 7;
+  copy.postStopWorkerAdmissionClaimableCount = 7;
 
   assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
     verdict: 'INCONCLUSIVE',
-    reasonCode: 'WORKER_ADMISSION_STOPPED_COUNT_INCOHERENT',
+    reasonCode: 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT',
+  });
+});
+
+void test('requires dedicated post-stop worker evidence and only a subset of legacy backlog', () => {
+  const missing = passingWorkerAdmissionFixture();
+  delete missing.postStopWorkerAdmissionClaimableCount;
+  assert.deepEqual(evaluateMainnetObserveCanary(missing).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING',
+  });
+
+  const malformed = passingWorkerAdmissionFixture();
+  malformed.postStopWorkerAdmissionClaimableCount = '6';
+  assert.deepEqual(evaluateMainnetObserveCanary(malformed).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED',
+  });
+
+  const exceedsLegacy = passingWorkerAdmissionFixture();
+  nested(exceedsLegacy, 'snapshots', 'T0', 'workerAdmission').claimableBacklogCount = 21;
+  assert.deepEqual(evaluateMainnetObserveCanary(exceedsLegacy).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_BACKLOG_INCOHERENT',
   });
 });
 
@@ -656,6 +683,7 @@ const WORKER_ADMISSION_SNAPSHOT_NAMES = [
 function passingWorkerAdmissionFixture(): Record<string, unknown> {
   const copy = cloneFixture();
   const claimable = [10, 9, 8, 7] as const;
+  const legacyBacklog = [20, 18, 16, 14] as const;
   const pending = [2, 1, 1, 1] as const;
   const ages = [1_000, 2_000, 30_000, 44_999] as const;
   WORKER_ADMISSION_SNAPSHOT_NAMES.forEach((name, index) => {
@@ -669,7 +697,7 @@ function passingWorkerAdmissionFixture(): Record<string, unknown> {
       extendedMintCount: 2,
       demotedCount: index,
     });
-    setHeartbeatBacklog(snapshot, claimableBacklogCount);
+    setHeartbeatBacklog(snapshot, legacyBacklog[index] ?? claimableBacklogCount);
   });
   const stopped = nested(copy, 'stoppedHeartbeat');
   stopped.workerAdmission = workerAdmissionEvidence({
@@ -680,8 +708,9 @@ function passingWorkerAdmissionFixture(): Record<string, unknown> {
     extendedMintCount: 1,
     demotedCount: 4,
   });
-  setHeartbeatBacklog(stopped, 6);
-  copy.postStopActionableCount = 6;
+  setHeartbeatBacklog(stopped, 12);
+  copy.postStopActionableCount = 12;
+  copy.postStopWorkerAdmissionClaimableCount = 6;
   return copy;
 }
 
@@ -708,7 +737,6 @@ function setClaimableBacklog(
 ): void {
   const snapshot = nested(copy, 'snapshots', name);
   nested(snapshot, 'workerAdmission').claimableBacklogCount = count;
-  setHeartbeatBacklog(snapshot, count);
 }
 
 function setHeartbeatBacklog(heartbeat: Record<string, unknown>, count: number): void {

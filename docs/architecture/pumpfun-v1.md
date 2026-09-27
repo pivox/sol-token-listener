@@ -1050,6 +1050,9 @@ first-processing historique indisponible interdit toute démotion rassurante.
 Le diagnostic exact `workerAdmission.v1` sépare le backlog réclamable de la
 dette de classification et publie les comptes union-distinct de mints frais,
 prolongés et démis. Il ne contient ni signature, mint, wallet, URL ou label.
+Son `claimableBacklogCount` est un sous-ensemble du `backlogCount` legacy ; la
+preuve SQL post-stop `postStopWorkerAdmissionClaimableCount` le réconcilie sans
+détourner `postStopActionableCount`, qui reste propre au shutdown legacy.
 Cette métrique ne remplace ni `catchUpAdmission`, ni la preuve first-processing.
 Le flag reste `false` dans les exemples et Compose : l'activation n'est permise
 qu'après fusion de #177, CI post-merge verte, puis dans le canary Mainnet

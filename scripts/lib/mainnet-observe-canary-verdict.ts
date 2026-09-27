@@ -79,6 +79,9 @@ type TerminalCounts = Readonly<{ failed: number; quarantined: number; exhausted:
 type WorkerAdmissionEvidence =
   | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
   | Readonly<{ state: 'VALID'; value: RuntimeWorkerAdmissionMetricsV1 }>;
+type OptionalIntegerEvidence =
+  | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
+  | Readonly<{ state: 'VALID'; value: number }>;
 
 interface Admission {
   readonly version: 1;
@@ -208,6 +211,7 @@ interface CanaryInput {
     groups: readonly TerminalGroup[];
   }>;
   readonly postStopActionableCount: number;
+  readonly postStopWorkerAdmissionClaimableCount: OptionalIntegerEvidence;
   readonly versionReplayProof: Readonly<{
     freshDatabase: boolean;
     observed: VersionCounts;
@@ -541,13 +545,37 @@ function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateRe
   if (!nonIncreasing(afterFiveMinutes.map((item) => item.claimableBacklogCount))) {
     return gate('FAIL', 'WORKER_ADMISSION_BACKLOG_GREW');
   }
-  if (snapshots.some((snapshot, index) =>
-    metrics[index]?.claimableBacklogCount !== snapshot.backlogCount)) {
+  if (snapshots.some((snapshot, index) => {
+    const item = metrics[index];
+    if (item === undefined) return true;
+    const classifiedPopulation = sum([
+      item.claimableBacklogCount,
+      item.classificationPendingCount,
+    ]);
+    return item.claimableBacklogCount > snapshot.backlogCount
+      || classifiedPopulation === null
+      || classifiedPopulation > snapshot.backlogCount;
+  })) {
     return gate('INCONCLUSIVE', 'WORKER_ADMISSION_BACKLOG_INCOHERENT');
   }
-  if (stoppedMetrics.claimableBacklogCount !== input.stoppedHeartbeat.backlogCount
-    || stoppedMetrics.claimableBacklogCount !== input.postStopActionableCount) {
-    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_STOPPED_COUNT_INCOHERENT');
+  const stoppedClassifiedPopulation = sum([
+    stoppedMetrics.claimableBacklogCount,
+    stoppedMetrics.classificationPendingCount,
+  ]);
+  if (stoppedMetrics.claimableBacklogCount > input.stoppedHeartbeat.backlogCount
+    || stoppedClassifiedPopulation === null
+    || stoppedClassifiedPopulation > input.stoppedHeartbeat.backlogCount) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_BACKLOG_INCOHERENT');
+  }
+  const postStopCount = input.postStopWorkerAdmissionClaimableCount;
+  if (postStopCount.state === 'MISSING') {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING');
+  }
+  if (postStopCount.state === 'MALFORMED') {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED');
+  }
+  if (stoppedMetrics.claimableBacklogCount !== postStopCount.value) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT');
   }
   return gate('PASS', 'WORKER_ADMISSION_BOUNDED');
 }
@@ -648,11 +676,11 @@ function evaluateShutdown(input: CanaryInput): MainnetObserveCanaryGateResultV1 
 }
 
 function parseInput(value: unknown): CanaryInput {
-  const input = exactObject(value, [
+  const input = exactObjectWithOptional(value, [
     'schemaVersion', 'commit', 'snapshots', 'stoppedHeartbeat', 'finalityDiagnostics',
     'providerMixingEvidenceCount', 'terminalEvidence', 'postStopActionableCount',
     'versionReplayProof', 'cleanupComplete',
-  ]);
+  ], ['postStopWorkerAdmissionClaimableCount']);
   if (input.schemaVersion !== 'mainnet-observe-canary-input.v1'
     || typeof input.commit !== 'string' || !/^[0-9a-f]{40}$/u.test(input.commit)) invalid();
   const sourceSnapshots = exactObject(input.snapshots, SNAPSHOT_NAMES);
@@ -672,11 +700,27 @@ function parseInput(value: unknown): CanaryInput {
       final: parseTerminalCounts(terminal.final),
       groups: Object.freeze(exactArray(terminal.groups, MAX_TERMINAL_GROUPS).map(parseTerminalGroup)) }),
     postStopActionableCount: integer(input.postStopActionableCount),
+    postStopWorkerAdmissionClaimableCount: parseOptionalIntegerEvidence(
+      input,
+      'postStopWorkerAdmissionClaimableCount',
+    ),
     versionReplayProof: Object.freeze({ freshDatabase: bool(proof.freshDatabase),
       observed: parseVersionCounts(proof.observed), normalized: parseVersionCounts(proof.normalized),
       persisted: parseVersionCounts(proof.persisted) }),
     cleanupComplete: bool(input.cleanupComplete),
   });
+}
+
+function parseOptionalIntegerEvidence(
+  input: Readonly<Record<string, unknown>>,
+  key: string,
+): OptionalIntegerEvidence {
+  if (!Object.hasOwn(input, key)) return Object.freeze({ state: 'MISSING', value: null });
+  try {
+    return Object.freeze({ state: 'VALID', value: integer(input[key]) });
+  } catch {
+    return Object.freeze({ state: 'MALFORMED', value: null });
+  }
 }
 
 function parseSnapshot(value: unknown): Snapshot {

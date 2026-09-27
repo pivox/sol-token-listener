@@ -419,6 +419,10 @@ void test('bounded worker admission canary remains post-merge, observe-only and 
   assert.match(runbook, /44[ ,.\u202f]?999[^.]{0,100}PASS/iu);
   assert.match(runbook, /45[ ,.\u202f]?000[^.]{0,100}FAIL/iu);
   assert.match(runbook, /T\+5[^.]{0,240}(?:non-growing|non croissant)[^.]{0,160}(?:classification|classement)[^.]{0,160}(?:backlog|claimable)/iu);
+  assert.match(runbook, /claimableBacklogCount[^.]{0,180}(?:<=|inférieur ou égal)[^.]{0,120}backlogCount/iu);
+  assert.match(runbook, /postStopWorkerAdmissionClaimableCount/iu);
+  assert.match(runbook, /postStopActionableCount[^.]{0,200}shutdown[^.]{0,120}legacy/iu);
+  assert.match(runbook, /SQL[^.]{0,180}post-stop[^.]{0,220}postStopWorkerAdmissionClaimableCount/iu);
   assert.match(runbook, /rollback[^.]{0,180}LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false/iu);
   for (const gate of [
     'workerAdmission', 'catchUpAdmission', 'firstProcessing', 'http429', 'finality',

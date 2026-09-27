@@ -71,7 +71,11 @@ trades vierges par claim et conserve leur rétention terminale de quatre heures.
 La migration 056 ajoute les index d'autorité et une vue `security_barrier`
 limitée au mint live actif. `workerAdmission.v1` expose séparément dette de
 classification, backlog réclamable, mints frais/prolongés et démotions, sans
-identifiant. La cohorte first-processing exclut les lignes non admises et les
+identifiant. Son `claimableBacklogCount` est une sous-population du
+`backlogCount` legacy, jamais une valeur tenue égale. Le canary réconcilie le
+STOPPED avec `postStopWorkerAdmissionClaimableCount`, preuve SQL dédiée, tandis
+que `postStopActionableCount` reste réservé au shutdown legacy. La cohorte
+first-processing exclut les lignes non admises et les
 lignes admises puis démises, sans transformer une preuve historique indisponible.
 Un seul repository reçoit la politique ; aucun worker, timer, queue, appel RPC,
 cache, chemin wallet, executor, signature ou soumission supplémentaire n'est ajouté.
