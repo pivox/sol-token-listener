@@ -8,6 +8,10 @@ import {
   snapshotRuntimeWorkerAdmissionMetrics,
   type RuntimeWorkerAdmissionMetricsV1,
 } from '../../src/domain/worker-admission-metrics.js';
+import {
+  parseMainnetTerminalAttribution,
+  type MainnetTerminalAttributionV1,
+} from './mainnet-terminal-attribution.js';
 
 export type MainnetObserveCanaryVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
@@ -221,23 +225,31 @@ interface CanaryInput {
   readonly cleanupComplete: boolean;
 }
 
+type TerminalAttributionEvidence =
+  | Readonly<{ readonly state: 'MISSING' | 'MALFORMED'; readonly value: null }>
+  | Readonly<{ readonly state: 'VALID'; readonly value: MainnetTerminalAttributionV1 }>;
+
 class InvalidEvidence extends Error {}
 
-export function evaluateMainnetObserveCanary(input: unknown): MainnetObserveCanaryResultV1 {
+export function evaluateMainnetObserveCanary(
+  input: unknown,
+  terminalAttribution?: unknown,
+): MainnetObserveCanaryResultV1 {
   let evidence: CanaryInput;
   try {
     evidence = parseInput(input);
   } catch {
     return result(null, allGates('INCONCLUSIVE', 'INVALID_EVIDENCE'));
   }
+  const attribution = parseTerminalAttributionEvidence(terminalAttribution);
   const gates: Record<MainnetObserveCanaryGateName, MainnetObserveCanaryGateResultV1> = {
     runtime: evaluateRuntime(evidence),
     http429: evaluateHttp429(evidence),
     backlog: evaluateBacklog(evidence),
-    terminalFailures: evaluateTerminal(evidence),
+    terminalFailures: evaluateTerminal(evidence, attribution),
     idempotence: evaluateIdempotence(evidence),
     retention: evaluateRetention(evidence),
-    decoderQuarantine: evaluateDecoder(evidence),
+    decoderQuarantine: evaluateDecoder(evidence, attribution),
     firstProcessing: evaluateFirstProcessing(evidence),
     blockHydration: evaluateHydration(evidence),
     catchUpAdmission: evaluateAdmission(evidence),
@@ -372,29 +384,32 @@ function evaluateBacklog(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     ? gate('PASS', 'BACKLOG_NON_GROWING') : gate('FAIL', 'BACKLOG_GREW');
 }
 
-function evaluateTerminal(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
-  const { baseline, final, groups } = input.terminalEvidence;
+function evaluateTerminal(
+  input: CanaryInput,
+  attribution: TerminalAttributionEvidence,
+): MainnetObserveCanaryGateResultV1 {
+  const { baseline, final } = input.terminalEvidence;
   if (baseline.exhausted > baseline.failed || final.exhausted > final.failed
     || final.failed < baseline.failed || final.exhausted < baseline.exhausted
     || final.quarantined < baseline.quarantined) {
     return gate('INCONCLUSIVE', 'TERMINAL_COUNTER_RESET');
   }
-  const failedDelta = final.failed - baseline.failed;
   const exhaustedDelta = final.exhausted - baseline.exhausted;
   const quarantinedDelta = final.quarantined - baseline.quarantined;
   if (exhaustedDelta > 0) return gate('FAIL', 'TERMINAL_RETRIES_EXHAUSTED');
-  const groupedFailed = sum(groups.filter((group) => group.processingStatus === 'FAILED')
-    .map((group) => group.count));
-  const groupedQuarantined = sum(groups.filter((group) => group.processingStatus === 'QUARANTINED')
-    .map((group) => group.count));
-  if (groupedFailed === null || groupedQuarantined === null
-    || groupedFailed !== failedDelta || groupedQuarantined !== quarantinedDelta
-    || groups.some((group) => group.reasonCode === null || group.errorCode === null)) {
-    return failedDelta + quarantinedDelta > 0
-      ? gate('INCONCLUSIVE', 'TERMINAL_GROUPS_INCOMPLETE') : gate('PASS', 'TERMINAL_NONE');
+  if (quarantinedDelta > 0) return gate('FAIL', 'TERMINAL_FAILURES_OBSERVED');
+  if (attribution.state !== 'VALID') return attributionUnavailableGate(attribution.state);
+  const reconciliation = reconcileTerminalAttribution(input, attribution.value);
+  if (reconciliation.currentPopulationReconciled
+    && reconciliation.terminalFailedCount > baseline.failed) {
+    return gate('FAIL', 'TERMINAL_FAILURES_OBSERVED');
   }
-  return groupedFailed + groupedQuarantined > 0 ? gate('FAIL', 'TERMINAL_FAILURES_OBSERVED')
-    : gate('PASS', 'TERMINAL_NONE');
+  const integrityFailure = attributionIntegrityFailure(attribution.value, reconciliation);
+  if (integrityFailure !== null) return integrityFailure;
+  if (reconciliation.terminalFailedCount > 0) {
+    return gate('INCONCLUSIVE', 'TERMINAL_ATTRIBUTION_BASELINE_STATE_UNKNOWN');
+  }
+  return gate('PASS', 'TERMINAL_NONE');
 }
 
 function evaluateIdempotence(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
@@ -408,9 +423,26 @@ function evaluateRetention(input: CanaryInput): MainnetObserveCanaryGateResultV1
     ? gate('PASS', 'RETENTION_CONFIRMED') : gate('FAIL', 'RETENTION_VIOLATION');
 }
 
-function evaluateDecoder(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
-  return orderedSnapshots(input).every((snapshot) => snapshot.decoderQuarantine.unresolvedCount === 0)
-    ? gate('PASS', 'DECODER_QUARANTINE_EMPTY') : gate('FAIL', 'DECODER_QUARANTINE_UNRESOLVED');
+function evaluateDecoder(
+  input: CanaryInput,
+  attribution: TerminalAttributionEvidence,
+): MainnetObserveCanaryGateResultV1 {
+  if (orderedSnapshots(input).some(
+    (snapshot) => snapshot.decoderQuarantine.unresolvedCount !== 0,
+  )) return gate('FAIL', 'DECODER_QUARANTINE_UNRESOLVED');
+  if (attribution.state !== 'VALID') return attributionUnavailableGate(attribution.state);
+  const diagnosticGroups = attribution.value.diagnosticOccurrences.groups;
+  if (diagnosticGroups.some((group) => group.diagnosticCode === 'PUMP_BORSH_INVALID')) {
+    return gate('FAIL', 'DECODER_PUMP_BORSH_INVALID');
+  }
+  if (diagnosticGroups.some((group) => group.source === 'CATCH_UP'
+    && group.processingOutcome === 'QUARANTINED'
+    && group.catchUpCauseKind === 'PUMP_DECODER')) {
+    return gate('FAIL', 'DECODER_CATCH_UP_QUARANTINE');
+  }
+  const reconciliation = reconcileTerminalAttribution(input, attribution.value);
+  const integrityFailure = attributionIntegrityFailure(attribution.value, reconciliation);
+  return integrityFailure ?? gate('PASS', 'DECODER_QUARANTINE_EMPTY');
 }
 
 function evaluateFirstProcessing(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
@@ -673,6 +705,76 @@ function evaluateShutdown(input: CanaryInput): MainnetObserveCanaryGateResultV1 
     return gate('INCONCLUSIVE', 'SHUTDOWN_DURABLE_COUNTS_INCOHERENT');
   }
   return gate('PASS', 'SHUTDOWN_CLEAN_WITH_DURABLE_BACKLOG');
+}
+
+interface TerminalAttributionReconciliation {
+  readonly currentPopulationReconciled: boolean;
+  readonly terminalFailedCount: number;
+}
+
+function parseTerminalAttributionEvidence(value: unknown): TerminalAttributionEvidence {
+  if (value === undefined) return Object.freeze({ state: 'MISSING', value: null });
+  try {
+    return Object.freeze({ state: 'VALID', value: parseMainnetTerminalAttribution(value) });
+  } catch {
+    return Object.freeze({ state: 'MALFORMED', value: null });
+  }
+}
+
+function reconcileTerminalAttribution(
+  input: CanaryInput,
+  attribution: MainnetTerminalAttributionV1,
+): TerminalAttributionReconciliation {
+  const groups = attribution.currentPopulation.groups;
+  const failed = sum(groups.filter((group) => group.processingStatus === 'FAILED')
+    .map((group) => group.count));
+  const quarantined = sum(groups.filter((group) => group.processingStatus === 'QUARANTINED')
+    .map((group) => group.count));
+  const terminalFailed = sum(groups.filter((group) => group.processingStatus === 'FAILED'
+    && group.failureState === 'TERMINAL').map((group) => group.count));
+  const final = input.terminalEvidence.final;
+  const expectedTotal = safeAdd(final.failed, final.quarantined);
+  return Object.freeze({
+    currentPopulationReconciled: attribution.currentPopulation.overflow.groupCount === 0
+      && attribution.currentPopulation.overflow.rowCount === 0
+      && failed === final.failed
+      && quarantined === final.quarantined
+      && expectedTotal !== null
+      && attribution.currentPopulation.totalRows === expectedTotal,
+    terminalFailedCount: terminalFailed ?? Number.MAX_SAFE_INTEGER,
+  });
+}
+
+function attributionIntegrityFailure(
+  attribution: MainnetTerminalAttributionV1,
+  reconciliation: TerminalAttributionReconciliation,
+): MainnetObserveCanaryGateResultV1 | null {
+  if (attribution.currentPopulation.overflow.groupCount !== 0
+    || attribution.currentPopulation.overflow.rowCount !== 0
+    || attribution.diagnosticOccurrences.overflow.groupCount !== 0
+    || attribution.diagnosticOccurrences.overflow.occurrenceCount !== 0) {
+    return gate('INCONCLUSIVE', 'TERMINAL_ATTRIBUTION_OVERFLOW');
+  }
+  if (attribution.currentPopulation.unavailableRows !== 0
+    || attribution.diagnosticOccurrences.unavailableOccurrences !== 0) {
+    return gate('INCONCLUSIVE', 'TERMINAL_ATTRIBUTION_UNAVAILABLE');
+  }
+  if (attribution.incompleteAttribution.parentRows !== 0
+    || attribution.incompleteAttribution.missingOccurrences !== 0) {
+    return gate('INCONCLUSIVE', 'TERMINAL_ATTRIBUTION_INCOMPLETE');
+  }
+  if (!reconciliation.currentPopulationReconciled) {
+    return gate('INCONCLUSIVE', 'TERMINAL_ATTRIBUTION_UNRECONCILED');
+  }
+  return null;
+}
+
+function attributionUnavailableGate(
+  state: 'MISSING' | 'MALFORMED',
+): MainnetObserveCanaryGateResultV1 {
+  return gate('INCONCLUSIVE', state === 'MISSING'
+    ? 'TERMINAL_ATTRIBUTION_MISSING'
+    : 'TERMINAL_ATTRIBUTION_MALFORMED');
 }
 
 function parseInput(value: unknown): CanaryInput {

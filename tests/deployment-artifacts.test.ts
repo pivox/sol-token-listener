@@ -381,10 +381,10 @@ void test('deployment keeps executable bounded admission disabled until the foll
   }
   assert.match(
     overview,
-    /drain[^.]{0,200}migrations[^.]{0,120}056[^.]{0,200}deploy[^.]{0,200}restart/iu,
+    /drain[^.]{0,200}migrations[^.]{0,120}057[^.]{0,200}deploy[^.]{0,200}restart/iu,
   );
   for (const document of [readme, overview]) {
-    assert.match(document, /migration 056[^.]{0,120}tête courante/iu);
+    assert.match(document, /migration 057[^.]{0,120}tête courante/iu);
   }
   assert.match(overview, /old binary[^.]{0,200}schema 053[^.]{0,160}not supported/iu);
   assert.match(overview, /no change[^.]{0,240}wallet[^.]{0,120}executor[^.]{0,120}RPC[^.]{0,120}cache/iu);
@@ -930,7 +930,7 @@ void test('decoder quarantine runbook documents bounded observation-only recover
 void test('block hydration runbook defines the corrected worker-eligible cohort and mandatory replay', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.4\.0/u);
+  assert.match(runbook, /Version : 1\.5\.0/u);
   assert.match(runbook, /population worker-éligible/iu);
   for (const exclusion of [
     'IGNORED / SOLANA_TRANSACTION_FAILED',
@@ -957,7 +957,7 @@ void test('block hydration runbook defines the corrected worker-eligible cohort 
 void test('block hydration runbook keeps catch-up refresh continuation bounded and fail-closed', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.4\.0/u);
+  assert.match(runbook, /Version : 1\.5\.0/u);
   assert.match(runbook, /CATCH_UP_REFRESH_REQUIRED[\s\S]{0,400}exactement un scan supplémentaire/iu);
   assert.match(runbook, /même provider[\s\S]{0,180}même session WebSocket[\s\S]{0,180}même signal d'arrêt/iu);
   assert.match(runbook, /ne promeut jamais[\s\S]{0,180}avant la réussite[\s\S]{0,120}seconde passe/iu);
@@ -975,7 +975,7 @@ void test('finality reconciler diagnostics are composed and documented as a non-
     readArtifact('src/application/production-listener-factory.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.4\.0/u);
+  assert.match(runbook, /Version : 1\.5\.0/u);
   assert.match(runbook, /listener\.finality_reconciler_degraded/u);
   assert.match(runbook, /listener\.finality_reconciler_recovered/u);
   for (const reasonCode of [
@@ -1020,7 +1020,7 @@ void test('versioned canary verdict documents provider-affine and durable shutdo
   assert.match(runbook,
     /npm run canary:evaluate -- \/absolute\/path\/to\/redacted-canary-input\.v1\.json/u);
   assert.match(runbook, /FAIL[^.]{0,160}INCONCLUSIVE[^.]{0,240}bloquent[^.]{0,160}wallet/iu);
-  assert.match(runbook, /Version : 1\.4\.0/u);
+  assert.match(runbook, /Version : 1\.5\.0/u);
   assert.match(runbook,
     /terminalEvidence[^.]{0,300}failed[^.]{0,120}quarantined[^.]{0,120}exhausted[^.]{0,300}baseline[^.]{0,120}final/iu);
   assert.match(runbook,
@@ -1054,6 +1054,35 @@ void test('versioned canary verdict documents provider-affine and durable shutdo
   assert.match(overview,
     /href="superpowers\/specs\/2026-09-25-mainnet-observe-canary-verdict-design\.md"/u);
   assert.match(overview, /npm run canary:evaluate/u);
+});
+
+void test('terminal attribution runbook captures before teardown and keeps provenance local', async () => {
+  const [runbook, evaluator] = await Promise.all([
+    readArtifact('docs/operations/block-hydration-canary.md'),
+    readArtifact('scripts/evaluate-mainnet-observe-canary.ts'),
+  ]);
+
+  assert.match(runbook, /Version : 1\.5\.0/u);
+  assert.match(runbook,
+    /arrêter[\s\S]{0,200}listener[\s\S]{0,240}PostgreSQL[\s\S]{0,160}actif[\s\S]{0,240}captur/iu);
+  assert.match(runbook,
+    /canary:capture-terminal-attribution[^\n]*mainnet-terminal-attribution\.v1\.json/u);
+  assert.match(runbook,
+    /canary:evaluate --[^\n]*redacted-canary-input\.v1\.json[^\n]*mainnet-terminal-attribution\.v1\.json/u);
+  assert.match(runbook,
+    /capture[\s\S]{0,240}évalu[\s\S]{0,240}copi[\s\S]{0,240}teardown/iu);
+  assert.match(runbook, /0600[\s\S]{0,240}owner-only/iu);
+  assert.match(runbook,
+    /manquant[\s\S]{0,180}malformé[\s\S]{0,180}non réconcilié[\s\S]{0,180}overflow/iu);
+  assert.match(runbook,
+    /PUMP_BORSH_INVALID[\s\S]{0,240}quarantaine catch-up[\s\S]{0,240}PUMP_DECODER[\s\S]{0,240}(?:FAIL|PASS)/iu);
+  assert.match(runbook,
+    /n'autorise[\s\S]{0,180}ni[\s\S]{0,160}décodeur[\s\S]{0,180}retry[\s\S]{0,180}transaction/iu);
+  assert.doesNotMatch(runbook,
+    /mainnet-terminal-attribution\.v1\.json[^\n]{0,240}(?:cat|jq|tee)/u);
+  assert.match(evaluator, /args\.length !== 2/u);
+  assert.match(evaluator,
+    /evaluateMainnetObserveCanary\(parsed, parsedTerminalAttribution\)/u);
 });
 
 void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {

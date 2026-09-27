@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.4.0 — 2026-09-27 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169 et #177.
+Version : 1.5.0 — 2026-09-27 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169, #170 et #177.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -48,14 +48,44 @@ fabriquer un backlog nul. Aucun wallet, aucun signer, aucun executor, aucune
 submission et aucun trade ne sont autorisés par ce canary ; il ne lit aucune
 clé, n'arme aucune intention et ne soumet aucune transaction.
 
-## Verdict V1 versionné
+## Verdict V1 versionné et attribution terminale
 
 Après capture des quatre snapshots et du heartbeat arrêté, construire uniquement
-le manifeste agrégé expurgé V1 puis lancer :
+le manifeste agrégé expurgé V1. Arrêter proprement le listener et vérifier le
+heartbeat `STOPPED`, mais conserver PostgreSQL actif. Capturer alors l'attribution
+terminale dans le snapshot en lecture seule, avant toute purge ou teardown :
 
 ```bash
-npm run canary:evaluate -- /absolute/path/to/redacted-canary-input.v1.json
+npm run canary:capture-terminal-attribution -- /absolute/path/to/mainnet-terminal-attribution.v1.json
 ```
+
+Le fichier est créé exclusivement en mode `0600` et reste un artefact local
+owner-only. Ne jamais afficher, journaliser, publier ni envoyer ses
+représentants de provenance. L'évaluateur reçoit ensuite les deux fichiers :
+
+```bash
+npm run canary:evaluate -- /absolute/path/to/redacted-canary-input.v1.json /absolute/path/to/mainnet-terminal-attribution.v1.json
+```
+
+L'ordre opérateur est strict : arrêt du listener en gardant la base active,
+capture, évaluation, copie des artefacts owner-only vers le stockage local
+protégé, puis seulement purge et teardown. Un artefact d'attribution manquant,
+malformé, non réconcilié ou avec overflow donne `INCONCLUSIVE`; il ne peut
+jamais produire `PASS`. Un compteur d'attribution incomplète ou une preuve
+`UNAVAILABLE` a le même effet.
+
+Un nouveau `FAILED` réellement terminal, une exhaustion ou une nouvelle
+`QUARANTINED` prouvée produit `FAIL`, même si un autre regroupement est
+incomplet. Un `FAILED` encore `RETRY_PENDING` reste compté mais n'est pas
+étiqueté terminal. Le gate décodeur produit `FAIL` devant un diagnostic
+`PUMP_BORSH_INVALID` ou une quarantaine catch-up dont la cause fermée est
+`PUMP_DECODER`; ce gate ne peut jamais produire `PASS` dans ces cas et aucun
+d'eux ne peut être compensé par un autre gate vert.
+
+Cette attribution est uniquement diagnostique : elle n'autorise ni changement
+du décodeur, ni changement de retry, ni transaction live. Toute correction de
+comportement exige une PR séparée fondée sur une reproduction assainie. Cette
+procédure ne lit aucune clé, n'arme aucun executor et ne soumet aucun ordre.
 
 Le verdict est fail-closed. `FAIL` et `INCONCLUSIVE` bloquent tous deux la
 readiness Mainnet et tout accès wallet ; seul un `PASS` de chaque gate permet de

@@ -17,16 +17,51 @@ const fixtureUrl = new URL(
   import.meta.url,
 );
 const fixtureText = await readFile(fixtureUrl, 'utf8');
+const terminalAttributionText = `${JSON.stringify({
+  schemaVersion: 'mainnet-terminal-attribution.v1',
+  currentPopulation: {
+    totalRows: 244,
+    retainedRows: 244,
+    unavailableRows: 190,
+    overflow: { groupCount: 0, rowCount: 0 },
+    groups: [
+      {
+        processingStatus: 'FAILED', normalizedErrorName: 'LEGACY_LEASE_EXPIRED',
+        retryable: false, failureState: 'TERMINAL', attempts: 3, attemptsInCycle: 3,
+        catchUpReasonCode: null, count: 54,
+      },
+      {
+        processingStatus: 'QUARANTINED', normalizedErrorName: 'UNAVAILABLE',
+        retryable: null, failureState: 'TERMINAL', attempts: 0, attemptsInCycle: 0,
+        catchUpReasonCode: 'PUMP_SCHEMA_UNSUPPORTED', count: 190,
+      },
+    ],
+  },
+  diagnosticOccurrences: {
+    totalOccurrences: 0,
+    retainedOccurrences: 0,
+    unavailableOccurrences: 0,
+    overflow: { groupCount: 0, occurrenceCount: 0 },
+    groups: [],
+  },
+  incompleteAttribution: { parentRows: 0, missingOccurrences: 0 },
+})}\n`;
 
-void test('evaluates one redacted manifest and emits exactly one canonical JSON line', async () => {
-  const harness = commandHarness(async (_path, maximumBytes) => {
+void test('evaluates the redacted manifest plus aggregate attribution and emits one JSON line', async () => {
+  const paths: string[] = [];
+  const harness = commandHarness(async (path, maximumBytes) => {
     assert.equal(maximumBytes, 1_048_576);
-    return fixtureText;
+    paths.push(path);
+    return path.endsWith('terminal.json') ? terminalAttributionText : fixtureText;
   });
 
-  const exitCode = await runMainnetObserveCanaryCommand(['/redacted/input.json'], harness.dependencies);
+  const exitCode = await runMainnetObserveCanaryCommand(
+    ['/redacted/input.json', '/redacted/terminal.json'],
+    harness.dependencies,
+  );
 
   assert.equal(exitCode, 2);
+  assert.deepEqual(paths, ['/redacted/input.json', '/redacted/terminal.json']);
   assert.equal(harness.stderr.join(''), '');
   assert.equal(harness.stdout.length, 1);
   assert.equal(harness.stdout[0]?.endsWith('\n'), true);
@@ -37,10 +72,12 @@ void test('evaluates one redacted manifest and emits exactly one canonical JSON 
 void test('fails closed with one fixed error for invocation, read, size, and JSON errors', async () => {
   const cases: readonly [readonly string[], () => Promise<string>][] = [
     [[], async () => fixtureText],
-    [['one', 'two'], async () => fixtureText],
-    [['secret-path'], async () => { throw new Error('private read failure'); }],
-    [['secret-path'], async () => 'x'.repeat(MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES + 1)],
-    [['secret-path'], async () => '{"privateKey":"must-not-leak"'],
+    [['one'], async () => fixtureText],
+    [['one', 'two', 'three'], async () => fixtureText],
+    [['manifest', 'secret-path'], async () => { throw new Error('private read failure'); }],
+    [['manifest', 'secret-path'], async () =>
+      'x'.repeat(MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES + 1)],
+    [['manifest', 'secret-path'], async () => '{"privateKey":"must-not-leak"'],
   ];
   for (const [args, reader] of cases) {
     const harness = commandHarness(reader);
@@ -55,9 +92,14 @@ void test('turns malicious but valid JSON fields into a redacted inconclusive re
     schemaVersion: 'mainnet-observe-canary-input.v1',
     privateKey: 'must-not-leak',
   });
-  const harness = commandHarness(async () => malicious);
+  const harness = commandHarness(async (path) => path.endsWith('terminal.json')
+    ? terminalAttributionText
+    : malicious);
 
-  const exitCode = await runMainnetObserveCanaryCommand(['/secret/path.json'], harness.dependencies);
+  const exitCode = await runMainnetObserveCanaryCommand(
+    ['/secret/path.json', '/secret/terminal.json'],
+    harness.dependencies,
+  );
 
   assert.equal(exitCode, 2);
   assert.equal(harness.stderr.join(''), '');
@@ -67,17 +109,39 @@ void test('turns malicious but valid JSON fields into a redacted inconclusive re
     'INCONCLUSIVE');
 });
 
-void test('real CLI exits 2 and writes one JSON line for the known failed fixture', () => {
+void test('rejects malformed attribution JSON without reflecting path or content', async () => {
+  const harness = commandHarness(async (path) => path.endsWith('terminal.json')
+    ? '{"signature":"must-not-leak"'
+    : fixtureText);
+
+  assert.equal(await runMainnetObserveCanaryCommand(
+    ['/redacted/input.json', '/private/terminal.json'],
+    harness.dependencies,
+  ), 1);
+  assert.deepEqual(harness.stdout, []);
+  assert.deepEqual(harness.stderr, ['MAINNET_OBSERVE_CANARY_EVALUATION_FAILED\n']);
+});
+
+void test('real CLI exits 2 and writes one JSON line for the known failed fixture', async () => {
   const scriptPath = fileURLToPath(new URL('../scripts/evaluate-mainnet-observe-canary.ts', import.meta.url));
   const fixturePath = fileURLToPath(fixtureUrl);
-  const result = spawnSync(process.execPath, ['--import', 'tsx', scriptPath, fixturePath], {
-    encoding: 'utf8',
-  });
+  const directory = await mkdtemp(join(tmpdir(), 'canary-attribution-cli-'));
+  try {
+    const attributionPath = join(directory, 'terminal.json');
+    await writeFile(attributionPath, terminalAttributionText, { encoding: 'utf8', mode: 0o600 });
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', scriptPath, fixturePath, attributionPath],
+      { encoding: 'utf8' },
+    );
 
-  assert.equal(result.status, 2, result.stderr);
-  assert.equal(result.stderr, '');
-  assert.equal(result.stdout.trimEnd().split('\n').length, 1);
-  assert.equal((JSON.parse(result.stdout) as { overallVerdict?: unknown }).overallVerdict, 'FAIL');
+    assert.equal(result.status, 2, result.stderr);
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout.trimEnd().split('\n').length, 1);
+    assert.equal((JSON.parse(result.stdout) as { overallVerdict?: unknown }).overallVerdict, 'FAIL');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 void test('bounded reader rejects symlinks and FIFOs without blocking', async () => {
