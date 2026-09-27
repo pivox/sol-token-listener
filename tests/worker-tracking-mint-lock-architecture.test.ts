@@ -18,6 +18,10 @@ const producers = Object.freeze([
 void test('all bounded-tracking proof producers use the one shared mint-lock protocol', async () => {
   const helper = await readFile('src/storage/worker-tracking-mint-lock.ts', 'utf8');
   assert.match(helper,
+    /from '\.\.\/domain\/solana-public-key\.js';/u);
+  assert.doesNotMatch(helper,
+    /from '\.\.\/domain\/transaction-ingestion\.js';/u);
+  assert.match(helper,
     /hashtextextended\('transaction-inbox-mint:' \|\| \$1,\s*0\)/u);
   assert.match(helper, /export async function lockWorkerTrackingMints/u);
   assert.match(helper, /\.sort\(/u);

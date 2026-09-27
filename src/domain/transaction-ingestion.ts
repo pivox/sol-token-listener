@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
-import { PublicKey } from '@solana/web3.js';
 import { assertValidObservedPipelineFailure } from './observed-pipeline-failure.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
@@ -19,6 +18,9 @@ import {
   type RuntimeWorkerAdmissionMetricsV1,
 } from './worker-admission-metrics.js';
 import type { ChainConfirmationStatus } from './types.js';
+import { isCanonicalSolanaPublicKey } from './solana-public-key.js';
+
+export const isCanonicalSolanaProgramId = isCanonicalSolanaPublicKey;
 
 export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
 export const MAX_TRANSACTION_SNAPSHOT_NODES = 10_000;
@@ -489,19 +491,6 @@ function assertCanonicalProgramIds(value: unknown): void {
       throw new TypeError('Transaction notification programIds are not canonical.');
     }
     previous = programId;
-  }
-}
-
-export function isCanonicalSolanaProgramId(value: string): boolean {
-  const byteLength = Buffer.byteLength(value, 'utf8');
-  if (byteLength < MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
-    || byteLength > MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
-    || value !== value.trim()
-    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(value)) return false;
-  try {
-    return new PublicKey(value).toBase58() === value;
-  } catch {
-    return false;
   }
 }
 

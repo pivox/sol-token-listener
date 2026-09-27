@@ -37,6 +37,7 @@ const h1ProductionModules = Object.freeze([
       '../ports/execution-intent-repository.js',
       './database.js',
       './execution-intent-expiration.js',
+      './worker-tracking-mint-lock.js',
     ]),
   }),
   Object.freeze({
@@ -56,6 +57,7 @@ const h1ProductionModules = Object.freeze([
       './database.js',
       './execution-intent.repository.js',
       './execution-risk.repository.js',
+      './worker-tracking-mint-lock.js',
     ]),
   }),
 ]);

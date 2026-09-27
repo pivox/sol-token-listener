@@ -1,4 +1,4 @@
-import { isCanonicalSolanaProgramId } from '../domain/transaction-ingestion.js';
+import { isCanonicalSolanaPublicKey } from '../domain/solana-public-key.js';
 
 interface MintLockClient {
   query(
@@ -45,7 +45,7 @@ export async function lockWorkerTrackingMints(
   const canonical = [...new Set(mints)].sort((left, right) =>
     left < right ? -1 : left > right ? 1 : 0);
   for (const mint of canonical) {
-    if (mint.length < 32 || mint.length > 44 || !isCanonicalSolanaProgramId(mint)) {
+    if (mint.length < 32 || mint.length > 44 || !isCanonicalSolanaPublicKey(mint)) {
       throw new TypeError('Worker tracking mint must be a canonical Solana public key.');
     }
   }
