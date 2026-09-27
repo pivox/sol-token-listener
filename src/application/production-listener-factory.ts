@@ -312,6 +312,7 @@ export function createProductionListenerRuntime(
       hydration.classifierLocator(providerId), inbox, Date.now, Object.freeze({
         coverageFastPathEnabled: config.listenerPumpFunCatchUpCoverageFastPathEnabled,
         coverageRepository: config.listenerPumpFunCatchUpCoverageFastPathEnabled ? inbox : null,
+        slotPersistencePipelineEnabled: workerAdmissionPolicy.enabled,
       }),
     )),
   ] as const));

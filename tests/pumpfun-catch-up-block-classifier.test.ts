@@ -152,6 +152,58 @@ void test('records failed discoveries directly, covers durable successes and hyd
   ]);
 });
 
+void test('reads grouped coverage before pipelining only the missing slots', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'coverage-pipeline-first', slot: 301n });
+  const covered = cloneTransaction(template, { signature: 'coverage-pipeline-covered', slot: 302n });
+  const second = cloneTransaction(template, { signature: 'coverage-pipeline-second', slot: 303n });
+  const firstWrite = deferred<undefined>();
+  const events: string[] = [];
+  const coverage = new RecordingCoverageRepository(async () => {
+    events.push('coverage');
+    return Object.freeze([createCatchUpClassificationReceipt({
+      signature: covered.signature,
+      slot: covered.slot,
+      disposition: null,
+      persistence: 'ALREADY_ADMITTED',
+      admission: 'NOT_ENQUEUED',
+      ingestionPriority: null,
+    })]);
+  });
+  const locator = new RecordingLocator(async (target) => {
+    events.push(`hydrate:${target.signature}`);
+    return target.signature === first.signature ? first : second;
+  });
+  const repository = new RecordingRepository(async (classification) => {
+    if (classification.signature === first.signature) await firstWrite.promise;
+  });
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 9_600, {
+    coverageFastPathEnabled: true,
+    coverageRepository: coverage,
+    slotPersistencePipelineEnabled: true,
+  }).classify(Object.freeze([
+    discovery(second), discovery(covered), discovery(first),
+  ]), NEVER_ABORTED);
+
+  await flush();
+  assert.deepEqual(events, [
+    'coverage', `hydrate:${first.signature}`, `hydrate:${second.signature}`,
+  ]);
+  assert.deepEqual(coverage.batches.map((batch) => batch.map(({ signature }) => signature)), [[
+    first.signature, covered.signature, second.signature,
+  ]]);
+  assert.deepEqual(repository.values, []);
+
+  firstWrite.resolve(undefined);
+  const receipts = await operation;
+  assert.deepEqual(repository.values.map(({ signature }) => signature), [
+    first.signature, second.signature,
+  ]);
+  assert.deepEqual(receipts.map(({ signature }) => signature), [
+    first.signature, covered.signature, second.signature,
+  ]);
+});
+
 void test('rejects a source-success discovery when hydrated block evidence reports failure', async () => {
   const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
   const transaction = cloneTransaction(template, {
@@ -740,6 +792,187 @@ void test('fingerprint ignores time, finality and program provenance but covers 
   assert.notEqual(first.evidenceFingerprint, moved.evidenceFingerprint);
 });
 
+void test('pipelines exactly one future slot while preserving serial writes and deterministic order', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'pipeline-first', slot: 201n });
+  const second = cloneTransaction(template, { signature: 'pipeline-second', slot: 202n });
+  const third = cloneTransaction(template, { signature: 'pipeline-third', slot: 203n });
+  const transactions = new Map([
+    [first.signature, first], [second.signature, second], [third.signature, third],
+  ]);
+  const firstWrite = deferred<undefined>();
+  let activeWrites = 0;
+  let maximumActiveWrites = 0;
+  const repository = new RecordingRepository(async (classification) => {
+    activeWrites += 1;
+    maximumActiveWrites = Math.max(maximumActiveWrites, activeWrites);
+    if (classification.signature === first.signature) await firstWrite.promise;
+    activeWrites -= 1;
+  });
+  const locator = returning(transactions);
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 100_000, {
+    coverageFastPathEnabled: false,
+    coverageRepository: null,
+    slotPersistencePipelineEnabled: true,
+  }).classify(Object.freeze([
+    discovery(third), discovery(first), discovery(second),
+  ]), NEVER_ABORTED);
+
+  await flush();
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [
+    first.signature, second.signature,
+  ]);
+  assert.equal(activeWrites, 1);
+  assert.deepEqual(repository.values, []);
+
+  firstWrite.resolve(undefined);
+  const receipts = await operation;
+
+  assert.equal(maximumActiveWrites, 1);
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [
+    first.signature, second.signature, third.signature,
+  ]);
+  assert.deepEqual(repository.values.map(({ signature }) => signature), [
+    first.signature, second.signature, third.signature,
+  ]);
+  assert.deepEqual(receipts.map(({ signature }) => signature), [
+    first.signature, second.signature, third.signature,
+  ]);
+});
+
+void test('keeps the exact serial slot path when the persistence pipeline is disabled', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'serial-first', slot: 211n });
+  const second = cloneTransaction(template, { signature: 'serial-second', slot: 212n });
+  const firstWrite = deferred<undefined>();
+  const locator = returning(new Map([[first.signature, first], [second.signature, second]]));
+  const repository = new RecordingRepository(async (classification) => {
+    if (classification.signature === first.signature) await firstWrite.promise;
+  });
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 101_000, {
+    coverageFastPathEnabled: false,
+    coverageRepository: null,
+    slotPersistencePipelineEnabled: false,
+  }).classify(Object.freeze([discovery(second), discovery(first)]), NEVER_ABORTED);
+
+  await flush();
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [first.signature]);
+  firstWrite.resolve(undefined);
+  await operation;
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [
+    first.signature, second.signature,
+  ]);
+});
+
+void test('captures a prefetched hydration rejection until current persistence settles', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'hydrate-reject-first', slot: 221n });
+  const second = cloneTransaction(template, { signature: 'hydrate-reject-second', slot: 222n });
+  const third = cloneTransaction(template, { signature: 'hydrate-reject-third', slot: 223n });
+  const firstWrite = deferred<undefined>();
+  const hydrationFailure = deferred<NormalizedTransaction>();
+  const locator = new RecordingLocator(async (target) => {
+    if (target.signature === first.signature) return first;
+    if (target.signature === second.signature) return hydrationFailure.promise;
+    return third;
+  });
+  const repository = new RecordingRepository(async (classification) => {
+    if (classification.signature === first.signature) await firstWrite.promise;
+  });
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 102_000, {
+    coverageFastPathEnabled: false,
+    coverageRepository: null,
+    slotPersistencePipelineEnabled: true,
+  }).classify(Object.freeze([
+    discovery(first), discovery(second), discovery(third),
+  ]), NEVER_ABORTED);
+
+  await flush();
+  hydrationFailure.reject(new Error('prefetched hydration failed'));
+  await flush();
+  assert.deepEqual(repository.values, []);
+  firstWrite.resolve(undefined);
+
+  await assert.rejects(operation, (error: unknown) => {
+    assert.equal(Reflect.get(error as object, 'code'), 'LOCATOR_UNTRUSTED');
+    return true;
+  });
+  assert.deepEqual(repository.values.map(({ signature }) => signature), [first.signature]);
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [
+    first.signature, second.signature,
+  ]);
+});
+
+void test('awaits and suppresses prefetched failure when current persistence rejects', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'persist-reject-first', slot: 231n });
+  const second = cloneTransaction(template, { signature: 'persist-reject-second', slot: 232n });
+  const third = cloneTransaction(template, { signature: 'persist-reject-third', slot: 233n });
+  const persistenceFailure = new Error('current persistence failed');
+  const hydration = deferred<NormalizedTransaction>();
+  const locator = new RecordingLocator(async (target) => {
+    if (target.signature === first.signature) return first;
+    if (target.signature === second.signature) return hydration.promise;
+    return third;
+  });
+  const repository = new RecordingRepository(async () => { throw persistenceFailure; });
+  let settled = false;
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 103_000, {
+    coverageFastPathEnabled: false,
+    coverageRepository: null,
+    slotPersistencePipelineEnabled: true,
+  }).classify(Object.freeze([
+    discovery(first), discovery(second), discovery(third),
+  ]), NEVER_ABORTED).finally(() => { settled = true; });
+
+  await flush();
+  assert.equal(settled, false);
+  hydration.reject(new Error('prefetched failure must be suppressed'));
+  await assert.rejects(operation, (error: unknown) => error === persistenceFailure);
+  assert.deepEqual(repository.values, []);
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [
+    first.signature, second.signature,
+  ]);
+});
+
+void test('abort awaits the prefetched slot and never writes it or hydrates a later slot', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const first = cloneTransaction(template, { signature: 'abort-first', slot: 241n });
+  const second = cloneTransaction(template, { signature: 'abort-second', slot: 242n });
+  const third = cloneTransaction(template, { signature: 'abort-third', slot: 243n });
+  const firstWrite = deferred<undefined>();
+  const hydration = deferred<NormalizedTransaction>();
+  const controller = new AbortController();
+  const locator = new RecordingLocator(async (target) => {
+    if (target.signature === first.signature) return first;
+    if (target.signature === second.signature) return hydration.promise;
+    return third;
+  });
+  const repository = new RecordingRepository(async (classification) => {
+    if (classification.signature === first.signature) await firstWrite.promise;
+  });
+  let settled = false;
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository, () => 104_000, {
+    coverageFastPathEnabled: false,
+    coverageRepository: null,
+    slotPersistencePipelineEnabled: true,
+  }).classify(Object.freeze([
+    discovery(first), discovery(second), discovery(third),
+  ]), controller.signal).finally(() => { settled = true; });
+
+  await flush();
+  controller.abort();
+  firstWrite.resolve(undefined);
+  await flush();
+  assert.equal(settled, false);
+  hydration.resolve(second);
+  await assert.rejects(operation, PumpFunCatchUpBlockClassifierAbortedError);
+  assert.deepEqual(repository.values.map(({ signature }) => signature), [first.signature]);
+  assert.deepEqual(locator.targets.map(({ signature }) => signature), [
+    first.signature, second.signature,
+  ]);
+});
+
 void test('replays a partially persisted slot with identical semantic fingerprints and order', async () => {
   const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
   const first = cloneTransaction(template, { signature: 'a-first', slot: 101n });
@@ -923,10 +1156,12 @@ function missingSignatureBlock(slot: bigint): unknown {
 function deferred<T>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
+  readonly reject: (reason: unknown) => void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => { resolve = settle; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => { resolve = settle; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 async function flush(): Promise<void> {
