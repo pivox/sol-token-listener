@@ -1,4 +1,11 @@
+import { isProxy } from 'node:util/types';
 import { createTokenLaunchDetectedEvent } from '../domain/launchpad-events.js';
+import {
+  inheritTrustedTerminalAttribution,
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+  type TerminalDiagnosticCode,
+} from '../domain/terminal-attribution.js';
 import type { DomainEvent, DomainEventType } from '../domain/events.js';
 import type {
   MetadataFailureReason,
@@ -104,9 +111,9 @@ implements QualificationProjectionRepository {
     ) throw new TypeError('Qualification projection mint is required.');
     let client: QualificationProjectionClient;
     try {
-      client = await this.database.connect();
+      client = diagnosticClient(await this.database.connect());
     } catch {
-      throw new QualificationProjectionRepositoryError();
+      throw attributed(new QualificationProjectionRepositoryError(), 'QUALIFICATION_CONNECT_FAILED');
     }
     let lockAcquired = false;
     let transactionStarted = false;
@@ -167,22 +174,77 @@ implements QualificationProjectionRepository {
       }
     }
     if (failures.length !== 0) {
-      if (failures.length === 1 && primaryFailure instanceof QualificationProjectionDataError) {
-        throw primaryFailure;
+      const dataFailure = isDataFailure(primaryFailure);
+      const fallback = completed ? 'QUALIFICATION_CLEANUP_FAILED'
+        : dataFailure ? 'QUALIFICATION_DATA_INVALID' : 'QUALIFICATION_PERSISTENCE_UNKNOWN';
+      if (failures.length === 1 && dataFailure
+        && primaryFailure instanceof QualificationProjectionDataError) {
+        throw attributed(primaryFailure, fallback);
       }
       if (
         failures.length === 1
-        && (primaryFailure instanceof TypeError || primaryFailure instanceof RangeError)
-      ) throw invalid();
+        && dataFailure
+      ) throw attributed(invalid(), fallback, primaryFailure);
       const redactedAggregate = new AggregateError(
         failures.map(() => new Error('Qualification projection operation or cleanup failed.')),
         'Qualification projection operation or cleanup failures were aggregated.',
       );
-      throw new QualificationProjectionRepositoryError({ cause: redactedAggregate });
+      throw attributed(new QualificationProjectionRepositoryError({ cause: redactedAggregate }),
+        fallback, completed ? undefined : primaryFailure);
     }
     if (!completed) throw new QualificationProjectionRepositoryError();
     return result as TResult;
   }
+}
+
+/** Diagnostic failures must never replace the operation's existing outcome. */
+function attributed<T extends object>(
+  target: T,
+  fallback: TerminalDiagnosticCode,
+  source?: unknown,
+): T {
+  try {
+    inheritTrustedTerminalAttribution(target, source);
+    if (trustedTerminalAttribution(target) === null) {
+      registerTrustedTerminalAttribution(target, {
+        version: 1, diagnosticCode: fallback, causeKind: null, pumpWire: null,
+      });
+    }
+  } catch { /* Attribution is best effort; preserve the original failure. */ }
+  return target;
+}
+
+function isDataFailure(error: unknown): boolean {
+  try {
+    return typeof error === 'object' && error !== null && !isProxy(error)
+      && (error instanceof QualificationProjectionDataError
+        || error instanceof TypeError || error instanceof RangeError);
+  } catch { return false; }
+}
+
+/** Inspect SQLSTATE only at the actual driver rejection boundary, never callbacks. */
+function diagnosticClient(client: QualificationProjectionClient): QualificationProjectionClient {
+  return {
+    async query(text, values): Promise<QueryResult> {
+      try {
+        return await client.query(text, values);
+      } catch (error: unknown) {
+        try {
+          if (typeof error === 'object' && error !== null && !isProxy(error)) {
+            const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+            const code: unknown = descriptor !== undefined && 'value' in descriptor
+              ? descriptor.value : undefined;
+            if (code === '40001' || code === '40P01') {
+              attributed(error, code === '40001'
+                ? 'QUALIFICATION_POSTGRES_SERIALIZATION' : 'QUALIFICATION_POSTGRES_DEADLOCK');
+            }
+          }
+        } catch { /* Never let diagnostic inspection replace the driver's rejection. */ }
+        throw error;
+      }
+    },
+    release(error): void { client.release(error); },
+  };
 }
 
 class PostgresQualificationProjectionTransaction

@@ -34,7 +34,7 @@ void test('054 is replay-safe on an empty PostgreSQL schema', async (context) =>
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '058_transaction_inbox_funding_attribution.sql');
+    assert.equal(applied.at(-1), '059_transaction_inbox_qualification_attribution.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const columns = await pool.query(`SELECT column_name,is_nullable FROM information_schema.columns
       WHERE table_schema=current_schema() AND table_name='paper_strategy_sessions'

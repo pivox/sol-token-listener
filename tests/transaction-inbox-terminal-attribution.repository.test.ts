@@ -104,6 +104,88 @@ void test('funding diagnostics retain retry-pending evidence and exact fifth-att
   });
 });
 
+void test('qualification diagnostics retain retry-pending evidence and exact fifth-attempt exhaustion', async (context) => {
+  await withDatabase(context, async (pool, repository) => {
+    const cases = [
+      ['qualification-validate', 'QUALIFICATION_CONNECT_FAILED'],
+      ['qualification-extract', 'QUALIFICATION_POSTGRES_SERIALIZATION'],
+      ['qualification-deadlock', 'QUALIFICATION_POSTGRES_DEADLOCK'],
+      ['qualification-data', 'QUALIFICATION_DATA_INVALID'],
+      ['qualification-launch', 'QUALIFICATION_LAUNCH_MISSING'],
+      ['qualification-rebuild', 'QUALIFICATION_REBUILD_UNKNOWN'],
+      ['qualification-persistence', 'QUALIFICATION_PERSISTENCE_UNKNOWN'],
+      ['qualification-record', 'QUALIFICATION_CLEANUP_FAILED'],
+    ] as const;
+
+    for (const [signature, diagnosticCode] of cases) {
+      await repository.enqueue(notification(signature));
+      const claim = await repository.claim(Date.now(), 30);
+      assert.ok(claim);
+      await repository.markFailed(signature, claim.leaseToken,
+        qualificationFailure(signature, diagnosticCode));
+      const stored = await parent(pool, signature);
+      assert.equal(stored.processing_status, 'FAILED');
+      assert.equal(stored.error_code, 'PIPELINE_STAGE_FAILED');
+      assert.equal(stored.error_name,
+        'ObservedPipelineFailure.v1.qualification.UNKNOWN');
+      assert.equal(stored.error_retryable, true);
+      assert.equal(stored.attempts_in_cycle, 1);
+      assert.equal(stored.retry_exhausted_at, null);
+      if (signature !== 'qualification-record') {
+        await pool.query(`UPDATE chain_transaction_inbox
+          SET next_attempt_at='2100-01-01T00:00:00.000Z'
+          WHERE signature=$1`, [signature]);
+      }
+    }
+
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      const claim = await claimRetry(pool, repository, 'qualification-record');
+      await repository.markFailed('qualification-record', claim.leaseToken,
+        qualificationFailure('qualification-record', 'QUALIFICATION_CLEANUP_FAILED'));
+    }
+
+    const rows = await occurrences(pool);
+    for (const [signature, diagnosticCode] of cases) {
+      const diagnosticRows = rows.filter((row) => row.signature === signature);
+      assert.equal(diagnosticRows.length, signature === 'qualification-record' ? 5 : 1);
+      for (const [index, row] of diagnosticRows.entries()) {
+        assert.equal(row.source, 'WORKER');
+        assert.equal(row.processing_outcome, 'FAILED');
+        assert.equal(row.worker_cycle_attempt, index + 1);
+        assert.equal(row.retryable, true);
+        assert.equal(row.retry_exhausted,
+          signature === 'qualification-record' && index === 4);
+        assert.equal(row.stage, 'qualification');
+        assert.equal(row.origin, null);
+        assert.equal(row.diagnostic_code, diagnosticCode);
+        assert.equal(row.catch_up_cause_kind, null);
+        assert.equal(row.completeness, 'COMPLETE');
+        assert.equal(row.wire_surface, null);
+      }
+    }
+
+    const retained = await pool.query<{ valid: boolean }>(`SELECT BOOL_AND(
+      purge_after=captured_at+INTERVAL '4 hours') AS valid
+      FROM transaction_inbox_terminal_attributions`);
+    assert.equal(retained.rows[0]?.valid, true);
+    const artifact = await capture(pool, repository);
+    assert.equal(artifact.diagnosticOccurrences.totalOccurrences, 12);
+    assert.equal(artifact.incompleteAttribution.missingOccurrences, 0);
+    assert.deepEqual([...new Set(artifact.diagnosticOccurrences.groups.map(
+      (group) => group.diagnosticCode,
+    ))].sort(), cases.map(([, code]) => code).sort());
+    for (const group of artifact.diagnosticOccurrences.groups) {
+      assert.equal(group.stage, 'qualification');
+      assert.equal(group.pumpWire, null);
+      assert.equal(group.representative, null);
+    }
+    const exhausted = await parent(pool, 'qualification-record');
+    assert.equal(exhausted.attempts_in_cycle, 5);
+    assert.ok(exhausted.retry_exhausted_at instanceof Date);
+    assert.equal(exhausted.error_retryable, true);
+  });
+});
+
 void test('real journal SQL rejection commits failure, survives later success and expires only after four hours', async (context) => {
   await withDatabase(context, async (pool, repository) => {
     await pool.query(`ALTER TABLE transaction_inbox_terminal_attributions ADD CONSTRAINT reject_test CHECK (signature<>'reject')`);
@@ -339,6 +421,35 @@ function fundingFailure(
   const value: IngestionFailure = Object.freeze({
     code: 'PIPELINE_STAGE_FAILED',
     errorName: 'ObservedPipelineFailure.v1.funding_observation.UNKNOWN',
+    retryable: true,
+  });
+  registerTrustedTerminalAttribution(value, {
+    version: 1,
+    diagnosticCode,
+    causeKind: null,
+    pumpWire: null,
+  });
+  registerTrustedTerminalAttributionContext(value, {
+    originCode: null,
+    locator: {
+      signature,
+      slot: 1n,
+      transactionIndex: 0,
+      confirmationStatus: 'confirmed',
+      instructionIndex: null,
+      innerInstructionIndex: null,
+    },
+  });
+  return value;
+}
+
+function qualificationFailure(
+  signature: string,
+  diagnosticCode: TerminalDiagnosticCode,
+): IngestionFailure {
+  const value: IngestionFailure = Object.freeze({
+    code: 'PIPELINE_STAGE_FAILED',
+    errorName: 'ObservedPipelineFailure.v1.qualification.UNKNOWN',
     retryable: true,
   });
   registerTrustedTerminalAttribution(value, {

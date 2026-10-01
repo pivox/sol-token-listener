@@ -26,6 +26,14 @@ export const TERMINAL_DIAGNOSTIC_CODES = Object.freeze([
   'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
   'PUMPSWAP_UNSUPPORTED_TOKEN_EXTENSION',
   'PUMPSWAP_PERSISTENCE_UNKNOWN',
+  'QUALIFICATION_CONNECT_FAILED',
+  'QUALIFICATION_POSTGRES_SERIALIZATION',
+  'QUALIFICATION_POSTGRES_DEADLOCK',
+  'QUALIFICATION_DATA_INVALID',
+  'QUALIFICATION_LAUNCH_MISSING',
+  'QUALIFICATION_REBUILD_UNKNOWN',
+  'QUALIFICATION_PERSISTENCE_UNKNOWN',
+  'QUALIFICATION_CLEANUP_FAILED',
   'UNAVAILABLE',
 ] as const);
 
@@ -169,7 +177,8 @@ export function createTerminalAttribution(input: unknown): TerminalAttributionV1
     : snapshotPumpWire(fields.pumpWire);
   const isPumpWireDiagnostic = diagnosticCode === 'PUMP_BORSH_INVALID';
   if (isPumpWireDiagnostic !== (pumpWire !== null)
-    || (isPumpWireDiagnostic && causeKind !== 'PUMP_DECODER')) {
+    || (isPumpWireDiagnostic && causeKind !== 'PUMP_DECODER')
+    || (diagnosticCode.startsWith('QUALIFICATION_') && causeKind !== null)) {
     invalidAttribution();
   }
 

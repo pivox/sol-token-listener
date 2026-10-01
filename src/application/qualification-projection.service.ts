@@ -3,6 +3,10 @@ import type { PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { QualificationRebuildService } from './qualification-rebuild.service.js';
 import type { RebuiltQualification } from './qualification-rebuild.service.js';
 import type { MissingCanonicalLaunchPolicy } from '../domain/projection-reconciliation.js';
+import {
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+} from '../domain/terminal-attribution.js';
 import type {
   CanonicalQualificationProjection,
   QualificationCanonicalSnapshot,
@@ -94,7 +98,7 @@ export class QualificationProjectionService {
         return Object.freeze({ kind:'DISSOLVED' as const, projection:null });
       }
       assertQuotePair(snapshot, buyQuote, reverseSellQuote, this.quoteMintAllowlist);
-      const rebuilt = this.rebuilder.rebuild({
+      const rebuildInput = {
         snapshot,
         buyQuote,
         reverseSellQuote,
@@ -104,7 +108,14 @@ export class QualificationProjectionService {
             this.quoteMintAllowlist.includes(asset.mint)
           )),
         })]),
-      });
+      };
+      let rebuilt: RebuiltQualification;
+      try {
+        rebuilt = this.rebuilder.rebuild(rebuildInput);
+      } catch (error: unknown) {
+        attributeQualificationFailure(error, 'QUALIFICATION_REBUILD_UNKNOWN');
+        throw error;
+      }
       const projection: CanonicalQualificationProjection = Object.freeze({
         reportId:rebuilt.reportId,
         sourceEventId:snapshot.asOfEvent.id,
@@ -118,9 +129,26 @@ export class QualificationProjectionService {
       return Object.freeze({ kind,projection,snapshot });
     });
     if (result === MISSING_CANONICAL_LAUNCH) {
-      throw new QualificationProjectionLaunchNotFoundError(mint);
+      const error = new QualificationProjectionLaunchNotFoundError(mint);
+      attributeQualificationFailure(error, 'QUALIFICATION_LAUNCH_MISSING');
+      throw error;
     }
     return result;
+  }
+}
+
+function attributeQualificationFailure(
+  error: unknown,
+  diagnosticCode: 'QUALIFICATION_REBUILD_UNKNOWN' | 'QUALIFICATION_LAUNCH_MISSING',
+): void {
+  try {
+    if (typeof error !== 'object' || error === null || isProxy(error)
+      || trustedTerminalAttribution(error) !== null) return;
+    registerTrustedTerminalAttribution(error, {
+      version: 1, diagnosticCode, causeKind: null, pumpWire: null,
+    });
+  } catch {
+    // Diagnostic registration must never replace the original business failure.
   }
 }
 

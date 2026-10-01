@@ -1,29 +1,32 @@
 import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { copyFile, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFile, readdir } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
 import pg from 'pg';
-import { migrateDatabase as migrateAll } from '../src/storage/database.js';
+import { migrateDatabase } from '../src/storage/database.js';
 
 const migrations = new URL('../migrations/', import.meta.url);
-const previousMigrationName = '057_transaction_inbox_terminal_attribution.sql';
-const migrationName = '058_transaction_inbox_funding_attribution.sql';
+const previousMigrationName = '058_transaction_inbox_funding_attribution.sql';
+const migrationName = '059_transaction_inbox_qualification_attribution.sql';
 const migrationUrl = new URL(migrationName, migrations);
 const diagnosticCodes = [
-  'FUNDING_OBSERVATION_VALIDATE',
-  'FUNDING_OBSERVATION_EXTRACT',
-  'FUNDING_OBSERVATION_RECORD',
+  'QUALIFICATION_CONNECT_FAILED',
+  'QUALIFICATION_POSTGRES_SERIALIZATION',
+  'QUALIFICATION_POSTGRES_DEADLOCK',
+  'QUALIFICATION_DATA_INVALID',
+  'QUALIFICATION_LAUNCH_MISSING',
+  'QUALIFICATION_REBUILD_UNKNOWN',
+  'QUALIFICATION_PERSISTENCE_UNKNOWN',
+  'QUALIFICATION_CLEANUP_FAILED',
 ] as const;
 
-void test('058 is forward-only, preserves 057 and pins its exact checksum', async () => {
+void test('059 is forward-only, preserves 058 and pins its exact checksum', async () => {
   const names = await readdir(migrations);
   assert.ok(names.includes(migrationName));
   const previous = await readFile(new URL(previousMigrationName, migrations), 'utf8');
   assert.equal(
     createHash('sha256').update(previous).digest('hex'),
-    '236a666265f906a4681e1615d8f08ce48dd41865de30903393ce51818bba7a2f',
+    '3444226ddb94be10c91711d1ec867be12bd96971b9ff8fbd29db883be45ea63f',
   );
   const sql = await readFile(migrationUrl, 'utf8');
   for (const code of diagnosticCodes) assert.ok(sql.includes(code), code);
@@ -39,13 +42,13 @@ void test('058 is forward-only, preserves 057 and pins its exact checksum', asyn
   assert.ok(catalog.includes(`${migrationName} ${checksum}`));
 });
 
-void test('058 installs, upgrades exact 057, replays and preserves journal state', async (context) => {
+void test('059 installs, upgrades exact 058, replays and preserves journal state', async (context) => {
   await withSchema(context, async (pool) => {
     const applied = await migrateDatabase({ pool });
     assert.equal(applied.at(-1), migrationName);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await insertParent(pool, 'empty-install');
-    await insertFundingDiagnostics(pool, 'empty-install');
+    await insertQualificationDiagnostics(pool, 'empty-install');
   });
 
   await withSchema(context, async (pool) => {
@@ -55,20 +58,30 @@ void test('058 installs, upgrades exact 057, replays and preserves journal state
       signature,source,occurrence_number,processing_outcome,worker_cycle_attempt,
       worker_recovery_count,retryable,retry_exhausted,stage,origin,diagnostic_code,
       slot,transaction_index,confirmation_status,completeness,captured_at,purge_after
-    ) VALUES ('upgrade','WORKER',1,'FAILED',1,0,TRUE,FALSE,'funding_observation',NULL,
+    ) VALUES ('upgrade','WORKER',1,'FAILED',1,0,TRUE,FALSE,'qualification',NULL,
       'WALLET_GRAPH_DATA_INVALID',1,0,'confirmed','COMPLETE',
       '2026-09-27T10:00:00.000Z','2026-09-27T14:00:00.000Z')`);
+    await pool.query(`INSERT INTO transaction_inbox_terminal_attributions (
+      signature,source,occurrence_number,processing_outcome,worker_cycle_attempt,
+      worker_recovery_count,retryable,retry_exhausted,stage,origin,diagnostic_code,
+      slot,transaction_index,confirmation_status,completeness,captured_at,purge_after
+    ) SELECT 'upgrade','WORKER',10+ordinality,'FAILED',1,0,TRUE,FALSE,NULL,NULL,code,
+      1,0,'confirmed','COMPLETE','2026-09-27T10:00:00.000Z'::TIMESTAMPTZ,
+      '2026-09-27T14:00:00.000Z'::TIMESTAMPTZ FROM unnest(ARRAY[
+        'FUNDING_OBSERVATION_VALIDATE','FUNDING_OBSERVATION_EXTRACT',
+        'FUNDING_OBSERVATION_RECORD','PUMPSWAP_PERSISTENCE_UNKNOWN'
+      ]) WITH ORDINALITY AS legacy(code,ordinality)`);
     const before = await preservedState(pool);
 
     assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
     assert.deepEqual(await preservedState(pool), before);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     assert.deepEqual(await preservedState(pool), before);
-    await insertFundingDiagnostics(pool, 'upgrade');
+    await insertQualificationDiagnostics(pool, 'upgrade');
   });
 });
 
-void test('058 rejects absent, duplicate, drifted and adjacent vocabularies', async (context) => {
+void test('059 rejects absent, duplicate, drifted and adjacent vocabularies', async (context) => {
   await withSchema(context, async (pool) => {
     await applyThrough(pool, previousMigrationName);
     const sql = await readFile(migrationUrl, 'utf8');
@@ -86,38 +99,51 @@ void test('058 rejects absent, duplicate, drifted and adjacent vocabularies', as
       `ALTER TABLE transaction_inbox_terminal_attributions
         DROP CONSTRAINT terminal_attributions_taxonomy_check,
         ADD CONSTRAINT terminal_attributions_taxonomy_check
-        CHECK (diagnostic_code<>'FUNDING_OBSERVATION_VALIDAT')`,
+        CHECK (diagnostic_code<>'QUALIFICATION_CONNECT_FAIL')`,
       `ALTER TABLE transaction_inbox_terminal_attributions
         DROP CONSTRAINT terminal_attributions_taxonomy_check,
         ADD CONSTRAINT terminal_attributions_taxonomy_check
-        CHECK (diagnostic_code<>'FUNDING_OBSERVATION_RETRY')`,
+        CHECK (diagnostic_code<>'QUALIFICATION_RETRY')`,
     ];
-    for (const drift of drifts) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        await client.query(drift);
-        await assert.rejects(client.query(sql), { code: '23514' }, drift);
-      } finally {
-        await client.query('ROLLBACK');
-        client.release();
+    for (const upgraded of [false, true]) {
+      if (upgraded) await pool.query(sql);
+      for (const drift of drifts) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(drift);
+          await assert.rejects(client.query(sql), { code: '23514' }, drift);
+        } finally {
+          await client.query('ROLLBACK');
+          client.release();
+        }
       }
     }
   });
 });
 
-// Replay this historical migration against its own head, not later extensions.
-async function migrateDatabase({ pool }: { pool: pg.Pool }): Promise<readonly string[]> {
-  const directory = await mkdtemp(join(tmpdir(), 'funding-migration-'));
-  try {
-    for (const name of (await readdir(migrations)).filter((name) => name <= migrationName)) {
-      await copyFile(new URL(name, migrations), join(directory, name));
+void test('059 rejects adjacent codes, wrong stages, null bypasses and incompatible provenance', async (context) => {
+  await withSchema(context, async (pool) => {
+    await migrateDatabase({ pool });
+    await insertParent(pool, 'restricted');
+    await insertQualificationDiagnostics(pool, 'restricted');
+    for (const code of diagnosticCodes) {
+      for (const assignment of [
+        "stage='wallet_graph'", 'stage=NULL', "source='CATCH_UP'",
+        `source='CATCH_UP',processing_outcome='QUARANTINED',occurrence_number=1,
+          worker_cycle_attempt=NULL,worker_recovery_count=NULL,retryable=NULL,
+          retry_exhausted=NULL,stage=NULL,catch_up_cause_kind='LOCATOR',
+          catch_up_reason_code='PUMP_SCHEMA_UNSUPPORTED'`,
+        "processing_outcome='QUARANTINED'", "catch_up_cause_kind='LOCATOR'",
+        "catch_up_reason_code='PUMP_SCHEMA_UNSUPPORTED'", "wire_surface='INSTRUCTION'",
+        "diagnostic_code='QUALIFICATION_RETRY'", "diagnostic_code='QUALIFICATION_CONNECT_FAIL'",
+      ]) {
+        await assert.rejects(pool.query(`UPDATE transaction_inbox_terminal_attributions
+          SET ${assignment} WHERE diagnostic_code=$1`, [code]), { code: '23514' }, assignment);
+      }
     }
-    return await migrateAll({ pool, migrationsDirectory: directory });
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-}
+  });
+});
 
 async function insertParent(pool: pg.Pool, signature: string): Promise<void> {
   await pool.query(`INSERT INTO chain_transaction_inbox
@@ -126,13 +152,13 @@ async function insertParent(pool: pg.Pool, signature: string): Promise<void> {
       'confirmed','2026-09-27T10:00:00.000Z')`, [signature]);
 }
 
-async function insertFundingDiagnostics(pool: pg.Pool, signature: string): Promise<void> {
+async function insertQualificationDiagnostics(pool: pg.Pool, signature: string): Promise<void> {
   for (const [index, diagnosticCode] of diagnosticCodes.entries()) {
     await pool.query(`INSERT INTO transaction_inbox_terminal_attributions (
       signature,source,occurrence_number,processing_outcome,worker_cycle_attempt,
       worker_recovery_count,retryable,retry_exhausted,stage,origin,diagnostic_code,
       slot,transaction_index,confirmation_status,completeness,captured_at,purge_after
-    ) VALUES ($1,'WORKER',$2,'FAILED',$2,0,TRUE,$3,'funding_observation',NULL,$4,
+    ) VALUES ($1,'WORKER',$2,'FAILED',$2,0,TRUE,$3,'qualification',NULL,$4,
       1,0,'confirmed','COMPLETE','2026-09-27T10:00:00.000Z',
       '2026-09-27T14:00:00.000Z')`, [
       signature,
@@ -143,7 +169,7 @@ async function insertFundingDiagnostics(pool: pg.Pool, signature: string): Promi
   }
   assert.deepEqual((await pool.query<{ diagnostic_code: string }>(`SELECT diagnostic_code FROM
     transaction_inbox_terminal_attributions WHERE signature=$1
-    AND diagnostic_code LIKE 'FUNDING_OBSERVATION_%' ORDER BY diagnostic_code`,
+    AND diagnostic_code LIKE 'QUALIFICATION_%' ORDER BY diagnostic_code`,
   [signature])).rows.map(({ diagnostic_code }) => diagnostic_code), [...diagnosticCodes].sort());
 }
 
@@ -157,7 +183,7 @@ async function preservedState(pool: pg.Pool): Promise<readonly unknown[]> {
     `SELECT grantee,privilege_type FROM information_schema.role_table_grants
       WHERE table_schema=current_schema() AND table_name='transaction_inbox_terminal_attributions'
       ORDER BY grantee,privilege_type`,
-    `SELECT signature,source,occurrence_number,diagnostic_code,captured_at,purge_after
+    `SELECT *
       FROM transaction_inbox_terminal_attributions ORDER BY signature,source,occurrence_number`,
     `SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
       WHERE conrelid='transaction_inbox_terminal_attributions'::REGCLASS
@@ -183,7 +209,7 @@ async function withSchema(
 ): Promise<void> {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (!databaseUrl) { context.skip('TEST_DATABASE_URL absent'); return; }
-  const schema = `funding_attribution_${randomUUID().replaceAll('-', '')}`;
+  const schema = `qualification_attribution_${randomUUID().replaceAll('-', '')}`;
   const admin = new pg.Pool({ connectionString: databaseUrl });
   const pool = new pg.Pool({
     connectionString: databaseUrl,

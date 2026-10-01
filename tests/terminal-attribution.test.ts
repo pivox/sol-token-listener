@@ -52,8 +52,26 @@ const diagnosticCodes = [
   'PUMPSWAP_MARKET_POOL_NON_CANONICAL',
   'PUMPSWAP_UNSUPPORTED_TOKEN_EXTENSION',
   'PUMPSWAP_PERSISTENCE_UNKNOWN',
+  'QUALIFICATION_CONNECT_FAILED',
+  'QUALIFICATION_POSTGRES_SERIALIZATION',
+  'QUALIFICATION_POSTGRES_DEADLOCK',
+  'QUALIFICATION_DATA_INVALID',
+  'QUALIFICATION_LAUNCH_MISSING',
+  'QUALIFICATION_REBUILD_UNKNOWN',
+  'QUALIFICATION_PERSISTENCE_UNKNOWN',
+  'QUALIFICATION_CLEANUP_FAILED',
   'UNAVAILABLE',
 ] as const;
+
+void test('qualification diagnostics require null cause kind and pump wire', () => {
+  for (const diagnosticCode of diagnosticCodes.filter((code) => code.startsWith('QUALIFICATION_'))) {
+    assert.doesNotThrow(() => createTerminalAttribution({ version: 1, diagnosticCode, causeKind: null, pumpWire: null }));
+    for (const causeKind of TERMINAL_ATTRIBUTION_CAUSE_KINDS) {
+      assert.throws(() => createTerminalAttribution({ version: 1, diagnosticCode, causeKind, pumpWire: null }));
+    }
+    assert.throws(() => createTerminalAttribution(pumpAttribution({ diagnosticCode })));
+  }
+});
 
 const causeKinds = [
   'PUMP_DECODER',
