@@ -9,6 +9,9 @@ additive SQL allowlist migration. No new logs or retries.
 
 ## Task 1 — Domain and repository boundary
 
+Implemented in `17c5d9c`. RED reproduced; parent focused suite36/36 and actual
+PostgreSQL repository suite63/63 (zero skips) passed. Global review remains due.
+
 Files: `src/domain/terminal-attribution.ts`,
 `src/storage/qualification-projection.repository.ts`,
 `tests/terminal-attribution.test.ts`,
@@ -42,6 +45,9 @@ Files: `src/domain/terminal-attribution.ts`,
 - [ ] Commit intended Task1 files only.
 
 ## Task 2 — Service and pipeline propagation
+
+Implemented in `e10034d`. RED reproduced; parent service/pipeline suite57/57
+passed. Global review remains due.
 
 Files: `src/application/qualification-projection.service.ts`,
 `tests/qualification-projection.service.test.ts`,
