@@ -7,6 +7,15 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 const root = new URL('../', import.meta.url);
+void test('frontend readiness waits for local HTTP without weakening backend checks', async () => {
+  const frontend = composeService(await readArtifact('deploy/compose.yaml'), 'frontend');
+  for (const line of [
+    '    healthcheck:',
+    '      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/index.html"]',
+    '      interval: 2s', '      timeout: 3s', '      retries: 30', '      start_period: 10s',
+  ]) assert.ok(frontend.includes(line), `Missing frontend readiness line: ${line}`);
+});
+
 const nodeImage =
   'node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94';
 const nginxImage =

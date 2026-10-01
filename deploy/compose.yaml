@@ -102,6 +102,12 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: frontend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/index.html"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
     depends_on:
       app:
         condition: service_healthy
