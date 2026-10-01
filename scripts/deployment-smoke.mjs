@@ -434,6 +434,7 @@ async function runSignalFaultProbe(signal) {
       throw new Error('Deployment signal fault probe controlled child failure.');
     }
   } catch (error) {
+    annotateSmokeFailure(error, { phase: 'SIGNAL_PROBE' });
     primaryFailure = error;
   } finally {
     cleanupDeadlineAt = Date.now() + CLEANUP_TIMEOUT_MS;
@@ -444,6 +445,7 @@ async function runSignalFaultProbe(signal) {
     }
   }
 
+  for (const error of cleanupFailures) annotateSmokeFailure(error, { phase: 'CLEANUP' });
   if (primaryFailure !== undefined && cleanupFailures.length > 0) {
     throw new AggregateError([primaryFailure, ...cleanupFailures], 'Deployment fault probe and cleanup failed.');
   }

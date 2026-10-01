@@ -1,6 +1,6 @@
 # Deployment smoke safe phase diagnostics
 
-Contract revision: 1.0.0
+Contract revision: 1.0.1
 
 Issue: #197
 
@@ -22,6 +22,12 @@ WeakMap without replacing errors. Annotate fixed phase names at the smoke
 steps and fixed operations at HTTP headers, bounded body, and SSE body reads.
 An outer phase can fill missing metadata, but cannot replace an inner operation
 or overwrite the primary error during cleanup.
+
+The standalone signal-fault-probe entrypoint follows the same attribution
+contract for both SIGTERM and SIGKILL: primary failures carry `SIGNAL_PROBE`,
+and collected cleanup failures carry `CLEANUP`, including aggregate members.
+The controlled SIGKILL failure remains a failure; the successful SIGTERM path
+remains successful when cleanup succeeds.
 
 The existing bounded failure summary gains only allowlisted phase, operation,
 and transport-code values. Transport codes are read from an error or its direct

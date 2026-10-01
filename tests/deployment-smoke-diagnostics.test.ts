@@ -23,6 +23,7 @@ function harness(fetchImpl: typeof fetch = async () => { throw new Error('Unexpe
     phase: typeof smokePhase === 'function' ? smokePhase : async (_phase, operation) => operation(),
     line: deploymentFailureLine, request: requestWithDeadline,
     body: readBoundedBody, sse: readSseToEof, deployment: runDeployment,
+    signalProbe: runSignalFaultProbe,
   })`, context) as {
     phase: (phase: string, operation: () => Promise<unknown>) => Promise<unknown>;
     line: (error: unknown) => string;
@@ -30,6 +31,7 @@ function harness(fetchImpl: typeof fetch = async () => { throw new Error('Unexpe
     body: (response: { body: ReadableStream<Uint8Array> }, label: string) => Promise<unknown>;
     sse: (body: ReadableStream<Uint8Array>, controller: AbortController) => Promise<unknown>;
     deployment: (signal: null) => Promise<number>;
+    signalProbe: (signal: 'SIGTERM' | 'SIGKILL') => Promise<void>;
   };
   return { ...api, context };
 }
@@ -153,4 +155,61 @@ void test('real deployment sequencing attaches the failing phase and preserves s
   `, api.context);
   await assert.rejects(api.deployment(null), (error) => error === failure);
   assert.equal(api.line(failure), 'Deployment smoke failed: TypeError(validation){phase=PUBLIC_HEALTH,transport=ECONNRESET}.\n');
+});
+
+function signalProbeHarness(primaryFailure: Error | null, cleanupFailures: Error[] = []) {
+  const api = harness();
+  api.context.process = { pid: 123 };
+  api.context.randomBytes = () => Buffer.alloc(4);
+  api.context.primaryFailure = primaryFailure;
+  api.context.cleanupFailures = cleanupFailures;
+  runInContext(`
+    runFaultProbeChild = async (_name, signal) => {
+      if (primaryFailure !== null) throw primaryFailure;
+      return signal === 'SIGTERM'
+        ? { code: 143, signal: null, stdout: '', stderr: '' }
+        : { code: null, signal: 'SIGKILL', stdout: '', stderr: '' };
+    };
+    cleanupFaultProject = async (_name, failures) => { failures.push(...cleanupFailures); };
+  `, api.context);
+  return api;
+}
+
+void test('standalone signal probe annotates its original primary failure for both signal modes', async () => {
+  for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+    const primary = new TypeError('PRIVATE_PROBE_MESSAGE');
+    const api = signalProbeHarness(primary);
+    await assert.rejects(api.signalProbe(signal), (error) => error === primary);
+    assert.equal(api.line(primary), 'Deployment smoke failed: TypeError(validation){phase=SIGNAL_PROBE}.\n');
+  }
+});
+
+void test('standalone signal probe keeps primary and cleanup attribution distinct in aggregates', async () => {
+  for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+    const primary = new TypeError('PRIVATE_PROBE_MESSAGE');
+    const cleanup = new Error('PRIVATE_CLEANUP_MESSAGE');
+    const api = signalProbeHarness(primary, [cleanup]);
+    await assert.rejects(api.signalProbe(signal), (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0], primary);
+      assert.equal(error.errors[1], cleanup);
+      assert.equal(api.line(error), 'Deployment smoke failed: AggregateError(2)[TypeError(validation){phase=SIGNAL_PROBE},Error(cleanup){phase=CLEANUP}].\n');
+      return true;
+    });
+  }
+});
+
+void test('standalone signal probe preserves successful SIGTERM and controlled SIGKILL contracts', async () => {
+  const success = signalProbeHarness(null);
+  await success.signalProbe('SIGTERM');
+  await assert.rejects(success.signalProbe('SIGKILL'), (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, 'Deployment signal fault probe controlled child failure.');
+    assert.equal(success.line(error), 'Deployment smoke failed: Error(signal){phase=SIGNAL_PROBE}.\n');
+    return true;
+  });
+  const cleanup = new Error('PRIVATE_CLEANUP_MESSAGE');
+  const api = signalProbeHarness(null, [cleanup]);
+  await assert.rejects(api.signalProbe('SIGTERM'), (error) => error === cleanup);
+  assert.equal(api.line(cleanup), 'Deployment smoke failed: Error(cleanup){phase=CLEANUP}.\n');
 });
