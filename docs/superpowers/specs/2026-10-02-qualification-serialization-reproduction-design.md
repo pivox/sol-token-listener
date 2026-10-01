@@ -19,8 +19,9 @@ qualification fixtures and authority. Alternatives rejected at this stage:
 another telemetry-only change does not establish a mechanism; changing isolation
 or the global outbox allocator would change safety properties before proof.
 
-No production behavior change is included in this revision. A corrective design
-must be versioned after the reproduction results and before a fix is implemented.
+The v1.0 reproduction stage included no production behavior change. The v1.1
+corrective design below was added after the observed reproduction results and
+before implementing a fix.
 Keep the investigation and resulting correction on one focused branch; do not
 claim a test-only change resolves the runtime failures.
 
