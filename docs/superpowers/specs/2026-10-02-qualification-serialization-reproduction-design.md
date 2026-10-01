@@ -1,4 +1,4 @@
-# Qualification serialization reproduction — v1.0.0
+# Qualification serialization reproduction — v1.0.1
 
 ## Purpose and evidence
 
@@ -72,3 +72,21 @@ Even a successful reproduction proves a possible mechanism, not the exact cause
 of every historical canary occurrence. The eventual fix must address the proven
 case without losing coherent snapshots or hiding failed work; capacity still
 requires a separate passing observation run.
+
+## Observed reproduction results (2026-10-02)
+
+The completed `7c63710` canary retained 137 qualification serialization
+occurrences (115/19/2/1 across worker attempts 1/2/3/4), and capacity remained
+FAIL. The two local PostgreSQL characterization tests then passed without skips:
+cross-mint publication rejected `DOMAIN_EVENT_INSERT/40001`; unchanged launch
+replay rejected `SOURCE_MAPPING/40001`. Both asserted full qualification rollback,
+preserved concurrent publication, lock release, fresh reconstruction and an
+unchanged exact replay with one linked qualification publication.
+
+Command: `node --import tsx --test --test-concurrency=1 --test-name-pattern='qualification serialization' tests/qualification-projection.repository.test.ts`
+with the isolated PostgreSQL 16.15 test URL configured. The adjacent repository,
+service, launchpad, diagnostic and API-stream suites passed 137 tests with zero
+failures or skips. Backend type checking and scoped ESLint also passed. These
+observations establish both mechanisms; they
+do not identify which statement caused each canary occurrence. No production
+retry or isolation change has been made.
