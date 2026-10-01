@@ -10,6 +10,17 @@ new API or gate. All attempts, not a candidate or first-processing cohort.
 
 **Tech Stack:** TypeScript ESM, node:test, injected monotonic clock.
 
+## Verified implementation progress
+
+- Recorder: 7783782 + 5d5db94, 10 focused tests, runtime enum guards before mutation.
+- Worker: bcac845, 52 worker/pool/recorder tests, operation and lease-clock parity
+  across 13 scenarios; cleanup-only completion measured without duplicate finish.
+- Factory shutdown: RED4 then GREEN6 focused tests; shared recorder and safe close.
+- Parent combined targeted suite: 124/124, zero fail/skip. Build, full check,
+  full lint, docs and diff pass. Global review, PR/CI and local harness capture
+  remain pending. Checklists below preserve task definitions; this section records
+  verified execution, not acceptance of the later Mainnet capacity gate.
+
 ## Task 1 — recorder
 
 Files: create `src/application/worker-phase-diagnostic.ts` and

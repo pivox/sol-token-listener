@@ -1,4 +1,4 @@
-# Worker phase diagnostic — v1.0.0
+# Worker phase diagnostic — v1.0.1
 
 Issue #203; supports capacity investigation #171. Approved-recommendation workflow.
 
@@ -42,6 +42,9 @@ Changing concurrency or cache before attribution would not establish causality.
   `listener_worker_phase_diagnostic_shutdown`, version 1, scope
   `ALL_WORKER_ATTEMPTS_PROCESS_LIFETIME`. Log/publication failures are isolated.
   Absent summary means unavailable, never zero. No API/heartbeat/schema change.
+  `closeStatus` is COMPLETED only for a resolved close, STOPPED component and zero
+  active attempt/phase counts; otherwise INCOMPLETE. Neither status is a capacity
+  verdict. Original close failures must remain the same rejected error object.
 
 ## Interpretation limits
 

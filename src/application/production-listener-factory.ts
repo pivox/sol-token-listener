@@ -138,6 +138,10 @@ import { CreationEntryV1Strategy } from './creation-entry-v1.strategy.js';
 import { QualificationEngine } from '../qualification/qualification-engine.js';
 import { loadQualificationProfile } from '../qualification/qualification-profile.js';
 import { logger } from '../utils/logger.js';
+import {
+  WorkerPhaseDiagnosticRecorder,
+  type WorkerPhaseDiagnosticSnapshot,
+} from './worker-phase-diagnostic.js';
 
 type ProductionPool = ReturnType<typeof getDatabasePool>;
 export const MAX_LISTENER_TIMER_DELAY_MS = 2_147_483_647;
@@ -635,9 +639,11 @@ export function createProductionListenerRuntime(
     inbox,
   );
 
+  const workerPhaseRecorder = new WorkerPhaseDiagnosticRecorder();
   const worker = new TransactionInboxWorkerPool(Array.from(
     { length: config.listenerWorkerCount },
     () => new TransactionInboxWorker(inbox, blockHydration.locator, pipeline, {
+      phaseObserver: workerPhaseRecorder,
       leaseSeconds: config.listenerWorkerLeaseSeconds,
       renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
       idlePollMs: 1_000,
@@ -686,7 +692,9 @@ export function createProductionListenerRuntime(
     supervisor: passiveMentionDiagnosticSupervisor(supervisor, (event): void => {
       logger.info(event, 'Bilan des mentions Pump passives à la fermeture WebSocket.');
     }),
-    worker: workerComponent,
+    worker: workerPhaseDiagnosticComponent(workerComponent, workerPhaseRecorder, (event): void => {
+      logger.info(event, 'Bilan des phases worker à la fermeture du listener.');
+    }),
     paperWorker: paperWorkerComponent,
     socialWorker: socialWorkerComponent,
     reconciler,
@@ -1408,6 +1416,45 @@ function validateRecurringOptions(options: RecurringListenerOptions): void {
         || typeof options.scheduler.cancel !== 'function'))) {
     throw new TypeError('Passive listener controller timing options are invalid.');
   }
+}
+
+type WorkerPhaseShutdownDiagnostic = WorkerPhaseDiagnosticSnapshot & Readonly<{
+  event: 'listener_worker_phase_diagnostic_shutdown';
+  closeStatus: 'COMPLETED' | 'INCOMPLETE';
+}>;
+
+/** One process-local summary; diagnostic failure cannot alter worker cleanup. */
+export function workerPhaseDiagnosticComponent(
+  component: ReturnType<typeof lifecycleComponent>,
+  recorder: Pick<WorkerPhaseDiagnosticRecorder, 'snapshot'>,
+  diagnostic: (event: WorkerPhaseShutdownDiagnostic) => void,
+): ReturnType<typeof lifecycleComponent> {
+  let closing: Promise<void> | null = null;
+  return Object.freeze({
+    start: (): Promise<void> => component.start(),
+    state: (): ListenerRuntimeState => component.state(),
+    close(): Promise<void> {
+      if (closing !== null) return closing;
+      let completed = false;
+      const result = new Promise<void>((resolve) => { resolve(component.close()); });
+      closing = result.then(() => { completed = true; }).finally(() => {
+        try {
+          const snapshot = recorder.snapshot();
+          const drained = completed && component.state() === 'STOPPED'
+            && snapshot.totalAttempt.active === 0
+            && Object.values(snapshot.phases).every((phase) => phase.active === 0);
+          diagnostic(Object.freeze({
+            ...snapshot,
+            event: 'listener_worker_phase_diagnostic_shutdown',
+            closeStatus: drained ? 'COMPLETED' : 'INCOMPLETE',
+          }));
+        } catch {
+          // Never replace the original close outcome with optional evidence errors.
+        }
+      });
+      return closing;
+    },
+  });
 }
 
 export function lifecycleComponent(component: {
