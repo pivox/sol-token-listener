@@ -558,6 +558,97 @@ void test('persists active remote-close and protocol-invalid completions after s
   }
 });
 
+void test('filters passive native Pump mentions without inbox writes while preserving activity and catch-up', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const inbox = new PostgresTransactionInboxRepository(pool);
+    const health = new PostgresWebSocketHealthRepository(pool);
+    const scheduler = new ManualScheduler();
+    const sessions = new NativeSetupFactory('no-ack', true);
+    const passiveSignature = bs58.encode(Buffer.alloc(64, 91));
+    let replayPassive = false;
+    let scans = 0;
+    const scanCount = (): number => scans;
+    const supervisor = supervisorFor({
+      inbox, health, scheduler, reporter: reporterFor(inbox, health), sessions,
+      providerIds: ['primary'],
+      strict: async (providerId, signal) => {
+        const result = await strictScanner(providerId, inbox,
+          replayPassive ? { signature: passiveSignature, slot: 43n } : undefined).scan(signal);
+        scans += 1;
+        return result;
+      },
+    });
+    try {
+      await supervisor.start();
+      scheduler.fire(0);
+      const socket = await sessions.waitForSocket();
+      socket.acknowledgeUnsubscribe = true;
+      establishNativeSession(socket);
+      await waitForProvider(supervisor, 'primary');
+      const checkpoint = await inbox.readCheckpoint('launchpad');
+      assert.equal(checkpoint?.signature, SHARED_SIGNATURE);
+      assert.deepEqual((await inboxRow(pool, SHARED_SIGNATURE)).discovery_sources, ['CATCH_UP']);
+      assert.equal((await health.read()).lastObservation, null);
+
+      socket.message(logsNotification(101, {
+        signature: passiveSignature, slot: 43,
+        logs: [
+          'Program 11111111111111111111111111111111 invoke [1]',
+          'Program 11111111111111111111111111111111 success',
+        ],
+      }));
+      const passiveDeadline = Date.now() + 2_000;
+      while (supervisor.filteredNotificationMetrics().byProvider.primary !== 1
+        && Date.now() < passiveDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(supervisor.filteredNotificationMetrics().reasonCode, 'PASSIVE_PUMP_ACCOUNT_MENTION');
+      assert.equal(supervisor.filteredNotificationMetrics().byProvider.primary, 1);
+      assert.equal(await inboxCount(pool, passiveSignature), 0);
+      assert.equal((await health.read()).lastObservation?.slot, 43n);
+      assert.deepEqual(await inbox.readCheckpoint('launchpad'), checkpoint);
+      assert.equal(scanCount(), 1);
+
+      socket.message(logsNotification(101, {
+        logs: [`Program ${PUMP_PROGRAM_ID} invoke [1]`, `Program ${PUMP_PROGRAM_ID} success`],
+      }));
+      const activeDeadline = Date.now() + 2_000;
+      while ((await health.read()).lastObservation?.slot !== 42n && Date.now() < activeDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal((await health.read()).lastObservation?.slot, 42n);
+      assert.deepEqual((await inboxRow(pool, SHARED_SIGNATURE)).discovery_sources.sort(), ['CATCH_UP', 'WEBSOCKET']);
+      assert.equal(supervisor.filteredNotificationMetrics().byProvider.primary, 1);
+      replayPassive = true;
+      scheduler.fire(WEBSOCKET_FRONTIER_INTERVAL_MS);
+      const scanDeadline = Date.now() + 2_000;
+      while (scans !== 2 && Date.now() < scanDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(scans, 2);
+      assert.equal(await inboxCount(pool, passiveSignature), 1);
+      assert.deepEqual((await inboxRow(pool, passiveSignature)).discovery_sources, ['CATCH_UP']);
+      assert.equal((await inbox.readCheckpoint('launchpad'))?.signature, passiveSignature);
+      const replayDeadline = Date.now() + 2_000;
+      while (!scheduler.pendingDelays().includes(WEBSOCKET_FRONTIER_INTERVAL_MS)
+        && Date.now() < replayDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      scheduler.fire(WEBSOCKET_FRONTIER_INTERVAL_MS);
+      const settledDeadline = Date.now() + 2_000;
+      while (scanCount() !== 3 && Date.now() < settledDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(scanCount(), 3);
+      assert.equal(await inboxCount(pool, passiveSignature), 1);
+      assert.deepEqual((await inboxRow(pool, passiveSignature)).discovery_sources, ['CATCH_UP']);
+      assert.equal(supervisor.filteredNotificationMetrics().byProvider.primary, 1);
+    } finally {
+      await supervisor.close();
+    }
+  });
+});
+
 void test('maps a real enqueue-port rejection from an active native notification to durable degradation', async (context) => {
   await withDatabase(context, async (pool) => {
     const inbox = new PostgresTransactionInboxRepository(pool);
@@ -1178,7 +1269,10 @@ class CasConflictRepository implements StrictCatchUpRepository {
 class NativeSetupFactory implements SessionOpener {
   public readonly timeoutScheduler = new NativeSetupScheduler();
   #socket: NativeSetupSocket | null = null;
-  public constructor(private readonly mode: 'partial-ack' | 'no-ack') {}
+  public constructor(
+    private readonly mode: 'partial-ack' | 'no-ack',
+    private readonly workerAdmissionEnabled = false,
+  ) {}
   public readonly open = (
     endpoint: Readonly<{ id: RpcProviderId; url: string }>,
     observe: (notification: WsProgramNotification) => Promise<void>,
@@ -1189,6 +1283,7 @@ class NativeSetupFactory implements SessionOpener {
     return openWsProgramSession(endpoint, observe, signal, {
       createWebSocket: () => socket,
       scheduler: this.timeoutScheduler,
+      workerAdmissionEnabled: this.workerAdmissionEnabled,
     });
   };
   public async waitForSocket(): Promise<NativeSetupSocket> {
@@ -1217,6 +1312,7 @@ class NativeSetupScheduler implements WsProgramSessionScheduler {
 
 class NativeSetupSocket implements WsProgramSessionWebSocket {
   public readyState = 0;
+  public acknowledgeUnsubscribe = false;
   public readonly sent: string[] = [];
   public closeCalls = 0;
   #listeners = new Map<string, Set<(event: unknown) => void>>();
@@ -1228,7 +1324,13 @@ class NativeSetupSocket implements WsProgramSessionWebSocket {
   public removeEventListener(type: 'open' | 'message' | 'error' | 'close', listener: (event: unknown) => void): void {
     this.#listeners.get(type)?.delete(listener);
   }
-  public send(data: string): void { this.sent.push(data); }
+  public send(data: string): void {
+    this.sent.push(data);
+    const request = JSON.parse(data) as { method: string; id: number };
+    if (this.acknowledgeUnsubscribe && request.method === 'logsUnsubscribe') {
+      queueMicrotask(() => { this.message({ jsonrpc: '2.0', id: request.id, result: true }); });
+    }
+  }
   public close(): void { this.closeCalls += 1; this.readyState = 3; this.#emit('close', {}); }
   public open(): void { this.readyState = 1; this.#emit('open', {}); }
   public message(value: unknown): void { this.#emit('message', { data: JSON.stringify(value) }); }
@@ -1270,13 +1372,20 @@ function deferred<TValue>(): Deferred<TValue> {
   return Object.freeze({ promise, resolve });
 }
 
-function strictScanner(providerId: RpcProviderId, inbox: StrictCatchUpRepository): StrictCatchUpScanner {
+function strictScanner(
+  providerId: RpcProviderId,
+  inbox: StrictCatchUpRepository,
+  pumpHead?: Readonly<{ signature: string; slot: bigint }>,
+): StrictCatchUpScanner {
   const source: CatchUpSource & { readonly providerId: RpcProviderId } = Object.freeze({
     providerId,
     async list(programId: string, before: string | undefined) {
       if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
       if (before !== undefined) return [];
-      return [Object.freeze({
+      return [...(programId === PUMP_PROGRAM_ID && pumpHead !== undefined ? [Object.freeze({
+        ...pumpHead, confirmationStatus: 'confirmed' as const,
+        blockTimeMs: null, transactionFailed: false,
+      })] : []), Object.freeze({
         signature: SHARED_SIGNATURE, slot: 42n, confirmationStatus: 'confirmed' as const,
         blockTimeMs: null, transactionFailed: false,
       })];
@@ -1408,14 +1517,20 @@ function establishNativeSession(socket: NativeSetupSocket): void {
   socket.message({ jsonrpc: '2.0', id: 2, result: 102 });
 }
 
-function logsNotification(subscription: number): unknown {
+function logsNotification(subscription: number, value: Readonly<{
+  signature?: string;
+  slot?: number;
+  logs?: readonly string[];
+}> = {}): unknown {
   return Object.freeze({
     jsonrpc: '2.0', method: 'logsNotification',
     params: Object.freeze({
       subscription,
       result: Object.freeze({
-        context: Object.freeze({ slot: 42 }),
-        value: Object.freeze({ signature: SHARED_SIGNATURE, err: null }),
+        context: Object.freeze({ slot: value.slot ?? 42 }),
+        value: Object.freeze({ signature: value.signature ?? SHARED_SIGNATURE, err: null,
+          ...(value.logs === undefined ? {} : { logs: value.logs }),
+        }),
       }),
     }),
   });

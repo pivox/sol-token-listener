@@ -216,6 +216,39 @@ function logRpcHttpFailoverEvent(event: RpcHttpFailoverEvent): void {
   logger.warn(event, 'Événement de basculement HTTP RPC observé.');
 }
 
+type PassiveMentionSupervisor = Pick<WebSocketFailoverSupervisor,
+  'start' | 'close' | 'state' | 'activeProviderId' | 'filteredNotificationMetrics'>;
+type PassiveMentionShutdownDiagnostic = ReturnType<WebSocketFailoverSupervisor['filteredNotificationMetrics']>
+  & Readonly<{ event: 'websocket_passive_mentions_shutdown' }>;
+
+/** Shutdown-only evidence, not a live metric stream; no extra timers or resources. */
+export function passiveMentionDiagnosticSupervisor(
+  supervisor: PassiveMentionSupervisor,
+  diagnostic: (event: PassiveMentionShutdownDiagnostic) => void,
+): Pick<PassiveMentionSupervisor, 'start' | 'close' | 'state' | 'activeProviderId'> {
+  let closing: Promise<void> | null = null;
+  return Object.freeze({
+    start: (): Promise<void> => supervisor.start(),
+    state: (): ReturnType<PassiveMentionSupervisor['state']> => supervisor.state(),
+    activeProviderId: (): ReturnType<PassiveMentionSupervisor['activeProviderId']> => supervisor.activeProviderId(),
+    close(): Promise<void> {
+      if (closing !== null) return closing;
+      const result = new Promise<void>((resolve) => { resolve(supervisor.close()); });
+      closing = result.finally(() => {
+        try {
+          diagnostic(Object.freeze({
+            ...supervisor.filteredNotificationMetrics(),
+            event: 'websocket_passive_mentions_shutdown',
+          }));
+        } catch {
+          // Diagnostic delivery must never replace the supervisor close outcome.
+        }
+      });
+      return closing;
+    },
+  });
+}
+
 export function createProductionListenerRuntime(
   config: AppConfig,
   pool?: ProductionPool,
@@ -650,7 +683,9 @@ export function createProductionListenerRuntime(
   );
 
   return new SolanaListenerRuntime({
-    supervisor,
+    supervisor: passiveMentionDiagnosticSupervisor(supervisor, (event): void => {
+      logger.info(event, 'Bilan des mentions Pump passives à la fermeture WebSocket.');
+    }),
     worker: workerComponent,
     paperWorker: paperWorkerComponent,
     socialWorker: socialWorkerComponent,

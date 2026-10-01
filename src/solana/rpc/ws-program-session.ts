@@ -1,6 +1,7 @@
 import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
 import {
   pumpFunWebSocketHintFromLogs,
+  isPassivePumpMentionFromLogs,
   type PumpFunWebSocketClassificationMode,
   type PumpFunWebSocketHint,
 } from '../../launchpads/pumpfun/websocket-create-hint.js';
@@ -31,6 +32,7 @@ export interface WsProgramNotification {
   readonly slot: bigint;
   readonly hint: WsProgramHint;
   readonly hintMint: string | null;
+  readonly filteredReason?: 'PASSIVE_PUMP_ACCOUNT_MENTION';
 }
 
 export type WsProgramSessionErrorReason =
@@ -457,6 +459,8 @@ export function openWsProgramSession(
         : null;
       const hint = hintResult?.hint ?? 'NONE';
       const hintMint = hintResult?.hintMint ?? null;
+      const passiveMention = program === 'pumpfun' && classificationMode === 'strict-admission'
+        && hint === 'NONE' && isPassivePumpMentionFromLogs(ownData(value, 'logs'), PUMPFUN_HINT_VETO_PROGRAM_IDS);
       let task: Promise<void>;
       try {
         task = observe(Object.freeze({
@@ -466,6 +470,7 @@ export function openWsProgramSession(
           slot: BigInt(slot),
           hint,
           hintMint,
+          ...(passiveMention ? { filteredReason: 'PASSIVE_PUMP_ACCOUNT_MENTION' as const } : {}),
         }));
       } catch {
         fail('NOTIFICATION_FAILED');

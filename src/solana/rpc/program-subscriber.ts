@@ -3,7 +3,7 @@ import { PublicKey, type LogsCallback } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { TransactionNotification } from '../../domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
-import { pumpFunWebSocketHintFromLogs } from '../../launchpads/pumpfun/websocket-create-hint.js';
+import { pumpFunWebSocketHintFromLogs, isPassivePumpMentionFromLogs } from '../../launchpads/pumpfun/websocket-create-hint.js';
 import { PUMPSWAP_PROGRAM_ID } from '../../markets/pumpswap/constants.js';
 import type { TransactionInboxRepository } from '../../ports/transaction-inbox-repository.js';
 
@@ -67,6 +67,7 @@ export class SolanaProgramSubscriber {
   private permanentlyClosed = false;
   private currentState: ProgramSubscriberState = 'STOPPED';
   private currentError: ProgramSubscriberError | null = null;
+  private passiveMentionCount = 0;
 
   public constructor(
     private readonly connection: ProgramLogsConnection,
@@ -84,6 +85,10 @@ export class SolanaProgramSubscriber {
 
   public get lastError(): ProgramSubscriberError | null {
     return this.currentError;
+  }
+
+  public filteredNotificationMetrics(): Readonly<{ reasonCode: 'PASSIVE_PUMP_ACCOUNT_MENTION'; count: number }> {
+    return Object.freeze({ reasonCode: 'PASSIVE_PUMP_ACCOUNT_MENTION', count: this.passiveMentionCount });
   }
 
   public start(): Promise<void> {
@@ -166,7 +171,7 @@ export class SolanaProgramSubscriber {
 
   private receive(programId: string, value: unknown, context: unknown): void {
     if (!this.accepting) return;
-    let notification: TransactionNotification | null;
+    let notification: TransactionNotification | 'PASSIVE_PUMP_ACCOUNT_MENTION' | null;
     try {
       notification = snapshotNotification(
         programId, value, context, this.readNow(), this.workerAdmissionEnabled,
@@ -176,6 +181,10 @@ export class SolanaProgramSubscriber {
       return;
     }
     if (notification === null) return;
+    if (notification === 'PASSIVE_PUMP_ACCOUNT_MENTION') {
+      this.passiveMentionCount = Math.min(Number.MAX_SAFE_INTEGER, this.passiveMentionCount + 1);
+      return;
+    }
 
     const task = Promise.resolve()
       .then(async () => { await this.repository.enqueue(notification); })
@@ -227,7 +236,7 @@ function snapshotNotification(
   context: unknown,
   observedAtMs: number,
   workerAdmissionEnabled: boolean,
-): TransactionNotification | null {
+): TransactionNotification | 'PASSIVE_PUMP_ACCOUNT_MENTION' | null {
   const record = objectRecord(value);
   const signature = dataProperty(record, 'signature');
   const failure = dataProperty(record, 'err');
@@ -248,6 +257,10 @@ function snapshotNotification(
       'strict-admission',
     )
     : null;
+  if (workerAdmissionEnabled && programId === PUMP_PROGRAM_ID && hintResult?.hint === 'NONE'
+    && isPassivePumpMentionFromLogs(optionalDataProperty(record, 'logs'), PUMPFUN_HINT_VETO_PROGRAM_IDS)) {
+    return 'PASSIVE_PUMP_ACCOUNT_MENTION';
+  }
   const ingestionHint = hintResult?.hint === 'PUMPFUN_CREATE'
     || hintResult?.hint === 'PUMPFUN_TRADE'
     ? hintResult.hint
