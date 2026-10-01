@@ -14,6 +14,76 @@ import {
 const observedBorsh =
   'ObservedPipelineFailure.v1.launchpad_observation.PUMP_BORSH_INVALID';
 
+for (const outcome of [
+  { error_name: 'RpcError', error_retryable: true, failure_state: 'RETRY_PENDING' },
+  { error_name: observedBorsh, error_retryable: false, failure_state: 'TERMINAL' },
+]) {
+  void test(`retains classification provenance on FAILED ${outcome.failure_state} rows`, () => {
+    const artifact = buildMainnetTerminalAttribution({
+      currentPopulationRows: [currentRow({
+        ...outcome,
+        catch_up_reason_code: 'PUMP_ACTION_SUPPORTED',
+        row_count: '3',
+      })],
+      diagnosticOccurrenceRows: [],
+      incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+    });
+
+    assert.deepEqual(artifact.currentPopulation.groups, [{
+      processingStatus: 'FAILED',
+      normalizedErrorName: outcome.error_retryable ? 'LEGACY_RPC_ERROR' : observedBorsh,
+      retryable: outcome.error_retryable,
+      failureState: outcome.failure_state,
+      attempts: 1,
+      attemptsInCycle: 1,
+      catchUpReasonCode: 'PUMP_ACTION_SUPPORTED',
+      count: 3,
+    }]);
+    assert.equal(artifact.currentPopulation.totalRows, 3);
+    assert.equal(artifact.currentPopulation.retainedRows, 3);
+    assert.equal(artifact.currentPopulation.unavailableRows, 0);
+    assert.deepEqual(artifact.currentPopulation.overflow, { groupCount: 0, rowCount: 0 });
+    const serialized = serializeMainnetTerminalAttribution(artifact);
+    assert.deepEqual(parseMainnetTerminalAttribution(JSON.parse(serialized) as unknown), artifact);
+    assert.equal(serializeMainnetTerminalAttribution(
+      parseMainnetTerminalAttribution(JSON.parse(serialized) as unknown),
+    ), serialized);
+  });
+}
+
+void test('normalizes unknown FAILED classification reasons without leaking raw text', () => {
+  const secret = 'https://rpc.invalid/key?token=private-classification';
+  const artifact = buildMainnetTerminalAttribution({
+    currentPopulationRows: [currentRow({ catch_up_reason_code: secret, row_count: 2 })],
+    diagnosticOccurrenceRows: [],
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  });
+  const serialized = serializeMainnetTerminalAttribution(artifact);
+
+  assert.equal(artifact.currentPopulation.groups[0]?.catchUpReasonCode, 'UNAVAILABLE');
+  assert.equal(artifact.currentPopulation.unavailableRows, 2);
+  assert.equal(serialized.includes(secret), false);
+  assert.deepEqual(parseMainnetTerminalAttribution(JSON.parse(serialized) as unknown), artifact);
+});
+
+void test('rejects invalid serialized FAILED classification reasons', () => {
+  const artifact = buildMainnetTerminalAttribution({
+    currentPopulationRows: [currentRow({ catch_up_reason_code: 'PUMP_ACTION_SUPPORTED' })],
+    diagnosticOccurrenceRows: [],
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  });
+
+  for (const catchUpReasonCode of ['INVALID_REASON', 'PUMP_ACTION_SUPPORTED ', 123, {}]) {
+    const invalid = JSON.parse(serializeMainnetTerminalAttribution(artifact)) as {
+      currentPopulation: { groups: { catchUpReasonCode: unknown }[] };
+    };
+    const group = invalid.currentPopulation.groups[0];
+    assert.ok(group);
+    group.catchUpReasonCode = catchUpReasonCode;
+    assert.throws(() => parseMainnetTerminalAttribution(invalid), TypeError);
+  }
+});
+
 void test('separates every current failed/quarantined row from diagnostic occurrences', () => {
   const artifact = buildMainnetTerminalAttribution({
     currentPopulationRows: [

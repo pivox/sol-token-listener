@@ -70,6 +70,35 @@ void test('rolls back and reveals no database or provenance error text', async (
   assert.equal(harness.stderr.join('').includes('/tmp/private.json'), false);
 });
 
+void test('commits STOPPED capture with a classified FAILED row', async () => {
+  const queries: string[] = [];
+  const stopped = emptyStoppedConnection('STOPPED', [{
+    processing_status: 'FAILED',
+    error_name: 'RpcError',
+    error_retryable: true,
+    failure_state: 'RETRY_PENDING',
+    attempts: 1,
+    attempts_in_cycle: 1,
+    catch_up_reason_code: 'PUMP_ACTION_SUPPORTED',
+    row_count: '1',
+  }]);
+  const artifact = await captureMainnetTerminalAttribution({
+    async query(sql) {
+      queries.push(sql);
+      return stopped.query(sql);
+    },
+  });
+
+  assert.equal(artifact.schemaVersion, 'mainnet-terminal-attribution.v1');
+  assert.equal(artifact.currentPopulation.groups[0]?.catchUpReasonCode, 'PUMP_ACTION_SUPPORTED');
+  assert.equal(artifact.currentPopulation.totalRows, 1);
+  assert.equal(artifact.currentPopulation.retainedRows, 1);
+  assert.equal(artifact.diagnosticOccurrences.totalOccurrences, 0);
+  assert.deepEqual(artifact.incompleteAttribution, { parentRows: 0, missingOccurrences: 0 });
+  assert.equal(queries.at(-1), 'COMMIT');
+  assert.equal(queries.includes('ROLLBACK'), false);
+});
+
 void test('command writes deterministic bytes and closes the database without stdout', async () => {
   const written: { path?: string; bytes?: string } = {};
   let closed = 0;
@@ -139,7 +168,10 @@ void test('fails closed when listener is not fully stopped', async () => {
   await assert.rejects(captureMainnetTerminalAttribution(connection), TypeError);
 });
 
-function emptyStoppedConnection(runtimeState = 'STOPPED'): MainnetTerminalAttributionConnection {
+function emptyStoppedConnection(
+  runtimeState = 'STOPPED',
+  currentPopulationRows: readonly Record<string, unknown>[] = [],
+): MainnetTerminalAttributionConnection {
   let queryIndex = 0;
   return {
     async query(sql) {
@@ -157,6 +189,7 @@ function emptyStoppedConnection(runtimeState = 'STOPPED'): MainnetTerminalAttrib
           leased_transactions: 0,
         }] };
       }
+      if (queryIndex === 2) return { rows: currentPopulationRows };
       if (queryIndex === 4) return { rows: [{ parent_count: 0, incomplete_count: 0 }] };
       return { rows: [] };
     },
