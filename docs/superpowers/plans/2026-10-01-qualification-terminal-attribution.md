@@ -78,6 +78,11 @@ historical checksum/predecessor references (retain) from latest-head assertions.
 
 - [ ] RED: each new code roundtrips only with stage qualification; wrong stage
   and arbitrary diagnostic are rejected; existing v1 codes/rows stay valid.
+  Cover `scripts/lib/mainnet-terminal-attribution.ts` and
+  `tests/mainnet-terminal-attribution.test.ts`: qualification codes must be
+  WORKER/FAILED, stage qualification, null catch-up cause/reason, null pump wire
+  and representative. Preserve legacy combinations. SQL and export validation
+  must agree; enum membership alone is insufficient.
 - [ ] Add migration059 following migration058's structural drift/replay pattern.
   Extend diagnostic allowlists and stage compatibility without changing any
   older migration, row value, retention timestamp or table shape. Ensure replay
