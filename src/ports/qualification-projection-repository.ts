@@ -58,9 +58,16 @@ export interface QualificationProjectionTransaction {
   readonly dissolveCurrent: (mint: string) => Promise<void>;
 }
 
+export type QualificationTransactionReplayPolicy = 'none' | 'bounded-serialization';
+
 export interface QualificationProjectionRepository {
+  /**
+   * Omitted policy means one attempt. Replay opt-in requires an externally
+   * side-effect-free callback that reloads and rebuilds on every attempt.
+   */
   readonly transact: <TResult>(
     mint: string,
     operation: (transaction: QualificationProjectionTransaction) => Promise<TResult>,
+    replayPolicy?: QualificationTransactionReplayPolicy,
   ) => Promise<TResult>;
 }

@@ -1,4 +1,5 @@
 import { isProxy } from 'node:util/types';
+import { setTimeout } from 'node:timers/promises';
 import { createTokenLaunchDetectedEvent } from '../domain/launchpad-events.js';
 import {
   inheritTrustedTerminalAttribution,
@@ -46,6 +47,7 @@ import type {
   QualificationCanonicalSnapshot,
   QualificationProjectionRepository,
   QualificationProjectionTransaction,
+  QualificationTransactionReplayPolicy,
 } from '../ports/qualification-projection-repository.js';
 import { canonicalStringifyJson, fromJsonValue, toJsonValue } from '../utils/json.js';
 
@@ -78,6 +80,7 @@ const WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM = 4_096;
 const DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM = 1_048_576;
 const QUALIFICATION_LOCK_EVICTION_MESSAGE =
   'Qualification projection session lock eviction required.';
+const SERIALIZATION_RETRY_DELAYS_MS = Object.freeze([10, 20]);
 
 export class QualificationProjectionDataError extends Error {
   public constructor(message = 'Stored qualification projection data is invalid.') {
@@ -98,20 +101,46 @@ implements QualificationProjectionRepository {
   public constructor(
     private readonly database: QualificationProjectionPool,
     private readonly authority: QualificationProjectionAuthority,
+    private readonly waitFor: (delayMs: number) => Promise<void> = setTimeout,
   ) {}
 
   public async transact<TResult>(
     mint: string,
     operation: (transaction: QualificationProjectionTransaction) => Promise<TResult>,
+    replayPolicy: QualificationTransactionReplayPolicy = 'none',
   ): Promise<TResult> {
     if (
       mint.length === 0
       || mint.trim() !== mint
       || Buffer.byteLength(mint, 'utf8') > 16_384
     ) throw new TypeError('Qualification projection mint is required.');
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- Validate untyped callers before connecting.
+    if (replayPolicy !== 'none' && replayPolicy !== 'bounded-serialization') {
+      throw new TypeError('Qualification transaction replay policy is invalid.');
+    }
+    const retryableFailures = new WeakSet();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.transactOnce(mint, operation, retryableFailures);
+      } catch (error: unknown) {
+        const delayMs = replayPolicy === 'bounded-serialization'
+          ? SERIALIZATION_RETRY_DELAYS_MS[attempt] : undefined;
+        if (delayMs === undefined || typeof error !== 'object' || error === null
+          || !retryableFailures.has(error)) throw error;
+        try { await this.waitFor(delayMs); } catch { throw error; }
+      }
+    }
+  }
+
+  private async transactOnce<TResult>(
+    mint: string,
+    operation: (transaction: QualificationProjectionTransaction) => Promise<TResult>,
+    retryableFailures: WeakSet<object>,
+  ): Promise<TResult> {
+    const querySerializationFailures = new WeakSet();
     let client: QualificationProjectionClient;
     try {
-      client = diagnosticClient(await this.database.connect());
+      client = diagnosticClient(await this.database.connect(), querySerializationFailures);
     } catch {
       throw attributed(new QualificationProjectionRepositoryError(), 'QUALIFICATION_CONNECT_FAILED');
     }
@@ -120,6 +149,7 @@ implements QualificationProjectionRepository {
     let completed = false;
     let result: TResult | undefined;
     let primaryFailure: unknown;
+    let primaryTransactionFailure = false;
     let evictClient = false;
     const failures: unknown[] = [];
     try {
@@ -142,6 +172,7 @@ implements QualificationProjectionRepository {
       completed = true;
     } catch (error: unknown) {
       primaryFailure = error;
+      primaryTransactionFailure = transactionStarted;
       failures.push(error);
       if (transactionStarted) {
         try {
@@ -189,8 +220,13 @@ implements QualificationProjectionRepository {
         failures.map(() => new Error('Qualification projection operation or cleanup failed.')),
         'Qualification projection operation or cleanup failures were aggregated.',
       );
-      throw attributed(new QualificationProjectionRepositoryError({ cause: redactedAggregate }),
+      const failure = attributed(new QualificationProjectionRepositoryError({ cause: redactedAggregate }),
         fallback, completed ? undefined : primaryFailure);
+      // Only this attempt's actual driver rejection can authorize replay, never diagnostics.
+      if (failures.length === 1 && primaryTransactionFailure && !completed
+        && typeof primaryFailure === 'object' && primaryFailure !== null
+        && querySerializationFailures.has(primaryFailure)) retryableFailures.add(failure);
+      throw failure;
     }
     if (!completed) throw new QualificationProjectionRepositoryError();
     return result as TResult;
@@ -223,7 +259,10 @@ function isDataFailure(error: unknown): boolean {
 }
 
 /** Inspect SQLSTATE only at the actual driver rejection boundary, never callbacks. */
-function diagnosticClient(client: QualificationProjectionClient): QualificationProjectionClient {
+function diagnosticClient(
+  client: QualificationProjectionClient,
+  querySerializationFailures: WeakSet<object>,
+): QualificationProjectionClient {
   return {
     async query(text, values): Promise<QueryResult> {
       try {
@@ -234,6 +273,7 @@ function diagnosticClient(client: QualificationProjectionClient): QualificationP
             const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
             const code: unknown = descriptor !== undefined && 'value' in descriptor
               ? descriptor.value : undefined;
+            if (code === '40001') querySerializationFailures.add(error);
             if (code === '40001' || code === '40P01') {
               attributed(error, code === '40001'
                 ? 'QUALIFICATION_POSTGRES_SERIALIZATION' : 'QUALIFICATION_POSTGRES_DEADLOCK');

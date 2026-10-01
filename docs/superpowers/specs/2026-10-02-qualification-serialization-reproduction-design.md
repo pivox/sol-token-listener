@@ -1,4 +1,4 @@
-# Qualification serialization reproduction and recovery — v1.1.0
+# Qualification serialization reproduction and recovery — v1.1.1
 
 ## Purpose and evidence
 
@@ -154,3 +154,17 @@ conflicts. No migration, worker/cache increase or evaluator change is included.
 - Run existing qualification, pipeline, outbox, finality and paper tests. One
   code-review cycle and green full CI before merge. A later capacity canary is
   still required; successful replay tests alone do not establish readiness.
+
+### Implementation evidence
+
+Before implementation, unit/service tests had eight behavioral failures and the
+two explicit-policy PostgreSQL cases failed while both defaults passed. After
+implementation, all four PostgreSQL variants passed: opt-in rebuilt on the second
+callback, default retained the original rejection. The service/unit suite passed
+50 tests with zero skips, repeated independently by the parent agent. Check,
+lint, full build, docs check and diff check passed; adjacent database suites also
+completed successfully. Final independent review, full suite and CI remain due.
+
+The old raw-error reuse case does not authorize a third attempt, and quote
+freshness is rechecked on the changed canonical snapshot. These are correctness
+results, not a new Mainnet capacity verdict.

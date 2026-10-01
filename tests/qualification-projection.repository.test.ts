@@ -1409,7 +1409,8 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
 });
 
 for (const scenario of ['CROSS_MINT_OUTBOX', 'UNCHANGED_SOURCE_REPLAY'] as const) {
-  void test(`live PostgreSQL qualification serialization ${scenario}`, { timeout: 30_000 }, async (context) => {
+for (const policy of [undefined, 'bounded-serialization'] as const) {
+  void test(`live PostgreSQL qualification serialization ${scenario} ${policy ?? 'default'}`, { timeout: 30_000 }, async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
     if (databaseUrl === undefined || databaseUrl.trim() === '') {
       context.skip('TEST_DATABASE_URL absent: serialization reproduction skipped');
@@ -1442,13 +1443,17 @@ for (const scenario of ['CROSS_MINT_OUTBOX', 'UNCHANGED_SOURCE_REPLAY'] as const
       const repository = new PostgresQualificationProjectionRepository(
         serializationProbe(qualificationPool, failures), rebuilder,
       );
+      let callbacks = 0;
       const rawAttempt = repository.transact(mintA, async (transaction) => {
+        callbacks++;
         const snapshot = await transaction.loadCanonicalInput(mintA);
         assert.ok(snapshot);
-        ready.release();
-        await resume.promise;
+        if (callbacks === 1) {
+          ready.release();
+          await resume.promise;
+        }
         return transaction.replaceProjection(canonicalProjectionFromSnapshot(rebuilder, snapshot));
-      });
+      }, policy);
       // Handle rejection immediately, including a failure before reaching the barrier.
       attempt = rawAttempt.then(
         (value): Attempt => ({ ok: true, value }),
@@ -1482,17 +1487,26 @@ for (const scenario of ['CROSS_MINT_OUTBOX', 'UNCHANGED_SOURCE_REPLAY'] as const
       } finally { resume.release(); }
 
       const outcome = await attempt;
-      assert.equal(outcome.ok, false, 'Counterexample: expected serialization rejection did not occur');
-      if (outcome.ok) throw new Error('Unexpected successful qualification transaction');
-      assert.ok(outcome.error instanceof QualificationProjectionRepositoryError);
-      assert.equal(trustedTerminalAttribution(outcome.error)?.diagnosticCode,
-        'QUALIFICATION_POSTGRES_SERIALIZATION');
+      if (policy === undefined) {
+        assert.equal(outcome.ok, false, 'Counterexample: expected serialization rejection did not occur');
+        if (outcome.ok) throw new Error('Unexpected successful qualification transaction');
+        assert.ok(outcome.error instanceof QualificationProjectionRepositoryError);
+        assert.equal(trustedTerminalAttribution(outcome.error)?.diagnosticCode,
+          'QUALIFICATION_POSTGRES_SERIALIZATION');
+      } else {
+        assert.deepEqual(outcome, { ok: true, value: 'UPDATED' });
+      }
+      assert.equal(callbacks, policy === undefined ? 1 : 2);
       assert.deepEqual(failures, [{
         operation: scenario === 'CROSS_MINT_OUTBOX' ? 'DOMAIN_EVENT_INSERT' : 'SOURCE_MAPPING',
         sqlstate: '40001',
       }]);
-      assert.deepEqual(await liveCounts(writerPool), ['0', '0', '0', '0']);
-      assert.deepEqual(await serializationStreamState(writerPool), committedStream);
+      if (policy === undefined) {
+        assert.deepEqual(await liveCounts(writerPool), ['0', '0', '0', '0']);
+        assert.deepEqual(await serializationStreamState(writerPool), committedStream);
+      } else {
+        assert.deepEqual(await liveCounts(writerPool), ['1', '1', '1', '1']);
+      }
       assert.deepEqual(await serializationSourceVersions(writerPool,
         scenario === 'CROSS_MINT_OUTBOX' ? mintB : mintA), committedSource);
       const committedEvent = await writerPool.query<{ count: string }>(
@@ -1511,7 +1525,7 @@ for (const scenario of ['CROSS_MINT_OUTBOX', 'UNCHANGED_SOURCE_REPLAY'] as const
         return { kind, reportId: projection.reportId, eventId: projection.qualificationEvent.id };
       });
       const rebuilt = await rebuildFresh();
-      assert.equal(rebuilt.kind, 'UPDATED');
+      assert.equal(rebuilt.kind, policy === undefined ? 'UPDATED' : 'UNCHANGED');
       const afterRebuild = await serializationStreamState(writerPool);
       assert.deepEqual(await liveCounts(writerPool), ['1', '1', '1', '1']);
       const replayed = await rebuildFresh();
@@ -1544,6 +1558,7 @@ for (const scenario of ['CROSS_MINT_OUTBOX', 'UNCHANGED_SOURCE_REPLAY'] as const
       }
     }
   });
+}
 }
 
 void test('live PostgreSQL rejects present oversized social and creator JSON evidence', async (context) => {
