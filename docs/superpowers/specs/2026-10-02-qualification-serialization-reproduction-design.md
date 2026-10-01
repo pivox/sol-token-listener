@@ -1,4 +1,4 @@
-# Qualification serialization reproduction — v1.0.1
+# Qualification serialization reproduction and recovery — v1.1.0
 
 ## Purpose and evidence
 
@@ -90,3 +90,66 @@ failures or skips. Backend type checking and scoped ESLint also passed. These
 observations establish both mechanisms; they
 do not identify which statement caused each canary occurrence. No production
 retry or isolation change has been made.
+
+## Corrective design after reproduction
+
+The recommended correction is explicit bounded whole-transaction replay, enabled
+only by the qualification service whose callback reloads canonical input and
+rebuilds its projection. Preserve the repository's default single-attempt
+contract for all other callers and the characterization tests.
+
+Add an optional closed transaction policy `'none' | 'bounded-serialization'` to
+the qualification repository port, defaulting to `'none'`. The service selects
+`'bounded-serialization'` for its canonical reconstruction. This policy promises
+that its callback has no external effects and can be rerun with a new transaction.
+
+The PostgreSQL implementation allows at most three attempts, separated by 10 ms
+and 20 ms, matching an existing local bounded-backoff convention. These are
+technical retry bounds, not trading thresholds or a promise of total latency.
+Release the session lock and connection completely before waiting/reconnecting.
+Each attempt reacquires the mint lock before BEGIN REPEATABLE READ and reloads
+all evidence. Never reuse the earlier snapshot, projection or quotes as if they
+had been reauthorized; the existing quote freshness checks run on each snapshot.
+
+Retry eligibility is private per-attempt evidence from an actual query rejection
+with an own data-property SQLSTATE `40001`. Do not authorize a retry using an
+arbitrary error's `code`, a public diagnostic label, inherited fields, accessors,
+proxies, a callback-spoofed error or a failure from an earlier attempt. Keep the
+existing diagnostics, redaction and final failure origin/retryability unchanged.
+Deadlock `40P01` is outside this observed correction and is not retried here.
+
+A retry requires all of the following: BEGIN succeeded, the primary failure is
+the actual recorded 40001, no commit succeeded, ROLLBACK succeeded, the session
+unlock returned true, release succeeded, and there was exactly one primary
+failure with no cleanup failures. A COMMIT 40001 may be retried after successful
+rollback because it reports an aborted transaction; an unknown COMMIT outcome
+must not be retried. Connect, BEGIN, lock, cleanup-only, data and rebuild errors
+are not eligible. Failure of the injected test backoff preserves the original
+redacted failure rather than exposing the wait error.
+
+An internal private WeakSet of sanitized retry-eligible attempt errors can carry
+this capability to the outer bounded loop; it must not become a persisted field,
+new event taxonomy or publicly forgeable eligibility flag. Query-boundary
+evidence is local to each attempt. Validate policy before connecting.
+
+Alternatives not selected: holding the global API-stream lock throughout the
+entire rebuild would serialize unrelated writers; lowering isolation would lose
+the coherent snapshot invariant. Neither is needed to recover the two proven
+conflicts. No migration, worker/cache increase or evaluator change is included.
+
+### Correction acceptance tests
+
+- Preserve both original single-attempt reproductions and their exact labels.
+- Under explicit policy, both real PostgreSQL interleavings succeed on a fresh
+  second attempt with one report/event/API publication and exact replay unchanged.
+- Service opts into the policy; each retried callback reloads and rebuilds.
+- Repeated conflicts stop after three attempts and waits `[10,20]`, preserving
+  the final sanitized error and diagnostic; no fourth attempt occurs.
+- No retry for forged diagnostic/SQLSTATE, hostile errors, deadlock, connect or
+  BEGIN failure, successful-commit cleanup failure, unknown COMMIT outcome,
+  rollback failure, unlock false/throw, or release failure.
+- Show lock-before-BEGIN and rollback/unlock/release-before-backoff ordering;
+  a new transaction object and connection are used for every attempt.
+- Run existing qualification, pipeline, outbox, finality and paper tests. One
+  code-review cycle and green full CI before merge. A later capacity canary is
+  still required; successful replay tests alone do not establish readiness.
