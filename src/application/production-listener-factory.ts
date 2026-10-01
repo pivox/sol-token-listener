@@ -1428,29 +1428,36 @@ export function workerPhaseDiagnosticComponent(
   component: ReturnType<typeof lifecycleComponent>,
   recorder: Pick<WorkerPhaseDiagnosticRecorder, 'snapshot'>,
   diagnostic: (event: WorkerPhaseShutdownDiagnostic) => void,
-): ReturnType<typeof lifecycleComponent> {
+): ReturnType<typeof lifecycleComponent> & { onCloseTimeout(): void } {
   let closing: Promise<void> | null = null;
+  let published = false;
+  const publish = (completed: boolean): void => {
+    if (published) return;
+    published = true;
+    try {
+      const snapshot = recorder.snapshot();
+      const drained = completed && component.state() === 'STOPPED'
+        && snapshot.totalAttempt.active === 0
+        && Object.values(snapshot.phases).every((phase) => phase.active === 0);
+      diagnostic(Object.freeze({
+        ...snapshot,
+        event: 'listener_worker_phase_diagnostic_shutdown',
+        closeStatus: drained ? 'COMPLETED' : 'INCOMPLETE',
+      }));
+    } catch {
+      // Never replace the original close outcome with optional evidence errors.
+    }
+  };
   return Object.freeze({
     start: (): Promise<void> => component.start(),
     state: (): ListenerRuntimeState => component.state(),
+    onCloseTimeout: (): void => { publish(false); },
     close(): Promise<void> {
       if (closing !== null) return closing;
       let completed = false;
       const result = new Promise<void>((resolve) => { resolve(component.close()); });
       closing = result.then(() => { completed = true; }).finally(() => {
-        try {
-          const snapshot = recorder.snapshot();
-          const drained = completed && component.state() === 'STOPPED'
-            && snapshot.totalAttempt.active === 0
-            && Object.values(snapshot.phases).every((phase) => phase.active === 0);
-          diagnostic(Object.freeze({
-            ...snapshot,
-            event: 'listener_worker_phase_diagnostic_shutdown',
-            closeStatus: drained ? 'COMPLETED' : 'INCOMPLETE',
-          }));
-        } catch {
-          // Never replace the original close outcome with optional evidence errors.
-        }
+        publish(completed);
       });
       return closing;
     },

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { workerPhaseDiagnosticComponent } from '../src/application/production-listener-factory.js';
+import { WorkerPhaseDiagnosticRecorder } from '../src/application/worker-phase-diagnostic.js';
 import {
   ListenerRuntimeError,
   SolanaListenerRuntime,
@@ -441,6 +443,70 @@ void test('validates shutdown bounds and returns STOPPED projections before star
     }),
     TypeError,
   );
+});
+
+void test('worker timeout publishes active phase evidence before pending close settles', async () => {
+  for (const phase of ['claim_call', 'locator', 'pipeline'] as const) {
+    const calls: string[] = [];
+    const deps = dependencies(calls);
+    const pending = deferred<undefined>();
+    const recorder = new WorkerPhaseDiagnosticRecorder(() => 0);
+    const finishPhase = recorder.beginPhase(phase);
+    const finishAttempt = phase === 'claim_call' ? undefined : recorder.beginAttempt();
+    const events: unknown[] = [];
+    let closes = 0;
+    const worker = workerPhaseDiagnosticComponent({
+      ...deps.worker,
+      state: () => 'STOPPED',
+      close: () => { calls.push('worker.close'); closes += 1; return pending.promise; },
+    }, recorder, (event) => { events.push(event); calls.push('worker.diagnostic'); });
+    const runtime = new SolanaListenerRuntime({ ...deps, worker }, { shutdownTimeoutMs: 10 });
+    await runtime.start();
+    calls.length = 0;
+    const closing = runtime.close();
+    assert.equal(runtime.close(), closing);
+    await assert.rejects(closing, (error: unknown) => {
+      assert.ok(error instanceof ListenerRuntimeError);
+      assert.deepEqual(error.failures, [{ stage: 'worker-timeout', errorName: 'ListenerTimeoutError' }]);
+      return true;
+    });
+    assert.deepEqual(events, [{ ...recorder.snapshot(),
+      event: 'listener_worker_phase_diagnostic_shutdown', closeStatus: 'INCOMPLETE' }]);
+    assert.equal(recorder.snapshot().phases[phase].active, 1);
+    assert.deepEqual(calls, ['supervisor.close', 'paperWorker.close', 'socialWorker.close',
+      'reconciler.close', 'worker.close', 'worker.diagnostic', 'heartbeat.stop:STOPPED']);
+    await assert.rejects(runtime.close(), ListenerRuntimeError);
+    assert.equal(events.length, 1);
+    finishPhase(); finishAttempt?.('processed');
+    pending.resolve(undefined);
+    await worker.close();
+    await runtime.close();
+    assert.equal(events.length, 1);
+    assert.equal(closes, 1);
+  }
+});
+
+void test('throwing worker timeout callback preserves cleanup order and failure aggregation', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  deps.worker.close = () => { calls.push('worker.close'); return new Promise(() => undefined); };
+  deps.supervisor.close = async () => { calls.push('supervisor.close'); throw new Error('original'); };
+  const worker = { ...deps.worker, onCloseTimeout() {
+    calls.push('worker.diagnostic'); throw new Error('optional diagnostic');
+  } };
+  const runtime = new SolanaListenerRuntime({ ...deps, worker }, { shutdownTimeoutMs: 10 });
+  await runtime.start();
+  calls.length = 0;
+  await assert.rejects(runtime.close(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      { stage: 'supervisor-close', errorName: 'ListenerDependencyError' },
+      { stage: 'worker-timeout', errorName: 'ListenerTimeoutError' },
+    ]);
+    return true;
+  });
+  assert.deepEqual(calls, ['supervisor.close', 'paperWorker.close', 'socialWorker.close',
+    'reconciler.close', 'worker.close', 'worker.diagnostic', 'heartbeat.stop:STOPPED']);
 });
 
 function dependencies(calls: string[]): ListenerRuntimeDependencies {

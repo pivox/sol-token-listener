@@ -58,7 +58,7 @@ interface RuntimeHeartbeat {
 
 export interface ListenerRuntimeDependencies {
   readonly supervisor: RuntimeSupervisor;
-  readonly worker: RuntimeComponent;
+  readonly worker: RuntimeComponent & { onCloseTimeout?: () => void };
   readonly paperWorker: RuntimeComponent;
   readonly socialWorker: RuntimeComponent;
   readonly reconciler: RuntimeComponent;
@@ -261,6 +261,13 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       if (result === 'complete') {
         this.activeResources.delete(resource);
         continue;
+      }
+      if (resource === 'worker' && result === 'timeout') {
+        try {
+          this.dependencies.worker.onCloseTimeout?.();
+        } catch {
+          // Optional evidence must not replace runtime failures or interrupt cleanup.
+        }
       }
       failures.push(result === 'timeout'
         ? timeoutFailure(timeoutStage(resource))

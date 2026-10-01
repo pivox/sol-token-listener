@@ -1,4 +1,4 @@
-# Worker phase diagnostic — v1.0.1
+# Worker phase diagnostic — v1.0.2
 
 Issue #203; supports capacity investigation #171. Approved-recommendation workflow.
 
@@ -38,13 +38,19 @@ Changing concurrency or cache before attribution would not establish causality.
   samples; do not change worker results, error identity, leases or cleanup.
 - No signatures, mints, slots, lease tokens, URLs, arbitrary errors or identifiers
   reach the recorder or output. No async I/O in hooks.
-- One immutable summary after worker drain, fixed event
+- One immutable summary after worker drain or at the existing runtime worker-close
+  timeout, fixed event
   `listener_worker_phase_diagnostic_shutdown`, version 1, scope
   `ALL_WORKER_ATTEMPTS_PROCESS_LIFETIME`. Log/publication failures are isolated.
   Absent summary means unavailable, never zero. No API/heartbeat/schema change.
   `closeStatus` is COMPLETED only for a resolved close, STOPPED component and zero
   active attempt/phase counts; otherwise INCOMPLETE. Neither status is a capacity
   verdict. Original close failures must remain the same rejected error object.
+- Runtime worker timeout invokes an optional failure-isolated synchronous callback
+  to publish INCOMPLETE evidence while close is still pending. Active phase and
+  attempt counts are retained. Timeout and settlement share one publication fence;
+  retries or late settlement cannot publish again. No new timer, deadline, lease,
+  cleanup-order or runtime failure-aggregation changes.
 
 ## Interpretation limits
 

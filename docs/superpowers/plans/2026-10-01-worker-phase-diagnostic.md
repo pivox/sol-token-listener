@@ -1,4 +1,4 @@
-# Worker phase diagnostic implementation plan
+# Worker phase diagnostic implementation plan — v1.0.2
 
 > **For agentic workers:** Use subagent-driven-development, TDD, and two review cycles maximum.
 
@@ -12,6 +12,11 @@ new API or gate. All attempts, not a candidate or first-processing cohort.
 
 ## Verified implementation progress
 
+- Cycle 2 timeout correction: runtime timeout callback and settlement share a
+  once-only publication fence. RED: missing active-phase timeout evidence and
+  callback (three regressions); GREEN: 20 runtime/shutdown tests. Includes blocked
+  claim/locator/pipeline, repeated close, late settlement, unchanged failure order
+  and failure-isolated callback/snapshot/state/sink/diagnostic clock.
 - Recorder: 7783782 + 5d5db94, 10 focused tests, runtime enum guards before mutation.
 - Worker: bcac845, 52 worker/pool/recorder tests, operation and lease-clock parity
   across 13 scenarios; cleanup-only completion measured without duplicate finish.

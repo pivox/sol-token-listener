@@ -32,6 +32,7 @@ void test('worker phase summary is emitted once after drain with shared final co
   finish();
   await first;
   await wrapped.close();
+  wrapped.onCloseTimeout();
   assert.deepEqual(events, [{
     ...recorder.snapshot(),
     event: 'listener_worker_phase_diagnostic_shutdown',
@@ -105,4 +106,48 @@ void test('production shares one recorder across the pool and shutdown wrapper',
   assert.equal([...source.matchAll(/new WorkerPhaseDiagnosticRecorder\(\)/gu)].length, 1);
   assert.match(source, /new TransactionInboxWorker\([^]*?phaseObserver: workerPhaseRecorder/u);
   assert.match(source, /worker: workerPhaseDiagnosticComponent\(workerComponent, workerPhaseRecorder,/u);
+});
+
+void test('timeout publication is once-only and never changes a late close outcome', async () => {
+  for (const closeFails of [false, true]) {
+    for (const failure of ['none', 'snapshot', 'state', 'sink', 'clock'] as const) {
+      const original = new Error('original close outcome');
+      let finish!: () => void;
+      const pending = new Promise<void>((resolve, reject) => {
+        finish = () => { if (closeFails) reject(original); else resolve(); };
+      });
+      const recorder = new WorkerPhaseDiagnosticRecorder(() => {
+        if (failure === 'clock') throw new Error('clock failed');
+        return 0;
+      });
+      const endPhase = recorder.beginPhase('pipeline');
+      let snapshots = 0;
+      const events: unknown[] = [];
+      const wrapped = factory.workerPhaseDiagnosticComponent({
+        async start() {}, close: () => pending,
+        state() { if (failure === 'state') throw new Error('state failed'); return 'STOPPED'; },
+      }, { snapshot() {
+        snapshots += 1;
+        if (failure === 'snapshot') throw new Error('snapshot failed');
+        return recorder.snapshot();
+      } }, (event) => {
+        events.push(event);
+        if (failure === 'sink') throw new Error('sink failed');
+      });
+      const closing = wrapped.close();
+      assert.equal(wrapped.close(), closing);
+      assert.equal(typeof wrapped.onCloseTimeout, 'function');
+      assert.doesNotThrow(() => { wrapped.onCloseTimeout(); wrapped.onCloseTimeout(); });
+      assert.equal(snapshots, 1);
+      assert.deepEqual(events, failure === 'snapshot' ? [] : [{ ...recorder.snapshot(),
+        event: 'listener_worker_phase_diagnostic_shutdown', closeStatus: 'INCOMPLETE' }]);
+      endPhase();
+      finish();
+      if (closeFails) await assert.rejects(closing, (error: unknown) => error === original);
+      else await closing;
+      wrapped.onCloseTimeout();
+      assert.equal(snapshots, 1);
+      assert.equal(events.length, failure === 'snapshot' ? 0 : 1);
+    }
+  }
 });
