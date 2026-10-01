@@ -1,6 +1,6 @@
 # Qualification terminal attribution implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans task-by-task. Two review cycles total maximum per user instruction.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans task-by-task. One code-review cycle per latest user instruction (2026-10-02), superseding the earlier two-cycle limit.
 
 **Goal:** Identify qualification failures without changing their handling.
 **Architecture:** Closed trusted attribution through existing weak-map provenance;
@@ -98,9 +98,13 @@ historical checksum/predecessor references (retain) from latest-head assertions.
   database harness; do not use the root .env or start a Mainnet process.
 - [ ] Run build/check/lint/docs and focused tests; full PostgreSQL suite in CI.
   If no local database, report integration tests unexecuted rather than green.
-- [ ] Commit. Review spec compliance then quality (local cycle1), address issues,
-  open PR and request GitHub review (cycle2). Merge only after green full CI and
-  all blocking feedback resolved; no third cycle.
+- [ ] Commit. Review spec compliance then quality in one local review cycle,
+  address findings, then open PR without requesting a second review cycle.
+  Merge only after green full CI and all blocking feedback resolved.
+
+Local independent review of `1bbf839..b41342c` completed with no proven functional
+findings. Full parent test run remains in progress; review completion does not
+replace test or CI evidence.
 
 ## Completion evidence
 

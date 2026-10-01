@@ -1,4 +1,4 @@
-# Qualification terminal attribution — v1.0.0
+# Qualification terminal attribution — v1.0.1
 
 Issue #205, capacity investigation #171. Recommended-choice approval applies.
 
@@ -63,4 +63,6 @@ query40P01, unknown query, malformed canonical data, missing launch, rebuilder,
 rollback/unlock/release, primary plus cleanup, hostile code getter/proxy, and
 callback spoofed SQLSTATE. Assert exact fixed attribution plus unchanged outcome.
 Test pipeline/worker/export propagation, runtime enum validation, migration
-roundtrip and existing tests. Two review cycles maximum, full CI before merge.
+roundtrip and existing tests. One code-review cycle per the user's 2026-10-02
+instruction, full CI before merge. This v1.0.1 revision changes only the review
+process; technical scope and invariants are unchanged.
