@@ -636,8 +636,8 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
       rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(configuredRpcHttpProviderIds),
-      workerAdmissionMetrics: (): Promise<RuntimeWorkerAdmissionMetricsV1> =>
-        inbox.workerAdmissionMetrics(),
+      inboxSnapshot: (): ReturnType<PostgresTransactionInboxRepository['heartbeatSnapshot']> =>
+        inbox.heartbeatSnapshot(),
       ...(hydration === null ? {} : {
         catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
           version: 1,
@@ -693,6 +693,10 @@ export interface RecurringListenerOptions {
 }
 
 export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
+  readonly inboxSnapshot?: () => Promise<Readonly<{
+    counts: InboxCounts;
+    workerAdmission: RuntimeWorkerAdmissionMetricsV1;
+  }>>;
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
@@ -1078,6 +1082,7 @@ export class PersistentListenerHeartbeat {
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
   private readonly workerAdmissionMetrics: (() => Promise<RuntimeWorkerAdmissionMetricsV1>) | null;
+  private readonly inboxSnapshot: ListenerHeartbeatOptions['inboxSnapshot'];
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository,
@@ -1113,6 +1118,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Worker admission metrics provider is invalid.');
     }
     this.workerAdmissionMetrics = options.workerAdmissionMetrics ?? null;
+    if (options.inboxSnapshot !== undefined && (typeof options.inboxSnapshot !== 'function'
+      || options.workerAdmissionMetrics !== undefined)) {
+      throw new TypeError('Inbox snapshot provider is invalid.');
+    }
+    this.inboxSnapshot = options.inboxSnapshot;
   }
 
   public async start(): Promise<void> {
@@ -1205,11 +1215,28 @@ export class PersistentListenerHeartbeat {
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
     this.ensureStartedAtMs();
     const cohortStartedAtMs = await this.firstProcessingCanaryCohortStartedAtMs();
+    let inboxSnapshot: Awaited<ReturnType<NonNullable<ListenerHeartbeatOptions['inboxSnapshot']>>> | undefined;
+    if (this.inboxSnapshot !== undefined) {
+      try {
+        const snapshot = await this.inboxSnapshot();
+        assertValidInboxCounts(snapshot.counts);
+        const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(snapshot.workerAdmission);
+        const backlog = safeInboxBacklog(snapshot.counts.pending, snapshot.counts.processing,
+          snapshot.counts.retryableFailed);
+        if (workerAdmission.classificationPendingCount > backlog
+          || workerAdmission.claimableBacklogCount > backlog - workerAdmission.classificationPendingCount) {
+          throw new TypeError();
+        }
+        inboxSnapshot = Object.freeze({ counts: snapshot.counts, workerAdmission });
+      } catch {
+        throw new TypeError('Inbox snapshot is invalid or unavailable.');
+      }
+    }
     let counts: InboxCounts;
     let firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
     if (runtimeState === 'RUNNING') {
       const [currentCounts, evidence, slots] = await Promise.all([
-        this.inbox.counts(),
+        inboxSnapshot === undefined ? this.inbox.counts() : Promise.resolve(inboxSnapshot.counts),
         this.inbox.firstProcessingCanary(cohortStartedAtMs),
         Promise.all([this.rpc.getSlot(), this.rpc.getFinalizedSlot()]),
       ]);
@@ -1219,7 +1246,7 @@ export class PersistentListenerHeartbeat {
       this.lastFinalizedSlot = slots[1];
     } else {
       const [currentCounts, evidence] = await Promise.all([
-        this.inbox.counts(),
+        inboxSnapshot === undefined ? this.inbox.counts() : Promise.resolve(inboxSnapshot.counts),
         this.inbox.firstProcessingCanary(cohortStartedAtMs),
       ]);
       counts = currentCounts;
@@ -1248,7 +1275,8 @@ export class PersistentListenerHeartbeat {
         throw new TypeError('RPC HTTP evidence metrics are invalid.');
       }
     }
-    let workerAdmission: RuntimeWorkerAdmissionMetricsV1 | undefined;
+    let workerAdmission: RuntimeWorkerAdmissionMetricsV1 | undefined = inboxSnapshot === undefined
+      ? undefined : snapshotRuntimeWorkerAdmissionMetrics(inboxSnapshot.workerAdmission);
     if (this.workerAdmissionMetrics !== null) {
       try {
         workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(

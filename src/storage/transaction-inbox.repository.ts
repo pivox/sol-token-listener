@@ -2901,11 +2901,27 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   }
 
   public async counts(): Promise<InboxCounts> {
+    return this.readCounts(this.pool);
+  }
+
+  public async heartbeatSnapshot(): Promise<Readonly<{
+    counts: InboxCounts;
+    workerAdmission: RuntimeWorkerAdmissionMetricsV1;
+  }>> {
+    return this.safely(() => this.transaction(async (client) => {
+      await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const counts = await this.readCounts(client);
+      const workerAdmission = await this.readWorkerAdmissionMetrics(client);
+      return Object.freeze({ counts, workerAdmission });
+    }));
+  }
+
+  private async readCounts(queryable: Queryable): Promise<InboxCounts> {
     return this.safely(async () => {
       const retryable = `processing_status = 'FAILED' AND error_retryable = TRUE
         AND retry_exhausted_at IS NULL AND next_attempt_at IS NOT NULL`;
       const actionable = `(processing_status IN ('PENDING', 'PROCESSING') OR (${retryable}))`;
-      const result = await this.pool.query(
+      const result = await queryable.query(
         `SELECT
            COUNT(*) FILTER (WHERE processing_status = 'PENDING') AS pending,
            COUNT(*) FILTER (WHERE processing_status = 'PROCESSING') AS processing,
@@ -2976,6 +2992,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   }
 
   public async workerAdmissionMetrics(): Promise<RuntimeWorkerAdmissionMetricsV1> {
+    return this.readWorkerAdmissionMetrics(this.pool);
+  }
+
+  private async readWorkerAdmissionMetrics(queryable: Queryable): Promise<RuntimeWorkerAdmissionMetricsV1> {
     return this.safely(async () => {
       const claimable = `(
         (inbox.processing_status='PENDING'
@@ -2988,7 +3008,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           AND inbox.lease_expires_at<=database_clock.at
           AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
       )`;
-      const result = await this.pool.query(this.workerAdmissionPolicy.enabled
+      const result = await queryable.query(this.workerAdmissionPolicy.enabled
         ? `WITH database_clock AS MATERIALIZED (
              SELECT date_trunc('milliseconds',clock_timestamp()) AS at
            ), fresh_launch AS MATERIALIZED (
