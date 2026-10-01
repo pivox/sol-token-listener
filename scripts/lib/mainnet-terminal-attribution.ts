@@ -407,6 +407,10 @@ function createDiagnosticGroup(
   if (source === 'CATCH_UP' && completeness === 'COMPLETE' && catchUpCauseKind === null) {
     invalidEvidence();
   }
+  if (diagnosticCode.startsWith('QUALIFICATION_')
+    && (source !== 'WORKER' || processingOutcome !== 'FAILED' || stage !== 'qualification'
+      || catchUpCauseKind !== null || catchUpReasonCode !== null
+      || pumpWire !== null || representative !== null)) invalidEvidence();
   if (diagnosticCode === 'PUMP_BORSH_INVALID') {
     if ((source === 'CATCH_UP' && catchUpCauseKind !== 'PUMP_DECODER')
       || (originCode !== null && originCode !== 'PUMP_BORSH_INVALID')

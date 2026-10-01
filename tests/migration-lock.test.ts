@@ -332,8 +332,8 @@ void test('serializes concurrent pools so each canonical migration is recorded o
     const canonical = (await readdir(new URL('../migrations/', import.meta.url)))
       .filter((name) => /^\d+_[a-z0-9_-]+\.sql$/u.test(name))
       .sort((left, right) => left.localeCompare(right));
-    assert.equal(canonical.length, 58);
-    assert.equal(canonical.at(-1), '058_transaction_inbox_funding_attribution.sql');
+    assert.equal(canonical.length, 59);
+    assert.equal(canonical.at(-1), '059_transaction_inbox_qualification_attribution.sql');
 
     const [firstApplied, secondApplied] = await Promise.all([
       migrateDatabase({ pool: firstPool }),

@@ -557,6 +557,47 @@ void test('keeps the canonical artifact below one MiB', () => {
   assert.ok(bytes <= MAINNET_TERMINAL_ATTRIBUTION_MAX_BYTES);
 });
 
+void test('qualification diagnostics round-trip and reject incompatible provenance', () => {
+  const codes = ['CONNECT_FAILED', 'POSTGRES_SERIALIZATION', 'POSTGRES_DEADLOCK',
+    'DATA_INVALID', 'LAUNCH_MISSING', 'REBUILD_UNKNOWN', 'PERSISTENCE_UNKNOWN',
+    'CLEANUP_FAILED'].map((suffix) => `QUALIFICATION_${suffix}`);
+  const build = (rows: readonly unknown[]) => buildMainnetTerminalAttribution({
+    currentPopulationRows: [], diagnosticOccurrenceRows: rows,
+    incompleteAttributionRows: [{ parent_count: 0, incomplete_count: 0 }],
+  });
+  const rows = codes.map((diagnostic_code) => occurrence({
+    diagnostic_code, stage: 'qualification', origin: null,
+  }));
+  const artifact = build(rows);
+  const serialized = serializeMainnetTerminalAttribution(artifact);
+  assert.deepEqual(artifact.diagnosticOccurrences.groups.map((group) => group.diagnosticCode),
+    [...codes].sort());
+  assert.equal(serialized, serializeMainnetTerminalAttribution(build([...rows].reverse())));
+  assert.equal(serialized, serializeMainnetTerminalAttribution(
+    parseMainnetTerminalAttribution(JSON.parse(serialized) as unknown),
+  ));
+  for (const row of rows) {
+    for (const overrides of [
+      { stage: 'wallet_graph' }, { stage: null },
+      { source: 'CATCH_UP', processing_outcome: 'QUARANTINED', worker_cycle_attempt: null,
+        worker_recovery_count: null, retryable: null, retry_exhausted: null, stage: null,
+        catch_up_cause_kind: 'LOCATOR', catch_up_reason_code: 'PUMP_SCHEMA_UNSUPPORTED' },
+      { processing_outcome: 'QUARANTINED' }, { catch_up_cause_kind: 'LOCATOR' },
+      { catch_up_reason_code: 'PUMP_SCHEMA_UNSUPPORTED' },
+      { wire_surface: 'INSTRUCTION' },
+      { representative_signature: solanaSignature(1), representative_slot: 1,
+        representative_confirmation_status: 'confirmed' },
+    ]) assert.throws(() => build([{ ...row, ...overrides }]), TypeError);
+  }
+  for (const group of artifact.diagnosticOccurrences.groups) {
+    assert.throws(() => parseMainnetTerminalAttribution({
+      ...artifact, diagnosticOccurrences: { ...artifact.diagnosticOccurrences,
+        groups: artifact.diagnosticOccurrences.groups.map((candidate) => candidate === group
+          ? { ...candidate, stage: 'wallet_graph' } : candidate) },
+    }), TypeError);
+  }
+});
+
 function currentRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     processing_status: 'FAILED',
