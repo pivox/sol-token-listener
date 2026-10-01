@@ -14,6 +14,23 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_RETENTION_OUTPUT_BYTES = 16 * 1024;
 const MAX_RETENTION_COUNTERS = 128;
 const MAX_FAILURE_SUMMARY_BYTES = 1_024;
+const smokeFailureContext = new WeakMap();
+const SMOKE_PHASES = new Set([
+  'BUILD', 'START', 'PORT_DISCOVERY', 'SIGNAL_PROBE', 'NON_ROOT_APP',
+  'NON_ROOT_FRONTEND', 'PUBLIC_HEALTH', 'CORS', 'MIGRATIONS', 'FRONTEND',
+  'SSE_SHUTDOWN', 'APP_RESTART', 'HEALTH_RECOVERY', 'RETENTION', 'CLEANUP',
+]);
+const SMOKE_OPERATIONS = new Set(['HTTP_HEADERS', 'HTTP_BODY', 'SSE_BODY']);
+const TRANSPORT_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT', 'UND_ERR_ABORTED', 'UND_ERR_DESTROYED',
+  'UND_ERR_RES_CONTENT_LENGTH_MISMATCH',
+]);
+const FAILURE_NAMES = new Set([
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+  'URIError', 'EvalError', 'AbortError', 'TimeoutError',
+]);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
 const smokeComposeFile = resolve(root, 'deploy/compose.smoke.yaml');
@@ -245,33 +262,35 @@ async function runDeployment(selfSignal) {
   const cleanupFailures = [];
   try {
     try {
-      await compose(['build', 'app', 'frontend']);
-      await compose(['up', '--detach', '--wait', '--wait-timeout', '120']);
-      baseUrl = await discoverFrontendBaseUrl();
+      await smokePhase('BUILD', async () => { await compose(['build', 'app', 'frontend']); });
+      await smokePhase('START', async () => { await compose(['up', '--detach', '--wait', '--wait-timeout', '120']); });
+      baseUrl = await smokePhase('PORT_DISCOVERY', discoverFrontendBaseUrl);
       if (selfSignal !== null) {
-        await runActiveChildSignalProbe(selfSignal);
+        await smokePhase('SIGNAL_PROBE', async () => { await runActiveChildSignalProbe(selfSignal); });
       }
-      await assertNonRoot('app');
-      await assertNonRoot('frontend');
-      await assertPublicHealth();
-      await assertCorsContract();
+      await smokePhase('NON_ROOT_APP', () => assertNonRoot('app'));
+      await smokePhase('NON_ROOT_FRONTEND', () => assertNonRoot('frontend'));
+      await smokePhase('PUBLIC_HEALTH', assertPublicHealth);
+      await smokePhase('CORS', assertCorsContract);
 
-      const initialMigrations = await readMigrationHistory();
-      assertMigrationHistory(initialMigrations);
-      await compose(['run', '--rm', 'migrate']);
-      const replayedMigrations = await readMigrationHistory();
-      assertMigrationHistory(replayedMigrations);
-      assertEqual(
-        JSON.stringify(replayedMigrations),
-        JSON.stringify(initialMigrations),
-        'Migration replay changed migration_history.',
-      );
+      await smokePhase('MIGRATIONS', async () => {
+        const initialMigrations = await readMigrationHistory();
+        assertMigrationHistory(initialMigrations);
+        await compose(['run', '--rm', 'migrate']);
+        const replayedMigrations = await readMigrationHistory();
+        assertMigrationHistory(replayedMigrations);
+        assertEqual(
+          JSON.stringify(replayedMigrations),
+          JSON.stringify(initialMigrations),
+          'Migration replay changed migration_history.',
+        );
+      });
 
-      await assertFrontendContract();
-      await assertGracefulSseShutdown();
-      await compose(['start', 'app']);
-      await waitForPublicHealth();
-      await assertRetentionOneShot();
+      await smokePhase('FRONTEND', assertFrontendContract);
+      await smokePhase('SSE_SHUTDOWN', assertGracefulSseShutdown);
+      await smokePhase('APP_RESTART', async () => { await compose(['start', 'app']); });
+      await smokePhase('HEALTH_RECOVERY', waitForPublicHealth);
+      await smokePhase('RETENTION', assertRetentionOneShot);
     } catch (error) {
       primaryFailure = error;
     }
@@ -307,6 +326,7 @@ async function runDeployment(selfSignal) {
     }
   }
 
+  for (const error of cleanupFailures) annotateSmokeFailure(error, { phase: 'CLEANUP' });
   if (primaryFailure !== undefined && cleanupFailures.length > 0) {
     throw new AggregateError([primaryFailure, ...cleanupFailures], 'Deployment smoke and cleanup failed.');
   }
@@ -414,6 +434,7 @@ async function runSignalFaultProbe(signal) {
       throw new Error('Deployment signal fault probe controlled child failure.');
     }
   } catch (error) {
+    annotateSmokeFailure(error, { phase: 'SIGNAL_PROBE' });
     primaryFailure = error;
   } finally {
     cleanupDeadlineAt = Date.now() + CLEANUP_TIMEOUT_MS;
@@ -424,6 +445,7 @@ async function runSignalFaultProbe(signal) {
     }
   }
 
+  for (const error of cleanupFailures) annotateSmokeFailure(error, { phase: 'CLEANUP' });
   if (primaryFailure !== undefined && cleanupFailures.length > 0) {
     throw new AggregateError([primaryFailure, ...cleanupFailures], 'Deployment fault probe and cleanup failed.');
   }
@@ -687,13 +709,52 @@ function redact(value) {
     .replaceAll(encodeURIComponent(postgresPassword), '[REDACTED]');
 }
 
+async function smokePhase(phase, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    annotateSmokeFailure(error, { phase });
+    throw error;
+  }
+}
+
+function annotateSmokeFailure(error, { phase, operation }) {
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') return;
+  const previous = smokeFailureContext.get(error) ?? {};
+  smokeFailureContext.set(error, {
+    phase: previous.phase ?? (SMOKE_PHASES.has(phase) ? phase : undefined),
+    operation: previous.operation ?? (SMOKE_OPERATIONS.has(operation) ? operation : undefined),
+  });
+}
+
+function failureContextSummary(error) {
+  const context = smokeFailureContext.get(error);
+  const fields = [];
+  if (context?.phase !== undefined) fields.push(`phase=${context.phase}`);
+  if (context?.operation !== undefined) fields.push(`operation=${context.operation}`);
+  // Never stringify arbitrary codes, causes, names, URLs, or error messages.
+  let transport;
+  try {
+    const ownCode = error.code;
+    const code = TRANSPORT_CODES.has(ownCode) ? ownCode : error.cause?.code;
+    if (TRANSPORT_CODES.has(code)) transport = code;
+  } catch { /* Diagnostic getters cannot change the smoke outcome. */ }
+  if (transport !== undefined) fields.push(`transport=${transport}`);
+  return fields.length === 0 ? '' : `{${fields.join(',')}}`;
+}
+
 function deploymentFailureLine(error) {
   const prefix = 'Deployment smoke failed: ';
   const suffix = '.\n';
   const availableBytes = MAX_FAILURE_SUMMARY_BYTES
     - Buffer.byteLength(prefix, 'utf8')
     - Buffer.byteLength(suffix, 'utf8');
-  const summary = summarizeFailure(error);
+  let summary;
+  try {
+    summary = summarizeFailure(error);
+  } catch {
+    summary = 'UnknownError(diagnostic_unavailable)';
+  }
   return `${prefix}${summary.slice(0, availableBytes)}${suffix}`;
 }
 
@@ -701,10 +762,20 @@ function summarizeFailure(error, depth = 0) {
   if (depth >= 4) return 'Error(depth_limit)';
   let summary;
   if (error instanceof AggregateError) {
-    const causes = [...error.errors].slice(0, 8).map((cause) => summarizeFailure(cause, depth + 1));
-    summary = `AggregateError(${error.errors.length})[${causes.join(',')}]`;
+    const errors = error.errors;
+    if (!Array.isArray(errors)) return 'UnknownError(diagnostic_unavailable)';
+    const count = errors.length;
+    if (!Number.isSafeInteger(count) || count < 0) return 'UnknownError(diagnostic_unavailable)';
+    const causes = [];
+    for (let index = 0; index < Math.min(count, 8); index += 1) {
+      causes.push(summarizeFailure(errors[index], depth + 1));
+    }
+    summary = `AggregateError(${count})[${causes.join(',')}]${failureContextSummary(error)}`;
   } else if (error instanceof Error) {
-    summary = `${safeName(error)}(${failureCategory(error.message)})`;
+    const errorName = error.name;
+    const message = error.message;
+    const name = FAILURE_NAMES.has(errorName) ? errorName : 'UnknownError';
+    summary = `${name}(${failureCategory(typeof message === 'string' ? message : '')})${failureContextSummary(error)}`;
   } else {
     summary = 'UnknownError(non_error)';
   }
@@ -874,6 +945,9 @@ async function readSseToEof(body, controller) {
       if (total > MAX_RESPONSE_BYTES) throw new Error('SSE response exceeded its size limit.');
       chunks.push(item.value);
     }
+  } catch (error) {
+    annotateSmokeFailure(error, { operation: 'SSE_BODY' });
+    throw error;
   } finally {
     clearTimeout(timeout);
     try { reader.releaseLock(); } catch { /* response is already terminal */ }
@@ -962,6 +1036,9 @@ async function requestWithDeadline(url, options = {}) {
   const timeout = setTimeout(() => controller.abort(), Math.min(REQUEST_TIMEOUT_MS, remainingGlobalMs()));
   try {
     return await fetch(url, { ...options, redirect: 'error', signal });
+  } catch (error) {
+    annotateSmokeFailure(error, { operation: 'HTTP_HEADERS' });
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -991,6 +1068,9 @@ async function readBoundedBody(response, label) {
       if (total > MAX_RESPONSE_BYTES) throw new Error(`Response for ${label} exceeded its size limit.`);
       chunks.push(item.value);
     }
+  } catch (error) {
+    annotateSmokeFailure(error, { operation: 'HTTP_BODY' });
+    throw error;
   } finally {
     clearTimeout(timeout);
     if (expired || !completed) void reader.cancel().catch(() => undefined);
