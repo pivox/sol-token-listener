@@ -1,8 +1,46 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { WorkerPhaseDiagnosticRecorder } from '../src/application/worker-phase-diagnostic.js';
+import {
+  WorkerPhaseDiagnosticRecorder,
+  type WorkerAttemptOutcome,
+  type WorkerClaimOutcome,
+  type WorkerDiagnosticPhase,
+} from '../src/application/worker-phase-diagnostic.js';
 
 const bounds = [1, 5, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000, 120000];
+
+void test('rejects runtime invalid phases without retaining or exposing raw values', () => {
+  for (const value of ['secret-signature', '__proto__', 'constructor', 'toString']) {
+    const recorder = new WorkerPhaseDiagnosticRecorder(() => 0);
+    const before = recorder.snapshot();
+    assert.throws(() => { recorder.beginPhase(value as WorkerDiagnosticPhase); },
+      { name: 'TypeError', message: 'Invalid diagnostic phase' });
+    assert.deepEqual(recorder.snapshot(), before);
+  }
+});
+
+void test('rejects runtime invalid claim outcomes without retaining or exposing raw values', () => {
+  for (const value of ['secret-signature', '__proto__', 'constructor', 'toString']) {
+    const recorder = new WorkerPhaseDiagnosticRecorder(() => 0);
+    const before = recorder.snapshot();
+    assert.throws(() => { recorder.recordClaimOutcome(value as WorkerClaimOutcome); },
+      { name: 'TypeError', message: 'Invalid diagnostic claim outcome' });
+    assert.deepEqual(recorder.snapshot(), before);
+  }
+});
+
+void test('rejects runtime invalid attempt outcomes without consuming valid finish', () => {
+  for (const value of ['secret-signature', '__proto__', 'constructor', 'toString']) {
+    const recorder = new WorkerPhaseDiagnosticRecorder(() => 0);
+    const finish = recorder.beginAttempt();
+    const active = recorder.snapshot();
+    assert.throws(() => { finish(value as WorkerAttemptOutcome); },
+      { name: 'TypeError', message: 'Invalid diagnostic attempt outcome' });
+    assert.deepEqual(recorder.snapshot(), active);
+    finish('processed');
+    assert.equal(recorder.snapshot().attemptOutcomes.processed, 1);
+  }
+});
 
 void test('records an exact 11ms phase in the 50ms bucket', () => {
   let now = 0;

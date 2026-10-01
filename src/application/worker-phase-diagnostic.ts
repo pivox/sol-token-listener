@@ -63,6 +63,9 @@ export class WorkerPhaseDiagnosticRecorder implements WorkerPhaseDiagnosticObser
   constructor(private readonly clock: () => number = () => performance.now()) {}
 
   beginPhase(phase: WorkerDiagnosticPhase): () => void {
+    if (typeof phase !== 'string' || !Object.hasOwn(this.phases, phase)) {
+      throw new TypeError('Invalid diagnostic phase');
+    }
     return this.beginDuration(this.phases[phase]);
   }
 
@@ -71,6 +74,9 @@ export class WorkerPhaseDiagnosticRecorder implements WorkerPhaseDiagnosticObser
     let finished = false;
     return outcome => {
       if (finished) return;
+      if (typeof outcome !== 'string' || !Object.hasOwn(this.attemptOutcomes, outcome)) {
+        throw new TypeError('Invalid diagnostic attempt outcome');
+      }
       finished = true;
       finish();
       this.attemptOutcomes[outcome] = this.add(this.attemptOutcomes[outcome], 1);
@@ -78,6 +84,9 @@ export class WorkerPhaseDiagnosticRecorder implements WorkerPhaseDiagnosticObser
   }
 
   recordClaimOutcome(outcome: WorkerClaimOutcome): void {
+    if (typeof outcome !== 'string' || !Object.hasOwn(this.claimOutcomes, outcome)) {
+      throw new TypeError('Invalid diagnostic claim outcome');
+    }
     this.claimOutcomes[outcome] = this.add(this.claimOutcomes[outcome], 1);
   }
 
