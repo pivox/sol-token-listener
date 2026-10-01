@@ -69,6 +69,37 @@ const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
 
+void test('heartbeat snapshot excludes an arrival committed between its PostgreSQL reads', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const writer = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
+    await writer.enqueue(notification('snapshot-first', 1n));
+    let inserted = false;
+    const repository = new PostgresTransactionInboxRepository({
+      query: (sql, values) => pool.query(sql, values === undefined ? undefined : [...values]),
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql, values) {
+            const result = await client.query(sql, values === undefined ? undefined : [...values]);
+            if (!inserted && sql.includes('AS pending')) {
+              inserted = true;
+              await writer.enqueue(notification('snapshot-concurrent', 2n));
+            }
+            return result;
+          },
+          release() { client.release(); },
+        };
+      },
+    }, undefined, enabledAdmission);
+    const snapshot = await repository.heartbeatSnapshot();
+    assert.equal(inserted, true);
+    assert.equal(snapshot.counts.pending, 1);
+    assert.equal(snapshot.workerAdmission.classificationPendingCount, 1);
+    assert.equal((await writer.counts()).pending, 2);
+    assert.equal((await writer.workerAdmissionMetrics()).classificationPendingCount, 2);
+  });
+});
+
 void test('worker admission metrics use one PostgreSQL clock and exact enabled and disabled cohorts',
   async (context) => {
     await withDatabase(context, async (pool) => {

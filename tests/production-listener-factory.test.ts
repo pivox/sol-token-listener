@@ -61,6 +61,51 @@ import type { PumpFunWorkerAdmissionPolicyV1 } from '../src/domain/worker-admiss
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
+void test('heartbeat keeps inbox counts and admission in one snapshot across concurrent arrivals', async () => {
+  let pending = 1;
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(),
+    async counts() { throw new Error('Independent counts must not be read.'); },
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { pending += 1; return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    async inboxSnapshot() {
+      const count = pending;
+      return Object.freeze({
+        counts: Object.freeze({ ...(await heartbeatCounts()), pending: count,
+          catchUpAdmission: admissionCounts(count) }),
+        workerAdmission: Object.freeze({ ...workerAdmissionMetricsFixture(),
+          claimableBacklogCount: 0, classificationPendingCount: count }),
+      });
+    },
+  });
+  await heartbeat.start();
+  await heartbeat.stop();
+  assert.deepEqual(writes.map((value) => [value.runtimeState, value.backlogCount,
+    value.workerAdmission?.classificationPendingCount]), [
+    ['RUNNING', 1, 1], ['STOPPED', 2, 2],
+  ]);
+});
+
+void test('heartbeat does not publish or fall back when its combined snapshot fails', async () => {
+  let writes = 0;
+  let countReads = 0;
+  const heartbeat = new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(),
+    async counts() { countReads += 1; return heartbeatCounts(); },
+    async writeHeartbeat() { writes += 1; },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    async inboxSnapshot() { throw new Error('private database failure'); },
+  });
+  await assert.rejects(heartbeat.start(), { message: 'Inbox snapshot is invalid or unavailable.' });
+  assert.equal(writes, 0);
+  assert.equal(countReads, 0);
+});
+
 function workerAdmissionMetricsFixture(): RuntimeWorkerAdmissionMetricsV1 {
   return snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
     version: 1,
@@ -518,7 +563,7 @@ void test('production creates one bounded admission policy and injects it as the
   assert.match(source, /createPumpFunWorkerAdmissionPolicy\(\{\s*enabled: config\.listenerPumpFunBoundedWorkerAdmissionEnabled,\s*trackingWindowSeconds: config\.listenerPumpFunTrackingWindowSeconds,\s*\}\)/u);
   assert.match(source, /new PostgresTransactionInboxRepository\(databasePool, Object\.freeze\(\{[^}]*\}\), workerAdmissionPolicy\)/u);
   assert.match(source, /openWsProgramSession\(\s*endpoint,\s*observe,\s*signal,\s*\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*\}/u);
-  assert.match(source, /workerAdmissionMetrics:\s*\(\):\s*Promise<RuntimeWorkerAdmissionMetricsV1>\s*=>\s*inbox\.workerAdmissionMetrics\(\)/u);
+  assert.match(source, /inboxSnapshot:\s*\(\):\s*ReturnType<PostgresTransactionInboxRepository\['heartbeatSnapshot'\]>\s*=>\s*inbox\.heartbeatSnapshot\(\)/u);
 });
 
 void test('activates slot persistence pipelining only from the bounded admission policy', async () => {
