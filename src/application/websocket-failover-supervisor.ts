@@ -156,6 +156,7 @@ interface ValidatedReporter {
   startTouch(snapshot: WebSocketHealthSnapshot): void;
   transition: PersistentWebSocketHealthReporter['transition'];
   observe: PersistentWebSocketHealthReporter['observe'];
+  observeFiltered: PersistentWebSocketHealthReporter['observeFiltered'];
   stop: PersistentWebSocketHealthReporter['stop'];
 }
 
@@ -207,6 +208,7 @@ export class WebSocketFailoverSupervisor {
   readonly #transitionWaiters: (() => void)[] = [];
   #shutdownResourceFailed = false;
   #initialFrontierPrepared = false;
+  readonly #filteredCounts = new Map<RpcProviderId, number>(RPC_PROVIDER_IDS.map((id) => [id, 0]));
 
   public constructor(
     dependencies: WebSocketFailoverSupervisorDependencies,
@@ -242,6 +244,15 @@ export class WebSocketFailoverSupervisor {
   public activeProviderId(): RpcProviderId | null {
     this.#reconcileReporterFailure();
     return this.#currentProviderId;
+  }
+
+  public filteredNotificationMetrics(): Readonly<{
+    reasonCode: 'PASSIVE_PUMP_ACCOUNT_MENTION';
+    byProvider: Readonly<Record<RpcProviderId, number>>;
+  }> {
+    return Object.freeze({ reasonCode: 'PASSIVE_PUMP_ACCOUNT_MENTION',
+      byProvider: Object.freeze(Object.fromEntries(this.#filteredCounts)) as Readonly<Record<RpcProviderId, number>>,
+    });
   }
 
   #reconcileReporterFailure(): void {
@@ -951,10 +962,19 @@ export class WebSocketFailoverSupervisor {
         || record.sessionGeneration !== sessionGeneration) return Promise.resolve();
     }
     let preliminary: TransactionNotification;
+    let filtered = false;
     try {
+      const untrusted: unknown = value;
+      if (typeof untrusted !== 'object' || untrusted === null || isProxy(untrusted)) throw new TypeError();
+      filtered = Object.getOwnPropertyDescriptor(value, 'filteredReason') !== undefined;
       const payload = exactOwnData(value, [
         'endpointId', 'program', 'signature', 'slot', 'hint', 'hintMint',
+        ...(filtered ? ['filteredReason'] : []),
       ]);
+      if (filtered && (payload.filteredReason !== 'PASSIVE_PUMP_ACCOUNT_MENTION'
+        || payload.program !== 'pumpfun' || payload.hint !== 'NONE' || payload.hintMint !== null)) {
+        throw new TypeError();
+      }
       const programId = programIdFrom(payload.program);
       if (payload.endpointId !== providerId
         || programId === null
@@ -983,6 +1003,15 @@ export class WebSocketFailoverSupervisor {
       assertValidTransactionNotification(notification);
     } catch {
       return Promise.reject(configurationError());
+    }
+    if (filtered) {
+      return this.#dependencies.reporter.observeFiltered(notification.slot, ownerGeneration, sessionGeneration)
+        .then((result: unknown) => {
+          if (result === 'RECORDED') {
+            const count = this.#filteredCounts.get(providerId) ?? 0;
+            this.#filteredCounts.set(providerId, Math.min(Number.MAX_SAFE_INTEGER, count + 1));
+          } else if (result !== 'STALE_SESSION') throw configurationError();
+        });
     }
     return this.#dependencies.reporter.observe(
       notification,
@@ -1497,6 +1526,9 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     reporterValue,
     'observe',
   );
+  const observeFiltered = dataMethod<PersistentWebSocketHealthReporter['observeFiltered']>(
+    reporterValue, 'observeFiltered',
+  );
   const stop = dataMethod<PersistentWebSocketHealthReporter['stop']>(
     reporterValue,
     'stop',
@@ -1553,6 +1585,9 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
       },
       stop(cleanup: Parameters<PersistentWebSocketHealthReporter['stop']>[0]) {
         return Reflect.apply(stop, reporterValue, [cleanup]);
+      },
+      observeFiltered(slot: bigint, ownerGeneration: bigint, sessionGeneration: bigint) {
+        return Reflect.apply(observeFiltered, reporterValue, [slot, ownerGeneration, sessionGeneration]);
       },
     }),
     promoted: Object.freeze({

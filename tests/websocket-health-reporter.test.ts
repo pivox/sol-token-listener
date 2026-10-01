@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   createWebSocketHealthSnapshot,
+  MAX_WEBSOCKET_HEALTH_SLOT,
   type WebSocketHealthPhase,
   type WebSocketHealthSnapshot,
 } from '../src/domain/websocket-health.js';
@@ -526,6 +527,59 @@ void test('websocket health reporter keeps rejected cleanup degraded and redacte
   );
   assert.equal(reporter.state(), 'DEGRADED');
   assert.equal(repository.transitions.at(-1)?.phase, 'DEGRADED');
+});
+
+void test('websocket health reporter records filtered activity without enqueue and returns the session result', async () => {
+  for (const result of ['RECORDED', 'STALE_SESSION'] as const) {
+    const repository = new FakeHealthRepository();
+    const pending = deferred<typeof result>();
+    repository.recordObservationResult = () => pending.promise;
+    let enqueues = 0;
+    const reporter = new PersistentWebSocketHealthReporter({
+      async enqueue() { enqueues += 1; },
+    }, repository, reporterOptions());
+
+    const observed = reporter.observeFiltered(42n, 7n, 9n);
+    assert.deepEqual(repository.observations, [{ ownerGeneration: 7n, sessionGeneration: 9n, slot: 42n }]);
+    assert.equal(enqueues, 0);
+    pending.resolve(result);
+    assert.equal(await observed, result);
+    assert.equal(enqueues, 0);
+  }
+});
+
+void test('websocket health reporter rejects invalid filtered slots before persistence', async () => {
+  for (const slot of [-1n, MAX_WEBSOCKET_HEALTH_SLOT + 1n, 42, null, {}]) {
+    const repository = new FakeHealthRepository();
+    let enqueues = 0;
+    const reporter = new PersistentWebSocketHealthReporter({
+      async enqueue() { enqueues += 1; },
+    }, repository, reporterOptions());
+
+    await assertReporterCode(reporter.observeFiltered(slot as bigint, 7n, 9n), 'OBSERVATION_FAILED');
+    assert.equal(repository.observations.length, 0);
+    assert.equal(enqueues, 0);
+    assert.equal(reporter.state(), 'DEGRADED');
+  }
+});
+
+void test('websocket health reporter redacts filtered observation failures and invalid results', async () => {
+  for (const record of [
+    async () => { throw new Error('secret filtered observation dependency'); },
+    async () => 'INVALID' as never,
+  ]) {
+    const repository = new FakeHealthRepository();
+    repository.recordObservationResult = record;
+    let enqueues = 0;
+    const reporter = new PersistentWebSocketHealthReporter({
+      async enqueue() { enqueues += 1; },
+    }, repository, reporterOptions());
+
+    await assertReporterCode(reporter.observeFiltered(42n, 7n, 9n), 'OBSERVATION_FAILED');
+    assert.equal(repository.observations.length, 1);
+    assert.equal(enqueues, 0);
+    assert.equal(reporter.state(), 'DEGRADED');
+  }
 });
 
 void test('websocket health reporter enqueues before recording a partial-ACK observation', async () => {

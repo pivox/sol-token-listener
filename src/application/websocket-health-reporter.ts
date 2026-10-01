@@ -171,7 +171,18 @@ export class PersistentWebSocketHealthReporter {
       this.degraded = true;
       throw reporterError('ENQUEUE_FAILED');
     }
+    await this.observeFiltered(slot, ownerGeneration, sessionGeneration);
+  }
+
+  public async observeFiltered(
+    slot: bigint,
+    ownerGeneration: bigint,
+    sessionGeneration: bigint,
+  ): Promise<'RECORDED' | 'STALE_SESSION'> {
     try {
+      if (typeof slot !== 'bigint' || slot < 0n || slot > MAX_WEBSOCKET_HEALTH_SLOT) {
+        throw reporterError('OBSERVATION_FAILED');
+      }
       const result: unknown = await this.health.recordObservation({
         ownerGeneration,
         sessionGeneration,
@@ -180,6 +191,7 @@ export class PersistentWebSocketHealthReporter {
       if (result !== 'RECORDED' && result !== 'STALE_SESSION') {
         throw reporterError('OBSERVATION_FAILED');
       }
+      return result;
     } catch {
       this.degraded = true;
       throw reporterError('OBSERVATION_FAILED');

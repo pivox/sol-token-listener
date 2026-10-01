@@ -46,6 +46,46 @@ import type {
   WsProgramSessionCompletion,
 } from '../src/solana/rpc/ws-program-session.js';
 
+void test('passive observations retain activity and session fences without enqueue', async () => {
+  const fixture = supervisorFixture();
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+  const passive = Object.freeze({ endpointId: 'primary' as const, program: 'pumpfun' as const,
+    hint: 'NONE' as const, hintMint: null, signature: '1'.repeat(64), slot: 43n,
+    filteredReason: 'PASSIVE_PUMP_ACCOUNT_MENTION' as const });
+  await observe(passive);
+  assert.equal(fixture.reporter.observations.length, 0);
+  assert.deepEqual(fixture.reporter.filteredObservations, [{ slot: 43n,
+    ownerGeneration: 1n, sessionGeneration: 1n }]);
+  const metrics = fixture.supervisor.filteredNotificationMetrics();
+  assert.equal(metrics.byProvider.primary, 1);
+  assert.ok(Object.isFrozen(metrics));
+  assert.ok(Object.isFrozen(metrics.byProvider));
+  await assert.rejects(observe(Object.freeze({ ...passive, program: 'pumpswap' })));
+  await assert.rejects(observe(Object.freeze({ ...passive, hint: 'PUMPFUN_CREATE' })));
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({ ...passive }, 'filteredReason', {
+    get: () => { getterCalls += 1; return 'PASSIVE_PUMP_ACCOUNT_MENTION'; },
+  });
+  for (const hostile of [accessor, new Proxy(passive, {}),
+    { ...passive, filteredReason: undefined }, { ...passive, filteredReason: 'UNKNOWN' }]) {
+    await assert.rejects(observe(hostile as WsProgramNotification));
+  }
+  assert.equal(getterCalls, 0);
+  fixture.reporter.filteredResult = 'STALE_SESSION';
+  await observe(passive);
+  assert.equal(fixture.supervisor.filteredNotificationMetrics().byProvider.primary, 1);
+  await fixture.supervisor.close();
+  await observe(passive);
+  assert.equal(fixture.supervisor.filteredNotificationMetrics().byProvider.primary, 1);
+});
+
 void test('equal-jitter backoff uses exact capped zero-based delays and rejects hostile inputs', () => {
   assert.equal(equalJitterDelay(0, 0), 500);
   assert.equal(equalJitterDelay(0, 0.999), 999);
@@ -3389,6 +3429,13 @@ class RecordingCatalog implements RpcProviderCatalog {
 }
 
 class RecordingReporter extends PersistentWebSocketHealthReporter {
+  public readonly filteredObservations: { slot: bigint; ownerGeneration: bigint; sessionGeneration: bigint }[] = [];
+  public filteredResult: 'RECORDED' | 'STALE_SESSION' = 'RECORDED';
+
+  public override async observeFiltered(slot: bigint, ownerGeneration: bigint, sessionGeneration: bigint): Promise<'RECORDED' | 'STALE_SESSION'> {
+    this.filteredObservations.push({ slot, ownerGeneration, sessionGeneration });
+    return this.filteredResult;
+  }
   public readonly transitions: WebSocketHealthTransition[] = [];
   public readonly observations: RecordedObservation[] = [];
   public readonly snapshots: WebSocketHealthSnapshot[] = [];
