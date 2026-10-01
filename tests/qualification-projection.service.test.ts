@@ -10,6 +10,10 @@ import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../src/domain/participant-analytics.js';
 import type { QuoteAsset } from '../src/domain/types.js';
 import type { WalletGraphAnalysis } from '../src/domain/wallet-graph.js';
+import {
+  registerTrustedTerminalAttribution,
+  trustedTerminalAttribution,
+} from '../src/domain/terminal-attribution.js';
 import type {
   CanonicalQualificationProjection,
   QualificationCanonicalSnapshot,
@@ -103,6 +107,10 @@ void test('rejects a missing active launch with a typed error without changing c
       assert.ok(error instanceof QualificationProjectionLaunchNotFoundError);
       assert.equal(error.mint, 'MINT');
       assert.equal(error.message, 'Qualification projection launch not found for mint MINT.');
+      assert.deepEqual(trustedTerminalAttribution(error), {
+        version: 1, diagnosticCode: 'QUALIFICATION_LAUNCH_MISSING', causeKind: null, pumpWire: null,
+      });
+      assert.deepEqual(Object.keys(error), ['mint', 'name']);
       return true;
     },
   );
@@ -116,11 +124,73 @@ void test('raises the typed missing-launch error after a wrapping transaction co
 
   await assert.rejects(
     () => service(repository, ['SOL']).rebuild('MINT'),
-    QualificationProjectionLaunchNotFoundError,
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionLaunchNotFoundError);
+      assert.equal(trustedTerminalAttribution(error)?.diagnosticCode, 'QUALIFICATION_LAUNCH_MISSING');
+      return true;
+    },
   );
   assert.equal(repository.callbackErrorsWrapped, 0);
   assert.deepEqual(delegate.dissolutions, []);
   assert.deepEqual(delegate.replacements, []);
+});
+
+void test('attributes only the rebuilder failure without changing its identity or shape', async (t) => {
+  const failure: Error = Object.freeze(new Error('secret https://private/?token=secret'));
+  const before = Object.getOwnPropertyDescriptors(failure);
+  const repository = new FakeRepository(snapshot(), []);
+  const rebuilder = new QualificationRebuildService(new QualificationEngine(createDefaultQualificationRuleSet(60)));
+  t.mock.method(rebuilder, 'rebuild', () => { throw failure; });
+  await assert.rejects(new QualificationProjectionService(repository, rebuilder, ['SOL']).rebuild('MINT'),
+    (error: unknown) => error === failure);
+  assert.deepEqual(Object.getOwnPropertyDescriptors(failure), before);
+  assert.deepEqual(trustedTerminalAttribution(failure), {
+    version: 1, diagnosticCode: 'QUALIFICATION_REBUILD_UNKNOWN', causeKind: null, pumpWire: null,
+  });
+  assert.deepEqual(repository.replacements, []);
+});
+
+void test('preserves a more specific trusted rebuilder diagnostic', async (t) => {
+  const failure = new Error('secret');
+  const evidence = registerTrustedTerminalAttribution(failure, {
+    version: 1, diagnosticCode: 'QUALIFICATION_DATA_INVALID', causeKind: null, pumpWire: null,
+  });
+  const rebuilder = new QualificationRebuildService(new QualificationEngine(createDefaultQualificationRuleSet(60)));
+  t.mock.method(rebuilder, 'rebuild', () => { throw failure; });
+  await assert.rejects(new QualificationProjectionService(new FakeRepository(snapshot(), []), rebuilder, ['SOL']).rebuild('MINT'),
+    (error: unknown) => error === failure);
+  assert.equal(trustedTerminalAttribution(failure), evidence);
+});
+
+void test('does not inspect hostile rebuilder errors or replace primitive and proxy throws', async (t) => {
+  let reads = 0;
+  const hostile = Object.create(null) as object;
+  for (const key of ['code', 'message', 'cause', 'terminalAttribution']) {
+    Object.defineProperty(hostile, key, { get: () => { reads += 1; throw new Error('secret getter'); } });
+  }
+  const proxy = new Proxy({}, {
+    get: () => { reads += 1; throw new Error('secret proxy'); },
+    getPrototypeOf: () => { reads += 1; throw new Error('secret prototype'); },
+    ownKeys: () => { reads += 1; throw new Error('secret keys'); },
+  });
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  for (const failure of [hostile, proxy, revoked.proxy, null, undefined, 'secret', 42, Symbol('secret')]) {
+    const rebuilder = new QualificationRebuildService(new QualificationEngine(createDefaultQualificationRuleSet(60)));
+    // eslint-disable-next-line @typescript-eslint/only-throw-error -- exercise arbitrary thrown values without inspecting them
+    t.mock.method(rebuilder, 'rebuild', () => { throw failure; });
+    let rejected = false;
+    try {
+      await new QualificationProjectionService(new FakeRepository(snapshot(), []), rebuilder, ['SOL']).rebuild('MINT');
+    } catch (error: unknown) {
+      rejected = true;
+      assert.equal(error === failure, true);
+    }
+    assert.equal(rejected, true);
+    assert.equal(trustedTerminalAttribution(failure)?.diagnosticCode ?? null,
+      failure === hostile ? 'QUALIFICATION_REBUILD_UNKNOWN' : null);
+  }
+  assert.equal(reads, 0);
 });
 
 void test('dissolves only the current projection when an orphan replay has no canonical launch', async () => {

@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { QualificationProjectionService } from '../src/application/qualification-projection.service.js';
+import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
+import { QualificationEngine, createDefaultQualificationRuleSet } from '../src/qualification/qualification-engine.js';
+import { trustedTerminalAttribution } from '../src/domain/terminal-attribution.js';
+import type { QualificationProjectionRepository } from '../src/ports/qualification-projection-repository.js';
 import {
   MAX_OBSERVED_PIPELINE_ITEMS,
   ObservedPipelineError,
@@ -210,6 +215,7 @@ interface HarnessOptions {
   readonly marketAffectedMints?: readonly string[];
   readonly paperDecisions?: boolean;
   readonly synchronizer?: boolean;
+  readonly qualification?: QualificationProjectionService;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -338,7 +344,7 @@ function harness(options: HarnessOptions = {}) {
     graph,
     market,
     paperDecisions,
-    qualification,
+    options.qualification ?? qualification,
     synchronizer,
   );
   return {
@@ -572,6 +578,46 @@ void test('attributes a qualification failure to its mint and stops before paper
   assert.deepEqual(h.order.slice(-2), ['qualification:MintA', 'qualification:MintB']);
   assert.equal(h.order.some((call) => call.startsWith('paper:')), false);
 });
+
+for (const diagnosticCode of ['QUALIFICATION_LAUNCH_MISSING', 'QUALIFICATION_REBUILD_UNKNOWN'] as const) {
+  void test(`preserves real service ${diagnosticCode} through the qualification pipeline`, async (t) => {
+    const launchEvent = event(`diagnostic-${diagnosticCode}`, 'MintA', 'TokenLaunchDetected');
+    assert.equal(launchEvent.type, 'TokenLaunchDetected');
+    if (launchEvent.type !== 'TokenLaunchDetected') return;
+    const repository: QualificationProjectionRepository = {
+      transact: async (_mint, operation) => operation({
+        loadCanonicalInput: async () => diagnosticCode === 'QUALIFICATION_LAUNCH_MISSING' ? null : {
+          mint: 'MintA', asOfEvent: { ...launchEvent, payload: { ...launchEvent.payload } }, asOfRawEventId: 'raw-source',
+          launch: launchEvent.payload.launch, metadata: null, social: null,
+          creatorProfile: null, holderSnapshot: null, walletGraph: null,
+        },
+        dissolveCurrent: async () => { assert.fail('must not dissolve'); },
+        replaceProjection: async () => { assert.fail('must not persist'); },
+      }),
+    };
+    const rebuilder = new QualificationRebuildService(new QualificationEngine(createDefaultQualificationRuleSet(60)));
+    t.mock.method(rebuilder, 'rebuild', () => { throw new Error('secret https://private/?token=secret'); });
+    const h = harness({
+      launchpadAffectedMints: ['MintA'], paperDecisions: true,
+      qualification: new QualificationProjectionService(repository, rebuilder, ['QuoteMint']),
+    });
+    await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
+      assert.ok(error instanceof ObservedPipelineError);
+      assert.equal(error.stage, 'qualification');
+      assert.equal(error.mint, 'MintA');
+      const failure = trustedObservedPipelineFailure(error);
+      assert.ok(failure);
+      assert.equal(failure.errorName, 'ObservedPipelineFailure.v1.qualification.UNKNOWN');
+      assert.equal(failure.retryable, true);
+      assert.deepEqual(trustedTerminalAttribution(failure), {
+        version: 1, diagnosticCode, causeKind: null, pumpWire: null,
+      });
+      assert.equal(JSON.stringify(failure).includes('secret'), false);
+      return true;
+    });
+    assert.equal(h.order.some((call) => call.startsWith('paper:')), false);
+  });
+}
 
 void test('attributes a paper enqueue failure to its mint and stops deterministically', async () => {
   const h = harness({
