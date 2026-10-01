@@ -69,6 +69,12 @@ following `tests/transaction-inbox-funding-attribution-migration.test.ts`),
 Also update `src/execution-migrations/live-catalog.ts` with the exact new migration
 checksum, and prior migration tests whose latest-migration expectation advances.
 Keep their predecessor/replay tests scoped to the migration they actually prove.
+Migration-head consumers also include `scripts/deployment-smoke.mjs`,
+`src/executor-live/startup-validator.ts`, and
+`src/executor-live-recovery/startup-validator.ts`; advance only their head
+literal/catalog expectations, without changing execution or enabling live mode.
+Audit `rg -n '058_transaction|length, 58' src tests scripts` and distinguish
+historical checksum/predecessor references (retain) from latest-head assertions.
 
 - [ ] RED: each new code roundtrips only with stage qualification; wrong stage
   and arbitrary diagnostic are rejected; existing v1 codes/rows stay valid.
