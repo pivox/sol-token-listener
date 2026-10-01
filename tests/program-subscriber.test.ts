@@ -19,6 +19,31 @@ const firstTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) 
 const secondTradeMint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 2));
 const web3ConnectionSatisfiesPort: Connection extends ProgramLogsConnection ? true : false = true;
 
+void test('counts passive Pump mentions only with admission enabled and preserves ambiguous work', async () => {
+  const passive = [
+    'Program 11111111111111111111111111111111 invoke [1]',
+    'Program 11111111111111111111111111111111 success',
+  ];
+  for (const enabled of [false, true]) {
+    const connection = new FakeConnection();
+    const inbox = new FakeInbox();
+    const subscriber = makeSubscriber(connection, inbox, enabled);
+    await subscriber.start();
+    connection.emit(PUMP_PROGRAM_ID, logs(signature, null, passive), context(42));
+    connection.emit(PUMP_PROGRAM_ID, logs(signature, null, [...passive, 'Log truncated']), context(42));
+    connection.emit(PUMPSWAP_PROGRAM_ID, logs(signature, null, passive), context(42));
+    await tick();
+    assert.equal(inbox.notifications.length, enabled ? 2 : 3);
+    assert.deepEqual(subscriber.filteredNotificationMetrics(), {
+      reasonCode: 'PASSIVE_PUMP_ACCOUNT_MENTION', count: enabled ? 1 : 0,
+    });
+    assert.ok(Object.isFrozen(subscriber.filteredNotificationMetrics()));
+    await subscriber.close();
+    connection.emit(PUMP_PROGRAM_ID, logs(signature, null, passive), context(42));
+    assert.equal(subscriber.filteredNotificationMetrics().count, enabled ? 1 : 0);
+  }
+});
+
 void test('subscribes exactly once to both official programs at processed commitment', async () => {
   assert.equal(web3ConnectionSatisfiesPort, true);
   const connection = new FakeConnection();

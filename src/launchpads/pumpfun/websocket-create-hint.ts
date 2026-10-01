@@ -1,5 +1,6 @@
 import { isProxy } from 'node:util/types';
 import { PublicKey } from '@solana/web3.js';
+import { PUMP_PROGRAM_ID } from './constants.js';
 import { PUMP_EVENTS } from './generated/pump-idl.js';
 
 export const PUMPFUN_WEBSOCKET_HINTS = Object.freeze([
@@ -23,6 +24,9 @@ export const MAX_PUMPFUN_WEBSOCKET_LOG_TOTAL_BYTES = 65_536;
 const PROGRAM_DATA_PREFIX = 'Program data: ';
 const RUNTIME_LOG_TRUNCATED = 'Log truncated';
 const RUNTIME_PROGRAM_INVOCATION = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[[1-9][0-9]*\]$/u;
+const PASSIVE_PROGRAM_INVOCATION = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[([1-9][0-9]*)\]$/u;
+const PASSIVE_PROGRAM_SUCCESS = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) success$/u;
+const PASSIVE_PROGRAM_CONSUMPTION = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) consumed (0|[1-9][0-9]*) of (0|[1-9][0-9]*) compute units$/u;
 const MAX_VETO_PROGRAM_COUNT = 16;
 const CREATE_EVENT_DISCRIMINATOR = Buffer.from(PUMP_EVENTS.CreateEvent.discriminator);
 const TRADE_EVENT_DISCRIMINATOR = Buffer.from(PUMP_EVENTS.TradeEvent.discriminator);
@@ -32,6 +36,62 @@ const NONE_HINT: PumpFunWebSocketCreateHint = Object.freeze({ hint: 'NONE', hint
 const CREATE_HINT: PumpFunWebSocketCreateHint = Object.freeze({
   hint: 'PUMPFUN_CREATE', hintMint: null,
 });
+
+/**
+ * A narrow proof over intact RPC runtime logs, not an instruction inventory or
+ * authentication against a provider removing whole frames. False means unknown.
+ * Stable control grammar: anza-xyz/agave program-runtime/src/stable_log.rs.
+ * Program text stays opaque; unsupported log forms deliberately fail open.
+ * The coordinator supplies additional veto programs (including PumpSwap).
+ */
+export function isPassivePumpMentionFromLogs(
+  logs: unknown,
+  vetoProgramIds: unknown = [],
+): boolean {
+  const snapshot = snapshotLogs(logs);
+  const vetoPrograms = snapshotVetoPrograms(vetoProgramIds);
+  if (snapshot === null || snapshot.length === 0 || vetoPrograms === null) return false;
+  const stack: string[] = [];
+  let invoked = false;
+  for (const line of snapshot) {
+    // Never split or normalize program-controlled text into runtime records.
+    if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(line)) return false;
+    const invocation = PASSIVE_PROGRAM_INVOCATION.exec(line);
+    if (invocation !== null) {
+      const program = invocation[1];
+      if (program === undefined || invocation[2] !== String(stack.length + 1)
+        || program === PUMP_PROGRAM_ID || vetoPrograms.has(program)) return false;
+      try {
+        if (new PublicKey(program).toBase58() !== program) return false;
+      } catch {
+        return false;
+      }
+      stack.push(program);
+      invoked = true;
+      continue;
+    }
+    const current = stack.at(-1);
+    if (current === undefined) return false;
+    const success = PASSIVE_PROGRAM_SUCCESS.exec(line);
+    if (success !== null) {
+      if (success[1] !== current) return false;
+      stack.pop();
+      continue;
+    }
+    if (line.startsWith('Program log: ')) continue;
+    const consumption = PASSIVE_PROGRAM_CONSUMPTION.exec(line);
+    if (consumption !== null) {
+      const consumed = Number(consumption[2]);
+      const available = Number(consumption[3]);
+      if (consumption[1] !== current || !Number.isSafeInteger(consumed)
+        || !Number.isSafeInteger(available) || consumed > available) return false;
+      continue;
+    }
+    // Includes truncation, failures, data/return payloads and unknown grammar.
+    return false;
+  }
+  return invoked && stack.length === 0;
+}
 
 export function pumpFunCreateHintFromLogs(logs: unknown): PumpFunWebSocketHint {
   const { hint } = pumpFunWebSocketHintFromLogs(logs);

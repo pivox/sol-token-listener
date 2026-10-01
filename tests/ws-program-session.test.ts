@@ -13,6 +13,34 @@ import {
   type WsProgramSessionWebSocket,
 } from '../src/solana/rpc/ws-program-session.js';
 
+void test('bounded admission forwards passive mentions as activity without changing legacy payloads', async () => {
+  for (const enabled of [false, true]) {
+    const socket = new FakeWebSocket();
+    const scheduler = new ManualScheduler();
+    const frames: WsProgramNotification[] = [];
+    const session = await acknowledge(openWsProgramSession(
+      { id: 'primary', url: 'wss://rpc.invalid/private' },
+      async (frame) => { frames.push(frame); }, new AbortController().signal,
+      { createWebSocket: () => socket, scheduler, workerAdmissionEnabled: enabled },
+    ), socket);
+    socket.message(notification(101, 42, '1'.repeat(64), null, [
+      'Program 11111111111111111111111111111111 invoke [1]',
+      'Program log: unrelated operation',
+      'Program 11111111111111111111111111111111 consumed 100 of 200000 compute units',
+      'Program 11111111111111111111111111111111 success',
+    ]));
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.deepEqual(frames, [{ endpointId: 'primary', program: 'pumpfun',
+      signature: '1'.repeat(64), slot: 42n, hint: 'NONE', hintMint: null,
+      ...(enabled ? { filteredReason: 'PASSIVE_PUMP_ACCOUNT_MENTION' } : {}),
+    }]);
+    const closing = session.close(new AbortController().signal);
+    socket.message({ jsonrpc: '2.0', id: 3, result: true });
+    socket.message({ jsonrpc: '2.0', id: 4, result: true });
+    await closing;
+  }
+});
+
 void test('opens only after both confirmed subscriptions acknowledge and forwards the first program immediately', async () => {
   const socket = new FakeWebSocket();
   const scheduler = new ManualScheduler();
