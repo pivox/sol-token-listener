@@ -19,6 +19,8 @@ import {
   registerTrustedTerminalAttributionContext, trustedTerminalAttributionContext,
 } from '../domain/terminal-attribution.js';
 
+import type { WorkerPhaseDiagnosticObserver, WorkerDiagnosticPhase, WorkerAttemptOutcome, WorkerClaimOutcome } from './worker-phase-diagnostic.js';
+
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export type TransactionInboxWorkerState =
@@ -67,6 +69,7 @@ export interface TransactionInboxWorkerOptions {
   readonly now?: () => number;
   readonly scheduler?: TransactionInboxWorkerScheduler;
   readonly canClaim?: () => boolean;
+  readonly phaseObserver?: WorkerPhaseDiagnosticObserver;
 }
 
 export class TransactionInboxWorkerError extends Error {
@@ -94,6 +97,7 @@ export class TransactionInboxWorker {
   private readonly now: () => number;
   private readonly scheduler: TransactionInboxWorkerScheduler;
   private readonly canClaim: (() => boolean) | null;
+  private readonly phaseObserver: WorkerPhaseDiagnosticObserver | undefined;
   private currentState: TransactionInboxWorkerState = 'STOPPED';
   private runTail: Promise<void> = Promise.resolve();
   private loopPromise: Promise<void> | null = null;
@@ -134,6 +138,7 @@ export class TransactionInboxWorker {
     this.now = options.now ?? Date.now;
     this.scheduler = options.scheduler ?? systemScheduler;
     this.canClaim = canClaim;
+    try { this.phaseObserver = options.phaseObserver; } catch { /* Diagnostics are optional. */ }
   }
 
   public get state(): TransactionInboxWorkerState {
@@ -193,29 +198,48 @@ export class TransactionInboxWorker {
     if (this.permanentlyClosed) return frozenResult({ kind: 'closed' });
     if (!this.canClaimNow()) return frozenResult({ kind: 'idle' });
     let claimed: ClaimedTransaction | null;
+    const finishClaim = this.beginPhase('claim_call');
     try {
       claimed = await this.repository.claim(this.readNow(), this.leaseSeconds);
     } catch {
+      this.recordClaimOutcome('exceptional');
       this.reportDegraded();
       throw new TransactionInboxWorkerError('claim');
+    } finally {
+      finishClaim();
     }
+    this.recordClaimOutcome(claimed === null ? 'idle' : 'claimed');
     if (claimed === null) return frozenResult({ kind: 'idle' });
+    const finishAttempt = this.beginAttempt();
+    let outcome: WorkerAttemptOutcome = 'exceptional';
     try {
-      assertValidClaimedTransaction(claimed);
-    } catch {
-      if (hasPotentialCorruptSnapshot(claimed)) {
-        return this.processClaim(claimed, normalizationFailure());
+      let invalidSnapshot: IngestionFailure | null = null;
+      try {
+        assertValidClaimedTransaction(claimed);
+      } catch {
+        if (hasPotentialCorruptSnapshot(claimed)) {
+          invalidSnapshot = normalizationFailure();
+        } else {
+          this.reportDegraded();
+          throw new TransactionInboxWorkerError('claim');
+        }
       }
-      this.reportDegraded();
-      throw new TransactionInboxWorkerError('claim');
+      const result = await this.processClaim(claimed, invalidSnapshot);
+      if (result.kind !== 'idle' && result.kind !== 'closed') outcome = result.kind;
+      return result;
+    } finally {
+      finishAttempt(outcome);
     }
-    return this.processClaim(claimed);
   }
 
   private async processClaim(
     claim: ClaimedTransaction,
     invalidSnapshot: IngestionFailure | null = null,
   ): Promise<TransactionInboxRunResult> {
+    // The first completion includes persistence; cleanup-only exits also get one
+    // completion sample. The duplicate finish in finally must not start another.
+    let completion: (() => void) | undefined;
+    const beginCompletion = (): (() => void) => completion ??= this.beginPhase('completion');
     const lease = new LeaseGuard(
       claim,
       this.repository,
@@ -227,73 +251,89 @@ export class TransactionInboxWorker {
       () => { this.reportCleanupFailure(); },
     );
     try {
-      if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
-      if (invalidSnapshot !== null) return await this.failClaim(claim, invalidSnapshot, lease);
-      return await this.processOwnedClaim(claim, lease);
+      const finishSetup = this.beginPhase('claim_setup');
+      try {
+        if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+      } finally { finishSetup(); }
+      if (invalidSnapshot !== null) return await this.failClaim(claim, invalidSnapshot, lease, beginCompletion);
+      return await this.processOwnedClaim(claim, lease, beginCompletion);
     } finally {
-      await lease.finish();
+      const finishCompletion = beginCompletion();
+      try { await lease.finish(); } finally { finishCompletion(); }
     }
   }
 
   private async processOwnedClaim(
     claim: ClaimedTransaction,
     lease: LeaseGuard,
+    beginCompletion: () => () => void,
   ): Promise<TransactionInboxRunResult> {
     let transaction: NormalizedTransaction;
-    if (claim.normalizedTransaction === null) {
-      if (claim.confirmationStatus === 'orphaned') {
-        return this.failClaim(claim, normalizationFailure(), lease);
+    let finishSnapshot: () => void = () => { /* No snapshot phase before hydration. */ };
+    try {
+      if (claim.normalizedTransaction === null) {
+        if (claim.confirmationStatus === 'orphaned') {
+          return await this.failClaim(claim, normalizationFailure(), lease, beginCompletion);
+        }
+        const finishLocator = this.beginPhase('locator');
+        try {
+          transaction = await this.locator.locate(Object.freeze({
+            signature: claim.signature,
+            slot: claim.slot,
+            confirmationStatus: legacyStatus(claim.confirmationStatus),
+          }));
+        } catch (error) {
+          finishLocator();
+          return await this.failClaim(claim, locatorFailure(error), lease, beginCompletion);
+        } finally { finishLocator(); }
+        finishSnapshot = this.beginPhase('snapshot_and_ownership');
+        if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+        let view: NormalizedTransaction;
+        try {
+          const snapshot = createDurableTransactionSnapshot(transaction);
+          assertValidClaimedTransaction(Object.freeze({
+            ...claim,
+            normalizedTransaction: snapshot,
+          }));
+          view = immutableClaimView(
+            restoreNormalizedTransactionSnapshot(snapshot),
+            claim.confirmationStatus,
+          );
+        } catch {
+          finishSnapshot();
+          return await this.failClaim(claim, normalizationFailure(), lease, beginCompletion);
+        }
+        if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+        try {
+          await this.repository.saveSnapshot(
+            claim.signature,
+            claim.leaseToken,
+            transaction,
+          );
+        } catch {
+          this.reportDegraded();
+          throw new TransactionInboxWorkerError('save-snapshot');
+        }
+        transaction = view;
+      } else {
+        this.recordSnapshotReuse();
+        finishSnapshot = this.beginPhase('snapshot_and_ownership');
+        try {
+          transaction = immutableClaimView(
+            restoreNormalizedTransactionSnapshot(claim.normalizedTransaction),
+            claim.confirmationStatus,
+          );
+        } catch {
+          finishSnapshot();
+          return await this.failClaim(claim, normalizationFailure(), lease, beginCompletion);
+        }
       }
-      try {
-        transaction = await this.locator.locate(Object.freeze({
-          signature: claim.signature,
-          slot: claim.slot,
-          confirmationStatus: legacyStatus(claim.confirmationStatus),
-        }));
-      } catch (error) {
-        return this.failClaim(claim, locatorFailure(error), lease);
-      }
-      if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
-      let view: NormalizedTransaction;
-      try {
-        const snapshot = createDurableTransactionSnapshot(transaction);
-        assertValidClaimedTransaction(Object.freeze({
-          ...claim,
-          normalizedTransaction: snapshot,
-        }));
-        view = immutableClaimView(
-          restoreNormalizedTransactionSnapshot(snapshot),
-          claim.confirmationStatus,
-        );
-      } catch {
-        return this.failClaim(claim, normalizationFailure(), lease);
-      }
-      if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
-      try {
-        await this.repository.saveSnapshot(
-          claim.signature,
-          claim.leaseToken,
-          transaction,
-        );
-      } catch {
-        this.reportDegraded();
-        throw new TransactionInboxWorkerError('save-snapshot');
-      }
-      transaction = view;
-    } else {
-      try {
-        transaction = immutableClaimView(
-          restoreNormalizedTransactionSnapshot(claim.normalizedTransaction),
-          claim.confirmationStatus,
-        );
-      } catch {
-        return this.failClaim(claim, normalizationFailure(), lease);
-      }
-    }
 
-    if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+      if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+    } finally { finishSnapshot(); }
 
     let pipelineFailed: IngestionFailure | null = null;
+    const finishPipeline = this.beginPhase('pipeline');
     try {
       await this.pipeline.process(transaction, claim.observedAtMs);
     } catch (error) {
@@ -311,35 +351,67 @@ export class TransactionInboxWorker {
           });
         } catch { /* Optional capture cannot affect the failure or lease decision. */ }
       }
-    }
-    const owned = await lease.finish();
-    if (!owned) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
-    if (pipelineFailed !== null) return this.markFailed(claim, pipelineFailed);
-
+    } finally { finishPipeline(); }
+    const finishCompletion = beginCompletion();
     try {
-      await this.repository.markProcessed(
-        claim.signature,
-        claim.leaseToken,
-        claim.confirmationStatus,
-      );
-    } catch {
-      this.reportDegraded();
-      throw new TransactionInboxWorkerError('mark-processed');
-    }
-    return frozenResult({ kind: 'processed', signature: claim.signature });
+      const owned = await lease.finish();
+      if (!owned) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+      if (pipelineFailed !== null) return await this.markFailed(claim, pipelineFailed);
+
+      try {
+        await this.repository.markProcessed(
+          claim.signature,
+          claim.leaseToken,
+          claim.confirmationStatus,
+        );
+      } catch {
+        this.reportDegraded();
+        throw new TransactionInboxWorkerError('mark-processed');
+      }
+      return frozenResult({ kind: 'processed', signature: claim.signature });
+    } finally { finishCompletion(); }
   }
 
   private async failClaim(
     claim: ClaimedTransaction,
     failure: IngestionFailure,
     lease: LeaseGuard,
+    beginCompletion: () => () => void,
   ): Promise<TransactionInboxRunResult> {
-    const owned = await lease.finish();
-    if (!owned) {
-      this.reportDegraded();
-      return frozenResult({ kind: 'lease-lost', signature: claim.signature });
-    }
-    return this.markFailed(claim, failure);
+    const finishCompletion = beginCompletion();
+    try {
+      const owned = await lease.finish();
+      if (!owned) {
+        this.reportDegraded();
+        return frozenResult({ kind: 'lease-lost', signature: claim.signature });
+      }
+      return await this.markFailed(claim, failure);
+    } finally { finishCompletion(); }
+  }
+
+  private beginPhase(phase: WorkerDiagnosticPhase): () => void {
+    let finish: (() => void) | undefined;
+    try { finish = this.phaseObserver?.beginPhase(phase); } catch { /* Optional diagnostics. */ }
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      try { finish?.(); } catch { /* Optional diagnostics. */ }
+    };
+  }
+
+  private beginAttempt(): (outcome: WorkerAttemptOutcome) => void {
+    let finish: ((outcome: WorkerAttemptOutcome) => void) | undefined;
+    try { finish = this.phaseObserver?.beginAttempt(); } catch { /* Optional diagnostics. */ }
+    return outcome => { try { finish?.(outcome); } catch { /* Optional diagnostics. */ } };
+  }
+
+  private recordClaimOutcome(outcome: WorkerClaimOutcome): void {
+    try { this.phaseObserver?.recordClaimOutcome(outcome); } catch { /* Optional diagnostics. */ }
+  }
+
+  private recordSnapshotReuse(): void {
+    try { this.phaseObserver?.recordSnapshotReuse(); } catch { /* Optional diagnostics. */ }
   }
 
   private async markFailed(

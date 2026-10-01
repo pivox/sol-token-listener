@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { ObservedPipelineError } from '../src/application/observed-transaction-pipeline.js';
 import test from 'node:test';
+import { WorkerPhaseDiagnosticRecorder } from '../src/application/worker-phase-diagnostic.js';
 import {
   TransactionInboxWorker,
   TransactionInboxWorkerError,
@@ -931,6 +932,106 @@ void test('rejects unsafe timing bounds without consulting injected objects', ()
   ]) {
     assert.throws(() => new TransactionInboxWorker(hostile as never, hostile as never, hostile as never, invalid), TypeError);
   }
+});
+
+void test('worker diagnostics measure phases without changing durable operations or business clock reads', async () => {
+  for (const scenario of ['success', 'reuse', 'locator', 'normalize', 'save', 'pipeline', 'lease', 'processed', 'failed', 'invalid', 'idle', 'claim', 'gate'] as const) {
+    async function run(enabled: boolean) {
+      let ticks = 0;
+      const events: string[] = [];
+      const recorder = new WorkerPhaseDiagnosticRecorder(() => ticks);
+      const step = (name: string, duration: number) => { events.push(name); ticks += duration; };
+      const worker = new TransactionInboxWorker(repositoryWith({
+        async claim() {
+          step('claim', 2);
+          if (scenario === 'claim') throw new Error('private');
+          if (scenario === 'idle') return null;
+          if (scenario === 'invalid') return {} as ClaimedTransaction;
+          return claim('sig', 1n, 'processed', scenario === 'reuse' ? createDurableTransactionSnapshot(normalized()) : null);
+        },
+        async renewLease() { step('renew', 3); if (scenario === 'lease') throw new Error('lost'); },
+        async saveSnapshot() { step('save', 7); if (scenario === 'save') throw new Error('private'); },
+        async markProcessed() { step('processed', 13); if (scenario === 'processed') throw new Error('private'); },
+        async markFailed() { step('failed', 17); if (scenario === 'failed') throw new Error('private'); },
+      }), { async locate() {
+        step('locate', 5);
+        if (scenario === 'locator' || scenario === 'failed') throw new Error('private');
+        return scenario === 'normalize' ? {} as NormalizedTransaction : normalized();
+      } }, { async process() { step('pipeline', 11); if (scenario === 'pipeline') throw new Error('private'); } }, options({
+        now: () => { events.push('now'); return 1_000; },
+        scheduler: { schedule() { events.push('schedule'); return 1; }, cancel() { step('cancel', 19); } },
+        canClaim: () => scenario !== 'gate',
+        ...(enabled ? { phaseObserver: recorder } : {}),
+      }));
+      let outcome: string;
+      try { outcome = (await worker.runOnce()).kind; } catch (error) { outcome = (error as TransactionInboxWorkerError).stage; }
+      return { events, outcome, snapshot: recorder.snapshot() };
+    }
+    const baseline = await run(false);
+    const observed = await run(true);
+    assert.deepEqual(observed.events, baseline.events, scenario);
+    assert.equal(observed.outcome, baseline.outcome, scenario);
+    const s = observed.snapshot;
+    assert.equal(s.phases.claim_call.count, scenario === 'gate' ? 0 : 1, scenario);
+    assert.equal(s.phases.claim_call.sumMs, scenario === 'gate' ? 0 : 2, scenario);
+    assert.deepEqual(s.claimOutcomes, {
+      claimed: !['gate', 'idle', 'claim'].includes(scenario) ? 1 : 0,
+      idle: scenario === 'idle' ? 1 : 0,
+      exceptional: scenario === 'claim' ? 1 : 0,
+    }, scenario);
+    const attempted = !['gate', 'idle', 'claim'].includes(scenario);
+    assert.equal(s.totalAttempt.count, attempted ? 1 : 0, scenario);
+    for (const phase of [...Object.values(s.phases), s.totalAttempt]) {
+      assert.equal(phase.active, 0, scenario);
+      assert.equal(phase.entered, phase.exited, scenario);
+    }
+    if (attempted) {
+      assert.equal(s.phases.completion.count, scenario === 'invalid' ? 0 : 1, scenario);
+      const outcome = ['save', 'processed', 'failed', 'invalid'].includes(scenario) ? 'exceptional'
+        : scenario === 'lease' ? 'lease-lost' : ['locator', 'normalize', 'pipeline'].includes(scenario) ? 'failed' : 'processed';
+      assert.equal(s.attemptOutcomes[outcome], 1, scenario);
+      const totalDurations: Record<string, number> = {
+        success: 58, reuse: 46, locator: 44, normalize: 44, save: 34,
+        pipeline: 62, lease: 3, processed: 58, failed: 44, invalid: 0,
+      };
+      assert.equal(s.totalAttempt.sumMs, totalDurations[scenario], scenario);
+    }
+    if (scenario === 'success' || scenario === 'reuse') {
+      assert.equal(s.phases.claim_setup.sumMs, 3);
+      assert.equal(s.phases.locator.sumMs, scenario === 'reuse' ? 0 : 5);
+      assert.equal(s.phases.locator.count, scenario === 'reuse' ? 0 : 1);
+      assert.equal(s.phases.snapshot_and_ownership.sumMs, scenario === 'reuse' ? 0 : 7);
+      assert.equal(s.phases.pipeline.sumMs, 11);
+      assert.equal(s.phases.completion.sumMs, 32);
+      assert.equal(s.phases.completion.count, 1);
+      assert.equal(s.totalAttempt.sumMs, scenario === 'reuse' ? 46 : 58);
+      assert.equal(s.snapshotReuse, scenario === 'reuse' ? 1 : 0);
+    }
+  }
+});
+
+void test('diagnostic getters, methods, finish callbacks and invalid clocks cannot affect worker results', async () => {
+  const boom = () => { throw new Error('diagnostic secret'); };
+  for (const observer of [
+    new Proxy({}, { get: boom }),
+    { beginPhase: boom, beginAttempt: boom, recordClaimOutcome: boom, recordSnapshotReuse: boom },
+    { beginPhase: () => boom, beginAttempt: () => boom, recordClaimOutcome: boom, recordSnapshotReuse: boom },
+    new WorkerPhaseDiagnosticRecorder(boom),
+    new WorkerPhaseDiagnosticRecorder(() => NaN),
+  ]) {
+    for (const fails of [false, true]) {
+      const worker = new TransactionInboxWorker(repositoryWith({
+        async claim() { return claim('sig', 1n, 'processed', createDurableTransactionSnapshot(normalized())); },
+        async markProcessed() { if (fails) throw new Error('business'); },
+      }), locator(), pipeline(), options({ phaseObserver: observer }));
+      if (fails) await assert.rejects(worker.runOnce(), { stage: 'mark-processed' });
+      else assert.equal((await worker.runOnce()).kind, 'processed');
+    }
+  }
+  const settings = options();
+  Object.defineProperty(settings, 'phaseObserver', { get: boom });
+  const worker = new TransactionInboxWorker(repositoryWith({ async claim() { return claim(); } }), locator(), pipeline(), settings);
+  assert.equal((await worker.runOnce()).kind, 'processed');
 });
 
 function options(overrides: Record<string, unknown> = {}) {
