@@ -63,7 +63,9 @@ Files: `src/application/qualification-projection.service.ts`,
 
 Files: `migrations/059_transaction_inbox_qualification_attribution.sql` (new),
 `tests/transaction-inbox-terminal-attribution.repository.test.ts`,
-`tests/migrations.test.ts`, relevant existing terminal-artifact validator tests.
+`tests/transaction-inbox-qualification-attribution-migration.test.ts` (new,
+following `tests/transaction-inbox-funding-attribution-migration.test.ts`),
+`tests/migration-contract.test.ts`, relevant existing terminal-artifact validator tests.
 
 - [ ] RED: each new code roundtrips only with stage qualification; wrong stage
   and arbitrary diagnostic are rejected; existing v1 codes/rows stay valid.
