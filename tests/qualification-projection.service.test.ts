@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   QualificationProjectionLaunchNotFoundError,
+  QualificationProjectionStaleQuotesError,
   QualificationProjectionService,
 } from '../src/application/qualification-projection.service.js';
 import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
@@ -39,6 +40,7 @@ void test('rebuilds and persists the canonical qualification projection', async 
   assert.equal(result.projection.qualificationEvent.mint, 'MINT');
   assert.equal(condition(result.projection, 'UNSUPPORTED_QUOTE_MINT').status, 'PASSED');
   assert.deepEqual(repository.transactedMints, ['MINT']);
+  assert.deepEqual(repository.replayPolicies, ['bounded-serialization']);
   assert.equal(repository.replacements.length, 1);
 });
 
@@ -266,6 +268,7 @@ void test('persists a quote-backed qualification under the canonical projection 
   assert.equal(result.projection.evaluation.calibrationFacts?.sellQuoteAvailable, true);
   assert.equal(result.projection.evaluation.calibrationFacts?.roundTripLossBps, 2_000n);
   assert.deepEqual(repository.transactedMints, ['MINT']);
+  assert.deepEqual(repository.replayPolicies, ['bounded-serialization']);
   assert.equal(repository.replacements.length, 1);
 });
 
@@ -307,6 +310,38 @@ void test('binds each quote-backed projection to the exact quote identities and 
     later.projection.evaluation.calibrationFacts?.quoteLineage,
   );
 });
+
+for (const field of ['observedSlot', 'observedAtMs'] as const) {
+  void test(`replayed callback reloads canonical input and revalidates quote ${field}`, async () => {
+    const initial = snapshot();
+    const fresh = snapshot({ asOfEvent: {
+      ...initial.asOfEvent,
+      observedAtMs: field === 'observedAtMs' ? 1_001 : initial.asOfEvent.observedAtMs,
+      cursor: { ...initial.asOfEvent.cursor, slot: field === 'observedSlot' ? 11n : 10n },
+    } });
+    let loads = 0;
+    const projections: CanonicalQualificationProjection[] = [];
+    const repository: QualificationProjectionRepository = {
+      async transact(_mint, operation, policy) {
+        assert.equal(policy, 'bounded-serialization');
+        for (const input of [initial, fresh]) {
+          await operation({
+            async loadCanonicalInput() { loads++; return input; },
+            async replaceProjection(projection) { projections.push(projection); return 'UPDATED'; },
+            async dissolveCurrent() { throw new Error('Unexpected dissolution'); },
+          });
+        }
+        throw new Error('Expected stale quote rejection on replay');
+      },
+    };
+    await assert.rejects(service(repository, ['SOL']).rebuildWithQuotes('MINT',
+      quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n),
+      quote('sell', 'MINT', 'SOL', 900n, 800n, 800n)),
+    (error: unknown) => error instanceof QualificationProjectionStaleQuotesError);
+    assert.equal(loads, 2);
+    assert.equal(projections.length, 1);
+  });
+}
 
 for (const side of ['BUY', 'SELL'] as const) {
 for (const field of ['observedSlot', 'observedAtMs'] as const) {
@@ -377,6 +412,7 @@ class FakeRepository implements QualificationProjectionRepository {
   public readonly dissolutions: string[] = [];
   public readonly replacements: CanonicalQualificationProjection[] = [];
   public readonly transactedMints: string[] = [];
+  public readonly replayPolicies: (string | undefined)[] = [];
   private replacementIndex = 0;
 
   public constructor(
@@ -388,8 +424,10 @@ class FakeRepository implements QualificationProjectionRepository {
   public async transact<TResult>(
     mint: string,
     operation: (transaction: QualificationProjectionTransaction) => Promise<TResult>,
+    policy?: string,
   ): Promise<TResult> {
     this.transactedMints.push(mint);
+    this.replayPolicies.push(policy);
     if (this.transactionFailure !== undefined) throw this.transactionFailure;
     return operation({
       loadCanonicalInput: async () => this.input,

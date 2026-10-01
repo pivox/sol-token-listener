@@ -127,7 +127,7 @@ export class QualificationProjectionService {
       });
       const kind = await transaction.replaceProjection(projection);
       return Object.freeze({ kind,projection,snapshot });
-    });
+    }, 'bounded-serialization');
     if (result === MISSING_CANONICAL_LAUNCH) {
       const error = new QualificationProjectionLaunchNotFoundError(mint);
       attributeQualificationFailure(error, 'QUALIFICATION_LAUNCH_MISSING');
