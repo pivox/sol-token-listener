@@ -131,7 +131,7 @@ until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-n
   fi
   sleep 2
 done
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps frontend
 ```
 
 La première pipeline retire uniquement l’image PostgreSQL déjà épinglée dans le
@@ -150,7 +150,9 @@ secondes ; une migration `--no-deps` ne part donc pas sur une base seulement
 démarrée. Lancez ensuite la migration one-shot, puis exactement une application
 et un worker de rétention, dont la préparation est aussi attendue avec une
 borne de 60 secondes. La boucle confirme ensuite le healthcheck compilé
-avant de publier le frontend derrière le proxy TLS externe. Vérifiez health, SSE
+avant de publier le frontend derrière le proxy TLS externe. Le frontend attend
+également sa disponibilité HTTP locale (`/index.html`), avec une borne de
+60 secondes ; cela ne remplace pas la vérification de l’API. Vérifiez health, SSE
 et les logs de rétention. La sonde SSE attend 20 secondes, donc au-delà du
 heartbeat par défaut de 15 secondes. Un `curl` encore connecté doit terminer
 uniquement sur son timeout attendu (code 28), puis les deux preuves sont

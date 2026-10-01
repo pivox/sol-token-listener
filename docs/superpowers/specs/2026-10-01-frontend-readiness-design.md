@@ -1,6 +1,6 @@
 # Frontend HTTP readiness
 
-Version 1.0.0 — issue #199.
+Version 1.0.1 — issue #199.
 
 ## Evidence
 
@@ -16,7 +16,9 @@ the race mechanism, not a retrospective trace of the failed CI container.
 Add a frontend Compose healthcheck for local `/index.html`, using the existing
 image's wget: `wget -q -T 2 -O /dev/null http://127.0.0.1:8080/index.html`.
 Use exec form, interval 2s, timeout 3s, retries 30, start period 10s. The existing
-120-second smoke startup deadline remains unchanged. A service that cannot
+120-second smoke startup deadline remains unchanged. Canonical forward rollout
+and rollback both use `--wait --wait-timeout 60` for frontend, so the readiness
+contract also applies outside the smoke. A service that cannot
 serve its static entrypoint must not be considered ready.
 
 This checks nginx/static availability, not backend health, token qualification

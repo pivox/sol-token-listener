@@ -1430,7 +1430,7 @@ void test('deployment runbook documents the safe production lifecycle and safety
   );
   assert.match(runbook, /up --detach --wait --wait-timeout 60 --no-build postgres/);
   assert.match(runbook, /deployment-healthcheck\.js --require-ok/);
-  assert.match(runbook, /up -d --no-build --no-deps frontend/);
+  assert.equal((runbook.match(/up -d --wait --wait-timeout 60 --no-build --no-deps frontend/g) ?? []).length, 2);
   assert.match(runbook, /4 heures/);
   assert.match(runbook, /15 minutes/);
   assert.match(runbook, /DEGRADED[\s\S]{0,120}smoke[\s\S]{0,120}listener[\s\S]{0,120}désactivé/i);
