@@ -312,7 +312,9 @@ function createCurrentGroup(
     || attemptsInCycle > attempts
     || (failureState !== 'TERMINAL' && failureState !== 'RETRY_PENDING')) invalidEvidence();
   if (processingStatus === 'FAILED') {
-    if (typeof retryable !== 'boolean' || catchUpReasonCode !== null
+    // Classification provenance survives worker claims and failures; it is not
+    // restricted to quarantined rows. The bounded reason parser still applies.
+    if (typeof retryable !== 'boolean'
       || (failureState === 'RETRY_PENDING' && !retryable)
       || normalizedErrorName === 'UNAVAILABLE'
       || (validObservedErrorName(normalizedErrorName)
