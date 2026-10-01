@@ -1,10 +1,10 @@
-# Qualification serialization reproduction and recovery — v1.1.1
+# Qualification serialization reproduction and recovery — v1.1.2
 
 ## Purpose and evidence
 
 Follow-up to #205/#206 and capacity issue #171. Canary `7c63710` has already
-recorded 39 `QUALIFICATION_POSTGRES_SERIALIZATION` occurrences near T+5. The
-complete run is still active. These labels prove query-boundary SQLSTATE 40001,
+recorded 39 `QUALIFICATION_POSTGRES_SERIALIZATION` occurrences near T+5 and 137
+across the completed run. These labels prove query-boundary SQLSTATE 40001,
 not which SQL statement failed or how much latency the failures caused.
 
 Establish deterministic PostgreSQL reproductions before choosing a production
@@ -163,7 +163,11 @@ implementation, all four PostgreSQL variants passed: opt-in rebuilt on the secon
 callback, default retained the original rejection. The service/unit suite passed
 50 tests with zero skips, repeated independently by the parent agent. Check,
 lint, full build, docs check and diff check passed; adjacent database suites also
-completed successfully. Final independent review, full suite and CI remain due.
+completed successfully. The single independent review of `7c63710..93abe5e`
+reported no concrete findings. The full local suite then passed 3,951 backend
+tests and 169 frontend tests, with no failures or skips; both database test URLs
+were supplied against the isolated PostgreSQL instance. CI remains required
+before merge. These counts describe this validation run, not a capacity verdict.
 
 The old raw-error reuse case does not authorize a third attempt, and quote
 freshness is rechecked on the changed canonical snapshot. These are correctness
