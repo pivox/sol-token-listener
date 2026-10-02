@@ -33,6 +33,15 @@ The final full run passes 4,018 backend tests with both PostgreSQL test URLs and
 pass on the corrected tree. CI and merge remain pending; these results do not
 establish Mainnet capacity or authorize a transaction.
 
+PR #210 CI found one intermittent failure in an existing decoder-quarantine
+fixture: two separate `clock_timestamp()` calls could cross a millisecond and
+violate the exact four-hour terminal retention constraint. A delayed SQL probe
+reproduced the inequality. Both identical fixture occurrences now derive their
+timestamps from one materialized clock. No production constraint or behavior is
+changed. The complete inbox repository suite passes 199/199 without skips;
+backend typecheck, scoped lint and diff check pass. The corrected CI must pass
+before merge; this fix remains within the single review cycle.
+
 ## Task 1 — Controller contract and deterministic state tests
 
 Create `src/application/hydration-group-admission.ts` and

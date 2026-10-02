@@ -1578,9 +1578,12 @@ void test('fails closed for every non-worker, malformed, processed, retryable an
     await storeWorkerDecoderQuarantine(
       repository, 'decoder-expired', 914n, 'PUMP_SCHEMA_UNSUPPORTED',
     );
-    await pool.query(`UPDATE chain_transaction_inbox SET
-      terminal_at=date_trunc('milliseconds',clock_timestamp()-INTERVAL '4 hours'),
-      purge_after=date_trunc('milliseconds',clock_timestamp())
+    await pool.query(`WITH fixture_clock AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+    ) UPDATE chain_transaction_inbox SET
+      terminal_at=fixture_clock.at-INTERVAL '4 hours',
+      purge_after=fixture_clock.at
+      FROM fixture_clock
       WHERE signature='decoder-expired'`);
     await storeWorkerDecoderQuarantine(
       repository, 'decoder-malformed', 915n, 'PUMP_SCHEMA_UNSUPPORTED',
@@ -2813,9 +2816,12 @@ void test('counts only retained unresolved worker decoder quarantines and clears
     await pool.query(`UPDATE chain_transaction_inbox SET
       manual_recovery_count=2147483647,last_manual_recovery_at=terminal_at
       WHERE signature='decoder-count-saturated'`);
-    await pool.query(`UPDATE chain_transaction_inbox SET
-      terminal_at=date_trunc('milliseconds',clock_timestamp()-INTERVAL '4 hours'),
-      purge_after=date_trunc('milliseconds',clock_timestamp())
+    await pool.query(`WITH fixture_clock AS MATERIALIZED (
+      SELECT date_trunc('milliseconds',clock_timestamp()) AS at
+    ) UPDATE chain_transaction_inbox SET
+      terminal_at=fixture_clock.at-INTERVAL '4 hours',
+      purge_after=fixture_clock.at
+      FROM fixture_clock
       WHERE signature='decoder-count-expired'`);
     await repository.recordCatchUpClassification(createCatchUpClassification({
       ...catchUpClassificationInput('decoder-count-catch-up'),
