@@ -1,6 +1,10 @@
 import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
 import { createPumpFunWorkerAdmissionPolicy } from '../domain/worker-admission.js';
 import {
+  snapshotRuntimeBlockHydrationAdmissionMetrics,
+  type RuntimeBlockHydrationAdmissionMetricsV1,
+} from '../domain/block-hydration-admission.js';
+import {
   requireSolanaGenesisHash,
   SolanaGenesisHashError,
 } from '../domain/solana-genesis-hash.js';
@@ -647,7 +651,7 @@ export function createProductionListenerRuntime(
       leaseSeconds: config.listenerWorkerLeaseSeconds,
       renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
       idlePollMs: 1_000,
-      ...(hydration === null ? {} : { canClaim: (): boolean => hydration.canWorkerClaim() }),
+      ...(hydration === null ? {} : { claimAdmission: hydration.workerAdmission() }),
     }),
   ), config.listenerWorkerCount === 1 ? {} : {
     beforeStart: async (): Promise<void> => {
@@ -678,6 +682,7 @@ export function createProductionListenerRuntime(
       inboxSnapshot: (): ReturnType<PostgresTransactionInboxRepository['heartbeatSnapshot']> =>
         inbox.heartbeatSnapshot(),
       ...(hydration === null ? {} : {
+        blockHydrationAdmissionMetrics: (): RuntimeBlockHydrationAdmissionMetricsV1 => hydration.admissionMetrics(),
         catchUpAdmissionMetrics: (counts: InboxCounts): RuntimeCatchUpAdmissionMetricsV1 => Object.freeze({
           version: 1,
           enabled: true,
@@ -741,6 +746,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
     workerAdmission: RuntimeWorkerAdmissionMetricsV1;
   }>>;
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
+  readonly blockHydrationAdmissionMetrics?: () => RuntimeBlockHydrationAdmissionMetricsV1;
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
   readonly workerAdmissionMetrics?: () => Promise<RuntimeWorkerAdmissionMetricsV1>;
@@ -1122,6 +1128,7 @@ export class PersistentListenerHeartbeat {
   private stopPromise: Promise<void> | null = null;
   private closed = false;
   private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
+  private readonly blockHydrationAdmissionMetrics: (() => RuntimeBlockHydrationAdmissionMetricsV1) | null;
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
   private readonly workerAdmissionMetrics: (() => Promise<RuntimeWorkerAdmissionMetricsV1>) | null;
@@ -1146,6 +1153,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Block hydration metrics provider is invalid.');
     }
     this.blockHydrationMetrics = options.blockHydrationMetrics ?? null;
+    if (options.blockHydrationAdmissionMetrics !== undefined
+      && typeof options.blockHydrationAdmissionMetrics !== 'function') {
+      throw new TypeError('Block hydration admission metrics provider is invalid.');
+    }
+    this.blockHydrationAdmissionMetrics = options.blockHydrationAdmissionMetrics ?? null;
     if (options.catchUpAdmissionMetrics !== undefined
       && typeof options.catchUpAdmissionMetrics !== 'function') {
       throw new TypeError('Catch-up admission metrics provider is invalid.');
@@ -1310,6 +1322,16 @@ export class PersistentListenerHeartbeat {
       }
     }
     const blockHydration = this.blockHydrationMetrics?.();
+    let blockHydrationAdmission: RuntimeBlockHydrationAdmissionMetricsV1 | undefined;
+    if (this.blockHydrationAdmissionMetrics !== null) {
+      try {
+        blockHydrationAdmission = snapshotRuntimeBlockHydrationAdmissionMetrics(
+          this.blockHydrationAdmissionMetrics(),
+        );
+      } catch {
+        throw new TypeError('Block hydration admission metrics are invalid.');
+      }
+    }
     let rpcHttpEvidence: RuntimeRpcHttpEvidenceV1 | undefined;
     if (this.rpcHttpEvidenceMetrics !== null) {
       try {
@@ -1350,6 +1372,7 @@ export class PersistentListenerHeartbeat {
         unresolvedCount: counts.decoderQuarantinedCount,
       })),
       ...(blockHydration === undefined ? {} : { blockHydration }),
+      ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
       ...(workerAdmission === undefined ? {} : { workerAdmission }),

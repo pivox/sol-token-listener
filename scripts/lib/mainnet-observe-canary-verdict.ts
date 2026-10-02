@@ -1,5 +1,9 @@
 import { types } from 'node:util';
 import {
+  snapshotRuntimeBlockHydrationAdmissionMetrics,
+  type RuntimeBlockHydrationAdmissionMetricsV1,
+} from '../../src/domain/block-hydration-admission.js';
+import {
   FIRST_PROCESSING_EVIDENCE_RETENTION_MS,
   createFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
@@ -19,7 +23,7 @@ export type MainnetObserveCanaryVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
 export const MAINNET_OBSERVE_CANARY_GATE_NAMES = [
   'runtime', 'http429', 'backlog', 'terminalFailures', 'idempotence', 'retention',
-  'decoderQuarantine', 'firstProcessing', 'blockHydration', 'catchUpAdmission',
+  'decoderQuarantine', 'firstProcessing', 'blockHydration', 'blockHydrationAdmission', 'catchUpAdmission',
   'workerAdmission', 'providerAffinity', 'rss', 'pumpswap', 'finality', 'versionsAndFreshReplay',
   'shutdown', 'cleanup',
 ] as const;
@@ -85,6 +89,9 @@ type TerminalCounts = Readonly<{ failed: number; quarantined: number; exhausted:
 type WorkerAdmissionEvidence =
   | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
   | Readonly<{ state: 'VALID'; value: RuntimeWorkerAdmissionMetricsV1 }>;
+type BlockHydrationAdmissionEvidence =
+  | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
+  | Readonly<{ state: 'VALID'; value: RuntimeBlockHydrationAdmissionMetricsV1 }>;
 type OptionalIntegerEvidence =
   | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
   | Readonly<{ state: 'VALID'; value: number }>;
@@ -149,6 +156,7 @@ interface Snapshot {
   readonly catchUpAdmission: Admission;
   readonly workerAdmission: WorkerAdmissionEvidence;
   readonly blockHydration: Hydration;
+  readonly blockHydrationAdmission: BlockHydrationAdmissionEvidence;
   readonly rpcHttpEvidence: RpcEvidence;
   readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
   readonly decoderQuarantine: Readonly<{ version: 1; unresolvedCount: number }>;
@@ -179,6 +187,7 @@ interface StoppedHeartbeat {
   readonly catchUpAdmission: Admission;
   readonly workerAdmission: WorkerAdmissionEvidence;
   readonly blockHydration: Hydration;
+  readonly blockHydrationAdmission: BlockHydrationAdmissionEvidence;
   readonly rpcHttpEvidence: RpcEvidence;
   readonly firstProcessingCanary: RuntimeFirstProcessingCanaryEvidenceV1;
 }
@@ -260,6 +269,7 @@ export function evaluateMainnetObserveCanary(
     decoderQuarantine: evaluateDecoder(evidence, attribution),
     firstProcessing: evaluateFirstProcessing(evidence),
     blockHydration: evaluateHydration(evidence),
+    blockHydrationAdmission: evaluateBlockHydrationAdmission(evidence),
     catchUpAdmission: evaluateAdmission(evidence),
     workerAdmission: evaluateWorkerAdmission(evidence),
     providerAffinity: evaluateAffinity(evidence),
@@ -550,6 +560,28 @@ function evaluateAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1
     }
   }
   return gate('PASS', 'ADMISSION_PROVIDER_AFFINE');
+}
+
+function evaluateBlockHydrationAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+  const evidence = [...orderedSnapshots(input).map((snapshot) => snapshot.blockHydrationAdmission),
+    input.stoppedHeartbeat.blockHydrationAdmission];
+  if (evidence.some((item) => item.state === 'MALFORMED')) {
+    return gate('FAIL', 'BLOCK_HYDRATION_ADMISSION_EVIDENCE_MALFORMED');
+  }
+  const stopped = input.stoppedHeartbeat.blockHydrationAdmission;
+  if (stopped.state === 'VALID' && (stopped.value.pendingWorkers !== 0
+    || stopped.value.pendingClassifierGroups !== 0 || stopped.value.unboundReservations !== 0
+    || stopped.value.activeGroups !== 0)) {
+    return gate('FAIL', 'BLOCK_HYDRATION_ADMISSION_NOT_DRAINED');
+  }
+  if (evidence.some((item) => item.state === 'MISSING')) {
+    return gate('INCONCLUSIVE', 'BLOCK_HYDRATION_ADMISSION_EVIDENCE_MISSING');
+  }
+  const metrics = evidence.flatMap((item) => item.state === 'VALID' ? [item.value] : []);
+  if (metrics.some((item) => !item.enabled)) {
+    return gate('INCONCLUSIVE', 'BLOCK_HYDRATION_ADMISSION_DISABLED');
+  }
+  return gate('PASS', 'BLOCK_HYDRATION_ADMISSION_BOUNDED');
 }
 
 function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
@@ -901,7 +933,7 @@ function parseSnapshot(value: unknown): Snapshot {
     'subscriberState', 'scannerState', 'workerState', 'reconcilerState', 'backlogCount',
     'leasedCount', 'websocket', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary', 'periodicPauseEvidence', 'decoderQuarantine', 'inbox', 'rssBytes',
-  ], ['workerAdmission']);
+  ], ['workerAdmission', 'blockHydrationAdmission']);
   const websocket = exactObject(input.websocket,
     ['phase', 'providerId', 'recoveryStatus', 'recoveryReasonCode']);
   const decoder = exactObject(input.decoderQuarantine, ['version', 'unresolvedCount']);
@@ -933,6 +965,7 @@ function parseSnapshot(value: unknown): Snapshot {
     catchUpAdmission: parseAdmission(input.catchUpAdmission),
     workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
     blockHydration: parseHydration(input.blockHydration),
+    blockHydrationAdmission: parseOptionalBlockHydrationAdmission(input),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary),
     decoderQuarantine: Object.freeze({ version: 1, unresolvedCount: integer(decoder.unresolvedCount) }),
@@ -952,7 +985,7 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     'reconcilerState',
     'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary',
-  ], ['workerAdmission']);
+  ], ['workerAdmission', 'blockHydrationAdmission']);
   return Object.freeze({ observedAtMs: integer(input.observedAtMs),
     startedAtMs: integer(input.startedAtMs),
     runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
@@ -964,8 +997,23 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     leasedCount: integer(input.leasedCount), catchUpAdmission: parseAdmission(input.catchUpAdmission),
     workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
     blockHydration: parseHydration(input.blockHydration),
+    blockHydrationAdmission: parseOptionalBlockHydrationAdmission(input),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary) });
+}
+
+function parseOptionalBlockHydrationAdmission(
+  input: Readonly<Record<string, unknown>>,
+): BlockHydrationAdmissionEvidence {
+  if (!Object.hasOwn(input, 'blockHydrationAdmission')) {
+    return Object.freeze({ state: 'MISSING', value: null });
+  }
+  try {
+    return Object.freeze({ state: 'VALID',
+      value: snapshotRuntimeBlockHydrationAdmissionMetrics(input.blockHydrationAdmission) });
+  } catch {
+    return Object.freeze({ state: 'MALFORMED', value: null });
+  }
 }
 
 function parseOptionalWorkerAdmission(

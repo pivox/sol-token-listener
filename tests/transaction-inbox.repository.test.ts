@@ -2886,6 +2886,59 @@ void test('persists detached decoder quarantine heartbeat metrics and supports l
   assert.deepEqual(captured[1]?.[14], { startedAt: '1970-01-01T00:00:01.000Z' });
 });
 
+function hydrationAdmissionHeartbeatMetrics() {
+  return Object.freeze({ version: 1 as const, enabled: true, registeredWorkers: 2,
+    pendingWorkers: 0, maximumPendingWorkers: 2, pendingClassifierGroups: 0,
+    maximumPendingClassifierGroups: 1, unboundReservations: 0, activeGroups: 0,
+    maximumAdmitted: 1, worker: Object.freeze({ grants: 2, cancellations: 0, oldestWaitMs: null,
+      lastWaitMs: 5, maximumWaitMs: 10 }), classifier: Object.freeze({ grants: 1, cancellations: 0,
+      oldestWaitMs: null, lastWaitMs: 3, maximumWaitMs: 3 }) });
+}
+
+void test('persists block hydration admission JSON roundtrip and historical omission', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const source = hydrationAdmissionHeartbeatMetrics();
+    await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), blockHydrationAdmission: source }));
+    const payload = (await pool.query("SELECT payload FROM listener_heartbeats WHERE service_key='transaction-listener'")).rows[0]?.payload as { blockHydrationAdmission: unknown };
+    assert.deepEqual(payload.blockHydrationAdmission, source);
+    await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), updatedAtMs: 3_000 }));
+    const legacy = (await pool.query("SELECT payload FROM listener_heartbeats WHERE service_key='transaction-listener'")).rows[0]?.payload as Record<string, unknown>;
+    assert.equal(Object.hasOwn(legacy, 'blockHydrationAdmission'), false);
+  });
+});
+
+void test('snapshots admission before query awaits and rejects malformed accessors before persistence', async () => {
+  let queries = 0;
+  let persisted: unknown;
+  const source = hydrationAdmissionHeartbeatMetrics();
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      queries += 1;
+      persisted = values?.[14];
+      assert.notEqual((persisted as { blockHydrationAdmission?: unknown }).blockHydrationAdmission, source);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), blockHydrationAdmission: source }));
+  assert.equal((persisted as { blockHydrationAdmission?: { worker: { grants: number } } }).blockHydrationAdmission?.worker.grants, 2);
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({ ...hydrationAdmissionHeartbeatMetrics() }, 'worker', {
+    enumerable: true, get() { getterCalls += 1; throw new Error('private-admission-secret'); },
+  });
+  for (const candidate of [accessor, { ...source, activeGroups: 2, secret: 'private-admission-secret' }]) {
+    await assert.rejects(repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(),
+      blockHydrationAdmission: candidate,
+    }) as unknown as RuntimeHeartbeat), (error: unknown) => {
+      assert.doesNotMatch(String(error), /private-admission-secret/u);
+      return true;
+    });
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(queries, 1);
+});
+
 void test('persists optional catch-up admission heartbeat metrics and rejects invalid payloads', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);

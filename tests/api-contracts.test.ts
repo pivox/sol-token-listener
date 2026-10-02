@@ -5,6 +5,7 @@ import {
   MAX_API_JSON_DEPTH,
   MAX_API_JSON_NODES,
   type ApiAvailability,
+  type ApiBlockHydrationAdmissionMetricsV1,
   type ApiDomainPayload,
   type ApiDecoderQuarantineMetricsV1,
   type ApiFailure,
@@ -27,6 +28,23 @@ import {
   toApiJson,
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
+
+void test('block hydration admission health contract permits optional nullable aggregate metrics', () => {
+  const metrics: ApiBlockHydrationAdmissionMetricsV1 = {
+    version: 1, enabled: true, registeredWorkers: 2, pendingWorkers: 0,
+    maximumPendingWorkers: 2, pendingClassifierGroups: 0, maximumPendingClassifierGroups: 1,
+    unboundReservations: 0, activeGroups: 0, maximumAdmitted: 1,
+    worker: { grants: 2, cancellations: 0, oldestWaitMs: null, lastWaitMs: 1, maximumWaitMs: 2 },
+    classifier: { grants: 0, cancellations: 0, oldestWaitMs: null, lastWaitMs: null, maximumWaitMs: null },
+  };
+  const absent: Pick<ApiHealth['heartbeat'], 'blockHydrationAdmission'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'blockHydrationAdmission'> = {
+    blockHydrationAdmission: null,
+  };
+  assert.deepEqual(absent, {});
+  assert.deepEqual(toApiJson(explicitNull), { blockHydrationAdmission: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+});
 
 void test('decoder quarantine health contract permits optional nullable aggregate-only metrics', () => {
   const metrics: ApiDecoderQuarantineMetricsV1 = { version: 1, unresolvedCount: 2 };

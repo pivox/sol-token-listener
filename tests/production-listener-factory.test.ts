@@ -54,6 +54,7 @@ import {
 import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import { SolanaTransactionLocator } from '../src/solana/rpc/transaction-locator.js';
 import { ProviderAffineCatchUpHydration } from '../src/application/provider-affine-catch-up-hydration.js';
+import type { TransactionInboxClaimAdmission } from '../src/application/transaction-inbox-claim-admission.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import type { ListenerRuntimeDependencies } from '../src/application/listener-runtime.js';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
@@ -649,14 +650,111 @@ void test('catch-up admission uses one provider-affine coordinator for each cata
   });
   await dependencies.worker.start();
   const worker = starts.mock.calls[0]?.this as unknown as {
-    locator: unknown; canClaim: () => boolean; runOnce: () => Promise<unknown>;
+    locator: unknown; canClaim: unknown; claimAdmission: unknown; runOnce: () => Promise<unknown>;
   };
   assert.equal(worker.locator, workers.mock.calls[0]?.result);
-  assert.equal(worker.canClaim(), false);
+  assert.equal(worker.canClaim, null);
+  assert.ok(worker.claimAdmission);
+  const admissionMetrics = (dependencies.heartbeat as unknown as {
+    blockHydrationAdmissionMetrics: () => unknown;
+  }).blockHydrationAdmissionMetrics;
+  assert.deepEqual(admissionMetrics(), hydration.admissionMetrics());
   assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
   assert.equal(runtime.pipelineState().pumpswap, 'IDLE');
   await dependencies.worker.close();
   assert.equal(hydration.canWorkerClaim(), false);
+});
+
+function hydrationAdmissionFixture() {
+  return { version: 1 as const, enabled: true, registeredWorkers: 2,
+    pendingWorkers: 0, maximumPendingWorkers: 2, pendingClassifierGroups: 0,
+    maximumPendingClassifierGroups: 1, unboundReservations: 0, activeGroups: 0,
+    maximumAdmitted: 1, worker: { grants: 2, cancellations: 0, oldestWaitMs: null,
+      lastWaitMs: 5, maximumWaitMs: 10 }, classifier: { grants: 1, cancellations: 0,
+      oldestWaitMs: null, lastWaitMs: 3, maximumWaitMs: 3 } };
+}
+
+void test('heartbeat snapshots detached immutable block hydration admission and redacts invalid providers', async () => {
+  const source = hydrationAdmissionFixture();
+  const writes: RuntimeHeartbeat[] = [];
+  const make = (provider: () => unknown) => new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(), counts: heartbeatCounts,
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    blockHydrationAdmissionMetrics: provider,
+  } as unknown as ConstructorParameters<typeof PersistentListenerHeartbeat>[6]);
+  const heartbeat = make(() => source);
+  await heartbeat.start();
+  assert.deepEqual(writes[0]?.blockHydrationAdmission, source);
+  assert.notEqual(writes[0]?.blockHydrationAdmission, source);
+  assert.ok(Object.isFrozen(writes[0]?.blockHydrationAdmission?.worker));
+  source.worker.grants = 99;
+  assert.equal(writes[0]?.blockHydrationAdmission?.worker.grants, 2);
+  await heartbeat.stop();
+  assert.equal(writes.at(-1)?.runtimeState, 'STOPPED');
+  let getterCalls = 0;
+  const accessor = Object.defineProperty(hydrationAdmissionFixture(), 'worker', {
+    enumerable: true, get() { getterCalls += 1; throw new Error('private-admission-secret'); },
+  });
+  for (const provider of [() => accessor, () => ({ secret: 'private-admission-secret' }),
+    () => { throw new Error('private-admission-secret'); }]) {
+    await assert.rejects(make(provider).start(), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.doesNotMatch(String(error), /private-admission-secret/u);
+      return true;
+    });
+  }
+  assert.equal(getterCalls, 0);
+  assert.throws(() => make('private-admission-secret' as unknown as () => unknown), TypeError);
+});
+
+void test('factory workers hold no database claim while admission capacity waits and wake on release', async (context) => {
+  context.mock.method(PromotedProviderSelector.prototype, 'selection', () => Object.freeze({ providerId: 'primary' as const, revision: 1n }));
+  context.mock.method(PostgresTransactionInboxRepository.prototype, 'hasNonTerminalProgramWork', async () => false);
+  const claims = context.mock.method(PostgresTransactionInboxRepository.prototype, 'claim', async () => null);
+  const locators = context.mock.method(ProviderAffineCatchUpHydration.prototype, 'workerLocator');
+  const starts = context.mock.method(TransactionInboxWorker.prototype, 'start', async () => undefined);
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_WORKER_COUNT: '2', LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'true',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'true', LISTENER_INGESTION_SCOPE: 'launchpad-only',
+    LISTENER_CATCH_UP_POLICY: 'live-edge',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  await dependencies.worker.start();
+  const members = starts.mock.calls.map((call) => call.this as unknown as {
+    claimAdmission: TransactionInboxClaimAdmission; runOnce: () => Promise<unknown>; idlePollMs: number;
+  });
+  const first = members[0]; const second = members[1];
+  assert.ok(first && second);
+  assert.notEqual(first.claimAdmission, second.claimAdmission);
+  assert.equal(second.idlePollMs, 1_000);
+  const hydration = locators.mock.calls[0]?.this;
+  assert.ok(hydration instanceof ProviderAffineCatchUpHydration);
+  assert.equal(hydration.admissionMetrics().registeredWorkers, 2);
+  try {
+    await hydration.runStrictScan('primary', async () => {
+      const holder = await first.claimAdmission.acquire(new AbortController().signal);
+      assert.ok(holder);
+      try {
+        const waiting = second.runOnce();
+        for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+        assert.equal(claims.mock.callCount(), 0);
+        assert.equal(hydration.admissionMetrics().pendingWorkers, 1);
+        holder.release();
+        assert.deepEqual(await waiting, { kind: 'idle' });
+        assert.equal(claims.mock.callCount(), 1);
+        assert.equal(hydration.admissionMetrics().pendingWorkers, 0);
+        assert.equal(hydration.admissionMetrics().maximumAdmitted, 1);
+      } finally { holder.release(); }
+      return Object.freeze({ providerId: 'primary', discoveredCount: 0, enqueuedCount: 0,
+        checkpointCasCount: 0, pageCount: 0, boundaries: Object.freeze({ launchpad: null, market: null }) });
+    }, new AbortController().signal);
+  } finally {
+    await dependencies.worker.close();
+  }
+  assert.equal(hydration.admissionMetrics().registeredWorkers, 0);
 });
 
 void test('catch-up admission wires identical provider admitters into both scanner paths and pins scan permits', async () => {

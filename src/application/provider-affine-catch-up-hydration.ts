@@ -35,6 +35,7 @@ type RouteContext = Readonly<{ providerId: RpcProviderId; token: string }>;
 type PermitKind = 'WORKER' | 'SCAN';
 type Waiter = Readonly<{
   kind: PermitKind;
+  workerContext: RouteContext | undefined;
   signal: AbortSignal | undefined;
   grant: () => void;
   reject: (error: Error) => void;
@@ -76,6 +77,8 @@ export class ProviderAffineCatchUpHydration {
   private scanGeneration = 0n;
   private scanPermit: ScanPermit | null = null;
   private permitKind: PermitKind | null = null;
+  private workerRouteContext: RouteContext | null = null;
+  private workerRouteReferences = 0;
   private closed = false;
 
   public constructor(
@@ -88,7 +91,7 @@ export class ProviderAffineCatchUpHydration {
         || isProxy(options.currentSelection)) throw new TypeError();
       this.currentSelection = options.currentSelection;
     } catch { throw new ProviderAffineCatchUpHydrationError(); }
-    this.admission = new HydrationGroupAdmission({ now: options.now ?? Date.now });
+    this.admission = new HydrationGroupAdmission({ now: options.now ?? ((): number => performance.now()) });
     const epoch = (): number => this.epoch;
     const rpc: EpochTransactionBlockRpc = {
       get httpTransportEpoch() { return epoch(); },
@@ -280,13 +283,14 @@ export class ProviderAffineCatchUpHydration {
           ticket?.release();
           ticket = null;
           settlePin?.();
-          if (ownsRoute) { ownsRoute = false; this.release(); }
+          if (ownsRoute) { ownsRoute = false; this.releaseWorkerRoute(); }
         };
         try {
           // Provider eligibility precedes group capacity: an incompatible scan
           // must never be pinned behind an unbound worker waiting for its route.
           if (scan === null) {
-            await this.acquire('WORKER', operationSignal);
+            await this.acquire('WORKER', operationSignal, knownTarget === undefined ? undefined
+              : { providerId: selected.providerId, token: `worker:${selected.revision}` });
             ownsRoute = true;
             // Legacy locate already has its durable target and may wait through
             // queued scans; pre-claim callers instead return null on that race.
@@ -408,9 +412,13 @@ export class ProviderAffineCatchUpHydration {
     }
   }
 
-  private acquire(kind: PermitKind, signal?: AbortSignal): Promise<void> {
+  private acquire(kind: PermitKind, signal?: AbortSignal, workerContext?: RouteContext): Promise<void> {
     this.assertOpen(signal);
-    if (this.queue.length >= MAX_PERMIT_WAITERS) return Promise.reject(retryableFailure());
+    // Shared routes are admitted consumers too, not a way around the existing
+    // finite envelope of one active permit plus MAX_PERMIT_WAITERS followers.
+    if (this.queue.length + Math.max(0, this.workerRouteReferences - 1) >= MAX_PERMIT_WAITERS) {
+      return Promise.reject(retryableFailure());
+    }
     return new Promise<void>((resolve, reject) => {
       const onAbort = (): void => {
         const index = this.queue.indexOf(waiter);
@@ -420,7 +428,7 @@ export class ProviderAffineCatchUpHydration {
         reject(retryableFailure());
       };
       const waiter: Waiter = Object.freeze({
-        kind, signal, grant: resolve, reject,
+        kind, workerContext, signal, grant: resolve, reject,
         detach: () => signal?.removeEventListener('abort', onAbort),
       });
       this.queue.push(waiter);
@@ -431,11 +439,27 @@ export class ProviderAffineCatchUpHydration {
 
   private release(): void {
     this.permitKind = null;
+    this.workerRouteContext = null;
     this.drain();
   }
 
+  private releaseWorkerRoute(): void {
+    this.workerRouteReferences -= 1;
+    if (this.workerRouteReferences === 0) this.release();
+  }
+
   private drain(): void {
-    if (this.closed || this.permitKind !== null) return;
+    if (this.closed) return;
+    if (this.permitKind !== null) {
+      const next = this.queue[0];
+      // Known-target consumers may share only this provider/revision context.
+      // A queued scan stays exclusive and prevents any new route sharing.
+      if (this.permitKind !== 'WORKER' || this.workerRouteContext === null
+        || this.queue.some(({ kind }) => kind === 'SCAN')
+        || next?.kind !== 'WORKER'
+        || next.workerContext?.providerId !== this.workerRouteContext.providerId
+        || next.workerContext.token !== this.workerRouteContext.token) return;
+    }
     const waiter = this.queue.shift();
     if (waiter === undefined) return;
     waiter.detach();
@@ -445,7 +469,17 @@ export class ProviderAffineCatchUpHydration {
       return;
     }
     this.permitKind = waiter.kind;
+    if (waiter.kind === 'WORKER') {
+      if (this.workerRouteReferences === 0) {
+        this.workerRouteContext = waiter.workerContext ?? null;
+        // Publish the compatible route atomically with its first grant so calls
+        // in the same turn can reach group admission before any fetch settles.
+        if (waiter.workerContext !== undefined) this.bind(waiter.workerContext);
+      }
+      this.workerRouteReferences += 1;
+    }
     waiter.grant();
+    this.drain();
   }
 
   private assertOpen(signal?: AbortSignal): void {

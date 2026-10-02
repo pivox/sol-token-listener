@@ -101,7 +101,7 @@ export class TransactionInboxWorker {
   private readonly scheduler: TransactionInboxWorkerScheduler;
   private readonly canClaim: (() => boolean) | null;
   private readonly claimAdmission: TransactionInboxClaimAdmission | null;
-  private readonly admissionAbort = new AbortController();
+  private admissionAbort: AbortController | null = null;
   private readonly phaseObserver: WorkerPhaseDiagnosticObserver | undefined;
   private currentState: TransactionInboxWorkerState = 'STOPPED';
   private runTail: Promise<void> = Promise.resolve();
@@ -175,8 +175,9 @@ export class TransactionInboxWorker {
     if (this.closePromise !== null) return this.closePromise;
     this.permanentlyClosed = true;
     this.currentState = 'STOPPING';
-    this.admissionAbort.abort();
-    try { this.claimAdmission?.close(); } catch { this.reportCleanupFailure(); }
+    // Only a pending acquisition is cancellable here. A granted reservation
+    // belongs to the real claim and must survive until that work has drained.
+    this.admissionAbort?.abort();
     this.cancelIdleWait();
     const operation = this.performClose();
     this.closePromise = operation;
@@ -200,6 +201,7 @@ export class TransactionInboxWorker {
     const loop = this.loopPromise;
     if (loop !== null) await loop;
     await this.runTail;
+    try { this.claimAdmission?.close(); } catch { this.reportCleanupFailure(); }
     this.currentState = this.unresolvedResource ? 'DEGRADED' : 'STOPPED';
   }
 
@@ -218,14 +220,16 @@ export class TransactionInboxWorker {
     };
     try {
       if (this.claimAdmission !== null) {
+        const acquiring = new AbortController();
+        this.admissionAbort = acquiring;
         try {
-          const acquired = await this.claimAdmission.acquire(this.admissionAbort.signal);
+          const acquired = await this.claimAdmission.acquire(acquiring.signal);
           if (acquired !== null && !hasOwnMethods(acquired, ['locate', 'release'])) throw new TypeError();
           reservation = acquired;
         } catch {
           this.reportDegraded();
           throw new TransactionInboxWorkerError('claim-admission');
-        }
+        } finally { this.admissionAbort = null; }
         if (this.isClosed()) return frozenResult({ kind: 'closed' });
         if (reservation === null) return frozenResult({ kind: 'idle' });
       }

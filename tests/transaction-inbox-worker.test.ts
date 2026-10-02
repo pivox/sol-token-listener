@@ -1086,6 +1086,33 @@ void test('worker close cancels capacity acquisition before draining its run', a
   } finally { await worker.close(); await running; }
 });
 
+void test('worker closes its admission handle only after granted claim work releases it', async () => {
+  const events: string[] = [];
+  let acquisitionSignal: AbortSignal | undefined;
+  let finishClaim!: () => void;
+  const claimGate = new Promise<void>((resolve) => { finishClaim = resolve; });
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { events.push('claim'); await claimGate; return claim(); },
+  }), locator(), pipeline(), options({ claimAdmission: {
+    async acquire(signal: AbortSignal) {
+      acquisitionSignal = signal;
+      return { ...locator(), release() { events.push('release'); } };
+    },
+    close() { events.push('close'); },
+  } }));
+  const running = worker.runOnce();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const closing = worker.close();
+  try {
+    assert.equal(acquisitionSignal?.aborted, false);
+    assert.deepEqual(events, ['claim']);
+    finishClaim();
+    assert.deepEqual(await running, { kind: 'processed', signature: 'sig' });
+    await closing;
+    assert.deepEqual(events, ['claim', 'release', 'close']);
+  } finally { finishClaim(); await running; await closing; }
+});
+
 void test('snapshot reuse releases pre-claim reservation before lease and pipeline work', async () => {
   const calls: string[] = [];
   const tx = normalized();

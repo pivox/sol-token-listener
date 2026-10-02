@@ -9,7 +9,29 @@
 **Tech Stack:** Strict TypeScript ESM, node:test, existing PostgreSQL repositories unchanged.
 
 Specification: `docs/superpowers/specs/2026-10-02-bounded-hydration-admission-design.md`, v1.0.2 (initial design `a00e696`, route-order and known-target worker clarification before integration).
-Baseline `c9aadef`: hydration/cache/classifier 96 PASS, zero skips. No implementation exists yet.
+Baseline `c9aadef`: hydration/cache/classifier 96 PASS, zero skips, before implementation.
+
+## Execution checkpoint — 2026-10-02
+
+Tasks 1–4 are implemented; Task 5 sustained mixed-role coverage runs 100 cycles.
+Verified focused evidence: 171 integration tests, 46 domain/heartbeat contract
+tests, 423 evidence-wiring tests including PostgreSQL, and 226 final non-DB
+evidence tests (overlapping suites, not additive). All have zero skips.
+The runbook was deliberately bumped to 1.6.0; five deployment-document assertions
+still pinned 1.5.0 and failed. Updating those exact version expectations restores
+44/44 deployment-artifact tests without weakening their behavioral assertions.
+Build, typecheck, lint and docs check pass; frontend has 169/169 passing tests.
+The initial full backend run ended with 4,006 passes and those five documentation
+failures, zero skips. The single independent review found three issues: stopping
+a worker invalidated granted reservations; the production admission clock was
+not monotonic; exclusive legacy worker routes prevented same-group single-flight.
+These are corrected with eight new regressions, including the existing route
+capacity envelope across shared active references and queued requests. Focused
+integration now passes 179 tests without skips. No second review is planned.
+The final full run passes 4,018 backend tests with both PostgreSQL test URLs and
+169 frontend tests, zero failures or skips. Build/typecheck/lint/docs checks also
+pass on the corrected tree. CI and merge remain pending; these results do not
+establish Mainnet capacity or authorize a transaction.
 
 ## Task 1 — Controller contract and deterministic state tests
 

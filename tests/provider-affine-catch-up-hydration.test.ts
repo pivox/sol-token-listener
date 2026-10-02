@@ -46,7 +46,7 @@ function deferred<T>() {
 async function flush(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
-function harness(options: BlockTransactionCacheOptions = {}) {
+function harness(options: BlockTransactionCacheOptions = {}, useSystemClock = false) {
   let now = 0;
   let selection: PromotedProviderSelection = { providerId: 'primary', revision: 1n };
   let fetch: (slot: bigint, providerId: RpcProviderId) => Promise<unknown> = async (slot) => block(slot);
@@ -64,7 +64,7 @@ function harness(options: BlockTransactionCacheOptions = {}) {
     }]),
   );
   const hydration = new ProviderAffineCatchUpHydration(providers, {
-    now: () => now, sleep: async (ms) => { now += ms; }, ...options,
+    ...(useSystemClock ? {} : { now: () => now }), sleep: async (ms) => { now += ms; }, ...options,
     currentSelection: () => selection,
   });
   return {
@@ -73,6 +73,74 @@ function harness(options: BlockTransactionCacheOptions = {}) {
     select(providerId: RpcProviderId | null) { selection = { providerId, revision: selection.revision + 1n }; },
     setFetch(value: typeof fetch) { fetch = value; },
   };
+}
+
+void test('default admission clock ignores backward wall-clock corrections', async (t) => {
+  let wallClock = 10_000;
+  t.mock.method(Date, 'now', () => wallClock);
+  const h = harness({}, true);
+  const handle = h.hydration.workerAdmission();
+  try {
+    const first = await handle.acquire(new AbortController().signal);
+    assert.ok(first);
+    first.release();
+    wallClock = 1_000;
+    const second = await handle.acquire(new AbortController().signal);
+    assert.ok(second, 'wall-clock correction must not disable admission');
+    second.release();
+    assert.equal(h.hydration.admissionMetrics().worker.grants, 2);
+    assert.equal(h.hydration.admissionMetrics().worker.oldestWaitMs, null);
+  } finally { handle.close(); h.hydration.close(); }
+});
+
+for (const phase of ['claim', 'hydration'] as const) {
+  void test(`worker close drains its granted reservation during pending ${phase}`, async () => {
+    const h = harness();
+    const started = deferred<undefined>();
+    const gate = deferred<undefined>();
+    const calls: string[] = [];
+    h.setFetch(async () => {
+      calls.push('rpc');
+      if (phase === 'hydration') { started.resolve(undefined); await gate.promise; }
+      return block();
+    });
+    const worker = new TransactionInboxWorker({
+      async claim() {
+        if (phase === 'claim') { started.resolve(undefined); await gate.promise; }
+        return Object.freeze({ signature: 'one', slot: 42n, confirmationStatus: 'confirmed' as const,
+          attempts: 1, leaseToken: 'lease', leaseExpiresAtMs: 11_000, observedAtMs: 1_000,
+          normalizedTransaction: null });
+      },
+      async renewLease() {},
+      async saveSnapshot() { calls.push('save'); },
+      async markProcessed() { calls.push('processed'); },
+      async markFailed() { calls.push('failed'); },
+    }, h.hydration.workerLocator(), { async process() { calls.push('pipeline'); } }, {
+      leaseSeconds: 10, renewalIntervalMs: 1_000, idlePollMs: 250, now: () => 1_000,
+      scheduler: { schedule: () => ({}), cancel: () => {} },
+      claimAdmission: h.hydration.workerAdmission(),
+    });
+    const run = worker.runOnce();
+    await started.promise;
+    let closed = false;
+    const closing = worker.close().then(() => { closed = true; });
+    try {
+      await flush();
+      assert.equal(closed, false);
+      gate.resolve(undefined);
+      assert.deepEqual(await run, { kind: 'processed', signature: 'one' });
+      await closing;
+      assert.deepEqual(calls, ['rpc', 'save', 'pipeline', 'processed']);
+      assert.equal(worker.state, 'STOPPED');
+      assert.equal(h.hydration.admissionMetrics().registeredWorkers, 0);
+      assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+    } finally {
+      gate.resolve(undefined);
+      await run;
+      await closing;
+      h.hydration.close();
+    }
+  });
 }
 
 void test('worker uses one frozen locator and one cache for same-slot transactions', async () => {
@@ -89,6 +157,87 @@ void test('worker uses one frozen locator and one cache for same-slot transactio
   assert.equal(Object.isFrozen(h.hydration.metrics()), true);
   assert.equal(Object.isFrozen(h.hydration.state()), true);
   h.hydration.close();
+});
+
+void test('legacy worker same-context oversize signatures join before route settlement', async () => {
+  const h = harness({ maxEntryBytes: 1 });
+  const pending = deferred<unknown>();
+  h.setFetch(async () => pending.promise);
+  const locator = h.hydration.workerLocator();
+  const one = locator.locate(target());
+  const two = locator.locate(target('two'));
+  try {
+    await flush();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.hydration.admissionMetrics().worker.grants, 2);
+    pending.resolve(block());
+    const transactions = await Promise.all([one, two]);
+    assert.deepEqual(transactions.map((tx) => tx.transactionIndex), [0, 1]);
+    assert.equal(h.hydration.metrics().fetches, 1);
+    assert.equal(h.hydration.metrics().inFlightJoins, 1);
+    assert.equal(h.hydration.metrics().oversizeBypasses, 1);
+    assert.equal(h.hydration.admissionMetrics().maximumAdmitted, 1);
+    assert.equal(h.hydration.admissionMetrics().registeredWorkers, 0);
+  } finally {
+    pending.resolve(block());
+    await Promise.allSettled([one, two]);
+    h.hydration.close();
+  }
+});
+
+void test('shared legacy worker routes drain every accepted group before an exclusive scan', async () => {
+  const h = harness();
+  const firstBlock = deferred<unknown>();
+  const secondBlock = deferred<unknown>();
+  const order: string[] = [];
+  h.setFetch(async (slot) => slot === 42n ? firstBlock.promise : secondBlock.promise);
+  const first = h.hydration.workerLocator().locate(target());
+  const second = h.hydration.workerLocator().locate(target('two', 43n));
+  await flush();
+  assert.equal(h.hydration.admissionMetrics().pendingWorkers, 1);
+  const scan = h.hydration.runStrictScan('fallback-1', async () => {
+    order.push('scan');
+    return RESULT;
+  }, new AbortController().signal);
+  try {
+    firstBlock.resolve(block());
+    await first;
+    await flush();
+    assert.deepEqual(order, []);
+    assert.deepEqual(h.calls.map(({ providerId, slot }) => [providerId, slot]),
+      [['primary', 42n], ['primary', 43n]]);
+    secondBlock.resolve(block(43n));
+    await Promise.all([second, scan]);
+    assert.deepEqual(order, ['scan']);
+    assert.equal(h.maximumActive(), 1);
+  } finally {
+    firstBlock.resolve(block());
+    secondBlock.resolve(block(43n));
+    await Promise.allSettled([first, second, scan]);
+    h.hydration.close();
+  }
+});
+
+void test('shared legacy worker route references retain the finite permit waiter envelope', async () => {
+  const h = harness({ maxEntryBytes: 1 });
+  const pending = deferred<unknown>();
+  h.setFetch(async () => pending.promise);
+  const consumers = Array.from({ length: 1025 }, () => h.hydration.workerLocator().locate(target()));
+  let overflow: unknown;
+  const extra = h.hydration.workerLocator().locate(target()).catch((error: unknown) => { overflow = error; });
+  try {
+    await flush();
+    assert.equal(retryable(overflow), true, 'shared routes must not bypass the 1024-waiter plus active permit bound');
+    assert.equal(h.hydration.admissionMetrics().registeredWorkers, 1025);
+    pending.resolve(block());
+    await Promise.all([...consumers, extra]);
+    assert.equal(h.hydration.metrics().fetches, 1);
+    assert.equal(h.hydration.admissionMetrics().registeredWorkers, 0);
+  } finally {
+    pending.resolve(block());
+    await Promise.allSettled([...consumers, extra]);
+    h.hydration.close();
+  }
 });
 
 void test('classifier views share the cache inside their pinned scan, independently of promotion', async () => {

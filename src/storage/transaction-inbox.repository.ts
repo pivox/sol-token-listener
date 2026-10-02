@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isProxy } from 'node:util/types';
+import { snapshotRuntimeBlockHydrationAdmissionMetrics } from '../domain/block-hydration-admission.js';
 import type { QueryResultRow } from 'pg';
 import { createRuntimeRpcHttpEvidence } from '../domain/rpc-http-evidence.js';
 import {
@@ -2841,6 +2842,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : snapshotRuntimeWorkerAdmissionMetrics(value.workerAdmission);
       const decoderQuarantine = value.decoderQuarantine === undefined ? undefined
         : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
+      const blockHydrationAdmission = value.blockHydrationAdmission === undefined ? undefined
+        : snapshotRuntimeBlockHydrationAdmissionMetrics(value.blockHydrationAdmission);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
@@ -2891,6 +2894,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
             ...(workerAdmission === undefined ? {} : { workerAdmission }),
+            ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
             ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
           }),
           value.exhaustedCount,

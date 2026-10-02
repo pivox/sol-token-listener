@@ -1,4 +1,5 @@
 import type { ApiErrorCode } from './errors.js';
+import type { RuntimeBlockHydrationAdmissionMetricsV1 } from '../domain/block-hydration-admission.js';
 import type { DomainEventType } from '../domain/events.js';
 import type { LaunchStatus } from '../domain/launch-status.js';
 import type { PaperPositionStatus } from '../domain/paper-trading.js';
@@ -56,6 +57,8 @@ declare const apiDomainPayloadBrand: unique symbol;
 export type ApiDomainPayload = ApiJsonValue & {
   readonly [apiDomainPayloadBrand]: 'ApiDomainPayload';
 };
+
+export type ApiBlockHydrationAdmissionMetricsV1 = RuntimeBlockHydrationAdmissionMetricsV1;
 
 export interface ApiMeta {
   readonly generatedAt: string;
@@ -543,6 +546,7 @@ export interface ApiHeartbeat {
   readonly websocket: ApiWebSocketHealth;
   /** Optional only during rolling deployment from API V1 implementations predating issue #114. */
   readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
+  readonly blockHydrationAdmission?: ApiBlockHydrationAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when admission metrics are absent. */
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when worker-admission metrics are absent. */
