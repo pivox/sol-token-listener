@@ -196,6 +196,10 @@ Test files: `tests/transaction-ingestion-contracts.test.ts`,
 
 ## Task 5 — Full validation and delivery
 
+- [ ] Add `tests/hydration-admission-load.test.ts`: 100 deterministic cycles with
+  two registered workers and a classifier, fake monotonic time and microtask
+  barriers. Assert alternating contested dispatch, queue/reference drainage,
+  bounded maxima and exact final grant counts; no PostgreSQL or network required.
 - [ ] Re-run all new admission/worker/coordinator/classifier/contract suites. Assert
   sustained mixed workload fairness and immediate capacity notification, not only
   the queue bound. Document that snapshot-only claims may conservatively wait.
