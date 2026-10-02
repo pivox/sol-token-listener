@@ -103,6 +103,30 @@ class RecordingCoverageRepository implements CatchUpAdmissionCoverageRepository 
   }
 }
 
+void test('hydrates effective commitment groups sequentially while keeping same-group fanout and receipt order', async () => {
+  const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const transactions = ['a-confirmed', 'b-finalized', 'c-confirmed'].map((signature) =>
+    cloneTransaction(template, { signature, slot: 501n }));
+  const gate = deferred<undefined>();
+  const locator = new RecordingLocator(async (target) => {
+    if (target.confirmationStatus !== 'FINALIZED') await gate.promise;
+    const transaction = transactions.find((transaction) => transaction.signature === target.signature);
+    assert.ok(transaction);
+    return transaction;
+  });
+  const repository = new RecordingRepository();
+  const operation = new PumpFunCatchUpBlockClassifier(locator, repository).classify(
+    transactions.map((transaction, index) => ({
+      ...discovery(transaction), confirmationStatus: index === 1 ? 'finalized' as const : 'confirmed' as const,
+    })), NEVER_ABORTED);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const beforeRelease = locator.targets.map(({ signature }) => signature);
+  gate.resolve(undefined);
+  const receipts = await operation;
+  assert.deepEqual(beforeRelease, ['a-confirmed', 'c-confirmed']);
+  assert.deepEqual(receipts.map(({ signature }) => signature), ['a-confirmed', 'c-confirmed', 'b-finalized']);
+});
+
 void test('keeps the coverage fast path inactive unless explicitly enabled', async () => {
   const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
   const locator = returning(new Map([[transaction.signature, transaction]]));
@@ -699,6 +723,9 @@ void test('hydrates and decodes every commitment bucket in a slot before its fir
   await operation;
 
   assert.deepEqual(targetsBeforeSettlement, [
+    ['z-confirmed', 'CONFIRMED'],
+  ]);
+  assert.deepEqual(locator.targets.map(({ signature, confirmationStatus }) => [signature, confirmationStatus]), [
     ['z-confirmed', 'CONFIRMED'],
     ['a-finalized', 'FINALIZED'],
   ]);

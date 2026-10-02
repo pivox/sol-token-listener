@@ -281,7 +281,21 @@ export class PumpFunCatchUpBlockClassifier {
     signal: AbortSignal,
   ): Promise<readonly CatchUpClassification[]> {
     assertNotAborted(signal);
-    const settled = await Promise.allSettled(slot.rows.map(async (row) => this.hydrate(row, signal)));
+    const groups = new Map<EffectiveCommitment, { row: SlotDiscovery; index: number }[]>();
+    slot.rows.forEach((row, index) => {
+      const group = groups.get(row.commitment);
+      if (group === undefined) groups.set(row.commitment, [{ row, index }]);
+      else group.push({ row, index });
+    });
+    const settled: PromiseSettledResult<HydrationOutcome>[] = [];
+    for (const group of groups.values()) {
+      assertNotAborted(signal);
+      const results = await Promise.allSettled(group.map(({ row }) => this.hydrate(row, signal)));
+      results.forEach((result, groupIndex) => {
+        const entry = group[groupIndex];
+        if (entry !== undefined) settled[entry.index] = result;
+      });
+    }
     assertNotAborted(signal);
     const firstRejection = settled.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',

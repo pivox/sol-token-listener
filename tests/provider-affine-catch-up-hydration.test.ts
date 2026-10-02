@@ -3,6 +3,7 @@ import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
 import { ProviderAffineCatchUpHydration, ProviderAffineCatchUpHydrationError } from '../src/application/provider-affine-catch-up-hydration.js';
 import type { PromotedProviderSelection } from '../src/application/promoted-provider-selector.js';
+import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import {
   StrictCatchUpAbortedError, StrictCatchUpPausedError, StrictCatchUpRefreshRequiredError, StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError, type StrictCatchUpScanResult,
@@ -212,6 +213,337 @@ function retryable(error: unknown): boolean {
   });
   return true;
 }
+
+void test('admission bounds distinct classifier and legacy worker groups upstream of the cache', async () => {
+  const h = harness();
+  const timeline: number[] = [];
+  const sample = (): void => { timeline.push(h.hydration.metrics().queuedFetches); };
+  const firstBlock = deferred<unknown>();
+  const started = deferred<undefined>();
+  h.setFetch(async (slot) => {
+    sample();
+    return slot === 42n && h.calls.length === 1 ? firstBlock.promise : block(slot);
+  });
+  const scan = h.hydration.runStrictScan('primary', async (signal) => {
+    const classifier = h.hydration.classifierLocator('primary');
+    const first = classifier.locate(target(), signal);
+    const second = classifier.locate({ ...target('two'), confirmationStatus: 'FINALIZED' }, signal);
+    started.resolve(undefined);
+    return Promise.all([first, second]).then(() => RESULT);
+  }, new AbortController().signal);
+  await started.promise;
+  const worker = h.hydration.workerLocator().locate(target('one', 43n));
+  await flush();
+  sample();
+  assert.equal(h.hydration.admissionMetrics().pendingClassifierGroups, 1);
+  assert.equal(h.hydration.admissionMetrics().pendingWorkers, 1);
+  firstBlock.resolve(block());
+  await Promise.all([scan, worker]);
+  sample();
+  assert.ok(timeline.every((queued) => queued <= 1), `cache queue must be bounded; observed ${JSON.stringify(timeline)}`);
+  assert.equal(h.maximumActive(), 1);
+  assert.equal(h.hydration.metrics().fetches, 3);
+  assert.equal(h.hydration.admissionMetrics().maximumAdmitted, 1);
+  h.hydration.close();
+});
+
+void test('pre-claim worker reservation pins a naturally finishing compatible scan until release', async () => {
+  const h = harness();
+  const started = deferred<undefined>();
+  const finishScan = deferred<undefined>();
+  let finished = false;
+  const scan = h.hydration.runStrictScan('primary', async () => {
+    started.resolve(undefined);
+    await finishScan.promise;
+    return RESULT;
+  }, new AbortController().signal).then(() => { finished = true; });
+  await started.promise;
+  const handle = h.hydration.workerAdmission();
+  const reservation = await handle.acquire(new AbortController().signal);
+  assert.ok(reservation);
+  finishScan.resolve(undefined);
+  await flush();
+  assert.equal(finished, false);
+  assert.equal(h.hydration.admissionMetrics().unboundReservations, 1);
+  assert.equal((await reservation.locate(target())).signature, 'one');
+  reservation.release();
+  await scan;
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+  handle.close();
+  h.hydration.close();
+});
+
+void test('manually wired worker pins delayed SQL claim through hydration but releases before persistence and business', async () => {
+  const h = harness();
+  const scanStarted = deferred<undefined>();
+  const finishScan = deferred<undefined>();
+  const claimStarted = deferred<undefined>();
+  const claimGate = deferred<undefined>();
+  const businessStarted = deferred<undefined>();
+  const businessGate = deferred<undefined>();
+  let scanFinished = false;
+  const scan = h.hydration.runStrictScan('primary', async () => {
+    scanStarted.resolve(undefined);
+    await finishScan.promise;
+    return RESULT;
+  }, new AbortController().signal).then(() => { scanFinished = true; });
+  await scanStarted.promise;
+  const worker = new TransactionInboxWorker({
+    async claim() {
+      claimStarted.resolve(undefined);
+      await claimGate.promise;
+      return Object.freeze({ signature: 'one', slot: 42n, confirmationStatus: 'confirmed' as const,
+        attempts: 1, leaseToken: 'lease', leaseExpiresAtMs: 11_000, observedAtMs: 1_000,
+        normalizedTransaction: null });
+    },
+    async renewLease() { /* Fake durable ownership. */ },
+    async saveSnapshot() { assert.equal(h.hydration.admissionMetrics().activeGroups, 0); },
+    async markProcessed() { /* Fake durable success. */ },
+    async markFailed() { assert.fail('hydration must succeed'); },
+  }, h.hydration.workerLocator(), {
+    async process() { businessStarted.resolve(undefined); await businessGate.promise; },
+  }, {
+    leaseSeconds: 10, renewalIntervalMs: 1_000, idlePollMs: 250, now: () => 1_000,
+    scheduler: { schedule: () => ({}), cancel: () => { /* No real timer. */ } },
+    claimAdmission: h.hydration.workerAdmission(),
+  });
+  const run = worker.runOnce();
+  await claimStarted.promise;
+  finishScan.resolve(undefined);
+  await flush();
+  assert.equal(scanFinished, false);
+  assert.equal(h.hydration.admissionMetrics().unboundReservations, 1);
+  claimGate.resolve(undefined);
+  await businessStarted.promise;
+  await scan;
+  assert.equal(scanFinished, true);
+  assert.equal(h.calls.length, 1);
+  businessGate.resolve(undefined);
+  assert.deepEqual(await run, { kind: 'processed', signature: 'one' });
+  await worker.close();
+  h.hydration.close();
+});
+
+void test('pre-claim capacity stays upstream while a classifier is in pacing or persistence', async () => {
+  const sleeping = deferred<undefined>();
+  const releaseSleep = deferred<undefined>();
+  const persistence = deferred<undefined>();
+  const atPersistence = deferred<undefined>();
+  let now = 0;
+  const h = harness({ now: () => now, sleep: async (ms) => {
+    sleeping.resolve(undefined); await releaseSleep.promise; now += ms;
+  } });
+  const timeline: number[] = [];
+  const sample = (): void => { timeline.push(h.hydration.metrics().queuedFetches); };
+  h.setFetch(async (slot) => { sample(); return block(slot); });
+  const scan = h.hydration.runStrictScan('primary', async (signal) => {
+    await h.hydration.classifierLocator('primary').locate(target(), signal);
+    sample();
+    await h.hydration.classifierLocator('primary').locate(target('one', 43n), signal);
+    atPersistence.resolve(undefined);
+    await persistence.promise;
+    return RESULT;
+  }, new AbortController().signal);
+  await sleeping.promise;
+  const handle = h.hydration.workerAdmission();
+  const acquiring = handle.acquire(new AbortController().signal);
+  await flush();
+  sample();
+  assert.equal(h.hydration.admissionMetrics().pendingWorkers, 1);
+  assert.equal(h.hydration.metrics().queuedFetches, 1);
+  releaseSleep.resolve(undefined);
+  const reservation = await acquiring;
+  assert.ok(reservation);
+  await atPersistence.promise;
+  const transaction = await reservation.locate(target('two', 44n));
+  sample();
+  assert.equal(transaction.signature, 'two');
+  reservation.release();
+  persistence.resolve(undefined);
+  await scan;
+  sample();
+  assert.ok(timeline.every((queued) => queued <= 1), JSON.stringify(timeline));
+  assert.equal(h.maximumActive(), 1);
+  assert.equal(h.hydration.metrics().oversizeBypasses, 0);
+  assert.equal(h.hydration.metrics().fetches, 3);
+  assert.equal(h.hydration.admissionMetrics().maximumAdmitted, 1);
+  handle.close();
+  h.hydration.close();
+});
+
+void test('worker eligibility never reserves group capacity during an incompatible scan', async () => {
+  const h = harness();
+  const started = deferred<undefined>();
+  const finish = deferred<undefined>();
+  const scan = h.hydration.runStrictScan('fallback-1', async () => {
+    started.resolve(undefined); await finish.promise; return RESULT;
+  }, new AbortController().signal);
+  await started.promise;
+  const handle = h.hydration.workerAdmission();
+  const acquiring = handle.acquire(new AbortController().signal);
+  await flush();
+  assert.equal(h.hydration.admissionMetrics().unboundReservations, 0);
+  assert.equal(h.hydration.admissionMetrics().pendingWorkers, 0);
+  finish.resolve(undefined);
+  await scan;
+  const reservation = await acquiring;
+  assert.ok(reservation);
+  assert.equal(h.hydration.admissionMetrics().unboundReservations, 1);
+  reservation.release();
+  handle.close();
+  h.hydration.close();
+});
+
+void test('a late classifier joins the worker-bound oversize group and cancellation cannot release unsettled cache ownership', async () => {
+  const h = harness({ maxEntryBytes: 1 });
+  const started = deferred<undefined>();
+  const finish = deferred<undefined>();
+  const fetch = deferred<unknown>();
+  h.setFetch(async () => fetch.promise);
+  const scan = h.hydration.runStrictScan('primary', async () => {
+    started.resolve(undefined); await finish.promise; return RESULT;
+  }, new AbortController().signal);
+  await started.promise;
+  const handle = h.hydration.workerAdmission();
+  const reservation = await handle.acquire(new AbortController().signal);
+  assert.ok(reservation);
+  const worker = reservation.locate(target());
+  await flush();
+  const abort = new AbortController();
+  const joiner = assert.rejects(h.hydration.classifierLocator('primary').locate(target('two'), abort.signal), retryable);
+  await flush();
+  assert.equal(h.hydration.metrics().inFlightJoins, 1);
+  assert.equal(h.hydration.admissionMetrics().worker.grants, 1);
+  assert.equal(h.hydration.admissionMetrics().classifier.grants, 1);
+  abort.abort();
+  reservation.release();
+  finish.resolve(undefined);
+  await flush();
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 1);
+  assert.equal(h.hydration.state().scanActive, true);
+  fetch.resolve(block());
+  assert.equal((await worker).signature, 'one');
+  await Promise.all([joiner, scan]);
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+  assert.equal(h.hydration.metrics().fetches, 1);
+  assert.equal(h.hydration.metrics().oversizeBypasses, 1);
+  assert.equal(h.maximumActive(), 1);
+  handle.close();
+  h.hydration.close();
+});
+
+for (const cancellation of ['signal', 'handle-close', 'scan-abort', 'coordinator-close'] as const) {
+  void test(`accepted pre-claim scan pin is settled by ${cancellation}`, async () => {
+    const h = harness();
+    const started = deferred<undefined>();
+    const finish = deferred<undefined>();
+    const scanAbort = new AbortController();
+    const scan = h.hydration.runStrictScan('primary', async () => {
+      started.resolve(undefined); await finish.promise; return RESULT;
+    }, scanAbort.signal);
+    const observedScan = scan.then(() => 'fulfilled', () => 'rejected');
+    await started.promise;
+    const handle = h.hydration.workerAdmission();
+    const abort = new AbortController();
+    const reservation = await handle.acquire(abort.signal);
+    assert.ok(reservation);
+    if (cancellation === 'signal') abort.abort();
+    else if (cancellation === 'handle-close') handle.close();
+    else if (cancellation === 'scan-abort') scanAbort.abort();
+    else h.hydration.close();
+    finish.resolve(undefined);
+    assert.equal(await observedScan, cancellation === 'signal' || cancellation === 'handle-close' ? 'fulfilled' : 'rejected');
+    assert.equal(h.hydration.admissionMetrics().unboundReservations, 0);
+    await assert.rejects(reservation.locate(target()), retryable);
+    reservation.release();
+    handle.close();
+    h.hydration.close();
+  });
+}
+
+void test('promotion revocation while waiting returns null before claim and after claim becomes a locator failure', async () => {
+  const h = harness();
+  const fetch = deferred<unknown>();
+  const started = deferred<undefined>();
+  const finish = deferred<undefined>();
+  h.setFetch(async () => fetch.promise);
+  const scan = h.hydration.runStrictScan('primary', async (signal) => {
+    const classifier = h.hydration.classifierLocator('primary').locate(target(), signal);
+    started.resolve(undefined); await classifier; await finish.promise; return RESULT;
+  }, new AbortController().signal);
+  await started.promise;
+  const handle = h.hydration.workerAdmission();
+  const acquiring = handle.acquire(new AbortController().signal);
+  await flush();
+  assert.equal(h.hydration.admissionMetrics().pendingWorkers, 1);
+  h.select('fallback-1');
+  fetch.resolve(block());
+  assert.equal(await acquiring, null);
+  finish.resolve(undefined);
+  await scan;
+  const reservation = await handle.acquire(new AbortController().signal);
+  assert.ok(reservation);
+  h.select('primary');
+  await assert.rejects(reservation.locate(target()), retryable);
+  reservation.release();
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+  assert.equal(h.hydration.admissionMetrics().unboundReservations, 0);
+  handle.close();
+  h.hydration.close();
+});
+
+void test('same-key forced refresh remains one bounded fetch for concurrent missing signatures', async () => {
+  const h = harness();
+  const scan = h.hydration.runStrictScan('primary', async (signal) => {
+    const classifier = h.hydration.classifierLocator('primary');
+    await classifier.locate(target(), signal);
+    await Promise.all(['missing-a', 'missing-b'].map((signature) =>
+      assert.rejects(classifier.locate(target(signature), signal), (error: unknown) =>
+        trustedTransactionLocatorFailure(error)?.code === 'TRANSACTION_INDEX_NOT_FOUND')));
+    return RESULT;
+  }, new AbortController().signal);
+  await scan;
+  assert.equal(h.hydration.metrics().forcedRefreshes, 1);
+  assert.equal(h.hydration.metrics().fetches, 2);
+  assert.equal(h.maximumActive(), 1);
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+  h.hydration.close();
+});
+
+void test('same-key classifier fanout keeps one fetch when its block exceeds the retention cap', async () => {
+  const h = harness({ maxEntryBytes: 1 });
+  await h.hydration.runStrictScan('primary', async (signal) => {
+    const classifier = h.hydration.classifierLocator('primary');
+    const results = await Promise.all([classifier.locate(target(), signal), classifier.locate(target('two'), signal)]);
+    assert.deepEqual(results.map(({ transactionIndex }) => transactionIndex), [0, 1]);
+    return RESULT;
+  }, new AbortController().signal);
+  assert.equal(h.hydration.metrics().fetches, 1);
+  assert.equal(h.hydration.metrics().inFlightJoins, 1);
+  assert.equal(h.hydration.metrics().oversizeBypasses, 1);
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+  h.hydration.close();
+});
+
+void test('a rejected concurrent reservation locate cannot settle the first active cache operation', async () => {
+  const h = harness();
+  const fetch = deferred<unknown>();
+  h.setFetch(async () => fetch.promise);
+  const handle = h.hydration.workerAdmission();
+  const reservation = await handle.acquire(new AbortController().signal);
+  assert.ok(reservation);
+  const first = reservation.locate(target());
+  await flush();
+  await assert.rejects(reservation.locate(target('two')), retryable);
+  reservation.release();
+  const activeBeforeSettlement = h.hydration.admissionMetrics().activeGroups;
+  fetch.resolve(block());
+  await first;
+  assert.equal(activeBeforeSettlement, 1);
+  assert.equal(h.hydration.admissionMetrics().activeGroups, 0);
+  handle.close();
+  h.hydration.close();
+});
 
 void test('different-provider scan excludes later workers for its entire callback including persistence', async () => {
   const h = harness();
