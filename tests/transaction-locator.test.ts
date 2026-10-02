@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { deserialize, serialize } from 'node:v8';
 import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
+import { decodeBlockTransactionPayload } from '../src/solana/rpc/block-transaction-payload-codec.js';
 import {
   Connection,
   PublicKey,
@@ -283,6 +285,29 @@ void test('retains a Connection-decoded v1 complete-block transaction snapshot',
 
   assert.equal(snapshot?.cacheable, true);
   assert.notEqual(snapshot?.transactions[0]?.payload, null);
+});
+
+void test('tagged snapshots preserve rich legacy/v0 order, fields and requested confirmation status', async () => {
+  const data = completeBlock([
+    response('legacy', 42, { error: { InstructionError: [0, 'Custom'] } }),
+    response('alt', 42, { rich: true }),
+  ]);
+  const uncached = new SolanaBlockTransactionLocator({ async getBlockTransactions() { return data; } });
+  for (const confirmationStatus of ['PROCESSED', 'CONFIRMED', 'FINALIZED'] as const) {
+    const snapshot = snapshotBlockTransactionData(data, 42n, confirmationStatus);
+    assert.ok(snapshot?.cacheable);
+    assert.deepEqual(snapshot.transactions.map(({ signature }) => signature), ['legacy', 'alt']);
+    for (const [index, { signature, payload }] of snapshot.transactions.entries()) {
+      assert.ok(payload);
+      assert.match(payload, /^b1:[rd]:/u);
+      const expected = await uncached.locate({ signature, slot: 42n, confirmationStatus });
+      assert.equal(expected.transactionIndex, index);
+      // Match the existing V8 boundary, which restores defensive null-prototype error records as objects.
+      assert.deepEqual(decodeBlockTransactionPayload(payload), deserialize(serialize(expected)) as unknown);
+    }
+    assert.equal(snapshot.bytes, 64 + snapshot.transactions.reduce((sum, tx) =>
+      sum + Buffer.byteLength(tx.signature, 'utf8') + (tx.payload?.length ?? 0) + 32, 0));
+  }
 });
 
 void test('maps null, rejected and malformed complete blocks without provider details', async () => {

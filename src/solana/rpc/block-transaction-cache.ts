@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { deserialize } from 'node:v8';
+import { decodeBlockTransactionPayload } from './block-transaction-payload-codec.js';
 import {
   BlockUnavailableError, RpcTransientError, TransactionIndexNotFoundError,
   TransactionNormalizationError, internalLocatorError, snapshotBlockTransactionData,
@@ -184,7 +184,7 @@ export class CachedSolanaBlockTransactionLocator {
     if (selected.payload === null) throw internalLocatorError(new TransactionNormalizationError());
     let normalized: NormalizedTransaction;
     try {
-      normalized = deserialize(Buffer.from(selected.payload, 'base64')) as NormalizedTransaction;
+      normalized = decodeBlockTransactionPayload(selected.payload) as NormalizedTransaction;
     } catch {
       this.remove(key, true);
       throw internalLocatorError(new TransactionNormalizationError());
