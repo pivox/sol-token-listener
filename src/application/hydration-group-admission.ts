@@ -232,7 +232,8 @@ export class HydrationGroupAdmission {
     if (contested) this.#nextContestedRole = role === 'worker' ? 'classifier' : 'worker';
     if (role === 'worker' && worker) this.#grant(worker, now);
     else for (const waiter of [...this.#classifierWaiters]) this.#grant(waiter, now);
-    if (this.#group) this.#dispatch(now);
+    // Grant installed either an unbound ticket (returns) or a group (joins only).
+    this.#dispatch(now);
   }
 
   #grant(waiter: Waiter, now: number): void {
