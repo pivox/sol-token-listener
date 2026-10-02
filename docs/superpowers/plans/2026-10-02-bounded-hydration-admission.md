@@ -151,6 +151,12 @@ JSON.stringify([context.token, context.providerId, target.slot.toString(),
 
 ## Task 4 — Visible admission evidence and production wiring
 
+Create `src/domain/block-hydration-admission.ts` and
+`tests/block-hydration-admission.test.ts` for the strict, detached immutable
+snapshot parser shared by heartbeat and API projection. This avoids duplicating
+validation in the already large repository and contract modules. The controller
+metrics remain structurally compatible without a domain-to-application dependency.
+
 Modify `src/domain/transaction-ingestion.ts`,
 `src/application/production-listener-factory.ts`,
 `src/storage/transaction-inbox.repository.ts`,
