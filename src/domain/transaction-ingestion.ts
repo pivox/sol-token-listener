@@ -19,6 +19,10 @@ import {
 } from './worker-admission-metrics.js';
 import type { ChainConfirmationStatus } from './types.js';
 import { isCanonicalSolanaPublicKey } from './solana-public-key.js';
+import {
+  snapshotRuntimeBlockHydrationAdmissionMetrics,
+  type RuntimeBlockHydrationAdmissionMetricsV1,
+} from './block-hydration-admission.js';
 
 export const isCanonicalSolanaProgramId = isCanonicalSolanaPublicKey;
 
@@ -282,6 +286,7 @@ export interface RuntimeHeartbeat {
   readonly leasedCount: number;
   readonly exhaustedCount: number;
   readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
+  readonly blockHydrationAdmission?: RuntimeBlockHydrationAdmissionMetricsV1;
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
   readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
@@ -760,6 +765,9 @@ export function assertValidRuntimeHeartbeat(
   }
   if (record.blockHydration !== undefined) {
     assertValidRuntimeBlockHydrationMetrics(record.blockHydration);
+  }
+  if (record.blockHydrationAdmission !== undefined) {
+    snapshotRuntimeBlockHydrationAdmissionMetrics(record.blockHydrationAdmission);
   }
   if (record.catchUpAdmission !== undefined) {
     snapshotRuntimeCatchUpAdmissionMetrics(record.catchUpAdmission, record.backlogCount);

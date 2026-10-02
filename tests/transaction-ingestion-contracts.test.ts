@@ -71,6 +71,11 @@ void test('heartbeat accepts omitted historical worker admission and only an exa
     demotedCount: 5,
   }));
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.throws(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({
+      ...heartbeat, blockHydrationAdmission: Object.freeze({ version: 1, enabled: true }),
+    }));
+  }, /block hydration admission/u);
   assert.doesNotThrow(() => {
     assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, workerAdmission }));
   });
