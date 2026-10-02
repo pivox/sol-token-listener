@@ -24,7 +24,9 @@ import {
   type PumpFunWorkerAdmissionPolicyV1,
 } from '../domain/worker-admission.js';
 import {
+  snapshotRuntimeWorkerAdmissionClock,
   snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionClockV1,
   type RuntimeWorkerAdmissionMetricsV1,
 } from '../domain/worker-admission-metrics.js';
 import {
@@ -2840,6 +2842,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : createFirstProcessingCanaryEvidence(value.firstProcessingCanary);
       const workerAdmission = value.workerAdmission === undefined ? undefined
         : snapshotRuntimeWorkerAdmissionMetrics(value.workerAdmission);
+      const workerAdmissionClock = value.workerAdmissionClock === undefined ? undefined
+        : snapshotRuntimeWorkerAdmissionClock(value.workerAdmissionClock);
       const decoderQuarantine = value.decoderQuarantine === undefined ? undefined
         : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
       const blockHydrationAdmission = value.blockHydrationAdmission === undefined ? undefined
@@ -2894,6 +2898,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
             ...(workerAdmission === undefined ? {} : { workerAdmission }),
+            ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
             ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
             ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
           }),
@@ -2911,12 +2916,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   public async heartbeatSnapshot(): Promise<Readonly<{
     counts: InboxCounts;
     workerAdmission: RuntimeWorkerAdmissionMetricsV1;
+    workerAdmissionClock: RuntimeWorkerAdmissionClockV1;
   }>> {
     return this.safely(() => this.transaction(async (client) => {
       await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
       const counts = await this.readCounts(client);
-      const workerAdmission = await this.readWorkerAdmissionMetrics(client);
-      return Object.freeze({ counts, workerAdmission });
+      const sample = await this.readWorkerAdmissionSample(client);
+      return Object.freeze({ counts, ...sample });
     }));
   }
 
@@ -2996,10 +3002,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   }
 
   public async workerAdmissionMetrics(): Promise<RuntimeWorkerAdmissionMetricsV1> {
-    return this.readWorkerAdmissionMetrics(this.pool);
+    return (await this.readWorkerAdmissionSample(this.pool)).workerAdmission;
   }
 
-  private async readWorkerAdmissionMetrics(queryable: Queryable): Promise<RuntimeWorkerAdmissionMetricsV1> {
+  private async readWorkerAdmissionSample(queryable: Queryable): Promise<Readonly<{
+    workerAdmission: RuntimeWorkerAdmissionMetricsV1;
+    workerAdmissionClock: RuntimeWorkerAdmissionClockV1;
+  }>> {
     return this.safely(async () => {
       const claimable = `(
         (inbox.processing_status='PENDING'
@@ -3050,6 +3059,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
                  AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED')
              UNION SELECT live.mint FROM listener_worker_tracking_live_mints AS live
            ) SELECT
+             (SELECT (EXTRACT(EPOCH FROM at)*1000)::BIGINT FROM database_clock) AS sampled_at_ms,
              COUNT(*) FILTER (WHERE ${claimable}
                AND inbox.worker_admitted_at IS NOT NULL
                AND ${workerAdmissionClaimAuthoritySql('inbox')}) AS claimable_backlog_count,
@@ -3072,6 +3082,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : `WITH database_clock AS MATERIALIZED (
              SELECT date_trunc('milliseconds',clock_timestamp()) AS at
            ) SELECT
+             (SELECT (EXTRACT(EPOCH FROM at)*1000)::BIGINT FROM database_clock) AS sampled_at_ms,
              COUNT(*) FILTER (WHERE ${claimable}) AS claimable_backlog_count,
              0::BIGINT AS classification_pending_count,
              NULL::BIGINT AS oldest_classification_pending_age_ms,
@@ -3093,7 +3104,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           row.oldest_classification_pending_age_ms,
           'worker admission oldest classification pending age',
         );
-      return snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+      const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
         version: 1,
         enabled: this.workerAdmissionPolicy.enabled,
         trackingWindowSeconds: this.workerAdmissionPolicy.trackingWindowSeconds,
@@ -3110,6 +3121,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         ),
         demotedCount: safeCount(row.demoted_count, 'worker admission demoted count'),
       }));
+      const workerAdmissionClock = snapshotRuntimeWorkerAdmissionClock(Object.freeze({
+        version: 1,
+        sampledAtMs: safeCount(row.sampled_at_ms, 'worker admission sample timestamp'),
+      }));
+      return Object.freeze({ workerAdmission, workerAdmissionClock });
     });
   }
 

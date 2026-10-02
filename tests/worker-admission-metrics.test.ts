@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  snapshotRuntimeWorkerAdmissionClock as snapshotClock,
   snapshotRuntimeWorkerAdmissionMetrics,
   type RuntimeWorkerAdmissionMetricsV1,
 } from '../src/domain/worker-admission-metrics.js';
@@ -21,6 +22,64 @@ Readonly<WorkerAdmissionMetricsInput> => Object.freeze({
   extendedMintCount: 2,
   demotedCount: 5,
   ...overrides,
+});
+
+void test('workerAdmissionClock.v1 returns exact detached frozen plain and null-prototype snapshots', () => {
+  for (const input of [
+    Object.freeze({ version: 1, sampledAtMs: 1 }),
+    Object.freeze(Object.assign(Object.create(null) as object, {
+      version: 1, sampledAtMs: 8_640_000_000_000_000,
+    })),
+  ]) {
+    const snapshot = snapshotClock(input);
+    assert.deepEqual(Reflect.ownKeys(snapshot), ['version', 'sampledAtMs']);
+    assert.equal(snapshot.version, 1);
+    assert.equal(snapshot.sampledAtMs, Reflect.get(input, 'sampledAtMs'));
+    assert.notEqual(snapshot, input);
+    assert.equal(Object.isFrozen(snapshot), true);
+    assert.equal(Object.getPrototypeOf(snapshot), Object.prototype);
+  }
+});
+
+void test('workerAdmissionClock.v1 rejects nonexact records and noncanonical or unrepresentable timestamps', () => {
+  for (const value of [
+    null, undefined, [], 1, { version: 1, sampledAtMs: 1 },
+    Object.freeze({ version: 1 }), Object.freeze({ sampledAtMs: 1 }),
+    Object.freeze({ version: 2, sampledAtMs: 1 }),
+    Object.freeze({ version: '1', sampledAtMs: 1 }),
+    Object.freeze({ version: 1, sampledAtMs: 1, secret: 'do-not-leak' }),
+    Object.freeze({ version: 1, sampledAtMs: 1, [Symbol('secret')]: 1 }),
+    Object.freeze(Object.assign(Object.create({}) as object, { version: 1, sampledAtMs: 1 })),
+    Object.freeze(Object.defineProperty({ version: 1 }, 'sampledAtMs', { value: 1 })),
+    ...[0, -0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER,
+      8_640_000_000_000_001, '1', 1n, null, undefined].map((sampledAtMs) => (
+      Object.freeze({ version: 1, sampledAtMs })
+    )),
+  ]) {
+    assert.throws(() => snapshotClock(value), {
+      name: 'TypeError', message: 'Runtime worker admission clock is invalid.',
+    });
+  }
+});
+
+void test('workerAdmissionClock.v1 rejects proxies and accessors without executing user code', () => {
+  let reads = 0;
+  const hostile = (): never => { reads += 1; throw new Error('do-not-leak'); };
+  const input = Object.freeze({ version: 1, sampledAtMs: 1 });
+  const revoked = Proxy.revocable(input, {});
+  revoked.revoke();
+  for (const value of [
+    new Proxy(input, { get: hostile, getPrototypeOf: hostile,
+      getOwnPropertyDescriptor: hostile, ownKeys: hostile, isExtensible: hostile }),
+    revoked.proxy,
+    Object.freeze({ version: 1, get sampledAtMs() { return hostile(); } }),
+    Object.freeze({ get version() { return hostile(); }, sampledAtMs: 1 }),
+  ]) {
+    assert.throws(() => snapshotClock(value), {
+      name: 'TypeError', message: 'Runtime worker admission clock is invalid.',
+    });
+  }
+  assert.equal(reads, 0);
 });
 
 void test('workerAdmission.v1 returns a detached frozen exact snapshot', () => {

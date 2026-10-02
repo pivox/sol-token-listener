@@ -69,6 +69,87 @@ const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
 
+void test('paired worker admission clock survives an empty inbox for enabled and disabled PostgreSQL samples',
+  async (context) => {
+    for (const enabled of [true, false]) {
+      await withDatabase(context, async (pool) => {
+        const clock = new Date('2026-01-02T00:00:00.123Z');
+        await withAuthoritySession(pool, clock, async ({ repository, authorityClockReads }) => {
+          const before = authorityClockReads();
+          const snapshot = await repository.heartbeatSnapshot();
+          assert.deepEqual(snapshot.workerAdmissionClock, {
+            version: 1, sampledAtMs: clock.getTime(),
+          });
+          assert.equal(snapshot.workerAdmission.enabled, enabled);
+          assert.equal(snapshot.workerAdmission.claimableBacklogCount, 0);
+          assert.equal(snapshot.workerAdmission.classificationPendingCount, 0);
+          assert.equal(snapshot.workerAdmission.oldestClassificationPendingAgeMs, null);
+          assert.equal(Reflect.ownKeys(snapshot.workerAdmission).length, 9);
+          assert.ok(Object.isFrozen(snapshot));
+          assert.ok(Object.isFrozen(snapshot.workerAdmissionClock));
+          assert.equal(authorityClockReads() - before, 1);
+          assert.equal(Reflect.ownKeys(await repository.workerAdmissionMetrics()).length, 9);
+        }, createPumpFunWorkerAdmissionPolicy({ enabled, trackingWindowSeconds: 45 }));
+      });
+    }
+  });
+
+void test('paired worker admission clock reproduces populated classification age from the same PostgreSQL instant',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-01-02T00:00:00.123Z');
+      await withAuthoritySession(pool, clock, async ({ repository, client, authorityClockReads }) => {
+        await client.query(`INSERT INTO chain_transaction_inbox (
+          signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+          processing_status,observed_at,first_detected_at,worker_admitted_at
+        ) VALUES ('paired-clock-pending',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING',$2,$2,NULL)`,
+        [PUMP_PROGRAM_ID, new Date(clock.getTime() - 5_001)]);
+        const before = authorityClockReads();
+        const snapshot = await repository.heartbeatSnapshot();
+        assert.deepEqual(snapshot.workerAdmissionClock, {
+          version: 1, sampledAtMs: clock.getTime(),
+        });
+        assert.equal(snapshot.counts.pending, 1);
+        assert.equal(snapshot.workerAdmission.classificationPendingCount, 1);
+        assert.equal(snapshot.workerAdmission.oldestClassificationPendingAgeMs, 5_001);
+        assert.equal(authorityClockReads() - before, 1);
+      });
+    });
+  });
+
+void test('heartbeat persists detached optional worker admission clock beside unchanged metrics', async () => {
+  const queryCalls: unknown[][] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      queryCalls.push(values === undefined ? [] : [...values]);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+    version: 1, enabled: false, trackingWindowSeconds: 45, claimableBacklogCount: 0,
+    classificationPendingCount: 0, oldestClassificationPendingAgeMs: null,
+    freshMintCount: 0, extendedMintCount: 0, demotedCount: 0,
+  }));
+  const workerAdmissionClock = Object.freeze({ version: 1 as const, sampledAtMs: 2_000 });
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), workerAdmission,
+    workerAdmissionClock }));
+  const payload = queryCalls[0]?.[14] as Record<string, unknown>;
+  assert.deepEqual(payload.workerAdmissionClock, workerAdmissionClock);
+  assert.notEqual(payload.workerAdmissionClock, workerAdmissionClock);
+  assert.notEqual(payload.workerAdmission, workerAdmission);
+  assert.deepEqual(payload.workerAdmission, workerAdmission);
+  (payload.workerAdmissionClock as { sampledAtMs: number }).sampledAtMs = 1;
+  assert.equal(workerAdmissionClock.sampledAtMs, 2_000);
+  const invalid = Object.freeze({ ...rpcEvidenceHeartbeat(), workerAdmission,
+    workerAdmissionClock: Object.freeze({ version: 1, sampledAtMs: 2_001 }) });
+  await assert.rejects(repository.writeHeartbeat(invalid), TransactionInboxRepositoryError);
+  assert.equal(queryCalls.length, 1);
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), updatedAtMs: 3_000,
+    workerAdmission }));
+  assert.equal(Object.hasOwn(queryCalls[1]?.[14] as object, 'workerAdmissionClock'), false);
+});
+
 void test('heartbeat snapshot excludes an arrival committed between its PostgreSQL reads', async (context) => {
   await withDatabase(context, async (pool) => {
     const writer = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
@@ -7361,6 +7442,7 @@ async function withAuthoritySession(
   pool: InstanceType<typeof pg.Pool>,
   clock: Date,
   run: (session: AuthoritySession) => Promise<void>,
+  admissionPolicy = enabledAdmission,
 ): Promise<void> {
   const connection = await pool.connect();
   const literal = `TIMESTAMPTZ '${clock.toISOString()}'`;
@@ -7414,13 +7496,13 @@ async function withAuthoritySession(
       connect: async () => client,
     };
     await run({
-      repository: new PostgresTransactionInboxRepository(database, undefined, enabledAdmission),
+      repository: new PostgresTransactionInboxRepository(database, undefined, admissionPolicy),
       launchpad: new PostgresLaunchpadEventRepository(
         database,
         4,
         Date.now,
         undefined,
-        enabledAdmission,
+        admissionPolicy,
       ),
       client: connection,
       authorityClockReads: () => authorityClockReadCount,
