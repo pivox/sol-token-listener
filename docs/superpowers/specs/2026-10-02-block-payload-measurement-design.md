@@ -1,4 +1,4 @@
-# Complete-block payload measurement — v1.0.0
+# Complete-block payload measurement — v1.0.1
 
 ## Scope and authority
 
@@ -77,6 +77,15 @@ Local Node 25 measurements are exploratory, not production Node 22 evidence.
 If a production-runtime comparison cannot be made, report that limitation rather
 than claiming production latency/RSS. Three historical blocks cannot establish a
 population distribution, sustained capacity, or a future canary PASS.
+
+An optional offline comparison may use the exact production Docker base image
+from `Dockerfile`: Node 22.22.0 bookworm-slim, digest
+`sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94`.
+Use at most one ephemeral container, no network, read-only mounts of the harness,
+isolated worktree and captured public blocks, 768 MiB memory and one CPU. Mount
+no root `.env`, wallet or Docker socket. Report these resource restrictions and
+any OOM/failure; do not silently raise limits. Remove only this experiment's
+container afterward. The capture itself still runs without Docker or database.
 
 ## Acceptance and next decision
 

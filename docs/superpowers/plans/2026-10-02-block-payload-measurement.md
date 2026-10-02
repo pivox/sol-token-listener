@@ -8,7 +8,7 @@
 
 **Tech Stack:** Existing Node/tsx, Solana web3.js, node:test, V8 serializer, zlib, fs/statfs, fixed-code errors.
 
-Specification: `docs/superpowers/specs/2026-10-02-block-payload-measurement-design.md` v1.0.0, commit `7b72a2e`.
+Specification: `docs/superpowers/specs/2026-10-02-block-payload-measurement-design.md` v1.0.1 (initial commit `7b72a2e`; exact production runtime added before any capture).
 
 ## Task 1 — Offline guards, RED before capture code
 
@@ -81,6 +81,7 @@ test('HTTP failure stops, redacts and never retries', async () => {
 - [ ] Run `node /tmp/sol-listener-block-measurement.mjs capture` once. A failure stops the fixed experiment; do not silently rerun or replace slots. Record successful request count and the fixed failure code if incomplete.
 - [ ] Verify 0700/0600 modes, public manifest hashes and total raw data <=96 MiB. Never display environment contents or provider response error bodies.
 - [ ] Run `node /tmp/sol-listener-block-measurement.mjs analyze <exact-returned-directory>` offline; save aggregate output with runtime and sample limitations.
+- [ ] If disk permits, repeat offline under the pinned Node22.22.0 Docker base from the spec: one ephemeral container, `--network none --read-only --memory 768m --cpus 1`, only read-only mounts for the harness, isolated worktree and capture directory. No `.env`, wallet, socket or database mount. Record the digest, runtime, resource limits and exit status; an OOM is evidence, not permission to increase the cap. No additional RPC requests are allowed.
 
 ## Task 4 — Decision and handoff
 
