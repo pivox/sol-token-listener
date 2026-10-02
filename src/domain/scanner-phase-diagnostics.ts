@@ -1,4 +1,5 @@
 import { isProxy } from 'node:util/types';
+import { RPC_PROVIDER_IDS } from './rpc-provider.js';
 
 export const SCANNER_DIAGNOSTIC_PHASES = Object.freeze([
   'SOURCE_PAGE', 'COVERAGE_READ', 'BLOCK_HYDRATE', 'CLASSIFICATION_WRITE',
@@ -7,7 +8,7 @@ export const SCANNER_DIAGNOSTIC_PHASES = Object.freeze([
 export const SCANNER_DIAGNOSTIC_OUTCOMES = Object.freeze([
   'OK', 'ERROR', 'PAUSED', 'REFRESH_REQUIRED', 'ABORTED',
 ] as const);
-export const SCANNER_DIAGNOSTIC_PROVIDERS = Object.freeze(['primary', 'secondary'] as const);
+export const SCANNER_DIAGNOSTIC_PROVIDERS = RPC_PROVIDER_IDS;
 export const SCANNER_DIAGNOSTIC_PROGRAMS = Object.freeze(['pumpfun', 'pumpswap'] as const);
 export const SCANNER_DIAGNOSTIC_CODES = Object.freeze([
   'UNKNOWN',

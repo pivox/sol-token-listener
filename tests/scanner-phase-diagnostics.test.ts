@@ -26,11 +26,30 @@ void test('records finite phases, provider/program dimensions and exact timings'
   assert.deepEqual(snapshot.fronts.map(front => front.program), ['pumpfun', 'pumpswap']);
 });
 
+void test('retains exact provider-affine fallback ids without accepting a collapsed secondary label', () => {
+  const collector = new ScannerPhaseDiagnosticsCollector();
+  for (const provider of ['primary', 'fallback-1', 'fallback-2', 'fallback-3'] as const) {
+    collector.recordPhase({
+      provider, program: 'pumpfun', phase: 'SOURCE_PAGE',
+      durationMs: 1, outcome: 'OK', code: null,
+    });
+  }
+  assert.deepEqual(collector.snapshot(1).buckets.map(bucket => bucket.provider), [
+    'primary', 'fallback-1', 'fallback-2', 'fallback-3',
+  ]);
+  assert.throws(() => {
+    collector.recordPhase({
+      provider: 'secondary', program: 'pumpfun', phase: 'SOURCE_PAGE',
+      durationMs: 1, outcome: 'OK', code: null,
+    } as never);
+  }, TypeError);
+});
+
 void test('preserves finite outcomes and trusted original codes but never retains an exception', () => {
   const collector = new ScannerPhaseDiagnosticsCollector();
   for (const outcome of SCANNER_DIAGNOSTIC_OUTCOMES) {
     collector.recordPhase({
-      provider: 'secondary', program: 'pumpswap', phase: 'SUPERVISOR',
+      provider: 'fallback-1', program: 'pumpswap', phase: 'SUPERVISOR',
       durationMs: 1, outcome,
       code: outcome === 'ERROR' ? 'SOURCE_RESPONSE'
         : outcome === 'PAUSED' ? 'CATCH_UP_PAGE_BUDGET_EXHAUSTED'
@@ -42,7 +61,7 @@ void test('preserves finite outcomes and trusted original codes but never retain
   assert.equal(snapshot.buckets[0]?.lastOutcome, 'ABORTED');
   assert.equal(snapshot.buckets[0]?.lastCode, null);
   collector.recordPhase({
-    provider: 'secondary', program: 'pumpswap', phase: 'BLOCK_HYDRATE',
+    provider: 'fallback-1', program: 'pumpswap', phase: 'BLOCK_HYDRATE',
     durationMs: 3, outcome: 'ERROR', code: 'UNKNOWN',
   });
   assert.equal(collector.snapshot(2_001).buckets.find(bucket => bucket.phase === 'BLOCK_HYDRATE')?.lastCode, 'UNKNOWN');
