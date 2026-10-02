@@ -3,8 +3,92 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { PUMP_INSTRUCTIONS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
+import { decodePumpInstruction } from '../src/launchpads/pumpfun/instruction-decoder.js';
 import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
 import { loadPumpFixture, parsePumpFixture } from './helpers/pumpfun-fixture.js';
+
+void test('observe la création opaque finalisée et son achat initial multi-quote', async () => {
+  const fixture = await loadPumpFixture('create-v2-opaque-holder-mainnet.json');
+  const instruction = fixture.transaction.instructions.find((candidate) =>
+    Buffer.from(candidate.data.subarray(0, 8)).equals(
+      Buffer.from(PUMP_INSTRUCTIONS.create_v2.discriminator),
+    ));
+  assert.ok(instruction);
+  assert.equal(Buffer.from(instruction.data.subarray(-2)).toString('hex'), '0001');
+  assert.equal(fixture.provenance.slot, 452_406_478n);
+  assert.equal(fixture.provenance.transactionIndex, 78);
+  assert.equal(fixture.transaction.confirmationStatus, 'FINALIZED');
+  assert.equal(fixture.transaction.error, null);
+  assert.throws(() => decodePumpInstruction(instruction),
+    (error: unknown) => error instanceof Error
+      && 'code' in error && error.code === 'PUMP_BORSH_INVALID');
+
+  const decoded = decodePumpTransaction(fixture.transaction);
+  assert.equal(decoded.creations.length, 1);
+  assert.equal(decoded.trades.length, 1);
+  assert.equal(decoded.trades[0]?.event.isBuy, true);
+  assert.equal(decoded.creations[0]?.isHolderReward, true);
+  assert.equal(decoded.creations[0]?.quoteAsset.mint,
+    'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn');
+  assert.equal(decoded.creations[0]?.quoteAsset.tokenProgram, 'TOKEN_2022');
+  assert.equal(decoded.creations[0]?.quoteAsset.decimals, 6);
+  assert.equal(decoded.creations[0]?.action.instruction, instruction);
+  const creation = decoded.creations[0];
+  assert.ok(creation);
+  assert.deepEqual(creation.action.wireEvidence, {
+    profile: 'CREATE_V2_OPAQUE_0001_V1',
+    pairedEventCursor: {
+      instructionIndex: creation.eventCpi.instruction.instructionIndex,
+      innerInstructionIndex: creation.eventCpi.instruction.innerInstructionIndex,
+      stackHeight: creation.eventCpi.instruction.stackHeight,
+    },
+  });
+  assert.deepEqual(Object.keys(creation.action.args), [
+    'name', 'symbol', 'uri', 'creator', 'is_mayhem_mode',
+  ]);
+  assert.equal(creation.creatorFeeBps, 0n);
+  assert.equal(creation.event.isCashbackEnabled, false);
+  assert.equal(decoded.trades[0]?.action.wireEvidence, undefined);
+});
+
+void test('observe la vente opaque finalisée avec événement appairé', async () => {
+  const fixture = await loadPumpFixture('sell-opaque-volume-mainnet.json');
+  const instruction = fixture.transaction.instructions.find((candidate) =>
+    Buffer.from(candidate.data.subarray(0, 8)).equals(
+      Buffer.from(PUMP_INSTRUCTIONS.sell.discriminator),
+    ));
+  assert.ok(instruction);
+  assert.equal(Buffer.from(instruction.data.subarray(-2)).toString('hex'), '0100');
+  assert.equal(fixture.provenance.slot, 452_406_531n);
+  assert.equal(fixture.provenance.transactionIndex, 460);
+  assert.equal(fixture.transaction.confirmationStatus, 'FINALIZED');
+  assert.equal(fixture.transaction.error, null);
+  assert.throws(() => decodePumpInstruction(instruction),
+    (error: unknown) => error instanceof Error
+      && 'code' in error && error.code === 'PUMP_BORSH_INVALID');
+
+  const decoded = decodePumpTransaction(fixture.transaction);
+  assert.equal(decoded.creations.length, 0);
+  assert.equal(decoded.trades.length, 1);
+  assert.equal(decoded.trades[0]?.event.isBuy, false);
+  assert.equal(decoded.trades[0]?.event.tokenAmount, 25_659_383_952_290n);
+  assert.equal(decoded.trades[0]?.action.instruction, instruction);
+  const trade = decoded.trades[0];
+  assert.ok(trade);
+  assert.deepEqual(trade.action.wireEvidence, {
+    profile: 'SELL_OPAQUE_0100_V1',
+    pairedEventCursor: {
+      instructionIndex: trade.eventCpi.instruction.instructionIndex,
+      innerInstructionIndex: trade.eventCpi.instruction.innerInstructionIndex,
+      stackHeight: trade.eventCpi.instruction.stackHeight,
+    },
+  });
+  assert.deepEqual(Object.keys(trade.action.args), ['amount', 'min_sol_output']);
+  assert.equal(trade.event.tokenAmount, trade.action.args.amount);
+  assert.equal(trade.event.trackVolume, false);
+  assert.equal(trade.event.ixName, 'sell');
+});
 
 void test('décode hors ligne la création mainnet et son achat initial', async () => {
   const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');

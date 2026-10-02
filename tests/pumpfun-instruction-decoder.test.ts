@@ -9,13 +9,16 @@ import {
 } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import {
   decodePumpInstruction,
+  decodePumpInstructionForTransaction,
 } from '../src/launchpads/pumpfun/instruction-decoder.js';
 import type {
+  PumpInstructionCandidate,
   PumpInstructionName,
 } from '../src/launchpads/pumpfun/types.js';
 import type {
   NormalizedInstruction,
 } from '../src/solana/rpc/types.js';
+import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
 const PUMP_PROGRAM =
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
@@ -312,6 +315,185 @@ void test('refuse les remaining account counts create_v2 hors 0, 3 et 4', () => 
     );
   }
 });
+
+for (const fixture of [
+  {
+    file: 'create-v2-opaque-holder-mainnet.json',
+    name: 'create_v2',
+    suffix: '0001',
+    profile: 'CREATE_V2_OPAQUE_0001_V1',
+  },
+  {
+    file: 'sell-opaque-volume-mainnet.json',
+    name: 'sell',
+    suffix: '0100',
+    profile: 'SELL_OPAQUE_0100_V1',
+  },
+] as const) {
+  void test(`refuse strictement le suffixe opaque original ${fixture.name}`, async () => {
+    const instruction = await opaqueFixtureInstruction(fixture.file, fixture.name);
+    assert.equal(Buffer.from(instruction.data.subarray(-2)).toString('hex'), fixture.suffix);
+    assert.throws(() => decodePumpInstruction(instruction), isPumpError('PUMP_BORSH_INVALID'));
+  });
+
+  void test(`préserve le préfixe et la provenance du candidat ${fixture.profile}`, async () => {
+    const instruction = await opaqueFixtureInstruction(fixture.file, fixture.name);
+    const originalBytes = Uint8Array.from(instruction.data);
+    const originalAccounts = [...instruction.accounts];
+    const candidate = decodeForTransaction(instruction);
+    assert.ok(candidate);
+    assert.equal(candidate.profile, fixture.profile);
+    assert.equal(candidate.action.name, fixture.name);
+    assert.equal(candidate.action.family, fixture.name === 'create_v2' ? 'CREATE' : 'SELL');
+    assert.equal(candidate.action.instruction, instruction);
+    assert.equal(candidate.action.instruction.data, instruction.data);
+    assert.equal(candidate.action.instruction.accounts, instruction.accounts);
+    assert.deepEqual(instruction.data, originalBytes);
+    assert.deepEqual(instruction.accounts, originalAccounts);
+    const definition = PUMP_INSTRUCTIONS[fixture.name];
+    for (const [index, account] of definition.accounts.entries()) {
+      assert.equal(candidate.action.accounts[account.name], instruction.accounts[index]);
+    }
+    if (fixture.name === 'create_v2') {
+      assert.deepEqual(candidate.action.args, {
+        name: 'attentioninu', symbol: 'AI',
+        uri: 'https://m.rapidlaunch.io/m/r1pPHQ1mM',
+        creator: new PublicKey(Buffer.from(
+          'a7eee5ed2ef38b3511545a51c0d1a307b25a339432d3b36d86f8ae1602ee86bd0', 'hex',
+        )).toBase58(),
+        is_mayhem_mode: false,
+      });
+      assert.equal(candidate.action.accounts.quote_mint,
+        'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn');
+      assert.equal(candidate.action.accounts.quote_control, instruction.accounts.at(-1));
+    } else {
+      assert.deepEqual(candidate.action.args, {
+        amount: 25_659_383_952_290n, min_sol_output: 0n,
+      });
+    }
+    for (const optional of ['is_cashback_enabled', 'creator_fee_bps', 'is_holder_reward', 'track_volume']) {
+      assert.equal(Object.hasOwn(candidate.action.args, optional), false);
+    }
+    for (const value of [candidate, candidate.action, candidate.action.args, candidate.action.accounts]) {
+      assert.equal(Object.isFrozen(value), true);
+    }
+    const nextCandidate = decodeForTransaction(instruction);
+    assert.notEqual(nextCandidate, candidate);
+    assert.notEqual(nextCandidate?.action, candidate.action);
+  });
+}
+
+void test('étiquette les instructions officielles avec un profil null', () => {
+  for (const name of Object.keys(PUMP_INSTRUCTIONS) as PumpInstructionName[]) {
+    const instruction = pumpInstruction(name);
+    const candidate = decodeForTransaction(instruction);
+    assert.ok(candidate);
+    assert.equal(candidate.profile, null);
+    assert.deepEqual(candidate.action, decodePumpInstruction(instruction));
+    assert.equal(candidate.action.instruction, instruction);
+    assert.equal(Object.isFrozen(candidate), true);
+  }
+  const officialOneByte = decodeForTransaction(createV2InstructionWithSuffix(Uint8Array.of(0)));
+  assert.equal(officialOneByte?.profile, null);
+});
+
+void test('refuse les suffixes opaques modifiés, étendus ou sell tronqués', () => {
+  for (const name of ['create_v2', 'sell'] as const) {
+    for (const suffix of [
+      Uint8Array.of(0, 0), Uint8Array.of(1, 1), Uint8Array.of(2, 0),
+      Uint8Array.of(0, 2), Uint8Array.of(0, 1, 0), Uint8Array.of(1, 0, 0),
+      ...(name === 'create_v2' ? [Uint8Array.of(1, 0)] : [Uint8Array.of(0, 1), Uint8Array.of(1)]),
+    ]) {
+      assertSameStrictFailure(opaqueInstruction(name, suffix), 'PUMP_BORSH_INVALID');
+    }
+  }
+});
+
+void test('ne reconnaît aucun profil opaque pour les autres discriminateurs ou programmes', () => {
+  const sell = opaqueInstruction('sell', Uint8Array.of(1, 0));
+  assert.equal(decodeForTransaction({ ...sell, programId: address(99) }), null);
+  assert.equal(decodeForTransaction({ ...sell, data: Uint8Array.of(1, 2, 3) }), null);
+  assert.equal(decodeForTransaction({
+    ...sell, data: Uint8Array.from([...Buffer.alloc(8, 255), ...sell.data.subarray(8)]),
+  }), null);
+  assertSameStrictFailure({
+    ...sell,
+    accounts: pumpInstruction('sell_v2').accounts,
+    data: Uint8Array.from([...PUMP_INSTRUCTIONS.sell_v2.discriminator, ...sell.data.subarray(8)]),
+  }, 'PUMP_BORSH_INVALID');
+  assertSameStrictFailure(buyInstructionWithSuffix('buy', Uint8Array.of(0, 1)), 'PUMP_BORSH_INVALID');
+});
+
+void test('préserve les rejets des comptes requis et remaining accounts opaques', () => {
+  for (const name of ['create_v2', 'sell'] as const) {
+    const instruction = opaqueInstruction(name, name === 'create_v2' ? Uint8Array.of(0, 1) : Uint8Array.of(1, 0));
+    assertSameStrictFailure({ ...instruction, accounts: instruction.accounts.slice(0, -1) }, 'PUMP_ACCOUNT_MISSING');
+    if (name === 'create_v2') {
+      for (const count of [1, 2, 5]) {
+        assertSameStrictFailure({
+          ...instruction,
+          accounts: [...instruction.accounts, ...Array.from({ length: count }, () => address(22))],
+        }, 'PUMP_ACCOUNT_MISSING');
+      }
+      assertSameStrictFailure({
+        ...instruction, accounts: [...instruction.accounts, address(21), address(22), address(23), address(24)],
+      }, 'PUMP_ACCOUNT_MISSING');
+    }
+  }
+});
+
+void test('préserve les rejets des préfixes requis malformés et tronqués', () => {
+  const create = opaqueInstruction('create_v2', Uint8Array.of(0, 1));
+  const invalidBool = Uint8Array.from(create.data);
+  invalidBool[invalidBool.length - 3] = 2;
+  assertSameStrictFailure({ ...create, data: invalidBool }, 'PUMP_BORSH_INVALID');
+  const invalidUtf8 = Uint8Array.from(create.data);
+  invalidUtf8[12] = 255;
+  assertSameStrictFailure({ ...create, data: invalidUtf8 }, 'PUMP_BORSH_INVALID');
+  const oversizedString = Uint8Array.from(create.data);
+  oversizedString.set(Buffer.from([255, 255, 255, 255]), 8);
+  assertSameStrictFailure({ ...create, data: oversizedString }, 'PUMP_BORSH_INVALID');
+  assertSameStrictFailure({ ...create, data: create.data.subarray(0, 13) }, 'PUMP_BORSH_TRUNCATED');
+  const sell = opaqueInstruction('sell', Uint8Array.of(1, 0));
+  assertSameStrictFailure({
+    ...sell, data: Uint8Array.from([...sell.data.subarray(0, 15), 1, 0]),
+  }, 'PUMP_BORSH_TRUNCATED');
+});
+
+function decodeForTransaction(instruction: NormalizedInstruction): PumpInstructionCandidate | null {
+  return decodePumpInstructionForTransaction(instruction);
+}
+
+async function opaqueFixtureInstruction(
+  file: string, name: 'create_v2' | 'sell',
+): Promise<NormalizedInstruction> {
+  const fixture = await loadPumpFixture(file);
+  const instruction = fixture.transaction.instructions.find((candidate) =>
+    candidate.programId === PUMP_PROGRAM
+    && Buffer.from(candidate.data.subarray(0, 8)).equals(Buffer.from(PUMP_INSTRUCTIONS[name].discriminator)));
+  assert.ok(instruction);
+  return instruction;
+}
+
+function opaqueInstruction(name: 'create_v2' | 'sell', suffix: Uint8Array): NormalizedInstruction {
+  if (name === 'create_v2') return createV2InstructionWithSuffix(suffix);
+  const instruction = pumpInstruction(name);
+  return { ...instruction, data: Uint8Array.from([...instruction.data, ...suffix]) };
+}
+
+function assertSameStrictFailure(instruction: NormalizedInstruction, code: string): void {
+  let strictError: unknown;
+  assert.throws(() => decodePumpInstruction(instruction), (error: unknown) => {
+    strictError = error;
+    return isPumpError(code)(error);
+  });
+  assert.throws(() => decodeForTransaction(instruction), (error: unknown) => {
+    assert.ok(strictError instanceof PumpDecodingError);
+    return error instanceof PumpDecodingError
+      && error.code === strictError.code && error.message === strictError.message
+      && error.retryable === strictError.retryable;
+  });
+}
 
 function pumpInstruction(name: PumpInstructionName): NormalizedInstruction {
   const definition = PUMP_INSTRUCTIONS[name];

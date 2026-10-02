@@ -295,6 +295,34 @@ void test('classifies a creation and its initial buy as one actionable launch', 
   }]);
 });
 
+void test('classifies event-attested opaque creation plus initial buy and sell without losing cursors', async () => {
+  const creation = await fixtureTransaction('create-v2-opaque-holder-mainnet.json');
+  const sale = await fixtureTransaction('sell-opaque-volume-mainnet.json');
+  const decodedCreation = decodePumpTransaction(creation);
+  const decodedSale = decodePumpTransaction(sale);
+  assert.deepEqual(decodedCreation.creations.map(({ action }) => [
+    action.instruction.instructionIndex, action.instruction.innerInstructionIndex,
+  ]), [[1, null]]);
+  assert.equal(decodedCreation.trades.length, 1);
+  assert.equal(decodedCreation.trades[0]?.action.family, 'BUY');
+  assert.deepEqual(decodedSale.trades.map(({ action }) => [
+    action.family, action.instruction.instructionIndex, action.instruction.innerInstructionIndex,
+  ]), [['SELL', 3, null]]);
+
+  const repository = new RecordingRepository();
+  const locator = returning(new Map([
+    [creation.signature, creation], [sale.signature, sale],
+  ]));
+  await new PumpFunCatchUpBlockClassifier(locator, repository, () => 10_001)
+    .classify(Object.freeze([discovery(creation), discovery(sale)]), NEVER_ABORTED);
+  const bySignature = new Map(repository.values.map((value) => [value.signature, value]));
+  assert.equal(bySignature.get(creation.signature)?.disposition, 'ACTIONABLE');
+  assert.equal(bySignature.get(creation.signature)?.reasonCode, 'PUMP_ACTION_SUPPORTED');
+  assert.equal(bySignature.get(sale.signature)?.disposition, 'DEFERRED');
+  assert.equal(bySignature.get(sale.signature)?.reasonCode, 'PUMP_TRADE_UNTRACKED');
+  assert.equal(bySignature.get(sale.signature)?.ingestionHint, 'PUMPFUN_TRADE');
+});
+
 void test('returns receipt-validated classifications in deterministic persistence order', async () => {
   const template = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
   const confirmed = cloneTransaction(template, { signature: 'z-confirmed-receipt', slot: 81n });

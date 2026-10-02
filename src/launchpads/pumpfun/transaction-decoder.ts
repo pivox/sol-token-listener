@@ -18,7 +18,7 @@ import {
 import type { PumpDecodingError } from './errors.js';
 import { createPumpDecodingError } from './errors.js';
 import { decodePumpCpiEvent } from './event-decoder.js';
-import { decodePumpInstruction } from './instruction-decoder.js';
+import { decodePumpInstructionForTransaction } from './instruction-decoder.js';
 import {
   normalizePumpQuoteMint,
   resolvePumpQuoteAsset,
@@ -31,6 +31,8 @@ import type {
   DecodedPumpTrade,
   DecodedPumpTransaction,
   PumpIdlValue,
+  PumpInstructionCandidate,
+  PumpObservedWireProfile,
 } from './types.js';
 
 interface IndexedEvent {
@@ -48,6 +50,10 @@ const BUY_IX_NAMES = new Set([
 const SELL_IX_NAMES = new Set(['sell', 'sell_v2']);
 const PUMP_PROGRAM = new PublicKey(PUMP_PROGRAM_ID);
 const HOLDER_REWARDS_SEED = Buffer.from('holder-rewards');
+const EVENT_AUTHORITY = PublicKey.findProgramAddressSync(
+  [Buffer.from('__event_authority')],
+  PUMP_PROGRAM,
+)[0].toBase58();
 
 export function decodePumpTransaction(
   transaction: NormalizedTransaction,
@@ -92,12 +98,12 @@ function decodeTransaction(transaction: NormalizedTransaction): DecodedPumpTrans
     );
   }
 
-  const actions: DecodedPumpInstruction[] = [];
+  const instructionCandidates: PumpInstructionCandidate[] = [];
   const events: IndexedEvent[] = [];
   transaction.instructions.forEach((instruction, index) => {
     try {
-      const action = decodePumpInstruction(instruction);
-      if (action !== null) actions.push(action);
+      const candidate = decodePumpInstructionForTransaction(instruction);
+      if (candidate !== null) instructionCandidates.push(candidate);
       const event = decodePumpCpiEvent(instruction);
       if (event !== null) events.push({ index, decoded: event });
     } catch (error) {
@@ -105,13 +111,13 @@ function decodeTransaction(transaction: NormalizedTransaction): DecodedPumpTrans
       throw error;
     }
   });
-  validateStackHeights(actions, events, transaction);
+  validateStackHeights(instructionCandidates.map(({ action }) => action), events, transaction);
 
   const consumed = new Set<number>();
   const creations: DecodedPumpCreation[] = [];
   const trades: DecodedPumpTrade[] = [];
   const migrations: DecodedPumpMigration[] = [];
-  for (const action of actions) {
+  for (const { action, profile } of instructionCandidates) {
     if (isMigrationAction(action)) {
       migrations.push(validateMigration(action, transaction));
       continue;
@@ -126,15 +132,19 @@ function decodeTransaction(transaction: NormalizedTransaction): DecodedPumpTrans
         transaction.instructions,
       ));
     const paired = requireOnlyEvent(candidates, action, transaction);
+    if (profile !== null) {
+      validateOpaqueEventAuthority(action, paired.decoded, transaction);
+    }
     consumed.add(paired.index);
     if (isCreateAction(action) && paired.decoded.kind === 'CREATE') {
       creations.push(validateCreation(
         action,
         paired.decoded,
         transaction,
+        profile,
       ));
     } else if (isTradeAction(action) && paired.decoded.kind === 'TRADE') {
-      trades.push(validateTrade(action, paired.decoded, transaction));
+      trades.push(validateTrade(action, paired.decoded, transaction, profile));
     } else {
       throw mismatch(transaction, 'Famille action/événement contradictoire.');
     }
@@ -326,6 +336,7 @@ function validateCreation(
   action: DecodedPumpCreation['action'],
   eventCpi: DecodedPumpCreation['eventCpi'],
   transaction: NormalizedTransaction,
+  profile: PumpObservedWireProfile | null,
 ): DecodedPumpCreation {
   const event = eventCpi.event;
   requireEqual(event.mint, account(action, 'mint'), transaction, 'mint');
@@ -355,18 +366,26 @@ function validateCreation(
       transaction,
       'is_mayhem_mode',
     );
-    requireEqual(
-      event.isCashbackEnabled,
-      optionBooleanArg(action, 'is_cashback_enabled'),
-      transaction,
-      'is_cashback_enabled',
-    );
-    requireEqual(
-      event.isHolderReward,
-      optionBooleanArg(action, 'is_holder_reward'),
-      transaction,
-      'is_holder_reward',
-    );
+    if (profile === 'CREATE_V2_OPAQUE_0001_V1') {
+      requireEqual(
+        event.isCashbackEnabled, false, transaction, 'is_cashback_enabled',
+      );
+      requireEqual(event.isHolderReward, true, transaction, 'is_holder_reward');
+      requireEqual(event.creatorFeeBps, 0n, transaction, 'creator_fee_bps');
+    } else {
+      requireEqual(
+        event.isCashbackEnabled,
+        optionBooleanArg(action, 'is_cashback_enabled'),
+        transaction,
+        'is_cashback_enabled',
+      );
+      requireEqual(
+        event.isHolderReward,
+        optionBooleanArg(action, 'is_holder_reward'),
+        transaction,
+        'is_holder_reward',
+      );
+    }
   } else if (event.isHolderReward) {
     throw mismatch(transaction, 'Preuves Pump contradictoires: is_holder_reward.');
   }
@@ -404,7 +423,7 @@ function validateCreation(
     );
   }
   return Object.freeze({
-    action,
+    action: withWireEvidence(action, profile, eventCpi),
     event,
     eventCpi,
     quoteAsset,
@@ -419,6 +438,7 @@ function validateTrade(
   action: DecodedPumpTrade['action'],
   eventCpi: DecodedPumpTrade['eventCpi'],
   transaction: NormalizedTransaction,
+  profile: PumpObservedWireProfile | null,
 ): DecodedPumpTrade {
   const event = eventCpi.event;
   const shouldBuy = action.family === 'BUY';
@@ -433,6 +453,13 @@ function validateTrade(
     'mint',
   );
   requireEqual(event.user, account(action, 'user'), transaction, 'user');
+  if (profile === 'SELL_OPAQUE_0100_V1') {
+    requireEqual(event.ixName, 'sell', transaction, 'ix_name');
+    requireEqual(event.trackVolume, false, transaction, 'track_volume');
+    requireEqual(
+      event.tokenAmount, bigintArg(action, 'amount'), transaction, 'token_amount',
+    );
+  }
 
   const rawQuoteMint = action.accounts.quote_mint ?? WSOL_MINT;
   requireEqual(
@@ -456,7 +483,47 @@ function validateTrade(
       'quote_token_program',
     );
   }
-  return Object.freeze({ action, event, eventCpi, quoteAsset });
+  return Object.freeze({
+    action: withWireEvidence(action, profile, eventCpi),
+    event,
+    eventCpi,
+    quoteAsset,
+  });
+}
+
+function validateOpaqueEventAuthority(
+  action: DecodedPumpInstruction,
+  event: DecodedPumpCpiEvent,
+  transaction: NormalizedTransaction,
+): void {
+  requireEqual(
+    account(action, 'event_authority'), EVENT_AUTHORITY, transaction, 'event_authority',
+  );
+  if (event.instruction.accounts.length !== 1) {
+    throw mismatch(transaction, 'Nombre de comptes autorité CPI Pump contradictoire.');
+  }
+  requireEqual(
+    event.instruction.accounts[0] ?? '', EVENT_AUTHORITY, transaction, 'cpi_event_authority',
+  );
+}
+
+function withWireEvidence<T extends DecodedPumpInstruction>(
+  action: T,
+  profile: PumpObservedWireProfile | null,
+  event: DecodedPumpCpiEvent,
+): T {
+  if (profile === null) return action;
+  return Object.freeze({
+    ...action,
+    wireEvidence: Object.freeze({
+      profile,
+      pairedEventCursor: Object.freeze({
+        instructionIndex: event.instruction.instructionIndex,
+        innerInstructionIndex: event.instruction.innerInstructionIndex,
+        stackHeight: event.instruction.stackHeight,
+      }),
+    }),
+  });
 }
 
 function requireTradeIxSemantic(
@@ -491,6 +558,12 @@ function stringArg(action: DecodedPumpInstruction, name: string): string {
 function booleanArg(action: DecodedPumpInstruction, name: string): boolean {
   const value = action.args[name];
   if (typeof value !== 'boolean') throw schemaMismatch(action, name);
+  return value;
+}
+
+function bigintArg(action: DecodedPumpInstruction, name: string): bigint {
+  const value = action.args[name];
+  if (typeof value !== 'bigint') throw schemaMismatch(action, name);
   return value;
 }
 
@@ -537,8 +610,8 @@ function requireSupportedProgram(
 }
 
 function requireEqual(
-  actual: string | boolean,
-  expected: string | boolean,
+  actual: string | boolean | bigint,
+  expected: string | boolean | bigint,
   transaction: NormalizedTransaction,
   field: string,
 ): void {

@@ -38,7 +38,23 @@ export interface DecodedPumpInstruction {
   readonly instruction: NormalizedInstruction;
   readonly accounts: Readonly<Record<string, string>>;
   readonly args: Readonly<Record<string, PumpIdlValue>>;
+  readonly wireEvidence?: {
+    readonly profile: PumpObservedWireProfile;
+    readonly pairedEventCursor: Readonly<Pick<
+      NormalizedInstruction,
+      'instructionIndex' | 'innerInstructionIndex' | 'stackHeight'
+    >>;
+  };
 }
+
+export type PumpObservedWireProfile =
+  | 'CREATE_V2_OPAQUE_0001_V1'
+  | 'SELL_OPAQUE_0100_V1';
+
+/** An opaque profile remains a candidate until its transaction event attests it. */
+export type PumpInstructionCandidate =
+  | { readonly action: DecodedPumpInstruction; readonly profile: null }
+  | { readonly action: DecodedPumpInstruction; readonly profile: PumpObservedWireProfile };
 
 export interface DecodedPumpShareholder {
   readonly address: string;
