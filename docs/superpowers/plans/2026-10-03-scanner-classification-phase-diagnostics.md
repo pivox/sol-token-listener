@@ -1,7 +1,7 @@
 # Scanner/classification phase diagnostics — implementation plan v1.0.0
 
 Base: `main@ced66e7086911265012897a34239a59371204878`.
-Issue: #216. Design: `../specs/2026-10-03-scanner-classification-phase-diagnostics-design.md` v1.0.1.
+Issue: #216. Design: `../specs/2026-10-03-scanner-classification-phase-diagnostics-design.md` v1.0.2.
 This is diagnostics only; old Mainnet canary remains FAIL.
 
 ## Task 1 — immutable bounded contract

@@ -1,4 +1,4 @@
-# Scanner/classification phase diagnostics — design v1.0.1
+# Scanner/classification phase diagnostics — design v1.0.2
 
 ## Evidence and decision
 
@@ -25,7 +25,8 @@ The field is an aggregate for the listener lifetime, not a transaction log:
   `ABORTED`;
 - finite, trusted error-code enum preserving the original stage where possible,
   with `UNKNOWN` for untrusted/unclassified exceptions;
-- by provider (`primary`/`secondary`), ingestion family and phase: bounded
+- by exact finite provider (`primary`, `fallback-1`, `fallback-2`,
+  `fallback-3`), ingestion family and phase: bounded
   count, total duration and maximum duration, plus last outcome/code;
 - a compact durable-front summary per program: count of progress operations,
   count of completed operations, last progress age, and whether a checkpoint
