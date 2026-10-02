@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { isProxy } from 'node:util/types';
 import test from 'node:test';
 import { trustedTerminalAttribution, trustedTerminalAttributionContext } from '../src/domain/terminal-attribution.js';
+import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { PublicKey } from '@solana/web3.js';
 import {
   PumpFunCatchUpBlockClassifier,
@@ -44,6 +45,89 @@ type LocatorHandler = (
   signal: AbortSignal | undefined,
 ) => Promise<NormalizedTransaction>;
 const NEVER_ABORTED = new AbortController().signal;
+
+void test('attributes hydration and classification persistence without storing transaction identity', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const diagnostics = new ScannerPhaseDiagnosticsCollector();
+  const repository = new RecordingRepository();
+  await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])), repository, () => 10_000,
+    {
+      coverageFastPathEnabled: false, coverageRepository: null,
+      diagnosticProviderId: 'primary', diagnosticObserver: diagnostics,
+    },
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
+
+  const buckets = diagnostics.snapshot(10_001).buckets;
+  assert.deepEqual(buckets.map(({ phase, lastOutcome, lastCode }) =>
+    [phase, lastOutcome, lastCode]), [
+    ['BLOCK_HYDRATE', 'OK', null],
+    ['CLASSIFICATION_WRITE', 'OK', null],
+  ]);
+  assert.equal(JSON.stringify(buckets).includes(transaction.signature), false);
+});
+
+void test('keeps trusted locator failure code before page-admit normalization', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const diagnostics = new ScannerPhaseDiagnosticsCollector();
+  const locator = new RecordingLocator(async () => {
+    throw internalLocatorError(new RpcTransientError());
+  });
+  await assert.rejects(new PumpFunCatchUpBlockClassifier(
+    locator, new RecordingRepository(), () => 10_000,
+    {
+      coverageFastPathEnabled: false, coverageRepository: null,
+      diagnosticProviderId: 'fallback-1', diagnosticObserver: diagnostics,
+    },
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED));
+
+  const hydrate = diagnostics.snapshot(10_001).buckets.find((bucket) =>
+    bucket.phase === 'BLOCK_HYDRATE');
+  assert.equal(hydrate?.provider, 'fallback-1');
+  assert.equal(hydrate?.lastOutcome, 'ERROR');
+  assert.equal(hydrate?.lastCode, 'LOCATOR_RETRYABLE');
+});
+
+void test('attributes coverage reads before hydration of uncovered work', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  const diagnostics = new ScannerPhaseDiagnosticsCollector();
+  const coverage = new RecordingCoverageRepository(async () => Object.freeze([]));
+  await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])),
+    new RecordingRepository(), () => 10_000,
+    {
+      coverageFastPathEnabled: true, coverageRepository: coverage,
+      diagnosticProviderId: 'fallback-2', diagnosticObserver: diagnostics,
+    },
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
+
+  const buckets = diagnostics.snapshot(10_001).buckets;
+  assert.deepEqual(buckets.map(({ provider, phase }) => [provider, phase]), [
+    ['fallback-2', 'COVERAGE_READ'],
+    ['fallback-2', 'BLOCK_HYDRATE'],
+    ['fallback-2', 'CLASSIFICATION_WRITE'],
+  ]);
+});
+
+void test('a failing diagnostic observer cannot change classification result', async () => {
+  const transaction = await fixtureTransaction('buy-exact-quote-v2-cpi-mainnet.json');
+  let unavailableMarks = 0;
+  const repository = new RecordingRepository();
+  const receipts = await new PumpFunCatchUpBlockClassifier(
+    returning(new Map([[transaction.signature, transaction]])), repository, () => 10_000,
+    {
+      coverageFastPathEnabled: false, coverageRepository: null,
+      diagnosticProviderId: 'primary',
+      diagnosticObserver: {
+        recordPhase: () => { throw new Error('diagnostic sink unavailable'); },
+        markUnavailable: () => { unavailableMarks += 1; },
+      },
+    },
+  ).classify(Object.freeze([discovery(transaction)]), NEVER_ABORTED);
+  assert.equal(receipts.length, 1);
+  assert.equal(repository.values.length, 1);
+  assert.equal(unavailableMarks, 2);
+});
 
 class RecordingLocator {
   public readonly targets: TransactionLocationTarget[] = [];
