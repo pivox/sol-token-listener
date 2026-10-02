@@ -20,6 +20,7 @@ import {
 } from '../domain/terminal-attribution.js';
 
 import type { WorkerPhaseDiagnosticObserver, WorkerDiagnosticPhase, WorkerAttemptOutcome, WorkerClaimOutcome } from './worker-phase-diagnostic.js';
+import type { TransactionInboxClaimAdmission, TransactionInboxClaimReservation } from './transaction-inbox-claim-admission.js';
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -30,6 +31,7 @@ export type TransactionInboxWorkerState =
   | 'STOPPED';
 
 export type TransactionInboxWorkerErrorStage =
+  | 'claim-admission'
   | 'claim-gate'
   | 'claim'
   | 'save-snapshot'
@@ -69,6 +71,7 @@ export interface TransactionInboxWorkerOptions {
   readonly now?: () => number;
   readonly scheduler?: TransactionInboxWorkerScheduler;
   readonly canClaim?: () => boolean;
+  readonly claimAdmission?: TransactionInboxClaimAdmission;
   readonly phaseObserver?: WorkerPhaseDiagnosticObserver;
 }
 
@@ -97,6 +100,8 @@ export class TransactionInboxWorker {
   private readonly now: () => number;
   private readonly scheduler: TransactionInboxWorkerScheduler;
   private readonly canClaim: (() => boolean) | null;
+  private readonly claimAdmission: TransactionInboxClaimAdmission | null;
+  private readonly admissionAbort = new AbortController();
   private readonly phaseObserver: WorkerPhaseDiagnosticObserver | undefined;
   private currentState: TransactionInboxWorkerState = 'STOPPED';
   private runTail: Promise<void> = Promise.resolve();
@@ -115,6 +120,7 @@ export class TransactionInboxWorker {
     options: TransactionInboxWorkerOptions,
   ) {
     const canClaim = readClaimGate(options);
+    const claimAdmission = readClaimAdmission(options);
     if (!positiveSafeInteger(options.leaseSeconds)
       || !positiveTimer(options.renewalIntervalMs)
       || !positiveTimer(options.idlePollMs)) {
@@ -138,6 +144,7 @@ export class TransactionInboxWorker {
     this.now = options.now ?? Date.now;
     this.scheduler = options.scheduler ?? systemScheduler;
     this.canClaim = canClaim;
+    this.claimAdmission = claimAdmission;
     try { this.phaseObserver = options.phaseObserver; } catch { /* Diagnostics are optional. */ }
   }
 
@@ -168,6 +175,8 @@ export class TransactionInboxWorker {
     if (this.closePromise !== null) return this.closePromise;
     this.permanentlyClosed = true;
     this.currentState = 'STOPPING';
+    this.admissionAbort.abort();
+    try { this.claimAdmission?.close(); } catch { this.reportCleanupFailure(); }
     this.cancelIdleWait();
     const operation = this.performClose();
     this.closePromise = operation;
@@ -197,6 +206,37 @@ export class TransactionInboxWorker {
   private async performRunOnce(): Promise<TransactionInboxRunResult> {
     if (this.permanentlyClosed) return frozenResult({ kind: 'closed' });
     if (!this.canClaimNow()) return frozenResult({ kind: 'idle' });
+    let reservation: TransactionInboxClaimReservation | null = null;
+    const releaseAdmission = (): void => {
+      const owned = reservation;
+      reservation = null;
+      if (owned === null) return;
+      try { owned.release(); } catch {
+        this.reportCleanupFailure();
+        throw new TransactionInboxWorkerError('claim-admission');
+      }
+    };
+    try {
+      if (this.claimAdmission !== null) {
+        try {
+          const acquired = await this.claimAdmission.acquire(this.admissionAbort.signal);
+          if (acquired !== null && !hasOwnMethods(acquired, ['locate', 'release'])) throw new TypeError();
+          reservation = acquired;
+        } catch {
+          this.reportDegraded();
+          throw new TransactionInboxWorkerError('claim-admission');
+        }
+        if (this.isClosed()) return frozenResult({ kind: 'closed' });
+        if (reservation === null) return frozenResult({ kind: 'idle' });
+      }
+      return await this.performAdmittedRunOnce(reservation, releaseAdmission);
+    } finally { releaseAdmission(); }
+  }
+
+  private async performAdmittedRunOnce(
+    reservation: TransactionInboxClaimReservation | null,
+    releaseAdmission: () => void,
+  ): Promise<TransactionInboxRunResult> {
     let claimed: ClaimedTransaction | null;
     const finishClaim = this.beginPhase('claim_call');
     try {
@@ -224,7 +264,9 @@ export class TransactionInboxWorker {
           throw new TransactionInboxWorkerError('claim');
         }
       }
-      const result = await this.processClaim(claimed, invalidSnapshot);
+      if (invalidSnapshot !== null || claimed.normalizedTransaction !== null
+        || claimed.confirmationStatus === 'orphaned') releaseAdmission();
+      const result = await this.processClaim(claimed, invalidSnapshot, reservation, releaseAdmission);
       if (result.kind !== 'idle' && result.kind !== 'closed') outcome = result.kind;
       return result;
     } finally {
@@ -234,7 +276,9 @@ export class TransactionInboxWorker {
 
   private async processClaim(
     claim: ClaimedTransaction,
-    invalidSnapshot: IngestionFailure | null = null,
+    invalidSnapshot: IngestionFailure | null,
+    reservation: TransactionInboxClaimReservation | null,
+    releaseAdmission: () => void,
   ): Promise<TransactionInboxRunResult> {
     // The first completion includes persistence; cleanup-only exits also get one
     // completion sample. The duplicate finish in finally must not start another.
@@ -256,7 +300,7 @@ export class TransactionInboxWorker {
         if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
       } finally { finishSetup(); }
       if (invalidSnapshot !== null) return await this.failClaim(claim, invalidSnapshot, lease, beginCompletion);
-      return await this.processOwnedClaim(claim, lease, beginCompletion);
+      return await this.processOwnedClaim(claim, lease, beginCompletion, reservation, releaseAdmission);
     } finally {
       const finishCompletion = beginCompletion();
       try { await lease.finish(); } finally { finishCompletion(); }
@@ -267,6 +311,8 @@ export class TransactionInboxWorker {
     claim: ClaimedTransaction,
     lease: LeaseGuard,
     beginCompletion: () => () => void,
+    reservation: TransactionInboxClaimReservation | null,
+    releaseAdmission: () => void,
   ): Promise<TransactionInboxRunResult> {
     let transaction: NormalizedTransaction;
     let finishSnapshot: () => void = () => { /* No snapshot phase before hydration. */ };
@@ -277,15 +323,16 @@ export class TransactionInboxWorker {
         }
         const finishLocator = this.beginPhase('locator');
         try {
-          transaction = await this.locator.locate(Object.freeze({
+          transaction = await (reservation ?? this.locator).locate(Object.freeze({
             signature: claim.signature,
             slot: claim.slot,
             confirmationStatus: legacyStatus(claim.confirmationStatus),
           }));
         } catch (error) {
           finishLocator();
+          releaseAdmission();
           return await this.failClaim(claim, locatorFailure(error), lease, beginCompletion);
-        } finally { finishLocator(); }
+        } finally { finishLocator(); releaseAdmission(); }
         finishSnapshot = this.beginPhase('snapshot_and_ownership');
         if (!await lease.checkOwnership()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
         let view: NormalizedTransaction;
@@ -711,6 +758,30 @@ function readClaimGate(options: TransactionInboxWorkerOptions): (() => boolean) 
     }
   }
   return gate;
+}
+
+function readClaimAdmission(options: TransactionInboxWorkerOptions): TransactionInboxClaimAdmission | null {
+  const invalid = (): TypeError => new TypeError('Transaction inbox worker claim admission is invalid.');
+  if (isProxy(options)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(options, 'claimAdmission');
+  for (let prototype = Reflect.getPrototypeOf(options); prototype !== null; prototype = Reflect.getPrototypeOf(prototype)) {
+    if (isProxy(prototype) || Object.getOwnPropertyDescriptor(prototype, 'claimAdmission') !== undefined) throw invalid();
+  }
+  if (descriptor === undefined) return null;
+  if (!('value' in descriptor)) throw invalid();
+  const value: unknown = descriptor.value;
+  if (value === undefined) return null;
+  if (!hasOwnMethods(value, ['acquire', 'close'])) throw invalid();
+  return value as TransactionInboxClaimAdmission;
+}
+
+function hasOwnMethods(value: unknown, methods: readonly string[]): boolean {
+  if (typeof value !== 'object' || value === null || isProxy(value)) return false;
+  return methods.every((name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    return descriptor !== undefined && 'value' in descriptor
+      && typeof descriptor.value === 'function' && !isProxy(descriptor.value);
+  });
 }
 
 function safeAdd(left: number, right: number): number {
