@@ -10,7 +10,7 @@
 
 ---
 
-Spec: [v1.0.0](../specs/2026-10-02-event-attested-pump-wire-design.md), commit `8202ee9`. Issue [#213](https://github.com/pivox/sol-token-listener/issues/213). Start implementation only after #212 post-merge CI is green. User authorizes one combined review cycle; do not start one review per task. Preserve root `main` and excluded private harness.
+Spec: [v1.0.0](../specs/2026-10-02-event-attested-pump-wire-design.md), commit `8202ee9`. Issue [#213](https://github.com/pivox/sol-token-listener/issues/213). Task 1 copies public captured fixtures and records RED tests while #212 post-merge CI runs; no production decoder edit begins before that CI is green. User authorizes one combined review cycle; do not start one review per task. Preserve root `main` and excluded private harness.
 
 ## Files and boundaries
 
