@@ -1034,6 +1034,188 @@ void test('diagnostic getters, methods, finish callbacks and invalid clocks cann
   assert.equal((await worker.runOnce()).kind, 'processed');
 });
 
+void test('capacity admission waits before claiming and consumes no transaction attempt', async () => {
+  let claims = 0;
+  let failures = 0;
+  let acquired = 0;
+  let releaseWait!: () => void;
+  const waiting = new Promise<null>((resolve) => { releaseWait = () => { resolve(null); }; });
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { claims += 1; return null; },
+    async markFailed() { failures += 1; },
+  }), locator(), pipeline(), options({ claimAdmission: {
+    acquire() { acquired += 1; return waiting; }, close() {},
+  } }));
+  const running = worker.runOnce();
+  try {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(acquired, 1);
+    assert.equal(claims, 0);
+    assert.equal(failures, 0);
+    assert.notEqual(worker.state, 'DEGRADED');
+    releaseWait();
+    assert.deepEqual(await running, { kind: 'idle' });
+  } finally { releaseWait(); await running; await worker.close(); }
+});
+
+void test('worker close cancels capacity acquisition before draining its run', async () => {
+  let claims = 0;
+  let admissionCloses = 0;
+  let acquisitionSignal: AbortSignal | null = null;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { claims += 1; return null; },
+  }), locator(), pipeline(), options({ claimAdmission: {
+    acquire(signal: AbortSignal) {
+      acquisitionSignal = signal;
+      return new Promise<null>((resolve) => {
+        if (signal.aborted) resolve(null);
+        else signal.addEventListener('abort', () => { resolve(null); }, { once: true });
+      });
+    },
+    close() { admissionCloses += 1; },
+  } }));
+  const running = worker.runOnce();
+  try {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.ok(acquisitionSignal);
+    await worker.close();
+    assert.equal((acquisitionSignal as AbortSignal).aborted, true);
+    assert.deepEqual(await running, { kind: 'closed' });
+    assert.equal(claims, 0);
+    assert.equal(admissionCloses, 1);
+  } finally { await worker.close(); await running; }
+});
+
+void test('worker closes its admission handle only after granted claim work releases it', async () => {
+  const events: string[] = [];
+  let acquisitionSignal: AbortSignal | undefined;
+  let finishClaim!: () => void;
+  const claimGate = new Promise<void>((resolve) => { finishClaim = resolve; });
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { events.push('claim'); await claimGate; return claim(); },
+  }), locator(), pipeline(), options({ claimAdmission: {
+    async acquire(signal: AbortSignal) {
+      acquisitionSignal = signal;
+      return { ...locator(), release() { events.push('release'); } };
+    },
+    close() { events.push('close'); },
+  } }));
+  const running = worker.runOnce();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const closing = worker.close();
+  try {
+    assert.equal(acquisitionSignal?.aborted, false);
+    assert.deepEqual(events, ['claim']);
+    finishClaim();
+    assert.deepEqual(await running, { kind: 'processed', signature: 'sig' });
+    await closing;
+    assert.deepEqual(events, ['claim', 'release', 'close']);
+  } finally { finishClaim(); await running; await closing; }
+});
+
+void test('snapshot reuse releases pre-claim reservation before lease and pipeline work', async () => {
+  const calls: string[] = [];
+  const tx = normalized();
+  let released = false;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { calls.push('claim'); return claim('sig', 1n, 'processed', createDurableTransactionSnapshot(tx)); },
+    async renewLease() { assert.equal(released, true); calls.push('renew'); },
+  }), locator(), { async process() { assert.equal(released, true); calls.push('pipeline'); } }, options({
+    claimAdmission: {
+      async acquire() {
+        calls.push('reserve');
+        return {
+          async locate() { assert.fail('snapshot must bypass hydration'); },
+          release() { if (!released) calls.push('release'); released = true; },
+        };
+      }, close() {},
+    },
+  }));
+  assert.equal((await worker.runOnce()).kind, 'processed');
+  assert.deepEqual(calls, ['reserve', 'claim', 'release', 'renew', 'pipeline']);
+  await worker.close();
+});
+
+void test('reserved locator releases admission before snapshot persistence and business work', async () => {
+  const calls: string[] = [];
+  let released = false;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim(); },
+    async saveSnapshot() { assert.equal(released, true); calls.push('save'); },
+  }), { async locate() { assert.fail('must use the reserved locator'); } }, {
+    async process() { assert.equal(released, true); calls.push('pipeline'); },
+  }, options({ claimAdmission: {
+    async acquire() { return {
+      async locate(target: TransactionLocationTarget) {
+        assert.equal(released, false); calls.push('locate');
+        return normalized(target.signature, target.slot, target.confirmationStatus);
+      },
+      release() { if (!released) calls.push('release'); released = true; },
+    }; }, close() {},
+  } }));
+  assert.equal((await worker.runOnce()).kind, 'processed');
+  assert.deepEqual(calls, ['locate', 'release', 'save', 'pipeline']);
+  await worker.close();
+});
+
+void test('pre-claim reservation is released after idle, claim error and invalid clock', async () => {
+  for (const scenario of ['idle', 'claim-error', 'clock-error'] as const) {
+    let releases = 0;
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() { if (scenario === 'claim-error') throw new Error('private'); return null; },
+    }), locator(), pipeline(), options({
+      now: () => scenario === 'clock-error' ? NaN : 1_000,
+      claimAdmission: {
+        async acquire() { return { ...locator(), release() { releases += 1; } }; }, close() {},
+      },
+    }));
+    if (scenario === 'idle') assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
+    else await assert.rejects(worker.runOnce(), TransactionInboxWorkerError);
+    assert.equal(releases, 1, scenario);
+    await worker.close();
+  }
+});
+
+void test('reservation cleanup covers invalid claim, lost lease, orphan and locator rejection', async () => {
+  for (const scenario of ['invalid-claim', 'lost-lease', 'orphan', 'locator-error'] as const) {
+    let released = false;
+    let releases = 0;
+    let locates = 0;
+    const worker = new TransactionInboxWorker(repositoryWith({
+      async claim() {
+        if (scenario === 'invalid-claim') return Object.freeze({ ...claim(), slot: -1n });
+        return claim('sig', 1n, scenario === 'orphan' ? 'orphaned' : 'processed');
+      },
+      async renewLease() { if (scenario === 'lost-lease') throw new Error('lease gone'); },
+      async markFailed() { assert.equal(released, true, scenario); },
+    }), locator(), pipeline(), options({ claimAdmission: {
+      async acquire() { return {
+        async locate() { locates += 1; throw new RpcTransientError(); },
+        release() { if (!released) releases += 1; released = true; },
+      }; }, close() {},
+    } }));
+    if (scenario === 'invalid-claim') await assert.rejects(worker.runOnce(), TransactionInboxWorkerError);
+    else assert.equal((await worker.runOnce()).kind, scenario === 'lost-lease' ? 'lease-lost' : 'failed');
+    assert.equal(releases, 1, scenario);
+    assert.equal(locates, scenario === 'locator-error' ? 1 : 0, scenario);
+    await worker.close();
+  }
+});
+
+void test('claim admission options reject getters, inherited values and proxies without invoking them', () => {
+  let accessed = false;
+  const admission = { async acquire() { return null; }, close() {} };
+  const getter = options();
+  Object.defineProperty(getter, 'claimAdmission', { get() { accessed = true; return admission; } });
+  const inherited = Object.assign(Object.create({ claimAdmission: admission }) as object, options());
+  const cases = [getter, inherited, options({ claimAdmission: new Proxy(admission, {}) }),
+    options({ claimAdmission: { acquire: 'invalid', close() {} } })];
+  for (const settings of cases) {
+    assert.throws(() => new TransactionInboxWorker(repositoryWith({}), locator(), pipeline(), settings), TypeError);
+  }
+  assert.equal(accessed, false);
+});
+
 function options(overrides: Record<string, unknown> = {}) {
   return { leaseSeconds: 10, renewalIntervalMs: 1_000, idlePollMs: 250, now: () => 1_000, ...overrides };
 }

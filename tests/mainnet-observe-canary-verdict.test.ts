@@ -15,9 +15,91 @@ const fixtureUrl = new URL(
 const fixture = JSON.parse(await readFile(fixtureUrl, 'utf8')) as unknown;
 const representativeSignature = '1'.repeat(64);
 
+function hydrationAdmissionEvidence() {
+  return { version: 1, enabled: true, registeredWorkers: 2, pendingWorkers: 0,
+    maximumPendingWorkers: 2, pendingClassifierGroups: 0, maximumPendingClassifierGroups: 1,
+    unboundReservations: 0, activeGroups: 0, maximumAdmitted: 1,
+    worker: { grants: 2, cancellations: 0, oldestWaitMs: null, lastWaitMs: 2, maximumWaitMs: 5 },
+    classifier: { grants: 1, cancellations: 0, oldestWaitMs: null, lastWaitMs: 3, maximumWaitMs: 3 } };
+}
+
+void test('admits bounded hydration evidence including historical worker maxima after handles close', () => {
+  const copy = cloneFixture();
+  nested(copy, 'stoppedHeartbeat', 'blockHydrationAdmission').registeredWorkers = 0;
+  const ongoing = nested(copy, 'snapshots', 'T_PLUS_5', 'blockHydrationAdmission');
+  ongoing.pendingWorkers = 1;
+  nested(ongoing, 'worker').oldestWaitMs = 100;
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.blockHydrationAdmission,
+    { verdict: 'PASS', reasonCode: 'BLOCK_HYDRATION_ADMISSION_BOUNDED' });
+});
+
+void test('old evidence is inconclusive only for the new hydration admission guarantee', () => {
+  const copy = cloneFixture();
+  for (const name of WORKER_ADMISSION_SNAPSHOT_NAMES) delete nested(copy, 'snapshots', name).blockHydrationAdmission;
+  delete nested(copy, 'stoppedHeartbeat').blockHydrationAdmission;
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.blockHydrationAdmission,
+    { verdict: 'INCONCLUSIVE', reasonCode: 'BLOCK_HYDRATION_ADMISSION_EVIDENCE_MISSING' });
+  assert.equal(evaluateMainnetObserveCanary(copy).gates.catchUpAdmission.verdict, 'PASS');
+});
+
+void test('hydration admission fails present malformed or over-bound evidence and requires stopped drain', () => {
+  for (const field of ['maximumAdmitted', 'maximumPendingClassifierGroups', 'unboundReservations', 'activeGroups']) {
+    const copy = cloneFixture();
+    nested(copy, 'snapshots', 'T_PLUS_5', 'blockHydrationAdmission')[field] = 2;
+    assert.equal(evaluateMainnetObserveCanary(copy).gates.blockHydrationAdmission.verdict, 'FAIL', field);
+  }
+  for (const overrides of [{ pendingWorkers: 3 }, { pendingWorkers: 1 },
+    { unboundReservations: 1, activeGroups: 1 }, { maximumAdmitted: 0, activeGroups: 1 },
+    { version: 2 }, { secret: 'private-admission-secret' }]) {
+    const copy = cloneFixture();
+    Object.assign(nested(copy, 'snapshots', 'T_PLUS_15', 'blockHydrationAdmission'), overrides);
+    const result = evaluateMainnetObserveCanary(copy);
+    assert.equal(result.gates.blockHydrationAdmission.verdict, 'FAIL');
+    assert.doesNotMatch(JSON.stringify(result), /private-admission-secret/u);
+  }
+  for (const field of ['pendingWorkers', 'pendingClassifierGroups', 'unboundReservations', 'activeGroups']) {
+    const copy = cloneFixture();
+    const stopped = nested(copy, 'stoppedHeartbeat', 'blockHydrationAdmission');
+    stopped[field] = 1;
+    if (field === 'pendingWorkers') nested(stopped, 'worker').oldestWaitMs = 10;
+    if (field === 'pendingClassifierGroups') nested(stopped, 'classifier').oldestWaitMs = 10;
+    assert.equal(evaluateMainnetObserveCanary(copy).gates.blockHydrationAdmission.verdict, 'FAIL', field);
+  }
+  const disabled = cloneFixture();
+  nested(disabled, 'snapshots', 'T0', 'blockHydrationAdmission').enabled = false;
+  assert.equal(evaluateMainnetObserveCanary(disabled).gates.blockHydrationAdmission.verdict, 'INCONCLUSIVE');
+});
+
+void test('hydration admission isolates hostile optional evidence without invoking accessors', () => {
+  const copy = cloneFixture();
+  let reads = 0;
+  Object.defineProperty(nested(copy, 'snapshots', 'T0'), 'blockHydrationAdmission', {
+    enumerable: true, get() { reads += 1; throw new Error('private-admission-secret'); },
+  });
+  const result = evaluateMainnetObserveCanary(copy);
+  assert.equal(result.gates.blockHydrationAdmission.verdict, 'FAIL');
+  assert.equal(result.gates.catchUpAdmission.verdict, 'PASS');
+  assert.doesNotMatch(JSON.stringify(result), /private-admission-secret/u);
+  assert.equal(reads, 0);
+});
+
+void test('proven undrained hydration admission fails despite another missing or disabled sample', () => {
+  for (const missing of [false, true]) {
+    const copy = cloneFixture();
+    nested(copy, 'stoppedHeartbeat', 'blockHydrationAdmission').activeGroups = 1;
+    if (missing) delete nested(copy, 'snapshots', 'T0').blockHydrationAdmission;
+    else nested(copy, 'snapshots', 'T0', 'blockHydrationAdmission').enabled = false;
+    assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.blockHydrationAdmission,
+      { verdict: 'FAIL', reasonCode: 'BLOCK_HYDRATION_ADMISSION_NOT_DRAINED' });
+  }
+});
+
 void test('keeps the real failed run failed while correcting four obsolete assertions', () => {
   const result = evaluateMainnetObserveCanary(fixture);
   assert.equal(result.overallVerdict, 'FAIL');
+  assert.deepEqual(result.gates.blockHydrationAdmission, {
+    verdict: 'INCONCLUSIVE', reasonCode: 'BLOCK_HYDRATION_ADMISSION_EVIDENCE_MISSING',
+  });
   assert.deepEqual(result.gates.workerAdmission, {
     verdict: 'INCONCLUSIVE',
     reasonCode: 'WORKER_ADMISSION_EVIDENCE_MISSING',
@@ -936,7 +1018,10 @@ void test('returns bounded inconclusive output for hostile or non-exact input wi
 });
 
 function cloneFixture(): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(fixture)) as Record<string, unknown>;
+  const copy = JSON.parse(JSON.stringify(fixture)) as Record<string, unknown>;
+  for (const name of WORKER_ADMISSION_SNAPSHOT_NAMES) nested(copy, 'snapshots', name).blockHydrationAdmission = hydrationAdmissionEvidence();
+  nested(copy, 'stoppedHeartbeat').blockHydrationAdmission = hydrationAdmissionEvidence();
+  return copy;
 }
 
 function terminalNeutralFixture(): Record<string, unknown> {

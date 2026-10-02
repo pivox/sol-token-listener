@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.5.0 — 2026-09-27 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169, #170 et #177.
+Version : 1.6.0 — 2026-10-02 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169, #170, #177 et #209.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -33,6 +33,46 @@ Le compte claimable `STOPPED` doit correspondre à la preuve SQL post-stop dédi
 `postStopWorkerAdmissionClaimableCount`, sinon le verdict est `INCONCLUSIVE`.
 Le champ distinct `postStopActionableCount` reste exclusivement la preuve du
 gate shutdown legacy et doit toujours égaler le `backlogCount` arrêté.
+
+## Preuve d'admission d'hydratation #209
+
+Capturer `heartbeat.blockHydrationAdmission` aux mêmes cinq frontières et
+conserver l'objet exact dans chaque snapshot du manifeste V1 et dans
+`stoppedHeartbeat`. Ce champ optionnel ne remplace pas `blockHydration.v1`.
+Le gate séparé `blockHydrationAdmission` classe une absence historique
+`INCONCLUSIVE` (`BLOCK_HYDRATION_ADMISSION_EVIDENCE_MISSING`), sans invalider le
+parsing ni réécrire les anciens gates. Toute preuve présente malformée ou
+hors bornes est `FAIL` (`BLOCK_HYDRATION_ADMISSION_EVIDENCE_MALFORMED`).
+Chaque preuve doit avoir `version=1` et `enabled=true` pour attester le contrat ;
+`enabled=false` reste `INCONCLUSIVE` (`BLOCK_HYDRATION_ADMISSION_DISABLED`).
+
+Les champs exacts sont `version`, `enabled`, `registeredWorkers`,
+`pendingWorkers`, `maximumPendingWorkers`, `pendingClassifierGroups`,
+`maximumPendingClassifierGroups`, `unboundReservations`, `activeGroups`,
+`maximumAdmitted`, `worker` et `classifier`. Chaque rôle contient uniquement
+`grants`, `cancellations`, `oldestWaitMs`, `lastWaitMs` et `maximumWaitMs`.
+Voir [le contrat JSON API](../api/v1.md) pour les formes et la sémantique.
+À chaque frontière, `pendingWorkers <= registeredWorkers` et
+`pendingWorkers <= maximumPendingWorkers`, tandis que
+`pendingClassifierGroups <= maximumPendingClassifierGroups <= 1`.
+La somme `unboundReservations + activeGroups` est inférieure ou égale au maximum
+historique `maximumAdmitted <= 1`. Au heartbeat arrêté, les quatre jauges
+`pendingWorkers`, `pendingClassifierGroups`, `unboundReservations` et
+`activeGroups` doivent toutes être zéro, sinon `FAIL`
+(`BLOCK_HYDRATION_ADMISSION_NOT_DRAINED`). Une preuve conforme donne
+`BLOCK_HYDRATION_ADMISSION_BOUNDED`, indépendamment des autres gates.
+
+`registeredWorkers` compte les handles encore ouverts, pas un maximum de
+configuration : zéro après fermeture reste compatible avec un
+`maximumPendingWorkers` historique positif. Les grants et annulations comptent
+les consommateurs par rôle, y compris les joins, pas les fetches physiques.
+L'attente upstream en cours reste visible via `oldestWaitMs` et peut dépasser
+le `maximumWaitMs` des attentes déjà terminées. Le backlog durable, l'âge de
+classification et la latence détection → traitement restent les preuves de
+capacité ; les seuils queue, oversize, p95, backlog et finalité sont inchangés.
+Ni ce gate ni cette livraison ne déclarent une readiness Mainnet.
+
+## Indépendance des gates
 
 Le gate `workerAdmission` reste indépendant de `catchUpAdmission`,
 `firstProcessing`, `http429`, `finality`, `idempotence`, `retention`, `rss` et
@@ -325,7 +365,8 @@ peut être réutilisée pour déclarer un `PASS`.
    configuration résolue avant le démarrage.
 2. Redémarrer exactement une réplique. Aucun flag n'est modifiable à chaud.
 3. Capturer l’état health, le backlog/les échecs terminaux, le RSS et
-   `workerAdmission` à T0, T+5 min et T+15 min, puis une dernière fois dans
+   `workerAdmission` et `blockHydrationAdmission` à T0, T+5 min et T+15 min,
+   puis une dernière fois dans
    `FINAL_PRESTOP` immédiatement avant l'arrêt. Ces quatre relevés viennent de
    l’API pendant que l’application tourne. Capturer ensuite `STOPPED` depuis le
    heartbeat PostgreSQL persistant après l’arrêt borné de la seule application :
@@ -420,7 +461,8 @@ peut être réutilisée pour déclarer un `PASS`.
          'startedAt', to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
          'rpcHttpEvidence', payload -> 'rpcHttpEvidence',
          'firstProcessingCanary', payload -> 'firstProcessingCanary',
-         'workerAdmission', payload -> 'workerAdmission'
+         'workerAdmission', payload -> 'workerAdmission',
+         'blockHydrationAdmission', payload -> 'blockHydrationAdmission'
        )
      )
    )
@@ -703,6 +745,10 @@ eux aussi indépendants, avec leurs snapshots et critères propres.
   `launchpad-only`; toute autre valeur entraîne `FAIL`;
 - `queuedFetches <= 1` et `inFlightFetches <= 1` à chaque relevé, avec backlog
   inbox non croissant;
+- `heartbeat.blockHydrationAdmission` exact et activé aux cinq frontières,
+  pending borné et somme groupes/réservations au plus un ; au `STOPPED`, zéro
+  pending worker/classifier, réservation et groupe actif. Une ancienne preuve
+  sans ce champ ne peut pas donner `PASS` au nouveau contrat d'admission ;
 - aucun nouvel échec terminal inexpliqué;
 - le runtime lit et normalise le jeu strictement supporté par cette release :
   `legacy`, v0 (`version=0`) et v1 (`version=1`), chacun démontré par un bloc

@@ -6,6 +6,7 @@ import {
   toApiDomainPayload,
   type ApiHealth,
   type ApiBlockHydrationMetricsV1,
+  type ApiBlockHydrationAdmissionMetricsV1,
   type ApiCatchUpAdmissionMetricsV1,
   type ApiDecoderQuarantineMetricsV1,
   type ApiFirstProcessingCanaryEvidenceV1,
@@ -39,6 +40,7 @@ import {
   type ApiTradingCandidate,
 } from '../api/contracts.js';
 import { isProxy } from 'node:util/types';
+import { snapshotRuntimeBlockHydrationAdmissionMetrics } from '../domain/block-hydration-admission.js';
 import {
   MAX_TIMELINE_INDEX,
   MAX_TIMELINE_SLOT,
@@ -2111,7 +2113,7 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null, catchUpAdmission: null, workerAdmission: null,
+    websocket, blockHydration: null, blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
     rpcHttpEvidence: null,
     firstProcessingCanary: null, decoderQuarantine: null });
 }
@@ -2198,12 +2200,24 @@ function heartbeatFromRow(
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
+    blockHydrationAdmission: blockHydrationAdmissionFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
     workerAdmission: workerAdmissionFromPayload(row.heartbeat_payload),
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
     firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
     decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
   });
+}
+
+function blockHydrationAdmissionFromPayload(value: unknown): ApiBlockHydrationAdmissionMetricsV1 | null {
+  try {
+    if (typeof value !== 'object' || value === null || isProxy(value) || !isRecord(value)) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'blockHydrationAdmission');
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return null;
+    return snapshotRuntimeBlockHydrationAdmissionMetrics(descriptor.value);
+  } catch {
+    return null;
+  }
 }
 
 function workerAdmissionFromPayload(value: unknown): ApiWorkerAdmissionMetricsV1 | null {

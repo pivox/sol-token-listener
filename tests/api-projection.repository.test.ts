@@ -1720,6 +1720,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: null,
       pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
       blockHydration: blockHydrationMetrics(),
+      blockHydrationAdmission: null,
       catchUpAdmission: null,
       workerAdmission: null,
       rpcHttpEvidence: null,
@@ -2121,6 +2122,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
     websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
+    blockHydrationAdmission: null,
     workerAdmission: null,
     rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
   });
@@ -2401,6 +2403,44 @@ function workerAdmissionMetrics() {
     extendedMintCount: 2, demotedCount: 5,
   };
 }
+
+function hydrationAdmissionMetrics() {
+  return { version: 1 as const, enabled: true, registeredWorkers: 2,
+    pendingWorkers: 0, maximumPendingWorkers: 2, pendingClassifierGroups: 0,
+    maximumPendingClassifierGroups: 1, unboundReservations: 0, activeGroups: 0,
+    maximumAdmitted: 1, worker: { grants: 2, cancellations: 0, oldestWaitMs: null,
+      lastWaitMs: 5, maximumWaitMs: 10 }, classifier: { grants: 1, cancellations: 0,
+      oldestWaitMs: null, lastWaitMs: 3, maximumWaitMs: 3 } };
+}
+
+void test('block hydration admission projects detached frozen metrics and missing or malformed evidence as null', async () => {
+  const source = hydrationAdmissionMetrics();
+  const health = await projectWorkerAdmission({ blockHydrationAdmission: source });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.blockHydrationAdmission, source);
+  assert.notEqual(health.heartbeat.blockHydrationAdmission, source);
+  assert.ok(Object.isFrozen(health.heartbeat.blockHydrationAdmission?.worker));
+  for (const payload of [null, {}, { blockHydrationAdmission: null },
+    { blockHydrationAdmission: { ...source, maximumAdmitted: 2, secret: 'private-admission-secret' } }]) {
+    const projected = await projectWorkerAdmission(payload);
+    assert.equal(projected.heartbeat.blockHydrationAdmission, null);
+    assert.doesNotMatch(JSON.stringify(projected), /private-admission-secret/u);
+  }
+});
+
+void test('block hydration admission projection never executes hostile accessors or proxies', async () => {
+  let calls = 0;
+  const accessor = Object.defineProperty({}, 'blockHydrationAdmission', {
+    enumerable: true, get() { calls += 1; throw new Error('private-admission-secret'); },
+  });
+  const proxy = new Proxy(hydrationAdmissionMetrics(), {
+    ownKeys() { calls += 1; throw new Error('private-admission-secret'); },
+  });
+  for (const payload of [accessor, { blockHydrationAdmission: proxy }]) {
+    assert.equal((await projectWorkerAdmission(payload)).heartbeat.blockHydrationAdmission, null);
+  }
+  assert.equal(calls, 0);
+});
 
 async function projectWorkerAdmission(payload: unknown) {
   return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(

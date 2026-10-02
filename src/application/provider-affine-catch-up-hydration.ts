@@ -20,6 +20,12 @@ import {
   StrictCatchUpScannerError, StrictCatchUpWindowExceededError, type StrictCatchUpScanResult,
 } from './strict-catch-up-scanner.js';
 import type { TransactionInboxWorkerLocator } from './transaction-inbox-worker.js';
+import {
+  HydrationGroupAdmission, type HydrationGroupAdmissionMetrics,
+} from './hydration-group-admission.js';
+import type {
+  TransactionInboxClaimAdmission, TransactionInboxClaimReservation,
+} from './transaction-inbox-claim-admission.js';
 
 export interface ProviderAffineCatchUpHydrationOptions extends BlockTransactionCacheOptions {
   readonly currentSelection: () => PromotedProviderSelection;
@@ -29,6 +35,7 @@ type RouteContext = Readonly<{ providerId: RpcProviderId; token: string }>;
 type PermitKind = 'WORKER' | 'SCAN';
 type Waiter = Readonly<{
   kind: PermitKind;
+  workerContext: RouteContext | undefined;
   signal: AbortSignal | undefined;
   grant: () => void;
   reject: (error: Error) => void;
@@ -37,7 +44,7 @@ type Waiter = Readonly<{
 interface ScanPermit {
   readonly context: RouteContext;
   readonly signal: AbortSignal;
-  readonly pending: Set<Promise<NormalizedTransaction>>;
+  readonly pending: Set<Promise<unknown>>;
   readonly calls: Set<Readonly<{ target: TransactionLocationTarget; signal: AbortSignal | undefined }>>;
   readonly workerSelectionRevision: bigint | null;
   workerSharingRevoked: boolean;
@@ -64,11 +71,14 @@ export class ProviderAffineCatchUpHydration {
   private readonly currentSelection: () => PromotedProviderSelection;
   private readonly queue: Waiter[] = [];
   private readonly shutdown = new AbortController();
+  private readonly admission: HydrationGroupAdmission;
   private active: RouteContext | null = null;
   private epoch = 0;
   private scanGeneration = 0n;
   private scanPermit: ScanPermit | null = null;
   private permitKind: PermitKind | null = null;
+  private workerRouteContext: RouteContext | null = null;
+  private workerRouteReferences = 0;
   private closed = false;
 
   public constructor(
@@ -81,6 +91,7 @@ export class ProviderAffineCatchUpHydration {
         || isProxy(options.currentSelection)) throw new TypeError();
       this.currentSelection = options.currentSelection;
     } catch { throw new ProviderAffineCatchUpHydrationError(); }
+    this.admission = new HydrationGroupAdmission({ now: options.now ?? ((): number => performance.now()) });
     const epoch = (): number => this.epoch;
     const rpc: EpochTransactionBlockRpc = {
       get httpTransportEpoch() { return epoch(); },
@@ -122,6 +133,10 @@ export class ProviderAffineCatchUpHydration {
   }
 
   public workerLocator(): TransactionInboxWorkerLocator { return this.worker; }
+
+  public workerAdmission(): TransactionInboxClaimAdmission { return this.createWorkerAdmission(); }
+
+  public admissionMetrics(): HydrationGroupAdmissionMetrics { return this.admission.metrics(); }
 
   public classifierLocator(providerId: RpcProviderId): PumpFunCatchUpTransactionLocator {
     this.assertProvider(providerId);
@@ -213,99 +228,197 @@ export class ProviderAffineCatchUpHydration {
       waiter.reject(retryableFailure());
     }
     this.shutdown.abort();
+    this.admission.close();
     this.cache.close();
   }
 
   private async locateWorker(target: TransactionLocationTarget): Promise<NormalizedTransaction> {
-    let acquired = false;
-    let selected: PromotedProviderSelection | null = null;
+    let handle: TransactionInboxClaimAdmission | undefined;
+    let reservation: TransactionInboxClaimReservation | null = null;
     try {
       this.assertOpen();
-      selected = this.selection();
-      if (selected?.providerId === undefined || selected.providerId === null) throw retryableFailure();
-      const sharedPermit = this.sharedScanPermit(selected);
-      if (sharedPermit !== null) return await this.locateSharedWorker(sharedPermit, selected, target);
-      await this.acquire('WORKER');
-      acquired = true;
-      this.assertOpen();
-      this.assertSelection(selected);
-      this.bind({ providerId: selected.providerId, token: `worker:${selected.revision}` });
-      const result = await this.cache.locate(target);
-      this.assertOpen();
-      this.assertSelection(selected);
-      return result;
+      handle = this.createWorkerAdmission(target);
+      reservation = await handle.acquire(this.shutdown.signal);
+      if (reservation === null) throw retryableFailure();
+      return await reservation.locate(target);
     } catch (error) {
-      const current = this.closed ? null : this.selection();
-      if (current?.providerId !== selected?.providerId || current?.revision !== selected?.revision || this.closed) {
-        throw retryableFailure();
-      }
-      throw locatorFailure(error);
-    }
-    finally { if (acquired) this.release(); }
-  }
-
-  private async locateSharedWorker(
-    permit: ScanPermit,
-    selected: PromotedProviderSelection,
-    target: TransactionLocationTarget,
-  ): Promise<NormalizedTransaction> {
-    const call = Object.freeze({ target: Object.freeze({ ...target }), signal: undefined });
-    permit.calls.add(call);
-    const pending = this.cache.locate(call.target);
-    permit.pending.add(pending);
-    try {
-      const result = await pending;
-      this.assertOpen();
-      this.assertOpen(permit.signal);
-      if (this.scanPermit !== permit || this.active !== permit.context) throw retryableFailure();
-      this.assertSelection(selected);
-      return result;
-    } catch (error) {
-      if (this.closed || permit.signal.aborted) throw retryableFailure();
-      const current = this.selection();
-      this.assertOpen(permit.signal);
-      if (current?.providerId !== selected.providerId || current.revision !== selected.revision) {
-        this.revokeWorkerSharing(permit);
-        throw retryableFailure();
-      }
       throw locatorFailure(error);
     } finally {
-      permit.pending.delete(pending);
-      permit.calls.delete(call);
+      reservation?.release();
+      handle?.close();
     }
+  }
+
+  private createWorkerAdmission(knownTarget?: TransactionLocationTarget): TransactionInboxClaimAdmission {
+    const worker = this.admission.registerWorker();
+    const stopped = new AbortController();
+    return Object.freeze({
+      acquire: async (signal: AbortSignal): Promise<TransactionInboxClaimReservation | null> => {
+        const combined = AbortSignal.any([signal, stopped.signal, this.shutdown.signal]);
+        const selected = this.selection();
+        if (selected?.providerId === undefined || selected.providerId === null || combined.aborted) return null;
+        let generation = this.scanGeneration;
+        const scan = this.sharedScanPermit(selected);
+        const settlePin = scan === null ? undefined : this.pin(scan);
+        let ownsRoute = false;
+        let ticket: Awaited<ReturnType<typeof worker.acquire>> = null;
+        let onReservationAbort: (() => void) | undefined;
+        const operationSignal = scan === null ? combined : AbortSignal.any([combined, scan.signal]);
+        const validate = (): void => {
+          this.assertOpen(operationSignal);
+          try { this.assertSelection(selected); }
+          catch (error) {
+            if (scan !== null) this.revokeWorkerSharing(scan);
+            throw error;
+          }
+          if (this.scanGeneration !== generation
+            || (scan !== null && (this.scanPermit !== scan || this.active !== scan.context
+              || scan.workerSharingRevoked))) throw retryableFailure();
+        };
+        const cleanup = (): void => {
+          if (onReservationAbort !== undefined) {
+            operationSignal.removeEventListener('abort', onReservationAbort);
+            onReservationAbort = undefined;
+          }
+          ticket?.release();
+          ticket = null;
+          settlePin?.();
+          if (ownsRoute) { ownsRoute = false; this.releaseWorkerRoute(); }
+        };
+        try {
+          // Provider eligibility precedes group capacity: an incompatible scan
+          // must never be pinned behind an unbound worker waiting for its route.
+          if (scan === null) {
+            await this.acquire('WORKER', operationSignal, knownTarget === undefined ? undefined
+              : { providerId: selected.providerId, token: `worker:${selected.revision}` });
+            ownsRoute = true;
+            // Legacy locate already has its durable target and may wait through
+            // queued scans; pre-claim callers instead return null on that race.
+            if (knownTarget !== undefined) generation = this.scanGeneration;
+            validate();
+            this.bind({ providerId: selected.providerId, token: `worker:${selected.revision}` });
+          }
+          validate();
+          const context = scan?.context ?? this.active;
+          if (context === null) throw retryableFailure();
+          ticket = knownTarget === undefined
+            ? await worker.acquire(operationSignal)
+            : await worker.acquireGroup(this.groupKey(context, knownTarget), operationSignal);
+          if (ticket === null) { cleanup(); return null; }
+          validate();
+          let released = false;
+          let locating = false;
+          let boundKey: string | null = knownTarget === undefined ? null : this.groupKey(context, knownTarget);
+          const release = (): void => {
+            if (released) return;
+            released = true;
+            operationSignal.removeEventListener('abort', release);
+            // Cancellation is not settlement of an already-started SDK/cache operation.
+            if (!locating) cleanup();
+          };
+          onReservationAbort = release;
+          operationSignal.addEventListener('abort', release, { once: true });
+          if (operationSignal.aborted) release();
+          validate();
+          return Object.freeze({
+            release,
+            locate: async (target: TransactionLocationTarget): Promise<NormalizedTransaction> => {
+              let ownsLocate = false;
+              try {
+                validate();
+                if (released || locating) throw retryableFailure();
+                const key = this.groupKey(context, target);
+                if (boundKey === null) {
+                  if (ticket === null) throw retryableFailure();
+                  ticket.bindGroup(key);
+                  boundKey = key;
+                }
+                else if (boundKey !== key) throw retryableFailure();
+                locating = true;
+                ownsLocate = true;
+                const result = await this.locateInContext(scan, target, operationSignal);
+                validate();
+                return result;
+              } catch (error) {
+                try { validate(); } catch { throw retryableFailure(); }
+                throw locatorFailure(error);
+              } finally {
+                if (ownsLocate) {
+                  locating = false;
+                  if (released) cleanup();
+                }
+              }
+            },
+          });
+        } catch {
+          cleanup();
+          return null;
+        }
+      },
+      close: (): void => { stopped.abort(); worker.close(); },
+    });
+  }
+
+  private pin(permit: ScanPermit): () => void {
+    let settle!: () => void;
+    const pending = new Promise<void>((resolve) => { settle = resolve; });
+    permit.pending.add(pending);
+    return (): void => { permit.pending.delete(pending); settle(); };
+  }
+
+  private groupKey(context: RouteContext, target: TransactionLocationTarget): string {
+    return JSON.stringify([context.token, context.providerId, target.slot.toString(),
+      target.confirmationStatus === 'FINALIZED' ? 'FINALIZED' : 'CONFIRMED']);
+  }
+
+  private async locateInContext(
+    permit: ScanPermit | null, target: TransactionLocationTarget, signal: AbortSignal,
+  ): Promise<NormalizedTransaction> {
+    const call = Object.freeze({ target: Object.freeze({ ...target }), signal });
+    permit?.calls.add(call);
+    const pending = this.cache.locate(call.target);
+    permit?.pending.add(pending);
+    try { return await pending; }
+    finally { permit?.pending.delete(pending); permit?.calls.delete(call); }
   }
 
   private async locateClassifier(
     providerId: RpcProviderId, target: TransactionLocationTarget, signal?: AbortSignal,
   ): Promise<NormalizedTransaction> {
     const permit = this.scanPermit;
+    let settlePin: (() => void) | undefined;
+    let ticket: Awaited<ReturnType<HydrationGroupAdmission['acquireClassifier']>> = null;
     try {
       this.assertOpen(signal);
       if (permit === null || !permit.accepting || permit.context.providerId !== providerId) throw retryableFailure();
       this.assertOpen(permit.signal);
-      const call = Object.freeze({ target: Object.freeze({ ...target }), signal });
-      permit.calls.add(call);
-      const pending = this.cache.locate(call.target);
-      permit.pending.add(pending);
-      try {
-        const result = await pending;
-        this.assertOpen(signal);
-        this.assertOpen(permit.signal);
-        if (this.scanPermit !== permit || this.active !== permit.context) throw retryableFailure();
-        return result;
-      } finally {
-        permit.pending.delete(pending);
-        permit.calls.delete(call);
-      }
+      settlePin = this.pin(permit);
+      const combined = AbortSignal.any([permit.signal, this.shutdown.signal,
+        ...(signal === undefined ? [] : [signal])]);
+      ticket = await this.admission.acquireClassifier(this.groupKey(permit.context, target), combined);
+      if (ticket === null) throw retryableFailure();
+      this.assertOpen(combined);
+      if (this.scanPermit !== permit || this.active !== permit.context) throw retryableFailure();
+      const result = await this.locateInContext(permit, target, combined);
+      this.assertOpen(combined);
+      if (this.scanPermit !== permit || this.active !== permit.context) throw retryableFailure();
+      return result;
     } catch (error) {
       if (this.closed || signal?.aborted === true || permit?.signal.aborted === true) throw retryableFailure();
       throw locatorFailure(error);
+    } finally {
+      ticket?.release();
+      settlePin?.();
     }
   }
 
-  private acquire(kind: PermitKind, signal?: AbortSignal): Promise<void> {
+  private acquire(kind: PermitKind, signal?: AbortSignal, workerContext?: RouteContext): Promise<void> {
     this.assertOpen(signal);
-    if (this.queue.length >= MAX_PERMIT_WAITERS) return Promise.reject(retryableFailure());
+    // Shared routes are admitted consumers too, not a way around the existing
+    // finite envelope of one active permit plus MAX_PERMIT_WAITERS followers.
+    if (this.queue.length + Math.max(0, this.workerRouteReferences - 1) >= MAX_PERMIT_WAITERS) {
+      return Promise.reject(retryableFailure());
+    }
     return new Promise<void>((resolve, reject) => {
       const onAbort = (): void => {
         const index = this.queue.indexOf(waiter);
@@ -315,7 +428,7 @@ export class ProviderAffineCatchUpHydration {
         reject(retryableFailure());
       };
       const waiter: Waiter = Object.freeze({
-        kind, signal, grant: resolve, reject,
+        kind, workerContext, signal, grant: resolve, reject,
         detach: () => signal?.removeEventListener('abort', onAbort),
       });
       this.queue.push(waiter);
@@ -326,11 +439,27 @@ export class ProviderAffineCatchUpHydration {
 
   private release(): void {
     this.permitKind = null;
+    this.workerRouteContext = null;
     this.drain();
   }
 
+  private releaseWorkerRoute(): void {
+    this.workerRouteReferences -= 1;
+    if (this.workerRouteReferences === 0) this.release();
+  }
+
   private drain(): void {
-    if (this.closed || this.permitKind !== null) return;
+    if (this.closed) return;
+    if (this.permitKind !== null) {
+      const next = this.queue[0];
+      // Known-target consumers may share only this provider/revision context.
+      // A queued scan stays exclusive and prevents any new route sharing.
+      if (this.permitKind !== 'WORKER' || this.workerRouteContext === null
+        || this.queue.some(({ kind }) => kind === 'SCAN')
+        || next?.kind !== 'WORKER'
+        || next.workerContext?.providerId !== this.workerRouteContext.providerId
+        || next.workerContext.token !== this.workerRouteContext.token) return;
+    }
     const waiter = this.queue.shift();
     if (waiter === undefined) return;
     waiter.detach();
@@ -340,7 +469,17 @@ export class ProviderAffineCatchUpHydration {
       return;
     }
     this.permitKind = waiter.kind;
+    if (waiter.kind === 'WORKER') {
+      if (this.workerRouteReferences === 0) {
+        this.workerRouteContext = waiter.workerContext ?? null;
+        // Publish the compatible route atomically with its first grant so calls
+        // in the same turn can reach group admission before any fetch settles.
+        if (waiter.workerContext !== undefined) this.bind(waiter.workerContext);
+      }
+      this.workerRouteReferences += 1;
+    }
     waiter.grant();
+    this.drain();
   }
 
   private assertOpen(signal?: AbortSignal): void {

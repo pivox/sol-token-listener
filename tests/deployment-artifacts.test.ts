@@ -941,7 +941,7 @@ void test('decoder quarantine runbook documents bounded observation-only recover
 void test('block hydration runbook defines the corrected worker-eligible cohort and mandatory replay', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.5\.0/u);
+  assert.match(runbook, /Version : 1\.6\.0/u);
   assert.match(runbook, /population worker-éligible/iu);
   for (const exclusion of [
     'IGNORED / SOLANA_TRANSACTION_FAILED',
@@ -968,7 +968,7 @@ void test('block hydration runbook defines the corrected worker-eligible cohort 
 void test('block hydration runbook keeps catch-up refresh continuation bounded and fail-closed', async () => {
   const runbook = await readArtifact('docs/operations/block-hydration-canary.md');
 
-  assert.match(runbook, /Version : 1\.5\.0/u);
+  assert.match(runbook, /Version : 1\.6\.0/u);
   assert.match(runbook, /CATCH_UP_REFRESH_REQUIRED[\s\S]{0,400}exactement un scan supplémentaire/iu);
   assert.match(runbook, /même provider[\s\S]{0,180}même session WebSocket[\s\S]{0,180}même signal d'arrêt/iu);
   assert.match(runbook, /ne promeut jamais[\s\S]{0,180}avant la réussite[\s\S]{0,120}seconde passe/iu);
@@ -986,7 +986,7 @@ void test('finality reconciler diagnostics are composed and documented as a non-
     readArtifact('src/application/production-listener-factory.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.5\.0/u);
+  assert.match(runbook, /Version : 1\.6\.0/u);
   assert.match(runbook, /listener\.finality_reconciler_degraded/u);
   assert.match(runbook, /listener\.finality_reconciler_recovered/u);
   for (const reasonCode of [
@@ -1031,7 +1031,7 @@ void test('versioned canary verdict documents provider-affine and durable shutdo
   assert.match(runbook,
     /npm run canary:evaluate -- \/absolute\/path\/to\/redacted-canary-input\.v1\.json/u);
   assert.match(runbook, /FAIL[^.]{0,160}INCONCLUSIVE[^.]{0,240}bloquent[^.]{0,160}wallet/iu);
-  assert.match(runbook, /Version : 1\.5\.0/u);
+  assert.match(runbook, /Version : 1\.6\.0/u);
   assert.match(runbook,
     /terminalEvidence[^.]{0,300}failed[^.]{0,120}quarantined[^.]{0,120}exhausted[^.]{0,300}baseline[^.]{0,120}final/iu);
   assert.match(runbook,
@@ -1074,7 +1074,7 @@ void test('terminal attribution runbook captures before teardown and keeps prove
     readArtifact('scripts/evaluate-mainnet-observe-canary.ts'),
   ]);
 
-  assert.match(runbook, /Version : 1\.5\.0/u);
+  assert.match(runbook, /Version : 1\.6\.0/u);
   assert.match(runbook,
     /arrêter[\s\S]{0,200}listener[\s\S]{0,240}PostgreSQL[\s\S]{0,160}actif[\s\S]{0,240}captur/iu);
   assert.match(runbook,
