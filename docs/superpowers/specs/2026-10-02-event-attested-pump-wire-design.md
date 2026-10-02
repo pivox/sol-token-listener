@@ -18,6 +18,13 @@ instructions rejected by the current strict Borsh decoder:
 Use fixture provenance and a content digest in the fixture documentation; no new
 RPC capture is needed. Do not rewrite historical canary evidence.
 
+Committed normalized fixture integrity (SHA-256 of the exact JSON bytes):
+
+- `tests/fixtures/pumpfun/create-v2-opaque-holder-mainnet.json`:
+  `54bec0d729caf29089d4d5e5d34b05a79484eb16e7f3b2b24952d45695d2a449`.
+- `tests/fixtures/pumpfun/sell-opaque-volume-mainnet.json`:
+  `a4c29ca77e89a533411b38a56b9dc1e97570db10abf86cb6d7381e4f95870ed6`.
+
 Official IDL inspected at pump-fun/pump-public-docs commit
 e0687ae9b7e064a0f54efc7297c65eecfbba3a8f (2026-09-12): create_v2 declares
 optional cashback, creator_fee_bps and holder_reward; sell declares two u64s.
