@@ -1,4 +1,4 @@
-# Complete-block payload measurement results — v1.0.0
+# Complete-block payload measurement results — v1.1.0
 
 ## Provenance and scope
 
@@ -91,3 +91,48 @@ Raw captures and full aggregate reports remain outside Git, located by the local
 tracking file. Preserve them while useful; once unneeded, apply the user's
 four-hour retention rule. Disk was approximately 10.97 GB free after measurement;
 the <=5 GB pause/safe-cleanup guard remains in effect.
+
+## Integrated codec verification — `d2efd18`
+
+After the design and plan were committed, codec `ef720c5` passed 54 unit tests
+on host Node25 and compiled Node22. Integration passed 128 codec/cache/locator
+tests with zero skips; the backend and frontend build passed. These are focused
+checks; the full PostgreSQL suite result is recorded below. CI remains required.
+
+An outside-Git offline verifier compared every tagged snapshot payload and every
+cache locate against direct Connection-entry normalization. All 4,220 values
+matched under Node25 and the same pinned Node22 container restrictions described
+above. Each block caused exactly one fake block-RPC read; all remaining locates
+were cache hits. No real RPC requests were made. Actual tagged sizes below include
+format, original-length and SHA-256 metadata, unlike the earlier candidate table.
+
+| Slot | Actual tagged retained bytes (Node22) | Cache hits after initial load | Snapshot encode ms |
+| --- | ---: | ---: | ---: |
+| 452406477 | 3,720,588 | 1,331 | 338.13 |
+| 452406478 | 3,599,398 | 1,442 | 307.41 |
+| 452406531 | 3,737,839 | 1,444 | 345.83 |
+
+All three fit the unchanged 8 MiB cap, with no oversize bypass. Peak RSS of this
+verification process was 229,249,024 bytes. Timings include defensive snapshotting
+and encoding; the verifier additionally performs duplicate snapshot work, exact
+value comparisons and direct normalization. This is not a serving p95 benchmark.
+The container exited 0 and was automatically removed. No explicit GC was used.
+
+The first verification run correctly failed on a **measurement assumption**, not
+a value mismatch: equal frozen and unfrozen arrays have different V8 byte lengths.
+A two-element string array serializes to 13 bytes normally and 17 bytes frozen on
+the host. Defensive snapshot metadata includes frozen arrays. Direct normalization
+therefore gives baseline accounting 12,589,201 / 11,680,603 / 11,951,074 bytes,
+which must not replace the originally measured snapshot baseline. The verifier
+now separately retains that direct-value comparison and reconstructs old snapshot
+base64 accounting from each codec-validated original byte length. It exactly
+matches all three original baseline totals. No production workaround was needed.
+
+Raw reports and verifier remain outside Git and are referenced in local tracking.
+The full local suite subsequently passed: 4,077 backend PostgreSQL tests and 169
+frontend tests, zero failures/skips (both database test URLs enabled). Build,
+check, lint and documentation checks passed. One independent combined review
+reported no blocking findings and independently passed the focused 128 tests.
+The disposable test database/volume was removed after the suite; logs remain
+outside Git. CI and post-merge verification remain required. No readiness/canary
+or trade claim follows from these samples.

@@ -10,6 +10,22 @@
 
 Spec: [v1.0.0](../specs/2026-10-02-bounded-block-payload-codec-design.md), committed `28ba7f1` before implementation. Existing linked worktree `qualification-terminal-attribution`, branch `investigate/block-payload-size`, clean baseline: 69 locator/cache tests pass, zero skips.
 
+## Execution evidence — 2026-10-02
+
+- Task 1 delivered in `ef720c5`: initial RED, expanded 50 expected failures,
+  then 54/54 codec tests on host and pinned Node22, backend check/scoped lint.
+- Task 2 delivered in `d2efd18`: 4 expected integration failures, then 128/128
+  focused tests without skips, backend check/scoped lint; full build passes.
+- Task 3 offline proof passes on both runtimes for all 4,220 transactions,
+  exact accounting, one fake block fetch per block and 4,217 cache hits.
+  Build/check/lint/docs checks pass. Full suite: 4,077 backend PostgreSQL and 169
+  frontend tests pass, zero failures/skips. See measurement results v1.1.0.
+- Task 4 unique independent combined review completed without blocking findings;
+  independently re-ran 54 codec and 74 locator/cache tests. Suggested future
+  corrupt-entry injection test is nonblocking; existing codec corruption tests
+  and unchanged cache catch/eviction path were inspected. No second review cycle.
+  Required CI/merge/post-merge verification remain pending.
+
 ## Task 1 — Pure codec, RED then GREEN
 
 Create `src/solana/rpc/block-transaction-payload-codec.ts` and
