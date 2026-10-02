@@ -1723,6 +1723,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       blockHydrationAdmission: null,
       catchUpAdmission: null,
       workerAdmission: null,
+      workerAdmissionClock: null,
       rpcHttpEvidence: null,
       firstProcessingCanary: null,
       decoderQuarantine: null,
@@ -2124,6 +2125,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
     blockHydrationAdmission: null,
     workerAdmission: null,
+    workerAdmissionClock: null,
     rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
   });
   assert.equal(health.lagSlots, null);
@@ -2447,6 +2449,60 @@ async function projectWorkerAdmission(payload: unknown) {
     websocketRow(), false, healthyHeartbeatRow({ payload }),
   ))).getHealth();
 }
+
+void test('worker admission clock projects exact detached frozen evidence and legacy absence as null', async () => {
+  for (const payload of [null, {}, { workerAdmission: workerAdmissionMetrics() }]) {
+    const health = await projectWorkerAdmission(payload);
+    assert.equal(health.status, 'OK');
+    assert.equal(health.heartbeat.workerAdmissionClock, null);
+  }
+  const source = { version: 1, sampledAtMs: openedAt.getTime() };
+  const health = await projectWorkerAdmission({ workerAdmission: workerAdmissionMetrics(), workerAdmissionClock: source });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.workerAdmissionClock, source);
+  assert.notEqual(health.heartbeat.workerAdmissionClock, source);
+  assert.ok(Object.isFrozen(health.heartbeat.workerAdmissionClock));
+  assert.deepEqual(Object.keys(health.heartbeat.workerAdmissionClock ?? {}).sort(), ['sampledAtMs', 'version']);
+});
+
+void test('worker admission clock rejects malformed or unpaired evidence through degraded health', async () => {
+  const source = { version: 1, sampledAtMs: openedAt.getTime() };
+  for (const candidate of [undefined, null, [], 'secret',
+    { ...source, version: 2 }, { ...source, secret: 'private-clock-secret' },
+    { version: 1 }, { sampledAtMs: source.sampledAtMs },
+    ...[-1, -0, 0, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1,
+      8_640_000_000_000_001, '1000', 1n, source.sampledAtMs + 1]
+      .map((sampledAtMs) => ({ ...source, sampledAtMs }))]) {
+    const health = await projectWorkerAdmission({ workerAdmission: workerAdmissionMetrics(), workerAdmissionClock: candidate });
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.equal(health.heartbeat.workerAdmissionClock, null);
+    assert.equal(health.heartbeat.workerAdmission, null);
+    assert.doesNotMatch(JSON.stringify(health), /private-clock-secret/u);
+  }
+  const unpaired = await projectWorkerAdmission({ workerAdmissionClock: source });
+  assert.equal(unpaired.status, 'DEGRADED');
+  assert.equal(unpaired.heartbeat.workerAdmissionClock, null);
+});
+
+void test('worker admission clock projection never invokes getters or proxy traps', async () => {
+  let calls = 0;
+  const source = { version: 1, sampledAtMs: openedAt.getTime() };
+  const accessor = Object.defineProperty({ workerAdmission: workerAdmissionMetrics() }, 'workerAdmissionClock', {
+    enumerable: true, get() { calls += 1; throw new Error('private-clock-secret'); },
+  });
+  const nestedAccessor = Object.defineProperty({ version: 1 }, 'sampledAtMs', {
+    enumerable: true, get() { calls += 1; throw new Error('private-clock-secret'); },
+  });
+  const proxy = new Proxy(source, {
+    ownKeys() { calls += 1; throw new Error('private-clock-secret'); },
+  });
+  for (const payload of [accessor, { workerAdmission: workerAdmissionMetrics(), workerAdmissionClock: nestedAccessor },
+    { workerAdmission: workerAdmissionMetrics(), workerAdmissionClock: proxy }]) {
+    assert.equal((await projectWorkerAdmission(payload)).status, 'DEGRADED');
+  }
+  assert.equal(calls, 0);
+});
 
 void test('worker admission projects exact detached frozen V1 metrics and legacy absence as null', async () => {
   for (const payload of [null, {}, { decoderQuarantine: { version: 1, unresolvedCount: 2 } }]) {

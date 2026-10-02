@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
 import { createPumpFunWorkerAdmissionPolicy } from '../domain/worker-admission.js';
 import {
@@ -23,7 +24,9 @@ import {
 } from '../domain/first-processing-canary.js';
 import {
   snapshotRuntimeWorkerAdmissionMetrics,
+  snapshotRuntimeWorkerAdmissionClock,
   type RuntimeWorkerAdmissionMetricsV1,
+  type RuntimeWorkerAdmissionClockV1,
 } from '../domain/worker-admission-metrics.js';
 import {
   assertValidInboxCounts,
@@ -744,6 +747,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly inboxSnapshot?: () => Promise<Readonly<{
     counts: InboxCounts;
     workerAdmission: RuntimeWorkerAdmissionMetricsV1;
+    workerAdmissionClock?: RuntimeWorkerAdmissionClockV1;
   }>>;
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
   readonly blockHydrationAdmissionMetrics?: () => RuntimeBlockHydrationAdmissionMetricsV1;
@@ -1183,7 +1187,6 @@ export class PersistentListenerHeartbeat {
   public async start(): Promise<void> {
     if (this.hasClosed()) return;
     this.currentState = 'RUNNING';
-    this.ensureStartedAtMs();
     await this.firstProcessingCanaryCohortStartedAtMs();
     if (this.hasClosed()) return;
     const initialWrite = this.write('RUNNING');
@@ -1268,12 +1271,18 @@ export class PersistentListenerHeartbeat {
   }
 
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
-    this.ensureStartedAtMs();
     const cohortStartedAtMs = await this.firstProcessingCanaryCohortStartedAtMs();
     let inboxSnapshot: Awaited<ReturnType<NonNullable<ListenerHeartbeatOptions['inboxSnapshot']>>> | undefined;
     if (this.inboxSnapshot !== undefined) {
       try {
         const snapshot = await this.inboxSnapshot();
+        if (isProxy(snapshot)) throw new TypeError();
+        const clockDescriptor = Object.getOwnPropertyDescriptor(snapshot, 'workerAdmissionClock');
+        if (clockDescriptor !== undefined && (!clockDescriptor.enumerable || !('value' in clockDescriptor))) {
+          throw new TypeError();
+        }
+        const workerAdmissionClock = clockDescriptor === undefined ? undefined
+          : snapshotRuntimeWorkerAdmissionClock(clockDescriptor.value);
         assertValidInboxCounts(snapshot.counts);
         const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(snapshot.workerAdmission);
         const backlog = safeInboxBacklog(snapshot.counts.pending, snapshot.counts.processing,
@@ -1282,7 +1291,8 @@ export class PersistentListenerHeartbeat {
           || workerAdmission.claimableBacklogCount > backlog - workerAdmission.classificationPendingCount) {
           throw new TypeError();
         }
-        inboxSnapshot = Object.freeze({ counts: snapshot.counts, workerAdmission });
+        inboxSnapshot = Object.freeze({ counts: snapshot.counts, workerAdmission,
+          ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }) });
       } catch {
         throw new TypeError('Inbox snapshot is invalid or unavailable.');
       }
@@ -1351,6 +1361,7 @@ export class PersistentListenerHeartbeat {
         throw new TypeError('Worker admission metrics are invalid.');
       }
     }
+    const workerAdmissionClock = inboxSnapshot?.workerAdmissionClock;
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
       subscriberState: runtimeState === 'STOPPED' ? 'STOPPED' : this.subscriberState(),
@@ -1376,7 +1387,15 @@ export class PersistentListenerHeartbeat {
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
       ...(workerAdmission === undefined ? {} : { workerAdmission }),
+      ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
     });
+    if (value.updatedAtMs < value.startedAtMs) {
+      throw new TypeError('Runtime heartbeat updatedAtMs precedes startedAtMs.');
+    }
+    if (workerAdmissionClock !== undefined
+      && (workerAdmission === undefined || workerAdmissionClock.sampledAtMs > value.updatedAtMs)) {
+      throw new TypeError('Inbox snapshot is invalid or unavailable.');
+    }
     if (this.catchUpAdmissionMetrics !== null) {
       try { assertValidRuntimeHeartbeat(value); } catch {
         throw new TypeError('Catch-up admission metrics are invalid.');
@@ -1385,15 +1404,12 @@ export class PersistentListenerHeartbeat {
     await this.inbox.writeHeartbeat(value);
   }
 
-  private ensureStartedAtMs(): void {
-    if (this.startedAtMs === 0) this.startedAtMs = Date.now();
-  }
-
   private firstProcessingCanaryCohortStartedAtMs(): Promise<number> {
     return this.firstProcessingCanaryCohort ??= this.inbox.beginFirstProcessingCanary().then((value) => {
-      if (!Number.isSafeInteger(value) || value <= 0) {
+      if (!Number.isSafeInteger(value) || value <= 0 || !Number.isFinite(new Date(value).getTime())) {
         throw new TypeError('First processing canary cohort start is invalid.');
       }
+      this.startedAtMs = value;
       return value;
     });
   }

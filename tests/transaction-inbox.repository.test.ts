@@ -69,6 +69,159 @@ const tradeMint = 'So11111111111111111111111111111111111111112';
 
 const enabledAdmission = createPumpFunWorkerAdmissionPolicy({ enabled: true, trackingWindowSeconds: 45 });
 
+void test('independent stopped runbook SQL binds the repository clock at retry, lease and authority boundaries',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-01-02T00:00:00.123Z');
+      const runbook = await readFile(new URL('../docs/operations/block-hydration-canary.md',
+        import.meta.url), 'utf8');
+      const queries = [...runbook.matchAll(/```sql\n([\s\S]*?)\n\s*```/gu)];
+      const sql = queries.find((match) => match[1]?.includes('postStopWorkerAdmissionClaimableCount'))?.[1];
+      assert.ok(sql, 'The independent proof executes the actual runbook query.');
+      assert.match(sql, /\$1::NUMERIC\s*\/\s*1000/u,
+        'The independent query must bind the recorded stopped epoch, not sample a new clock.');
+      await withAuthoritySession(pool, clock, async ({ repository, client }) => {
+        const proof = async () => {
+          const result = await client.query(sql, [clock.getTime()]);
+          assert.equal(result.rows.length, 1);
+          const value = result.rows[0] as Record<string, unknown>;
+          return {
+            version: 1,
+            sampledAtMs: Number(value.sampledAtMs),
+            claimableBacklogCount: Number(value.postStopWorkerAdmissionClaimableCount),
+          };
+        };
+        // Empty relations must still retain the scalar database clock.
+        assert.deepEqual(await proof(), {
+          version: 1, sampledAtMs: clock.getTime(), claimableBacklogCount: 0,
+        });
+        await client.query(`INSERT INTO chain_transaction_inbox (
+          signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+          processing_status,observed_at,worker_admitted_at,error_retryable,next_attempt_at,
+          lease_token,lease_expires_at,error_code,error_name
+        ) VALUES
+          ('bound-retry-at',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','FAILED',$2,$2,TRUE,$2,NULL,NULL,'RPC_TRANSIENT','retry'),
+          ('bound-retry-after',2,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','FAILED',$2,$2,TRUE,$3,NULL,NULL,'RPC_TRANSIENT','retry'),
+          ('bound-lease-at',3,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PROCESSING',$2,$2,NULL,NULL,'at',$2,NULL,NULL),
+          ('bound-lease-after',4,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PROCESSING',$2,$2,NULL,NULL,'after',$3,NULL,NULL)`,
+        [PUMP_PROGRAM_ID, clock, new Date(clock.getTime() + 1)]);
+        await seedCanonicalAuthorityLaunch(client, new Date(clock.getTime() - 44_999));
+        await client.query(`INSERT INTO chain_transaction_inbox (
+          signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+          processing_status,ingestion_priority,ingestion_hint,ingestion_hint_mint,observed_at,
+          worker_admitted_at
+        ) VALUES ('bound-authority',5,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING',
+          'TRACKED_TRADE','PUMPFUN_TRADE',$2,$3,$3)`, [PUMP_PROGRAM_ID, tradeMint, clock]);
+        const stopped = await repository.heartbeatSnapshot();
+        assert.equal(stopped.workerAdmissionClock.sampledAtMs, clock.getTime());
+        assert.equal(stopped.workerAdmission.claimableBacklogCount, 3);
+        assert.deepEqual(await proof(), { ...stopped.workerAdmissionClock,
+          claimableBacklogCount: stopped.workerAdmission.claimableBacklogCount });
+        // A later unbound clock changes eligibility without any row writes.
+        const later = await client.query(sql, [clock.getTime() + 1]);
+        assert.equal(Number(later.rows[0]?.postStopWorkerAdmissionClaimableCount), 4);
+        assert.equal(Number(later.rows[0]?.sampledAtMs), clock.getTime() + 1);
+        // Executing the independent query again still binds the recorded instant.
+        assert.equal((await proof()).claimableBacklogCount,
+          stopped.workerAdmission.claimableBacklogCount);
+        // The bound clock is not time travel: relevant intervening writes remain visible.
+        await client.query('UPDATE token_launches SET detected_at=$1',
+          [new Date(clock.getTime() - 45_000)]);
+        assert.equal((await proof()).claimableBacklogCount, 2);
+        assert.equal((await repository.heartbeatSnapshot()).workerAdmission.claimableBacklogCount, 2);
+        await client.query(`INSERT INTO trading_candidates (
+          mint,source_event_id,state,eligible_until,confirmation_status
+        ) VALUES ($1,'candidate-source','ELIGIBLE',$2,'confirmed')`, [tradeMint, clock]);
+        assert.equal((await proof()).claimableBacklogCount, 2, 'eligible_until=t is excluded');
+        await client.query('UPDATE trading_candidates SET eligible_until=$1',
+          [new Date(clock.getTime() + 1)]);
+        assert.equal((await proof()).claimableBacklogCount, 3);
+        assert.equal((await repository.heartbeatSnapshot()).workerAdmission.claimableBacklogCount, 3);
+      });
+    });
+  });
+
+void test('paired worker admission clock survives an empty inbox for enabled and disabled PostgreSQL samples',
+  async (context) => {
+    for (const enabled of [true, false]) {
+      await withDatabase(context, async (pool) => {
+        const clock = new Date('2026-01-02T00:00:00.123Z');
+        await withAuthoritySession(pool, clock, async ({ repository, authorityClockReads }) => {
+          const before = authorityClockReads();
+          const snapshot = await repository.heartbeatSnapshot();
+          assert.deepEqual(snapshot.workerAdmissionClock, {
+            version: 1, sampledAtMs: clock.getTime(),
+          });
+          assert.equal(snapshot.workerAdmission.enabled, enabled);
+          assert.equal(snapshot.workerAdmission.claimableBacklogCount, 0);
+          assert.equal(snapshot.workerAdmission.classificationPendingCount, 0);
+          assert.equal(snapshot.workerAdmission.oldestClassificationPendingAgeMs, null);
+          assert.equal(Reflect.ownKeys(snapshot.workerAdmission).length, 9);
+          assert.ok(Object.isFrozen(snapshot));
+          assert.ok(Object.isFrozen(snapshot.workerAdmissionClock));
+          assert.equal(authorityClockReads() - before, 1);
+          assert.equal(Reflect.ownKeys(await repository.workerAdmissionMetrics()).length, 9);
+        }, createPumpFunWorkerAdmissionPolicy({ enabled, trackingWindowSeconds: 45 }));
+      });
+    }
+  });
+
+void test('paired worker admission clock reproduces populated classification age from the same PostgreSQL instant',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const clock = new Date('2026-01-02T00:00:00.123Z');
+      await withAuthoritySession(pool, clock, async ({ repository, client, authorityClockReads }) => {
+        await client.query(`INSERT INTO chain_transaction_inbox (
+          signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+          processing_status,observed_at,first_detected_at,worker_admitted_at
+        ) VALUES ('paired-clock-pending',1,ARRAY['WEBSOCKET'],ARRAY[$1],'processed','PENDING',$2,$2,NULL)`,
+        [PUMP_PROGRAM_ID, new Date(clock.getTime() - 5_001)]);
+        const before = authorityClockReads();
+        const snapshot = await repository.heartbeatSnapshot();
+        assert.deepEqual(snapshot.workerAdmissionClock, {
+          version: 1, sampledAtMs: clock.getTime(),
+        });
+        assert.equal(snapshot.counts.pending, 1);
+        assert.equal(snapshot.workerAdmission.classificationPendingCount, 1);
+        assert.equal(snapshot.workerAdmission.oldestClassificationPendingAgeMs, 5_001);
+        assert.equal(authorityClockReads() - before, 1);
+      });
+    });
+  });
+
+void test('heartbeat persists detached optional worker admission clock beside unchanged metrics', async () => {
+  const queryCalls: unknown[][] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      queryCalls.push(values === undefined ? [] : [...values]);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({
+    version: 1, enabled: false, trackingWindowSeconds: 45, claimableBacklogCount: 0,
+    classificationPendingCount: 0, oldestClassificationPendingAgeMs: null,
+    freshMintCount: 0, extendedMintCount: 0, demotedCount: 0,
+  }));
+  const workerAdmissionClock = Object.freeze({ version: 1 as const, sampledAtMs: 2_000 });
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), workerAdmission,
+    workerAdmissionClock }));
+  const payload = queryCalls[0]?.[14] as Record<string, unknown>;
+  assert.deepEqual(payload.workerAdmissionClock, workerAdmissionClock);
+  assert.notEqual(payload.workerAdmissionClock, workerAdmissionClock);
+  assert.notEqual(payload.workerAdmission, workerAdmission);
+  assert.deepEqual(payload.workerAdmission, workerAdmission);
+  (payload.workerAdmissionClock as { sampledAtMs: number }).sampledAtMs = 1;
+  assert.equal(workerAdmissionClock.sampledAtMs, 2_000);
+  const invalid = Object.freeze({ ...rpcEvidenceHeartbeat(), workerAdmission,
+    workerAdmissionClock: Object.freeze({ version: 1, sampledAtMs: 2_001 }) });
+  await assert.rejects(repository.writeHeartbeat(invalid), TransactionInboxRepositoryError);
+  assert.equal(queryCalls.length, 1);
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), updatedAtMs: 3_000,
+    workerAdmission }));
+  assert.equal(Object.hasOwn(queryCalls[1]?.[14] as object, 'workerAdmissionClock'), false);
+});
+
 void test('heartbeat snapshot excludes an arrival committed between its PostgreSQL reads', async (context) => {
   await withDatabase(context, async (pool) => {
     const writer = new PostgresTransactionInboxRepository(pool, undefined, enabledAdmission);
@@ -7361,6 +7514,7 @@ async function withAuthoritySession(
   pool: InstanceType<typeof pg.Pool>,
   clock: Date,
   run: (session: AuthoritySession) => Promise<void>,
+  admissionPolicy = enabledAdmission,
 ): Promise<void> {
   const connection = await pool.connect();
   const literal = `TIMESTAMPTZ '${clock.toISOString()}'`;
@@ -7414,13 +7568,13 @@ async function withAuthoritySession(
       connect: async () => client,
     };
     await run({
-      repository: new PostgresTransactionInboxRepository(database, undefined, enabledAdmission),
+      repository: new PostgresTransactionInboxRepository(database, undefined, admissionPolicy),
       launchpad: new PostgresLaunchpadEventRepository(
         database,
         4,
         Date.now,
         undefined,
-        enabledAdmission,
+        admissionPolicy,
       ),
       client: connection,
       authorityClockReads: () => authorityClockReadCount,

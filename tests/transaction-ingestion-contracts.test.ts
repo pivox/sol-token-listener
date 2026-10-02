@@ -57,6 +57,53 @@ import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
 
+void test('heartbeat worker admission clock requires paired metrics and cannot follow updatedAtMs', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const workerAdmission = Object.freeze({ version: 1, enabled: false, trackingWindowSeconds: 45,
+    claimableBacklogCount: 0, classificationPendingCount: 0, oldestClassificationPendingAgeMs: null,
+    freshMintCount: 0, extendedMintCount: 0, demotedCount: 0 });
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  for (const sampledAtMs of [1, heartbeat.updatedAtMs]) {
+    assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat,
+      workerAdmission, workerAdmissionClock: Object.freeze({ version: 1, sampledAtMs }) })); });
+  }
+  for (const value of [
+    Object.freeze({ ...heartbeat, workerAdmissionClock: Object.freeze({ version: 1, sampledAtMs: 1 }) }),
+    Object.freeze({ ...heartbeat, workerAdmission,
+      workerAdmissionClock: Object.freeze({ version: 1, sampledAtMs: heartbeat.updatedAtMs + 1 }) }),
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(value); }, TypeError);
+  }
+});
+
+void test('heartbeat validates original worker admission clock descriptors before normalization', () => {
+  let reads = 0;
+  const hostile = (): never => { reads += 1; throw new Error('do-not-leak'); };
+  const heartbeat = Object.freeze({ ...rpcEvidenceHeartbeat(), workerAdmission: Object.freeze({
+    version: 1, enabled: false, trackingWindowSeconds: 45, claimableBacklogCount: 0,
+    classificationPendingCount: 0, oldestClassificationPendingAgeMs: null, freshMintCount: 0,
+    extendedMintCount: 0, demotedCount: 0,
+  }) });
+  for (const workerAdmissionClock of [
+    null, undefined, { version: 1, sampledAtMs: 1 },
+    Object.freeze({ version: 1, sampledAtMs: 1, secret: 'do-not-leak' }),
+    new Proxy(Object.freeze({ version: 1, sampledAtMs: 1 }), { ownKeys: hostile }),
+    Object.freeze({ version: 1, get sampledAtMs() { return hostile(); } }),
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat,
+      workerAdmissionClock })); }, { name: 'TypeError', message: 'Runtime worker admission clock is invalid.' });
+  }
+  for (const descriptor of [
+    { enumerable: true, get: hostile },
+    { enumerable: false, value: Object.freeze({ version: 1, sampledAtMs: 1 }) },
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze(Object.defineProperty(
+      { ...heartbeat }, 'workerAdmissionClock', descriptor,
+    ))); }, { name: 'TypeError', message: 'Runtime worker admission clock is invalid.' });
+  }
+  assert.equal(reads, 0);
+});
+
 void test('heartbeat accepts omitted historical worker admission and only an exact frozen snapshot', () => {
   const heartbeat = rpcEvidenceHeartbeat();
   const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(Object.freeze({

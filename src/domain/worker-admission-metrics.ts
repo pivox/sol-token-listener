@@ -31,6 +31,34 @@ export interface RuntimeWorkerAdmissionMetricsV1 {
   readonly demotedCount: number;
 }
 
+export interface RuntimeWorkerAdmissionClockV1 {
+  readonly version: 1;
+  readonly sampledAtMs: number;
+}
+
+export function snapshotRuntimeWorkerAdmissionClock(value: unknown): RuntimeWorkerAdmissionClockV1 {
+  const invalidClock = (): TypeError => new TypeError('Runtime worker admission clock is invalid.');
+  try {
+    if (typeof value !== 'object' || value === null || isProxy(value)
+      || Array.isArray(value) || !Object.isFrozen(value)) throw invalidClock();
+    const prototype = Reflect.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw invalidClock();
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== 2 || !keys.includes('version') || !keys.includes('sampledAtMs')) {
+      throw invalidClock();
+    }
+    const version = Object.getOwnPropertyDescriptor(value, 'version');
+    const sampledAt = Object.getOwnPropertyDescriptor(value, 'sampledAtMs');
+    if (version === undefined || !version.enumerable || !('value' in version)
+      || version.value !== 1 || sampledAt === undefined || !sampledAt.enumerable
+      || !('value' in sampledAt)) throw invalidClock();
+    const sampledAtMs = integer(sampledAt.value, 1, 8_640_000_000_000_000);
+    return Object.freeze({ version: 1, sampledAtMs });
+  } catch {
+    throw invalidClock();
+  }
+}
+
 export function snapshotRuntimeWorkerAdmissionMetrics(
   value: unknown,
 ): RuntimeWorkerAdmissionMetricsV1 {

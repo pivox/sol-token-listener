@@ -551,12 +551,19 @@ export interface ApiHeartbeat {
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when worker-admission metrics are absent. */
   readonly workerAdmission?: ApiWorkerAdmissionMetricsV1 | null;
+  /** Optional during rolling deployment; null when the paired SQL clock is absent. */
+  readonly workerAdmissionClock?: ApiWorkerAdmissionClockV1 | null;
   /** Optional during rolling deployment; null when RPC HTTP evidence is absent. */
   readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
   /** Optional during rolling deployment; null when first-processing evidence is absent. */
   readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
   /** Optional during rolling deployment; null when decoder-quarantine evidence is absent. */
   readonly decoderQuarantine?: ApiDecoderQuarantineMetricsV1 | null;
+}
+
+export interface ApiWorkerAdmissionClockV1 {
+  readonly version: 1;
+  readonly sampledAtMs: number;
 }
 
 export interface ApiWorkerAdmissionMetricsV1 {

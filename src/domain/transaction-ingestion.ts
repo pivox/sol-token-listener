@@ -14,7 +14,9 @@ import {
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from './first-processing-canary.js';
 import {
+  snapshotRuntimeWorkerAdmissionClock,
   snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionClockV1,
   type RuntimeWorkerAdmissionMetricsV1,
 } from './worker-admission-metrics.js';
 import type { ChainConfirmationStatus } from './types.js';
@@ -291,6 +293,7 @@ export interface RuntimeHeartbeat {
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
   readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
   readonly workerAdmission?: RuntimeWorkerAdmissionMetricsV1;
+  readonly workerAdmissionClock?: RuntimeWorkerAdmissionClockV1;
   readonly decoderQuarantine?: RuntimeDecoderQuarantineMetricsV1;
 }
 
@@ -705,6 +708,7 @@ export function assertValidRuntimeHeartbeat(
   value: unknown,
 ): asserts value is RuntimeHeartbeat {
   if (isProxy(value)) throw new TypeError('Runtime heartbeat is invalid.');
+  let workerAdmissionClock: RuntimeWorkerAdmissionClockV1 | undefined;
   // Validate the original evidence before the generic durable snapshot can normalize proxies.
   if (typeof value === 'object' && value !== null) {
     const evidence = Object.getOwnPropertyDescriptor(value, 'rpcHttpEvidence');
@@ -728,6 +732,16 @@ export function assertValidRuntimeHeartbeat(
       }
       snapshotRuntimeWorkerAdmissionMetrics(workerAdmission.value);
     }
+    const clock = Object.getOwnPropertyDescriptor(value, 'workerAdmissionClock');
+    if (clock !== undefined) {
+      if (!('value' in clock) || clock.enumerable !== true) {
+        throw new TypeError('Runtime worker admission clock is invalid.');
+      }
+      workerAdmissionClock = snapshotRuntimeWorkerAdmissionClock(clock.value);
+      if (workerAdmission === undefined) {
+        throw new TypeError('Runtime worker admission clock requires paired metrics.');
+      }
+    }
     const decoderQuarantine = Object.getOwnPropertyDescriptor(value, 'decoderQuarantine');
     if (decoderQuarantine !== undefined) {
       if (!('value' in decoderQuarantine) || decoderQuarantine.enumerable !== true) {
@@ -750,6 +764,9 @@ export function assertValidRuntimeHeartbeat(
   }
   assertMilliseconds(record.startedAtMs, 'Runtime heartbeat startedAtMs');
   assertMilliseconds(record.updatedAtMs, 'Runtime heartbeat updatedAtMs');
+  if (workerAdmissionClock !== undefined && workerAdmissionClock.sampledAtMs > record.updatedAtMs) {
+    throw new TypeError('Runtime worker admission clock follows updatedAtMs.');
+  }
   if (record.updatedAtMs < record.startedAtMs) {
     throw new TypeError('Runtime heartbeat updatedAtMs precedes startedAtMs.');
   }

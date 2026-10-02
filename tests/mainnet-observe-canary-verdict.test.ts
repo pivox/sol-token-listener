@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { isProxy } from 'node:util/types';
 import {
   MAINNET_OBSERVE_CANARY_GATE_NAMES,
   evaluateMainnetObserveCanary,
@@ -181,6 +182,43 @@ void test('checks worker admission population and post-stop proof before failure
   });
 });
 
+void test('matching legacy stopped counts without paired clock proof cannot pass worker admission', () => {
+  const copy = passingWorkerAdmissionFixture();
+  for (const name of WORKER_ADMISSION_SNAPSHOT_NAMES) {
+    delete nested(copy, 'snapshots', name).workerAdmissionClock;
+  }
+  delete nested(copy, 'stoppedHeartbeat').workerAdmissionClock;
+  delete copy.postStopWorkerAdmissionClaimableProof;
+
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING',
+  });
+});
+
+void test('paired stopped clock proof accepts exact time and rejects equal counts at another time', () => {
+  const copy = passingWorkerAdmissionFixture();
+  for (const name of WORKER_ADMISSION_SNAPSHOT_NAMES) {
+    const snapshot = nested(copy, 'snapshots', name);
+    snapshot.workerAdmissionClock = { version: 1, sampledAtMs: snapshot.observedAtMs };
+  }
+  const stopped = nested(copy, 'stoppedHeartbeat');
+  const sampledAtMs = stopped.observedAtMs as number;
+  stopped.workerAdmissionClock = { version: 1, sampledAtMs };
+  copy.postStopWorkerAdmissionClaimableProof = {
+    version: 1, sampledAtMs, claimableBacklogCount: 6,
+  };
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+    verdict: 'PASS', reasonCode: 'WORKER_ADMISSION_BOUNDED',
+  });
+
+  nested(copy, 'postStopWorkerAdmissionClaimableProof').sampledAtMs = sampledAtMs + 1;
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE',
+    reasonCode: 'WORKER_ADMISSION_POST_STOP_CLOCK_INCOHERENT',
+  });
+});
+
 void test('keeps STOPPED SQL count disagreement inconclusive', () => {
   const copy = passingWorkerAdmissionFixture();
   copy.postStopWorkerAdmissionClaimableCount = 7;
@@ -189,6 +227,124 @@ void test('keeps STOPPED SQL count disagreement inconclusive', () => {
     verdict: 'INCONCLUSIVE',
     reasonCode: 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT',
   });
+});
+
+void test('requires every paired clock and the independent stopped proof', () => {
+  for (const location of [...WORKER_ADMISSION_SNAPSHOT_NAMES, 'STOPPED', 'PROOF']) {
+    const copy = passingWorkerAdmissionFixture();
+    if (location === 'PROOF') delete copy.postStopWorkerAdmissionClaimableProof;
+    else delete (location === 'STOPPED' ? nested(copy, 'stoppedHeartbeat')
+      : nested(copy, 'snapshots', location)).workerAdmissionClock;
+    assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+      verdict: 'INCONCLUSIVE', reasonCode: 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING',
+    }, location);
+  }
+});
+
+void test('rejects malformed paired clocks and proofs without reflecting private values', () => {
+  const badClocks: readonly unknown[] = [null, undefined, { version: 2, sampledAtMs: 1 },
+    { version: 1, sampledAtMs: 0 }, { version: 1, sampledAtMs: -0 },
+    { version: 1, sampledAtMs: 1.5 }, { version: 1, sampledAtMs: '1' },
+    { version: 1, sampledAtMs: Number.MAX_SAFE_INTEGER },
+    { version: 1, sampledAtMs: Infinity },
+    { version: 1, sampledAtMs: 1, wallet: 'private-wallet' },
+    new Proxy({}, { ownKeys() { throw new Error('private-proxy'); } }),
+  ];
+  for (const location of [...WORKER_ADMISSION_SNAPSHOT_NAMES, 'STOPPED', 'PROOF']) {
+    for (const clock of badClocks) {
+      const copy = passingWorkerAdmissionFixture();
+      if (location === 'PROOF') {
+        copy.postStopWorkerAdmissionClaimableProof = typeof clock === 'object'
+          && clock !== null && !isProxy(clock)
+          ? { ...clock, claimableBacklogCount: 6 } : clock;
+      } else (location === 'STOPPED' ? nested(copy, 'stoppedHeartbeat')
+        : nested(copy, 'snapshots', location)).workerAdmissionClock = clock;
+      const result = evaluateMainnetObserveCanary(copy);
+      assert.deepEqual(result.gates.workerAdmission, {
+        verdict: 'INCONCLUSIVE', reasonCode: 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED',
+      }, location);
+      assert.equal(result.gates.catchUpAdmission.verdict, 'PASS');
+      assert.equal(JSON.stringify(result).includes('private-'), false);
+    }
+  }
+  for (const count of [-1, -0, 1.5, '6', Number.MAX_SAFE_INTEGER + 1]) {
+    const copy = passingWorkerAdmissionFixture();
+    nested(copy, 'postStopWorkerAdmissionClaimableProof').claimableBacklogCount = count;
+    assert.equal(evaluateMainnetObserveCanary(copy).gates.workerAdmission.reasonCode,
+      'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED');
+  }
+});
+
+void test('never invokes paired clock or proof accessors', () => {
+  let reads = 0;
+  for (const nestedField of [false, 'version', 'sampledAtMs', 'claimableBacklogCount'] as const) {
+    for (const proof of [false, true]) {
+      if (!proof && nestedField === 'claimableBacklogCount') continue;
+      const copy = passingWorkerAdmissionFixture();
+      const root = proof ? copy : nested(copy, 'stoppedHeartbeat');
+      const key = proof ? 'postStopWorkerAdmissionClaimableProof' : 'workerAdmissionClock';
+      Object.defineProperty(nestedField ? nested(root, key) : root,
+        nestedField || key, {
+          enumerable: true, get() { reads += 1; throw new Error('private-accessor'); },
+        });
+      const result = evaluateMainnetObserveCanary(copy);
+      assert.equal(reads, 0);
+      assert.equal(result.gates.workerAdmission.reasonCode,
+        'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED');
+      assert.equal(result.gates.catchUpAdmission.verdict, 'PASS');
+    }
+  }
+});
+
+void test('requires the third independent count to agree with stopped metrics and legacy scalar', () => {
+  const copy = passingWorkerAdmissionFixture();
+  nested(copy, 'postStopWorkerAdmissionClaimableProof').claimableBacklogCount = 7;
+  assert.deepEqual(evaluateMainnetObserveCanary(copy).gates.workerAdmission, {
+    verdict: 'INCONCLUSIVE', reasonCode: 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT',
+  });
+});
+
+void test('requires actual paired samples within the process timeline and nondecreasing samples', () => {
+  for (const location of [...WORKER_ADMISSION_SNAPSHOT_NAMES, 'STOPPED']) {
+    for (const beforeStartup of [false, true]) {
+      const copy = passingWorkerAdmissionFixture();
+      const heartbeat = location === 'STOPPED' ? nested(copy, 'stoppedHeartbeat')
+        : nested(copy, 'snapshots', location);
+      nested(heartbeat, 'workerAdmissionClock').sampledAtMs = beforeStartup
+        ? (heartbeat.startedAtMs as number) - 1 : (heartbeat.observedAtMs as number) + 1;
+      assert.equal(evaluateMainnetObserveCanary(copy).gates.workerAdmission.reasonCode,
+        'WORKER_ADMISSION_TIMELINE_INCOHERENT', location);
+    }
+  }
+  const regressing = passingWorkerAdmissionFixture();
+  nested(regressing, 'snapshots', 'T_PLUS_15', 'workerAdmissionClock').sampledAtMs =
+    (nested(regressing, 'snapshots', 'T_PLUS_5', 'workerAdmissionClock').sampledAtMs as number) - 1;
+  assert.equal(evaluateMainnetObserveCanary(regressing).gates.workerAdmission.reasonCode,
+    'WORKER_ADMISSION_TIMELINE_INCOHERENT');
+
+  const repeatedSample = passingWorkerAdmissionFixture();
+  nested(repeatedSample, 'snapshots', 'T_PLUS_15', 'workerAdmissionClock').sampledAtMs =
+    nested(repeatedSample, 'snapshots', 'T_PLUS_5', 'workerAdmissionClock').sampledAtMs;
+  assert.equal(evaluateMainnetObserveCanary(repeatedSample).gates.workerAdmission.verdict, 'PASS');
+});
+
+void test('paired worker proof never substitutes for process and first-processing cohort coherence', () => {
+  const changedProcess = passingWorkerAdmissionFixture();
+  const stopped = nested(changedProcess, 'stoppedHeartbeat');
+  stopped.startedAtMs = (stopped.startedAtMs as number) + 1;
+  const changedProcessResult = evaluateMainnetObserveCanary(changedProcess);
+  assert.equal(changedProcessResult.gates.workerAdmission.reasonCode,
+    'WORKER_ADMISSION_TIMELINE_INCOHERENT');
+  assert.equal(changedProcessResult.gates.firstProcessing.verdict, 'INCONCLUSIVE');
+
+  const changedCohort = passingWorkerAdmissionFixture();
+  const evidence = nested(changedCohort, 'stoppedHeartbeat', 'firstProcessingCanary');
+  evidence.cohortStartedAtMs = (evidence.cohortStartedAtMs as number) + 1;
+  evidence.cohortEndsAtMs = (evidence.cohortEndsAtMs as number) + 1;
+  const changedCohortResult = evaluateMainnetObserveCanary(changedCohort);
+  assert.equal(changedCohortResult.gates.workerAdmission.verdict, 'PASS');
+  assert.equal(changedCohortResult.gates.firstProcessing.verdict, 'INCONCLUSIVE');
+  assert.notEqual(changedCohortResult.overallVerdict, 'PASS');
 });
 
 void test('requires dedicated post-stop worker evidence and only a subset of legacy backlog', () => {
@@ -1187,8 +1343,11 @@ function passingWorkerAdmissionFixture(): Record<string, unknown> {
   const legacyBacklog = [20, 18, 16, 14] as const;
   const pending = [2, 1, 1, 1] as const;
   const ages = [1_000, 2_000, 30_000, 44_999] as const;
+  // Explicit paired database samples, independent from the observation timestamps.
+  const sampledAtMs = [1790313410002, 1790313692690, 1790314294666, 1790314338243] as const;
   WORKER_ADMISSION_SNAPSHOT_NAMES.forEach((name, index) => {
     const snapshot = nested(copy, 'snapshots', name);
+    snapshot.workerAdmissionClock = { version: 1, sampledAtMs: sampledAtMs[index] };
     const claimableBacklogCount = claimable[index] ?? 0;
     snapshot.workerAdmission = workerAdmissionEvidence({
       claimableBacklogCount,
@@ -1201,6 +1360,7 @@ function passingWorkerAdmissionFixture(): Record<string, unknown> {
     setHeartbeatBacklog(snapshot, legacyBacklog[index] ?? claimableBacklogCount);
   });
   const stopped = nested(copy, 'stoppedHeartbeat');
+  stopped.workerAdmissionClock = { version: 1, sampledAtMs: 1790314339761 };
   stopped.workerAdmission = workerAdmissionEvidence({
     claimableBacklogCount: 6,
     classificationPendingCount: 0,
@@ -1212,6 +1372,9 @@ function passingWorkerAdmissionFixture(): Record<string, unknown> {
   setHeartbeatBacklog(stopped, 12);
   copy.postStopActionableCount = 12;
   copy.postStopWorkerAdmissionClaimableCount = 6;
+  copy.postStopWorkerAdmissionClaimableProof = {
+    version: 1, sampledAtMs: 1790314339761, claimableBacklogCount: 6,
+  };
   return copy;
 }
 

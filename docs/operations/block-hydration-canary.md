@@ -22,15 +22,19 @@ est limitée à cette fenêtre Mainnet observe-only de quinze minutes.
 
 Capturer le health complet et expurgé aux cinq frontières exactes `T0`, `T+5`,
 `T+15`, `FINAL_PRESTOP` puis dans le heartbeat PostgreSQL durable `STOPPED`.
-Chacune porte un objet exact `workerAdmission.v1`; l'absence, une forme
+Chacune porte un objet exact `workerAdmission.v1` et son sidecar exact
+`workerAdmissionClock` (`version=1`, `sampledAtMs`); l'absence, une forme
 malformée, `enabled=false`, une fenêtre différente de 45 secondes ou une
 chronologie non monotone donne `INCONCLUSIVE`. Depuis T+5 : non croissant pour
 classification puis backlog claimable jusqu'à `STOPPED`. La dette la plus
 ancienne à 44 999 ms reste éligible à `PASS`; 45 000 ms exactement produit
 `FAIL`. À chaque relevé, `claimableBacklogCount <= backlogCount` et la somme
 avec `classificationPendingCount` reste inférieure ou égale au backlog legacy.
-Le compte claimable `STOPPED` doit correspondre à la preuve SQL post-stop dédiée
-`postStopWorkerAdmissionClaimableCount`, sinon le verdict est `INCONCLUSIVE`.
+Le compte claimable `STOPPED` doit correspondre au compte SQL post-stop dédié
+`postStopWorkerAdmissionClaimableCount` et à
+`postStopWorkerAdmissionClaimableProof.claimableBacklogCount`. Le clock de la
+preuve doit égaler exactement celui du heartbeat `STOPPED`, sinon le verdict
+est `INCONCLUSIVE`.
 Le champ distinct `postStopActionableCount` reste exclusivement la preuve du
 gate shutdown legacy et doit toujours égaler le `backlogCount` arrêté.
 
@@ -365,7 +369,8 @@ peut être réutilisée pour déclarer un `PASS`.
    configuration résolue avant le démarrage.
 2. Redémarrer exactement une réplique. Aucun flag n'est modifiable à chaud.
 3. Capturer l’état health, le backlog/les échecs terminaux, le RSS et
-   `workerAdmission` et `blockHydrationAdmission` à T0, T+5 min et T+15 min,
+   `workerAdmission`, `workerAdmissionClock` et `blockHydrationAdmission` à T0,
+   T+5 min et T+15 min,
    puis une dernière fois dans
    `FINAL_PRESTOP` immédiatement avant l'arrêt. Ces quatre relevés viennent de
    l’API pendant que l’application tourne. Capturer ensuite `STOPPED` depuis le
@@ -382,8 +387,10 @@ peut être réutilisée pour déclarer un `PASS`.
    doit contenir aucun identifiant, signature, mint, wallet ou label. Le CLI
    `canary:evaluate` réapplique le snapshotter domaine exact et rejette toute
    absence, clé additionnelle, valeur non entière ou relation zéro/null invalide.
-   Ajouter au niveau racine le seul entier SQL frais
-   `postStopWorkerAdmissionClaimableCount`; ne jamais le déduire de
+   Conserver le sidecar exact `workerAdmissionClock` indépendamment de ces neuf
+   champs. Ajouter au niveau racine le compte SQL indépendant
+   `postStopWorkerAdmissionClaimableCount` et sa preuve liée
+   `postStopWorkerAdmissionClaimableProof`; ne jamais les déduire de
    `postStopActionableCount`, qui conserve la population legacy du shutdown.
    Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
    projection fixe suivante de la réponse health :
@@ -462,6 +469,7 @@ peut être réutilisée pour déclarer un `PASS`.
          'rpcHttpEvidence', payload -> 'rpcHttpEvidence',
          'firstProcessingCanary', payload -> 'firstProcessingCanary',
          'workerAdmission', payload -> 'workerAdmission',
+         'workerAdmissionClock', payload -> 'workerAdmissionClock',
          'blockHydrationAdmission', payload -> 'blockHydrationAdmission'
        )
      )
@@ -508,16 +516,19 @@ peut être réutilisée pour déclarer un `PASS`.
    trap - EXIT
    ```
 
-   Exécuter ensuite la requête SQL post-stop suivante avec le rôle PostgreSQL
-   dédié au listener. Elle reprend exactement la population claimable et les
+   Après l'arrêt de tous les writers du périmètre et avant toute purge, exécuter
+   la requête SQL post-stop suivante avec le rôle PostgreSQL dédié au listener.
+   Lier `$1` à l'entier `workerAdmissionClock.sampledAtMs` enregistré dans le
+   heartbeat durable `STOPPED`, jamais à l'heure d'exécution de cette requête.
+   Elle reprend exactement la population claimable et les
    cinq preuves d'autorité utilisées par le repository avec la fenêtre V1 de
-   45 secondes. Son unique sortie agrégée devient
+   45 secondes. Sa sortie agrégée contient l'instant lié et
    `postStopWorkerAdmissionClaimableCount`; elle ne révèle aucune signature,
    aucun mint, wallet, identifiant ou label :
 
    ```sql
    WITH database_clock AS MATERIALIZED (
-     SELECT date_trunc('milliseconds', clock_timestamp()) AS at
+     SELECT to_timestamp($1::NUMERIC / 1000) AS at
    ), fresh_launch AS MATERIALIZED (
      SELECT DISTINCT launch.mint
      FROM token_launches AS launch
@@ -555,7 +566,8 @@ peut être réutilisée pour déclarer un `PASS`.
          AND intent.status NOT IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
      UNION SELECT live.mint FROM listener_worker_tracking_live_mints AS live
    )
-   SELECT COUNT(*) FILTER (
+   SELECT (SELECT (EXTRACT(EPOCH FROM at) * 1000)::BIGINT
+     FROM database_clock) AS "sampledAtMs", COUNT(*) FILTER (
      WHERE (
        (inbox.processing_status = 'PENDING'
          AND inbox.attempts_in_cycle < inbox.retry_max_attempts)
@@ -609,9 +621,27 @@ peut être réutilisée pour déclarer un `PASS`.
    CROSS JOIN database_clock;
    ```
 
-   Archiver seulement cet entier dans le manifeste V1. Une requête absente,
-   échouée, malformée ou exécutée avant `STOPPED` vaut `INCONCLUSIVE`; ne jamais
-   substituer le compte legacy `postStopActionableCount`.
+   Archiver le compte historique `postStopWorkerAdmissionClaimableCount` et la
+   preuve exacte `postStopWorkerAdmissionClaimableProof` de forme
+   `{version: 1, sampledAtMs, claimableBacklogCount}` dans le manifeste V1.
+   Les trois comptes (métriques `STOPPED`, entier historique et preuve SQL)
+   doivent être identiques, tout comme les instants de la preuve et du clock
+   `STOPPED`. Conserver également le vrai `workerAdmissionClock` de chacun des
+   quatre snapshots : entier positif représentable en date, compris entre
+   l'ancre du processus et son `observedAtMs`; les samples doivent être
+   non décroissants (un heartbeat répété peut conserver le même sample).
+   Ne jamais reconstruire un clock à partir d'un timestamp d'observation.
+
+   Cette requête lit les lignes actuelles de la base arrêtée, pas un snapshot
+   historique ni un voyage dans le temps. Des écritures pertinentes intervenues
+   après le sample restent visibles et peuvent produire un désaccord. L'égalité
+   de comptes ne prouve ni l'identité des lignes ni l'absence de mutations qui
+   se compensent. Une preuve absente, échouée, malformée, de clock différent ou
+   capturée avant `STOPPED` vaut `INCONCLUSIVE`; ne jamais substituer le compte
+   legacy `postStopActionableCount`. Les anciens manifestes sans clock/preuve
+   restent lisibles mais ne peuvent pas obtenir `PASS` au gate worker admission.
+   Déployer ensemble readers et writers compatibles : les anciens binaires à
+   allowlist stricte ne comprennent pas ces nouveaux champs optionnels V1.
 
    Nommer les quatre fichiers HTTP `T0`, `T+5`, `T+15` et `final`, et les quatre
    fichiers de latence `T0.firstProcessingCanary`,
@@ -777,8 +807,11 @@ eux aussi indépendants, avec leurs snapshots et critères propres.
   classification et backlog claimable non croissants, aucun âge pending à
   45 000 ms ou davantage ; à chaque frontière, le claimable et la somme
   claimable + pending restent inférieurs ou égaux au backlog legacy, et le
-  claimable `STOPPED` égale le SQL frais dédié
-  `postStopWorkerAdmissionClaimableCount`. Le compte distinct
+  claimable `STOPPED` égale le compte SQL dédié
+  `postStopWorkerAdmissionClaimableCount` et celui de la preuve
+  `postStopWorkerAdmissionClaimableProof`, liée exactement au clock `STOPPED`.
+  Les cinq clocks sont présents, valides, non décroissants et compris entre
+  le démarrage du processus et leur observation. Le compte distinct
   `postStopActionableCount` reste la preuve du shutdown legacy;
 - l'affinité provider est conservée pendant chaque scan strict : aucun résultat
   ou cache d'un provider remplacé n'est réutilisé, et le cache unique reste à
