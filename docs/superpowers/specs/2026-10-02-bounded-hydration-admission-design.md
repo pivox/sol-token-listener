@@ -1,4 +1,4 @@
-# Bounded shared hydration admission — v1.0.0
+# Bounded shared hydration admission — v1.0.1
 
 ## Goal and evidence
 
@@ -98,6 +98,11 @@ without an artificial fairness delay. Never preempt an in-flight RPC.
 
 Provider-affinity permits remain authoritative. Bind tickets to provider revision
 and scan generation; revoke stale unconsumed tickets and reject stale results.
+Acquire route eligibility before group capacity: never hold the sole group slot
+while waiting for an incompatible scan to release its route. A shared worker
+accepted by an active scan pins that scan through its reservation and hydration,
+releasing the pin before business work. Natural scan completion must not invalidate
+a reservation during its database claim and manufacture a transaction retry.
 Different-provider scans must not share worker fetches. Scan abort, shutdown and
 selection change must settle all admitted and waiting consumers without a leak.
 A genuine route change after claim may remain a retryable locator failure; lack

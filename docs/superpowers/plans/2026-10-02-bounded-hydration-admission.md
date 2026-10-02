@@ -8,7 +8,7 @@
 
 **Tech Stack:** Strict TypeScript ESM, node:test, existing PostgreSQL repositories unchanged.
 
-Specification: `docs/superpowers/specs/2026-10-02-bounded-hydration-admission-design.md`, v1.0.0, commit `a00e696`.
+Specification: `docs/superpowers/specs/2026-10-02-bounded-hydration-admission-design.md`, v1.0.1 (initial design `a00e696`, route-order clarification before integration).
 Baseline `c9aadef`: hydration/cache/classifier 96 PASS, zero skips. No implementation exists yet.
 
 ## Task 1 — Controller contract and deterministic state tests
@@ -115,6 +115,13 @@ The controller remains separate from provider route permits.
 - [ ] Preserve the old `workerLocator` for legacy/direct callers, but route all
   coordinator cache entries through the same controller budget. The ticket path
   must not reacquire its own budget. Map the bound group with an unambiguous key:
+
+  Acquire the route permit before the group slot to avoid holding capacity while
+  an incompatible scan needs it to finish. A shared worker accepted by a scan
+  adds a settlement pin covering acquisition/claim/hydration, not business work,
+  to the scan's pending drain. Release it on every null/error/cancellation path.
+  Test natural scan completion during a delayed claim: it cannot unbind the route
+  before this reservation is consumed/released or create an artificial retry.
 
 ```ts
 JSON.stringify([context.token, context.providerId, target.slot.toString(),
