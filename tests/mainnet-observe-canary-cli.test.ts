@@ -87,6 +87,45 @@ void test('fails closed with one fixed error for invocation, read, size, and JSO
   }
 });
 
+void test('CLI keeps legacy worker evidence inconclusive and accepts only exact paired stopped proof', async () => {
+  const manifest = JSON.parse(fixtureText) as Record<string, any>;
+  const metrics = {
+    version: 1, enabled: true, trackingWindowSeconds: 45, claimableBacklogCount: 0,
+    classificationPendingCount: 0, oldestClassificationPendingAgeMs: null,
+    freshMintCount: 0, extendedMintCount: 0, demotedCount: 0,
+  };
+  for (const snapshot of [...Object.values(manifest.snapshots) as Record<string, any>[],
+    manifest.stoppedHeartbeat as Record<string, any>]) {
+    snapshot.workerAdmission = metrics;
+    snapshot.workerAdmissionClock = { version: 1, sampledAtMs: snapshot.observedAtMs };
+  }
+  manifest.postStopWorkerAdmissionClaimableCount = 0;
+  const stoppedSampledAtMs = manifest.stoppedHeartbeat.observedAtMs as number;
+  for (const [proof, verdict, reasonCode] of [
+    [undefined, 'INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING'],
+    [{ version: 1, sampledAtMs: stoppedSampledAtMs,
+      claimableBacklogCount: 0 }, 'PASS', 'WORKER_ADMISSION_BOUNDED'],
+    [{ version: 1, sampledAtMs: stoppedSampledAtMs + 1,
+      claimableBacklogCount: 0 }, 'INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_CLOCK_INCOHERENT'],
+    [{ version: 1, sampledAtMs: stoppedSampledAtMs,
+      claimableBacklogCount: 0, wallet: 'must-not-leak' }, 'INCONCLUSIVE',
+    'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED'],
+  ] as const) {
+    manifest.postStopWorkerAdmissionClaimableProof = proof;
+    const harness = commandHarness(async (path) => path.endsWith('terminal.json')
+      ? terminalAttributionText : JSON.stringify(manifest));
+    assert.equal(await runMainnetObserveCanaryCommand(
+      ['/redacted/input.json', '/redacted/terminal.json'], harness.dependencies,
+    ), 2);
+    assert.equal(harness.stdout.length, 1);
+    assert.deepEqual(harness.stderr, []);
+    const result = JSON.parse(harness.stdout[0] ?? '') as Record<string, any>;
+    assert.deepEqual(result.gates.workerAdmission, { verdict, reasonCode });
+    assert.equal(result.overallVerdict, 'FAIL', 'The archived real failures remain failures.');
+    assert.equal(harness.stdout.join('').includes('must-not-leak'), false);
+  }
+});
+
 void test('turns malicious but valid JSON fields into a redacted inconclusive result', async () => {
   const malicious = JSON.stringify({
     schemaVersion: 'mainnet-observe-canary-input.v1',

@@ -9,7 +9,9 @@ import {
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from '../../src/domain/first-processing-canary.js';
 import {
+  snapshotRuntimeWorkerAdmissionClock,
   snapshotRuntimeWorkerAdmissionMetrics,
+  type RuntimeWorkerAdmissionClockV1,
   type RuntimeWorkerAdmissionMetricsV1,
 } from '../../src/domain/worker-admission-metrics.js';
 import {
@@ -95,6 +97,12 @@ type BlockHydrationAdmissionEvidence =
 type OptionalIntegerEvidence =
   | Readonly<{ state: 'MISSING' | 'MALFORMED'; value: null }>
   | Readonly<{ state: 'VALID'; value: number }>;
+type WorkerAdmissionClockEvidence = AttributionSectionEvidence<RuntimeWorkerAdmissionClockV1>;
+type WorkerAdmissionClaimableProofEvidence = AttributionSectionEvidence<Readonly<{
+  version: 1;
+  sampledAtMs: number;
+  claimableBacklogCount: number;
+}>>;
 
 interface Admission {
   readonly version: 1;
@@ -155,6 +163,7 @@ interface Snapshot {
   readonly periodicPauseEvidence: PeriodicPauseEvidence | null;
   readonly catchUpAdmission: Admission;
   readonly workerAdmission: WorkerAdmissionEvidence;
+  readonly workerAdmissionClock: WorkerAdmissionClockEvidence;
   readonly blockHydration: Hydration;
   readonly blockHydrationAdmission: BlockHydrationAdmissionEvidence;
   readonly rpcHttpEvidence: RpcEvidence;
@@ -186,6 +195,7 @@ interface StoppedHeartbeat {
   readonly leasedCount: number;
   readonly catchUpAdmission: Admission;
   readonly workerAdmission: WorkerAdmissionEvidence;
+  readonly workerAdmissionClock: WorkerAdmissionClockEvidence;
   readonly blockHydration: Hydration;
   readonly blockHydrationAdmission: BlockHydrationAdmissionEvidence;
   readonly rpcHttpEvidence: RpcEvidence;
@@ -227,6 +237,7 @@ interface CanaryInput {
   }>;
   readonly postStopActionableCount: number;
   readonly postStopWorkerAdmissionClaimableCount: OptionalIntegerEvidence;
+  readonly postStopWorkerAdmissionClaimableProof: WorkerAdmissionClaimableProofEvidence;
   readonly versionReplayProof: Readonly<{
     freshDatabase: boolean;
     observed: VersionCounts;
@@ -651,6 +662,27 @@ function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateRe
   if (stoppedMetrics.claimableBacklogCount !== postStopCount.value) {
     return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT');
   }
+  const clocks = [...snapshots.map((snapshot) => snapshot.workerAdmissionClock),
+    input.stoppedHeartbeat.workerAdmissionClock];
+  const proof = input.postStopWorkerAdmissionClaimableProof;
+  if ([...clocks, proof].some((item) => item.state === 'MALFORMED')) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MALFORMED');
+  }
+  if (clocks.some((item) => item.state !== 'VALID') || proof.state !== 'VALID') {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_EVIDENCE_MISSING');
+  }
+  const sampledAtMs = clocks.flatMap((item) => item.state === 'VALID'
+    ? [item.value.sampledAtMs] : []);
+  if (sampledAtMs.some((value, index) => value < processStartedAtMs
+    || value > (observedAtMs[index] ?? 0)) || !nonDecreasing(sampledAtMs)) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_TIMELINE_INCOHERENT');
+  }
+  if (proof.value.sampledAtMs !== sampledAtMs[4]) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_CLOCK_INCOHERENT');
+  }
+  if (proof.value.claimableBacklogCount !== stoppedMetrics.claimableBacklogCount) {
+    return gate('INCONCLUSIVE', 'WORKER_ADMISSION_POST_STOP_COUNT_INCOHERENT');
+  }
   const thresholdMs = stoppedMetrics.trackingWindowSeconds * 1_000;
   if (metrics.some((item) => item.oldestClassificationPendingAgeMs !== null
     && item.oldestClassificationPendingAgeMs >= thresholdMs)) {
@@ -884,7 +916,7 @@ function parseInput(value: unknown): CanaryInput {
     'schemaVersion', 'commit', 'snapshots', 'stoppedHeartbeat', 'finalityDiagnostics',
     'providerMixingEvidenceCount', 'terminalEvidence', 'postStopActionableCount',
     'versionReplayProof', 'cleanupComplete',
-  ], ['postStopWorkerAdmissionClaimableCount']);
+  ], ['postStopWorkerAdmissionClaimableCount', 'postStopWorkerAdmissionClaimableProof']);
   if (input.schemaVersion !== 'mainnet-observe-canary-input.v1'
     || typeof input.commit !== 'string' || !/^[0-9a-f]{40}$/u.test(input.commit)) invalid();
   const sourceSnapshots = exactObject(input.snapshots, SNAPSHOT_NAMES);
@@ -908,6 +940,7 @@ function parseInput(value: unknown): CanaryInput {
       input,
       'postStopWorkerAdmissionClaimableCount',
     ),
+    postStopWorkerAdmissionClaimableProof: parseOptionalWorkerAdmissionClaimableProof(input),
     versionReplayProof: Object.freeze({ freshDatabase: bool(proof.freshDatabase),
       observed: parseVersionCounts(proof.observed), normalized: parseVersionCounts(proof.normalized),
       persisted: parseVersionCounts(proof.persisted) }),
@@ -933,7 +966,7 @@ function parseSnapshot(value: unknown): Snapshot {
     'subscriberState', 'scannerState', 'workerState', 'reconcilerState', 'backlogCount',
     'leasedCount', 'websocket', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary', 'periodicPauseEvidence', 'decoderQuarantine', 'inbox', 'rssBytes',
-  ], ['workerAdmission', 'blockHydrationAdmission']);
+  ], ['workerAdmission', 'workerAdmissionClock', 'blockHydrationAdmission']);
   const websocket = exactObject(input.websocket,
     ['phase', 'providerId', 'recoveryStatus', 'recoveryReasonCode']);
   const decoder = exactObject(input.decoderQuarantine, ['version', 'unresolvedCount']);
@@ -964,6 +997,7 @@ function parseSnapshot(value: unknown): Snapshot {
     periodicPauseEvidence: parsePeriodicPause(input.periodicPauseEvidence),
     catchUpAdmission: parseAdmission(input.catchUpAdmission),
     workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
+    workerAdmissionClock: parseOptionalWorkerAdmissionClock(input),
     blockHydration: parseHydration(input.blockHydration),
     blockHydrationAdmission: parseOptionalBlockHydrationAdmission(input),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
@@ -985,7 +1019,7 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     'reconcilerState',
     'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
     'firstProcessingCanary',
-  ], ['workerAdmission', 'blockHydrationAdmission']);
+  ], ['workerAdmission', 'workerAdmissionClock', 'blockHydrationAdmission']);
   return Object.freeze({ observedAtMs: integer(input.observedAtMs),
     startedAtMs: integer(input.startedAtMs),
     runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
@@ -996,10 +1030,46 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     backlogCount: integer(input.backlogCount),
     leasedCount: integer(input.leasedCount), catchUpAdmission: parseAdmission(input.catchUpAdmission),
     workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
+    workerAdmissionClock: parseOptionalWorkerAdmissionClock(input),
     blockHydration: parseHydration(input.blockHydration),
     blockHydrationAdmission: parseOptionalBlockHydrationAdmission(input),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary) });
+}
+
+function parseOptionalWorkerAdmissionClock(
+  input: Readonly<Record<string, unknown>>,
+): WorkerAdmissionClockEvidence {
+  if (!Object.hasOwn(input, 'workerAdmissionClock')) {
+    return Object.freeze({ state: 'MISSING', value: null });
+  }
+  try {
+    const source = exactObject(input.workerAdmissionClock, ['version', 'sampledAtMs']);
+    const value = snapshotRuntimeWorkerAdmissionClock(Object.freeze(source));
+    return Object.freeze({ state: 'VALID', value });
+  } catch {
+    return Object.freeze({ state: 'MALFORMED', value: null });
+  }
+}
+
+function parseOptionalWorkerAdmissionClaimableProof(
+  input: Readonly<Record<string, unknown>>,
+): WorkerAdmissionClaimableProofEvidence {
+  if (!Object.hasOwn(input, 'postStopWorkerAdmissionClaimableProof')) {
+    return Object.freeze({ state: 'MISSING', value: null });
+  }
+  try {
+    const source = exactObject(input.postStopWorkerAdmissionClaimableProof,
+      ['version', 'sampledAtMs', 'claimableBacklogCount']);
+    const clock = snapshotRuntimeWorkerAdmissionClock(Object.freeze({
+      version: source.version, sampledAtMs: source.sampledAtMs,
+    }));
+    const value = Object.freeze({ ...clock,
+      claimableBacklogCount: integer(source.claimableBacklogCount) });
+    return Object.freeze({ state: 'VALID', value });
+  } catch {
+    return Object.freeze({ state: 'MALFORMED', value: null });
+  }
 }
 
 function parseOptionalBlockHydrationAdmission(
