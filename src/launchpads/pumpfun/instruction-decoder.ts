@@ -11,8 +11,10 @@ import { decodeIdlFields } from './idl-codec.js';
 import type {
   DecodedPumpInstruction,
   PumpIdlValue,
+  PumpInstructionCandidate,
   PumpInstructionFamily,
   PumpInstructionName,
+  PumpObservedWireProfile,
 } from './types.js';
 
 interface InstructionDefinition {
@@ -74,6 +76,50 @@ export function decodePumpInstruction(
       } catch { /* Attribution cannot change the decoder decision. */ }
     }
     throw error;
+  }
+}
+
+/** Transaction-only candidates require event attestation before business use. */
+export function decodePumpInstructionForTransaction(
+  instruction: NormalizedInstruction,
+): PumpInstructionCandidate | null {
+  try {
+    const action = decodePumpInstruction(instruction);
+    return action === null ? null : Object.freeze({ action, profile: null });
+  } catch (error) {
+    if (trustedObservedPipelineOrigin(error) !== 'PUMP_BORSH_INVALID') throw error;
+    const matched = DEFINITION_BY_DISCRIMINATOR.get(
+      toHex(instruction.data.subarray(0, 8)),
+    );
+    if (matched === undefined || (matched.name !== 'create_v2' && matched.name !== 'sell')) {
+      throw error;
+    }
+
+    // Re-read only the required fields; opaque bytes have no invented IDL meaning.
+    try {
+      const reader = new PumpBorshReader(instruction.data.subarray(8));
+      const fields = matched.name === 'create_v2'
+        ? matched.definition.args.slice(0, CREATE_V2_REQUIRED_ARGUMENT_COUNT)
+        : matched.definition.args;
+      const args = decodeIdlFields(fields, reader);
+      if (reader.remaining !== 2) throw error;
+      const expectedSuffix = matched.name === 'create_v2' ? '0001' : '0100';
+      if (toHex(reader.readBytes(2)) !== expectedSuffix) throw error;
+      const action = Object.freeze({
+        name: matched.name,
+        family: familyOf(matched.name),
+        instruction,
+        accounts: mapAccounts(matched.name, matched.definition, instruction),
+        args,
+      });
+      const profile: PumpObservedWireProfile = matched.name === 'create_v2'
+        ? 'CREATE_V2_OPAQUE_0001_V1'
+        : 'SELL_OPAQUE_0100_V1';
+      return Object.freeze({ action, profile });
+    } catch {
+      // Any prefix/account failure or nonmatching suffix retains the strict error.
+      throw error;
+    }
   }
 }
 
