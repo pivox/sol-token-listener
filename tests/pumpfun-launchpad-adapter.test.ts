@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
-import { PUMP_PROGRAM_ID, TOKEN_2022_PROGRAM_ADDRESS } from '../src/launchpads/pumpfun/constants.js';
+import { PUMP_PROGRAM_ID, TOKEN_2022_PROGRAM_ADDRESS, WSOL_MINT } from '../src/launchpads/pumpfun/constants.js';
 import {
   createPumpFunObservedTransaction,
   PumpFunLaunchpadAdapter,
@@ -10,6 +10,7 @@ import type { DecodedPumpTransaction } from '../src/launchpads/pumpfun/types.js'
 import type { BondingCurveState, TokenLaunch } from '../src/domain/types.js';
 import type { LaunchpadEventSink } from '../src/ports/launchpad-event-sink.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
 const MINT = 'Mint111111111111111111111111111111111111111';
 const CREATOR = 'Creator111111111111111111111111111111111111';
@@ -90,6 +91,36 @@ void test('filtre les trades non suivis et délègue la lecture de courbe', asyn
   const state = await adapter.readBondingCurveState(launch);
   assert.equal(state.launchMint, MINT);
   assert.equal(requestedLaunch, launch);
+});
+
+void test('projette les deux formes opaques appairées sans promouvoir le quote non-SOL', async () => {
+  const launchFixture = await loadPumpFixture('create-v2-opaque-holder-mainnet.json');
+  const launchObserved = createPumpFunObservedTransaction(launchFixture.transaction, 2_000);
+  const adapter = new PumpFunLaunchpadAdapter({ read: async (launch) => curveState(launch) });
+  const launches = await adapter.detectLaunches(launchObserved);
+  const launch = launches[0];
+  assert.equal(launches.length, 1);
+  assert.ok(launch);
+  assert.equal(launch.createdAt.instructionIndex, 1);
+  assert.equal(launch.createdAt.innerInstructionIndex, null);
+  assert.equal(launch.quoteAssets[0]?.mint, 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn');
+  assert.notEqual(launch.quoteAssets[0]?.mint, WSOL_MINT);
+  assert.equal(launch.quoteAssets[0]?.tokenProgram, 'TOKEN_2022');
+  const initialBuys = await adapter.decodeTrades(launchObserved, new Set([launch.mint]));
+  assert.equal(initialBuys.length, 1);
+  assert.equal(initialBuys[0]?.kind, 'BUY');
+  assert.equal(initialBuys[0]?.cursor.instructionIndex, 3);
+  assert.equal(initialBuys[0]?.cursor.innerInstructionIndex, 0);
+
+  const sellFixture = await loadPumpFixture('sell-opaque-volume-mainnet.json');
+  const sellObserved = createPumpFunObservedTransaction(sellFixture.transaction, 2_001);
+  const saleMint = 'MubA3r5tYDjVxGcrKNoAtRxA1f3az5F2CWJB83u7Zhm';
+  const sales = await adapter.decodeTrades(sellObserved, new Set([saleMint]));
+  assert.equal(sales.length, 1);
+  assert.equal(sales[0]?.kind, 'SELL');
+  assert.equal(sales[0]?.cursor.instructionIndex, 3);
+  assert.equal(sales[0]?.cursor.innerInstructionIndex, null);
+  assert.equal(sales[0]?.baseAmountRaw, 25_659_383_952_290n);
 });
 
 void test('construit une enveloppe immuable cohérente avec la transaction brute', () => {
