@@ -15,6 +15,15 @@ Spec: [v1.0.0](../specs/2026-10-02-canary-clock-evidence-design.md), commit4b469
 Base8fb1b10 has the same tree as the fully tested #211 head654428f. Post-merge CI
 36956089302 is still running; do not duplicate it. No runtime or wallet execution.
 
+## Execution evidence
+
+- Task1 implemented at c2c5607. RED67/68 then67/71; final GREEN72/72,
+  zero skipped, independently rerun by parent. Backend type check, scoped lint
+  and diff check passed. No independent delivery review yet.
+- Task2 in progress; tasks3-5 not started. One disposable PostgreSQL instance
+  on localhost60214 is reused, limited to512MiB. Baseline paired-snapshot and
+  single-clock repository tests passed2/2 with no skips before task2 changes.
+
 ## Task 1 — Canonical startup regression
 
 Files: src/application/production-listener-factory.ts;
