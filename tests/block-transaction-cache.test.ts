@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { serialize } from 'node:v8';
 import { PublicKey } from '@solana/web3.js';
 import { BLOCK_TRANSACTION_CACHE_DEFAULTS, CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
+import {
+  decodeBlockTransactionPayload, encodeBlockTransactionPayload,
+  MAX_BLOCK_COMPRESSION_INPUT_BYTES, MAX_COMPRESSED_TRANSACTION_BYTES,
+} from '../src/solana/rpc/block-transaction-payload-codec.js';
 import {
   ListenerRpcWorkGate,
   gateBlockTransactionRpc,
@@ -9,7 +14,7 @@ import {
 import {
   BlockUnavailableError, RpcTransientError, TransactionIndexNotFoundError,
   TransactionNormalizationError, type TransactionLocationTarget,
-  trustedTransactionLocatorFailure,
+  SolanaBlockTransactionLocator, snapshotBlockTransactionData, trustedTransactionLocatorFailure,
 } from '../src/solana/rpc/transaction-locator.js';
 
 const KEY = new PublicKey('11111111111111111111111111111111');
@@ -29,13 +34,32 @@ function entry(signature: string, version: 'legacy' | 0 = 'legacy') {
         compiledInstructions: [{ programIdIndex: 0, accountKeyIndexes: [0], data: new Uint8Array([1, 2]) }],
       },
     },
-    meta: { fee: 5000, err: null, preBalances: [10000], postBalances: [5000],
+    meta: { fee: 5000, err: null, preBalances: [10000], postBalances: [5000], logMessages: [] as string[],
       loadedAddresses: { writable: version === 0 ? [KEY] : [], readonly: [] } },
   };
 }
 function block(signatures = ['one', 'two'], slot = 42n) {
   return { blockhash: KEY.toBase58(), previousBlockhash: KEY.toBase58(), parentSlot: Number(slot - 1n),
     blockTime: null, transactions: signatures.map((signature) => entry(signature)) };
+}
+function loggedBlock(count: number, log: string) {
+  const data = block(Array.from({ length: count }, (_unused, index) => `logged-${index}`));
+  for (const transaction of data.transactions) transaction.meta.logMessages = [log];
+  return data;
+}
+function incompressibleLog(length: number): string {
+  const bytes = Buffer.alloc(length);
+  let state = 0x12345678;
+  for (let index = 0; index < length; index += 1) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[index] = state >>> 24;
+  }
+  return bytes.toString('latin1');
+}
+function uncachedLocator(data: ReturnType<typeof block>) {
+  return new SolanaBlockTransactionLocator({ async getBlockTransactions() { return data; } });
 }
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -78,6 +102,132 @@ void test('whole-slot single-flight and sequential hits preserve canonical index
   assert.equal(h.calls.length, 1);
   assert.equal(h.locator.stats.entries, 1);
   assert.equal(h.locator.stats.inFlight, 0);
+});
+
+void test('the default cache retains a compressible block above the old 8 MiB representation', async () => {
+  const data = loggedBlock(12, 'Program log: repeated payload '.repeat(28_000));
+  const uncached = uncachedLocator(data);
+  const expected = await Promise.all(data.transactions.map(({ transaction }) =>
+    uncached.locate(target(transaction.signatures[0]))));
+  const oldBytes = 64 + expected.reduce((sum, normalized) =>
+    sum + Buffer.byteLength(normalized.signature, 'utf8') + serialize(normalized).toString('base64').length + 32, 0);
+  assert.ok(expected.every((normalized) => serialize(normalized).byteLength <= MAX_COMPRESSED_TRANSACTION_BYTES));
+  assert.ok(oldBytes > BLOCK_TRANSACTION_CACHE_DEFAULTS.maxEntryBytes);
+
+  const h = harness();
+  h.setFetch(async () => data);
+  assert.deepEqual(await h.locator.locate(target('logged-0')), expected[0]);
+  assert.equal(h.locator.stats.entries, 1);
+  assert.ok(h.locator.stats.bytes < BLOCK_TRANSACTION_CACHE_DEFAULTS.maxEntryBytes);
+  assert.deepEqual(await h.locator.locate(target('logged-1')), expected[1]);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.locator.metrics.hits, 1);
+  assert.equal(h.locator.metrics.oversizeBypasses, 0);
+
+  const snapshot = snapshotBlockTransactionData(data, 42n, 'CONFIRMED');
+  assert.ok(snapshot?.cacheable);
+  assert.equal(snapshot.bytes, 64 + snapshot.transactions.reduce((sum, tx) =>
+    sum + Buffer.byteLength(tx.signature, 'utf8') + (tx.payload?.length ?? 0) + 32, 0));
+  assert.equal(h.locator.stats.bytes, snapshot.bytes);
+  assert.deepEqual(snapshot.transactions.map(({ signature, payload }) => {
+    assert.ok(payload);
+    assert.match(payload, /^b1:d:/u);
+    return { signature, normalized: decodeBlockTransactionPayload(payload) };
+  }), expected.map((normalized) => ({ signature: normalized.signature, normalized })));
+});
+
+void test('tagged payload accounting admits exact entry/global budgets but bypasses one byte under', async () => {
+  const data = loggedBlock(2, 'repeated log '.repeat(2048));
+  const uncached = uncachedLocator(data);
+  const expected = await Promise.all(data.transactions.map(({ transaction }) =>
+    uncached.locate(target(transaction.signatures[0]))));
+  const bytes = 64 + expected.reduce((sum, normalized) => {
+    const encoded = encodeBlockTransactionPayload(serialize(normalized), MAX_BLOCK_COMPRESSION_INPUT_BYTES);
+    return sum + Buffer.byteLength(normalized.signature, 'utf8') + encoded.payload.length + 32;
+  }, 0);
+  for (const options of [
+    { maxEntryBytes: bytes }, { maxBytes: bytes },
+    { maxEntryBytes: bytes - 1 }, { maxBytes: bytes - 1 },
+  ]) {
+    const h = harness(options);
+    h.setFetch(async () => data);
+    assert.deepEqual(await h.locator.locate(target('logged-0')), expected[0]);
+    const retained = !Object.values(options).includes(bytes - 1);
+    assert.equal(h.locator.stats.entries, retained ? 1 : 0);
+    assert.equal(h.locator.stats.bytes, retained ? bytes : 0);
+    assert.deepEqual(await h.locator.locate(target('logged-1')), expected[1]);
+    assert.equal(h.calls.length, retained ? 1 : 2);
+    assert.equal(h.locator.metrics.oversizeBypasses, retained ? 0 : 2);
+  }
+});
+
+void test('genuine incompressible oversize blocks bypass retention while sharing one physical fetch', async () => {
+  const data = loggedBlock(10, incompressibleLog(MAX_COMPRESSED_TRANSACTION_BYTES - 1024));
+  const snapshot = snapshotBlockTransactionData(data, 42n, 'CONFIRMED');
+  assert.ok(snapshot?.cacheable);
+  assert.ok(snapshot.bytes > BLOCK_TRANSACTION_CACHE_DEFAULTS.maxEntryBytes);
+  const release = deferred<unknown>();
+  const h = harness();
+  h.setFetch(async () => release.promise);
+  const first = h.locator.locate(target('logged-0'));
+  const joined = h.locator.locate(target('logged-1'));
+  await flushMicrotasks();
+  assert.equal(h.calls.length, 1);
+  release.resolve(data);
+  const uncached = uncachedLocator(data);
+  assert.deepEqual(await first, await uncached.locate(target('logged-0')));
+  assert.deepEqual(await joined, await uncached.locate(target('logged-1')));
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.locator.stats.entries, 0);
+  assert.equal(h.locator.stats.bytes, 0);
+  assert.equal(h.locator.metrics.inFlightJoins, 1);
+  assert.equal(h.locator.metrics.oversizeBypasses, 1);
+  h.setFetch(async () => data);
+  await h.locator.locate(target('logged-2'));
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.locator.metrics.oversizeBypasses, 2);
+});
+
+void test('snapshot compression budget counts incompressible attempts and leaves later eligible transactions raw', async () => {
+  const data = loggedBlock(34, 'x'.repeat(MAX_COMPRESSED_TRANSACTION_BYTES - 1024));
+  const first = data.transactions[0];
+  assert.ok(first);
+  first.meta.logMessages = [incompressibleLog(MAX_COMPRESSED_TRANSACTION_BYTES - 1024)];
+  const uncached = uncachedLocator(data);
+  const snapshot = snapshotBlockTransactionData(data, 42n, 'CONFIRMED');
+  assert.ok(snapshot?.cacheable);
+  let remaining = MAX_BLOCK_COMPRESSION_INPUT_BYTES;
+  let totalOriginalBytes = 0;
+  let attemptedBytes = 0;
+  let skippedEligible = 0;
+  for (const [index, transaction] of snapshot.transactions.entries()) {
+    const normalized = await uncached.locate(target(transaction.signature));
+    const serialized = serialize(normalized);
+    assert.ok(serialized.byteLength <= MAX_COMPRESSED_TRANSACTION_BYTES);
+    totalOriginalBytes += serialized.byteLength;
+    const expected = encodeBlockTransactionPayload(serialized, remaining);
+    if (index === 0) {
+      assert.match(expected.payload, /^b1:r:/u);
+      assert.equal(expected.compressionInputBytes, serialized.byteLength);
+    }
+    assert.equal(transaction.payload === expected.payload, true, `transaction ${index} uses the bounded codec`);
+    assert.deepEqual(decodeBlockTransactionPayload(expected.payload), normalized);
+    if (expected.compressionInputBytes === 0) {
+      assert.ok(serialized.byteLength > remaining);
+      assert.match(expected.payload, /^b1:r:/u);
+      skippedEligible += 1;
+    }
+    remaining -= expected.compressionInputBytes;
+    attemptedBytes += expected.compressionInputBytes;
+  }
+  assert.ok(totalOriginalBytes > MAX_BLOCK_COMPRESSION_INPUT_BYTES);
+  assert.ok(attemptedBytes <= MAX_BLOCK_COMPRESSION_INPUT_BYTES);
+  assert.ok(skippedEligible > 0);
+  assert.equal(remaining, MAX_BLOCK_COMPRESSION_INPUT_BYTES - attemptedBytes);
+  assert.equal(snapshot.bytes, 64 + snapshot.transactions.reduce((sum, tx) =>
+    sum + Buffer.byteLength(tx.signature, 'utf8') + (tx.payload?.length ?? 0) + 32, 0));
+  const fresh = snapshotBlockTransactionData(loggedBlock(1, 'x'.repeat(4096)), 42n, 'CONFIRMED');
+  assert.match(fresh?.transactions[0]?.payload ?? '', /^b1:d:/u);
 });
 
 void test('a low-level RPC gate preserves same-slot single-flight even when the block is not retained', async () => {

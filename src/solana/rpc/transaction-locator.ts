@@ -7,6 +7,9 @@ import type {
   TransactionIngestionErrorCode,
 } from '../../domain/transaction-ingestion.js';
 import { normalizeTransaction } from './transaction-fetcher.js';
+import {
+  encodeBlockTransactionPayload, MAX_BLOCK_COMPRESSION_INPUT_BYTES,
+} from './block-transaction-payload-codec.js';
 import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 import type {
   LegacyConfirmationStatus,
@@ -351,6 +354,7 @@ export function snapshotBlockTransactionData(
     const seen = new Set<string>();
     let cacheable = true;
     let bytes = 64;
+    let remainingCompressionBytes = MAX_BLOCK_COMPRESSION_INPUT_BYTES;
     for (const [index, entry] of entries.entries()) {
       const entryRecord = ownRecord(entry);
       const transaction = ownData(entryRecord, 'transaction');
@@ -372,8 +376,10 @@ export function snapshotBlockTransactionData(
           ...(version === undefined ? {} : { version }),
         }, confirmationStatus, index);
         if (normalized.signature !== signature || normalized.slot !== slot) throw new TypeError();
-        // V8 preserves bigint and typed arrays, but the retained representation is just text.
-        payload = serialize(normalized).toString('base64');
+        // V8 preserves bigint and typed arrays; the bounded codec retains only text.
+        const encoded = encodeBlockTransactionPayload(serialize(normalized), remainingCompressionBytes);
+        remainingCompressionBytes -= encoded.compressionInputBytes;
+        payload = encoded.payload;
       } catch {
         cacheable = false;
       }
