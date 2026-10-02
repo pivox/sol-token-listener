@@ -10,6 +10,7 @@ import { PumpFunStrictCatchUpPageAdmitter } from '../src/application/pumpfun-str
 import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { createPumpDecodingError, PUMP_DECODING_ERROR_CODES } from '../src/launchpads/pumpfun/errors.js';
 import { createPumpSwapDecodingError, PUMPSWAP_DECODING_ERROR_CODES } from '../src/markets/pumpswap/errors.js';
 import { failurePipeline, failureTransaction, realPumpPipeline, malformedPumpTransaction } from './observed-pipeline-failure-fixtures.js';
@@ -3043,6 +3044,31 @@ void test('persists detached decoder quarantine heartbeat metrics and supports l
   assert.ok(omitted);
   await repository.writeHeartbeat(Object.freeze({ ...legacy, updatedAtMs: 3_000 }));
   assert.deepEqual(captured[1]?.[14], { startedAt: '1970-01-01T00:00:01.000Z' });
+});
+
+void test('persists detached scanner phase evidence without changing legacy heartbeat JSON', async () => {
+  const captured: unknown[][] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      captured.push(values === undefined ? [] : [...values]);
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const diagnostics = new ScannerPhaseDiagnosticsCollector();
+  diagnostics.recordPhase({
+    provider: 'fallback-1', program: 'pumpfun', phase: 'BLOCK_HYDRATE',
+    durationMs: 7, outcome: 'ERROR', code: 'LOCATOR_RETRYABLE',
+  });
+  const owned = diagnostics.snapshot(2_000);
+  await repository.writeHeartbeat(Object.freeze({
+    ...rpcEvidenceHeartbeat(), scannerPhaseDiagnostics: owned,
+  }));
+  const payload = captured[0]?.[14] as { readonly scannerPhaseDiagnostics?: unknown };
+  assert.deepEqual(payload.scannerPhaseDiagnostics, owned);
+  assert.notEqual(payload.scannerPhaseDiagnostics, owned);
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), updatedAtMs: 3_000 }));
+  assert.equal(Object.hasOwn(captured[1]?.[14] as object, 'scannerPhaseDiagnostics'), false);
 });
 
 function hydrationAdmissionHeartbeatMetrics() {

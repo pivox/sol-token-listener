@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import { snapshotRuntimeBlockHydrationAdmissionMetrics } from '../domain/block-hydration-admission.js';
+import { snapshotScannerPhaseDiagnostics } from '../domain/scanner-phase-diagnostics.js';
 import type { QueryResultRow } from 'pg';
 import { createRuntimeRpcHttpEvidence } from '../domain/rpc-http-evidence.js';
 import {
@@ -2846,6 +2847,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : snapshotRuntimeWorkerAdmissionClock(value.workerAdmissionClock);
       const decoderQuarantine = value.decoderQuarantine === undefined ? undefined
         : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
+      const scannerPhaseDiagnostics = value.scannerPhaseDiagnostics === undefined ? undefined
+        : snapshotScannerPhaseDiagnostics(value.scannerPhaseDiagnostics);
       const blockHydrationAdmission = value.blockHydrationAdmission === undefined ? undefined
         : snapshotRuntimeBlockHydrationAdmissionMetrics(value.blockHydrationAdmission);
       const result = await this.pool.query(
@@ -2901,6 +2904,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
             ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
             ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
+            ...(scannerPhaseDiagnostics === undefined ? {} : { scannerPhaseDiagnostics }),
           }),
           value.exhaustedCount,
         ],
