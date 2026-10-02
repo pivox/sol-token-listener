@@ -18,6 +18,43 @@ interface Metrics {
 }
 const metrics = (admission: HydrationGroupAdmission): Metrics => admission.metrics() as Metrics;
 
+void test('known-group worker joins retain worker accounting and group ownership', async () => {
+  const admission = new HydrationGroupAdmission({ now: () => 0 });
+  const worker = admission.registerWorker();
+  const first = required(await admission.acquireClassifier('same', signal()));
+  try {
+    assert.equal(typeof worker.acquireGroup, 'function');
+    const joined = required(await settled(worker.acquireGroup('same', signal())));
+    assert.equal(metrics(admission).worker.grants, 1);
+    assert.equal(metrics(admission).classifier.grants, 1);
+    assert.equal(metrics(admission).unboundReservations, 0);
+    first.release();
+    assert.equal(metrics(admission).activeGroups, 1);
+    joined.release();
+    assert.equal(metrics(admission).activeGroups, 0);
+  } finally { first.release(); admission.close(); }
+});
+
+void test('queued known-group worker and classifier join on the same dispatch', async () => {
+  const admission = new HydrationGroupAdmission({ now: () => 0 });
+  const worker = admission.registerWorker();
+  const first = required(await admission.acquireClassifier('first', signal()));
+  try {
+    assert.equal(typeof worker.acquireGroup, 'function');
+    const pendingWorker = worker.acquireGroup('next', signal());
+    const pendingClassifier = admission.acquireClassifier('next', signal());
+    assert.equal(metrics(admission).pendingWorkers, 1);
+    first.release();
+    const nextWorker = required(await settled(pendingWorker));
+    const nextClassifier = required(await settled(pendingClassifier));
+    assert.equal(metrics(admission).maximumAdmitted, 1);
+    assert.equal(metrics(admission).unboundReservations, 0);
+    nextWorker.release();
+    assert.equal(metrics(admission).activeGroups, 1);
+    nextClassifier.release();
+  } finally { first.release(); admission.close(); }
+});
+
 const signal = (): AbortSignal => new AbortController().signal;
 const flush = async (): Promise<void> => { await Promise.resolve(); await Promise.resolve(); };
 const required = (permit: HydrationAdmissionPermit | null): HydrationAdmissionPermit => {

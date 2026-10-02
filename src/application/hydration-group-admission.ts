@@ -5,6 +5,7 @@ export interface HydrationAdmissionPermit {
 
 export interface HydrationWorkerAdmissionHandle {
   acquire(signal: AbortSignal): Promise<HydrationAdmissionPermit | null>;
+  acquireGroup(key: string, signal: AbortSignal): Promise<HydrationAdmissionPermit | null>;
   close(): void;
 }
 
@@ -119,6 +120,15 @@ export class HydrationGroupAdmission {
         }
         return this.#request('worker', null, worker, signal, now);
       },
+      acquireGroup: async (key: string, signal: AbortSignal) => {
+        const now = this.#readClock();
+        if (this.#closed || !worker.open) return null;
+        this.#validateKey(key);
+        if (worker.outstanding !== null) {
+          throw new HydrationGroupAdmissionContractError('worker_already_outstanding');
+        }
+        return this.#request('worker', key, worker, signal, now);
+      },
       close: () => { this.#closeWorker(worker); },
     });
   }
@@ -193,7 +203,7 @@ export class HydrationGroupAdmission {
       this.#queue(role).push(waiter);
       signal.addEventListener('abort', waiter.onAbort, { once: true });
       if (signal.aborted) this.#cancel(waiter, now);
-      else if (role === 'classifier' && this.#group?.key === key) this.#grant(waiter, now);
+      else if (key !== null && this.#group?.key === key) this.#grant(waiter, now);
       else this.#dispatch(now);
       this.#maximumPendingWorkers = Math.max(this.#maximumPendingWorkers, this.#workerWaiters.length);
       this.#maximumPendingClassifierGroups = Math.max(
@@ -206,6 +216,9 @@ export class HydrationGroupAdmission {
     if (this.#closed || this.#unbound) return;
     if (this.#group) {
       // Same-group consumers are references, not another admission or a fairness turn.
+      for (const waiter of [...this.#workerWaiters]) {
+        if (waiter.key === this.#group.key) this.#grant(waiter, now);
+      }
       if (this.#classifierWaiters[0]?.key === this.#group.key) {
         for (const waiter of [...this.#classifierWaiters]) this.#grant(waiter, now);
       }
@@ -219,6 +232,7 @@ export class HydrationGroupAdmission {
     if (contested) this.#nextContestedRole = role === 'worker' ? 'classifier' : 'worker';
     if (role === 'worker' && worker) this.#grant(worker, now);
     else for (const waiter of [...this.#classifierWaiters]) this.#grant(waiter, now);
+    if (this.#group) this.#dispatch(now);
   }
 
   #grant(waiter: Waiter, now: number): void {
@@ -226,7 +240,7 @@ export class HydrationGroupAdmission {
     this.#record(waiter.role, 'grants', elapsed);
     this.#removeWaiter(waiter);
     const ticket: Ticket = {
-      state: waiter.role === 'worker' ? 'unbound' : 'bound', worker: waiter.worker,
+      state: waiter.key === null ? 'unbound' : 'bound', worker: waiter.worker,
     };
     if (waiter.worker) waiter.worker.outstanding = ticket;
     if (ticket.state === 'unbound') this.#unbound = ticket;
