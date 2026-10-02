@@ -1,4 +1,4 @@
-# Bounded shared hydration admission — v1.0.1
+# Bounded shared hydration admission — v1.0.2
 
 ## Goal and evidence
 
@@ -53,6 +53,12 @@ visible and is not dropped, classified as terminal or moved into a new database.
 Worker handles are registered once per configured worker, so pending reservation
 requests are bounded by that existing worker count. No unbounded generic waiter
 queue is introduced. No change to worker count, RPC pacing or cache byte limits.
+Direct legacy worker-locator callers already know their target: their handle may
+acquire a bound group explicitly, preserving same-key joins and worker-role
+accounting. They must not impersonate classifier requests. Same-group joins do
+not consume a fairness turn and may bypass requests waiting for a different group;
+new-group worker admissions remain FIFO. Production pre-claim uses only unbound
+reservations because the target is not known yet.
 
 ## Worker contract and lifecycle
 

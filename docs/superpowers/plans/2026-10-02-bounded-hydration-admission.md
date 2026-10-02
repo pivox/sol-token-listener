@@ -8,7 +8,7 @@
 
 **Tech Stack:** Strict TypeScript ESM, node:test, existing PostgreSQL repositories unchanged.
 
-Specification: `docs/superpowers/specs/2026-10-02-bounded-hydration-admission-design.md`, v1.0.1 (initial design `a00e696`, route-order clarification before integration).
+Specification: `docs/superpowers/specs/2026-10-02-bounded-hydration-admission-design.md`, v1.0.2 (initial design `a00e696`, route-order and known-target worker clarification before integration).
 Baseline `c9aadef`: hydration/cache/classifier 96 PASS, zero skips. No implementation exists yet.
 
 ## Task 1 — Controller contract and deterministic state tests
@@ -27,6 +27,7 @@ export interface HydrationAdmissionPermit {
 }
 export interface HydrationWorkerAdmissionHandle {
   acquire(signal: AbortSignal): Promise<HydrationAdmissionPermit | null>;
+  acquireGroup(key: string, signal: AbortSignal): Promise<HydrationAdmissionPermit | null>;
   close(): void;
 }
 export interface HydrationGroupAdmissionOptions {
@@ -115,6 +116,10 @@ The controller remains separate from provider route permits.
 - [ ] Preserve the old `workerLocator` for legacy/direct callers, but route all
   coordinator cache entries through the same controller budget. The ticket path
   must not reacquire its own budget. Map the bound group with an unambiguous key:
+
+  Direct worker-locator calls use `handle.acquireGroup(key, signal)` (worker role),
+  never `acquireClassifier`. Cover same-key joins, distinct-key waiting and role
+  metrics. Production pre-claim still uses `handle.acquire(signal)` unbound.
 
   Acquire the route permit before the group slot to avoid holding capacity while
   an incompatible scan needs it to finish. A shared worker accepted by a scan
