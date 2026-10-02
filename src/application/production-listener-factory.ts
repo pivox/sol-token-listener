@@ -1183,7 +1183,6 @@ export class PersistentListenerHeartbeat {
   public async start(): Promise<void> {
     if (this.hasClosed()) return;
     this.currentState = 'RUNNING';
-    this.ensureStartedAtMs();
     await this.firstProcessingCanaryCohortStartedAtMs();
     if (this.hasClosed()) return;
     const initialWrite = this.write('RUNNING');
@@ -1268,7 +1267,6 @@ export class PersistentListenerHeartbeat {
   }
 
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
-    this.ensureStartedAtMs();
     const cohortStartedAtMs = await this.firstProcessingCanaryCohortStartedAtMs();
     let inboxSnapshot: Awaited<ReturnType<NonNullable<ListenerHeartbeatOptions['inboxSnapshot']>>> | undefined;
     if (this.inboxSnapshot !== undefined) {
@@ -1377,6 +1375,9 @@ export class PersistentListenerHeartbeat {
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
       ...(workerAdmission === undefined ? {} : { workerAdmission }),
     });
+    if (value.updatedAtMs < value.startedAtMs) {
+      throw new TypeError('Runtime heartbeat updatedAtMs precedes startedAtMs.');
+    }
     if (this.catchUpAdmissionMetrics !== null) {
       try { assertValidRuntimeHeartbeat(value); } catch {
         throw new TypeError('Catch-up admission metrics are invalid.');
@@ -1385,15 +1386,12 @@ export class PersistentListenerHeartbeat {
     await this.inbox.writeHeartbeat(value);
   }
 
-  private ensureStartedAtMs(): void {
-    if (this.startedAtMs === 0) this.startedAtMs = Date.now();
-  }
-
   private firstProcessingCanaryCohortStartedAtMs(): Promise<number> {
     return this.firstProcessingCanaryCohort ??= this.inbox.beginFirstProcessingCanary().then((value) => {
-      if (!Number.isSafeInteger(value) || value <= 0) {
+      if (!Number.isSafeInteger(value) || value <= 0 || !Number.isFinite(new Date(value).getTime())) {
         throw new TypeError('First processing canary cohort start is invalid.');
       }
+      this.startedAtMs = value;
       return value;
     });
   }

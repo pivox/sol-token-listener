@@ -35,7 +35,7 @@ import type {
   FinalityProviderPass,
   FinalityProviderPassSource,
 } from '../src/ports/finality-provider-pass.js';
-import { createCatchUpGap } from '../src/domain/transaction-ingestion.js';
+import { assertValidRuntimeHeartbeat, createCatchUpGap } from '../src/domain/transaction-ingestion.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
   BondingCurveReadUnavailableError,
@@ -213,6 +213,7 @@ void test('heartbeat begins one durable first processing cohort and snapshots fr
   assert.equal(begins, 1);
   assert.equal(aggregateCalls, 3);
   assert.deepEqual(writes.map(({ runtimeState }) => runtimeState), ['RUNNING', 'RUNNING', 'STOPPED']);
+  assert.ok(writes.every((write) => write.startedAtMs === 1_000));
   assert.ok(writes.every((write) => write.firstProcessingCanary?.cohortStartedAtMs === 1_000));
   assert.ok(writes.every((write) => Object.isFrozen(write.firstProcessingCanary)));
   assert.notEqual(writes[0]?.firstProcessingCanary, writes[1]?.firstProcessingCanary);
@@ -241,12 +242,133 @@ function heartbeatCanaryMethods() {
   });
 }
 
-void test('heartbeat fails closed for canary initialization or aggregation and initializes safely on stop before start', async () => {
-  for (const failure of ['begin', 'aggregate'] as const) {
+void test('heartbeat uses the database startup anchor without changing local observation times', async (context) => {
+  context.mock.method(Date, 'now', () => 1_001);
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = new PersistentListenerHeartbeat({
+    counts: heartbeatCounts,
+    async beginFirstProcessingCanary() { return 1_000; },
+    async firstProcessingCanary() {
+      return createFirstProcessingCanaryEvidence({ ...firstProcessingCanaryEvidence(), sampledAtMs: 1_001 });
+    },
+    async writeHeartbeat(value) {
+      assertValidRuntimeHeartbeat(value);
+      writes.push(value);
+    },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+  });
+
+  await heartbeat.start();
+  await heartbeat.stop();
+
+  assert.deepEqual(writes.map(({ runtimeState, startedAtMs, updatedAtMs, firstProcessingCanary }) =>
+    [runtimeState, startedAtMs, updatedAtMs, firstProcessingCanary?.cohortStartedAtMs,
+      firstProcessingCanary?.sampledAtMs]), [
+    ['RUNNING', 1_000, 1_001, 1_000, 1_001],
+    ['STOPPED', 1_000, 1_001, 1_000, 1_001],
+  ]);
+});
+
+void test('heartbeat rejects future database startup anchors before RUNNING or STOPPED publication', async (context) => {
+  context.mock.method(Date, 'now', () => 1_001);
+  for (const stopBeforeStart of [false, true]) {
+    const writes: RuntimeHeartbeat[] = [];
+    const heartbeat = new PersistentListenerHeartbeat({
+      counts: heartbeatCounts,
+      async beginFirstProcessingCanary() { return 1_002; },
+      async firstProcessingCanary() {
+        return createFirstProcessingCanaryEvidence({ ...firstProcessingCanaryEvidence(),
+          cohortStartedAtMs: 1_002, cohortEndsAtMs: 901_002, sampledAtMs: 1_002 });
+      },
+      async writeHeartbeat(value) { writes.push(value); },
+    }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+      intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    });
+
+    if (stopBeforeStart) {
+      await assert.rejects(heartbeat.stop(), (error: unknown) => error instanceof ListenerControllerCloseError
+        && error.reason === 'dependency');
+    } else {
+      await assert.rejects(heartbeat.start(), { name: 'TypeError',
+        message: 'Runtime heartbeat updatedAtMs precedes startedAtMs.' });
+      await assert.rejects(heartbeat.stop(), ListenerControllerCloseError);
+    }
+    assert.deepEqual(writes, []);
+  }
+});
+
+void test('heartbeat caches invalid database startup rejection without aggregating or publishing', async () => {
+  for (const anchor of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 8_640_000_000_000_001]) {
+    let begins = 0;
+    let aggregates = 0;
     let writes = 0;
     const heartbeat = new PersistentListenerHeartbeat({
       counts: heartbeatCounts,
+      async beginFirstProcessingCanary() { begins += 1; return anchor; },
+      async firstProcessingCanary() { aggregates += 1; return firstProcessingCanaryEvidence(); },
+      async writeHeartbeat() { writes += 1; },
+    }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+      intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    });
+    await assert.rejects(heartbeat.start(), { name: 'TypeError',
+      message: 'First processing canary cohort start is invalid.' });
+    await assert.rejects(heartbeat.start(), TypeError);
+    const stopping = heartbeat.stop();
+    assert.equal(heartbeat.stop(), stopping);
+    await assert.rejects(stopping, ListenerControllerCloseError);
+    assert.equal(begins, 1);
+    assert.equal(aggregates, 0);
+    assert.equal(writes, 0);
+  }
+});
+
+void test('heartbeat stop racing unresolved cohort initialization shares one anchor and publishes only STOPPED', async () => {
+  const pendingAnchor = deferred<number>();
+  const scheduler = new ManualScheduler();
+  const writes: RuntimeHeartbeat[] = [];
+  let begins = 0;
+  const heartbeat = new PersistentListenerHeartbeat({
+    counts: heartbeatCounts,
+    async beginFirstProcessingCanary() { begins += 1; return pendingAnchor.promise; },
+    async firstProcessingCanary(anchor) {
+      assert.equal(anchor, 1_000);
+      return firstProcessingCanaryEvidence();
+    },
+    async writeHeartbeat(value) { writes.push(value); },
+  }, {
+    async getSlot() { assert.fail('Closed startup must not read RPC.'); },
+    async getFinalizedSlot() { assert.fail('Closed startup must not read RPC.'); },
+  }, () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler,
+  });
+
+  const starting = heartbeat.start();
+  const stopping = heartbeat.stop();
+  assert.equal(heartbeat.stop(), stopping);
+  assert.equal(begins, 1);
+  assert.deepEqual(writes, []);
+  pendingAnchor.resolve(1_000);
+  await Promise.all([starting, stopping]);
+  await heartbeat.start();
+
+  assert.equal(begins, 1);
+  assert.deepEqual(writes.map(({ runtimeState, startedAtMs }) => [runtimeState, startedAtMs]),
+    [['STOPPED', 1_000]]);
+  assert.equal(heartbeat.state(), 'STOPPED');
+});
+
+void test('heartbeat fails closed for canary initialization or aggregation and initializes safely on stop before start', async () => {
+  for (const failure of ['begin', 'aggregate'] as const) {
+    let writes = 0;
+    let begins = 0;
+    const heartbeat = new PersistentListenerHeartbeat({
+      counts: heartbeatCounts,
       async beginFirstProcessingCanary() {
+        begins += 1;
         if (failure === 'begin') throw new Error('private canary initialization failure');
         return 1_000;
       },
@@ -260,6 +382,9 @@ void test('heartbeat fails closed for canary initialization or aggregation and i
       intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
     });
     await assert.rejects(heartbeat.start());
+    await assert.rejects(heartbeat.start());
+    await assert.rejects(heartbeat.stop(), ListenerControllerCloseError);
+    assert.equal(begins, 1);
     assert.equal(writes, 0);
   }
 
@@ -283,7 +408,7 @@ void test('heartbeat fails closed for canary initialization or aggregation and i
   assert.equal(aggregates, 1);
   assert.equal(rpcReads, 0);
   assert.equal(writes[0]?.runtimeState, 'STOPPED');
-  assert.ok((writes[0]?.startedAtMs ?? 0) > 0);
+  assert.equal(writes[0]?.startedAtMs, 1_000);
 });
 
 void test('heartbeat stop fences the initial RUNNING write before its final STOPPED write', async () => {
