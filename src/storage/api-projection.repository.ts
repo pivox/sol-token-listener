@@ -12,6 +12,7 @@ import {
   type ApiFirstProcessingCanaryEvidenceV1,
   type ApiRpcHttpEvidenceV1,
   type ApiWorkerAdmissionMetricsV1,
+  type ApiWorkerAdmissionClockV1,
   type ApiWebSocketHealth,
   type ApiHolders,
   type ApiHolderSnapshot,
@@ -53,7 +54,7 @@ import {
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
 import { createFirstProcessingCanaryEvidence } from '../domain/first-processing-canary.js';
-import { snapshotRuntimeWorkerAdmissionMetrics } from '../domain/worker-admission-metrics.js';
+import { snapshotRuntimeWorkerAdmissionMetrics, snapshotRuntimeWorkerAdmissionClock } from '../domain/worker-admission-metrics.js';
 import {
   SOCIAL_COLLECTION_STATUSES,
   SOCIAL_EVIDENCE_OUTCOMES,
@@ -2114,6 +2115,7 @@ function emptyHeartbeat(
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
     websocket, blockHydration: null, blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
+    workerAdmissionClock: null,
     rpcHttpEvidence: null,
     firstProcessingCanary: null, decoderQuarantine: null });
 }
@@ -2192,6 +2194,8 @@ function heartbeatFromRow(
   const startedAt = nullableTimestamp(row.started_at);
   const updatedAt = timestamp(row.heartbeat_updated_at).toISOString();
   if (startedAt !== null && Date.parse(startedAt) > Date.parse(updatedAt)) throw invalid();
+  const workerAdmission = workerAdmissionFromPayload(row.heartbeat_payload);
+  const workerAdmissionClock = workerAdmissionClockFromPayload(row.heartbeat_payload, workerAdmission, Date.parse(updatedAt));
   return freeze({
     runtimeState, subscriberState, scannerState, workerState, reconcilerState,
     backlogCount, leasedCount, exhaustedCount, startedAt, updatedAt,
@@ -2202,7 +2206,8 @@ function heartbeatFromRow(
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
     blockHydrationAdmission: blockHydrationAdmissionFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
-    workerAdmission: workerAdmissionFromPayload(row.heartbeat_payload),
+    workerAdmission,
+    workerAdmissionClock,
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
     firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
     decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
@@ -2233,6 +2238,26 @@ function workerAdmissionFromPayload(value: unknown): ApiWorkerAdmissionMetricsV1
       'freshMintCount', 'extendedMintCount', 'demotedCount',
     ], 'Worker admission metrics');
     return snapshotRuntimeWorkerAdmissionMetrics(freeze(metrics));
+  } catch {
+    throw invalid();
+  }
+}
+
+function workerAdmissionClockFromPayload(
+  value: unknown,
+  workerAdmission: ApiWorkerAdmissionMetricsV1 | null,
+  updatedAtMs: number,
+): ApiWorkerAdmissionClockV1 | null {
+  if (value === null || value === undefined) return null;
+  try {
+    if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'workerAdmissionClock');
+    if (descriptor === undefined) return null;
+    if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+    const fields = exactDataRecord(descriptor.value, ['version', 'sampledAtMs'], 'Worker admission clock');
+    const clock = snapshotRuntimeWorkerAdmissionClock(freeze(fields));
+    if (workerAdmission === null || clock.sampledAtMs > updatedAtMs) throw invalid();
+    return clock;
   } catch {
     throw invalid();
   }

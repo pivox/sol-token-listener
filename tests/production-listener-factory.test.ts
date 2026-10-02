@@ -50,6 +50,7 @@ import {
   lifecycleComponent,
   type RecurringFinalityOptions,
   type ListenerRuntimeScheduler,
+  type ListenerHeartbeatOptions,
 } from '../src/application/production-listener-factory.js';
 import { CachedSolanaBlockTransactionLocator } from '../src/solana/rpc/block-transaction-cache.js';
 import { SolanaTransactionLocator } from '../src/solana/rpc/transaction-locator.js';
@@ -61,6 +62,87 @@ import { PostgresTransactionInboxRepository } from '../src/storage/transaction-i
 import type { PumpFunWorkerAdmissionPolicyV1 } from '../src/domain/worker-admission.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+void test('paired inbox provider propagates its detached frozen clock for RUNNING and STOPPED', async () => {
+  const source = Object.freeze({ version: 1 as const, sampledAtMs: 1_000 });
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = clockHeartbeat(async () => ({
+    counts: await clockInboxCounts(), workerAdmission: workerAdmissionMetricsFixture(),
+    workerAdmissionClock: source,
+  }), writes);
+  await heartbeat.start();
+  await heartbeat.stop();
+  assert.deepEqual(writes.map((value) => value.workerAdmissionClock), [source, source]);
+  for (const value of writes) {
+    assert.notEqual(value.workerAdmissionClock, source);
+    assert.ok(Object.isFrozen(value.workerAdmissionClock));
+  }
+});
+
+void test('legacy paired providers omit clock evidence without fabricating an observation clock', async () => {
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = clockHeartbeat(async () => ({
+    counts: await clockInboxCounts(), workerAdmission: workerAdmissionMetricsFixture(),
+  }), writes);
+  await heartbeat.start();
+  await heartbeat.stop();
+  assert.ok(writes.every((value) => !Object.hasOwn(value, 'workerAdmissionClock')));
+});
+
+void test('paired inbox provider rejects malformed, undefined and future clocks before publication', async () => {
+  for (const candidate of [undefined, null, { version: 1, sampledAtMs: 1_000 },
+    Object.freeze({ version: 2, sampledAtMs: 1_000 }),
+    Object.freeze({ version: 1, sampledAtMs: 0 }),
+    Object.freeze({ version: 1, sampledAtMs: Date.now() + 60_000 })]) {
+    const writes: RuntimeHeartbeat[] = [];
+    const heartbeat = clockHeartbeat(async () => ({
+      counts: await clockInboxCounts(), workerAdmission: workerAdmissionMetricsFixture(),
+      workerAdmissionClock: candidate,
+    }), writes);
+    await assert.rejects(heartbeat.start(), TypeError);
+    assert.equal(writes.length, 0);
+  }
+});
+
+void test('paired inbox clock extraction never invokes getters or proxy traps', async () => {
+  let calls = 0;
+  const source = { counts: await clockInboxCounts(), workerAdmission: workerAdmissionMetricsFixture() };
+  const accessor = Object.defineProperty({ ...source }, 'workerAdmissionClock', {
+    enumerable: true, get() { calls += 1; throw new Error('private-clock-secret'); },
+  });
+  const clockAccessor = Object.freeze(Object.defineProperty({ version: 1 }, 'sampledAtMs', {
+    enumerable: true, get() { calls += 1; throw new Error('private-clock-secret'); },
+  }));
+  const proxy = new Proxy(Object.freeze({ version: 1, sampledAtMs: 1_000 }), {
+    ownKeys() { calls += 1; throw new Error('private-clock-secret'); },
+  });
+  const wrapperProxy = new Proxy({ ...source }, {
+    getOwnPropertyDescriptor() { calls += 1; throw new Error('private-clock-secret'); },
+    ownKeys() { calls += 1; throw new Error('private-clock-secret'); },
+  });
+  for (const snapshot of [accessor, wrapperProxy,
+    { ...source, workerAdmissionClock: clockAccessor }, { ...source, workerAdmissionClock: proxy }]) {
+    const writes: RuntimeHeartbeat[] = [];
+    await assert.rejects(clockHeartbeat(async () => snapshot, writes).start(), TypeError);
+    assert.equal(writes.length, 0);
+  }
+  assert.equal(calls, 0);
+});
+
+function clockHeartbeat(snapshot: () => Promise<unknown>, writes: RuntimeHeartbeat[]) {
+  return new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(), counts: heartbeatCounts,
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    inboxSnapshot: snapshot as NonNullable<ListenerHeartbeatOptions['inboxSnapshot']>,
+  });
+}
+
+async function clockInboxCounts() {
+  return Object.freeze({ ...await heartbeatCounts(), pending: 10, catchUpAdmission: admissionCounts(10) });
+}
 
 void test('heartbeat keeps inbox counts and admission in one snapshot across concurrent arrivals', async () => {
   let pending = 1;
@@ -145,6 +227,7 @@ void test('heartbeat snapshots optional worker admission for RUNNING and STOPPED
   for (const write of writes) {
     assert.notEqual(write.workerAdmission, metrics);
     assert.ok(Object.isFrozen(write.workerAdmission));
+    assert.equal(Object.hasOwn(write, 'workerAdmissionClock'), false);
   }
 
   let invalidWrites = 0;

@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
 import { createPumpFunWorkerAdmissionPolicy } from '../domain/worker-admission.js';
 import {
@@ -23,7 +24,9 @@ import {
 } from '../domain/first-processing-canary.js';
 import {
   snapshotRuntimeWorkerAdmissionMetrics,
+  snapshotRuntimeWorkerAdmissionClock,
   type RuntimeWorkerAdmissionMetricsV1,
+  type RuntimeWorkerAdmissionClockV1,
 } from '../domain/worker-admission-metrics.js';
 import {
   assertValidInboxCounts,
@@ -744,6 +747,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly inboxSnapshot?: () => Promise<Readonly<{
     counts: InboxCounts;
     workerAdmission: RuntimeWorkerAdmissionMetricsV1;
+    workerAdmissionClock?: RuntimeWorkerAdmissionClockV1;
   }>>;
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
   readonly blockHydrationAdmissionMetrics?: () => RuntimeBlockHydrationAdmissionMetricsV1;
@@ -1272,6 +1276,13 @@ export class PersistentListenerHeartbeat {
     if (this.inboxSnapshot !== undefined) {
       try {
         const snapshot = await this.inboxSnapshot();
+        if (isProxy(snapshot)) throw new TypeError();
+        const clockDescriptor = Object.getOwnPropertyDescriptor(snapshot, 'workerAdmissionClock');
+        if (clockDescriptor !== undefined && (!clockDescriptor.enumerable || !('value' in clockDescriptor))) {
+          throw new TypeError();
+        }
+        const workerAdmissionClock = clockDescriptor === undefined ? undefined
+          : snapshotRuntimeWorkerAdmissionClock(clockDescriptor.value);
         assertValidInboxCounts(snapshot.counts);
         const workerAdmission = snapshotRuntimeWorkerAdmissionMetrics(snapshot.workerAdmission);
         const backlog = safeInboxBacklog(snapshot.counts.pending, snapshot.counts.processing,
@@ -1280,7 +1291,8 @@ export class PersistentListenerHeartbeat {
           || workerAdmission.claimableBacklogCount > backlog - workerAdmission.classificationPendingCount) {
           throw new TypeError();
         }
-        inboxSnapshot = Object.freeze({ counts: snapshot.counts, workerAdmission });
+        inboxSnapshot = Object.freeze({ counts: snapshot.counts, workerAdmission,
+          ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }) });
       } catch {
         throw new TypeError('Inbox snapshot is invalid or unavailable.');
       }
@@ -1349,6 +1361,7 @@ export class PersistentListenerHeartbeat {
         throw new TypeError('Worker admission metrics are invalid.');
       }
     }
+    const workerAdmissionClock = inboxSnapshot?.workerAdmissionClock;
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
       subscriberState: runtimeState === 'STOPPED' ? 'STOPPED' : this.subscriberState(),
@@ -1374,9 +1387,14 @@ export class PersistentListenerHeartbeat {
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
       ...(workerAdmission === undefined ? {} : { workerAdmission }),
+      ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
     });
     if (value.updatedAtMs < value.startedAtMs) {
       throw new TypeError('Runtime heartbeat updatedAtMs precedes startedAtMs.');
+    }
+    if (workerAdmissionClock !== undefined
+      && (workerAdmission === undefined || workerAdmissionClock.sampledAtMs > value.updatedAtMs)) {
+      throw new TypeError('Inbox snapshot is invalid or unavailable.');
     }
     if (this.catchUpAdmissionMetrics !== null) {
       try { assertValidRuntimeHeartbeat(value); } catch {
