@@ -38,6 +38,13 @@ export interface DecodedPumpInstruction {
   readonly instruction: NormalizedInstruction;
   readonly accounts: Readonly<Record<string, string>>;
   readonly args: Readonly<Record<string, PumpIdlValue>>;
+  readonly wireEvidence?: {
+    readonly profile: PumpObservedWireProfile;
+    readonly pairedEventCursor: Readonly<Pick<
+      NormalizedInstruction,
+      'instructionIndex' | 'innerInstructionIndex' | 'stackHeight'
+    >>;
+  };
 }
 
 export type PumpObservedWireProfile =

@@ -34,6 +34,22 @@ void test('observe la création opaque finalisée et son achat initial multi-quo
   assert.equal(decoded.creations[0]?.quoteAsset.tokenProgram, 'TOKEN_2022');
   assert.equal(decoded.creations[0]?.quoteAsset.decimals, 6);
   assert.equal(decoded.creations[0]?.action.instruction, instruction);
+  const creation = decoded.creations[0];
+  assert.ok(creation);
+  assert.deepEqual(creation.action.wireEvidence, {
+    profile: 'CREATE_V2_OPAQUE_0001_V1',
+    pairedEventCursor: {
+      instructionIndex: creation.eventCpi.instruction.instructionIndex,
+      innerInstructionIndex: creation.eventCpi.instruction.innerInstructionIndex,
+      stackHeight: creation.eventCpi.instruction.stackHeight,
+    },
+  });
+  assert.deepEqual(Object.keys(creation.action.args), [
+    'name', 'symbol', 'uri', 'creator', 'is_mayhem_mode',
+  ]);
+  assert.equal(creation.creatorFeeBps, 0n);
+  assert.equal(creation.event.isCashbackEnabled, false);
+  assert.equal(decoded.trades[0]?.action.wireEvidence, undefined);
 });
 
 void test('observe la vente opaque finalisée avec événement appairé', async () => {
@@ -58,6 +74,20 @@ void test('observe la vente opaque finalisée avec événement appairé', async 
   assert.equal(decoded.trades[0]?.event.isBuy, false);
   assert.equal(decoded.trades[0]?.event.tokenAmount, 25_659_383_952_290n);
   assert.equal(decoded.trades[0]?.action.instruction, instruction);
+  const trade = decoded.trades[0];
+  assert.ok(trade);
+  assert.deepEqual(trade.action.wireEvidence, {
+    profile: 'SELL_OPAQUE_0100_V1',
+    pairedEventCursor: {
+      instructionIndex: trade.eventCpi.instruction.instructionIndex,
+      innerInstructionIndex: trade.eventCpi.instruction.innerInstructionIndex,
+      stackHeight: trade.eventCpi.instruction.stackHeight,
+    },
+  });
+  assert.deepEqual(Object.keys(trade.action.args), ['amount', 'min_sol_output']);
+  assert.equal(trade.event.tokenAmount, trade.action.args.amount);
+  assert.equal(trade.event.trackVolume, false);
+  assert.equal(trade.event.ixName, 'sell');
 });
 
 void test('décode hors ligne la création mainnet et son achat initial', async () => {

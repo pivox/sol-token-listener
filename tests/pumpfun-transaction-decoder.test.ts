@@ -5,6 +5,7 @@ import {
   PUMP_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ADDRESS,
+  WSOL_MINT,
 } from '../src/launchpads/pumpfun/constants.js';
 import { PumpDecodingError } from '../src/launchpads/pumpfun/errors.js';
 import { PUMP_INSTRUCTIONS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
@@ -32,6 +33,11 @@ const HOLDER_REWARDS_CREATOR = PublicKey.findProgramAddressSync(
 const USER = address(3);
 const QUOTE_MINT = address(4);
 const OTHER = address(10);
+const EVENT_AUTHORITY = PublicKey.findProgramAddressSync(
+  [Buffer.from('__event_authority')],
+  new PublicKey(PUMP_PROGRAM_ID),
+)[0].toBase58();
+const OPAQUE_SELL_AMOUNT = 9_007_199_254_740_993n;
 const CREATE_ARGS = {
   name: 'Éclair',
   symbol: 'ECL',
@@ -333,6 +339,215 @@ void test('refuse un programme token de trade inconnu', () => {
   );
 });
 
+for (const name of ['create_v2', 'sell'] as const) {
+  void test(`atteste ${name} opaque sans fabriquer d’arguments optionnels`, () => {
+    const instruction = opaqueAction(name, cursor(3, null, 1));
+    const event = opaqueEvent(name, cursor(3, 7, 2));
+    const decoded = decodePumpTransaction(transaction([instruction, event]));
+    const accepted = name === 'create_v2'
+      ? decoded.creations[0]?.action
+      : decoded.trades[0]?.action;
+    assert.ok(accepted);
+    assert.equal(accepted.instruction, instruction);
+    assert.deepEqual(accepted.wireEvidence, {
+      profile: name === 'create_v2' ? 'CREATE_V2_OPAQUE_0001_V1' : 'SELL_OPAQUE_0100_V1',
+      pairedEventCursor: cursor(3, 7, 2),
+    });
+    assert.ok(Object.isFrozen(accepted));
+    assert.ok(Object.isFrozen(accepted.wireEvidence));
+    assert.ok(Object.isFrozen(accepted.wireEvidence?.pairedEventCursor));
+    for (const optional of ['is_cashback_enabled', 'creator_fee_bps', 'is_holder_reward', 'track_volume']) {
+      assert.equal(Object.hasOwn(accepted.args, optional), false);
+    }
+    if (name === 'sell') {
+      assert.equal(accepted.args.amount, OPAQUE_SELL_AMOUNT);
+      assert.equal(accepted.args.min_sol_output, 1n);
+    }
+  });
+
+  for (const [label, mutate, code] of [
+    ['absent', () => [], 'PUMP_EVENT_MISSING'],
+    ['dupliqué', (event: NormalizedInstruction) => [event, event], 'PUMP_EVENT_DUPLICATE'],
+    ['ambigu', (event: NormalizedInstruction) => [event, eventAt(event, cursor(3, 8, 2))], 'PUMP_EVENT_AMBIGUOUS'],
+    ['autre action', (event: NormalizedInstruction) => [eventAt(event, cursor(4, 7, 2))], 'PUMP_EVENT_MISSING'],
+    ['mauvaise profondeur', (event: NormalizedInstruction) => [eventAt(event, cursor(3, 7, 3))], 'PUMP_EVENT_MISSING'],
+    ['sans profondeur', (event: NormalizedInstruction) => [eventAt(event, cursor(3, 7, null))], 'PUMP_STACK_HEIGHT_REQUIRED'],
+    ['externe', (event: NormalizedInstruction) => [eventAt(event, cursor(3, null, 2))], 'PUMP_EVENT_MISSING'],
+    ['mauvais programme', (event: NormalizedInstruction) => [{ ...event, programId: OTHER }], 'PUMP_EVENT_MISSING'],
+    ['mauvais tag', (event: NormalizedInstruction) => [{ ...event, data: Uint8Array.from([0, ...event.data.subarray(1)]) }], 'PUMP_EVENT_MISSING'],
+    ['mauvais discriminateur', (event: NormalizedInstruction) => [{ ...event, data: Uint8Array.from([...event.data.subarray(0, 8), ...Buffer.alloc(8), ...event.data.subarray(16)]) }], 'PUMP_EVENT_MISSING'],
+  ] as const) {
+    void test(`refuse ${name} opaque avec événement ${label}`, () => {
+      assert.throws(() => decodePumpTransaction(transaction([
+        opaqueAction(name, cursor(3, null, 1)),
+        ...mutate(opaqueEvent(name, cursor(3, 7, 2))),
+      ])), isPumpError(code));
+    });
+  }
+
+  for (const authorityAccounts of [[], [OTHER], [EVENT_AUTHORITY, OTHER]]) {
+    void test(`refuse ${name} opaque avec autorité CPI ${JSON.stringify(authorityAccounts)}`, () => {
+      assert.throws(() => decodePumpTransaction(transaction([
+        opaqueAction(name, cursor(3, null, 1)),
+        { ...opaqueEvent(name, cursor(3, 7, 2)), accounts: authorityAccounts },
+      ])), isPumpError('PUMP_EVENT_MISMATCH'));
+    });
+  }
+
+  void test(`refuse ${name} opaque avec event_authority non canonique`, () => {
+    assert.throws(() => decodePumpTransaction(transaction([
+      opaqueAction(name, cursor(3, null, 1), { event_authority: OTHER }),
+      opaqueEvent(name, cursor(3, 7, 2)),
+    ])), isPumpError('PUMP_EVENT_MISMATCH'));
+  });
+
+  void test(`atteste ${name} opaque CPI uniquement dans sa portée`, () => {
+    const instruction = opaqueAction(name, cursor(3, 2, 2));
+    const event = opaqueEvent(name, cursor(3, 3, 3));
+    const decoded = decodePumpTransaction(transaction([instruction, event]));
+    assert.equal(decoded.creations.length + decoded.trades.length, 1);
+    for (const escaped of [
+      eventAt(event, cursor(3, 1, 3)),
+      eventAt(event, cursor(3, 5, 3)),
+    ]) {
+      assert.throws(() => decodePumpTransaction(transaction([
+        instruction,
+        unrelated(cursor(3, 4, 2)),
+        escaped,
+      ])), isPumpError('PUMP_EVENT_MISSING'));
+    }
+  });
+
+  void test(`refuse ${name} opaque avec événement orphelin supplémentaire`, () => {
+    assert.throws(() => decodePumpTransaction(transaction([
+      opaqueAction(name, cursor(3, null, 1)),
+      opaqueEvent(name, cursor(3, 7, 2)),
+      opaqueEvent(name, cursor(4, 0, 2)),
+    ])), isPumpError('PUMP_EVENT_ORPHANED'));
+  });
+
+  for (const [label, mutate] of [
+    ['programme', (instruction: NormalizedInstruction) => ({ ...instruction, programId: OTHER })],
+    ['discriminateur', (instruction: NormalizedInstruction) => ({ ...instruction, data: Uint8Array.from([...Buffer.alloc(8), ...instruction.data.subarray(8)]) })],
+  ] as const) {
+    void test(`n’atteste pas une action ${name} au ${label} inconnu`, () => {
+      assert.throws(() => decodePumpTransaction(transaction([
+        mutate(opaqueAction(name, cursor(3, null, 1))),
+        opaqueEvent(name, cursor(3, 7, 2)),
+      ])), isPumpError('PUMP_EVENT_ORPHANED'));
+    });
+  }
+}
+
+for (const [field, value] of Object.entries({
+  name: 'wrong', symbol: 'wrong', uri: 'wrong', mint: OTHER,
+  bonding_curve: OTHER, user: OTHER, creator: OTHER,
+  token_program: SPL_TOKEN_PROGRAM_ID, is_mayhem_mode: false,
+  is_cashback_enabled: true, is_holder_reward: false,
+  creator_fee_bps: 1n, quote_mint: OTHER,
+})) {
+  void test(`refuse la contradiction ${field} d’une création opaque`, () => {
+    assert.throws(() => decodePumpTransaction(transaction([
+      opaqueAction('create_v2', cursor(3, null, 1)),
+      opaqueEvent('create_v2', cursor(3, 7, 2), { [field]: value }),
+    ])), isPumpError('PUMP_EVENT_MISMATCH'));
+  });
+}
+
+void test('conserve le créateur demandé opaque et exige le PDA effectif du mint', () => {
+  const decoded = decodePumpTransaction(transaction([
+    opaqueAction('create_v2', cursor(3, null, 1), {}, { creator: OTHER }),
+    opaqueEvent('create_v2', cursor(3, 7, 2)),
+  ]));
+  assert.equal(decoded.creations[0]?.requestedCreator, OTHER);
+  assert.equal(decoded.creations[0]?.effectiveCreator, HOLDER_REWARDS_CREATOR);
+  assert.equal(decoded.creations[0]?.creatorFeeBps, 0n);
+});
+
+void test('refuse les métadonnées quote incompatibles d’une création opaque', () => {
+  const instructions = [
+    opaqueAction('create_v2', cursor(3, null, 1)),
+    opaqueEvent('create_v2', cursor(3, 7, 2)),
+  ];
+  const base = transaction(instructions);
+  assert.throws(() => decodePumpTransaction({ ...base, postTokenBalances: [] }),
+    isPumpError('PUMP_QUOTE_ASSET_UNRESOLVED'));
+  assert.throws(() => decodePumpTransaction({
+    ...base,
+    postTokenBalances: base.postTokenBalances.map((balance) => ({
+      ...balance, tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
+    })),
+  }), isPumpError('PUMP_EVENT_MISMATCH'));
+  assert.throws(() => decodePumpTransaction(transaction([
+    opaqueAction('create_v2', cursor(3, null, 1), { quote_control: OTHER }),
+    opaqueEvent('create_v2', cursor(3, 7, 2)),
+  ])), isPumpError('PUMP_ACCOUNT_MISSING'));
+});
+
+for (const [field, value] of Object.entries({
+  is_buy: true, ix_name: 'sell_v2', user: OTHER, mint: OTHER,
+  token_amount: OPAQUE_SELL_AMOUNT - 1n, track_volume: true, quote_mint: OTHER,
+})) {
+  void test(`refuse la contradiction ${field} d’une vente opaque`, () => {
+    assert.throws(() => decodePumpTransaction(transaction([
+      opaqueAction('sell', cursor(3, null, 1)),
+      opaqueEvent('sell', cursor(3, 7, 2), { [field]: value }),
+    ])), isPumpError('PUMP_EVENT_MISMATCH'));
+  });
+}
+
+void test('ne globalise pas les restrictions d’une vente opaque aux formes IDL', () => {
+  const decoded = decodePumpTransaction(transaction([
+    action('sell', cursor(3, null, 1)),
+    eventAt(tradeEventInstruction(new Uint8Array(), {
+      is_buy: false, ix_name: 'sell_v2', track_volume: true,
+      quote_mint: WSOL_MINT,
+    }), cursor(3, 7, 2)),
+  ]));
+  assert.equal(decoded.trades.length, 1);
+  assert.equal(decoded.trades[0]?.action.wireEvidence, undefined);
+});
+
+function opaqueAction(
+  name: 'create_v2' | 'sell',
+  location: Cursor,
+  accountOverrides: Readonly<Record<string, string>> = {},
+  argumentOverrides: Readonly<Record<string, unknown>> = {},
+): NormalizedInstruction {
+  const instruction = action(name, location, {
+    event_authority: EVENT_AUTHORITY,
+    ...accountOverrides,
+  }, argumentOverrides);
+  const definition = PUMP_INSTRUCTIONS[name];
+  const values = name === 'create_v2'
+    ? { ...CREATE_ARGS, ...argumentOverrides }
+    : { ...SELL_ARGS, amount: OPAQUE_SELL_AMOUNT, ...argumentOverrides };
+  return {
+    ...instruction,
+    data: Uint8Array.from([
+      ...definition.discriminator,
+      ...encodeFields(name === 'create_v2' ? definition.args.slice(0, 5) : definition.args, values),
+      ...(name === 'create_v2' ? [0, 1] : [1, 0]),
+    ]),
+  };
+}
+
+function opaqueEvent(
+  name: 'create_v2' | 'sell',
+  location: Cursor,
+  overrides: Readonly<Record<string, unknown>> = {},
+): NormalizedInstruction {
+  const event = name === 'create_v2'
+    ? createEventInstruction(new Uint8Array(), {
+      is_cashback_enabled: false, creator_fee_bps: 0n, ...overrides,
+    })
+    : tradeEventInstruction(new Uint8Array(), {
+      is_buy: false, ix_name: 'sell', track_volume: false,
+      token_amount: OPAQUE_SELL_AMOUNT, quote_mint: WSOL_MINT, ...overrides,
+    });
+  return { ...eventAt(event, location), accounts: [EVENT_AUTHORITY] };
+}
+
 function action(
   name: PumpInstructionName,
   location: Cursor,
@@ -344,7 +559,7 @@ function action(
     ? CREATE_ARGS
     : name === 'create'
       ? CREATE_LEGACY_ARGS
-    : name === 'sell_v2'
+    : name === 'sell_v2' || name === 'sell'
       ? SELL_ARGS
       : TRADE_ARGS;
   const values = { ...baseValues, ...argumentOverrides };
