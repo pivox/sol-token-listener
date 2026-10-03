@@ -325,12 +325,12 @@ void test('stopped evidence preserves recent rolling starts and historical maxim
 
 **Files:** `src/domain/transaction-ingestion.ts`, `src/storage/transaction-inbox.repository.ts`, `tests/transaction-ingestion-contracts.test.ts`, `tests/transaction-inbox.repository.test.ts`.
 
-- [ ] **Step 1: Write RED heartbeat tests using the existing `rpcEvidenceHeartbeat()` helper.** Preserve its exact V1 fixture. Spread a complete V2 fixture into a frozen heartbeat and expect acceptance; remove any V2 peer and expect rejection. Add state/drain cases, mixed identities, malformed counts, and accessor/proxy detection before generic durable normalization.
+- [ ] **Step 1: Write RED heartbeat tests using the existing `rpcEvidenceHeartbeat()` helper.** Preserve its exact V1 fixture. Snapshot/freeze the complete V2 fixture before spreading it into a frozen heartbeat and expect acceptance; the existing heartbeat contract requires deeply frozen nested metrics. Remove any V2 peer and expect rejection. Add state/drain cases, mixed identities, malformed counts, and accessor/proxy detection before generic durable normalization.
 
 ```ts
 void test('heartbeat accepts only a complete original V2 evidence bundle', () => {
   const base = rpcEvidenceHeartbeat();
-  const evidence = twoGroupHydrationEvidenceFixture();
+  const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(twoGroupHydrationEvidenceFixture());
   assert.doesNotThrow(() => assertValidRuntimeHeartbeat(Object.freeze({ ...base, ...evidence })));
   const { blockResponseMemory, ...partial } = evidence;
   assert.ok(blockResponseMemory);
@@ -352,7 +352,7 @@ readonly blockResponseMemory?: RuntimeBlockResponseMemoryMetricsV2;
 
 Before `frozenRecord` can normalize a graph, inspect the original four own descriptors. A present budget/memory descriptor or exact numeric version-two descriptor selects the V2 branch. Reject accessors/non-enumerable descriptors immediately. Validate the full original bundle and its state. Existing V1 branches continue to call their existing validators; do not loosen V1 exact keys. A claimed V2 with invalid/missing peers must never fall through to V1.
 
-- [ ] **Step 4: Run heartbeat GREEN, then add RED JSONB tests.** Use the existing repository fake-pool tests to capture query arguments, not a live database. A complete V2 write must persist the four exact detached sidecars, preserve nonzero local rejection/oversize observations, and reject malformed evidence before the first query. Mutation of original nested queue/role data after the call must not change the captured persisted snapshot. Add an optional disposable-PostgreSQL round-trip under the existing `TEST_DATABASE_URL` guard; do not provision or access production DB.
+- [ ] **Step 4: Run heartbeat GREEN, then add RED JSONB tests.** Use the existing repository fake-pool tests to capture query arguments, not a live database. A complete V2 write must persist the four exact detached sidecars, preserve nonzero local rejection/oversize observations, and reject malformed evidence before the first query. Assert captured sidecar identity differs from the original frozen nested queue/role data; mutating heartbeat-owned evidence is intentionally disallowed before the write. Add an optional disposable-PostgreSQL round-trip under the existing `TEST_DATABASE_URL` guard; do not provision or access production DB.
 
 ```ts
 void test('V2 heartbeat JSONB is detached before query awaits', async () => {
@@ -366,14 +366,12 @@ void test('V2 heartbeat JSONB is detached before query awaits', async () => {
     },
     async connect() { throw new Error('not used'); },
   });
-  const original = twoGroupHydrationEvidenceFixture();
-  const expected = structuredClone(original);
+  const original = snapshotRuntimeTwoGroupHydrationEvidenceV2(twoGroupHydrationEvidenceFixture());
   await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), ...original }));
-  original.blockHydration.queueDelayMs.last = 99;
   const payload = persisted as Record<string, unknown>;
   for (const field of ['blockHydration', 'blockHydrationAdmission',
     'ordinaryRpcBudget', 'blockResponseMemory'] as const) {
-    assert.deepEqual(payload[field], expected[field]);
+    assert.deepEqual(payload[field], original[field]);
     assert.notEqual(payload[field], original[field]);
   }
   assert.equal(queries, 1);
