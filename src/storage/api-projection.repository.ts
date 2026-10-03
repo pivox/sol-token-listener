@@ -55,6 +55,14 @@ import {
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
 import { createFirstProcessingCanaryEvidence } from '../domain/first-processing-canary.js';
+import {
+  createRuntimeRpcHttpRoleEvidence,
+  type RuntimeRpcHttpRoleEvidenceV1,
+} from '../domain/rpc-http-role-evidence.js';
+import {
+  createRuntimeBlockHydrationPhaseEvidence,
+  type RuntimeBlockHydrationPhaseEvidenceV1,
+} from '../domain/block-hydration-phase-evidence.js';
 import { snapshotRuntimeWorkerAdmissionMetrics, snapshotRuntimeWorkerAdmissionClock } from '../domain/worker-admission-metrics.js';
 import {
   SOCIAL_COLLECTION_STATUSES,
@@ -2115,9 +2123,11 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null, blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
+    websocket, blockHydration: null, blockHydrationPhaseEvidence: null,
+    blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
     workerAdmissionClock: null,
     rpcHttpEvidence: null,
+    rpcHttpRoleEvidence: null,
     firstProcessingCanary: null, decoderQuarantine: null, scannerPhaseDiagnostics: null });
 }
 
@@ -2205,11 +2215,13 @@ function heartbeatFromRow(
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
+    blockHydrationPhaseEvidence: blockHydrationPhaseEvidenceFromPayload(row.heartbeat_payload),
     blockHydrationAdmission: blockHydrationAdmissionFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
     workerAdmission,
     workerAdmissionClock,
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
+    rpcHttpRoleEvidence: rpcHttpRoleEvidenceFromPayload(row.heartbeat_payload),
     firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
     decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
     scannerPhaseDiagnostics: scannerPhaseDiagnosticsFromPayload(row.heartbeat_payload, Date.parse(updatedAt)),
@@ -2346,6 +2358,32 @@ function rpcHttpEvidenceFromPayload(value: unknown): ApiRpcHttpEvidenceV1 | null
       });
     })) as ApiRpcHttpEvidenceV1['providers'],
   });
+}
+
+function rpcHttpRoleEvidenceFromPayload(value: unknown): RuntimeRpcHttpRoleEvidenceV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'rpcHttpRoleEvidence');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  try {
+    return createRuntimeRpcHttpRoleEvidence(descriptor.value);
+  } catch {
+    throw invalid();
+  }
+}
+
+function blockHydrationPhaseEvidenceFromPayload(value: unknown): RuntimeBlockHydrationPhaseEvidenceV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'blockHydrationPhaseEvidence');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  try {
+    return createRuntimeBlockHydrationPhaseEvidence(descriptor.value);
+  } catch {
+    throw invalid();
+  }
 }
 
 function catchUpAdmissionFromPayload(value: unknown, backlogCount: number): ApiCatchUpAdmissionMetricsV1 | null {

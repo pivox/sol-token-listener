@@ -614,6 +614,35 @@ const rpcHttpEvidenceSchema = z.object({
     rpcHttpProviderEvidenceSchema('fallback-3'),
   ]),
 }).strict();
+const rpcHttpRoles = ['SOURCE', 'FINALITY', 'BLOCK_HYDRATION', 'SHARED_CLIENT'] as const;
+const rpcHttpProviders = ['primary', 'fallback-1', 'fallback-2', 'fallback-3'] as const;
+const rpcHttpRoleEntrySchema = z.object({
+  providerId: z.enum(rpcHttpProviders),
+  role: z.enum(rpcHttpRoles),
+  attempts: rpcHttpEvidenceCountSchema,
+  responses: rpcHttpEvidenceCountSchema,
+  http429Responses: rpcHttpEvidenceCountSchema,
+  failures: rpcHttpEvidenceCountSchema,
+  inFlight: rpcHttpEvidenceCountSchema,
+  maxInFlight: rpcHttpEvidenceCountSchema,
+  headerLatencyBuckets: z.array(rpcHttpEvidenceCountSchema).length(10),
+  maxHeaderLatencyMs: rpcHttpEvidenceCountSchema,
+}).strict();
+const rpcHttpRoleEvidenceSchema = z.object({
+  version: z.literal(1),
+  overflowed: z.boolean(),
+  entries: z.array(rpcHttpRoleEntrySchema).length(16),
+}).strict().superRefine(({ overflowed, entries }, context) => {
+  for (const [index, entry] of entries.entries()) {
+    if (entry.providerId !== rpcHttpProviders[Math.floor(index / rpcHttpRoles.length)]
+      || entry.role !== rpcHttpRoles[index % rpcHttpRoles.length]
+      || (!overflowed && (entry.responses + entry.failures + entry.inFlight !== entry.attempts
+        || entry.headerLatencyBuckets.reduce((sum, count) => sum + count, 0) !== entry.responses
+        || entry.http429Responses > entry.responses || entry.maxInFlight < entry.inFlight))) {
+      context.addIssue({ code: 'custom', message: 'Invalid RPC HTTP role evidence cell', path: ['entries', index] });
+    }
+  }
+});
 const FIRST_PROCESSING_THRESHOLD_MS = 45_000;
 const FIRST_PROCESSING_COHORT_DURATION_MS = 900_000;
 const FIRST_PROCESSING_COHORT_CAPACITY = 50_000;
@@ -745,6 +774,7 @@ const healthSchema = z.object({
     catchUpAdmission: catchUpAdmissionSchema.nullish(),
     workerAdmission: workerAdmissionSchema.nullish(),
     rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
+    rpcHttpRoleEvidence: rpcHttpRoleEvidenceSchema.nullish(),
     firstProcessingCanary: firstProcessingCanarySchema.nullish(),
     decoderQuarantine: decoderQuarantineSchema.nullish(),
     scannerPhaseDiagnostics: scannerPhaseDiagnosticsSchema.nullish(),

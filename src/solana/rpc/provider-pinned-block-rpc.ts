@@ -6,6 +6,7 @@ import type { LegacyConfirmationStatus } from './types.js';
 import type { TransactionBlockRpc } from './transaction-locator.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
+import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
 export type ProviderPinnedBlockRpcErrorReason = 'CONFIG_INVALID' | 'BLOCK_UNAVAILABLE';
@@ -50,6 +51,7 @@ export function createProviderPinnedBlockRpc(
   dependencies?: ProviderPinnedBlockRpcDependencies,
   options: ProviderPinnedBlockRpcOptions = { requestTimeoutMs: 30_000 },
   recorder?: RpcHttpEvidenceRecorder,
+  roleRecorder?: RpcHttpRoleEvidenceRecorder,
 ): ProviderPinnedBlockRpc {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId) || !validCommitment(commitment)) {
@@ -57,8 +59,9 @@ export function createProviderPinnedBlockRpc(
   }
   const requestTimeoutMs = readRequestTimeout(options, exposedProviderId);
   const requestContext = new AsyncLocalStorage<AbortSignal>();
-  const observedFetch = dependencies === undefined && recorder !== undefined
-    ? createObservedRpcFetch(providerId, recorder)
+  const observedFetch = dependencies === undefined
+    && (recorder !== undefined || roleRecorder !== undefined)
+    ? createObservedRpcFetch(providerId, recorder, globalThis.fetch, roleRecorder, 'BLOCK_HYDRATION')
     : undefined;
   const createConnection = dependencies === undefined
     ? (url: string, selected: Commitment): Connection => (

@@ -14,6 +14,7 @@ import {
   type ProviderPinnedCatchUpSourceDependencies,
 } from '../src/solana/rpc/provider-pinned-catch-up-source.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
 import type { CatchUpSource as LegacyCatchUpSource } from '../src/application/catch-up-scanner.js';
 import type { CatchUpSource as CanonicalCatchUpSource } from '../src/ports/catch-up-source.js';
@@ -292,6 +293,7 @@ void test('default genesis HTTP transport propagates abort and settles before it
 
 void test('records a returned genesis HTTP 429 even when its body is invalid', async () => {
   const recorder = createRpcHttpEvidenceRecorder();
+  const roles = createRpcHttpRoleEvidenceRecorder();
   let requests = 0;
   const provider = createServer((_request, response) => {
     requests += 1;
@@ -304,11 +306,13 @@ void test('records a returned genesis HTTP 429 even when its body is invalid', a
     assert.ok(address !== null && typeof address !== 'string');
     const source = createProviderPinnedCatchUpSource(
       catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', 'confirmed', EXPECTED_GENESIS,
-      undefined, recorder,
+      undefined, recorder, roles,
     );
 
     await assert.rejects(source.verifyGenesis(), (error: unknown) => invalid(error, 'GENESIS_UNAVAILABLE', 'primary'));
     assert.equal(requests, 1);
+    assert.equal(roles.snapshot().entries[0]?.http429Responses, 1);
+    assert.equal(roles.snapshot().entries[0]?.inFlight, 0);
     assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
       providerId: 'primary', configured: true, attempts: 1, http429Responses: 1,
     });

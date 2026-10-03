@@ -4,6 +4,7 @@ import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { FinalityProviderPass } from '../../ports/finality-provider-pass.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
+import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 
 export type ProviderPinnedFinalityErrorReason =
   | 'CONFIG_INVALID'
@@ -49,10 +50,11 @@ export function createProviderPinnedFinalityPass(
   providerId: RpcProviderId,
   dependencies?: ProviderPinnedFinalityDependencies,
   recorder?: RpcHttpEvidenceRecorder,
+  roleRecorder?: RpcHttpRoleEvidenceRecorder,
 ): FinalityProviderPass {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)) throw failure('CONFIG_INVALID', exposedProviderId);
-  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder);
+  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const calls = createPinnedCalls(createRpc, httpUrl, providerId);
 
@@ -100,10 +102,13 @@ function dependencyFactory(
   providerId: RpcProviderId | null,
   selectedProviderId: RpcProviderId,
   recorder: RpcHttpEvidenceRecorder | undefined,
+  roleRecorder: RpcHttpRoleEvidenceRecorder | undefined,
 ): (httpUrl: string) => unknown {
   if (dependencies === undefined) {
-    if (recorder === undefined) return createDefaultRpc;
-    const observedFetch = createObservedRpcFetch(selectedProviderId, recorder);
+    if (recorder === undefined && roleRecorder === undefined) return createDefaultRpc;
+    const observedFetch = createObservedRpcFetch(
+      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'FINALITY',
+    );
     return (httpUrl: string): Connection => createDefaultRpc(httpUrl, observedFetch);
   }
   try {

@@ -75,6 +75,28 @@ function harness(options: BlockTransactionCacheOptions = {}, useSystemClock = fa
   };
 }
 
+void test('hydration facade exposes null before fetch and preserves cumulative phase evidence across routing changes', async () => {
+  const h = harness({ phaseNow: () => 0 });
+  assert.equal(h.hydration.phaseEvidence(), null);
+  const flight = deferred<unknown>();
+  h.setFetch(async () => flight.promise);
+  const locate = h.hydration.workerLocator().locate(target());
+  await flush();
+  assert.equal(h.hydration.phaseEvidence()?.rpc.inFlight, 1);
+  flight.resolve(block());
+  await locate;
+  const first = h.hydration.phaseEvidence();
+  assert.equal(first?.rpc.completed, 1);
+  assert.equal(first?.snapshot.completed, 1);
+  h.select('fallback-1');
+  h.setFetch(async () => block());
+  await h.hydration.workerLocator().locate(target());
+  assert.equal(h.hydration.phaseEvidence()?.rpc.completed, 2);
+  assert.ok(h.hydration.metrics().epochInvalidations > 0);
+  assert.equal(first?.rpc.completed, 1);
+  h.hydration.close();
+});
+
 void test('default admission clock ignores backward wall-clock corrections', async (t) => {
   let wallClock = 10_000;
   t.mock.method(Date, 'now', () => wallClock);

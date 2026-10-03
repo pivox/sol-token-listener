@@ -53,6 +53,8 @@ import { createFirstProcessingCanaryEvidence } from '../src/domain/first-process
 import { snapshotRuntimeWorkerAdmissionMetrics } from '../src/domain/worker-admission-metrics.js';
 import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRuntimeRpcHttpRoleEvidence } from '../src/domain/rpc-http-role-evidence.js';
+import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
@@ -201,6 +203,60 @@ void test('heartbeat accepts omitted historical RPC HTTP evidence and the exact 
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
   const rpcHttpEvidence = createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-2']);
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, rpcHttpEvidence })); });
+});
+
+void test('heartbeat validates optional RPC HTTP role evidence before generic normalization', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const entries = RPC_PROVIDER_IDS.flatMap((providerId) =>
+    ['SOURCE', 'FINALITY', 'BLOCK_HYDRATION', 'SHARED_CLIENT'].map((role) => ({
+      providerId, role, attempts: 0, responses: 0, http429Responses: 0,
+      failures: 0, inFlight: 0, maxInFlight: 0,
+      headerLatencyBuckets: Array<number>(10).fill(0), maxHeaderLatencyMs: 0,
+    })));
+  const valid = createRuntimeRpcHttpRoleEvidence({ version: 1, overflowed: false, entries });
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: valid }));
+  });
+  let reads = 0;
+  const hostile = (): never => { reads += 1; throw new Error('should not read'); };
+  const accessor = Object.freeze(Object.defineProperty({ ...heartbeat }, 'rpcHttpRoleEvidence', {
+    enumerable: true, get: hostile,
+  }));
+  for (const candidate of [
+    Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: undefined }),
+    Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: new Proxy(valid, { ownKeys: hostile }) }),
+    Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: Object.freeze({ ...valid, endpoint: 'secret' }) }),
+    accessor,
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(candidate); }, TypeError);
+  }
+  assert.equal(reads, 0);
+});
+
+void test('heartbeat validates optional block hydration phase evidence before generic normalization', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  recorder.begin('rpc')('completed');
+  const valid = recorder.snapshot();
+  assert.ok(valid);
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: valid }));
+  });
+  let reads = 0;
+  const accessor = Object.freeze(Object.defineProperty({ ...heartbeat }, 'blockHydrationPhaseEvidence', {
+    enumerable: true, get() { reads += 1; throw new Error('must not read'); },
+  }));
+  for (const candidate of [
+    Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: undefined }),
+    Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: new Proxy(valid, {}) }),
+    Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: { ...valid, signature: 'private' } }),
+    accessor,
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(candidate); }, TypeError);
+  }
+  assert.equal(reads, 0);
 });
 
 void test('heartbeat accepts an omitted legacy first processing canary and only an exact frozen canary snapshot', () => {

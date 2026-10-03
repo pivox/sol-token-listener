@@ -1,6 +1,8 @@
 import type { FetchFn } from '@solana/web3.js';
 import type { RpcProviderId } from './rpc-provider-catalog.js';
-import type { RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
+import { RPC_HTTP_ROLES, type RpcHttpRole } from '../../domain/rpc-http-role-evidence.js';
+import { beginRoleSafely, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
+import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 type FetchInit = Parameters<FetchFn>[1];
@@ -39,6 +41,8 @@ export type RpcHttpFailoverFetchOptions = Readonly<{
   onEvent?: (event: RpcHttpFailoverEvent) => void;
   onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void;
   recorder?: RpcHttpEvidenceRecorder;
+  roleRecorder?: RpcHttpRoleEvidenceRecorder;
+  role?: RpcHttpRole;
 }>;
 
 interface EndpointState {
@@ -84,6 +88,8 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
   const now = validated.now ?? Date.now;
   const onEvent = validated.onEvent;
   const recorder = validated.recorder;
+  const roleRecorder = validated.roleRecorder;
+  const role = validated.role ?? 'SHARED_CLIENT';
   let stickyIndex = 0;
 
   return async (input, init): Promise<Response> => {
@@ -125,16 +131,20 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       let response: Response;
       throwIfAborted(signal);
       recordAttempt(recorder, endpoint.id);
+      const finishRole = beginRoleSafely(roleRecorder, endpoint.id, role);
       try {
         response = await fetch(rewrittenInput, init);
       } catch (error) {
+        finishRole(null);
         if (signal?.aborted === true) throw error;
         const reason = 'NETWORK';
         degrade(endpoint, reason, DEFAULT_COOLDOWN_MS, now(), onEvent);
         lastFailure = { endpointId: endpoint.id, reason };
         continue;
       }
-      const responseStatus = response.status;
+      let responseStatus: number;
+      try { responseStatus = response.status; } catch (error) { finishRole(null); throw error; }
+      finishRole(responseStatus);
       if (responseStatus === 429) recordHttp429(recorder, endpoint.id);
       if (signal?.aborted === true) {
         cancelResponse(response);
@@ -216,6 +226,12 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
   if (candidate.recorder !== undefined && !validRecorder(candidate.recorder)) {
     throw new TypeError('HTTP RPC evidence recorder is invalid.');
   }
+  if (candidate.roleRecorder !== undefined && !validRoleRecorder(candidate.roleRecorder)) {
+    throw new TypeError('HTTP RPC role evidence recorder is invalid.');
+  }
+  if (candidate.role !== undefined && !RPC_HTTP_ROLES.includes(candidate.role)) {
+    throw new TypeError('HTTP RPC role is invalid.');
+  }
   return Object.freeze({
     endpoints: Object.freeze(endpoints),
     ...(candidate.fetch === undefined ? {} : { fetch: candidate.fetch }),
@@ -223,7 +239,15 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
     ...(candidate.onEvent === undefined ? {} : { onEvent: candidate.onEvent }),
     ...(candidate.onEndpointSelected === undefined ? {} : { onEndpointSelected: candidate.onEndpointSelected }),
     ...(candidate.recorder === undefined ? {} : { recorder: candidate.recorder }),
+    ...(candidate.roleRecorder === undefined ? {} : { roleRecorder: candidate.roleRecorder }),
+    ...(candidate.role === undefined ? {} : { role: candidate.role }),
   });
+}
+
+function validRoleRecorder(value: unknown): value is RpcHttpRoleEvidenceRecorder {
+  return typeof value === 'object' && value !== null
+    && typeof (value as Partial<RpcHttpRoleEvidenceRecorder>).begin === 'function'
+    && typeof (value as Partial<RpcHttpRoleEvidenceRecorder>).snapshot === 'function';
 }
 
 function validRecorder(value: unknown): value is RpcHttpEvidenceRecorder {

@@ -9,6 +9,7 @@ import {
   type ProviderPinnedFinalityDependencies,
 } from '../src/solana/rpc/provider-pinned-finality-source.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
 import type { FinalityProviderPass } from '../src/ports/finality-provider-pass.js';
 
@@ -304,6 +305,7 @@ void test('does not import failover or execution boundaries and does not expose 
 
 void test('records one returned HTTP 429 for each default provider-pinned finality boundary', async () => {
   const recorder = createRpcHttpEvidenceRecorder();
+  const roles = createRpcHttpRoleEvidenceRecorder();
   let requests = 0;
   const provider = createServer((_request, response) => {
     requests += 1;
@@ -315,13 +317,15 @@ void test('records one returned HTTP 429 for each default provider-pinned finali
     const address = provider.address();
     assert.ok(address !== null && typeof address !== 'string');
     const pass = createProviderPinnedFinalityPass(
-      catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', undefined, recorder,
+      catalog(() => pair(`http://127.0.0.1:${address.port}`)), 'primary', undefined, recorder, roles,
     );
 
     await assert.rejects(pass.getHistoryStatuses(Object.freeze([SIGNATURE])), (error: unknown) => invalid(error, 'HISTORY_UNAVAILABLE'));
     await assert.rejects(pass.getFinalizedSlot(), (error: unknown) => invalid(error, 'ROOT_UNAVAILABLE'));
     await assert.rejects(pass.getFinalizedBlockSignatures(42n), (error: unknown) => invalid(error, 'BLOCK_UNAVAILABLE'));
     assert.equal(requests, 3);
+    assert.equal(roles.snapshot().entries[1]?.http429Responses, 3);
+    assert.equal(roles.snapshot().entries[1]?.inFlight, 0);
     assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
       providerId: 'primary', configured: true, attempts: 3, http429Responses: 3,
     });

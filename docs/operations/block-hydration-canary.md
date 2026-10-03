@@ -1,6 +1,6 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
-Version : 1.6.0 — 2026-10-02 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169, #170, #177 et #209.
+Version : 1.7.0 — 2026-10-03 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169, #170, #177, #209 et #218.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère
 aucune autorité wallet, signer ou submit : elle ne connecte ni ne lit aucun
@@ -10,6 +10,25 @@ readiness Mainnet n'est déclarée avant que cette fenêtre ait passé. Utiliser
 seule réplique avec `LISTENER_INGESTION_SCOPE=launchpad-only`, en mode `observe`.
 Archiver le health, les compteurs inbox, le RSS et le tableau fournisseur avant
 activation.
+
+## Diagnostic des phases d’hydratation #218
+
+Le heartbeat durable et `/api/v1/health` peuvent exposer le sidecar optionnel
+`blockHydrationPhaseEvidence.v1`. Il mesure séparément les phases physiques
+`rpc` (`getBlockTransactions`, y compris transfert, JSON et conversion SDK) et
+`snapshot` (normalisation et encodage local). Chaque phase publie des compteurs
+de tentatives et dix classes de latence agrégées ; aucune identité, URL ou
+réponse RPC n’y figure. L’absence historique, le mode désactivé ou l’absence
+de premier fetch se projette en `null`.
+
+Capturer ce sidecar séparément du manifeste canary V1 : **ne jamais** l’ajouter
+aux snapshots `T0`/`T+5`/`T+15`/`FINAL_PRESTOP` ni au `stoppedHeartbeat` remis à
+`canary:evaluate`. Ce manifeste reste fermé et comporte exactement 19 gates ;
+un champ supplémentaire donne `INVALID_EVIDENCE`. Une valeur `overflowed=true`
+ou `epochInvalidations>0` limite l’interprétation des distributions ; les
+mesures agrégées ne sont pas appariées requête par requête avec les latences
+HTTP. Ce diagnostic ne constitue ni un gain de débit prouvé ni une readiness
+Mainnet, et ne change aucun verdict ou seuil du canary.
 
 ## Activation bornée #177
 
@@ -394,6 +413,18 @@ peut être réutilisée pour déclarer un `PASS`.
    `postStopActionableCount`, qui conserve la population legacy du shutdown.
    Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
    projection fixe suivante de la réponse health :
+
+   `heartbeat.rpcHttpRoleEvidence` est un diagnostic additif pour #218,
+   distinct de `rpcHttpEvidence` V1. Ne jamais l'ajouter aux snapshots ou au
+   heartbeat STOPPED du manifeste `canary:evaluate` : celui-ci refuse les
+   clés supplémentaires avec `INVALID_EVIDENCE` et doit conserver ses 19 gates
+   inchangés. Si cet agrégat par rôle est conservé pour une analyse séparée,
+   utiliser uniquement ses compteurs et buckets bornés, sans réponse health
+   brute, URL, clé, signature ni donnée de wallet ; sa présence ou un zéro 429
+   ne prouve ni le plafond RPS propre au projet ni une réserve RPC pour la
+   sortie réelle. Une preuve absente ou overflowed reste `INCONCLUSIVE` pour
+   #218. La rétention locale de ces diagnostics est limitée à quatre heures
+   après la fin de leur utilité.
 
    ```text
    jq 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)}' health.json

@@ -22,6 +22,8 @@ import type {
   WebSocketRecoveryStatus,
 } from '../domain/websocket-health.js';
 import type { RpcProviderId } from '../domain/rpc-provider.js';
+import type { RuntimeRpcHttpRoleEvidenceV1 } from '../domain/rpc-http-role-evidence.js';
+import type { RuntimeBlockHydrationPhaseEvidenceV1 } from '../domain/block-hydration-phase-evidence.js';
 import type { ScannerPhaseDiagnosticsV1 } from '../domain/scanner-phase-diagnostics.js';
 import type {
   CreationExitReason,
@@ -547,6 +549,8 @@ export interface ApiHeartbeat {
   readonly websocket: ApiWebSocketHealth;
   /** Optional only during rolling deployment from API V1 implementations predating issue #114. */
   readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
+  /** Optional diagnostic sidecar; null until a physical block fetch has started. */
+  readonly blockHydrationPhaseEvidence?: RuntimeBlockHydrationPhaseEvidenceV1 | null;
   readonly blockHydrationAdmission?: ApiBlockHydrationAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when admission metrics are absent. */
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
@@ -556,6 +560,8 @@ export interface ApiHeartbeat {
   readonly workerAdmissionClock?: ApiWorkerAdmissionClockV1 | null;
   /** Optional during rolling deployment; null when RPC HTTP evidence is absent. */
   readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
+  /** Optional during rolling deployment; null when aggregate physical HTTP role evidence is absent. */
+  readonly rpcHttpRoleEvidence?: RuntimeRpcHttpRoleEvidenceV1 | null;
   /** Optional during rolling deployment; null when first-processing evidence is absent. */
   readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
   /** Optional during rolling deployment; null when decoder-quarantine evidence is absent. */

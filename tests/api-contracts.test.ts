@@ -28,6 +28,33 @@ import {
   toApiJson,
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
+import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
+
+void test('RPC HTTP role health contract is optional, nullable, and aggregate-only', () => {
+  const metrics = createRpcHttpRoleEvidenceRecorder().snapshot();
+  const omitted: Pick<ApiHealth['heartbeat'], 'rpcHttpRoleEvidence'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'rpcHttpRoleEvidence'> = { rpcHttpRoleEvidence: null };
+  assert.deepEqual(omitted, {});
+  assert.deepEqual(explicitNull, { rpcHttpRoleEvidence: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+  assert.doesNotMatch(JSON.stringify(metrics), /endpoint|method|body|signature/u);
+});
+
+void test('block hydration phase health contract is optional, nullable, and aggregate-only', () => {
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  recorder.begin('rpc')('completed');
+  const metrics = recorder.snapshot();
+  assert.ok(metrics);
+  const omitted: Pick<ApiHealth['heartbeat'], 'blockHydrationPhaseEvidence'> = {};
+  const explicitNull: Pick<ApiHealth['heartbeat'], 'blockHydrationPhaseEvidence'> = {
+    blockHydrationPhaseEvidence: null,
+  };
+  assert.deepEqual(omitted, {});
+  assert.deepEqual(toApiJson(explicitNull), { blockHydrationPhaseEvidence: null });
+  assert.deepEqual(toApiJson(metrics), metrics);
+  assert.doesNotMatch(JSON.stringify(metrics), /endpoint|body|signature|mint/u);
+});
 
 void test('block hydration admission health contract permits optional nullable aggregate metrics', () => {
   const metrics: ApiBlockHydrationAdmissionMetricsV1 = {
