@@ -8,6 +8,7 @@ import {
 } from './catch-up-source.js';
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
+import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 
 export type ProviderPinnedCatchUpSourceErrorReason =
   | 'CONFIG_INVALID'
@@ -52,6 +53,7 @@ export function createProviderPinnedCatchUpSource(
   expectedGenesisHash: string,
   dependencies?: ProviderPinnedCatchUpSourceDependencies,
   recorder?: RpcHttpEvidenceRecorder,
+  roleRecorder?: RpcHttpRoleEvidenceRecorder,
 ): ProviderPinnedCatchUpSource {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)
@@ -60,7 +62,7 @@ export function createProviderPinnedCatchUpSource(
     throw failure('CONFIG_INVALID', exposedProviderId);
   }
 
-  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder);
+  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const rpc = createPinnedRpc(createRpc, httpUrl, commitment, providerId);
   const source = new SolanaCatchUpSource(rpc, commitment);
@@ -189,10 +191,13 @@ function dependencyFactory(
   providerId: RpcProviderId | null,
   selectedProviderId: RpcProviderId,
   recorder: RpcHttpEvidenceRecorder | undefined,
+  roleRecorder: RpcHttpRoleEvidenceRecorder | undefined,
 ): (httpUrl: string, commitment: Commitment) => unknown {
   if (dependencies === undefined) {
-    if (recorder === undefined) return createDefaultRpc;
-    const observedFetch = createObservedRpcFetch(selectedProviderId, recorder);
+    if (recorder === undefined && roleRecorder === undefined) return createDefaultRpc;
+    const observedFetch = createObservedRpcFetch(
+      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'SOURCE',
+    );
     return (httpUrl: string, commitment: Commitment): PinnedCatchUpRpc => (
       createDefaultRpc(httpUrl, commitment, observedFetch)
     );
