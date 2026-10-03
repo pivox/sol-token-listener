@@ -9,6 +9,7 @@ import {
   type MainnetObserveCanaryGateName,
 } from '../scripts/lib/mainnet-observe-canary-verdict.js';
 import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
+import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
 
 const fixtureUrl = new URL(
   './fixtures/mainnet-observe-canary/32c9bf4-failed.v1.json',
@@ -986,6 +987,29 @@ void test('diagnostic RPC role sidecar stays outside the closed 19-gate canary m
     delete nested(copy, 'snapshots', name).rpcHttpRoleEvidence;
   }
   delete nested(copy, 'stoppedHeartbeat').rpcHttpRoleEvidence;
+  assert.deepEqual(evaluateMainnetObserveCanary(copy), baseline);
+  assert.equal(Object.keys(baseline.gates).length, 19);
+});
+
+void test('block hydration phase sidecar stays outside the closed 19-gate canary manifest', () => {
+  const baseline = evaluateMainnetObserveCanary(cloneFixture());
+  const copy = cloneFixture();
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  recorder.begin('rpc')('completed');
+  const sidecar = recorder.snapshot();
+  assert.ok(sidecar);
+  for (const name of ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP']) {
+    nested(copy, 'snapshots', name).blockHydrationPhaseEvidence = sidecar;
+  }
+  nested(copy, 'stoppedHeartbeat').blockHydrationPhaseEvidence = sidecar;
+
+  const unfiltered = evaluateMainnetObserveCanary(copy);
+  assert.equal(unfiltered.overallVerdict, 'INCONCLUSIVE');
+  assert.equal(unfiltered.gates.http429.reasonCode, 'INVALID_EVIDENCE');
+  for (const name of ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP']) {
+    delete nested(copy, 'snapshots', name).blockHydrationPhaseEvidence;
+  }
+  delete nested(copy, 'stoppedHeartbeat').blockHydrationPhaseEvidence;
   assert.deepEqual(evaluateMainnetObserveCanary(copy), baseline);
   assert.equal(Object.keys(baseline.gates).length, 19);
 });
