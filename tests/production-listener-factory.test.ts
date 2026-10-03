@@ -12,6 +12,8 @@ import {
 } from '../src/domain/worker-admission-metrics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
+import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
+import type { RuntimeBlockHydrationPhaseEvidenceV1 } from '../src/domain/block-hydration-phase-evidence.js';
 import {
   ALL_INGESTION_PROGRAMS,
   LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
@@ -610,6 +612,57 @@ void test('production shares one role recorder with every physical RPC source an
   await dependencies.worker.close();
 });
 
+void test('production wires nullable phase evidence through both hydration facades to heartbeat', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.match(source, /phaseEvidence:\s*\(\).*?=> hydration\.phaseEvidence\(\)/u);
+  assert.match(source, /blockHydrationPhaseEvidenceMetrics:\s*blockHydration\.phaseEvidence/u);
+  for (const enabled of ['false', 'true']) {
+    const runtime = createProductionListenerRuntime(config({ LISTENER_BLOCK_HYDRATION_ENABLED: enabled }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+    const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+    const metrics = (dependencies.heartbeat as unknown as {
+      blockHydrationPhaseEvidenceMetrics: () => RuntimeBlockHydrationPhaseEvidenceV1 | null;
+    }).blockHydrationPhaseEvidenceMetrics;
+    assert.equal(metrics(), null);
+    await dependencies.worker.close();
+  }
+});
+
+void test('heartbeat omits null phase evidence and snapshots fresh detached aggregate at STOPPED', async () => {
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = new PersistentListenerHeartbeat({ counts: heartbeatCounts,
+    ...heartbeatCanaryMethods(), async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    blockHydrationPhaseEvidenceMetrics: () => recorder.snapshot(),
+  });
+  await heartbeat.start();
+  assert.equal(Object.hasOwn(writes[0] ?? {}, 'blockHydrationPhaseEvidence'), false);
+  recorder.begin('rpc')('completed');
+  recorder.begin('snapshot')('completed');
+  const source = recorder.snapshot();
+  await heartbeat.stop();
+  assert.deepEqual(writes[1]?.blockHydrationPhaseEvidence, source);
+  assert.notEqual(writes[1]?.blockHydrationPhaseEvidence, source);
+  assert.ok(Object.isFrozen(writes[1]?.blockHydrationPhaseEvidence?.rpc.settledLatencyBuckets));
+});
+
+void test('heartbeat phase callbacks fail closed and redact malformed or throwing providers', async () => {
+  for (const candidate of [() => undefined, () => ({}), () => { throw new Error('private-phase-secret'); }]) {
+    const writes: RuntimeHeartbeat[] = [];
+    const heartbeat = new PersistentListenerHeartbeat({ counts: heartbeatCounts,
+      ...heartbeatCanaryMethods(), async writeHeartbeat(value) { writes.push(value); },
+    }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+      intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+      blockHydrationPhaseEvidenceMetrics: candidate,
+    } as unknown as ListenerHeartbeatOptions);
+    await assert.rejects(heartbeat.start(), { name: 'TypeError', message: 'Block hydration phase evidence metrics are invalid.' });
+    assert.equal(writes.length, 0);
+  }
+});
+
 void test('heartbeat samples detached role evidence at RUNNING and STOPPED writes', async () => {
   const recorder = createRpcHttpRoleEvidenceRecorder();
   const writes: RuntimeHeartbeat[] = [];
@@ -1099,6 +1152,7 @@ void test('production block hydration keeps the exact legacy locator unless expl
     SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
   }), rpc);
   assert.ok(disabled.locator instanceof SolanaTransactionLocator);
+  assert.equal(disabled.phaseEvidence(), null);
   assert.deepEqual(disabled.metrics(), {
     version: 1, enabled: false, callerConcurrency: 1,
     locates: 0, hits: 0, misses: 0, inFlightJoins: 0, fetches: 0,
@@ -1117,6 +1171,7 @@ void test('production block hydration keeps the exact legacy locator unless expl
   assert.ok(enabled.locator instanceof CachedSolanaBlockTransactionLocator);
   assert.equal(enabled.metrics().enabled, true);
   assert.equal(enabled.metrics().callerConcurrency, 1);
+  assert.equal(enabled.phaseEvidence(), null);
   disabled.close();
   enabled.close();
 });

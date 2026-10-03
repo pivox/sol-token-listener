@@ -14,6 +14,10 @@ import {
   type RuntimeRpcHttpRoleEvidenceV1,
 } from './rpc-http-role-evidence.js';
 import {
+  assertValidRuntimeBlockHydrationPhaseEvidence,
+  type RuntimeBlockHydrationPhaseEvidenceV1,
+} from './block-hydration-phase-evidence.js';
+import {
   assertValidFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from './first-processing-canary.js';
@@ -296,6 +300,7 @@ export interface RuntimeHeartbeat {
   readonly leasedCount: number;
   readonly exhaustedCount: number;
   readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
+  readonly blockHydrationPhaseEvidence?: RuntimeBlockHydrationPhaseEvidenceV1;
   readonly blockHydrationAdmission?: RuntimeBlockHydrationAdmissionMetricsV1;
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
@@ -735,6 +740,13 @@ export function assertValidRuntimeHeartbeat(
         throw new TypeError('RPC HTTP role evidence is invalid.');
       }
       assertValidRuntimeRpcHttpRoleEvidence(roleEvidence.value);
+    }
+    const blockHydrationPhaseEvidence = Object.getOwnPropertyDescriptor(value, 'blockHydrationPhaseEvidence');
+    if (blockHydrationPhaseEvidence !== undefined) {
+      if (!('value' in blockHydrationPhaseEvidence) || blockHydrationPhaseEvidence.enumerable !== true) {
+        throw new TypeError('Block hydration phase evidence is invalid.');
+      }
+      assertValidRuntimeBlockHydrationPhaseEvidence(blockHydrationPhaseEvidence.value);
     }
     const firstProcessingCanary = Object.getOwnPropertyDescriptor(value, 'firstProcessingCanary');
     if (firstProcessingCanary !== undefined) {

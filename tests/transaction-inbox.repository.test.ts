@@ -2851,6 +2851,47 @@ void test('role evidence heartbeat JSONB is detached on RUNNING and STOPPED and 
   assert.deepEqual(payloads.at(-1), { startedAt: '1970-01-01T00:00:01.000Z' });
 });
 
+void test('block hydration phase heartbeat JSONB is detached and omitted for legacy writes', async () => {
+  const { createBlockHydrationPhaseRecorder } = await import('../src/solana/rpc/block-hydration-phase-recorder.js');
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  recorder.begin('rpc')('completed');
+  const blockHydrationPhaseEvidence = recorder.snapshot();
+  assert.ok(blockHydrationPhaseEvidence);
+  type PhaseEvidence = NonNullable<ReturnType<typeof recorder.snapshot>>;
+  const payloads: unknown[] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    async connect() { throw new Error('No connection needed.'); },
+    async query(_sql, values) { payloads.push(values?.[14]); return { rows: [], rowCount: 1 }; },
+  });
+  for (const runtimeState of ['RUNNING', 'STOPPED'] as const) {
+    await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), runtimeState, blockHydrationPhaseEvidence }));
+    const payload = payloads.at(-1) as { blockHydrationPhaseEvidence: PhaseEvidence };
+    assert.deepEqual(payload.blockHydrationPhaseEvidence, blockHydrationPhaseEvidence);
+    assert.notEqual(payload.blockHydrationPhaseEvidence, blockHydrationPhaseEvidence);
+    assert.notEqual(payload.blockHydrationPhaseEvidence.rpc.settledLatencyBuckets,
+      blockHydrationPhaseEvidence.rpc.settledLatencyBuckets);
+  }
+  await repository.writeHeartbeat(rpcEvidenceHeartbeat());
+  assert.deepEqual(payloads.at(-1), { startedAt: '1970-01-01T00:00:01.000Z' });
+});
+
+void test('block hydration phase evidence survives the PostgreSQL heartbeat JSONB round trip', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const { createBlockHydrationPhaseRecorder } = await import('../src/solana/rpc/block-hydration-phase-recorder.js');
+    const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+    recorder.begin('rpc')('completed');
+    const blockHydrationPhaseEvidence = recorder.snapshot();
+    assert.ok(blockHydrationPhaseEvidence);
+    await new PostgresTransactionInboxRepository(pool).writeHeartbeat(Object.freeze({
+      ...rpcEvidenceHeartbeat(), blockHydrationPhaseEvidence,
+    }));
+    const payload = (await pool.query(
+      "SELECT payload FROM listener_heartbeats WHERE service_key='transaction-listener'",
+    )).rows[0]?.payload as { blockHydrationPhaseEvidence?: unknown } | undefined;
+    assert.deepEqual(payload?.blockHydrationPhaseEvidence, blockHydrationPhaseEvidence);
+  });
+});
+
 void test('RPC HTTP heartbeat persistence rejects present malformed evidence before querying', async () => {
   const valid = createRpcHttpEvidenceRecorder().snapshot(['primary']);
   let queries = 0;

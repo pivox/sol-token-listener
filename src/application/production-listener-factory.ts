@@ -2,6 +2,10 @@ import { isProxy } from 'node:util/types';
 import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
 import { createPumpFunWorkerAdmissionPolicy } from '../domain/worker-admission.js';
 import {
+  createRuntimeBlockHydrationPhaseEvidence,
+  type RuntimeBlockHydrationPhaseEvidenceV1,
+} from '../domain/block-hydration-phase-evidence.js';
+import {
   snapshotRuntimeBlockHydrationAdmissionMetrics,
   type RuntimeBlockHydrationAdmissionMetricsV1,
 } from '../domain/block-hydration-admission.js';
@@ -191,6 +195,7 @@ type BlockHydrationConfig = Pick<AppConfig,
 export interface ProductionBlockHydration {
   readonly locator: TransactionInboxWorkerLocator;
   readonly metrics: () => RuntimeBlockHydrationMetricsV1;
+  readonly phaseEvidence: () => RuntimeBlockHydrationPhaseEvidenceV1 | null;
   readonly close: () => void;
 }
 
@@ -211,6 +216,7 @@ export function createProductionBlockHydration(
     return Object.freeze({
       locator: new SolanaTransactionLocator(rpc),
       metrics: (): RuntimeBlockHydrationMetricsV1 => DISABLED_BLOCK_HYDRATION_METRICS,
+      phaseEvidence: (): null => null,
       close: (): void => undefined,
     });
   }
@@ -229,6 +235,7 @@ export function createProductionBlockHydration(
       callerConcurrency: 1,
       ...locator.metrics,
     }),
+    phaseEvidence: (): RuntimeBlockHydrationPhaseEvidenceV1 | null => locator.phaseEvidence,
     close: (): void => { locator.close(); },
   });
 }
@@ -360,6 +367,7 @@ export function createProductionListenerRuntime(
     : Object.freeze({
       locator: hydration.workerLocator(),
       metrics: (): RuntimeBlockHydrationMetricsV1 => hydration.metrics(),
+      phaseEvidence: (): RuntimeBlockHydrationPhaseEvidenceV1 | null => hydration.phaseEvidence(),
       close: (): void => { hydration.close(); },
     });
   const scannerPhaseDiagnostics = new ScannerPhaseDiagnosticsCollector();
@@ -699,6 +707,7 @@ export function createProductionListenerRuntime(
       intervalMs: 5_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
+      blockHydrationPhaseEvidenceMetrics: blockHydration.phaseEvidence,
       rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(configuredRpcHttpProviderIds),
       rpcHttpRoleEvidenceMetrics: (): RuntimeRpcHttpRoleEvidenceV1 => roleRecorder.snapshot(),
       scannerPhaseDiagnosticsMetrics: (sampledAtMs): ScannerPhaseDiagnosticsV1 =>
@@ -771,6 +780,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
     workerAdmissionClock?: RuntimeWorkerAdmissionClockV1;
   }>>;
   readonly blockHydrationMetrics?: () => RuntimeBlockHydrationMetricsV1;
+  readonly blockHydrationPhaseEvidenceMetrics?: () => RuntimeBlockHydrationPhaseEvidenceV1 | null;
   readonly blockHydrationAdmissionMetrics?: () => RuntimeBlockHydrationAdmissionMetricsV1;
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
@@ -1155,6 +1165,7 @@ export class PersistentListenerHeartbeat {
   private stopPromise: Promise<void> | null = null;
   private closed = false;
   private readonly blockHydrationMetrics: (() => RuntimeBlockHydrationMetricsV1) | null;
+  private readonly blockHydrationPhaseEvidenceMetrics: (() => RuntimeBlockHydrationPhaseEvidenceV1 | null) | null;
   private readonly blockHydrationAdmissionMetrics: (() => RuntimeBlockHydrationAdmissionMetricsV1) | null;
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
@@ -1182,6 +1193,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Block hydration metrics provider is invalid.');
     }
     this.blockHydrationMetrics = options.blockHydrationMetrics ?? null;
+    if (options.blockHydrationPhaseEvidenceMetrics !== undefined
+      && typeof options.blockHydrationPhaseEvidenceMetrics !== 'function') {
+      throw new TypeError('Block hydration phase evidence metrics provider is invalid.');
+    }
+    this.blockHydrationPhaseEvidenceMetrics = options.blockHydrationPhaseEvidenceMetrics ?? null;
     if (options.blockHydrationAdmissionMetrics !== undefined
       && typeof options.blockHydrationAdmissionMetrics !== 'function') {
       throw new TypeError('Block hydration admission metrics provider is invalid.');
@@ -1367,6 +1383,15 @@ export class PersistentListenerHeartbeat {
       }
     }
     const blockHydration = this.blockHydrationMetrics?.();
+    let blockHydrationPhaseEvidence: RuntimeBlockHydrationPhaseEvidenceV1 | undefined;
+    if (this.blockHydrationPhaseEvidenceMetrics !== null) {
+      try {
+        const evidence = this.blockHydrationPhaseEvidenceMetrics();
+        if (evidence !== null) blockHydrationPhaseEvidence = createRuntimeBlockHydrationPhaseEvidence(evidence);
+      } catch {
+        throw new TypeError('Block hydration phase evidence metrics are invalid.');
+      }
+    }
     let blockHydrationAdmission: RuntimeBlockHydrationAdmissionMetricsV1 | undefined;
     if (this.blockHydrationAdmissionMetrics !== null) {
       try {
@@ -1440,6 +1465,7 @@ export class PersistentListenerHeartbeat {
         unresolvedCount: counts.decoderQuarantinedCount,
       })),
       ...(blockHydration === undefined ? {} : { blockHydration }),
+      ...(blockHydrationPhaseEvidence === undefined ? {} : { blockHydrationPhaseEvidence }),
       ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
