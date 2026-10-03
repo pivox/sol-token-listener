@@ -1,4 +1,4 @@
-# #218 RPC role evidence Implementation Plan v1.0.0
+# #218 RPC role evidence Implementation Plan v1.0.1
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node test runner, PostgreSQL JSONB heartbeat, Solana web3.js fetch hooks.
 
-**Base:** `origin/main@dd9c4b908230ad7a69a57d27097412ee61711b4b`. **Design:** [capacity design v1.1.0](../specs/2026-10-03-classification-throughput-capacity-design.md). No wallet, signing, submission or wider admission.
+**Base:** `origin/main@dd9c4b908230ad7a69a57d27097412ee61711b4b`. **Design:** [capacity design v1.1.1](../specs/2026-10-03-classification-throughput-capacity-design.md). No wallet, signing, submission or wider admission.
 
 ---
 
@@ -35,7 +35,7 @@
 
 **Files:** Modify `src/application/production-listener-factory.ts`, `src/storage/transaction-inbox.repository.ts`, `src/storage/api-projection.repository.ts`, `src/api/contracts.ts` and any health parser in the independent frontend; test `tests/production-listener-factory.test.ts`, `tests/transaction-inbox.repository.test.ts`, `tests/api-projection.repository.test.ts`, `tests/api-contracts.test.ts`, relevant frontend tests.
 
-- [ ] Write RED tests for RUNNING and STOPPED heartbeat snapshots with the optional sibling `rpcHttpRoleEvidence`, immutable JSONB clone, missing/invalid evidence projected as `null`, and no secret-bearing fields. An older heartbeat without the sidecar remains accepted. Assert the V1 `rpcHttpEvidence` projection is exactly unchanged.
+- [ ] Write RED tests for RUNNING and STOPPED heartbeat snapshots with the optional sibling `rpcHttpRoleEvidence`, immutable JSONB clone, absence projected as `null`, malformed stored evidence rejected as a data error, and no secret-bearing fields. An older heartbeat without the sidecar remains accepted. Assert the V1 `rpcHttpEvidence` projection is exactly unchanged.
 - [ ] Run focused tests and confirm missing sidecar failures.
 - [ ] Thread one process-owned recorder through the factory and heartbeat sampler. Clone/validate the sidecar in `writeHeartbeat`, project it from JSONB into `/api/v1/health`, and add a documented optional V1 API field. Do not introduce a SQL migration or a new endpoint.
 - [ ] Re-run focused tests, `npm run check --workspace frontend`, `npm test --workspace frontend`, `npm run build:backend`, `npm run check:backend`, `npm run lint:backend`; expect PASS. Commit persistence/API slice.
