@@ -82,6 +82,7 @@ import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js'
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
 import { createRpcHttpEvidenceRecorder } from '../solana/rpc/rpc-http-evidence.js';
 import { createRpcHttpRoleEvidenceRecorder } from '../solana/rpc/rpc-http-role-evidence.js';
+import { OrdinaryRpcAttemptBudget } from '../solana/rpc/ordinary-rpc-attempt-budget.js';
 import { openWsProgramSession } from '../solana/rpc/ws-program-session.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
@@ -294,6 +295,7 @@ export function createProductionListenerRuntime(
   const databasePool = pool ?? getDatabasePool();
   const recorder = createRpcHttpEvidenceRecorder();
   const roleRecorder = createRpcHttpRoleEvidenceRecorder();
+  const attemptBudget = config.listenerOrdinaryRpcBudgetEnabled ? new OrdinaryRpcAttemptBudget() : undefined;
   const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
   const rpcRequestTimeoutMs = rpcWorkGate === null
     ? config.listenerShutdownTimeoutMs
@@ -301,8 +303,9 @@ export function createProductionListenerRuntime(
   const rpc = new SolanaRpcClient(config, {
     recorder,
     roleRecorder,
+    ...(attemptBudget === undefined ? {} : { attemptBudget }),
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
-    ...(rpcWorkGate === null ? {} : {
+    ...(rpcWorkGate === null && attemptBudget === undefined ? {} : {
       requestTimeoutMs: rpcRequestTimeoutMs,
     }),
   });
@@ -334,14 +337,16 @@ export function createProductionListenerRuntime(
     baseDelayMs: config.rpcRetryBaseDelayMs,
   }), workerAdmissionPolicy);
   const promoted = new PromotedProviderSelector(
-    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId, undefined, recorder, roleRecorder)),
+    providers.ids.map((providerId) => createProviderPinnedFinalityPass(
+      providers, providerId, undefined, recorder, roleRecorder, attemptBudget, rpcRequestTimeoutMs,
+    )),
   );
   const hydration = config.listenerPumpFunCatchUpPageAdmissionEnabled
     ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
       providerId, ((): ProviderPinnedBlockRpc => {
         const pinned = createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
           requestTimeoutMs: rpcRequestTimeoutMs,
-        }, recorder, roleRecorder);
+        }, recorder, roleRecorder, attemptBudget);
         if (rpcWorkGate === null) return pinned;
         const gated = gateBlockTransactionRpc(rpcWorkGate, pinned);
         return Object.freeze({
@@ -402,6 +407,8 @@ export function createProductionListenerRuntime(
         undefined,
         recorder,
         roleRecorder,
+        attemptBudget,
+        rpcRequestTimeoutMs,
       );
       return [providerId, source] as const;
     }),
@@ -726,7 +733,7 @@ export function createProductionListenerRuntime(
     },
   );
 
-  return new SolanaListenerRuntime({
+  const runtime = new SolanaListenerRuntime({
     supervisor: passiveMentionDiagnosticSupervisor(supervisor, (event): void => {
       logger.info(event, 'Bilan des mentions Pump passives à la fermeture WebSocket.');
     }),
@@ -740,6 +747,18 @@ export function createProductionListenerRuntime(
   }, {
     shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
     marketIngestionEnabled: config.listenerIngestionScope === 'launchpad-and-market',
+  });
+  if (attemptBudget === undefined) return runtime;
+  return Object.freeze({
+    async start(): Promise<void> {
+      try { await runtime.start(); } catch (error) { attemptBudget.close(); throw error; }
+    },
+    close(): Promise<void> {
+      attemptBudget.close();
+      return runtime.close();
+    },
+    state: () => runtime.state(),
+    pipelineState: () => runtime.pipelineState(),
   });
 }
 

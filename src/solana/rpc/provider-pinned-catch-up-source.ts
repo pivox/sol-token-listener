@@ -9,6 +9,8 @@ import {
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
+import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
+import { createBoundedRpcFetch } from './rpc-client.js';
 
 export type ProviderPinnedCatchUpSourceErrorReason =
   | 'CONFIG_INVALID'
@@ -54,6 +56,8 @@ export function createProviderPinnedCatchUpSource(
   dependencies?: ProviderPinnedCatchUpSourceDependencies,
   recorder?: RpcHttpEvidenceRecorder,
   roleRecorder?: RpcHttpRoleEvidenceRecorder,
+  attemptBudget?: OrdinaryRpcAttemptBudget,
+  requestTimeoutMs = 30_000,
 ): ProviderPinnedCatchUpSource {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)
@@ -62,7 +66,8 @@ export function createProviderPinnedCatchUpSource(
     throw failure('CONFIG_INVALID', exposedProviderId);
   }
 
-  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder);
+  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder,
+    attemptBudget, requestTimeoutMs);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const rpc = createPinnedRpc(createRpc, httpUrl, commitment, providerId);
   const source = new SolanaCatchUpSource(rpc, commitment);
@@ -192,14 +197,17 @@ function dependencyFactory(
   selectedProviderId: RpcProviderId,
   recorder: RpcHttpEvidenceRecorder | undefined,
   roleRecorder: RpcHttpRoleEvidenceRecorder | undefined,
+  attemptBudget: OrdinaryRpcAttemptBudget | undefined,
+  requestTimeoutMs: number,
 ): (httpUrl: string, commitment: Commitment) => unknown {
   if (dependencies === undefined) {
-    if (recorder === undefined && roleRecorder === undefined) return createDefaultRpc;
+    if (recorder === undefined && roleRecorder === undefined && attemptBudget === undefined) return createDefaultRpc;
     const observedFetch = createObservedRpcFetch(
-      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'SOURCE',
+      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'SOURCE', attemptBudget,
     );
+    const boundedFetch = attemptBudget === undefined ? observedFetch : createBoundedRpcFetch(observedFetch, requestTimeoutMs);
     return (httpUrl: string, commitment: Commitment): PinnedCatchUpRpc => (
-      createDefaultRpc(httpUrl, commitment, observedFetch)
+      createDefaultRpc(httpUrl, commitment, boundedFetch)
     );
   }
   try {

@@ -14,6 +14,7 @@ import {
 } from './http-failover-transport.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
+import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
@@ -30,6 +31,7 @@ export interface SolanaRpcClientDependencies {
   readonly recorder?: RpcHttpEvidenceRecorder;
   readonly roleRecorder?: RpcHttpRoleEvidenceRecorder;
   readonly requestTimeoutMs?: number;
+  readonly attemptBudget?: OrdinaryRpcAttemptBudget;
 }
 
 type SolanaConnectionConfig = Pick<
@@ -43,18 +45,20 @@ export function createSolanaConnectionConfig(
   onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void,
 ): ConnectionConfig {
   if (config.httpRpcFallbackUrls.length === 0) {
-    const boundedFetch = dependencies.requestTimeoutMs === undefined
+    // Preserve the legacy measurement/timeout order when admission is OFF.
+    const boundedFetch = dependencies.attemptBudget !== undefined || dependencies.requestTimeoutMs === undefined
       ? undefined
-      : createBoundedRpcFetch(
-        dependencies.fetch ?? globalThis.fetch,
-        dependencies.requestTimeoutMs,
-      );
-    const configuredFetch = dependencies.recorder === undefined && dependencies.roleRecorder === undefined
+      : createBoundedRpcFetch(dependencies.fetch ?? globalThis.fetch, dependencies.requestTimeoutMs);
+    const observedFetch = dependencies.recorder === undefined && dependencies.roleRecorder === undefined
+      && dependencies.attemptBudget === undefined
       ? boundedFetch
       : createObservedRpcFetch(
         'primary', dependencies.recorder, boundedFetch ?? dependencies.fetch,
-        dependencies.roleRecorder, 'SHARED_CLIENT',
+        dependencies.roleRecorder, 'SHARED_CLIENT', dependencies.attemptBudget,
       );
+    const configuredFetch = dependencies.attemptBudget === undefined || dependencies.requestTimeoutMs === undefined
+      ? observedFetch
+      : createBoundedRpcFetch(observedFetch ?? globalThis.fetch, dependencies.requestTimeoutMs);
     return {
       commitment: config.commitment,
       wsEndpoint: config.wsRpcUrl,
@@ -72,6 +76,7 @@ export function createSolanaConnectionConfig(
   ]);
   const failoverFetch = createRpcHttpFailoverFetch({
     endpoints,
+    ...(dependencies.attemptBudget === undefined ? {} : { attemptBudget: dependencies.attemptBudget }),
     ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
     ...(dependencies.recorder === undefined ? {} : { recorder: dependencies.recorder }),
