@@ -1,5 +1,15 @@
 import { isProxy } from 'node:util/types';
 import {
+  type ScannerDiagnosticCode,
+  type ScannerDiagnosticOutcome,
+  type ScannerDiagnosticPhase,
+  type ScannerDiagnosticProgram,
+  type ScannerPhaseEvent,
+  type ScannerFrontEvent,
+  type ScannerPhaseDiagnosticsCollector,
+  SCANNER_DIAGNOSTIC_CODES,
+} from '../domain/scanner-phase-diagnostics.js';
+import {
   advanceStrictCatchUpRun,
   assertValidStrictCatchUpRun,
   createStrictCatchUpRun,
@@ -36,8 +46,9 @@ import {
 } from '../solana/rpc/catch-up-source.js';
 import {
   mergeCatchUpDiscoveries,
-  type CatchUpDiscoveryProgram,
 } from './catch-up-discovery.js';
+import { PumpFunCatchUpBlockClassifierError } from './pumpfun-catch-up-block-classifier.js';
+import { PumpFunStrictCatchUpPageAdmitterError } from './pumpfun-strict-catch-up-page-admitter.js';
 
 export const MAX_STRICT_CATCH_UP_PAGES = 100;
 export type StrictCatchUpPolicy = 'live-edge' | 'strict';
@@ -52,6 +63,7 @@ export interface StrictCatchUpScannerOptions {
   readonly now?: () => number;
   readonly policy?: StrictCatchUpPolicy;
   readonly programs?: readonly ListenerIngestionProgram[];
+  readonly diagnosticObserver?: Pick<ScannerPhaseDiagnosticsCollector, 'recordPhase' | 'recordFront' | 'markUnavailable'>;
 }
 
 export interface StrictCatchUpBoundaries {
@@ -242,6 +254,7 @@ export class StrictCatchUpScanner {
   private readonly now: () => number;
   private readonly policy: StrictCatchUpPolicy;
   private readonly programs: readonly ListenerIngestionProgram[];
+  private readonly diagnosticObserver: StrictCatchUpScannerOptions['diagnosticObserver'];
 
   public constructor(
     private readonly source: StrictCatchUpSource,
@@ -250,11 +263,12 @@ export class StrictCatchUpScanner {
     private readonly pageAdmitter?: StrictCatchUpPageAdmitter,
   ) {
     this.providerId = snapshotProviderId(source);
-    const { pageSize, maxPages, now, policy, programs } = snapshotOptions(options);
+    const { pageSize, maxPages, now, policy, programs, diagnosticObserver } = snapshotOptions(options);
     if (!positiveBound(pageSize, MAX_CATCH_UP_PAGE_SIZE)
       || !positiveBound(maxPages, MAX_STRICT_CATCH_UP_PAGES)
       || (policy !== undefined && policy !== 'live-edge' && policy !== 'strict')
-      || (now !== undefined && typeof now !== 'function')) {
+      || (now !== undefined && typeof now !== 'function')
+      || (diagnosticObserver !== undefined && !isDiagnosticObserver(diagnosticObserver))) {
       throw new TypeError('Strict catch-up scanner bounds are invalid.');
     }
     this.pageSize = pageSize;
@@ -262,6 +276,7 @@ export class StrictCatchUpScanner {
     this.now = now === undefined ? Date.now : now as () => number;
     this.policy = policy ?? 'strict';
     this.programs = snapshotPrograms(programs ?? DEFAULT_PROGRAMS);
+    this.diagnosticObserver = diagnosticObserver;
   }
 
   public async scan(signal: AbortSignal): Promise<StrictCatchUpScanResult> {
@@ -315,12 +330,21 @@ export class StrictCatchUpScanner {
     }
     // The frozen head predates this recovery session. Complete durable work,
     // then open a new session and bridge the new head in a separate bounded pass.
-    if (activePrograms.length > 0) throw new StrictCatchUpRefreshRequiredError(this.providerId);
+    if (activePrograms.length > 0) {
+      const last = activePrograms.at(-1);
+      if (last !== undefined) this.observeOutcome(last.program.family, 'SUPERVISOR',
+        'REFRESH_REQUIRED', 'CATCH_UP_REFRESH_REQUIRED');
+      throw new StrictCatchUpRefreshRequiredError(this.providerId);
+    }
     for (const program of this.programs) {
       const scan = await this.awaited(signal, () => this.scanProgram(
         program, boundaries, observedAtMs, discoveries, signal, null,
       ));
-      if (scan.refreshRequired) throw new StrictCatchUpRefreshRequiredError(this.providerId);
+      if (scan.refreshRequired) {
+        this.observeOutcome(program.family, 'SUPERVISOR',
+          'REFRESH_REQUIRED', 'CATCH_UP_REFRESH_REQUIRED');
+        throw new StrictCatchUpRefreshRequiredError(this.providerId);
+      }
       scans.push(scan);
     }
 
@@ -377,10 +401,8 @@ export class StrictCatchUpScanner {
     const liveEdgeBootstrap = this.policy === 'live-edge' && expected === null && run === null;
 
     for (let pageCount = 1; pageCount <= this.maxPages; pageCount += 1) {
-      const page = await this.awaited(
-        signal,
-        () => this.readPage(program, before, signal),
-      );
+      const sourceStarted = this.diagnosticStart();
+      const page = await this.readPage(program, before, signal, sourceStarted);
       const rows: CatchUpSignature[] = [];
       let boundaryFound = false;
       let crossedBoundarySlot = false;
@@ -390,18 +412,18 @@ export class StrictCatchUpScanner {
           || row.signature !== row.signature.trim()
           || Buffer.byteLength(row.signature, 'utf8') > 128
           || (row.blockTimeMs !== null && !validMilliseconds(row.blockTimeMs))) {
-          throw this.failure('source', program.key, 'response');
+          throw this.sourceValidationFailure(program, sourceStarted, 'response');
         }
         if (previousSlot !== null && row.slot > previousSlot) {
-          throw this.failure('source', program.key, 'response');
+          throw this.sourceValidationFailure(program, sourceStarted, 'response');
         }
         previousSlot = row.slot;
         if (signatures.has(row.signature)) {
-          throw this.failure('source', program.key, 'pagination');
+          throw this.sourceValidationFailure(program, sourceStarted, 'pagination');
         }
         signatures.add(row.signature);
         if (expected !== null && row.signature === expected.signature) {
-          if (row.slot !== expected.slot) throw this.failure('source', program.key, 'response');
+          if (row.slot !== expected.slot) throw this.sourceValidationFailure(program, sourceStarted, 'response');
           boundaryFound = true;
           break;
         }
@@ -419,7 +441,7 @@ export class StrictCatchUpScanner {
               ]);
               discoveries.set(row.signature, merged[0] ?? row);
             } catch {
-              throw this.failure('source', program.key, 'response');
+              throw this.sourceValidationFailure(program, sourceStarted, 'response');
             }
           } else {
             discoveries.set(row.signature, row);
@@ -427,15 +449,14 @@ export class StrictCatchUpScanner {
         }
         rows.push(row);
       }
+      this.observePhase(program.family, 'SOURCE_PAGE', sourceStarted, 'OK', null);
       observedHead ??= rows[0] ?? null;
       let pageClassifiedCount = 0n;
       let pageEnqueuedCount = 0n;
       if (!liveEdgeBootstrap) {
         const pageAdmitter = this.pageAdmitter;
         if (program.family === 'pumpfun' && pageAdmitter !== undefined && rows.length > 0) {
-          const admitted = await this.operation(signal, 'page-admit', program.key,
-            () => pageAdmitter.admitPage(program, Object.freeze(rows), signal));
-          const counts = snapshotPageAdmission(admitted, rows);
+          const counts = await this.admitPage(program, rows, pageAdmitter, signal);
           pageClassifiedCount = counts.signaturesClassified;
           pageEnqueuedCount = counts.signaturesEnqueued;
         } else {
@@ -464,7 +485,7 @@ export class StrictCatchUpScanner {
         && tail !== undefined && observedHead !== null) {
         const current = run;
         const head = observedHead;
-        run = await this.operation(signal, current === null ? 'run-create' : 'run-progress', program.key, async () => {
+        run = await this.operation(signal, current === null ? 'run-create' : 'run-progress', program, async () => {
           const progress = {
             beforeSignature: tail.signature, lastAcceptedSlot: tail.slot,
             pagesScanned: (current?.pagesScanned ?? 0n) + 1n,
@@ -499,12 +520,13 @@ export class StrictCatchUpScanner {
           });
           const completedRun = run;
           if (completedRun === null) {
-            await this.operation(signal, 'checkpoint-cas', program.key,
+            await this.operation(signal, 'checkpoint-cas', program,
               () => this.repository.compareAndSwapCheckpoint(expected, next));
           } else {
-            await this.operation(signal, 'run-complete', program.key,
+            await this.operation(signal, 'run-complete', program,
               () => this.repository.completeStrictCatchUpRun({ run: completedRun, nextCheckpoint: next }));
           }
+          if (!sameCheckpoint(expected, next)) this.observeFront(program.family, 'CHECKPOINT_ADVANCED');
           checkpointCasCount = 1;
         }
         return Object.freeze({ discoveredCount, enqueuedCount, checkpointCasCount, pageCount, refreshRequired });
@@ -524,6 +546,7 @@ export class StrictCatchUpScanner {
       }
     }
     if (run === null) throw this.failure('source', program.key, 'pagination');
+    this.observeOutcome(program.family, 'RUN_PROGRESS', 'PAUSED', 'CATCH_UP_PAGE_BUDGET_EXHAUSTED');
     throw new StrictCatchUpPausedError(this.providerId, program.key, run.runId,
       run.pagesScanned, run.signaturesEnqueued);
   }
@@ -531,38 +554,160 @@ export class StrictCatchUpScanner {
   private async operation<T>(
     signal: AbortSignal,
     stage: StrictCatchUpScannerStage,
-    key: ProcessingCheckpointKey,
+    key: ProcessingCheckpointKey | ListenerIngestionProgram,
     operation: () => Promise<T>,
   ): Promise<T> {
-    return this.awaited(signal, async () => {
-      try {
-        return await operation();
-      } catch {
-        throw this.failure(stage, key);
-      }
-    });
+    const checkpointKey = typeof key === 'string' ? key : key.key;
+    const program = typeof key === 'string' ? programForKey(key) : key.family;
+    const phase = phaseForStage(stage);
+    const started = phase === null ? null : this.diagnosticStart();
+    let originalCode: ScannerDiagnosticCode = 'UNKNOWN';
+    try {
+      const result = await this.awaited(signal, async () => {
+        try {
+          return await operation();
+        } catch (error) {
+          originalCode = originalDiagnosticCode(error);
+          throw this.failure(stage, checkpointKey);
+        }
+      });
+      if (phase !== null) this.observePhase(program, phase, started, 'OK', null);
+      if (stage === 'run-create' || stage === 'run-progress') this.observeFront(program, 'PROGRESS');
+      if (stage === 'run-complete') this.observeFront(program, 'COMPLETE');
+      return result;
+    } catch (error) {
+      if (phase !== null) this.observePhase(program, phase, started,
+        signal.aborted ? 'ABORTED' : 'ERROR', signal.aborted ? null : originalCode);
+      throw error;
+    }
   }
 
   private async readPage(
-    program: CatchUpDiscoveryProgram,
+    program: ListenerIngestionProgram,
     before: string | undefined,
     signal: AbortSignal,
+    started: number | null,
   ): Promise<readonly CatchUpSignature[]> {
-    const value = await this.awaited(signal, async () => {
-      try {
-        return await this.source.list(program.id, before, this.pageSize);
-      } catch (error) {
-        throw this.failure(
-          'source',
-          program.key,
-          trustedCatchUpSourceErrorStage(error) ?? 'request',
-        );
-      }
-    });
+    let originalStage: CatchUpSourceStage = 'request';
     try {
-      return snapshotCatchUpSignatures(value, this.pageSize);
+      const value = await this.awaited(signal, async () => {
+        try {
+          return await this.source.list(program.id, before, this.pageSize);
+        } catch (error) {
+          originalStage = trustedCatchUpSourceErrorStage(error) ?? 'request';
+          throw this.failure('source', program.key, originalStage);
+        }
+      });
+      try {
+        return snapshotCatchUpSignatures(value, this.pageSize);
+      } catch {
+        originalStage = 'response';
+        throw this.failure('source', program.key, 'response');
+      }
+    } catch (error) {
+      this.observePhase(program.family, 'SOURCE_PAGE', started,
+        signal.aborted ? 'ABORTED' : 'ERROR',
+        signal.aborted ? null : sourceDiagnosticCode(originalStage));
+      throw error;
+    }
+  }
+
+  private sourceValidationFailure(
+    program: ListenerIngestionProgram,
+    started: number | null,
+    stage: CatchUpSourceStage,
+  ): StrictCatchUpScannerError {
+    this.observePhase(program.family, 'SOURCE_PAGE', started, 'ERROR', sourceDiagnosticCode(stage));
+    return this.failure('source', program.key, stage);
+  }
+
+  private async admitPage(
+    program: ListenerIngestionProgram,
+    rows: readonly CatchUpSignature[],
+    pageAdmitter: StrictCatchUpPageAdmitter,
+    signal: AbortSignal,
+  ): Promise<Pick<StrictCatchUpPageAdmissionResult, 'signaturesClassified' | 'signaturesEnqueued'>> {
+    const started = this.diagnosticStart();
+    let originalCode: ScannerDiagnosticCode = 'UNKNOWN';
+    try {
+      const admitted = await this.awaited(signal, async () => {
+        try {
+          return await pageAdmitter.admitPage(program, Object.freeze(rows), signal);
+        } catch (error) {
+          originalCode = originalDiagnosticCode(error);
+          throw this.failure('page-admit', program.key);
+        }
+      });
+      let counts: Pick<StrictCatchUpPageAdmissionResult, 'signaturesClassified' | 'signaturesEnqueued'>;
+      try {
+        counts = snapshotPageAdmission(admitted, rows);
+      } catch (error) {
+        originalCode = 'INVALID_RECEIPT';
+        throw error;
+      }
+      this.observePhase(program.family, 'PAGE_ADMIT', started, 'OK', null);
+      return counts;
+    } catch (error) {
+      this.observePhase(program.family, 'PAGE_ADMIT', started,
+        signal.aborted ? 'ABORTED' : 'ERROR', signal.aborted ? null : originalCode);
+      throw error;
+    }
+  }
+
+  private diagnosticStart(): number | null {
+    if (this.diagnosticObserver === undefined) return null;
+    try {
+      return performance.now();
     } catch {
-      throw this.failure('source', program.key, 'response');
+      this.markDiagnosticsUnavailable();
+      return null;
+    }
+  }
+
+  private observeOutcome(
+    program: ScannerDiagnosticProgram,
+    phase: ScannerDiagnosticPhase,
+    outcome: ScannerDiagnosticOutcome,
+    code: ScannerDiagnosticCode | null,
+  ): void {
+    this.observePhase(program, phase, null, outcome, code);
+  }
+
+  private observePhase(
+    program: ScannerDiagnosticProgram,
+    phase: ScannerDiagnosticPhase,
+    started: number | null,
+    outcome: ScannerDiagnosticOutcome,
+    code: ScannerDiagnosticCode | null,
+  ): void {
+    const observer = this.diagnosticObserver;
+    if (observer === undefined) return;
+    try {
+      const elapsed = started === null ? 0 : Math.max(0, Math.ceil(performance.now() - started));
+      const event: ScannerPhaseEvent = Object.freeze({
+        provider: this.providerId, program, phase, durationMs: elapsed, outcome, code,
+      });
+      observer.recordPhase(event);
+    } catch {
+      this.markDiagnosticsUnavailable();
+    }
+  }
+
+  private observeFront(program: ScannerDiagnosticProgram, kind: ScannerFrontEvent['kind']): void {
+    const observer = this.diagnosticObserver;
+    if (observer === undefined) return;
+    try {
+      observer.recordFront(Object.freeze({ program, kind, atMs: Date.now() }));
+    } catch {
+      this.markDiagnosticsUnavailable();
+    }
+  }
+
+  private markDiagnosticsUnavailable(): void {
+    try {
+      this.diagnosticObserver?.markUnavailable();
+    } catch {
+      // Diagnostics are non-authoritative; never change the scanner outcome.
     }
   }
 
@@ -570,14 +715,23 @@ export class StrictCatchUpScanner {
     key: ProcessingCheckpointKey,
     signal: AbortSignal,
   ): Promise<ProcessingCheckpoint | null> {
-    return this.awaited(signal, async () => {
-      try {
-        const value = await this.repository.readCheckpoint(key);
-        return value === null ? null : snapshotCheckpoint(value, key);
-      } catch {
-        throw this.failure('checkpoint-read', key);
-      }
-    });
+    const started = this.diagnosticStart();
+    try {
+      const checkpoint = await this.awaited(signal, async () => {
+        try {
+          const value = await this.repository.readCheckpoint(key);
+          return value === null ? null : snapshotCheckpoint(value, key);
+        } catch {
+          throw this.failure('checkpoint-read', key);
+        }
+      });
+      this.observePhase(programForKey(key), 'CHECKPOINT', started, 'OK', null);
+      return checkpoint;
+    } catch (error) {
+      this.observePhase(programForKey(key), 'CHECKPOINT', started,
+        signal.aborted ? 'ABORTED' : 'ERROR', signal.aborted ? null : 'UNKNOWN');
+      throw error;
+    }
   }
 
   private async recordWindowFailure(
@@ -706,6 +860,54 @@ function assertNotAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new StrictCatchUpAbortedError();
 }
 
+function phaseForStage(stage: StrictCatchUpScannerStage): ScannerDiagnosticPhase | null {
+  switch (stage) {
+    case 'page-admit': return 'PAGE_ADMIT';
+    case 'run-read':
+    case 'run-create':
+    case 'run-progress':
+    case 'run-fail':
+    case 'run-supersede': return 'RUN_PROGRESS';
+    case 'run-complete':
+    case 'checkpoint-cas':
+    case 'failure-resolve': return 'CHECKPOINT';
+    default: return null;
+  }
+}
+
+function programForKey(key: ProcessingCheckpointKey): ScannerDiagnosticProgram {
+  return key === 'launchpad' ? 'pumpfun' : 'pumpswap';
+}
+
+function sourceDiagnosticCode(stage: CatchUpSourceStage): ScannerDiagnosticCode {
+  switch (stage) {
+    case 'request': return 'SOURCE_REQUEST';
+    case 'response': return 'SOURCE_RESPONSE';
+    case 'pagination': return 'SOURCE_PAGINATION';
+  }
+}
+
+function originalDiagnosticCode(error: unknown): ScannerDiagnosticCode {
+  if (typeof error !== 'object' || error === null || isProxy(error)
+    || !(error instanceof PumpFunCatchUpBlockClassifierError
+      || error instanceof PumpFunStrictCatchUpPageAdmitterError)) return 'UNKNOWN';
+  const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+  const code = descriptor !== undefined && 'value' in descriptor ? descriptor.value as unknown : null;
+  return typeof code === 'string' && SCANNER_DIAGNOSTIC_CODES.some(value => value === code)
+    ? code as ScannerDiagnosticCode : 'UNKNOWN';
+}
+
+function isDiagnosticObserver(value: unknown): value is NonNullable<StrictCatchUpScannerOptions['diagnosticObserver']> {
+  try {
+    return typeof value === 'object' && value !== null && !isProxy(value)
+      && typeof Reflect.get(value, 'recordPhase') === 'function'
+      && typeof Reflect.get(value, 'recordFront') === 'function'
+      && typeof Reflect.get(value, 'markUnavailable') === 'function';
+  } catch {
+    return false;
+  }
+}
+
 function snapshotBoundaries(value: unknown): StrictCatchUpBoundaries {
   try {
     if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
@@ -789,6 +991,7 @@ function snapshotOptions(options: unknown): {
   readonly now: unknown;
   readonly policy: unknown;
   readonly programs: unknown;
+  readonly diagnosticObserver: unknown;
 } {
   try {
     if (typeof options !== 'object' || options === null || isProxy(options) || Array.isArray(options)) {
@@ -797,14 +1000,15 @@ function snapshotOptions(options: unknown): {
     const prototype: object | null = Object.getPrototypeOf(options) as object | null;
     if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
     const keys = Reflect.ownKeys(options);
-    if (keys.length < 2 || keys.length > 5
+    if (keys.length < 2 || keys.length > 6
       || !keys.includes('pageSize')
       || !keys.includes('maxPages')
       || keys.some((key) => key !== 'pageSize'
         && key !== 'maxPages'
         && key !== 'now'
         && key !== 'policy'
-        && key !== 'programs')) {
+        && key !== 'programs'
+        && key !== 'diagnosticObserver')) {
       throw new TypeError();
     }
     return Object.freeze({
@@ -813,6 +1017,8 @@ function snapshotOptions(options: unknown): {
       now: keys.includes('now') ? ownData(options, 'now') : undefined,
       policy: keys.includes('policy') ? ownData(options, 'policy') : undefined,
       programs: keys.includes('programs') ? ownData(options, 'programs') : undefined,
+      diagnosticObserver: keys.includes('diagnosticObserver')
+        ? ownData(options, 'diagnosticObserver') : undefined,
     });
   } catch {
     throw new TypeError('Strict catch-up scanner bounds are invalid.');

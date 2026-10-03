@@ -51,6 +51,7 @@ import {
 import { RPC_PROVIDER_IDS, isRpcProviderId } from '../src/domain/rpc-provider.js';
 import { createFirstProcessingCanaryEvidence } from '../src/domain/first-processing-canary.js';
 import { snapshotRuntimeWorkerAdmissionMetrics } from '../src/domain/worker-admission-metrics.js';
+import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
@@ -171,6 +172,26 @@ void test('decoder quarantine metrics are exact, frozen, aggregate-only and roll
   ]) {
     assert.throws(() => {
       assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, decoderQuarantine }));
+    }, TypeError);
+  }
+});
+
+void test('scanner phase heartbeat accepts only bounded immutable diagnostics and legacy omission', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const diagnostics = new ScannerPhaseDiagnosticsCollector().snapshot(heartbeat.updatedAtMs);
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, scannerPhaseDiagnostics: diagnostics }));
+  });
+  for (const scannerPhaseDiagnostics of [
+    null,
+    { ...diagnostics },
+    Object.freeze({ ...diagnostics, sampledAtMs: heartbeat.updatedAtMs + 1 }),
+    Object.freeze({ ...diagnostics, signature: 'must-not-leak' }),
+    new Proxy(diagnostics, {}),
+  ]) {
+    assert.throws(() => {
+      assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, scannerPhaseDiagnostics }));
     }, TypeError);
   }
 });

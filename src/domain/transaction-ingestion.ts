@@ -19,6 +19,10 @@ import {
   type RuntimeWorkerAdmissionClockV1,
   type RuntimeWorkerAdmissionMetricsV1,
 } from './worker-admission-metrics.js';
+import {
+  snapshotScannerPhaseDiagnostics,
+  type ScannerPhaseDiagnosticsV1,
+} from './scanner-phase-diagnostics.js';
 import type { ChainConfirmationStatus } from './types.js';
 import { isCanonicalSolanaPublicKey } from './solana-public-key.js';
 import {
@@ -295,6 +299,7 @@ export interface RuntimeHeartbeat {
   readonly workerAdmission?: RuntimeWorkerAdmissionMetricsV1;
   readonly workerAdmissionClock?: RuntimeWorkerAdmissionClockV1;
   readonly decoderQuarantine?: RuntimeDecoderQuarantineMetricsV1;
+  readonly scannerPhaseDiagnostics?: ScannerPhaseDiagnosticsV1;
 }
 
 export interface RuntimeDecoderQuarantineMetricsV1 {
@@ -709,6 +714,7 @@ export function assertValidRuntimeHeartbeat(
 ): asserts value is RuntimeHeartbeat {
   if (isProxy(value)) throw new TypeError('Runtime heartbeat is invalid.');
   let workerAdmissionClock: RuntimeWorkerAdmissionClockV1 | undefined;
+  let scannerPhaseDiagnostics: ScannerPhaseDiagnosticsV1 | undefined;
   // Validate the original evidence before the generic durable snapshot can normalize proxies.
   if (typeof value === 'object' && value !== null) {
     const evidence = Object.getOwnPropertyDescriptor(value, 'rpcHttpEvidence');
@@ -749,6 +755,15 @@ export function assertValidRuntimeHeartbeat(
       }
       snapshotRuntimeDecoderQuarantineMetrics(decoderQuarantine.value);
     }
+    const scannerDiagnostic = Object.getOwnPropertyDescriptor(value, 'scannerPhaseDiagnostics');
+    if (scannerDiagnostic !== undefined) {
+      if (!('value' in scannerDiagnostic) || scannerDiagnostic.enumerable !== true
+        || typeof scannerDiagnostic.value !== 'object' || scannerDiagnostic.value === null
+        || isProxy(scannerDiagnostic.value) || !Object.isFrozen(scannerDiagnostic.value)) {
+        throw new TypeError('Scanner phase diagnostics are invalid.');
+      }
+      scannerPhaseDiagnostics = snapshotScannerPhaseDiagnostics(scannerDiagnostic.value);
+    }
   }
   const record = frozenRecord(value, 'Runtime heartbeat');
   for (const field of [
@@ -766,6 +781,10 @@ export function assertValidRuntimeHeartbeat(
   assertMilliseconds(record.updatedAtMs, 'Runtime heartbeat updatedAtMs');
   if (workerAdmissionClock !== undefined && workerAdmissionClock.sampledAtMs > record.updatedAtMs) {
     throw new TypeError('Runtime worker admission clock follows updatedAtMs.');
+  }
+  if (scannerPhaseDiagnostics !== undefined
+    && scannerPhaseDiagnostics.sampledAtMs > record.updatedAtMs) {
+    throw new TypeError('Scanner phase diagnostics follow updatedAtMs.');
   }
   if (record.updatedAtMs < record.startedAtMs) {
     throw new TypeError('Runtime heartbeat updatedAtMs precedes startedAtMs.');

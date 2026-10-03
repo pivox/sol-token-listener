@@ -4,6 +4,7 @@ import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
 import type { RuntimeRpcHttpEvidenceV1 } from '../src/domain/rpc-http-evidence.js';
 import { RPC_PROVIDER_IDS } from '../src/domain/rpc-provider.js';
+import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { createFirstProcessingCanaryEvidence, type RuntimeFirstProcessingCanaryEvidenceV1 } from '../src/domain/first-processing-canary.js';
 import {
   snapshotRuntimeWorkerAdmissionMetrics,
@@ -62,6 +63,46 @@ import { PostgresTransactionInboxRepository } from '../src/storage/transaction-i
 import type { PumpFunWorkerAdmissionPolicyV1 } from '../src/domain/worker-admission.js';
 
 const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
+void test('production wires one scanner diagnostic collector to both scan paths, classifier and heartbeat', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.match(source, /const scannerPhaseDiagnostics = new ScannerPhaseDiagnosticsCollector\(\)/u);
+  assert.equal(source.match(/diagnosticObserver: scannerPhaseDiagnostics/g)?.length, 3);
+  assert.match(source, /diagnosticProviderId: providerId/u);
+  assert.match(source, /scannerPhaseDiagnosticsMetrics:\s*\(sampledAtMs\)/u);
+});
+
+void test('heartbeat persists scanner phase snapshots at its own timestamp and preserves failures explicitly', async () => {
+  const diagnostics = new ScannerPhaseDiagnosticsCollector();
+  diagnostics.recordPhase({
+    provider: 'primary', program: 'pumpfun', phase: 'PAGE_ADMIT',
+    durationMs: 4, outcome: 'ERROR', code: 'LOCATOR_RETRYABLE',
+  });
+  const writes: RuntimeHeartbeat[] = [];
+  let unavailable = false;
+  const heartbeat = new PersistentListenerHeartbeat({
+    ...heartbeatCanaryMethods(), counts: heartbeatCounts,
+    async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    scannerPhaseDiagnosticsMetrics: (sampledAtMs) => {
+      if (unavailable) throw new Error('private diagnostic failure');
+      return diagnostics.snapshot(sampledAtMs);
+    },
+  });
+  await heartbeat.start();
+  unavailable = true;
+  await heartbeat.stop();
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0]?.scannerPhaseDiagnostics?.sampledAtMs, writes[0]?.updatedAtMs);
+  assert.equal(writes[0]?.scannerPhaseDiagnostics?.buckets[0]?.lastCode, 'LOCATOR_RETRYABLE');
+  assert.ok(Object.isFrozen(writes[0]?.scannerPhaseDiagnostics));
+  assert.equal(writes[1]?.scannerPhaseDiagnostics?.unavailable, true);
+  assert.deepEqual(writes[1]?.scannerPhaseDiagnostics?.buckets, []);
+  assert.doesNotMatch(JSON.stringify(writes.map((value) => value.scannerPhaseDiagnostics)),
+    /private diagnostic failure/u);
+});
 
 void test('paired inbox provider propagates its detached frozen clock for RUNNING and STOPPED', async () => {
   const source = Object.freeze({ version: 1 as const, sampledAtMs: 1_000 });

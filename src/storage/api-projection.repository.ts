@@ -42,6 +42,7 @@ import {
 } from '../api/contracts.js';
 import { isProxy } from 'node:util/types';
 import { snapshotRuntimeBlockHydrationAdmissionMetrics } from '../domain/block-hydration-admission.js';
+import { snapshotScannerPhaseDiagnostics, type ScannerPhaseDiagnosticsV1 } from '../domain/scanner-phase-diagnostics.js';
 import {
   MAX_TIMELINE_INDEX,
   MAX_TIMELINE_SLOT,
@@ -2117,7 +2118,7 @@ function emptyHeartbeat(
     websocket, blockHydration: null, blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
     workerAdmissionClock: null,
     rpcHttpEvidence: null,
-    firstProcessingCanary: null, decoderQuarantine: null });
+    firstProcessingCanary: null, decoderQuarantine: null, scannerPhaseDiagnostics: null });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2211,7 +2212,26 @@ function heartbeatFromRow(
     rpcHttpEvidence: rpcHttpEvidenceFromPayload(row.heartbeat_payload),
     firstProcessingCanary: firstProcessingCanaryFromPayload(row.heartbeat_payload),
     decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
+    scannerPhaseDiagnostics: scannerPhaseDiagnosticsFromPayload(row.heartbeat_payload, Date.parse(updatedAt)),
   });
+}
+
+function scannerPhaseDiagnosticsFromPayload(
+  value: unknown,
+  updatedAtMs: number,
+): ScannerPhaseDiagnosticsV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'scannerPhaseDiagnostics');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  try {
+    const diagnostics = snapshotScannerPhaseDiagnostics(descriptor.value);
+    if (diagnostics.sampledAtMs > updatedAtMs) throw invalid();
+    return diagnostics;
+  } catch {
+    throw invalid();
+  }
 }
 
 function blockHydrationAdmissionFromPayload(value: unknown): ApiBlockHydrationAdmissionMetricsV1 | null {

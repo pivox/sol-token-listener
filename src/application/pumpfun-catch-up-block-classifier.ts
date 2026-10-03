@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { isProxy } from 'node:util/types';
+import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
+import type {
+  ScannerDiagnosticCode,
+  ScannerDiagnosticPhase,
+  ScannerPhaseDiagnosticsCollector,
+} from '../domain/scanner-phase-diagnostics.js';
 import type { MergedCatchUpDiscovery } from './catch-up-discovery.js';
 import {
   createCatchUpClassification,
@@ -131,6 +138,8 @@ export interface PumpFunCatchUpBlockClassifierOptions {
   readonly coverageFastPathEnabled: boolean;
   readonly coverageRepository: CatchUpAdmissionCoverageRepository | null;
   readonly slotPersistencePipelineEnabled?: boolean;
+  readonly diagnosticProviderId?: RpcProviderId;
+  readonly diagnosticObserver?: Pick<ScannerPhaseDiagnosticsCollector, 'recordPhase' | 'markUnavailable'>;
 }
 
 /** B3b composes this service for provider-affine Pump.fun strict scans when the restart-only flag is enabled. */
@@ -138,6 +147,8 @@ export class PumpFunCatchUpBlockClassifier {
   private readonly coverageFastPathEnabled: boolean;
   private readonly coverageRepository: CatchUpAdmissionCoverageRepository | null;
   private readonly slotPersistencePipelineEnabled: boolean;
+  private readonly diagnosticProviderId: RpcProviderId | null;
+  private readonly diagnosticObserver: Pick<ScannerPhaseDiagnosticsCollector, 'recordPhase' | 'markUnavailable'> | null;
 
   public constructor(
     private readonly locator: PumpFunCatchUpTransactionLocator,
@@ -148,9 +159,13 @@ export class PumpFunCatchUpBlockClassifier {
     this.coverageFastPathEnabled = options?.coverageFastPathEnabled ?? false;
     this.coverageRepository = options?.coverageRepository ?? null;
     this.slotPersistencePipelineEnabled = options?.slotPersistencePipelineEnabled ?? false;
+    this.diagnosticProviderId = options?.diagnosticProviderId ?? null;
+    this.diagnosticObserver = options?.diagnosticObserver ?? null;
     if (typeof this.coverageFastPathEnabled !== 'boolean'
       || typeof this.slotPersistencePipelineEnabled !== 'boolean'
-      || (this.coverageFastPathEnabled && this.coverageRepository === null)) {
+      || (this.coverageFastPathEnabled && this.coverageRepository === null)
+      || (this.diagnosticObserver !== null && !isRpcProviderId(this.diagnosticProviderId))
+      || (this.diagnosticObserver === null && this.diagnosticProviderId !== null)) {
       throw new TypeError('Pump.fun catch-up coverage configuration is invalid.');
     }
   }
@@ -205,9 +220,12 @@ export class PumpFunCatchUpBlockClassifier {
       programIds: discovery.programIds,
     } satisfies CatchUpAdmissionCoverageCandidate)));
     if (candidates.length > 0) {
-      const covered = await this.awaited(signal,
-        () => coverageRepository.readExistingCatchUpCoverage(candidates, signal));
-      for (const receipt of validateCoverageReceipts(covered, candidates)) {
+      const covered = await this.observe('COVERAGE_READ', signal, async () => {
+        const value = await this.awaited(signal,
+          () => coverageRepository.readExistingCatchUpCoverage(candidates, signal));
+        return validateCoverageReceipts(value, candidates);
+      });
+      for (const receipt of covered) {
         receipts.set(receipt.signature, receipt);
       }
     }
@@ -290,7 +308,8 @@ export class PumpFunCatchUpBlockClassifier {
     const settled: PromiseSettledResult<HydrationOutcome>[] = [];
     for (const group of groups.values()) {
       assertNotAborted(signal);
-      const results = await Promise.allSettled(group.map(({ row }) => this.hydrate(row, signal)));
+      const results = await Promise.allSettled(group.map(({ row }) =>
+        this.observe('BLOCK_HYDRATE', signal, () => this.hydrate(row, signal))));
       results.forEach((result, groupIndex) => {
         const entry = group[groupIndex];
         if (entry !== undefined) settled[entry.index] = result;
@@ -356,19 +375,65 @@ export class PumpFunCatchUpBlockClassifier {
     classification: CatchUpClassification,
     signal: AbortSignal,
   ): Promise<CatchUpClassificationReceipt> {
-    assertNotAborted(signal);
-    const receipt = await this.awaited(signal,
-      () => this.repository.recordCatchUpClassification(classification, signal));
-    try {
-      assertValidCatchUpClassificationReceipt(receipt);
-      if (receipt.signature !== classification.signature || receipt.slot !== classification.slot
-        || (receipt.persistence !== 'ALREADY_ADMITTED'
-          && receipt.disposition !== classification.disposition)) {
-        throw new TypeError();
+    return this.observe('CLASSIFICATION_WRITE', signal, async () => {
+      assertNotAborted(signal);
+      const receipt = await this.awaited(signal,
+        () => this.repository.recordCatchUpClassification(classification, signal));
+      try {
+        assertValidCatchUpClassificationReceipt(receipt);
+        if (receipt.signature !== classification.signature || receipt.slot !== classification.slot
+          || (receipt.persistence !== 'ALREADY_ADMITTED'
+            && receipt.disposition !== classification.disposition)) {
+          throw new TypeError();
+        }
+        return receipt;
+      } catch {
+        throw failure('INVALID_RECEIPT');
       }
-      return receipt;
+    });
+  }
+
+  private async observe<T>(
+    phase: Extract<ScannerDiagnosticPhase,
+      'COVERAGE_READ' | 'BLOCK_HYDRATE' | 'CLASSIFICATION_WRITE'>,
+    signal: AbortSignal,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (this.diagnosticObserver === null) return operation();
+    const startedAt = performance.now();
+    try {
+      const result = await operation();
+      this.emitDiagnostic(phase, startedAt, 'OK', null);
+      return result;
+    } catch (error) {
+      const aborted = signal.aborted || error instanceof PumpFunCatchUpBlockClassifierAbortedError;
+      this.emitDiagnostic(phase, startedAt, aborted ? 'ABORTED' : 'ERROR',
+        aborted ? null : classifierDiagnosticCode(error));
+      throw error;
+    }
+  }
+
+  private emitDiagnostic(
+    phase: Extract<ScannerDiagnosticPhase,
+      'COVERAGE_READ' | 'BLOCK_HYDRATE' | 'CLASSIFICATION_WRITE'>,
+    startedAt: number,
+    outcome: 'OK' | 'ERROR' | 'ABORTED',
+    code: ScannerDiagnosticCode | null,
+  ): void {
+    const observer = this.diagnosticObserver;
+    const provider = this.diagnosticProviderId;
+    if (observer === null || provider === null) return;
+    try {
+      const elapsed = performance.now() - startedAt;
+      observer.recordPhase({
+        provider, program: 'pumpfun', phase,
+        durationMs: Number.isFinite(elapsed)
+          ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.ceil(elapsed)))
+          : 0,
+        outcome, code,
+      });
     } catch {
-      throw failure('INVALID_RECEIPT');
+      try { observer.markUnavailable(); } catch { /* Diagnostics never alter ingestion. */ }
     }
   }
 
@@ -863,4 +928,12 @@ function assertNotAborted(signal: AbortSignal): void {
 
 function failure(code: ClassifierErrorCode): PumpFunCatchUpBlockClassifierError {
   return new PumpFunCatchUpBlockClassifierError(code);
+}
+
+function classifierDiagnosticCode(error: unknown): ScannerDiagnosticCode {
+  if (typeof error === 'object' && error !== null && !isProxy(error)
+    && Object.getPrototypeOf(error) === PumpFunCatchUpBlockClassifierError.prototype) {
+    return (error as PumpFunCatchUpBlockClassifierError).code;
+  }
+  return 'UNKNOWN';
 }

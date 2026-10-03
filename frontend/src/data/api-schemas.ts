@@ -504,6 +504,62 @@ const decoderQuarantineSchema = z.object({
   version: z.literal(1),
   unresolvedCount: countSchema.refine((value) => !Object.is(value, -0)),
 }).strict();
+const scannerDiagnosticCountSchema = countSchema.refine((value) => !Object.is(value, -0));
+const scannerDiagnosticPhaseSchema = z.enum([
+  'SOURCE_PAGE', 'COVERAGE_READ', 'BLOCK_HYDRATE', 'CLASSIFICATION_WRITE',
+  'PAGE_ADMIT', 'RUN_PROGRESS', 'CHECKPOINT', 'SUPERVISOR',
+]);
+const scannerDiagnosticOutcomeSchema = z.enum([
+  'OK', 'ERROR', 'PAUSED', 'REFRESH_REQUIRED', 'ABORTED',
+]);
+const scannerDiagnosticCodeSchema = z.enum([
+  'UNKNOWN', 'SOURCE_REQUEST', 'SOURCE_RESPONSE', 'SOURCE_PAGINATION',
+  'INVALID_INPUT', 'INVALID_CLOCK', 'LOCATOR_RETRYABLE', 'LOCATOR_UNTRUSTED',
+  'LOCATOR_UNSUPPORTED_FAILURE', 'TRANSACTION_IDENTITY_MISMATCH',
+  'TRANSACTION_OUTCOME_MISMATCH', 'DECODER_UNTRUSTED', 'INVALID_RECEIPT',
+  'INVALID_PROGRAM', 'INVALID_PAGE', 'INVALID_RECEIPTS', 'PROVIDER_AFFINITY',
+  'CHECKPOINT_READ', 'SOURCE', 'ENQUEUE', 'PAGE_ADMIT', 'CHECKPOINT_CAS',
+  'FAILURE_WRITE', 'FAILURE_RESOLVE', 'RUN_READ', 'RUN_CREATE', 'RUN_PROGRESS',
+  'RUN_COMPLETE', 'RUN_FAIL', 'RUN_SUPERSEDE', 'CATCH_UP_WINDOW_EXCEEDED',
+  'CATCH_UP_PAGE_BUDGET_EXHAUSTED', 'CATCH_UP_REFRESH_REQUIRED', 'RPC_UNAVAILABLE',
+]);
+const scannerPhaseBucketSchema = z.object({
+  provider: rpcProviderIdSchema,
+  program: z.enum(['pumpfun', 'pumpswap']),
+  phase: scannerDiagnosticPhaseSchema,
+  count: scannerDiagnosticCountSchema.min(1),
+  totalDurationMs: scannerDiagnosticCountSchema,
+  maxDurationMs: scannerDiagnosticCountSchema,
+  lastOutcome: scannerDiagnosticOutcomeSchema,
+  lastCode: scannerDiagnosticCodeSchema.nullable(),
+}).strict().refine((value) => value.maxDurationMs <= value.totalDurationMs
+  && ((value.lastOutcome === 'OK' || value.lastOutcome === 'ABORTED')
+    ? value.lastCode === null
+    : value.lastOutcome === 'PAUSED'
+      ? value.lastCode === 'CATCH_UP_PAGE_BUDGET_EXHAUSTED'
+      : value.lastOutcome === 'REFRESH_REQUIRED'
+        ? value.lastCode === 'CATCH_UP_REFRESH_REQUIRED'
+        : value.lastCode !== null));
+const scannerPhaseFrontSchema = z.object({
+  program: z.enum(['pumpfun', 'pumpswap']),
+  progressCount: scannerDiagnosticCountSchema,
+  completedCount: scannerDiagnosticCountSchema,
+  lastProgressAgeMs: scannerDiagnosticCountSchema.nullable(),
+  checkpointAdvanced: z.boolean(),
+}).strict().refine((value) => (value.progressCount === 0) === (value.lastProgressAgeMs === null));
+const scannerPhaseDiagnosticsSchema = z.object({
+  version: z.literal(1),
+  sampledAtMs: scannerDiagnosticCountSchema,
+  unavailable: z.boolean(),
+  overflow: z.boolean(),
+  buckets: z.array(scannerPhaseBucketSchema).max(64),
+  fronts: z.tuple([scannerPhaseFrontSchema, scannerPhaseFrontSchema]),
+}).strict().refine((value) => value.fronts[0].program === 'pumpfun'
+  && value.fronts[1].program === 'pumpswap'
+  && value.fronts.every((front) => front.lastProgressAgeMs === null
+    || front.lastProgressAgeMs <= value.sampledAtMs)
+  && new Set(value.buckets.map((bucket) =>
+    `${bucket.provider}:${bucket.program}:${bucket.phase}`)).size === value.buckets.length);
 const catchUpAdmissionSchema = z.object({
   version: z.literal(1),
   enabled: z.boolean(),
@@ -691,6 +747,7 @@ const healthSchema = z.object({
     rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
     firstProcessingCanary: firstProcessingCanarySchema.nullish(),
     decoderQuarantine: decoderQuarantineSchema.nullish(),
+    scannerPhaseDiagnostics: scannerPhaseDiagnosticsSchema.nullish(),
   }).loose().refine(({ catchUpAdmission, backlogCount }) => {
     if (catchUpAdmission === undefined || catchUpAdmission === null) return true;
     const source = catchUpAdmission.actionableBacklogBySource;

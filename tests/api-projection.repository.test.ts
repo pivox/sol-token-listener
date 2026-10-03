@@ -17,6 +17,7 @@ import {
 } from '../src/api/cursor.js';
 import { toJsonValue } from '../src/utils/json.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
+import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import {
   createDefaultQualificationRuleSet,
   QualificationEngine,
@@ -1727,6 +1728,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       rpcHttpEvidence: null,
       firstProcessingCanary: null,
       decoderQuarantine: null,
+      scannerPhaseDiagnostics: null,
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2127,6 +2129,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     workerAdmission: null,
     workerAdmissionClock: null,
     rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
+    scannerPhaseDiagnostics: null,
   });
   assert.equal(health.lagSlots, null);
 });
@@ -2578,6 +2581,43 @@ async function projectDecoderQuarantine(payload: unknown) {
     websocketRow(), false, healthyHeartbeatRow({ payload }),
   ))).getHealth();
 }
+
+async function projectScannerPhaseDiagnostics(payload: unknown) {
+  return healthyRepository(new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow(), false, healthyHeartbeatRow({ payload }),
+  ))).getHealth();
+}
+
+void test('scanner phase diagnostics project a detached aggregate and legacy null', async () => {
+  const legacy = await projectScannerPhaseDiagnostics({});
+  assert.equal(legacy.status, 'OK');
+  assert.equal(legacy.heartbeat.scannerPhaseDiagnostics, null);
+  const diagnostics = new ScannerPhaseDiagnosticsCollector();
+  diagnostics.recordPhase({
+    provider: 'fallback-3', program: 'pumpfun', phase: 'SOURCE_PAGE',
+    durationMs: 3, outcome: 'ERROR', code: 'SOURCE_RESPONSE',
+  });
+  const source = diagnostics.snapshot(1_000);
+  const health = await projectScannerPhaseDiagnostics({ scannerPhaseDiagnostics: source });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.scannerPhaseDiagnostics, source);
+  assert.notEqual(health.heartbeat.scannerPhaseDiagnostics, source);
+  assert.ok(Object.isFrozen(health.heartbeat.scannerPhaseDiagnostics));
+});
+
+void test('scanner phase diagnostics reject malformed identifying payloads fail closed', async () => {
+  const source = new ScannerPhaseDiagnosticsCollector().snapshot(1_000);
+  for (const payload of [
+    { scannerPhaseDiagnostics: { ...source, signature: 'must-not-leak' } },
+    { scannerPhaseDiagnostics: { ...source, sampledAtMs: Number.MAX_SAFE_INTEGER } },
+    { scannerPhaseDiagnostics: null },
+  ]) {
+    const health = await projectScannerPhaseDiagnostics(payload);
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.heartbeat.scannerPhaseDiagnostics, null);
+    assert.doesNotMatch(JSON.stringify(health), /must-not-leak/u);
+  }
+});
 
 void test('decoder quarantine projects one exact frozen aggregate and legacy absence as null', async () => {
   for (const payload of [null, {}, { rpcHttpEvidence: rpcHttpEvidenceMetrics() }]) {
