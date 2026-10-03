@@ -1,0 +1,56 @@
+# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.0.0
+
+Base: `main@ced66e7086911265012897a34239a59371204878`.
+Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.0.0.
+This plan does not authorize accepting a new wire variant, weakening quarantine,
+using a wallet, or submitting a transaction.
+
+## Task 1 — pin authoritative sources
+
+Record the Pump.fun public IDL commit and official SDK release used for the
+comparison. Confirm the exact `TradeEvent` discriminator, field order, and
+documented legacy suffix lengths from those sources. Keep source URLs and
+versions in the spec, not copied third-party discriminators. A published IDL
+that ends at 16 bytes leaves the additional 8 bytes unexplained; do not infer a
+field from its length alone.
+
+## Task 2 — build a bounded, owner-only evidence collector
+
+Before implementation, add offline RED tests for selection of distinct
+finalized representatives, two independent RPC responses, instruction/event
+pairing, exact payload consumption, provider disagreement, orphaning, missing
+forms, malformed payloads, and aggregate-only output. The collector reads only
+owner-only canary attribution and finalized public chain transactions; it
+must not accept wallet inputs or write raw transactions, signatures, addresses,
+URLs, credentials, free-form errors, or payload bytes. Use integer quantities.
+Bound its sample count and runtime; discard raw data after each check. The
+output is a versioned aggregate with a four-hour maximum retention.
+
+## Task 3 — run a controlled observe-only comparison
+
+Require two genuinely independent RPC paths; an alias of the same endpoint is
+not independent evidence. Validate slot, transaction bytes, program, CPI
+location, event discriminator and known-prefix parse on both paths. Pair each
+event with its own Pump.fun instruction and exact attributable movements,
+never a transaction-global delta reused for multiple instructions. Capture
+distinct finalized slots and buy/sell forms where present. Record only
+pass/fail/inconclusive counts by bounded instruction family and variant length.
+If two paths or exact pairing are unavailable, report `INCONCLUSIVE` and stop.
+
+## Task 4 — decoder decision gate
+
+Review an official updated schema or independently verifiable on-chain
+invariants for the final 8-byte boundary. If no proof establishes the consumed
+business fields and the suffix's compatibility, keep 24-byte events in strict
+quarantine and mark #215 externally blocked. If proof exists, revise the
+versioned design first, add sanitized finalized RED fixtures, then implement
+only the exact proven variant. Preserve 0/16 behavior and reject other
+lengths. Verify multi-instruction pairing, duplicate elimination, commitment
+promotion and orphan reconciliation.
+
+## Task 5 — delivery and rollout
+
+Run build, check, lint, docs, focused tests and full CI. One independent code
+review cycle, then merge only with green checks and no blocking findings.
+Post-merge, run a new 15-minute observe-only Mainnet canary; the old FAIL
+verdict remains FAIL and none of the H2e/H2c/wallet/trade gates are bypassed.
