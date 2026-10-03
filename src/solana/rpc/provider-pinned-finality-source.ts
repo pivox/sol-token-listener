@@ -5,6 +5,8 @@ import type { FinalityProviderPass } from '../../ports/finality-provider-pass.js
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
+import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
+import { createBoundedRpcFetch } from './rpc-client.js';
 
 export type ProviderPinnedFinalityErrorReason =
   | 'CONFIG_INVALID'
@@ -51,10 +53,13 @@ export function createProviderPinnedFinalityPass(
   dependencies?: ProviderPinnedFinalityDependencies,
   recorder?: RpcHttpEvidenceRecorder,
   roleRecorder?: RpcHttpRoleEvidenceRecorder,
+  attemptBudget?: OrdinaryRpcAttemptBudget,
+  requestTimeoutMs = 30_000,
 ): FinalityProviderPass {
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)) throw failure('CONFIG_INVALID', exposedProviderId);
-  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder);
+  const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder,
+    attemptBudget, requestTimeoutMs);
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const calls = createPinnedCalls(createRpc, httpUrl, providerId);
 
@@ -103,13 +108,16 @@ function dependencyFactory(
   selectedProviderId: RpcProviderId,
   recorder: RpcHttpEvidenceRecorder | undefined,
   roleRecorder: RpcHttpRoleEvidenceRecorder | undefined,
+  attemptBudget: OrdinaryRpcAttemptBudget | undefined,
+  requestTimeoutMs: number,
 ): (httpUrl: string) => unknown {
   if (dependencies === undefined) {
-    if (recorder === undefined && roleRecorder === undefined) return createDefaultRpc;
+    if (recorder === undefined && roleRecorder === undefined && attemptBudget === undefined) return createDefaultRpc;
     const observedFetch = createObservedRpcFetch(
-      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'FINALITY',
+      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'FINALITY', attemptBudget,
     );
-    return (httpUrl: string): Connection => createDefaultRpc(httpUrl, observedFetch);
+    const boundedFetch = attemptBudget === undefined ? observedFetch : createBoundedRpcFetch(observedFetch, requestTimeoutMs);
+    return (httpUrl: string): Connection => createDefaultRpc(httpUrl, boundedFetch);
   }
   try {
     if (Array.isArray(dependencies)) throw new TypeError();

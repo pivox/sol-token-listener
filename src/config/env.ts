@@ -65,6 +65,7 @@ export interface AppConfig {
   readonly qualificationMinimumScore: number | null;
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
+  readonly listenerOrdinaryRpcBudgetEnabled: boolean;
   readonly listenerPumpFunBoundedWorkerAdmissionEnabled: boolean;
   readonly listenerPumpFunTrackingWindowSeconds: number;
   readonly listenerPumpFunCatchUpPageAdmissionEnabled: boolean;
@@ -367,6 +368,9 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
     listenerEnabled,
     listenerPumpFunBoundedWorkerAdmissionEnabled: workerAdmissionPolicy.enabled,
+    listenerOrdinaryRpcBudgetEnabled: parseStrictBoolean(
+      environment.LISTENER_ORDINARY_RPC_BUDGET_ENABLED, false, 'LISTENER_ORDINARY_RPC_BUDGET_ENABLED',
+    ),
     listenerPumpFunTrackingWindowSeconds: workerAdmissionPolicy.trackingWindowSeconds,
     listenerPumpFunCatchUpPageAdmissionEnabled,
     listenerPumpFunCatchUpCoverageFastPathEnabled,

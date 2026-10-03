@@ -1,5 +1,6 @@
 import { PublicKey, type Commitment } from '@solana/web3.js';
 import type { ChainConfirmationStatus } from '../../domain/types.js';
+import { isOrdinaryRpcBudgetError } from './ordinary-rpc-attempt-budget.js';
 
 export const MAX_CATCH_UP_PAGE_SIZE = 1_000;
 export const MAX_CATCH_UP_SIGNATURE_LENGTH = 128;
@@ -67,7 +68,8 @@ export class SolanaCatchUpSource {
         { before, limit },
         this.commitment,
       );
-    } catch {
+    } catch (error) {
+      if (isOrdinaryRpcBudgetError(error)) throw error;
       throw new CatchUpSourceError('request');
     }
     const page = snapshotCatchUpPage(response, limit);
