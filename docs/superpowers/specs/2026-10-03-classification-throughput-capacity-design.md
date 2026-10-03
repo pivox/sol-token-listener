@@ -1,4 +1,4 @@
-# Mainnet classification throughput — capacity evidence gate v1.0.0
+# Mainnet classification throughput — capacity evidence gate v1.0.1
 
 Issue: [#218](https://github.com/pivox/sol-token-listener/issues/218).
 Base: `origin/main@8a99152f776b55ebff167323a17a5d4b336c76de`.
@@ -48,12 +48,17 @@ filter, cross-finality cache reuse or silent backlog truncation is justified.
 
 ## Evidence required before implementation
 
-1. Record the actual Helius project/plan and fresh authoritative quota via
-   the existing H2e path. Public [Helius pricing](https://www.helius.dev/pricing)
-   is not evidence of this project's tier; a monthly credit snapshot alone
-   is not evidence of instantaneous RPS or exit headroom. The current local
-   configuration has no `HELIUS_PROJECT_ID`, H2e API-key file or dedicated
-   attestation key. Do not infer them from the RPC URL or publish credentials.
+1. Record the actual Helius project/plan and fresh monthly credit quota via
+   the existing H2e path. H2e's Admin `/usage` projection contains billing
+   credits and a plan ID, **not** a per-project RPS, concurrency or live-exit
+   allowance. Independently obtain a dated, authoritative per-project RPC
+   rate-limit source from Helius dashboard, API or support, including custom
+   limits if applicable; otherwise instantaneous capacity remains
+   `INCONCLUSIVE` and no wider admission mode may be selected. Public
+   [Helius pricing](https://www.helius.dev/pricing) and zero observed 429 are
+   not project-specific capacity proof. The current local configuration has
+   no `HELIUS_PROJECT_ID`, H2e API-key file or dedicated attestation key. Do
+   not infer them from the RPC URL or publish credentials.
 2. Capture bounded per-provider total attempts, 429, latency and maximum
    simultaneous response/parse memory for source, finality, block, worker,
    health and any other listener traffic, on an exact clean commit. Record

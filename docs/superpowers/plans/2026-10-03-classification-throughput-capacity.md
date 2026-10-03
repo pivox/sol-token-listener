@@ -1,13 +1,16 @@
-# #218 classification throughput — evidence plan v1.0.0
+# #218 classification throughput — evidence plan v1.0.1
 
-Base and safety contract: [capacity design v1.0.0](../specs/2026-10-03-classification-throughput-capacity-design.md).
+Base and safety contract: [capacity design v1.0.1](../specs/2026-10-03-classification-throughput-capacity-design.md).
 The existing 15-minute Mainnet verdict is FAIL. This plan does not activate
 new concurrency or trading.
 
 1. Obtain the Helius project UUID and API key through owner-only files, then
    run the existing H2e one-shot collector with a dedicated non-Solana Ed25519
-   attestation key. If unavailable, mark capacity `INCONCLUSIVE`; do not guess
-   the tier from public pricing or the absence of 429.
+   attestation key for monthly credits. Separately collect a dated, official
+   project-specific RPS/concurrency limit from Helius dashboard, API or
+   support; H2e `/usage` and plan ID do not contain that limit. If either
+   source is unavailable, mark the corresponding capacity `INCONCLUSIVE`;
+   do not guess from public pricing or the absence of 429.
 2. Define an aggregate-only per-provider traffic envelope: attempts and
    429 by RPC role, p95/maximum response time, in-flight response bytes/RSS,
    and explicit worker plus future exit headroom. Add offline RED tests for
