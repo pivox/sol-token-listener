@@ -9,6 +9,11 @@ import {
 } from '../src/domain/strict-catch-up.js';
 import type { RpcProviderId } from '../src/domain/rpc-provider.js';
 import {
+  ScannerPhaseDiagnosticsCollector,
+  type ScannerPhaseEvent,
+  type ScannerFrontEvent,
+} from '../src/domain/scanner-phase-diagnostics.js';
+import {
   createStrictCatchUpRun,
   terminalizeStrictCatchUpRun,
   type StrictCatchUpRun,
@@ -45,6 +50,7 @@ import {
   type StrictCatchUpSource,
 } from '../src/application/strict-catch-up-scanner.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
+import { PumpFunCatchUpBlockClassifierError } from '../src/application/pumpfun-catch-up-block-classifier.js';
 
 const programs = [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID] as const;
 const repositoryRootUrl = new URL(import.meta.url.endsWith('.js') ? '../../' : '../', import.meta.url);
@@ -53,6 +59,188 @@ const NEVER_ABORTED = new AbortController().signal;
 const LAUNCHPAD_ONLY = Object.freeze([
   Object.freeze({ key: 'launchpad', family: 'pumpfun', id: PUMP_PROGRAM_ID } as const),
 ]);
+
+void test('observes source, page admission, run progress and checkpoint at awaited boundaries', async () => {
+  const collector = new ScannerPhaseDiagnosticsCollector();
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([
+      classificationReceipt('head', 12, 'ACTIONABLE', 'ENQUEUED'),
+      classificationReceipt('tail', 11, 'IGNORED', 'NOT_ENQUEUED'),
+    ]),
+    signaturesClassified: 2n, signaturesEnqueued: 1n,
+  }));
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)], [sig('boundary', 10)]],
+  }, 'fallback-2');
+  await scanner(source, repository, {
+    programs: LAUNCHPAD_ONLY, pageAdmitter: admitter, diagnosticObserver: collector,
+  }).scan(NEVER_ABORTED);
+  const snapshot = collector.snapshot(Date.now());
+  assert.deepEqual(snapshot.buckets.map(bucket => [
+    bucket.provider, bucket.program, bucket.phase, bucket.lastOutcome,
+  ]).sort((left, right) => String(left[2]).localeCompare(String(right[2]))), [
+    ['fallback-2', 'pumpfun', 'CHECKPOINT', 'OK'],
+    ['fallback-2', 'pumpfun', 'PAGE_ADMIT', 'OK'],
+    ['fallback-2', 'pumpfun', 'RUN_PROGRESS', 'OK'],
+    ['fallback-2', 'pumpfun', 'SOURCE_PAGE', 'OK'],
+  ]);
+  assert.deepEqual(Object.fromEntries(snapshot.buckets.map(bucket => [bucket.phase, bucket.count])), {
+    CHECKPOINT: 2, RUN_PROGRESS: 3, SOURCE_PAGE: 2, PAGE_ADMIT: 1,
+  });
+  assert.ok(snapshot.buckets.every(bucket => bucket.totalDurationMs >= 0 && bucket.maxDurationMs >= 0));
+  assert.deepEqual(snapshot.fronts[0] && {
+    progressCount: snapshot.fronts[0].progressCount,
+    completedCount: snapshot.fronts[0].completedCount,
+    checkpointAdvanced: snapshot.fronts[0].checkpointAdvanced,
+  }, { progressCount: 1, completedCount: 1, checkpointAdvanced: true });
+  assert.ok(!JSON.stringify(snapshot).includes('head'));
+  assert.ok(!JSON.stringify(snapshot).includes('boundary'));
+});
+
+void test('records original finite source and admission error codes before scanner normalization', async () => {
+  const sourceCollector = new ScannerPhaseDiagnosticsCollector();
+  const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[]] });
+  source.failure = new CatchUpSourceError('response');
+  await assert.rejects(scanner(source, new FakeRepository(), {
+    programs: LAUNCHPAD_ONLY, diagnosticObserver: sourceCollector,
+  }).scan(NEVER_ABORTED), (error: unknown) => sourceFailure(error, 'launchpad'));
+  assert.deepEqual(sourceCollector.snapshot(Date.now()).buckets.filter(bucket => bucket.phase === 'SOURCE_PAGE').map(bucket => [
+    bucket.phase, bucket.lastOutcome, bucket.lastCode,
+  ]), [['SOURCE_PAGE', 'ERROR', 'SOURCE_RESPONSE']]);
+
+  const admitCollector = new ScannerPhaseDiagnosticsCollector();
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([]), signaturesClassified: 0n, signaturesEnqueued: 0n,
+  }));
+  admitter.failure = new PumpFunCatchUpBlockClassifierError('LOCATOR_UNTRUSTED');
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }), repository, {
+    programs: LAUNCHPAD_ONLY, pageAdmitter: admitter, diagnosticObserver: admitCollector,
+  }).scan(NEVER_ABORTED), (error: unknown) => scannerFailure(error, 'page-admit', 'launchpad'));
+  assert.deepEqual(admitCollector.snapshot(Date.now()).buckets.filter(bucket =>
+    bucket.phase === 'SOURCE_PAGE' || bucket.phase === 'PAGE_ADMIT').map(bucket => [
+    bucket.phase, bucket.lastOutcome, bucket.lastCode,
+  ]), [
+    ['SOURCE_PAGE', 'OK', null],
+    ['PAGE_ADMIT', 'ERROR', 'LOCATOR_UNTRUSTED'],
+  ]);
+});
+
+void test('attributes invalid admission receipts to PAGE_ADMIT rather than recording success', async () => {
+  const collector = new ScannerPhaseDiagnosticsCollector();
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([]), signaturesClassified: 0n, signaturesEnqueued: 0n,
+  }));
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }), new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) }), {
+    programs: LAUNCHPAD_ONLY, pageAdmitter: admitter, diagnosticObserver: collector,
+  }).scan(NEVER_ABORTED), TypeError);
+  assert.deepEqual(collector.snapshot(Date.now()).buckets.filter(bucket => bucket.phase === 'PAGE_ADMIT')
+    .map(bucket => [bucket.count, bucket.lastOutcome, bucket.lastCode]), [
+    [1, 'ERROR', 'INVALID_RECEIPT'],
+  ]);
+});
+
+void test('attributes source pagination and ordering failures before recording source success', async () => {
+  for (const { page, code } of [
+    { page: [sig('duplicate', 12), sig('duplicate', 12)], code: 'SOURCE_PAGINATION' },
+    { page: [sig('older', 11), sig('newer', 12)], code: 'SOURCE_RESPONSE' },
+  ]) {
+    const collector = new ScannerPhaseDiagnosticsCollector();
+    await assert.rejects(scanner(new FakeSource({ [PUMP_PROGRAM_ID]: [page] }),
+      new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) }), {
+        programs: LAUNCHPAD_ONLY, diagnosticObserver: collector,
+      }).scan(NEVER_ABORTED), (error: unknown) => sourceFailure(error, 'launchpad'));
+    assert.deepEqual(collector.snapshot(Date.now()).buckets.filter(bucket => bucket.phase === 'SOURCE_PAGE')
+      .map(bucket => [bucket.count, bucket.lastOutcome, bucket.lastCode]), [
+      [1, 'ERROR', code],
+    ]);
+  }
+});
+
+void test('attributes early durable reads and unknown admission exceptions without raw text', async () => {
+  const failedRead = new FakeRepository();
+  failedRead.failRunOperation = 'read';
+  const readCollector = new ScannerPhaseDiagnosticsCollector();
+  await assert.rejects(scanner(new FakeSource({}), failedRead, {
+    programs: LAUNCHPAD_ONLY, diagnosticObserver: readCollector,
+  }).scan(NEVER_ABORTED), (error: unknown) => scannerFailure(error, 'run-read', 'launchpad'));
+  assert.ok(readCollector.snapshot(Date.now()).buckets.some(bucket =>
+    bucket.phase === 'RUN_PROGRESS' && bucket.lastOutcome === 'ERROR' && bucket.lastCode === 'UNKNOWN'));
+
+  const unknownCollector = new ScannerPhaseDiagnosticsCollector();
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([]), signaturesClassified: 0n, signaturesEnqueued: 0n,
+  }));
+  admitter.failure = new Error('secret-signature');
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }), new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) }), {
+    programs: LAUNCHPAD_ONLY, pageAdmitter: admitter, diagnosticObserver: unknownCollector,
+  }).scan(NEVER_ABORTED), (error: unknown) => scannerFailure(error, 'page-admit', 'launchpad'));
+  const snapshot = unknownCollector.snapshot(Date.now());
+  assert.ok(snapshot.buckets.some(bucket => bucket.phase === 'PAGE_ADMIT'
+    && bucket.lastOutcome === 'ERROR' && bucket.lastCode === 'UNKNOWN'));
+  assert.ok(!JSON.stringify(snapshot).includes('secret-signature'));
+});
+
+void test('distinguishes bounded pause, refresh and abort from failures', async () => {
+  const paused = new ScannerPhaseDiagnosticsCollector();
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 14), sig('tail', 13)]],
+  }), new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) }), {
+    programs: LAUNCHPAD_ONLY, maxPages: 1, diagnosticObserver: paused,
+  }).scan(NEVER_ABORTED), { name: 'StrictCatchUpPausedError' });
+  assert.ok(paused.snapshot(Date.now()).buckets.some(bucket => bucket.lastOutcome === 'PAUSED'
+    && bucket.lastCode === 'CATCH_UP_PAGE_BUDGET_EXHAUSTED'));
+
+  const refreshed = new ScannerPhaseDiagnosticsCollector();
+  const repository = new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) });
+  repository.runs.push(activeRun());
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('boundary', 10)]],
+  }), repository, { programs: LAUNCHPAD_ONLY, diagnosticObserver: refreshed }).scan(NEVER_ABORTED), refreshRequired);
+  assert.ok(refreshed.snapshot(Date.now()).buckets.some(bucket => bucket.lastOutcome === 'REFRESH_REQUIRED'
+    && bucket.lastCode === 'CATCH_UP_REFRESH_REQUIRED'));
+
+  const aborted = new ScannerPhaseDiagnosticsCollector();
+  const controller = new AbortController();
+  const pending = deferred<unknown>();
+  const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[]] });
+  source.nextList = pending.promise;
+  const scan = scanner(source, new FakeRepository(), {
+    programs: LAUNCHPAD_ONLY, diagnosticObserver: aborted,
+  }).scan(controller.signal);
+  await waitFor(() => source.calls.length === 1);
+  controller.abort();
+  pending.resolve([sig('head', 1)]);
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(aborted.snapshot(Date.now()).buckets.filter(bucket => bucket.phase === 'SOURCE_PAGE')
+    .map(bucket => [bucket.phase, bucket.lastOutcome]), [
+    ['SOURCE_PAGE', 'ABORTED'],
+  ]);
+});
+
+void test('a throwing diagnostic observer cannot change scanner outcome or durable work', async () => {
+  let unavailableCalls = 0;
+  const diagnosticObserver = {
+    recordPhase(_event: ScannerPhaseEvent): void { throw new Error('observer-secret'); },
+    recordFront(_event: ScannerFrontEvent): void { throw new Error('observer-secret'); },
+    markUnavailable(): void { unavailableCalls += 1; },
+  };
+  const repository = new FakeRepository();
+  const result = await scanner(new FakeSource({ [PUMP_PROGRAM_ID]: [[sig('head', 1)]] }), repository, {
+    programs: LAUNCHPAD_ONLY, diagnosticObserver,
+  }).scan(NEVER_ABORTED);
+  assert.equal(result.checkpointCasCount, 1);
+  assert.equal(repository.enqueued.length, 1);
+  assert.equal(repository.cas.length, 1);
+  assert.ok(unavailableCalls > 0);
+});
 
 void test('persists a full page before budget pause and resumes its frozen head to exact completion', async () => {
   const previous = checkpoint('launchpad', 'boundary', 10);
@@ -1488,6 +1676,7 @@ function scanner(
       readonly id: string;
     }>[];
     readonly pageAdmitter?: StrictCatchUpPageAdmitter;
+    readonly diagnosticObserver?: Pick<ScannerPhaseDiagnosticsCollector, 'recordPhase' | 'recordFront' | 'markUnavailable'>;
   } = {},
 ): StrictCatchUpScanner {
   return new StrictCatchUpScanner(source, repository, {
@@ -1496,6 +1685,7 @@ function scanner(
     now: overrides.now ?? (() => 9_000),
     ...(overrides.policy === undefined ? {} : { policy: overrides.policy }),
     ...(overrides.programs === undefined ? {} : { programs: overrides.programs }),
+    ...(overrides.diagnosticObserver === undefined ? {} : { diagnosticObserver: overrides.diagnosticObserver }),
   }, overrides.pageAdmitter);
 }
 

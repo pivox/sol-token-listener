@@ -11,6 +11,11 @@ import {
 } from '../domain/solana-genesis-hash.js';
 import { isRpcProviderId, RPC_PROVIDER_IDS, type RpcProviderId } from '../domain/rpc-provider.js';
 import {
+  ScannerPhaseDiagnosticsCollector,
+  snapshotScannerPhaseDiagnostics,
+  type ScannerPhaseDiagnosticsV1,
+} from '../domain/scanner-phase-diagnostics.js';
+import {
   createRuntimeRpcHttpEvidence,
   type RuntimeRpcHttpEvidenceV1,
 } from '../domain/rpc-http-evidence.js';
@@ -350,6 +355,7 @@ export function createProductionListenerRuntime(
       metrics: (): RuntimeBlockHydrationMetricsV1 => hydration.metrics(),
       close: (): void => { hydration.close(); },
     });
+  const scannerPhaseDiagnostics = new ScannerPhaseDiagnosticsCollector();
   const pageAdmitters = new Map(hydration === null ? [] : providers.ids.map((providerId) => [
     providerId,
     new PumpFunStrictCatchUpPageAdmitter(new PumpFunCatchUpBlockClassifier(
@@ -357,6 +363,8 @@ export function createProductionListenerRuntime(
         coverageFastPathEnabled: config.listenerPumpFunCatchUpCoverageFastPathEnabled,
         coverageRepository: config.listenerPumpFunCatchUpCoverageFastPathEnabled ? inbox : null,
         slotPersistencePipelineEnabled: workerAdmissionPolicy.enabled,
+        diagnosticProviderId: providerId,
+        diagnosticObserver: scannerPhaseDiagnostics,
       }),
     )),
   ] as const));
@@ -397,6 +405,7 @@ export function createProductionListenerRuntime(
           maxPages: config.listenerCatchUpMaxPages,
           policy: 'strict',
           programs: ingestionPrograms,
+          diagnosticObserver: scannerPhaseDiagnostics,
         },
         pageAdmitters.get(providerId),
       );
@@ -433,6 +442,7 @@ export function createProductionListenerRuntime(
           maxPages: config.listenerCatchUpMaxPages,
           policy: 'live-edge',
           programs: ingestionPrograms,
+          diagnosticObserver: scannerPhaseDiagnostics,
         }, pageAdmitters.get(providerId));
         if (hydration === null) await baselineScanner.scan(signal);
         else await hydration.runStrictScan(providerId, (scanSignal) => baselineScanner.scan(scanSignal), signal);
@@ -682,6 +692,8 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
       rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(configuredRpcHttpProviderIds),
+      scannerPhaseDiagnosticsMetrics: (sampledAtMs): ScannerPhaseDiagnosticsV1 =>
+        scannerPhaseDiagnostics.snapshot(sampledAtMs),
       inboxSnapshot: (): ReturnType<PostgresTransactionInboxRepository['heartbeatSnapshot']> =>
         inbox.heartbeatSnapshot(),
       ...(hydration === null ? {} : {
@@ -754,6 +766,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
   readonly workerAdmissionMetrics?: () => Promise<RuntimeWorkerAdmissionMetricsV1>;
+  readonly scannerPhaseDiagnosticsMetrics?: (sampledAtMs: number) => ScannerPhaseDiagnosticsV1;
 }
 
 export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
@@ -1136,6 +1149,7 @@ export class PersistentListenerHeartbeat {
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
   private readonly workerAdmissionMetrics: (() => Promise<RuntimeWorkerAdmissionMetricsV1>) | null;
+  private readonly scannerPhaseDiagnosticsMetrics: ((sampledAtMs: number) => ScannerPhaseDiagnosticsV1) | null;
   private readonly inboxSnapshot: ListenerHeartbeatOptions['inboxSnapshot'];
 
   public constructor(
@@ -1177,6 +1191,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('Worker admission metrics provider is invalid.');
     }
     this.workerAdmissionMetrics = options.workerAdmissionMetrics ?? null;
+    if (options.scannerPhaseDiagnosticsMetrics !== undefined
+      && typeof options.scannerPhaseDiagnosticsMetrics !== 'function') {
+      throw new TypeError('Scanner phase diagnostics provider is invalid.');
+    }
+    this.scannerPhaseDiagnosticsMetrics = options.scannerPhaseDiagnosticsMetrics ?? null;
     if (options.inboxSnapshot !== undefined && (typeof options.inboxSnapshot !== 'function'
       || options.workerAdmissionMetrics !== undefined)) {
       throw new TypeError('Inbox snapshot provider is invalid.');
@@ -1362,6 +1381,20 @@ export class PersistentListenerHeartbeat {
       }
     }
     const workerAdmissionClock = inboxSnapshot?.workerAdmissionClock;
+    const updatedAtMs = Date.now();
+    let scannerPhaseDiagnostics: ScannerPhaseDiagnosticsV1 | undefined;
+    if (this.scannerPhaseDiagnosticsMetrics !== null) {
+      try {
+        scannerPhaseDiagnostics = snapshotScannerPhaseDiagnostics(
+          this.scannerPhaseDiagnosticsMetrics(updatedAtMs),
+        );
+        if (scannerPhaseDiagnostics.sampledAtMs !== updatedAtMs) throw new TypeError();
+      } catch {
+        const fallback = new ScannerPhaseDiagnosticsCollector();
+        fallback.markUnavailable();
+        scannerPhaseDiagnostics = fallback.snapshot(updatedAtMs);
+      }
+    }
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
       subscriberState: runtimeState === 'STOPPED' ? 'STOPPED' : this.subscriberState(),
@@ -1369,7 +1402,7 @@ export class PersistentListenerHeartbeat {
       workerState: runtimeState === 'STOPPED' ? 'STOPPED' : this.workerState(),
       reconcilerState: runtimeState === 'STOPPED' ? 'STOPPED' : this.reconcilerState(),
       startedAtMs: this.startedAtMs,
-      updatedAtMs: Date.now(),
+      updatedAtMs,
       lastHttpSlot: this.lastHttpSlot,
       lastWebsocketSlot: null,
       lastFinalizedSlot: this.lastFinalizedSlot,
@@ -1388,6 +1421,7 @@ export class PersistentListenerHeartbeat {
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
       ...(workerAdmission === undefined ? {} : { workerAdmission }),
       ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
+      ...(scannerPhaseDiagnostics === undefined ? {} : { scannerPhaseDiagnostics }),
     });
     if (value.updatedAtMs < value.startedAtMs) {
       throw new TypeError('Runtime heartbeat updatedAtMs precedes startedAtMs.');

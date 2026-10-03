@@ -63,6 +63,41 @@ const DOMAIN_EVENT_TYPES = [
 ] as const;
 
 describe('frontend-owned API V1 schemas', () => {
+  it('accepts only bounded scanner phase aggregates and rolling absence', () => {
+    const value = {
+      version: 1, sampledAtMs: 1_790_000_000_000, unavailable: false, overflow: false,
+      buckets: [{
+        provider: 'fallback-1', program: 'pumpfun', phase: 'BLOCK_HYDRATE',
+        count: 2, totalDurationMs: 8, maxDurationMs: 5,
+        lastOutcome: 'ERROR', lastCode: 'LOCATOR_RETRYABLE',
+      }],
+      fronts: [
+        { program: 'pumpfun', progressCount: 1, completedCount: 0,
+          lastProgressAgeMs: 4_000, checkpointAdvanced: false },
+        { program: 'pumpswap', progressCount: 0, completedCount: 0,
+          lastProgressAgeMs: null, checkpointAdvanced: false },
+      ],
+    };
+    const parse = (scannerPhaseDiagnostics: unknown) => apiHealthEnvelopeSchema.parse(success({
+      ...health, heartbeat: { ...health.heartbeat, scannerPhaseDiagnostics },
+    })).data.heartbeat.scannerPhaseDiagnostics;
+    expect(parse(value)).toEqual(value);
+    expect(parse(null)).toBeNull();
+    const legacyHeartbeat: Record<string, unknown> = { ...health.heartbeat };
+    delete legacyHeartbeat.scannerPhaseDiagnostics;
+    expect(apiHealthEnvelopeSchema.parse(success({
+      ...health, heartbeat: legacyHeartbeat,
+    })).data.heartbeat.scannerPhaseDiagnostics).toBeUndefined();
+    for (const malformed of [
+      { ...value, signature: 'must-not-leak' },
+      { ...value, buckets: [{ ...value.buckets[0], provider: 'private-rpc-url' }] },
+      { ...value, buckets: [{ ...value.buckets[0], count: -1 }] },
+      { ...value, fronts: [...value.fronts, value.fronts[0]] },
+    ]) {
+      expect(() => parse(malformed)).toThrow();
+    }
+  });
+
   it('accepts exact decoder quarantine aggregates and rolling absence only', () => {
     const parse = (decoderQuarantine: unknown) => apiHealthEnvelopeSchema.parse(success({
       ...health,

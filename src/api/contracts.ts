@@ -22,6 +22,7 @@ import type {
   WebSocketRecoveryStatus,
 } from '../domain/websocket-health.js';
 import type { RpcProviderId } from '../domain/rpc-provider.js';
+import type { ScannerPhaseDiagnosticsV1 } from '../domain/scanner-phase-diagnostics.js';
 import type {
   CreationExitReason,
   PaperDecisionReasonCode,
@@ -559,6 +560,8 @@ export interface ApiHeartbeat {
   readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
   /** Optional during rolling deployment; null when decoder-quarantine evidence is absent. */
   readonly decoderQuarantine?: ApiDecoderQuarantineMetricsV1 | null;
+  /** Optional during rolling deployment; null when no scanner phase evidence was recorded. */
+  readonly scannerPhaseDiagnostics?: ScannerPhaseDiagnosticsV1 | null;
 }
 
 export interface ApiWorkerAdmissionClockV1 {
