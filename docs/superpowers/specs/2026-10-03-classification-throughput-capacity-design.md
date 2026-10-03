@@ -1,4 +1,4 @@
-# Mainnet classification throughput — capacity evidence gate v1.0.1
+# Mainnet classification throughput — capacity evidence gate v1.1.0
 
 Issue: [#218](https://github.com/pivox/sol-token-listener/issues/218).
 Base: `origin/main@8a99152f776b55ebff167323a17a5d4b336c76de`.
@@ -81,3 +81,35 @@ RSS, terminal failures and cleanup. An opt-in short probe must show a causal
 gain within an attested budget. Only after one independent review cycle, green
 CI and merge may a fresh exact-merge 15-minute observe-only canary be assessed.
 H2d/H2c, wallet and live-trade gates remain closed until that canary passes.
+
+## Additive RPC role evidence — instrumentation slice v1.1.0
+
+The first implementation slice measures physical HTTP fetches without changing
+admission, retry, failover, decoding, orders or the existing exact-shape
+`rpcHttpEvidence` V1 contract. A sibling, optional `rpcHttpRoleEvidence` V1
+snapshot is persisted in the existing heartbeat JSONB and projected through
+`/api/v1/health`; no SQL migration or new RPC call is needed. Its absence,
+invalidity or counter overflow is `INCONCLUSIVE` for capacity analysis, never
+an implicit zero or a canary PASS. The current 19-gate verdict continues to
+consume only the unchanged `rpcHttpEvidence` V1 zero-429 evidence.
+
+The sidecar has fixed provider IDs and four honest, fixed-cardinality roles:
+`SOURCE`, `FINALITY`, `BLOCK_HYDRATION`, and `SHARED_CLIENT`. The last role
+includes mixed worker, market and health calls from the existing shared
+connection; it must not be labelled as any one of those traffic classes.
+`BLOCK_HYDRATION` is one physical cache path used by both classifier and
+worker, not separate per-caller requests. Each provider/role cell records
+attempts, HTTP responses, 429 responses, fetch failures, completed
+time-to-headers histogram buckets, the maximum time-to-headers and maximum
+physical fetches in flight. Each failover retry is attributed to the provider
+actually attempted. Measurements are monotonic, bounded integers; snapshots
+contain no endpoint, method, request body, signature, error text or key.
+
+This sidecar measures fetch start to HTTP headers only. Solana SDK response
+body download/JSON parse time and transient response/parse memory are outside
+its scope and require separate evidence before a throughput change. Likewise,
+other processes sharing a Helius key remain invisible. Its purpose is to
+identify RPC traffic mix and latency, not to infer a project rate limit or
+exit reserve. Tests must prove failover attribution, abort/error decrement,
+overflow behavior, strict projection, persistence, and unchanged V1 canary
+handling. No concurrency flag may be turned on by this slice.
