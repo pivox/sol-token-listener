@@ -1,7 +1,7 @@
-# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.0.0
+# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.1.0
 
 Base: `main@ced66e7086911265012897a34239a59371204878`.
-Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.0.0.
+Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.3.0.
 This plan does not authorize accepting a new wire variant, weakening quarantine,
 using a wallet, or submitting a transaction.
 
@@ -23,7 +23,8 @@ forms, malformed payloads, and aggregate-only output. The collector reads only
 owner-only canary attribution and finalized public chain transactions; it
 must not accept wallet inputs or write raw transactions, signatures, addresses,
 URLs, credentials, free-form errors, or payload bytes. Use integer quantities.
-Bound its sample count and runtime; discard raw data after each check. The
+Bound it to 12 samples, three windows, 24 RPC calls, 8 seconds per call and
+240 seconds total, with no retries; discard raw data after each check. The
 output is a versioned aggregate with a four-hour maximum retention.
 
 ## Task 3 — run a controlled observe-only comparison
@@ -35,14 +36,17 @@ event with its own Pump.fun instruction and exact attributable movements,
 never a transaction-global delta reused for multiple instructions. Capture
 distinct finalized slots and buy/sell forms where present. Record only
 pass/fail/inconclusive counts by bounded instruction family and variant length.
-If two paths or exact pairing are unavailable, report `INCONCLUSIVE` and stop.
+If two paths, exact pairing or attributable movements are unavailable, report
+compatibility `INCONCLUSIVE` and stop. Wire-shape matches alone are not a PASS.
 
 ## Task 4 — decoder decision gate
 
-Review an official updated schema or independently verifiable on-chain
-invariants for the final 8-byte boundary. If no proof establishes the consumed
-business fields and the suffix's compatibility, keep 24-byte events in strict
-quarantine and mark #215 externally blocked. If proof exists, revise the
+Review an authoritative full-suffix schema or an explicitly value-bounded
+opaque profile backed by independently verifiable on-chain invariants. The
+known-prefix parse plus eight-byte skip never suffices. If no proof establishes
+the complete accepted-value boundary, consumed business fields and suffix
+compatibility, keep 24-byte events in strict quarantine and mark #215
+externally blocked. If proof exists, revise the
 versioned design first, add sanitized finalized RED fixtures, then implement
 only the exact proven variant. Preserve 0/16 behavior and reject other
 lengths. Verify multi-instruction pairing, duplicate elimination, commitment

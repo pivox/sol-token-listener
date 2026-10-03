@@ -1,4 +1,4 @@
-# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.2.0
+# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.3.0
 
 ## Scope and current evidence
 
@@ -20,6 +20,12 @@ that the full payload was consumed. The third 8-byte segment is presently
 unexplained. Its type, meaning, activation conditions and effect on known
 fields are not asserted here.
 
+The finalized Mainnet legacy Anchor IDL account derived from the Pump.fun
+program ID is present and owned by that program. A read-only fetch using the
+Anchor IDL client also ends `TradeEvent` at the same two documented `u64`
+fields. This on-chain IDL does **not** describe the extra eight bytes or prove
+that its published schema matches every currently emitted runtime event.
+
 ## Independent wire observation (2026-10-03)
 
 An owner-only, observe-only collector selected nine distinct finalized slots
@@ -34,14 +40,16 @@ the pinned IDL-known prefix, left exactly 24 bytes, consumed the documented
 two trailing `u64` values and left exactly eight opaque bytes. Six paired
 to BUY and three to SELL actions in their own instruction/stack scopes, with
 matching side, instruction name, mint, user and normalized quote mint; the
-SELL action amount also matched the event token amount. The collector's four
-safety tests passed; only bounded aggregate counts were emitted.
+SELL action amount also matched the event token amount. Four basic offline
+collector tests passed; only bounded aggregate counts were emitted. This
+diagnostic did not complete the plan's exact per-instruction account-movement
+attribution or its full adversarial collector test matrix.
 
-This proves a narrow observed wire shape for nine finalized trades, not the meaning of
-the final eight bytes, exact balance-movement attribution, or safety of
-using those transactions for qualification or trading. It does not change
-the decoder go/no-go below. The protected source signatures and raw RPC
-responses were not published or persisted by this check.
+The result is a narrow observed wire-shape and action-pairing match, but the
+**compatibility-evidence verdict is `INCONCLUSIVE`**: the final eight bytes,
+exact balance-movement attribution and safe downstream business use remain
+unproved. It does not change the decoder go/no-go below. The protected source
+signatures and raw RPC responses were not published or persisted by this check.
 
 ## Decision and alternatives
 
@@ -54,9 +62,10 @@ Three approaches were considered:
 1. Reject 24 indefinitely: safe but leaves the observed Mainnet population
    quarantined.
 2. Validate a narrowly attested 24-byte variant and then specify its decoder:
-   preferred only if authoritative schema or sufficient on-chain invariants
-   establish the field boundary and show that the unknown segment cannot alter
-   the business facts consumed by the listener.
+   preferred only if an authoritative full-suffix schema establishes every
+   field and constraint, or a separately specified, explicitly value-bounded
+   opaque profile proves each accepted value and all consumed business facts.
+   Merely proving that earlier fields remain valid is insufficient.
 3. Accept whatever an SDK coder returns despite trailing bytes: rejected,
    because partial Borsh consumption does not authenticate the residual data.
 
@@ -64,8 +73,11 @@ This document is an evidence-stage design, not approval to activate option 2.
 
 ## Evidence collection boundary
 
-An owner-only, observe-only collector may select a small set of finalized
-representatives from the canary attribution in memory. It must never open a
+An owner-only, observe-only collector may select at most 12 finalized
+representatives from the canary attribution in memory, in at most three
+windows of four. It may make at most 24 standard `getTransaction` calls (one
+per sample per provider), with no retries, an 8-second timeout per call and
+a 240-second total wall-clock limit. It must never open a
 wallet or invoke transaction submission. For each representative it checks:
 
 - same finalized transaction bytes, slot and instruction location from two
@@ -95,11 +107,14 @@ ambiguous pairing or unavailable movement attribution is fail-closed.
 ## Decoder go/no-go
 
 No decoder change follows merely from observing many 24-byte payloads or from
-byte equality across RPCs. A follow-up revision must identify an official
-IDL/SDK release or another independently verifiable on-chain schema/invariant
-that establishes the final 8-byte boundary and proves the known fields used by
-qualification and paper trading remain valid. If this cannot be established,
-maintain quarantine and report #215 as externally blocked on protocol evidence.
+byte equality across RPCs. A follow-up revision must identify an authoritative
+schema decoding the **entire** suffix with validated type/range constraints,
+or define an explicitly value-bounded opaque profile backed by independently
+verifiable on-chain invariants, including exact movements and every business
+field consumed by qualification or paper trading. A length check plus an
+eight-byte skip, unrestricted opaque value, or historical sample frequency is
+not sufficient. If this cannot be established, maintain quarantine and report
+#215 as externally blocked on protocol evidence.
 
 If established, add a RED fixture with sanitized finalized data first. The
 GREEN parser must accept exactly the newly proven variant, preserve 0/16,
