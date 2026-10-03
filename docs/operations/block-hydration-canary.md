@@ -822,6 +822,16 @@ eux aussi indépendants, avec leurs snapshots et critères propres.
 - le shutdown arrête les nouvelles admissions, draine dans le délai borné et
   laisse le health final propre, sans fuite de file ou de cache.
 
+Diagnostic additionnel #216 : archiver séparément, avant le nettoyage du
+canary, `mainnet-scanner-attribution.v1.json` (T0, T+5, T+15,
+FINAL_PRESTOP, STOPPED). Chaque échantillon porte `VALID`, `MISSING`,
+`MALFORMED` ou `OVERFLOW`. Le sidecar provient du heartbeat public et de
+l'agrégat final PostgreSQL ; son constructeur fermé élimine toute identité
+de transaction et tout message libre. Le manifeste et les 19 gates V1 restent
+inchangés. Un sidecar manquant n'est pas un PASS. Un probe observe-only court
+peut comparer les deltas source/hydratation/admission/front avec l'âge de la
+dette, mais ne remplace jamais le canary complet de 15 minutes.
+
 Pour le gate HTTP 429, seul un delta positif prouvé est `FAIL`; les autres
 observations de la matrice restent `INCONCLUSIVE`. Les gates opérationnels
 distincts ci-dessus conservent leurs propres critères. Deux niveaux de rollback
