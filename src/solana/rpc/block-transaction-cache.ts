@@ -1,4 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import type { RuntimeBlockHydrationPhaseEvidenceV1 } from '../../domain/block-hydration-phase-evidence.js';
+import { createBlockHydrationPhaseRecorder, type BlockHydrationPhaseRecorder } from './block-hydration-phase-recorder.js';
 import { decodeBlockTransactionPayload } from './block-transaction-payload-codec.js';
 import {
   BlockUnavailableError, RpcTransientError, TransactionIndexNotFoundError,
@@ -19,6 +21,7 @@ export interface BlockTransactionCacheOptions {
   readonly finalizedTtlMs?: number;
   readonly fetchIntervalMs?: number;
   readonly now?: () => number;
+  readonly phaseNow?: () => number;
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
@@ -67,6 +70,7 @@ export class CachedSolanaBlockTransactionLocator {
   private readonly queue: Admission[] = [];
   private readonly abort = new AbortController();
   private readonly now: () => number;
+  private readonly phaseRecorder: BlockHydrationPhaseRecorder;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly maxEntries: number;
   private readonly maxBytes: number;
@@ -96,6 +100,9 @@ export class CachedSolanaBlockTransactionLocator {
 
   public constructor(private readonly rpc: EpochTransactionBlockRpc, options: BlockTransactionCacheOptions = {}) {
     this.now = options.now ?? ((): number => performance.now());
+    this.phaseRecorder = createBlockHydrationPhaseRecorder(
+      options.phaseNow === undefined ? {} : { now: options.phaseNow },
+    );
     this.sleep = options.sleep ?? (async (ms, signal): Promise<void> => { await delay(ms, undefined, { signal }); });
     this.maxEntries = options.maxEntries ?? BLOCK_TRANSACTION_CACHE_DEFAULTS.maxEntries;
     this.maxBytes = options.maxBytes ?? BLOCK_TRANSACTION_CACHE_DEFAULTS.maxBytes;
@@ -113,6 +120,10 @@ export class CachedSolanaBlockTransactionLocator {
     this.synchronizeEpoch();
     this.pruneExpired();
     return Object.freeze({ entries: this.entries.size, bytes: this.bytes, inFlight: this.inFlight.size, queued: this.queue.length });
+  }
+
+  public get phaseEvidence(): RuntimeBlockHydrationPhaseEvidenceV1 | null {
+    return this.phaseRecorder.snapshot();
   }
 
   public get metrics(): BlockTransactionCacheMetricsV1 {
@@ -258,13 +269,22 @@ export class CachedSolanaBlockTransactionLocator {
 
   private async fetchSnapshot(target: TransactionLocationTarget): Promise<BlockTransactionDataSnapshot> {
     let raw: unknown;
+    const settleRpc = this.phaseRecorder.begin('rpc');
     try {
       raw = await this.rpc.getBlockTransactions(target.slot, target.confirmationStatus, this.abort.signal);
+      settleRpc('completed');
     } catch {
+      settleRpc('failed');
       this.fetchFailures = increment(this.fetchFailures);
       throw internalLocatorError(new RpcTransientError());
     }
-    const snapshot = snapshotBlockTransactionData(raw, target.slot, target.confirmationStatus);
+    const settleSnapshot = this.phaseRecorder.begin('snapshot');
+    let snapshot: BlockTransactionDataSnapshot | null = null;
+    try {
+      snapshot = snapshotBlockTransactionData(raw, target.slot, target.confirmationStatus);
+    } finally {
+      settleSnapshot(snapshot === null ? 'failed' : 'completed');
+    }
     if (snapshot === null) {
       this.fetchFailures = increment(this.fetchFailures);
       throw internalLocatorError(new BlockUnavailableError());

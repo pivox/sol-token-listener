@@ -73,7 +73,7 @@ function deferred<T>() {
 async function flushMicrotasks(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
-function harness(options: { maxEntries?: number; maxBytes?: number; maxEntryBytes?: number; confirmedTtlMs?: number } = {}) {
+function harness(options: { maxEntries?: number; maxBytes?: number; maxEntryBytes?: number; confirmedTtlMs?: number; phaseNow?: () => number } = {}) {
   let now = 0;
   let epoch = 0;
   const calls: { slot: bigint; status: string; time: number }[] = [];
@@ -88,6 +88,111 @@ function harness(options: { maxEntries?: number; maxBytes?: number; maxEntryByte
   return { locator, calls, setNow(value: number) { now = value; },
     setEpoch(value: number) { epoch = value; }, setFetch(value: typeof fetch) { fetch = value; } };
 }
+
+void test('phase evidence measures one physical single-flight fetch independently of cache metrics and TTL clock', async () => {
+  const times = [10, 110, 200, 225];
+  const h = harness({ phaseNow: () => {
+    const time = times.shift();
+    assert.ok(time !== undefined);
+    return time;
+  } });
+  const initial = h.locator.phaseEvidence;
+  assert.equal(initial, null);
+  const flight = deferred<unknown>();
+  h.setFetch(async () => flight.promise);
+  const first = h.locator.locate(target());
+  const second = h.locator.locate(target('two'));
+  const pending = h.locator.phaseEvidence;
+  assert.ok(pending);
+  assert.equal(pending.rpc.started, 1);
+  assert.equal(pending.rpc.inFlight, 1);
+  assert.equal(pending.snapshot.started, 0);
+  assert.equal(h.calls.length, 1);
+  flight.resolve(block());
+  await Promise.all([first, second]);
+  const settled = h.locator.phaseEvidence;
+  assert.ok(settled);
+  assert.deepEqual(settled.rpc, {
+    started: 1, completed: 1, failed: 0, inFlight: 0, maxInFlight: 1,
+    settledLatencyBuckets: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0], maxSettledLatencyMs: 100,
+  });
+  assert.deepEqual(settled.snapshot, {
+    started: 1, completed: 1, failed: 0, inFlight: 0, maxInFlight: 1,
+    settledLatencyBuckets: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], maxSettledLatencyMs: 25,
+  });
+  assert.equal(Object.isFrozen(settled.snapshot.settledLatencyBuckets), true);
+  assert.equal(pending.rpc.inFlight, 1);
+  await h.locator.locate(target());
+  assert.deepEqual(h.locator.phaseEvidence, settled);
+  assert.equal(h.locator.stats.entries, 1);
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(h.locator.metrics, {
+    version: 1, locates: 3, hits: 1, misses: 2, inFlightJoins: 1, fetches: 1,
+    forcedRefreshes: 0, evictions: 0, oversizeBypasses: 0, fetchFailures: 0,
+    epochInvalidations: 0, retainedEntries: 1, retainedBytes: h.locator.stats.bytes,
+    inFlightFetches: 0, queuedFetches: 0, queueDelayMs: { last: 0, maximum: 0 },
+  });
+  assert.deepEqual(times, []);
+});
+
+void test('phase evidence settles RPC rejection and counts a retry as a distinct physical attempt', async () => {
+  const h = harness({ phaseNow: () => 0 });
+  h.setFetch(async () => { throw new Error('private provider payload'); });
+  await assert.rejects(h.locator.locate(target()), RpcTransientError);
+  const failed = h.locator.phaseEvidence;
+  assert.ok(failed);
+  assert.equal(failed.rpc.started, 1);
+  assert.equal(failed.rpc.failed, 1);
+  assert.equal(failed.rpc.inFlight, 0);
+  assert.equal(failed.snapshot.started, 0);
+  h.setFetch(async () => block());
+  await h.locator.locate(target());
+  const retried = h.locator.phaseEvidence;
+  assert.ok(retried);
+  assert.equal(retried.rpc.started, 2);
+  assert.equal(retried.rpc.completed, 1);
+  assert.equal(retried.rpc.failed, 1);
+  assert.equal(retried.rpc.settledLatencyBuckets[0], 2);
+  assert.equal(retried.snapshot.completed, 1);
+  assert.equal(h.locator.metrics.fetchFailures, 1);
+  assert.equal(h.calls.length, 2);
+});
+
+void test('invalid blocks settle snapshot failures without changing trusted locator errors', async () => {
+  for (const value of [null, {}, new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('private payload'); } })]) {
+    const h = harness({ phaseNow: () => 0 });
+    h.setFetch(async () => value);
+    await assert.rejects(h.locator.locate(target()), BlockUnavailableError);
+    const evidence = h.locator.phaseEvidence;
+    assert.ok(evidence);
+    assert.equal(evidence.rpc.completed, 1);
+    assert.equal(evidence.rpc.failed, 0);
+    assert.equal(evidence.snapshot.started, 1);
+    assert.equal(evidence.snapshot.failed, 1);
+    assert.equal(evidence.snapshot.inFlight, 0);
+    assert.equal(evidence.snapshot.settledLatencyBuckets[0], 1);
+    assert.equal(h.locator.metrics.fetchFailures, 1);
+    assert.equal(h.locator.stats.entries, 0);
+  }
+});
+
+void test('a throwing phase clock cannot replace success or failure outcomes', async () => {
+  const h = harness({ phaseNow: () => { throw new Error('measurement unavailable'); } });
+  assert.equal((await h.locator.locate(target())).signature, 'one');
+  h.setFetch(async () => { throw new Error('provider unavailable'); });
+  await assert.rejects(h.locator.locate(target('one', 43n)), RpcTransientError);
+  h.setFetch(async () => null);
+  await assert.rejects(h.locator.locate(target('one', 44n)), BlockUnavailableError);
+  const evidence = h.locator.phaseEvidence;
+  assert.ok(evidence);
+  assert.equal(evidence.overflowed, true);
+  assert.equal(evidence.rpc.completed, 2);
+  assert.equal(evidence.rpc.failed, 1);
+  assert.equal(evidence.snapshot.completed, 1);
+  assert.equal(evidence.snapshot.failed, 1);
+  assert.equal(evidence.rpc.inFlight, 0);
+  assert.equal(evidence.snapshot.inFlight, 0);
+});
 
 void test('whole-slot single-flight and sequential hits preserve canonical indexes and caller isolation', async () => {
   const h = harness();
