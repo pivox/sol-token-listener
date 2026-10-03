@@ -1,4 +1,4 @@
-# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.4.1
+# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.4.2
 
 ## Recheck and fail-closed regression (2026-10-03)
 
@@ -11,8 +11,9 @@ assert that both zero and nonzero extra eight-byte tails fail with
 `PUMP_BORSH_INVALID`, and that terminal attribution records `suffixBytes: 24`
 without exposing payload bytes. These tests protect the existing quarantine;
 they do not constitute a finalized 24-byte fixture or a parser acceptance
-test. Canary verdict stays FAIL/INCONCLUSIVE and #215 remains open pending
-authoritative wire evidence.
+test. The existing 15-minute canary verdict remains `FAIL`. The separate
+24-byte wire-compatibility evidence verdict remains `INCONCLUSIVE`; #215
+stays open pending authoritative wire evidence.
 
 ## Scope and current evidence
 
