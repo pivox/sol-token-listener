@@ -1,7 +1,7 @@
-# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.1.0
+# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.2.0
 
 Base: `main@ced66e7086911265012897a34239a59371204878`.
-Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.3.0.
+Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.4.0.
 This plan does not authorize accepting a new wire variant, weakening quarantine,
 using a wallet, or submitting a transaction.
 
@@ -32,17 +32,24 @@ output is a versioned aggregate with a four-hour maximum retention.
 Require two genuinely independent RPC paths; an alias of the same endpoint is
 not independent evidence. Validate slot, transaction bytes, program, CPI
 location, event discriminator and known-prefix parse on both paths. Pair each
-event with its own Pump.fun instruction and exact attributable movements,
-never a transaction-global delta reused for multiple instructions. Capture
+event with its own Pump.fun instruction and separately classify event amounts,
+explicit scoped transfer legs and transaction-net reconciliation. Require
+complete scope and metadata; mark each movement field `UNAVAILABLE` or
+`AMBIGUOUS` when direct native-SOL mutation or repeated actions prevent exact
+attribution. Never reuse a transaction-global delta for multiple instructions. Capture
 distinct finalized slots and buy/sell forms where present. Record only
 pass/fail/inconclusive counts by bounded instruction family and variant length.
-If two paths, exact pairing or attributable movements are unavailable, report
-compatibility `INCONCLUSIVE` and stop. Wire-shape matches alone are not a PASS.
+If two paths or exact pairing are unavailable, report compatibility
+`INCONCLUSIVE` and stop. Movement fields without exact attribution remain
+inconclusive and cannot support an opaque suffix profile. Wire-shape matches
+alone are not a PASS.
 
 ## Task 4 — decoder decision gate
 
 Review an authoritative full-suffix schema or an explicitly value-bounded
-opaque profile backed by independently verifiable on-chain invariants. The
+opaque profile backed by independently verifiable on-chain invariants for
+every consumed business field. State separately which amounts are only
+event-attributed and which have independently verified movement legs. The
 known-prefix parse plus eight-byte skip never suffices. If no proof establishes
 the complete accepted-value boundary, consumed business fields and suffix
 compatibility, keep 24-byte events in strict quarantine and mark #215
