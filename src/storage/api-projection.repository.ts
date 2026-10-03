@@ -59,6 +59,10 @@ import {
   createRuntimeRpcHttpRoleEvidence,
   type RuntimeRpcHttpRoleEvidenceV1,
 } from '../domain/rpc-http-role-evidence.js';
+import {
+  createRuntimeBlockHydrationPhaseEvidence,
+  type RuntimeBlockHydrationPhaseEvidenceV1,
+} from '../domain/block-hydration-phase-evidence.js';
 import { snapshotRuntimeWorkerAdmissionMetrics, snapshotRuntimeWorkerAdmissionClock } from '../domain/worker-admission-metrics.js';
 import {
   SOCIAL_COLLECTION_STATUSES,
@@ -2119,7 +2123,8 @@ function emptyHeartbeat(
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket, blockHydration: null, blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
+    websocket, blockHydration: null, blockHydrationPhaseEvidence: null,
+    blockHydrationAdmission: null, catchUpAdmission: null, workerAdmission: null,
     workerAdmissionClock: null,
     rpcHttpEvidence: null,
     rpcHttpRoleEvidence: null,
@@ -2210,6 +2215,7 @@ function heartbeatFromRow(
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
     blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
+    blockHydrationPhaseEvidence: blockHydrationPhaseEvidenceFromPayload(row.heartbeat_payload),
     blockHydrationAdmission: blockHydrationAdmissionFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
     workerAdmission,
@@ -2362,6 +2368,19 @@ function rpcHttpRoleEvidenceFromPayload(value: unknown): RuntimeRpcHttpRoleEvide
   if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
   try {
     return createRuntimeRpcHttpRoleEvidence(descriptor.value);
+  } catch {
+    throw invalid();
+  }
+}
+
+function blockHydrationPhaseEvidenceFromPayload(value: unknown): RuntimeBlockHydrationPhaseEvidenceV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object' || isProxy(value) || !isRecord(value)) throw invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'blockHydrationPhaseEvidence');
+  if (descriptor === undefined) return null;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  try {
+    return createRuntimeBlockHydrationPhaseEvidence(descriptor.value);
   } catch {
     throw invalid();
   }

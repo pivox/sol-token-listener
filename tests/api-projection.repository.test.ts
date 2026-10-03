@@ -18,6 +18,7 @@ import {
 import { toJsonValue } from '../src/utils/json.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
+import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
 import {
   createDefaultQualificationRuleSet,
   QualificationEngine,
@@ -1721,6 +1722,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: null,
       pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
       blockHydration: blockHydrationMetrics(),
+      blockHydrationPhaseEvidence: null,
       blockHydrationAdmission: null,
       catchUpAdmission: null,
       workerAdmission: null,
@@ -2125,7 +2127,8 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
-    websocket: inactiveWebSocketHealth(), blockHydration: null, catchUpAdmission: null,
+    websocket: inactiveWebSocketHealth(), blockHydration: null, blockHydrationPhaseEvidence: null,
+    catchUpAdmission: null,
     blockHydrationAdmission: null,
     workerAdmission: null,
     workerAdmissionClock: null,
@@ -2922,6 +2925,27 @@ void test('role evidence legacy absence is null and malformed stored sidecar fai
     assert.equal(health.postgresql.status, 'UNAVAILABLE');
     assert.equal(health.heartbeat.rpcHttpRoleEvidence, null);
     assert.doesNotMatch(JSON.stringify(health), /private-secret/u);
+  }
+});
+
+void test('block hydration phase evidence projects a detached snapshot and fails malformed storage closed', async () => {
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  recorder.begin('rpc')('completed');
+  const phase = recorder.snapshot();
+  assert.ok(phase);
+  const health = await projectRpcHttpEvidence({ blockHydrationPhaseEvidence: phase });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.blockHydrationPhaseEvidence, phase);
+  assert.notEqual(health.heartbeat.blockHydrationPhaseEvidence, phase);
+  assert.ok(Object.isFrozen(health.heartbeat.blockHydrationPhaseEvidence?.rpc.settledLatencyBuckets));
+  assert.equal((await projectRpcHttpEvidence({})).heartbeat.blockHydrationPhaseEvidence, null);
+  for (const candidate of [null, { ...phase, signature: 'private-secret' },
+    { ...phase, rpc: { ...phase.rpc, started: 2 } }]) {
+    const malformed = await projectRpcHttpEvidence({ blockHydrationPhaseEvidence: candidate });
+    assert.equal(malformed.status, 'DEGRADED');
+    assert.equal(malformed.postgresql.status, 'UNAVAILABLE');
+    assert.equal(malformed.heartbeat.blockHydrationPhaseEvidence, null);
+    assert.doesNotMatch(JSON.stringify(malformed), /private-secret/u);
   }
 });
 

@@ -54,6 +54,7 @@ import { snapshotRuntimeWorkerAdmissionMetrics } from '../src/domain/worker-admi
 import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import { createRuntimeRpcHttpRoleEvidence } from '../src/domain/rpc-http-role-evidence.js';
+import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
@@ -226,6 +227,31 @@ void test('heartbeat validates optional RPC HTTP role evidence before generic no
     Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: undefined }),
     Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: new Proxy(valid, { ownKeys: hostile }) }),
     Object.freeze({ ...heartbeat, rpcHttpRoleEvidence: Object.freeze({ ...valid, endpoint: 'secret' }) }),
+    accessor,
+  ]) {
+    assert.throws(() => { assertValidRuntimeHeartbeat(candidate); }, TypeError);
+  }
+  assert.equal(reads, 0);
+});
+
+void test('heartbeat validates optional block hydration phase evidence before generic normalization', () => {
+  const heartbeat = rpcEvidenceHeartbeat();
+  const recorder = createBlockHydrationPhaseRecorder({ now: () => 0 });
+  recorder.begin('rpc')('completed');
+  const valid = recorder.snapshot();
+  assert.ok(valid);
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => {
+    assertValidRuntimeHeartbeat(Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: valid }));
+  });
+  let reads = 0;
+  const accessor = Object.freeze(Object.defineProperty({ ...heartbeat }, 'blockHydrationPhaseEvidence', {
+    enumerable: true, get() { reads += 1; throw new Error('must not read'); },
+  }));
+  for (const candidate of [
+    Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: undefined }),
+    Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: new Proxy(valid, {}) }),
+    Object.freeze({ ...heartbeat, blockHydrationPhaseEvidence: { ...valid, signature: 'private' } }),
     accessor,
   ]) {
     assert.throws(() => { assertValidRuntimeHeartbeat(candidate); }, TypeError);
