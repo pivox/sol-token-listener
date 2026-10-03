@@ -2960,7 +2960,10 @@ void test('persists one detached exact V2 heartbeat bundle before querying', asy
     },
     async connect() { throw new Error('not used'); },
   });
-  const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(twoGroupHydrationEvidenceFixture());
+  const source = twoGroupHydrationEvidenceFixture();
+  source.ordinaryRpcBudget.localRejections = 1;
+  source.blockResponseMemory.oversizedResponses = 1;
+  const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(source);
   await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), ...evidence }));
   const payload = persisted as Record<string, unknown>;
   for (const field of ['blockHydration', 'blockHydrationAdmission',
