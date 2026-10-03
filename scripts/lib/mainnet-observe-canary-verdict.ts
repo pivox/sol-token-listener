@@ -257,6 +257,41 @@ interface TerminalAttributionEvidence {
   readonly incompleteAttribution: AttributionSectionEvidence<MainnetTerminalAttributionV1['incompleteAttribution']>;
 }
 
+export type MainnetObserveCanaryCoreSnapshot = Omit<Snapshot, 'blockHydration' | 'blockHydrationAdmission'>;
+export type MainnetObserveCanaryCoreStopped = Omit<StoppedHeartbeat, 'blockHydration' | 'blockHydrationAdmission'>;
+export type MainnetObserveCanaryCoreInput = Omit<CanaryInput, 'snapshots' | 'stoppedHeartbeat'> & Readonly<{
+  snapshots: Readonly<Record<SnapshotName, MainnetObserveCanaryCoreSnapshot>>;
+  stoppedHeartbeat: MainnetObserveCanaryCoreStopped;
+}>;
+export type MainnetObserveCanaryCoreGateName = Exclude<MainnetObserveCanaryGateName,
+  'blockHydration' | 'blockHydrationAdmission' | 'providerAffinity' | 'shutdown'>;
+type ParsedCore<T> = Omit<MainnetObserveCanaryCoreInput, 'snapshots' | 'stoppedHeartbeat'> & Readonly<{
+  snapshots: Readonly<Record<SnapshotName, MainnetObserveCanaryCoreSnapshot & T>>;
+  stoppedHeartbeat: MainnetObserveCanaryCoreStopped & T;
+}>;
+type SidecarParser<T> = (input: object) => T;
+function parseV1Sidecars(input: object): Pick<Snapshot, 'blockHydration' | 'blockHydrationAdmission'> {
+  const data = input as Record<string, unknown>;
+  return { blockHydration: parseHydration(data.blockHydration),
+    blockHydrationAdmission: parseOptionalBlockHydrationAdmission(data) };
+}
+
+export function evaluateMainnetObserveCanarySafetyGates(
+  evidence: MainnetObserveCanaryCoreInput, terminalAttribution?: unknown,
+): Readonly<Record<MainnetObserveCanaryCoreGateName, MainnetObserveCanaryGateResultV1>> {
+  const attribution = parseTerminalAttributionEvidence(terminalAttribution);
+  return Object.freeze({
+    runtime: evaluateRuntime(evidence), http429: evaluateHttp429(evidence),
+    backlog: evaluateBacklog(evidence), terminalFailures: evaluateTerminal(evidence, attribution),
+    idempotence: evaluateIdempotence(evidence), retention: evaluateRetention(evidence),
+    decoderQuarantine: evaluateDecoder(evidence, attribution), firstProcessing: evaluateFirstProcessing(evidence),
+    catchUpAdmission: evaluateAdmission(evidence), workerAdmission: evaluateWorkerAdmission(evidence),
+    rss: evaluateRss(evidence), pumpswap: evaluatePumpSwap(evidence),
+    finality: evaluateFinality(evidence), versionsAndFreshReplay: evaluateVersions(evidence),
+    cleanup: evidence.cleanupComplete ? gate('PASS', 'CLEANUP_COMPLETE') : gate('FAIL', 'CLEANUP_INCOMPLETE'),
+  });
+}
+
 class InvalidEvidence extends Error {}
 
 export function evaluateMainnetObserveCanary(
@@ -269,33 +304,17 @@ export function evaluateMainnetObserveCanary(
   } catch {
     return result(null, allGates('INCONCLUSIVE', 'INVALID_EVIDENCE'));
   }
-  const attribution = parseTerminalAttributionEvidence(terminalAttribution);
   const gates: Record<MainnetObserveCanaryGateName, MainnetObserveCanaryGateResultV1> = {
-    runtime: evaluateRuntime(evidence),
-    http429: evaluateHttp429(evidence),
-    backlog: evaluateBacklog(evidence),
-    terminalFailures: evaluateTerminal(evidence, attribution),
-    idempotence: evaluateIdempotence(evidence),
-    retention: evaluateRetention(evidence),
-    decoderQuarantine: evaluateDecoder(evidence, attribution),
-    firstProcessing: evaluateFirstProcessing(evidence),
+    ...evaluateMainnetObserveCanarySafetyGates(evidence, terminalAttribution),
     blockHydration: evaluateHydration(evidence),
     blockHydrationAdmission: evaluateBlockHydrationAdmission(evidence),
-    catchUpAdmission: evaluateAdmission(evidence),
-    workerAdmission: evaluateWorkerAdmission(evidence),
     providerAffinity: evaluateAffinity(evidence),
-    rss: evaluateRss(evidence),
-    pumpswap: evaluatePumpSwap(evidence),
-    finality: evaluateFinality(evidence),
-    versionsAndFreshReplay: evaluateVersions(evidence),
     shutdown: evaluateShutdown(evidence),
-    cleanup: evidence.cleanupComplete ? gate('PASS', 'CLEANUP_COMPLETE')
-      : gate('FAIL', 'CLEANUP_INCOMPLETE'),
   };
   return result(evidence.commit, gates);
 }
 
-function evaluateRuntime(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateRuntime(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
   if (!strictlyIncreasing(snapshots.map((snapshot) => snapshot.observedAtMs))) {
     return gate('INCONCLUSIVE', 'RUNTIME_TIMELINE_INVALID');
@@ -326,7 +345,7 @@ function evaluateRuntime(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     : gate('PASS', 'RUNTIME_HEALTHY');
 }
 
-function isAuthenticatedPeriodicPause(snapshot: Snapshot): boolean {
+function isAuthenticatedPeriodicPause(snapshot: MainnetObserveCanaryCoreSnapshot): boolean {
   const pause = snapshot.periodicPauseEvidence;
   return pause !== null
     && snapshot.status === 'DEGRADED'
@@ -345,7 +364,7 @@ function isAuthenticatedPeriodicPause(snapshot: Snapshot): boolean {
     && pause.observedAtMs === snapshot.observedAtMs;
 }
 
-function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateHttp429(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
   const rpcSnapshots = [...snapshots.map((snapshot) => snapshot.rpcHttpEvidence),
     input.stoppedHeartbeat.rpcHttpEvidence];
@@ -408,13 +427,13 @@ function evaluateHttp429(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
   return gate('PASS', 'RPC_HTTP_429_NONE');
 }
 
-function evaluateBacklog(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateBacklog(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   return nonIncreasing(orderedSnapshots(input).map((snapshot) => snapshot.backlogCount))
     ? gate('PASS', 'BACKLOG_NON_GROWING') : gate('FAIL', 'BACKLOG_GREW');
 }
 
 function evaluateTerminal(
-  input: CanaryInput,
+  input: MainnetObserveCanaryCoreInput,
   attribution: TerminalAttributionEvidence,
 ): MainnetObserveCanaryGateResultV1 {
   const { baseline, final } = input.terminalEvidence;
@@ -448,19 +467,19 @@ function evaluateTerminal(
   return gate('PASS', 'TERMINAL_NONE');
 }
 
-function evaluateIdempotence(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateIdempotence(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   return orderedSnapshots(input).every((snapshot) => snapshot.inbox.total
     === snapshot.inbox.distinctSignatures && snapshot.inbox.admissionReceiptViolations === 0)
     ? gate('PASS', 'IDEMPOTENCE_CONFIRMED') : gate('FAIL', 'IDEMPOTENCE_VIOLATION');
 }
 
-function evaluateRetention(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateRetention(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   return orderedSnapshots(input).every((snapshot) => snapshot.inbox.terminalRetentionViolations === 0)
     ? gate('PASS', 'RETENTION_CONFIRMED') : gate('FAIL', 'RETENTION_VIOLATION');
 }
 
 function evaluateDecoder(
-  input: CanaryInput,
+  input: MainnetObserveCanaryCoreInput,
   attribution: TerminalAttributionEvidence,
 ): MainnetObserveCanaryGateResultV1 {
   if (orderedSnapshots(input).some(
@@ -488,7 +507,7 @@ function evaluateDecoder(
   return integrityFailure ?? gate('PASS', 'DECODER_QUARANTINE_EMPTY');
 }
 
-function evaluateFirstProcessing(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateFirstProcessing(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
   const evidence = [...snapshots.map((snapshot) => snapshot.firstProcessingCanary),
     input.stoppedHeartbeat.firstProcessingCanary];
@@ -555,7 +574,7 @@ function evaluateHydration(input: CanaryInput): MainnetObserveCanaryGateResultV1
   return gate('PASS', 'BLOCK_HYDRATION_WITHIN_LIMITS');
 }
 
-function evaluateAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateAdmission(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   for (const snapshot of orderedSnapshots(input)) {
     const admission = snapshot.catchUpAdmission;
     if (!admission.enabled) return gate('INCONCLUSIVE', 'ADMISSION_DISABLED');
@@ -595,7 +614,7 @@ function evaluateBlockHydrationAdmission(input: CanaryInput): MainnetObserveCana
   return gate('PASS', 'BLOCK_HYDRATION_ADMISSION_BOUNDED');
 }
 
-function evaluateWorkerAdmission(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateWorkerAdmission(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
   const evidence = [...snapshots.map((snapshot) => snapshot.workerAdmission),
     input.stoppedHeartbeat.workerAdmission];
@@ -710,7 +729,7 @@ function evaluateAffinity(input: CanaryInput): MainnetObserveCanaryGateResultV1 
     : gate('INCONCLUSIVE', 'PROVIDER_SWITCH_UNPROVEN');
 }
 
-function evaluateRss(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateRss(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const baseline = BigInt(input.snapshots.T_PLUS_5.rssBytes);
   const proportionalHeadroom = (baseline + 3n) / 4n;
   const headroom = proportionalHeadroom > BigInt(MIN_RSS_HEADROOM_BYTES)
@@ -721,12 +740,12 @@ function evaluateRss(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
     ? gate('PASS', 'RSS_WITHIN_LIMIT') : gate('FAIL', 'RSS_LIMIT_EXCEEDED');
 }
 
-function evaluatePumpSwap(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluatePumpSwap(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   return orderedSnapshots(input).every((snapshot) => snapshot.pipelinePumpswap === 'IDLE')
     ? gate('PASS', 'PUMPSWAP_ISOLATED') : gate('FAIL', 'PUMPSWAP_NOT_ISOLATED');
 }
 
-function evaluateFinality(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateFinality(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const snapshots = orderedSnapshots(input);
   if (snapshots.some((snapshot) => snapshot.reconcilerState !== 'RUNNING')) {
     return gate('FAIL', 'FINALITY_RECONCILER_NOT_RUNNING');
@@ -765,7 +784,7 @@ function evaluateFinality(input: CanaryInput): MainnetObserveCanaryGateResultV1 
   return open === null ? gate('PASS', 'FINALITY_HEALTHY') : gate('FAIL', 'FINALITY_INCIDENT_OPEN');
 }
 
-function evaluateVersions(input: CanaryInput): MainnetObserveCanaryGateResultV1 {
+function evaluateVersions(input: MainnetObserveCanaryCoreInput): MainnetObserveCanaryGateResultV1 {
   const proof = input.versionReplayProof;
   const observed = [proof.observed.legacy, proof.observed.v0, proof.observed.v1];
   const normalized = [proof.normalized.legacy, proof.normalized.v0, proof.normalized.v1];
@@ -856,7 +875,7 @@ function completeTerminalAttribution(
 }
 
 function reconcileTerminalAttribution(
-  input: CanaryInput,
+  input: MainnetObserveCanaryCoreInput,
   currentPopulation: MainnetTerminalAttributionV1['currentPopulation'],
 ): TerminalAttributionReconciliation {
   const groups = currentPopulation.groups;
@@ -912,23 +931,30 @@ function attributionUnavailableGate(
 }
 
 function parseInput(value: unknown): CanaryInput {
+  return parseMainnetObserveCanaryCore(value, 'mainnet-observe-canary-input.v1', parseV1Sidecars);
+}
+
+export function parseMainnetObserveCanaryCore<T>(
+  value: unknown, schema: 'mainnet-observe-canary-input.v1' | 'mainnet-observe-canary-input.v2',
+  sidecars: SidecarParser<T>,
+): ParsedCore<T> {
   const input = exactObjectWithOptional(value, [
     'schemaVersion', 'commit', 'snapshots', 'stoppedHeartbeat', 'finalityDiagnostics',
     'providerMixingEvidenceCount', 'terminalEvidence', 'postStopActionableCount',
     'versionReplayProof', 'cleanupComplete',
   ], ['postStopWorkerAdmissionClaimableCount', 'postStopWorkerAdmissionClaimableProof']);
-  if (input.schemaVersion !== 'mainnet-observe-canary-input.v1'
+  if (input.schemaVersion !== schema
     || typeof input.commit !== 'string' || !/^[0-9a-f]{40}$/u.test(input.commit)) invalid();
   const sourceSnapshots = exactObject(input.snapshots, SNAPSHOT_NAMES);
-  const snapshots = Object.freeze({ T0: parseSnapshot(sourceSnapshots.T0),
-    T_PLUS_5: parseSnapshot(sourceSnapshots.T_PLUS_5),
-    T_PLUS_15: parseSnapshot(sourceSnapshots.T_PLUS_15),
-    FINAL_PRESTOP: parseSnapshot(sourceSnapshots.FINAL_PRESTOP) });
+  const snapshots = Object.freeze({ T0: parseSnapshot(sourceSnapshots.T0, schema, sidecars),
+    T_PLUS_5: parseSnapshot(sourceSnapshots.T_PLUS_5, schema, sidecars),
+    T_PLUS_15: parseSnapshot(sourceSnapshots.T_PLUS_15, schema, sidecars),
+    FINAL_PRESTOP: parseSnapshot(sourceSnapshots.FINAL_PRESTOP, schema, sidecars) });
   const terminal = exactObject(input.terminalEvidence, ['baseline', 'final', 'groups']);
   const proof = exactObject(input.versionReplayProof,
     ['freshDatabase', 'observed', 'normalized', 'persisted']);
   return Object.freeze({
-    commit: input.commit, snapshots, stoppedHeartbeat: parseStopped(input.stoppedHeartbeat),
+    commit: input.commit, snapshots, stoppedHeartbeat: parseStopped(input.stoppedHeartbeat, schema, sidecars),
     finalityDiagnostics: Object.freeze(exactArray(input.finalityDiagnostics,
       MAX_FINALITY_DIAGNOSTICS).map(parseFinality)),
     providerMixingEvidenceCount: integer(input.providerMixingEvidenceCount),
@@ -960,13 +986,14 @@ function parseOptionalIntegerEvidence(
   }
 }
 
-function parseSnapshot(value: unknown): Snapshot {
+function parseSnapshot<T>(value: unknown, schema: string, sidecars: SidecarParser<T>): MainnetObserveCanaryCoreSnapshot & T {
   const input = exactObjectWithOptional(value, [
     'observedAtMs', 'startedAtMs', 'status', 'pipelinePumpfun', 'pipelinePumpswap', 'runtimeState',
     'subscriberState', 'scannerState', 'workerState', 'reconcilerState', 'backlogCount',
-    'leasedCount', 'websocket', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
+    'leasedCount', 'websocket', 'catchUpAdmission', ...(schema.endsWith('.v1') ? ['blockHydration'] : []), 'rpcHttpEvidence',
     'firstProcessingCanary', 'periodicPauseEvidence', 'decoderQuarantine', 'inbox', 'rssBytes',
-  ], ['workerAdmission', 'workerAdmissionClock', 'blockHydrationAdmission']);
+  ], ['workerAdmission', 'workerAdmissionClock', 'blockHydrationAdmission',
+    ...(schema.endsWith('.v2') ? ['blockHydration', 'ordinaryRpcBudget', 'blockResponseMemory'] : [])]);
   const websocket = exactObject(input.websocket,
     ['phase', 'providerId', 'recoveryStatus', 'recoveryReasonCode']);
   const decoder = exactObject(input.decoderQuarantine, ['version', 'unresolvedCount']);
@@ -998,8 +1025,7 @@ function parseSnapshot(value: unknown): Snapshot {
     catchUpAdmission: parseAdmission(input.catchUpAdmission),
     workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
     workerAdmissionClock: parseOptionalWorkerAdmissionClock(input),
-    blockHydration: parseHydration(input.blockHydration),
-    blockHydrationAdmission: parseOptionalBlockHydrationAdmission(input),
+    ...sidecars(schema.endsWith('.v1') ? input : value as object),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary),
     decoderQuarantine: Object.freeze({ version: 1, unresolvedCount: integer(decoder.unresolvedCount) }),
@@ -1013,13 +1039,14 @@ function parseSnapshot(value: unknown): Snapshot {
   });
 }
 
-function parseStopped(value: unknown): StoppedHeartbeat {
+function parseStopped<T>(value: unknown, schema: string, sidecars: SidecarParser<T>): MainnetObserveCanaryCoreStopped & T {
   const input = exactObjectWithOptional(value, [
     'observedAtMs', 'startedAtMs', 'runtimeState', 'subscriberState', 'scannerState', 'workerState',
     'reconcilerState',
-    'backlogCount', 'leasedCount', 'catchUpAdmission', 'blockHydration', 'rpcHttpEvidence',
+    'backlogCount', 'leasedCount', 'catchUpAdmission', ...(schema.endsWith('.v1') ? ['blockHydration'] : []), 'rpcHttpEvidence',
     'firstProcessingCanary',
-  ], ['workerAdmission', 'workerAdmissionClock', 'blockHydrationAdmission']);
+  ], ['workerAdmission', 'workerAdmissionClock', 'blockHydrationAdmission',
+    ...(schema.endsWith('.v2') ? ['blockHydration', 'ordinaryRpcBudget', 'blockResponseMemory'] : [])]);
   return Object.freeze({ observedAtMs: integer(input.observedAtMs),
     startedAtMs: integer(input.startedAtMs),
     runtimeState: enumeration(input.runtimeState, RUNTIME_STATES),
@@ -1031,8 +1058,7 @@ function parseStopped(value: unknown): StoppedHeartbeat {
     leasedCount: integer(input.leasedCount), catchUpAdmission: parseAdmission(input.catchUpAdmission),
     workerAdmission: parseOptionalWorkerAdmission(input, 'workerAdmission'),
     workerAdmissionClock: parseOptionalWorkerAdmissionClock(input),
-    blockHydration: parseHydration(input.blockHydration),
-    blockHydrationAdmission: parseOptionalBlockHydrationAdmission(input),
+    ...sidecars(schema.endsWith('.v1') ? input : value as object),
     rpcHttpEvidence: parseRpc(input.rpcHttpEvidence),
     firstProcessingCanary: createFirstProcessingCanaryEvidence(input.firstProcessingCanary) });
 }
@@ -1296,7 +1322,7 @@ function gate(verdict: MainnetObserveCanaryVerdict, reasonCode: string): Mainnet
   return Object.freeze({ verdict, reasonCode });
 }
 
-function orderedSnapshots(input: CanaryInput): readonly [Snapshot, Snapshot, Snapshot, Snapshot] {
+function orderedSnapshots<T extends MainnetObserveCanaryCoreSnapshot>(input: { readonly snapshots: Readonly<Record<SnapshotName, T>> }): readonly [T, T, T, T] {
   return [input.snapshots.T0, input.snapshots.T_PLUS_5, input.snapshots.T_PLUS_15,
     input.snapshots.FINAL_PRESTOP];
 }
