@@ -1,4 +1,4 @@
-# #218 RPC role evidence Implementation Plan v1.0.2
+# #218 RPC role evidence Implementation Plan v1.0.3
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node test runner, PostgreSQL JSONB heartbeat, Solana web3.js fetch hooks.
 
-**Base:** `origin/main@dd9c4b908230ad7a69a57d27097412ee61711b4b`. **Design:** [capacity design v1.1.1](../specs/2026-10-03-classification-throughput-capacity-design.md). No wallet, signing, submission or wider admission.
+**Base:** `origin/main@dd9c4b908230ad7a69a57d27097412ee61711b4b`. **Design:** [capacity design v1.1.2](../specs/2026-10-03-classification-throughput-capacity-design.md). No wallet, signing, submission or wider admission.
 
 ---
 
@@ -44,7 +44,7 @@
 
 **Files:** Modify `docs/operations/block-hydration-canary.md`, `docs/api/v1.md`, `tests/mainnet-observe-canary-verdict.test.ts`; do **not** relax `scripts/lib/mainnet-observe-canary-verdict.ts`.
 
-- [ ] Add a characterization regression proving that a valid sibling role snapshot leaves the current 19-gate V1 verdict unchanged. Because the existing parser already ignores unknown heartbeat siblings, this test may pass immediately; do not alter production verdict code to manufacture a RED phase. Document that absent/overflowed role evidence cannot be treated as rate-capacity proof; this is not a new canary PASS gate.
+- [ ] Add a RED characterization regression for the closed canary manifest: injecting even a valid role sidecar directly into snapshot/STOPPED input must yield `INVALID_EVIDENCE`/`INCONCLUSIVE`; removing the sidecar through the existing closed projection restores the exact prior 19-gate result. Do not alter verdict parser or gate logic. Document that absent/overflowed role evidence cannot be treated as rate-capacity proof; this is not a new canary PASS gate.
 - [ ] Run focused tests, then document exact histogram boundaries, coarse roles, header-only timing, gaps (SDK parse/RSS, other key-sharing processes, project RPS and exit reserve), and aggregate-only handling.
 - [ ] Run `npm run build`, `npm run check`, `npm run lint`, `npm test`, `npm run docs:check` and frontend tests. Check host disk before/during heavy commands; pause and safely clean task-owned disposable artifacts at <=5,000,000,000 bytes available. Review diff for URLs, keys, signatures, fixture secrets, behavior changes and missing failure paths.
 - [ ] Commit, push and open one focused PR against `main`. Run **one** independent Codex review cycle; address its findings, await green PR CI, merge, then verify exact post-merge CI. Do not run a new Mainnet canary or alter concurrency in this PR.

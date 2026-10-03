@@ -1,4 +1,4 @@
-# Mainnet classification throughput — capacity evidence gate v1.1.1
+# Mainnet classification throughput — capacity evidence gate v1.1.2
 
 Issue: [#218](https://github.com/pivox/sol-token-listener/issues/218).
 Base: `origin/main@8a99152f776b55ebff167323a17a5d4b336c76de`.
@@ -82,7 +82,7 @@ gain within an attested budget. Only after one independent review cycle, green
 CI and merge may a fresh exact-merge 15-minute observe-only canary be assessed.
 H2d/H2c, wallet and live-trade gates remain closed until that canary passes.
 
-## Additive RPC role evidence — instrumentation slice v1.1.1
+## Additive RPC role evidence — instrumentation slice v1.1.2
 
 The first implementation slice measures physical HTTP fetches without changing
 admission, retry, failover, decoding, orders or the existing exact-shape
@@ -91,8 +91,12 @@ snapshot is persisted in the existing heartbeat JSONB and projected through
 `/api/v1/health`; no SQL migration or new RPC call is needed. Absence projects
 as `null`; malformed stored evidence fails health projection closed, while
 overflow marks the capacity analysis `INCONCLUSIVE`. None is an implicit zero
-or a canary PASS. The current 19-gate verdict continues to
-consume only the unchanged `rpcHttpEvidence` V1 zero-429 evidence.
+or a canary PASS. The current 19-gate verdict continues to consume only the
+unchanged `rpcHttpEvidence` V1 zero-429 evidence. Its input manifest has exact
+snapshot/STOPPED keys: inserting `rpcHttpRoleEvidence` there is correctly
+rejected as `INVALID_EVIDENCE`. The existing canary runbook must continue to
+project only its closed V1 fields; role evidence may be captured separately
+as an aggregate diagnostic and never used to turn a failed gate into PASS.
 
 The sidecar has fixed provider IDs and four honest, fixed-cardinality roles:
 `SOURCE`, `FINALITY`, `BLOCK_HYDRATION`, and `SHARED_CLIENT`. The last role
