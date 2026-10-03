@@ -1728,6 +1728,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       rpcHttpEvidence: null,
       firstProcessingCanary: null,
       decoderQuarantine: null,
+      scannerPhaseDiagnostics: null,
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
@@ -2128,6 +2129,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     workerAdmission: null,
     workerAdmissionClock: null,
     rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
+    scannerPhaseDiagnostics: null,
   });
   assert.equal(health.lagSlots, null);
 });
