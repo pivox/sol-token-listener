@@ -6,6 +6,10 @@ import {
   MAX_API_JSON_NODES,
   type ApiAvailability,
   type ApiBlockHydrationAdmissionMetricsV1,
+  type ApiBlockHydrationMetricsV2,
+  type ApiBlockHydrationAdmissionMetricsV2,
+  type ApiOrdinaryRpcBudgetMetricsV2,
+  type ApiBlockResponseMemoryMetricsV2,
   type ApiDomainPayload,
   type ApiDecoderQuarantineMetricsV1,
   type ApiFailure,
@@ -30,6 +34,22 @@ import {
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
 import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
+import { twoGroupHydrationEvidenceFixture } from './helpers/two-group-hydration-evidence-fixture.js';
+
+void test('V2 health aliases expose only the four exact aggregate sidecars', () => {
+  const sample = twoGroupHydrationEvidenceFixture();
+  const hydration: ApiBlockHydrationMetricsV2 = sample.blockHydration;
+  const admission: ApiBlockHydrationAdmissionMetricsV2 = sample.blockHydrationAdmission;
+  const budget: ApiOrdinaryRpcBudgetMetricsV2 = sample.ordinaryRpcBudget;
+  const memory: ApiBlockResponseMemoryMetricsV2 = sample.blockResponseMemory;
+  const sidecars: Pick<ApiHealth['heartbeat'], 'blockHydration' | 'blockHydrationAdmission'
+    | 'ordinaryRpcBudget' | 'blockResponseMemory'> = {
+    blockHydration: hydration, blockHydrationAdmission: admission,
+    ordinaryRpcBudget: budget, blockResponseMemory: memory,
+  };
+  assert.deepEqual(toApiJson(sidecars), sample);
+  assert.doesNotMatch(JSON.stringify(sidecars), /mint|signature|provider|endpoint|key/u);
+});
 
 void test('RPC HTTP role health contract is optional, nullable, and aggregate-only', () => {
   const metrics = createRpcHttpRoleEvidenceRecorder().snapshot();

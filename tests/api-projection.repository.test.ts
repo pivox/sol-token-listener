@@ -16,6 +16,7 @@ import {
   encodeTimelineCursor,
 } from '../src/api/cursor.js';
 import { toJsonValue } from '../src/utils/json.js';
+import { twoGroupHydrationEvidenceFixture } from './helpers/two-group-hydration-evidence-fixture.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
 import { createBlockHydrationPhaseRecorder } from '../src/solana/rpc/block-hydration-phase-recorder.js';
@@ -2456,6 +2457,45 @@ async function projectWorkerAdmission(payload: unknown) {
     websocketRow(), false, healthyHeartbeatRow({ payload }),
   ))).getHealth();
 }
+
+void test('health projects complete V2 and nulls all four malformed V2 peers atomically', async () => {
+  const source = twoGroupHydrationEvidenceFixture();
+  const valid = await projectWorkerAdmission(source);
+  assert.equal(valid.heartbeat.blockHydration?.version, 2);
+  assert.equal(Object.hasOwn(valid.heartbeat.blockHydration ?? {}, 'callerConcurrency'), false);
+  for (const field of ['blockHydration', 'blockHydrationAdmission',
+    'ordinaryRpcBudget', 'blockResponseMemory'] as const) {
+    assert.deepEqual(valid.heartbeat[field], source[field]);
+    assert.notEqual(valid.heartbeat[field], source[field]);
+  }
+  const incomplete = await projectWorkerAdmission({ ...source, blockResponseMemory: undefined });
+  for (const field of ['blockHydration', 'blockHydrationAdmission',
+    'ordinaryRpcBudget', 'blockResponseMemory'] as const) {
+    assert.equal(incomplete.heartbeat[field], null);
+  }
+  assert.deepEqual(incomplete.heartbeat.websocket, valid.heartbeat.websocket);
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({ ...source }, 'blockResponseMemory', {
+    enumerable: true, get() { getterCalls += 1; throw new Error('private-secret'); },
+  });
+  for (const invalid of [
+    { ...source, ordinaryRpcBudget: { ...source.ordinaryRpcBudget, maximumStartsInWindow: 9 } },
+    { ...source, blockHydration: blockHydrationMetrics() },
+    { ...source, blockHydration: { ...source.blockHydration, mint: 'private-secret' } },
+    accessor,
+  ]) {
+    const projected = await projectWorkerAdmission(invalid);
+    for (const field of ['blockHydration', 'blockHydrationAdmission',
+      'ordinaryRpcBudget', 'blockResponseMemory'] as const) {
+      assert.equal(projected.heartbeat[field], null);
+    }
+    assert.doesNotMatch(JSON.stringify(projected), /private-secret/u);
+  }
+  assert.equal(getterCalls, 0);
+  const v1 = await projectWorkerAdmission({ blockHydration: blockHydrationMetrics() });
+  assert.equal(Object.hasOwn(v1.heartbeat, 'ordinaryRpcBudget'), false);
+  assert.equal(Object.hasOwn(v1.heartbeat, 'blockResponseMemory'), false);
+});
 
 void test('worker admission clock projects exact detached frozen evidence and legacy absence as null', async () => {
   for (const payload of [null, {}, { workerAdmission: workerAdmissionMetrics() }]) {

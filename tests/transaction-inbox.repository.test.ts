@@ -8,6 +8,8 @@ import { TransactionInboxWorker } from '../src/application/transaction-inbox-wor
 import { PumpFunCatchUpBlockClassifier } from '../src/application/pumpfun-catch-up-block-classifier.js';
 import { PumpFunStrictCatchUpPageAdmitter } from '../src/application/pumpfun-strict-catch-up-page-admitter.js';
 import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
+import { twoGroupHydrationEvidenceFixture } from './helpers/two-group-hydration-evidence-fixture.js';
+import { snapshotRuntimeTwoGroupHydrationEvidenceV2 } from '../src/domain/two-group-hydration-evidence.js';
 import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import { ScannerPhaseDiagnosticsCollector } from '../src/domain/scanner-phase-diagnostics.js';
@@ -2946,6 +2948,46 @@ function rpcEvidenceHeartbeat(): RuntimeHeartbeat {
     lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0, exhaustedCount: 0,
   });
 }
+
+void test('persists one detached exact V2 heartbeat bundle before querying', async () => {
+  let queries = 0;
+  let persisted: unknown;
+  const repository = new PostgresTransactionInboxRepository({
+    async query(_text, values) {
+      queries += 1;
+      persisted = values?.[14];
+      return { rows: [], rowCount: 1 };
+    },
+    async connect() { throw new Error('not used'); },
+  });
+  const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(twoGroupHydrationEvidenceFixture());
+  await repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(), ...evidence }));
+  const payload = persisted as Record<string, unknown>;
+  for (const field of ['blockHydration', 'blockHydrationAdmission',
+    'ordinaryRpcBudget', 'blockResponseMemory'] as const) {
+    assert.deepEqual(payload[field], evidence[field]);
+    assert.notEqual(payload[field], evidence[field]);
+  }
+  await assert.rejects(repository.writeHeartbeat(Object.freeze({ ...rpcEvidenceHeartbeat(),
+    ...evidence, ordinaryRpcBudget: undefined,
+  }) as unknown as RuntimeHeartbeat), TransactionInboxRepositoryError);
+  assert.equal(queries, 1);
+});
+
+void test('V2 heartbeat sidecars round-trip through disposable PostgreSQL', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(twoGroupHydrationEvidenceFixture());
+    await new PostgresTransactionInboxRepository(pool).writeHeartbeat(Object.freeze({
+      ...rpcEvidenceHeartbeat(), ...evidence,
+    }));
+    const payload = (await pool.query("SELECT payload FROM listener_heartbeats WHERE service_key='transaction-listener'"))
+      .rows[0]?.payload as Record<string, unknown>;
+    for (const field of ['blockHydration', 'blockHydrationAdmission',
+      'ordinaryRpcBudget', 'blockResponseMemory'] as const) {
+      assert.deepEqual(payload[field], evidence[field]);
+    }
+  });
+});
 
 void test('catch-up admission counts partition actionable work by source and priority in one query', async (context) => {
   await withDatabase(context, async (pool) => {

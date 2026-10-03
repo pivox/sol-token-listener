@@ -42,6 +42,10 @@ import {
 } from '../api/contracts.js';
 import { isProxy } from 'node:util/types';
 import { snapshotRuntimeBlockHydrationAdmissionMetrics } from '../domain/block-hydration-admission.js';
+import {
+  assertTwoGroupHydrationEvidenceForState,
+  snapshotRuntimeTwoGroupHydrationEvidenceV2,
+} from '../domain/two-group-hydration-evidence.js';
 import { snapshotScannerPhaseDiagnostics, type ScannerPhaseDiagnosticsV1 } from '../domain/scanner-phase-diagnostics.js';
 import {
   MAX_TIMELINE_INDEX,
@@ -2207,6 +2211,7 @@ function heartbeatFromRow(
   if (startedAt !== null && Date.parse(startedAt) > Date.parse(updatedAt)) throw invalid();
   const workerAdmission = workerAdmissionFromPayload(row.heartbeat_payload);
   const workerAdmissionClock = workerAdmissionClockFromPayload(row.heartbeat_payload, workerAdmission, Date.parse(updatedAt));
+  const hydrationEvidence = hydrationEvidenceFromPayload(row.heartbeat_payload, runtimeState);
   return freeze({
     runtimeState, subscriberState, scannerState, workerState, reconcilerState,
     backlogCount, leasedCount, exhaustedCount, startedAt, updatedAt,
@@ -2214,9 +2219,8 @@ function heartbeatFromRow(
     lastWebsocketSlot: nullableDecimal(row.last_websocket_slot), lastFinalizedSlot: nullableDecimal(row.last_finalized_slot),
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
-    blockHydration: blockHydrationFromPayload(row.heartbeat_payload),
+    ...hydrationEvidence,
     blockHydrationPhaseEvidence: blockHydrationPhaseEvidenceFromPayload(row.heartbeat_payload),
-    blockHydrationAdmission: blockHydrationAdmissionFromPayload(row.heartbeat_payload),
     catchUpAdmission: catchUpAdmissionFromPayload(row.heartbeat_payload, backlogCount),
     workerAdmission,
     workerAdmissionClock,
@@ -2226,6 +2230,42 @@ function heartbeatFromRow(
     decoderQuarantine: decoderQuarantineFromPayload(row.heartbeat_payload),
     scannerPhaseDiagnostics: scannerPhaseDiagnosticsFromPayload(row.heartbeat_payload, Date.parse(updatedAt)),
   });
+}
+
+function hydrationEvidenceFromPayload(
+  value: unknown,
+  runtimeState: ApiHealth['heartbeat']['runtimeState'],
+): Pick<ApiHealth['heartbeat'], 'blockHydration' | 'blockHydrationAdmission' | 'ordinaryRpcBudget' | 'blockResponseMemory'> {
+  const legacy = (): Pick<ApiHealth['heartbeat'], 'blockHydration' | 'blockHydrationAdmission'> => ({
+    blockHydration: blockHydrationFromPayload(value),
+    blockHydrationAdmission: blockHydrationAdmissionFromPayload(value),
+  });
+  if (typeof value !== 'object' || value === null || isProxy(value) || !isRecord(value)) return legacy();
+  const fields = ['blockHydration', 'blockHydrationAdmission', 'ordinaryRpcBudget', 'blockResponseMemory'] as const;
+  const descriptors = Object.fromEntries(fields.map((field) => [field, Object.getOwnPropertyDescriptor(value, field)])) as Record<(typeof fields)[number], PropertyDescriptor | undefined>;
+  const claimsVersionTwo = (descriptor: PropertyDescriptor | undefined): boolean => {
+    if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'object'
+      || descriptor.value === null || isProxy(descriptor.value)) return false;
+    const version = Object.getOwnPropertyDescriptor(descriptor.value, 'version');
+    return version !== undefined && 'value' in version && version.value === 2;
+  };
+  const v2 = descriptors.ordinaryRpcBudget !== undefined || descriptors.blockResponseMemory !== undefined
+    || claimsVersionTwo(descriptors.blockHydration) || claimsVersionTwo(descriptors.blockHydrationAdmission);
+  if (!v2) return legacy();
+  try {
+    const candidate = Object.fromEntries(fields.map((field) => {
+      const descriptor = descriptors[field];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalid();
+      return [field, descriptor.value];
+    }));
+    const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(candidate);
+    const state = runtimeState === 'RUNNING' || runtimeState === 'STOPPED' ? runtimeState : 'OTHER';
+    assertTwoGroupHydrationEvidenceForState(evidence, state);
+    return evidence;
+  } catch {
+    return { blockHydration: null, blockHydrationAdmission: null,
+      ordinaryRpcBudget: null, blockResponseMemory: null };
+  }
 }
 
 function scannerPhaseDiagnosticsFromPayload(

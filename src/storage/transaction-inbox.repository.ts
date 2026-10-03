@@ -71,6 +71,7 @@ import {
   type RuntimeHeartbeat,
   type TransactionNotification,
 } from '../domain/transaction-ingestion.js';
+import { snapshotRuntimeTwoGroupHydrationEvidenceV2 } from '../domain/two-group-hydration-evidence.js';
 import {
   assertValidStrictCatchUpFailure,
   MAX_STRICT_CATCH_UP_SLOT,
@@ -2837,6 +2838,13 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   public async writeHeartbeat(value: RuntimeHeartbeat): Promise<void> {
     return this.safely(async () => {
       assertValidRuntimeHeartbeat(value);
+      const twoGroupEvidence = value.ordinaryRpcBudget === undefined ? undefined
+        : snapshotRuntimeTwoGroupHydrationEvidenceV2({
+          blockHydration: value.blockHydration,
+          blockHydrationAdmission: value.blockHydrationAdmission,
+          ordinaryRpcBudget: value.ordinaryRpcBudget,
+          blockResponseMemory: value.blockResponseMemory,
+        });
       const catchUpAdmission = value.catchUpAdmission === undefined ? undefined
         : snapshotRuntimeCatchUpAdmissionMetrics(value.catchUpAdmission, value.backlogCount);
       const rpcHttpEvidence = value.rpcHttpEvidence === undefined ? undefined
@@ -2855,7 +2863,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : snapshotRuntimeDecoderQuarantineMetrics(value.decoderQuarantine);
       const scannerPhaseDiagnostics = value.scannerPhaseDiagnostics === undefined ? undefined
         : snapshotScannerPhaseDiagnostics(value.scannerPhaseDiagnostics);
-      const blockHydrationAdmission = value.blockHydrationAdmission === undefined ? undefined
+      const blockHydrationAdmission = twoGroupEvidence !== undefined || value.blockHydrationAdmission === undefined ? undefined
         : snapshotRuntimeBlockHydrationAdmissionMetrics(value.blockHydrationAdmission);
       const result = await this.pool.query(
         `INSERT INTO listener_heartbeats (
@@ -2898,7 +2906,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           value.leasedCount,
           toJsonValue({
             startedAt: dateFromMs(value.startedAtMs).toISOString(),
-            ...(value.blockHydration === undefined
+            ...(twoGroupEvidence !== undefined
+              ? { blockHydration: twoGroupEvidence.blockHydration }
+              : value.blockHydration === undefined
               ? {}
               : { blockHydration: value.blockHydration }),
             ...(blockHydrationPhaseEvidence === undefined ? {} : { blockHydrationPhaseEvidence }),
@@ -2910,7 +2920,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
             ...(workerAdmission === undefined ? {} : { workerAdmission }),
             ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
-            ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
+            ...(twoGroupEvidence !== undefined
+              ? { blockHydrationAdmission: twoGroupEvidence.blockHydrationAdmission,
+                ordinaryRpcBudget: twoGroupEvidence.ordinaryRpcBudget,
+                blockResponseMemory: twoGroupEvidence.blockResponseMemory }
+              : blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
             ...(decoderQuarantine === undefined ? {} : { decoderQuarantine }),
             ...(scannerPhaseDiagnostics === undefined ? {} : { scannerPhaseDiagnostics }),
           }),
