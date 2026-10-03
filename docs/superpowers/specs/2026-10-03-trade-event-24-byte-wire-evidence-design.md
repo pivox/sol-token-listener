@@ -1,4 +1,19 @@
-# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.3.0
+# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.4.2
+
+## Recheck and fail-closed regression (2026-10-03)
+
+The official `pump-public-docs` main still points to `cb188ce08b5069196eef1f3e4a0c43b70099793b`.
+Its `TradeEvent` ends with the two documented `u64` holder-reward fields;
+official SDK 2.0.0 embeds the same IDL. Upstream issue #54 remains open and
+has no maintainer serialization answer. Consequently the observed 24-byte
+suffix is still **not** an accepted decoding variant. Synthetic unit tests
+assert that both zero and nonzero extra eight-byte tails fail with
+`PUMP_BORSH_INVALID`, and that terminal attribution records `suffixBytes: 24`
+without exposing payload bytes. These tests protect the existing quarantine;
+they do not constitute a finalized 24-byte fixture or a parser acceptance
+test. The existing 15-minute canary verdict remains `FAIL`. The separate
+24-byte wire-compatibility evidence verdict remains `INCONCLUSIVE`; #215
+stays open pending authoritative wire evidence.
 
 ## Scope and current evidence
 
@@ -51,6 +66,38 @@ exact balance-movement attribution and safe downstream business use remain
 unproved. It does not change the decoder go/no-go below. The protected source
 signatures and raw RPC responses were not published or persisted by this check.
 
+## Movement evidence is field-specific
+
+The event's `tokenAmount`/`quoteAmount`, independently decoded transfer legs,
+and transaction-wide pre/post balance deltas are different kinds of evidence.
+The current decoder pairs an event to a Pump instruction, but does not prove
+every fee endpoint or movement amount. A movement verifier must retain whether
+RPC metadata, account indexes, stack heights and balance snapshots were
+actually available; an absent form must not silently become an empty set or a
+zero. Amounts must remain lossless integers.
+
+For an action with complete invocation ancestry, a scoped SPL Token or System
+transfer can be attributed to that action once, subject to supported account,
+mint, token-program, fee-extension and lifecycle checks. An unrelated inner
+instruction with missing stack height can hide a boundary and therefore makes
+the relevant attribution `INCONCLUSIVE`. A transaction-wide delta is only a
+conservation check, never an amount to reuse for several Pump actions. A
+creation plus initial buy must separate minting and account-creation deposits
+from the buy's transfer legs.
+
+Native SOL can also be moved by a program directly changing lamports in an
+account it owns, without a System transfer CPI. The
+[Solana account-modification rules](https://solana.com/docs/core/accounts/modification-rules)
+permit this, while [finalized RPC transaction metadata](https://solana.com/docs/rpc/json-structures)
+provides transaction endpoints, not intermediate per-instruction balances.
+Consequently, repeated actions sharing those accounts may be underdetermined
+even when the event totals reconcile with the transaction net. This is a
+capability limit, not a claim that every Pump.fun sell uses direct mutation.
+Report `UNAVAILABLE` or `AMBIGUOUS` for the affected field; never infer a
+partition from event values. A verified transaction success does not require
+inventing a special catchable-CPI failure case: ordinary CPI execution errors
+propagate under [Agave's CPI implementation](https://github.com/anza-xyz/agave/blob/v3.1.8/program-runtime/src/cpi.rs).
+
 ## Decision and alternatives
 
 Keep the current strict 0/16 parser and quarantine 24 until the evidence gate
@@ -89,8 +136,10 @@ wallet or invoke transaction submission. For each representative it checks:
 - event-to-instruction pairing in a transaction that may contain several
   Pump.fun instructions/events; no transaction-global balance delta counted
   more than once;
-- mint, participant, direction and amounts independently consistent with the
-  associated instruction and account movements where attribution is exact;
+- mint, participant and direction independently consistent with the action;
+  distinguish event amount, independently verified scoped transfer legs and
+  transaction-net reconciliation per field. Unavailable or ambiguous movement
+  attribution is not a match and cannot be filled from the event amount;
 - different finalized slots and both buy/sell forms when the evidence contains
   them. Missing forms remain unproven, not implicitly supported.
 
@@ -110,8 +159,12 @@ No decoder change follows merely from observing many 24-byte payloads or from
 byte equality across RPCs. A follow-up revision must identify an authoritative
 schema decoding the **entire** suffix with validated type/range constraints,
 or define an explicitly value-bounded opaque profile backed by independently
-verifiable on-chain invariants, including exact movements and every business
-field consumed by qualification or paper trading. A length check plus an
+verifiable on-chain invariants for **every** business field consumed by
+qualification or paper trading. The authoritative-schema path must still
+state which financial fields are event-attributed versus independently
+transfer-verified; it cannot claim transfer proof where the chain metadata
+does not provide it. The opaque path cannot accept a field whose exact
+movements are ambiguous or unavailable. A length check plus an
 eight-byte skip, unrestricted opaque value, or historical sample frequency is
 not sufficient. If this cannot be established, maintain quarantine and report
 #215 as externally blocked on protocol evidence.
