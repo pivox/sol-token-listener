@@ -1,4 +1,4 @@
-# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.0.0
+# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.1.0
 
 ## Scope and current evidence
 
@@ -19,6 +19,28 @@ historical variants. An SDK decode that tolerates extra bytes is not evidence
 that the full payload was consumed. The third 8-byte segment is presently
 unexplained. Its type, meaning, activation conditions and effect on known
 fields are not asserted here.
+
+## Independent wire observation (2026-10-03)
+
+An owner-only, observe-only collector selected four distinct finalized slots
+from the protected attribution. Standard Solana `getTransaction` with
+`commitment=finalized` and `encoding=base64` returned the same transaction
+bytes, slot and selected inner CPI data from the configured Helius Mainnet RPC
+and the [Solana public Mainnet RPC](https://solana.com/docs/references/clusters).
+The latter is rate-limited and was used only for this bounded diagnostic.
+All four CPI payloads had the official event tag and discriminator, decoded
+the pinned IDL-known prefix, left exactly 24 bytes, consumed the documented
+two trailing `u64` values and left exactly eight opaque bytes. All four
+paired to a BUY action in their own instruction/stack scope, with matching
+side, instruction name, mint, user and normalized quote mint. No SELL form
+was established by this four-sample check. The collector's four offline
+safety tests passed; only bounded aggregate counts were emitted.
+
+This proves a narrow observed wire shape for four BUYs, not the meaning of
+the final eight bytes, exact balance-movement attribution, or safety of
+using those transactions for qualification or trading. It does not change
+the decoder go/no-go below. The protected source signatures and raw RPC
+responses were not published or persisted by this check.
 
 ## Decision and alternatives
 
