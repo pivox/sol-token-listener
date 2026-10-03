@@ -19,7 +19,8 @@ void test('emits only the closed live executor context', () => {
   assert.equal(line.errorCode, 'DATABASE_FAILURE');
 });
 
-void test('drops secrets, economic values and hostile error objects before serialization', () => {
+void test('drops secrets, economic values and hostile error objects before serialization', (t) => {
+  t.mock.method(Date, 'now', () => 1790994518123);
   const sink = memorySink();
   const logger = createLiveExecutorLogger(sink.stream);
   logger.error({
@@ -35,11 +36,14 @@ void test('drops secrets, economic values and hostile error objects before seria
     error: new Error('sensitive-error'),
   } as never);
 
-  const raw = sink.raw();
-  for (const marker of [
-    'user:secret', '/secret/wallet.json', 'sensitive-signature', 'sensitive-mint',
-    '123', 'sensitive-error', 'databaseUrl', 'keypairPath', 'signature', 'mint', 'amount',
-  ]) assert.equal(raw.includes(marker), false);
+  assert.deepEqual(sink.single(), {
+    level: 50,
+    time: 1790994518123,
+    service: 'sol-token-executor-live',
+    event: 'executor_live.pass_failed',
+    lane: 'BUY',
+    errorCode: 'LIVE_EXECUTOR_PASS_FAILED',
+  });
 });
 
 void test('allows only the shared reachable code vocabulary', () => {
