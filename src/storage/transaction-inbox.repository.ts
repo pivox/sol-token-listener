@@ -4,6 +4,7 @@ import { snapshotRuntimeBlockHydrationAdmissionMetrics } from '../domain/block-h
 import { snapshotScannerPhaseDiagnostics } from '../domain/scanner-phase-diagnostics.js';
 import type { QueryResultRow } from 'pg';
 import { createRuntimeRpcHttpEvidence } from '../domain/rpc-http-evidence.js';
+import { createRuntimeRpcHttpRoleEvidence } from '../domain/rpc-http-role-evidence.js';
 import {
   createFirstProcessingCanaryEvidence,
   FIRST_PROCESSING_COHORT_CAPACITY,
@@ -2839,6 +2840,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         : snapshotRuntimeCatchUpAdmissionMetrics(value.catchUpAdmission, value.backlogCount);
       const rpcHttpEvidence = value.rpcHttpEvidence === undefined ? undefined
         : createRuntimeRpcHttpEvidence(value.rpcHttpEvidence);
+      const rpcHttpRoleEvidence = value.rpcHttpRoleEvidence === undefined ? undefined
+        : createRuntimeRpcHttpRoleEvidence(value.rpcHttpRoleEvidence);
       const firstProcessingCanary = value.firstProcessingCanary === undefined ? undefined
         : createFirstProcessingCanaryEvidence(value.firstProcessingCanary);
       const workerAdmission = value.workerAdmission === undefined ? undefined
@@ -2899,6 +2902,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               ? {}
               : { catchUpAdmission }),
             ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
+            ...(rpcHttpRoleEvidence === undefined ? {} : { rpcHttpRoleEvidence }),
             ...(firstProcessingCanary === undefined ? {} : { firstProcessingCanary }),
             ...(workerAdmission === undefined ? {} : { workerAdmission }),
             ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),

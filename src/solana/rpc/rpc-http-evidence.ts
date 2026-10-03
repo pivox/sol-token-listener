@@ -4,6 +4,8 @@ import {
   type RuntimeRpcHttpEvidenceV1,
 } from '../../domain/rpc-http-evidence.js';
 import { isRpcProviderId, RPC_PROVIDER_IDS, type RpcProviderId } from '../../domain/rpc-provider.js';
+import type { RpcHttpRole } from '../../domain/rpc-http-role-evidence.js';
+import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 type FetchInit = Parameters<FetchFn>[1];
@@ -25,18 +27,42 @@ export function createRpcHttpEvidenceRecorder(): RpcHttpEvidenceRecorder {
 
 export function createObservedRpcFetch(
   providerId: RpcProviderId,
-  recorder: RpcHttpEvidenceRecorder,
+  recorder: RpcHttpEvidenceRecorder | undefined,
   fetchImplementation: FetchFn = globalThis.fetch,
+  roleRecorder?: RpcHttpRoleEvidenceRecorder,
+  role: RpcHttpRole = 'SHARED_CLIENT',
 ): FetchFn {
   if (!isRpcProviderId(providerId) || typeof fetchImplementation !== 'function') invalid();
 
   return async (input, init): Promise<Response> => {
     throwIfAborted(requestSignal(input, init));
-    recordSafely(recorder, 'recordAttempt', providerId);
-    const response = await fetchImplementation(input, init);
-    if (responseStatus(response) === 429) recordSafely(recorder, 'recordHttp429', providerId);
-    return response;
+    if (recorder !== undefined) recordSafely(recorder, 'recordAttempt', providerId);
+    const finish = beginRoleSafely(roleRecorder, providerId, role);
+    try {
+      const response = await fetchImplementation(input, init);
+      const status = responseStatus(response);
+      finish(status ?? 0);
+      if (status === 429 && recorder !== undefined) recordSafely(recorder, 'recordHttp429', providerId);
+      return response;
+    } catch (error) {
+      finish(null);
+      throw error;
+    }
   };
+}
+
+export function beginRoleSafely(
+  recorder: RpcHttpRoleEvidenceRecorder | undefined,
+  providerId: RpcProviderId,
+  role: RpcHttpRole,
+): (status: number | null) => void {
+  if (recorder === undefined) return () => undefined;
+  try {
+    const finish = recorder.begin(providerId, role);
+    return (status) => { try { finish(status); } catch { /* Metrics cannot affect RPC. */ } };
+  } catch {
+    return () => undefined;
+  }
 }
 
 function responseStatus(response: Response): number | undefined {

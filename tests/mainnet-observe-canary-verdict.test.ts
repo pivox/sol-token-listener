@@ -8,6 +8,7 @@ import {
   evaluateMainnetObserveCanary,
   type MainnetObserveCanaryGateName,
 } from '../scripts/lib/mainnet-observe-canary-verdict.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 
 const fixtureUrl = new URL(
   './fixtures/mainnet-observe-canary/32c9bf4-failed.v1.json',
@@ -967,6 +968,26 @@ void test('checks RPC counter invariants before classifying traffic volume', () 
   for (const invalid of invalidCases) {
     assert.equal(evaluateMainnetObserveCanary(invalid).gates.http429.verdict, 'INCONCLUSIVE');
   }
+});
+
+void test('diagnostic RPC role sidecar stays outside the closed 19-gate canary manifest', () => {
+  const baseline = evaluateMainnetObserveCanary(cloneFixture());
+  const copy = cloneFixture();
+  const sidecar = createRpcHttpRoleEvidenceRecorder().snapshot();
+  for (const name of ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP']) {
+    nested(copy, 'snapshots', name).rpcHttpRoleEvidence = sidecar;
+  }
+  nested(copy, 'stoppedHeartbeat').rpcHttpRoleEvidence = sidecar;
+
+  const unfiltered = evaluateMainnetObserveCanary(copy);
+  assert.equal(unfiltered.overallVerdict, 'INCONCLUSIVE');
+  assert.equal(unfiltered.gates.http429.reasonCode, 'INVALID_EVIDENCE');
+  for (const name of ['T0', 'T_PLUS_5', 'T_PLUS_15', 'FINAL_PRESTOP']) {
+    delete nested(copy, 'snapshots', name).rpcHttpRoleEvidence;
+  }
+  delete nested(copy, 'stoppedHeartbeat').rpcHttpRoleEvidence;
+  assert.deepEqual(evaluateMainnetObserveCanary(copy), baseline);
+  assert.equal(Object.keys(baseline.gates).length, 19);
 });
 
 void test('requires the canonical V1 provider membership and bounds provider evidence', () => {

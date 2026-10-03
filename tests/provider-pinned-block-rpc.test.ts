@@ -7,6 +7,7 @@ import {
   type ProviderPinnedBlockRpcDependencies,
 } from '../src/solana/rpc/provider-pinned-block-rpc.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
 
 void test('pins complete-block reads to the selected provider HTTP URL and maps commitments exactly', async () => {
@@ -193,6 +194,7 @@ void test('captures descriptor methods and maps hostile RPC failures to a fixed 
 void test('records one returned HTTP 429 for the default pinned block fetch', async () => {
   const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
   const recorder = createRpcHttpEvidenceRecorder();
+  const roles = createRpcHttpRoleEvidenceRecorder();
   let fetchCalls = 0;
   try {
     Object.defineProperty(globalThis, 'fetch', {
@@ -204,13 +206,15 @@ void test('records one returned HTTP 429 for the default pinned block fetch', as
       },
     });
     const source = createProviderPinnedBlockRpc(
-      catalog(), 'primary', 'confirmed', undefined, undefined, recorder,
+      catalog(), 'primary', 'confirmed', undefined, undefined, recorder, roles,
     );
 
     await assert.rejects(source.getBlockTransactions(42n, 'CONFIRMED'), (error: unknown) => (
       invalid(error, 'BLOCK_UNAVAILABLE')
     ));
     assert.equal(fetchCalls, 1);
+    assert.equal(roles.snapshot().entries[2]?.http429Responses, 1);
+    assert.equal(roles.snapshot().entries[2]?.inFlight, 0);
     assert.deepEqual(recorder.snapshot(['primary']).providers[0], {
       providerId: 'primary', configured: true, attempts: 1, http429Responses: 1,
     });

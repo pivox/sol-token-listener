@@ -9,8 +9,26 @@ import {
 } from '../src/solana/rpc/rpc-client.js';
 import type { RpcHttpFailoverEvent } from '../src/solana/rpc/http-failover-transport.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 
 type FetchInput = Parameters<FetchFn>[0];
+
+void test('attributes direct and failover client fetches to the shared-client role', async () => {
+  for (const fallbacks of [[], ['https://fallback.invalid/rpc']]) {
+    const roles = createRpcHttpRoleEvidenceRecorder({ now: () => 0 });
+    const config = createSolanaConnectionConfig({
+      httpRpcUrl: 'https://primary.invalid/rpc', httpRpcFallbackUrls: fallbacks,
+      wsRpcUrl: 'wss://websocket.invalid/rpc', commitment: 'confirmed',
+    }, {
+      roleRecorder: roles, fetch: async () => new Response(null, { status: 200 }),
+    });
+    assert.ok(config.fetch);
+    await config.fetch('https://primary.invalid/rpc');
+    assert.equal(roles.snapshot().entries[3]?.attempts, 1);
+    assert.equal(roles.snapshot().entries[3]?.responses, 1);
+    assert.equal(roles.snapshot().entries[0]?.attempts, 0);
+  }
+});
 
 void test('bounded RPC fetch aborts a physically pending request at its deadline', async () => {
   const keepAlive = setTimeout(() => undefined, 100);

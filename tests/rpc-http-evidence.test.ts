@@ -3,10 +3,109 @@ import test from 'node:test';
 import type { FetchFn } from '@solana/web3.js';
 import { RPC_PROVIDER_IDS } from '../src/domain/rpc-provider.js';
 import { assertValidRuntimeRpcHttpEvidence } from '../src/domain/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import {
   createObservedRpcFetch,
   createRpcHttpEvidenceRecorder,
 } from '../src/solana/rpc/rpc-http-evidence.js';
+
+void test('role recorder times headers, tracks pending attempts, and releases failures exactly once', () => {
+  let now = 100;
+  const recorder = createRpcHttpRoleEvidenceRecorder({ now: () => now });
+  const first = recorder.begin('primary', 'SOURCE');
+  const second = recorder.begin('primary', 'SOURCE');
+  const pending = recorder.snapshot().entries[0];
+  assert.equal(pending?.attempts, 2);
+  assert.equal(pending?.inFlight, 2);
+  assert.equal(pending?.maxInFlight, 2);
+  now = 150;
+  first(429);
+  first(429);
+  second(null);
+  const finished = recorder.snapshot();
+  assert.deepEqual(finished.entries[0], {
+    providerId: 'primary', role: 'SOURCE', attempts: 2, responses: 1,
+    http429Responses: 1, failures: 1, inFlight: 0, maxInFlight: 2,
+    headerLatencyBuckets: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], maxHeaderLatencyMs: 50,
+  });
+  assert.equal(finished.entries[3]?.attempts, 0);
+  assert.equal(Object.isFrozen(finished.entries[0]?.headerLatencyBuckets), true);
+});
+
+void test('role recorder marks invalid and saturated durations as overflow without raw values', () => {
+  let now = 0;
+  const recorder = createRpcHttpRoleEvidenceRecorder({ now: () => now });
+  const invalid = recorder.begin('primary', 'SOURCE');
+  now = Number.NaN;
+  invalid(200);
+  const afterInvalid = recorder.snapshot();
+  assert.equal(afterInvalid.overflowed, true);
+  assert.equal(afterInvalid.entries[0]?.responses, 1);
+  assert.equal(afterInvalid.entries[0]?.inFlight, 0);
+  assert.equal(Number.isSafeInteger(afterInvalid.entries[0]?.maxHeaderLatencyMs), true);
+  now = 0;
+  const huge = recorder.begin('primary', 'SOURCE');
+  now = Number.MAX_SAFE_INTEGER + 1;
+  huge(200);
+  const afterHuge = recorder.snapshot();
+  assert.equal(afterHuge.overflowed, true);
+  assert.equal(afterHuge.entries[0]?.maxHeaderLatencyMs, 0);
+});
+
+void test('role recorder assigns all ten fixed latency bucket boundaries', () => {
+  let now = 0;
+  const recorder = createRpcHttpRoleEvidenceRecorder({ now: () => now });
+  for (const duration of [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 30001]) {
+    const finish = recorder.begin('primary', 'SOURCE');
+    now += duration;
+    finish(200);
+  }
+  const cell = recorder.snapshot().entries[0];
+  assert.deepEqual(cell?.headerLatencyBuckets, Array<number>(10).fill(1));
+  assert.equal(cell?.maxHeaderLatencyMs, 30001);
+});
+
+void test('observed fetch releases an aborted rejection and ignores throwing role hooks', async () => {
+  const roles = createRpcHttpRoleEvidenceRecorder({ now: () => 0 });
+  const controller = new AbortController();
+  const abortError = new DOMException('cancelled', 'AbortError');
+  const observed = createObservedRpcFetch('primary', undefined, async (_input, init) => (
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { reject(abortError); }, { once: true });
+    })
+  ), roles, 'SOURCE');
+  const pending = observed('https://rpc.example.invalid', { signal: controller.signal });
+  assert.equal(roles.snapshot().entries[0]?.inFlight, 1);
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => error === abortError);
+  assert.equal(roles.snapshot().entries[0]?.failures, 1);
+  assert.equal(roles.snapshot().entries[0]?.inFlight, 0);
+
+  const response = new Response(null, { status: 200 });
+  const hostileRoles = { begin: () => { throw new Error('instrumentation'); }, snapshot: () => roles.snapshot() };
+  const safe = createObservedRpcFetch('primary', undefined, async () => response, hostileRoles, 'SOURCE');
+  assert.strictEqual(await safe('https://rpc.example.invalid'), response);
+});
+
+void test('observed fetch attributes a pending and completed physical attempt to its explicit role', async () => {
+  let now = 0;
+  const roles = createRpcHttpRoleEvidenceRecorder({ now: () => now });
+  const legacy = createRpcHttpEvidenceRecorder();
+  let resolve!: (response: Response) => void;
+  const observed = createObservedRpcFetch('primary', legacy, () => new Promise<Response>((done) => {
+    resolve = done;
+  }), roles, 'FINALITY');
+  const pending = observed('https://rpc.example.invalid');
+  assert.equal(roles.snapshot().entries[1]?.inFlight, 1);
+  now = 101;
+  resolve(new Response(null, { status: 429 }));
+  assert.equal((await pending).status, 429);
+  assert.equal(roles.snapshot().entries[1]?.headerLatencyBuckets[2], 1);
+  assert.equal(roles.snapshot().entries[1]?.inFlight, 0);
+  assert.deepEqual(legacy.snapshot(['primary']).providers[0], {
+    providerId: 'primary', configured: true, attempts: 1, http429Responses: 1,
+  });
+});
 
 void test('records fixed ordered configured provider evidence as detached frozen snapshots', () => {
   const recorder = createRpcHttpEvidenceRecorder();

@@ -10,6 +10,10 @@ import {
   type RuntimeRpcHttpEvidenceV1,
 } from './rpc-http-evidence.js';
 import {
+  assertValidRuntimeRpcHttpRoleEvidence,
+  type RuntimeRpcHttpRoleEvidenceV1,
+} from './rpc-http-role-evidence.js';
+import {
   assertValidFirstProcessingCanaryEvidence,
   type RuntimeFirstProcessingCanaryEvidenceV1,
 } from './first-processing-canary.js';
@@ -295,6 +299,7 @@ export interface RuntimeHeartbeat {
   readonly blockHydrationAdmission?: RuntimeBlockHydrationAdmissionMetricsV1;
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
+  readonly rpcHttpRoleEvidence?: RuntimeRpcHttpRoleEvidenceV1;
   readonly firstProcessingCanary?: RuntimeFirstProcessingCanaryEvidenceV1;
   readonly workerAdmission?: RuntimeWorkerAdmissionMetricsV1;
   readonly workerAdmissionClock?: RuntimeWorkerAdmissionClockV1;
@@ -723,6 +728,13 @@ export function assertValidRuntimeHeartbeat(
         throw new TypeError('RPC HTTP evidence is invalid.');
       }
       assertValidRuntimeRpcHttpEvidence(evidence.value);
+    }
+    const roleEvidence = Object.getOwnPropertyDescriptor(value, 'rpcHttpRoleEvidence');
+    if (roleEvidence !== undefined) {
+      if (!('value' in roleEvidence) || roleEvidence.enumerable !== true) {
+        throw new TypeError('RPC HTTP role evidence is invalid.');
+      }
+      assertValidRuntimeRpcHttpRoleEvidence(roleEvidence.value);
     }
     const firstProcessingCanary = Object.getOwnPropertyDescriptor(value, 'firstProcessingCanary');
     if (firstProcessingCanary !== undefined) {

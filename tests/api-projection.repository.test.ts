@@ -1726,6 +1726,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       workerAdmission: null,
       workerAdmissionClock: null,
       rpcHttpEvidence: null,
+      rpcHttpRoleEvidence: null,
       firstProcessingCanary: null,
       decoderQuarantine: null,
       scannerPhaseDiagnostics: null,
@@ -2128,7 +2129,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     blockHydrationAdmission: null,
     workerAdmission: null,
     workerAdmissionClock: null,
-    rpcHttpEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
+    rpcHttpEvidence: null, rpcHttpRoleEvidence: null, firstProcessingCanary: null, decoderQuarantine: null,
     scannerPhaseDiagnostics: null,
   });
   assert.equal(health.lagSlots, null);
@@ -2891,6 +2892,36 @@ void test('RPC HTTP evidence projects exact frozen four-provider snapshots and o
     assert.ok(Object.isFrozen(health.heartbeat.rpcHttpEvidence?.providers));
     assert.ok(health.heartbeat.rpcHttpEvidence?.providers.every(Object.isFrozen));
     assert.notEqual(health.heartbeat.rpcHttpEvidence, metrics);
+  }
+});
+
+void test('role evidence projects strict frozen sibling while preserving V1 RPC evidence', async () => {
+  const { createRpcHttpRoleEvidenceRecorder } = await import('../src/solana/rpc/rpc-http-role-evidence.js');
+  const recorder = createRpcHttpRoleEvidenceRecorder();
+  recorder.begin('primary', 'SOURCE')(200);
+  const role = recorder.snapshot();
+  const v1 = rpcHttpEvidenceMetrics();
+  const health = await projectRpcHttpEvidence({ rpcHttpEvidence: v1, rpcHttpRoleEvidence: role });
+  assert.equal(health.status, 'OK');
+  assert.deepEqual(health.heartbeat.rpcHttpRoleEvidence, role);
+  assert.notEqual(health.heartbeat.rpcHttpRoleEvidence, role);
+  assert.ok(Object.isFrozen(health.heartbeat.rpcHttpRoleEvidence?.entries[0]?.headerLatencyBuckets));
+  assert.deepEqual(health.heartbeat.rpcHttpEvidence, v1);
+});
+
+void test('role evidence legacy absence is null and malformed stored sidecar fails health closed', async () => {
+  const { createRpcHttpRoleEvidenceRecorder } = await import('../src/solana/rpc/rpc-http-role-evidence.js');
+  assert.equal((await projectRpcHttpEvidence({})).heartbeat.rpcHttpRoleEvidence, null);
+  const role = createRpcHttpRoleEvidenceRecorder().snapshot();
+  for (const candidate of [null, { ...role, endpoint: 'private-secret' },
+    { ...role, entries: [...role.entries].reverse() },
+    { ...role, entries: role.entries.map((entry, index) => index === 0
+      ? { ...entry, headerLatencyBuckets: [1, ...entry.headerLatencyBuckets.slice(1)] } : entry) }]) {
+    const health = await projectRpcHttpEvidence({ rpcHttpRoleEvidence: candidate });
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.equal(health.heartbeat.rpcHttpRoleEvidence, null);
+    assert.doesNotMatch(JSON.stringify(health), /private-secret/u);
   }
 });
 

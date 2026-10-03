@@ -13,6 +13,7 @@ import {
   type RpcHttpFailoverEvent,
 } from './http-failover-transport.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
+import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import { MAX_SUPPORTED_TRANSACTION_VERSION } from './transaction-version.js';
 
@@ -27,6 +28,7 @@ export interface SolanaRpcClientDependencies {
   readonly now?: () => number;
   readonly onHttpFailoverEvent?: (event: RpcHttpFailoverEvent) => void;
   readonly recorder?: RpcHttpEvidenceRecorder;
+  readonly roleRecorder?: RpcHttpRoleEvidenceRecorder;
   readonly requestTimeoutMs?: number;
 }
 
@@ -47,10 +49,11 @@ export function createSolanaConnectionConfig(
         dependencies.fetch ?? globalThis.fetch,
         dependencies.requestTimeoutMs,
       );
-    const configuredFetch = dependencies.recorder === undefined
+    const configuredFetch = dependencies.recorder === undefined && dependencies.roleRecorder === undefined
       ? boundedFetch
       : createObservedRpcFetch(
         'primary', dependencies.recorder, boundedFetch ?? dependencies.fetch,
+        dependencies.roleRecorder, 'SHARED_CLIENT',
       );
     return {
       commitment: config.commitment,
@@ -72,6 +75,8 @@ export function createSolanaConnectionConfig(
     ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
     ...(dependencies.recorder === undefined ? {} : { recorder: dependencies.recorder }),
+    ...(dependencies.roleRecorder === undefined
+      ? {} : { roleRecorder: dependencies.roleRecorder, role: 'SHARED_CLIENT' }),
     ...(onEndpointSelected === undefined ? {} : { onEndpointSelected }),
     ...(dependencies.onHttpFailoverEvent === undefined
       ? {}

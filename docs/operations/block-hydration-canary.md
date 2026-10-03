@@ -395,6 +395,18 @@ peut être réutilisée pour déclarer un `PASS`.
    Pour l’artefact séparé consacré à la preuve HTTP RPC, archiver uniquement la
    projection fixe suivante de la réponse health :
 
+   `heartbeat.rpcHttpRoleEvidence` est un diagnostic additif pour #218,
+   distinct de `rpcHttpEvidence` V1. Ne jamais l'ajouter aux snapshots ou au
+   heartbeat STOPPED du manifeste `canary:evaluate` : celui-ci refuse les
+   clés supplémentaires avec `INVALID_EVIDENCE` et doit conserver ses 19 gates
+   inchangés. Si cet agrégat par rôle est conservé pour une analyse séparée,
+   utiliser uniquement ses compteurs et buckets bornés, sans réponse health
+   brute, URL, clé, signature ni donnée de wallet ; sa présence ou un zéro 429
+   ne prouve ni le plafond RPS propre au projet ni une réserve RPC pour la
+   sortie réelle. Une preuve absente ou overflowed reste `INCONCLUSIVE` pour
+   #218. La rétention locale de ces diagnostics est limitée à quatre heures
+   après la fin de leur utilité.
+
    ```text
    jq 'def counter: type == "number" and . >= 0 and floor == . and . <= 9007199254740991; def provider: type == "object" and (keys | sort == ["attempts", "configured", "http429Responses", "providerId"]) and (.providerId | type == "string") and (.configured | type == "boolean") and (.attempts | counter) and (.http429Responses | counter) and (.http429Responses <= .attempts) and (.configured or (.attempts == 0 and .http429Responses == 0)); . as $root | {startedAt: (try $root.data.heartbeat.startedAt catch null), rpcHttpEvidence: (try ($root.data.heartbeat.rpcHttpEvidence | if (. == null or (type != "object") or ((keys | sort) != ["overflowed", "providers", "version"]) or .version != 1 or (.overflowed | type) != "boolean" or (.providers | type) != "array" or (.providers | length) != 4 or (any(.providers[]; provider | not)) or ([.providers[].providerId] != ["primary", "fallback-1", "fallback-2", "fallback-3"]) or (any(.providers[]; .http429Responses > .attempts))) then null else {version: .version, overflowed: .overflowed, providers: [.providers[] | {providerId, configured, attempts, http429Responses}]} end) catch null)}' health.json
    ```

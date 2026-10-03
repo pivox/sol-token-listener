@@ -11,6 +11,7 @@ import {
   type RuntimeWorkerAdmissionMetricsV1,
 } from '../src/domain/worker-admission-metrics.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import {
   ALL_INGESTION_PROGRAMS,
   LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
@@ -564,8 +565,8 @@ void test('production shares exactly one RPC HTTP recorder across every transpor
   const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
   assert.equal(count(source, /createRpcHttpEvidenceRecorder\(\)/gu), 1);
   assert.match(source, /new SolanaRpcClient\(config,\s*\{\s*recorder,/u);
-  assert.match(source, /createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder\)/u);
-  assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*rpcRequestTimeoutMs,?\s*\}, recorder\)/u);
+  assert.match(source, /createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder, roleRecorder\)/u);
+  assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*rpcRequestTimeoutMs,?\s*\}, recorder, roleRecorder\)/u);
   assert.match(source, /createProviderPinnedCatchUpSource\(\s*providers,\s*providerId,\s*'confirmed',\s*expectedGenesisHash,\s*undefined,\s*recorder,/u);
   assert.match(source, /rpcHttpEvidenceMetrics:\s*\(\).*?=> recorder\.snapshot\(configuredRpcHttpProviderIds\)/u);
   for (const name of ['createProviderPinnedFinalityPass', 'createProviderPinnedBlockRpc', 'createProviderPinnedCatchUpSource']) {
@@ -586,6 +587,46 @@ void test('production shares exactly one RPC HTTP recorder across every transpor
     assert.deepEqual(metrics(), createRpcHttpEvidenceRecorder().snapshot(['primary', 'fallback-1']));
     await dependencies.worker.close();
   }
+});
+
+void test('production shares one role recorder with every physical RPC source and heartbeat', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.equal(count(source, /createRpcHttpRoleEvidenceRecorder\(\)/gu), 1);
+  assert.match(source, /new SolanaRpcClient\(config,\s*\{[^}]*roleRecorder/u);
+  assert.match(source, /createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder, roleRecorder\)/u);
+  assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{[^}]*\}, recorder, roleRecorder\)/u);
+  assert.match(source, /createProviderPinnedCatchUpSource\([\s\S]*?recorder,\s*roleRecorder,/u);
+  assert.match(source, /rpcHttpRoleEvidenceMetrics:\s*\(\).*?=> roleRecorder\.snapshot\(\)/u);
+  const runtime = createProductionListenerRuntime(config({
+    LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: 'false',
+    LISTENER_BLOCK_HYDRATION_ENABLED: 'false',
+    LISTENER_INGESTION_SCOPE: 'launchpad-only', LISTENER_CATCH_UP_POLICY: 'live-edge',
+  }), inertPool as unknown as ReturnType<typeof getDatabasePool>);
+  const dependencies = (runtime as unknown as { dependencies: ListenerRuntimeDependencies }).dependencies;
+  const metrics = (dependencies.heartbeat as unknown as {
+    rpcHttpRoleEvidenceMetrics: () => ReturnType<ReturnType<typeof createRpcHttpRoleEvidenceRecorder>['snapshot']>;
+  }).rpcHttpRoleEvidenceMetrics;
+  assert.deepEqual(metrics(), createRpcHttpRoleEvidenceRecorder().snapshot());
+  await dependencies.worker.close();
+});
+
+void test('heartbeat samples detached role evidence at RUNNING and STOPPED writes', async () => {
+  const recorder = createRpcHttpRoleEvidenceRecorder();
+  const writes: RuntimeHeartbeat[] = [];
+  const heartbeat = new PersistentListenerHeartbeat({ counts: heartbeatCounts,
+    ...heartbeatCanaryMethods(), async writeHeartbeat(value) { writes.push(value); },
+  }, { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+  () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', {
+    intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler(),
+    rpcHttpRoleEvidenceMetrics: () => recorder.snapshot(),
+  } as ListenerHeartbeatOptions);
+  await heartbeat.start();
+  recorder.begin('primary', 'SOURCE')(200);
+  await heartbeat.stop();
+  assert.deepEqual(writes.map((write) => write.runtimeState), ['RUNNING', 'STOPPED']);
+  assert.equal(writes[0]?.rpcHttpRoleEvidence?.entries[0]?.attempts, 0);
+  assert.equal(writes[1]?.rpcHttpRoleEvidence?.entries[0]?.attempts, 1);
+  assert.ok(Object.isFrozen(writes[1]?.rpcHttpRoleEvidence?.entries[0]));
 });
 
 void test('RPC HTTP evidence includes an HTTP-only fallback absent from the WebSocket catalog', async () => {
@@ -1211,7 +1252,7 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
 
   assert.match(
     source,
-    /new SolanaRpcClient\(config,\s*\{\s*recorder,\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,/u,
+    /new SolanaRpcClient\(config,\s*\{\s*recorder,\s*roleRecorder,\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,/u,
   );
   const sink = /function logRpcHttpFailoverEvent\([\s\S]*?\n\}/u.exec(source)?.[0];
   assert.ok(sink);
@@ -1232,7 +1273,7 @@ void test('production binds finality to immutable passes selected by the promote
   assert.match(factory, /import\s*\{[^}]*\bcreateRpcProviderCatalog\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/rpc-provider-catalog\.js['"]/u);
   assert.match(factory, /import\s*\{[^}]*\bcreateProviderPinnedFinalityPass\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/provider-pinned-finality-source\.js['"]/u);
   assert.match(factory, /const providers = createRpcProviderCatalog\(config\);/u);
-  assert.match(factory, /providers\.ids\.map\(\(providerId\)[\s\S]*?createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder\)/u);
+  assert.match(factory, /providers\.ids\.map\(\(providerId\)[\s\S]*?createProviderPinnedFinalityPass\(providers, providerId, undefined, recorder, roleRecorder\)/u);
   assert.match(factory, /new PromotedProviderSelector\(/u);
   assert.match(factory, /new FinalityReconciler\(promoted, inbox,/u);
   assert.match(factory, /initialFailureMode:\s*'DEGRADED_RETRY'/u);

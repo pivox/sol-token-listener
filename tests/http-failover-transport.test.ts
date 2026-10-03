@@ -9,6 +9,49 @@ import {
   type RpcHttpFailureReason,
 } from '../src/solana/rpc/http-failover-transport.js';
 import { createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
+
+void test('role evidence attributes each physical failover attempt and leaves V1 unchanged', async () => {
+  let now = 0;
+  let calls = 0;
+  const recorder = createRpcHttpEvidenceRecorder();
+  const roleRecorder = createRpcHttpRoleEvidenceRecorder({ now: () => now });
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2), recorder, roleRecorder, role: 'SHARED_CLIENT',
+    fetch: async () => {
+      calls += 1;
+      now += 75;
+      return reply(calls === 1 ? 429 : 200);
+    },
+  });
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  const entries = roleRecorder.snapshot().entries;
+  assert.equal(entries[3]?.attempts, 1);
+  assert.equal(entries[3]?.http429Responses, 1);
+  assert.equal(entries[3]?.headerLatencyBuckets[1], 1);
+  assert.equal(entries[7]?.attempts, 1);
+  assert.equal(entries[7]?.responses, 1);
+  assert.equal(entries[7]?.headerLatencyBuckets[1], 1);
+  assert.deepEqual(recorder.snapshot(['primary', 'fallback-1']).providers.slice(0, 2), [
+    { providerId: 'primary', configured: true, attempts: 1, http429Responses: 1 },
+    { providerId: 'fallback-1', configured: true, attempts: 1, http429Responses: 0 },
+  ]);
+});
+
+void test('role evidence releases a failed physical attempt before failover', async () => {
+  const roleRecorder = createRpcHttpRoleEvidenceRecorder({ now: () => 0 });
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2), roleRecorder, role: 'SHARED_CLIENT',
+    fetch: async (input) => {
+      if (inputUrl(input) === endpoints[0].url) throw new Error('network');
+      return reply(200);
+    },
+  });
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.equal(roleRecorder.snapshot().entries[3]?.failures, 1);
+  assert.equal(roleRecorder.snapshot().entries[3]?.inFlight, 0);
+  assert.equal(roleRecorder.snapshot().entries[7]?.responses, 1);
+});
 
 type FetchInput = Parameters<FetchFn>[0];
 
