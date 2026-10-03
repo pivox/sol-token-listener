@@ -8,7 +8,7 @@
 
 **Tech Stack:** Strict TypeScript/ESM, `node:test`/`tsx`, PostgreSQL JSONB, frontend-owned Zod/Vitest schemas, existing offline canary CLI.
 
-**Design:** [Two-group hydration evidence v1.1.1](../specs/2026-10-03-two-group-hydration-evidence-design.md), spec commits `6ae22db`, `312fdb6`, `67268aa`; merged #227 baseline `main@74a31ce` is incorporated in this worktree. Do not replay or overwrite the ordinary-budget foundation or its local-admission fix.
+**Design:** [Two-group hydration evidence v1.1.2](../specs/2026-10-03-two-group-hydration-evidence-design.md), spec commits `6ae22db`, `312fdb6`, `67268aa`; merged #227 baseline `main@74a31ce` is incorporated in this worktree. Do not replay or overwrite the ordinary-budget foundation or its local-admission fix.
 
 ---
 
@@ -120,7 +120,7 @@ export function stoppedTwoGroupHydrationEvidenceFixture() {
 
 ### Exact domain exports to implement
 
-The new domain file exports the following types, all deeply readonly, and functions. `RuntimeHydrationAdmissionRoleMetricsV1` is imported as a type from the unchanged V1 admission module. Field names are precisely those in spec v1.1.1; no IDs, timestamps, body text, URLs, keys, slot, signature, mint, or provider field is added to these sidecars.
+The new domain file exports the following types, all deeply readonly, and functions. `RuntimeHydrationAdmissionRoleMetricsV1` is imported as a type from the unchanged V1 admission module. Field names are precisely those in spec v1.1.2; no IDs, timestamps, body text, URLs, keys, slot, signature, mint, or provider field is added to these sidecars.
 
 ```ts
 export interface RuntimeBlockHydrationMetricsV2 {
@@ -249,7 +249,7 @@ function fields<const T extends readonly string[]>(
 Import `isProxy` from `node:util/types`. Budget checks are `startsInWindow <= maximumStartsInWindow <= 8`, `queuedWaiters <= maximumQueuedWaiters <= 64`, exact literals, boolean `closed`, and unrestricted valid `localRejections` count. No cross-time or provider check belongs here.
 
 - [ ] **Step 4: Run budget GREEN.** Run the same file; every budget assertion must pass before adding the next sidecar.
-- [ ] **Step 5: Add RED hydration and memory tests.** For hydration, exercise exact upper boundaries (2 active/fetches/groups, 1,024 queued fetches, 64 retained entries, 67,108,864 retained bytes), each boundary plus one, current>maximum, removed `callerConcurrency`, unknown keys, queue-delay nullable counts, last>maximum, and deep-copy mutation. Memory must accept exactly two bodies/64 MiB combined bytes and retain a positive `oversizedResponses`, then reject literal limit changes, unsafe RSS, three bodies, and current>maximum.
+- [ ] **Step 5: Add RED hydration and memory tests.** For hydration, exercise exact upper boundaries (2 active/fetches/groups and queued distinct cache fetches, 64 retained entries, 67,108,864 retained bytes), each boundary plus one, current>maximum, removed `callerConcurrency`, unknown keys, queue-delay nullable counts, last>maximum, and deep-copy mutation. The separate 1,024 cap concerns caller waits in the runtime scheduler, not `queuedFetches`. Memory must accept exactly two bodies/64 MiB combined bytes and retain a positive `oversizedResponses`, then reject literal limit changes, unsafe RSS, three bodies, and current>maximum.
 
 ```ts
 void test('V2 memory retains overflow observations but not caller-owned data', () => {
@@ -263,7 +263,7 @@ void test('V2 memory retains overflow observations but not caller-owned data', (
 });
 ```
 
-- [ ] **Step 6: Run RED, implement the two exact snapshot functions, and run GREEN.** Hydration's numeric field list is every numeric interface property except its literals and `queueDelayMs`; memory's numeric list is every numeric property except literals. Build field manifests from the interfaces above, not from `Object.keys(input)`. Check independent pairs for activeGroups, queuedGroups, inFlightFetches, queuedFetches, unsettledAfterCancel. Bound `maximumUnsettledAfterCancel` at two. Keep the existing queue-delay nullable semantics; do not derive maxima from current gauges.
+- [ ] **Step 6: Run RED, implement the two exact snapshot functions, and run GREEN.** Hydration's numeric field list is every numeric interface property except its literals and `queueDelayMs`; memory's numeric list is every numeric property except literals. Build field manifests from the interfaces above, not from `Object.keys(input)`. Check independent pairs for activeGroups, queuedGroups, inFlightFetches, queuedFetches, unsettledAfterCancel. Bound both maximum queued-group/fetch gauges and `maximumUnsettledAfterCancel` at two. Keep the existing queue-delay nullable semantics; do not derive maxima from current gauges.
 - [ ] **Step 7: Add RED admission tests.** Require `registeredWorkers <= 1`, pendingWorkers<=registeredWorkers and maximumPendingWorkers<=1, pendingClassifierGroups<=maximumPendingClassifierGroups<=2, `unboundReservations + activeGroups <= maximumAdmitted <= 2`. Copy the five exact V1 role properties into new frozen role objects and preserve the existing role invariants: oldestWaitMs iff pending>0, last/maximum paired, no completed-wait fields before a grant/cancellation, last<=maximum; an ongoing oldest wait may exceed the completed maximum.
 
 ```ts
@@ -657,7 +657,7 @@ Expected: exit 0 for every check, unchanged V1 golden results and no V2 activati
 
 ## Self-review and handoff checklist
 
-- [ ] All spec v1.1.1 field names/literals appear in the domain declarations; exact own-data, safe-count, current/max, role and STOPPED constraints have concrete negative tests.
+- [ ] All spec v1.1.2 field names/literals appear in the domain declarations; exact own-data, safe-count, current/max, role and STOPPED constraints have concrete negative tests.
 - [ ] No cross-sidecar equality has been introduced, and current gauges are not incorrectly monotonic.
 - [ ] Nonzero rejection/oversize observations survive JSONB/API; verdict policy is not used to discard stored evidence.
 - [ ] V1 fields, validation, nineteen-gate order, private input/result shapes, fixture bytes and golden outcomes are unchanged.
