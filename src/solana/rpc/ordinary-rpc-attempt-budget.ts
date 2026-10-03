@@ -4,6 +4,7 @@ import { performance } from 'node:perf_hooks';
 const MAX_ATTEMPTS = 8;
 const WINDOW_MS = 1000;
 const MAX_WAITERS = 64;
+const trustedBudgetErrors = new WeakSet();
 
 export interface OrdinaryRpcBudgetScheduler {
   now(): number;
@@ -29,7 +30,13 @@ export class OrdinaryRpcBudgetError extends Error {
     super(code === 'RPC_ORDINARY_BUDGET_FULL'
       ? 'Ordinary RPC admission queue is full.' : 'Ordinary RPC admission is closed.');
     this.name = 'OrdinaryRpcBudgetError';
+    trustedBudgetErrors.add(this);
+    Object.freeze(this);
   }
+}
+
+export function isOrdinaryRpcBudgetError(value: unknown): value is OrdinaryRpcBudgetError {
+  return typeof value === 'object' && value !== null && trustedBudgetErrors.has(value);
 }
 
 /** One listener runtime shares this budget across every physical HTTP RPC role. */

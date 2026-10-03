@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { ordinaryRpcAdmissionFixture } from './helpers/ordinary-rpc-admission-fixture.js';
+import { OrdinaryRpcBudgetError } from '../src/solana/rpc/ordinary-rpc-attempt-budget.js';
 import { PromotedProviderSelector } from '../src/application/promoted-provider-selector.js';
 import { PersistentWebSocketHealthReporter } from '../src/application/websocket-health-reporter.js';
 import {
@@ -84,6 +86,197 @@ void test('passive observations retain activity and session fences without enque
   await fixture.supervisor.close();
   await observe(passive);
   assert.equal(fixture.supervisor.filteredNotificationMetrics().byProvider.primary, 1);
+});
+
+void test('local genesis saturation retries the same provider without a degraded provider cycle', async (context) => {
+  const admission = ordinaryRpcAdmissionFixture(context);
+  const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'], random: () => 0 });
+  const providers: RpcProviderId[] = [];
+  const supervisor = new WebSocketFailoverSupervisor({ ...fixture.dependencies,
+    verifyProviderGenesis(providerId, signal) {
+      providers.push(providerId);
+      const source = admission.sources.get(providerId);
+      assert.ok(source);
+      return source.verifyGenesis(signal);
+    },
+  }, fixture.options);
+  try {
+    await admission.saturate();
+    await supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary']);
+    assert.equal(fixture.reporter.transitions.some(({ phase }) => phase === 'DEGRADED'), false);
+    assert.deepEqual(admission.calls, []);
+    assert.ok(admission.recorder.snapshot(['primary', 'fallback-1']).providers.every((value) => value.attempts === 0));
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    admission.release();
+    fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+    fixture.resolveOpenSession();
+    fixture.scheduler.fireNext(500);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary', 'primary']);
+    assert.deepEqual(admission.calls, ['getGenesisHash']);
+    assert.equal(supervisor.state(), 'RUNNING');
+  } finally { admission.close(); await supervisor.close(); }
+});
+
+void test('a locally saturated fallback is retried first and genuine failure then restores historical provider order', async (context) => {
+  const admission = ordinaryRpcAdmissionFixture(context);
+  const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'], random: () => 0 });
+  const providers: RpcProviderId[] = [];
+  const supervisor = new WebSocketFailoverSupervisor({ ...fixture.dependencies,
+    async verifyProviderGenesis(providerId, signal) {
+      providers.push(providerId);
+      if (providers.length === 1 || providers.length === 3) throw new Error('Provider unavailable.');
+      const source = admission.sources.get(providerId);
+      assert.ok(source);
+      await source.verifyGenesis(signal);
+    },
+  }, fixture.options);
+  try {
+    await admission.saturate();
+    await supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary', 'fallback-1']);
+    assert.equal(fixture.reporter.transitions.some(({ phase }) => phase === 'DEGRADED'), false);
+    assert.deepEqual(admission.calls, []);
+    admission.release();
+    fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+    fixture.resolveOpenSession();
+    fixture.scheduler.fireNext(500);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary', 'fallback-1', 'fallback-1', 'primary']);
+    assert.equal(supervisor.state(), 'RUNNING');
+    assert.deepEqual(admission.calls, ['getGenesisHash']);
+  } finally { admission.close(); await supervisor.close(); }
+});
+
+void test('a durable provider pin overrides the locally saturated provider retry hint', async () => {
+  let pinned: RpcProviderId | null = null;
+  const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'], random: () => 0,
+    readPinnedProviderId: async () => pinned,
+  });
+  const providers: RpcProviderId[] = [];
+  const supervisor = new WebSocketFailoverSupervisor({ ...fixture.dependencies,
+    async verifyProviderGenesis(providerId) {
+      providers.push(providerId);
+      if (providers.length === 1) throw new Error('Provider unavailable.');
+      if (providers.length === 2) throw new OrdinaryRpcBudgetError('RPC_ORDINARY_BUDGET_FULL');
+    },
+  }, fixture.options);
+  try {
+    await supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary', 'fallback-1']);
+    pinned = 'primary';
+    fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+    fixture.resolveOpenSession();
+    fixture.scheduler.fireNext(500);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary', 'fallback-1', 'primary']);
+    assert.equal(supervisor.state(), 'RUNNING');
+  } finally { await supervisor.close(); }
+});
+
+void test('local candidate page saturation cleans up and retries the same provider without degradation', async (context) => {
+  const admission = ordinaryRpcAdmissionFixture(context);
+  const first = controlledSession('primary');
+  const second = controlledSession('primary');
+  const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'], random: () => 0,
+    sessionFactories: [() => Promise.resolve(first.session), () => Promise.resolve(second.session)],
+  });
+  const providers: RpcProviderId[] = [];
+  const supervisor = new WebSocketFailoverSupervisor({ ...fixture.dependencies,
+    verifyProviderGenesis(providerId, signal) {
+      providers.push(providerId);
+      const source = admission.sources.get(providerId);
+      assert.ok(source);
+      return source.verifyGenesis(signal);
+    },
+    runStrictScan: (_providerId, signal) => admission.scan(signal),
+  }, fixture.options);
+  try {
+    await admission.source.verifyGenesis();
+    await admission.saturate();
+    await supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary']);
+    assert.equal(first.closeCalls(), 1);
+    assert.equal(supervisor.activeProviderId(), null);
+    assert.equal(fixture.reporter.transitions.some(({ phase }) => phase === 'DEGRADED'), false);
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    assert.deepEqual(admission.calls, ['getGenesisHash']);
+    assert.equal(admission.roles.snapshot().entries[0]?.attempts, 1);
+    assert.deepEqual(admission.durableWrites, []);
+    admission.release();
+    fixture.scheduler.fireNext(500);
+    await flushLifecycle();
+    assert.deepEqual(providers, ['primary', 'primary']);
+    assert.equal(supervisor.state(), 'RUNNING');
+    assert.equal(second.closeCalls(), 0);
+    assert.deepEqual(admission.calls, ['getGenesisHash', 'getSignaturesForAddress']);
+  } finally { admission.close(); await supervisor.close(); }
+});
+
+void test('a real saturated periodic scanner retains its healthy incumbent and rearms without provider recovery', async (context) => {
+  const admission = ordinaryRpcAdmissionFixture(context);
+  const incumbent = controlledSession('primary');
+  const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'],
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  let scans = 0;
+  const supervisor = new WebSocketFailoverSupervisor({ ...fixture.dependencies,
+    runStrictScan(_providerId, signal) {
+      scans += 1;
+      return scans === 1 ? Promise.resolve(scanResult('primary')) : admission.scan(signal);
+    },
+  }, fixture.options);
+  try {
+    await admission.source.verifyGenesis();
+    await supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    const transitions = fixture.reporter.transitions.length;
+    await admission.saturate();
+    fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+    await flushLifecycle();
+    assert.equal(supervisor.state(), 'RUNNING');
+    assert.equal(supervisor.activeProviderId(), 'primary');
+    assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+    assert.equal(fixture.reporter.transitions.length, transitions);
+    assert.equal(incumbent.closeCalls(), 0);
+    assert.equal(fixture.openedAttempts.length, 1);
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+    assert.deepEqual(admission.calls, ['getGenesisHash']);
+    assert.equal(admission.roles.snapshot().entries[0]?.attempts, 1);
+    assert.deepEqual(admission.durableWrites, []);
+    admission.release();
+    fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+    await flushLifecycle();
+    assert.equal(scans, 3);
+    assert.equal(supervisor.state(), 'RUNNING');
+    assert.deepEqual(admission.calls, ['getGenesisHash', 'getSignaturesForAddress']);
+    assert.deepEqual(admission.durableWrites, ['resolve:launchpad']);
+  } finally { admission.close(); await supervisor.close(); }
+});
+
+void test('budget-shaped and proxied errors still follow genuine provider-error recovery semantics', async () => {
+  const forged = Object.setPrototypeOf(new Error('Ordinary RPC admission queue is full.'), OrdinaryRpcBudgetError.prototype);
+  for (const error of [forged, new Proxy(new OrdinaryRpcBudgetError('RPC_ORDINARY_BUDGET_FULL'), {})]) {
+    const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'], random: () => 0,
+      genesisResults: [rejected(error), rejected(new Error('provider unavailable'))],
+    });
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+    assert.equal(fixture.genesisSignals.length, 2);
+    assert.equal(fixture.supervisor.state(), 'DEGRADED');
+    await fixture.supervisor.close();
+  }
 });
 
 void test('equal-jitter backoff uses exact capped zero-based delays and rejects hostile inputs', () => {

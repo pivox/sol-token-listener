@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { OrdinaryRpcAttemptBudget } from '../src/solana/rpc/ordinary-rpc-attempt-budget.js';
+import { OrdinaryRpcAttemptBudget, OrdinaryRpcBudgetError } from '../src/solana/rpc/ordinary-rpc-attempt-budget.js';
+import { ordinaryRpcAdmissionFixture } from './helpers/ordinary-rpc-admission-fixture.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { createObservedRpcFetch, createRpcHttpEvidenceRecorder } from '../src/solana/rpc/rpc-http-evidence.js';
 import { createRpcHttpRoleEvidenceRecorder } from '../src/solana/rpc/rpc-http-role-evidence.js';
 import { createSolanaConnectionConfig } from '../src/solana/rpc/rpc-client.js';
@@ -332,4 +334,29 @@ void test('normalizes primitive physical fetch rejection into an Error for the S
     reject('primitive rejection');
   })), Error);
   budget.close();
+});
+
+void test('local queue-full errors survive real genesis, SDK page, scanner and hydration routing without HTTP evidence', async (context) => {
+  const fixture = ordinaryRpcAdmissionFixture(context);
+  const local = (error: unknown): boolean => {
+    assert.ok(error instanceof OrdinaryRpcBudgetError);
+    assert.equal(error.code, 'RPC_ORDINARY_BUDGET_FULL');
+    return true;
+  };
+  try {
+    await fixture.saturate();
+    await assert.rejects(fixture.source.verifyGenesis(), local);
+    assert.deepEqual(fixture.calls, []);
+    assert.ok(fixture.recorder.snapshot(['primary', 'fallback-1']).providers.every((value) => value.attempts === 0));
+    fixture.release();
+    await fixture.source.verifyGenesis();
+    await fixture.saturate();
+    await assert.rejects(fixture.source.list(PUMP_PROGRAM_ID, undefined, 1), local);
+    await assert.rejects(fixture.scanner.scan(new AbortController().signal), local);
+    await assert.rejects(fixture.scan(new AbortController().signal), local);
+    assert.deepEqual(fixture.calls, ['getGenesisHash']);
+    assert.equal(fixture.recorder.snapshot(['primary', 'fallback-1']).providers[0]?.attempts, 1);
+    assert.equal(fixture.roles.snapshot().entries[0]?.attempts, 1);
+    assert.deepEqual(fixture.durableWrites, []);
+  } finally { fixture.close(); }
 });

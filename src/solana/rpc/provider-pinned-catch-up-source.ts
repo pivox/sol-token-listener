@@ -9,7 +9,7 @@ import {
 import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
-import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
+import { isOrdinaryRpcBudgetError, type OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
 import { createBoundedRpcFetch } from './rpc-client.js';
 
 export type ProviderPinnedCatchUpSourceErrorReason =
@@ -81,8 +81,9 @@ export function createProviderPinnedCatchUpSource(
       let actual: unknown;
       try {
         actual = await rpc.getGenesisHash(controller.signal);
-      } catch {
+      } catch (error) {
         if (controller.signal.aborted) throw abortError();
+        if (isOrdinaryRpcBudgetError(error)) throw error;
         throw failure('GENESIS_UNAVAILABLE', providerId);
       }
       if (controller.signal.aborted) throw abortError();
