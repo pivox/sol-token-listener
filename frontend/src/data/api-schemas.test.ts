@@ -63,6 +63,29 @@ const DOMAIN_EVENT_TYPES = [
 ] as const;
 
 describe('frontend-owned API V1 schemas', () => {
+  it('parses fixed role evidence, rolling absence, and rejects identifying or inconsistent cells', () => {
+    const providers = ['primary', 'fallback-1', 'fallback-2', 'fallback-3'] as const;
+    const roles = ['SOURCE', 'FINALITY', 'BLOCK_HYDRATION', 'SHARED_CLIENT'] as const;
+    const evidence = { version: 1, overflowed: false,
+      entries: providers.flatMap((providerId) => roles.map((role) => ({
+        providerId, role, attempts: 0, responses: 0, http429Responses: 0,
+        failures: 0, inFlight: 0, maxInFlight: 0,
+        headerLatencyBuckets: Array<number>(10).fill(0), maxHeaderLatencyMs: 0,
+      }))),
+    };
+    const parse = (rpcHttpRoleEvidence: unknown) => apiHealthEnvelopeSchema.parse(success({
+      ...health, heartbeat: { ...health.heartbeat, rpcHttpRoleEvidence },
+    })).data.heartbeat.rpcHttpRoleEvidence;
+    expect(parse(evidence)).toEqual(evidence);
+    expect(parse(null)).toBeNull();
+    const legacy = { ...health.heartbeat } as Record<string, unknown>;
+    delete legacy.rpcHttpRoleEvidence;
+    expect(apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat: legacy })).data.heartbeat.rpcHttpRoleEvidence).toBeUndefined();
+    expect(() => parse({ ...evidence, endpoint: 'private-secret' })).toThrow();
+    expect(() => parse({ ...evidence, entries: [...evidence.entries].reverse() })).toThrow();
+    expect(() => parse({ ...evidence, entries: evidence.entries.map((entry, index) => index === 0
+      ? { ...entry, attempts: 1 } : entry) })).toThrow();
+  });
   it('accepts only bounded scanner phase aggregates and rolling absence', () => {
     const value = {
       version: 1, sampledAtMs: 1_790_000_000_000, unavailable: false, overflow: false,

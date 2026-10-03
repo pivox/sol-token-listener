@@ -22,6 +22,7 @@ import type {
   WebSocketRecoveryStatus,
 } from '../domain/websocket-health.js';
 import type { RpcProviderId } from '../domain/rpc-provider.js';
+import type { RuntimeRpcHttpRoleEvidenceV1 } from '../domain/rpc-http-role-evidence.js';
 import type { ScannerPhaseDiagnosticsV1 } from '../domain/scanner-phase-diagnostics.js';
 import type {
   CreationExitReason,
@@ -556,6 +557,8 @@ export interface ApiHeartbeat {
   readonly workerAdmissionClock?: ApiWorkerAdmissionClockV1 | null;
   /** Optional during rolling deployment; null when RPC HTTP evidence is absent. */
   readonly rpcHttpEvidence?: ApiRpcHttpEvidenceV1 | null;
+  /** Optional during rolling deployment; null when aggregate physical HTTP role evidence is absent. */
+  readonly rpcHttpRoleEvidence?: RuntimeRpcHttpRoleEvidenceV1 | null;
   /** Optional during rolling deployment; null when first-processing evidence is absent. */
   readonly firstProcessingCanary?: ApiFirstProcessingCanaryEvidenceV1 | null;
   /** Optional during rolling deployment; null when decoder-quarantine evidence is absent. */

@@ -19,6 +19,10 @@ import {
   createRuntimeRpcHttpEvidence,
   type RuntimeRpcHttpEvidenceV1,
 } from '../domain/rpc-http-evidence.js';
+import {
+  createRuntimeRpcHttpRoleEvidence,
+  type RuntimeRpcHttpRoleEvidenceV1,
+} from '../domain/rpc-http-role-evidence.js';
 import type {
   FinalityReconcilerDiagnosticReason,
   FinalityReconcilerDiagnosticV1,
@@ -73,6 +77,7 @@ import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-
 import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
 import { createRpcHttpEvidenceRecorder } from '../solana/rpc/rpc-http-evidence.js';
+import { createRpcHttpRoleEvidenceRecorder } from '../solana/rpc/rpc-http-role-evidence.js';
 import { openWsProgramSession } from '../solana/rpc/ws-program-session.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
@@ -281,12 +286,14 @@ export function createProductionListenerRuntime(
   const ingestionPrograms = listenerIngestionPrograms(config.listenerIngestionScope);
   const databasePool = pool ?? getDatabasePool();
   const recorder = createRpcHttpEvidenceRecorder();
+  const roleRecorder = createRpcHttpRoleEvidenceRecorder();
   const rpcWorkGate = config.listenerWorkerCount > 1 ? new ListenerRpcWorkGate() : null;
   const rpcRequestTimeoutMs = rpcWorkGate === null
     ? config.listenerShutdownTimeoutMs
     : Math.max(1, Math.floor(config.listenerShutdownTimeoutMs / 2));
   const rpc = new SolanaRpcClient(config, {
     recorder,
+    roleRecorder,
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
     ...(rpcWorkGate === null ? {} : {
       requestTimeoutMs: rpcRequestTimeoutMs,
@@ -320,14 +327,14 @@ export function createProductionListenerRuntime(
     baseDelayMs: config.rpcRetryBaseDelayMs,
   }), workerAdmissionPolicy);
   const promoted = new PromotedProviderSelector(
-    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId, undefined, recorder)),
+    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId, undefined, recorder, roleRecorder)),
   );
   const hydration = config.listenerPumpFunCatchUpPageAdmissionEnabled
     ? new ProviderAffineCatchUpHydration(new Map(providers.ids.map((providerId) => [
       providerId, ((): ProviderPinnedBlockRpc => {
         const pinned = createProviderPinnedBlockRpc(providers, providerId, config.commitment, undefined, {
           requestTimeoutMs: rpcRequestTimeoutMs,
-        }, recorder);
+        }, recorder, roleRecorder);
         if (rpcWorkGate === null) return pinned;
         const gated = gateBlockTransactionRpc(rpcWorkGate, pinned);
         return Object.freeze({
@@ -386,6 +393,7 @@ export function createProductionListenerRuntime(
         expectedGenesisHash,
         undefined,
         recorder,
+        roleRecorder,
       );
       return [providerId, source] as const;
     }),
@@ -692,6 +700,7 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       blockHydrationMetrics: blockHydration.metrics,
       rpcHttpEvidenceMetrics: (): RuntimeRpcHttpEvidenceV1 => recorder.snapshot(configuredRpcHttpProviderIds),
+      rpcHttpRoleEvidenceMetrics: (): RuntimeRpcHttpRoleEvidenceV1 => roleRecorder.snapshot(),
       scannerPhaseDiagnosticsMetrics: (sampledAtMs): ScannerPhaseDiagnosticsV1 =>
         scannerPhaseDiagnostics.snapshot(sampledAtMs),
       inboxSnapshot: (): ReturnType<PostgresTransactionInboxRepository['heartbeatSnapshot']> =>
@@ -765,6 +774,7 @@ export interface ListenerHeartbeatOptions extends RecurringListenerOptions {
   readonly blockHydrationAdmissionMetrics?: () => RuntimeBlockHydrationAdmissionMetricsV1;
   readonly catchUpAdmissionMetrics?: (counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidenceMetrics?: () => RuntimeRpcHttpEvidenceV1;
+  readonly rpcHttpRoleEvidenceMetrics?: () => RuntimeRpcHttpRoleEvidenceV1;
   readonly workerAdmissionMetrics?: () => Promise<RuntimeWorkerAdmissionMetricsV1>;
   readonly scannerPhaseDiagnosticsMetrics?: (sampledAtMs: number) => ScannerPhaseDiagnosticsV1;
 }
@@ -1148,6 +1158,7 @@ export class PersistentListenerHeartbeat {
   private readonly blockHydrationAdmissionMetrics: (() => RuntimeBlockHydrationAdmissionMetricsV1) | null;
   private readonly catchUpAdmissionMetrics: ((counts: InboxCounts) => RuntimeCatchUpAdmissionMetricsV1) | null;
   private readonly rpcHttpEvidenceMetrics: (() => RuntimeRpcHttpEvidenceV1) | null;
+  private readonly rpcHttpRoleEvidenceMetrics: (() => RuntimeRpcHttpRoleEvidenceV1) | null;
   private readonly workerAdmissionMetrics: (() => Promise<RuntimeWorkerAdmissionMetricsV1>) | null;
   private readonly scannerPhaseDiagnosticsMetrics: ((sampledAtMs: number) => ScannerPhaseDiagnosticsV1) | null;
   private readonly inboxSnapshot: ListenerHeartbeatOptions['inboxSnapshot'];
@@ -1186,6 +1197,11 @@ export class PersistentListenerHeartbeat {
       throw new TypeError('RPC HTTP evidence metrics provider is invalid.');
     }
     this.rpcHttpEvidenceMetrics = options.rpcHttpEvidenceMetrics ?? null;
+    if (options.rpcHttpRoleEvidenceMetrics !== undefined
+      && typeof options.rpcHttpRoleEvidenceMetrics !== 'function') {
+      throw new TypeError('RPC HTTP role evidence metrics provider is invalid.');
+    }
+    this.rpcHttpRoleEvidenceMetrics = options.rpcHttpRoleEvidenceMetrics ?? null;
     if (options.workerAdmissionMetrics !== undefined
       && typeof options.workerAdmissionMetrics !== 'function') {
       throw new TypeError('Worker admission metrics provider is invalid.');
@@ -1369,6 +1385,14 @@ export class PersistentListenerHeartbeat {
         throw new TypeError('RPC HTTP evidence metrics are invalid.');
       }
     }
+    let rpcHttpRoleEvidence: RuntimeRpcHttpRoleEvidenceV1 | undefined;
+    if (this.rpcHttpRoleEvidenceMetrics !== null) {
+      try {
+        rpcHttpRoleEvidence = createRuntimeRpcHttpRoleEvidence(this.rpcHttpRoleEvidenceMetrics());
+      } catch {
+        throw new TypeError('RPC HTTP role evidence metrics are invalid.');
+      }
+    }
     let workerAdmission: RuntimeWorkerAdmissionMetricsV1 | undefined = inboxSnapshot === undefined
       ? undefined : snapshotRuntimeWorkerAdmissionMetrics(inboxSnapshot.workerAdmission);
     if (this.workerAdmissionMetrics !== null) {
@@ -1419,6 +1443,7 @@ export class PersistentListenerHeartbeat {
       ...(blockHydrationAdmission === undefined ? {} : { blockHydrationAdmission }),
       ...(catchUpAdmission === undefined ? {} : { catchUpAdmission }),
       ...(rpcHttpEvidence === undefined ? {} : { rpcHttpEvidence }),
+      ...(rpcHttpRoleEvidence === undefined ? {} : { rpcHttpRoleEvidence }),
       ...(workerAdmission === undefined ? {} : { workerAdmission }),
       ...(workerAdmissionClock === undefined ? {} : { workerAdmissionClock }),
       ...(scannerPhaseDiagnostics === undefined ? {} : { scannerPhaseDiagnostics }),
