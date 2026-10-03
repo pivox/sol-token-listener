@@ -7,6 +7,64 @@ import type { ApiClient } from '../../data/api-client.js';
 import { apiHealthEnvelopeSchema, type ApiHealth } from '../../data/api-schemas.js';
 import { ApiClientProvider } from '../../data/api-provider.js';
 import { HealthPage } from './health-page.js';
+function v2Evidence() {
+  const role = () => ({ grants: 0, cancellations: 0, oldestWaitMs: null, lastWaitMs: null, maximumWaitMs: null });
+  return {
+    blockHydration: { version: 2, enabled: true, configuredGroups: 2,
+      locates: 0, hits: 0, misses: 0, inFlightJoins: 0, fetches: 0, forcedRefreshes: 0,
+      evictions: 0, oversizeBypasses: 0, fetchFailures: 0, epochInvalidations: 0,
+      retainedEntries: 0, retainedBytes: 0, inFlightFetches: 0, queuedFetches: 0,
+      queueDelayMs: { last: null, maximum: null }, activeGroups: 0, maximumActiveGroups: 0,
+      queuedGroups: 0, maximumQueuedGroups: 0, maximumInFlightFetches: 0,
+      maximumQueuedFetches: 0, sameGroupJoins: 0, unsettledAfterCancel: 0, maximumUnsettledAfterCancel: 0 },
+    blockHydrationAdmission: { version: 2, enabled: true, configuredGroups: 2,
+      registeredWorkers: 1, pendingWorkers: 0, maximumPendingWorkers: 0,
+      pendingClassifierGroups: 0, maximumPendingClassifierGroups: 0,
+      unboundReservations: 0, activeGroups: 0, maximumAdmitted: 0, worker: role(), classifier: role() },
+    ordinaryRpcBudget: { version: 2, enabled: true, windowMs: 1000, maxAttemptsPerWindow: 8, maxWaiters: 64,
+      startsInWindow: 0, maximumStartsInWindow: 0, queuedWaiters: 0, maximumQueuedWaiters: 0,
+      localRejections: 0, closed: false },
+    blockResponseMemory: { version: 2, perResponseLimitBytes: 33_554_432, totalInFlightLimitBytes: 67_108_864,
+      activeBodies: 0, inFlightBytes: 0, maximumInFlightBytes: 0, oversizedResponses: 0, maximumRssBytes: 67_108_864 },
+  };
+}
+
+describe('two-group health diagnostics', () => {
+  it('renders V2 observations without caller concurrency or capacity assurances', async () => {
+    const value = v2Evidence();
+    value.ordinaryRpcBudget.localRejections = 1;
+    value.blockResponseMemory.oversizedResponses = 2;
+    renderHealth(apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat: { ...health.heartbeat, ...value } })).data);
+    const card = (await screen.findByRole('heading', { name: 'Hydratation des blocs' })).closest('section');
+    expect(card).toHaveTextContent('groupes configurés : 2');
+    expect(card).toHaveTextContent('Groupes actifs/max : 0/0 ; en attente/max : 0/0');
+    expect(card).toHaveTextContent('Fetches actifs/max : 0/0 ; en attente/max : 0/0');
+    expect(card).not.toHaveTextContent('concurrence appelante');
+    const budget = screen.getByRole('heading', { name: 'Budget RPC ordinaire' }).closest('section');
+    expect(budget).toHaveTextContent('Départs/max : 0/0 ; limite : 8 par 1000 ms');
+    expect(budget).toHaveTextContent('Attentes/max : 0/0 ; limite : 64 ; rejets locaux : 1');
+    expect(budget).toHaveTextContent('Fermé : Non');
+    const memory = screen.getByRole('heading', { name: 'Mémoire des réponses bloc' }).closest('section');
+    expect(memory).toHaveTextContent('Corps actifs : 0 ; octets en vol/max : 0/0');
+    expect(memory).toHaveTextContent('RSS maximum : 67108864 octet(s) ; réponses oversized : 2');
+    for (const diagnostic of [card, budget, memory]) expect(diagnostic).not.toHaveTextContent(/prêt|safe|sûr|H2e/iu);
+  });
+  it('keeps V1 one-caller diagnostics', async () => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success(health)).data);
+    const card = (await screen.findByRole('heading', { name: 'Hydratation des blocs' })).closest('section');
+    expect(card).toHaveTextContent('concurrence appelante : 1');
+  });
+  it.each([undefined, null])('shows unavailable capacity rather than zero for %s', async (value) => {
+    renderHealth(apiHealthEnvelopeSchema.parse(success({ ...health, heartbeat: { ...health.heartbeat,
+      ordinaryRpcBudget: value, blockResponseMemory: value } })).data);
+    await screen.findByRole('heading', { name: 'Budget RPC ordinaire' });
+    for (const name of ['Budget RPC ordinaire', 'Mémoire des réponses bloc']) {
+      const card = screen.getByRole('heading', { name }).closest('section');
+      expect(card).toHaveTextContent(value === undefined ? 'Non disponible — backend antérieur' : 'Non disponible — heartbeat antérieur ou invalide');
+      expect(card).not.toHaveTextContent('0/0');
+    }
+  });
+});
 
 const degraded = apiHealthEnvelopeSchema.parse(success({
   ...health,

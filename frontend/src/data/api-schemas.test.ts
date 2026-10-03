@@ -1,6 +1,97 @@
 // @vitest-environment node
 
 import { describe, expect, expectTypeOf, it } from 'vitest';
+function v2Evidence() {
+  const role = () => ({ grants: 0, cancellations: 0, oldestWaitMs: null, lastWaitMs: null, maximumWaitMs: null });
+  return {
+    blockHydration: { version: 2, enabled: true, configuredGroups: 2,
+      locates: 0, hits: 0, misses: 0, inFlightJoins: 0, fetches: 0, forcedRefreshes: 0,
+      evictions: 0, oversizeBypasses: 0, fetchFailures: 0, epochInvalidations: 0,
+      retainedEntries: 0, retainedBytes: 0, inFlightFetches: 0, queuedFetches: 0,
+      queueDelayMs: { last: null, maximum: null }, activeGroups: 0, maximumActiveGroups: 0,
+      queuedGroups: 0, maximumQueuedGroups: 0, maximumInFlightFetches: 0,
+      maximumQueuedFetches: 0, sameGroupJoins: 0, unsettledAfterCancel: 0, maximumUnsettledAfterCancel: 0 },
+    blockHydrationAdmission: { version: 2, enabled: true, configuredGroups: 2,
+      registeredWorkers: 1, pendingWorkers: 0, maximumPendingWorkers: 0,
+      pendingClassifierGroups: 0, maximumPendingClassifierGroups: 0,
+      unboundReservations: 0, activeGroups: 0, maximumAdmitted: 0, worker: role(), classifier: role() },
+    ordinaryRpcBudget: { version: 2, enabled: true, windowMs: 1000, maxAttemptsPerWindow: 8, maxWaiters: 64,
+      startsInWindow: 0, maximumStartsInWindow: 0, queuedWaiters: 0, maximumQueuedWaiters: 0,
+      localRejections: 0, closed: false },
+    blockResponseMemory: { version: 2, perResponseLimitBytes: 33_554_432, totalInFlightLimitBytes: 67_108_864,
+      activeBodies: 0, inFlightBytes: 0, maximumInFlightBytes: 0, oversizedResponses: 0, maximumRssBytes: 67_108_864 },
+  };
+}
+
+describe('two-group frontend evidence', () => {
+  const envelope = (evidence: Record<string, unknown>) => success({ ...health, heartbeat: { ...health.heartbeat, ...evidence } });
+  it('retains complete V2 evidence without fabricating caller concurrency', () => {
+    const value = v2Evidence();
+    expect(apiHealthEnvelopeSchema.parse(envelope(value)).data.heartbeat).toMatchObject(value);
+    expect(apiHealthEnvelopeSchema.parse(envelope(value)).data.heartbeat.blockHydration).not.toHaveProperty('callerConcurrency');
+  });
+  it('preserves V1 and historical absent/null evidence', () => {
+    expect(apiHealthEnvelopeSchema.parse(success(health)).data.heartbeat.blockHydration).toEqual(health.heartbeat.blockHydration);
+    expect(apiHealthEnvelopeSchema.safeParse(envelope({ blockHydration: null, blockHydrationAdmission: null, ordinaryRpcBudget: null, blockResponseMemory: null })).success).toBe(true);
+    const legacy = Object.fromEntries(Object.entries(health.heartbeat).filter(([key]) => !Object.hasOwn(v2Evidence(), key)));
+    expect(apiHealthEnvelopeSchema.safeParse(success({ ...health, heartbeat: legacy })).success).toBe(true);
+    const admission = Object.fromEntries(Object.entries(v2Evidence().blockHydrationAdmission).filter(([key]) => key !== 'configuredGroups'));
+    expect(apiHealthEnvelopeSchema.parse(envelope({ blockHydrationAdmission: { ...admission, version: 1 } })).data.heartbeat.blockHydrationAdmission?.version).toBe(1);
+  });
+  it('accepts exact upper boundaries and independently sampled admission/cache gauges', () => {
+    const value = v2Evidence();
+    Object.assign(value.blockHydration, { retainedEntries: 64, retainedBytes: 67_108_864,
+      activeGroups: 2, maximumActiveGroups: 2, queuedGroups: 2, maximumQueuedGroups: 2,
+      inFlightFetches: 2, maximumInFlightFetches: 2, queuedFetches: 2, maximumQueuedFetches: 2,
+      unsettledAfterCancel: 2, maximumUnsettledAfterCancel: 2 });
+    Object.assign(value.ordinaryRpcBudget, { startsInWindow: 8, maximumStartsInWindow: 8,
+      queuedWaiters: 64, maximumQueuedWaiters: 64, localRejections: 1 });
+    Object.assign(value.blockResponseMemory, { activeBodies: 2, inFlightBytes: 67_108_864,
+      maximumInFlightBytes: 67_108_864, oversizedResponses: 1 });
+    expect(apiHealthEnvelopeSchema.parse(envelope(value)).data.heartbeat).toMatchObject(value);
+  });
+  it('rejects mixed, partial and explicitly undefined V2 evidence', () => {
+    for (const key of Object.keys(v2Evidence())) {
+      for (const replacement of [null, undefined]) {
+        expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...v2Evidence(), [key]: replacement })).success).toBe(false);
+      }
+      const heartbeat = Object.fromEntries(Object.entries({ ...health.heartbeat, ...v2Evidence() }).filter(([name]) => name !== key));
+      expect(apiHealthEnvelopeSchema.safeParse(success({ ...health, heartbeat })).success).toBe(false);
+    }
+    expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...v2Evidence(), blockHydration: health.heartbeat.blockHydration })).success).toBe(false);
+  });
+  it('rejects unsafe counts, extra fields and incorrect current/max bounds', () => {
+    for (const hits of [-0, -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      const value = v2Evidence();
+      expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...value, blockHydration: { ...value.blockHydration, hits } })).success).toBe(false);
+    }
+    for (const [key, overrides] of [
+      ['blockHydration', { callerConcurrency: 1 }], ['blockHydration', { maximumQueuedFetches: 3 }],
+      ['blockHydration', { activeGroups: 1 }], ['blockHydration', { retainedEntries: 65 }],
+      ['blockHydration', { retainedBytes: 67_108_865 }], ['blockHydration', { queueDelayMs: { last: 2, maximum: 1 } }],
+      ['blockHydrationAdmission', { registeredWorkers: 2 }], ['blockHydrationAdmission', { maximumPendingWorkers: 2 }],
+      ['blockHydrationAdmission', { pendingClassifierGroups: 1, maximumPendingClassifierGroups: 1 }],
+      ['blockHydrationAdmission', { unboundReservations: 2, activeGroups: 1, maximumAdmitted: 2 }],
+      ['ordinaryRpcBudget', { maximumStartsInWindow: 9 }], ['ordinaryRpcBudget', { queuedWaiters: 1 }],
+      ['ordinaryRpcBudget', { maxWaiters: 65 }], ['blockResponseMemory', { activeBodies: 3 }],
+      ['blockResponseMemory', { inFlightBytes: 1 }], ['blockResponseMemory', { maximumInFlightBytes: 67_108_865 }],
+      ['blockResponseMemory', { maximumRssBytes: -0 }], ['blockResponseMemory', { totalInFlightLimitBytes: 1 }],
+    ] as const) {
+      const value = v2Evidence();
+      expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...value, [key]: { ...value[key], ...overrides } })).success).toBe(false);
+    }
+  });
+  it('enforces running worker registration and stopped drain without erasing maxima', () => {
+    const value = v2Evidence();
+    expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...value, runtimeState: 'RUNNING', blockHydrationAdmission: { ...value.blockHydrationAdmission, registeredWorkers: 0 } })).success).toBe(false);
+    expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...value, runtimeState: 'STOPPED' })).success).toBe(false);
+    value.ordinaryRpcBudget.closed = true;
+    value.ordinaryRpcBudget.startsInWindow = 1;
+    value.ordinaryRpcBudget.maximumStartsInWindow = 8;
+    value.blockHydration.maximumActiveGroups = 2;
+    expect(apiHealthEnvelopeSchema.safeParse(envelope({ ...value, runtimeState: 'STOPPED' })).success).toBe(true);
+  });
+});
 import {
   apiFailureSchema,
   apiHealthEnvelopeSchema,
