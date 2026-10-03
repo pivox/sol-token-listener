@@ -1,6 +1,7 @@
 import { isNativeError, isProxy } from 'node:util/types';
 import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
 import type { RuntimeBlockHydrationMetricsV1 } from '../domain/transaction-ingestion.js';
+import type { RuntimeBlockHydrationPhaseEvidenceV1 } from '../domain/block-hydration-phase-evidence.js';
 import {
   CachedSolanaBlockTransactionLocator,
   type BlockTransactionCacheOptions,
@@ -137,6 +138,8 @@ export class ProviderAffineCatchUpHydration {
   public workerAdmission(): TransactionInboxClaimAdmission { return this.createWorkerAdmission(); }
 
   public admissionMetrics(): HydrationGroupAdmissionMetrics { return this.admission.metrics(); }
+
+  public phaseEvidence(): RuntimeBlockHydrationPhaseEvidenceV1 | null { return this.cache.phaseEvidence; }
 
   public classifierLocator(providerId: RpcProviderId): PumpFunCatchUpTransactionLocator {
     this.assertProvider(providerId);
