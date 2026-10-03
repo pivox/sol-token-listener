@@ -1,4 +1,4 @@
-# #218 RPC role evidence Implementation Plan v1.0.1
+# #218 RPC role evidence Implementation Plan v1.0.2
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -44,7 +44,7 @@
 
 **Files:** Modify `docs/operations/block-hydration-canary.md`, `docs/api/v1.md`, `tests/mainnet-observe-canary-verdict.test.ts`; do **not** relax `scripts/lib/mainnet-observe-canary-verdict.ts`.
 
-- [ ] Write RED regression proving that a valid sibling role snapshot leaves the current 19-gate V1 verdict unchanged and that an absent/overflowed role snapshot cannot be treated as rate-capacity proof. The latter is a documentation/diagnostic requirement, not a new canary PASS gate.
+- [ ] Add a characterization regression proving that a valid sibling role snapshot leaves the current 19-gate V1 verdict unchanged. Because the existing parser already ignores unknown heartbeat siblings, this test may pass immediately; do not alter production verdict code to manufacture a RED phase. Document that absent/overflowed role evidence cannot be treated as rate-capacity proof; this is not a new canary PASS gate.
 - [ ] Run focused tests, then document exact histogram boundaries, coarse roles, header-only timing, gaps (SDK parse/RSS, other key-sharing processes, project RPS and exit reserve), and aggregate-only handling.
 - [ ] Run `npm run build`, `npm run check`, `npm run lint`, `npm test`, `npm run docs:check` and frontend tests. Check host disk before/during heavy commands; pause and safely clean task-owned disposable artifacts at <=5,000,000,000 bytes available. Review diff for URLs, keys, signatures, fixture secrets, behavior changes and missing failure paths.
 - [ ] Commit, push and open one focused PR against `main`. Run **one** independent Codex review cycle; address its findings, await green PR CI, merge, then verify exact post-merge CI. Do not run a new Mainnet canary or alter concurrency in this PR.
