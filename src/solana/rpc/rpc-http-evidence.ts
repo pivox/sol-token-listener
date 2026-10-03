@@ -6,6 +6,7 @@ import {
 import { isRpcProviderId, RPC_PROVIDER_IDS, type RpcProviderId } from '../../domain/rpc-provider.js';
 import type { RpcHttpRole } from '../../domain/rpc-http-role-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
+import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 type FetchInit = Parameters<FetchFn>[1];
@@ -31,23 +32,28 @@ export function createObservedRpcFetch(
   fetchImplementation: FetchFn = globalThis.fetch,
   roleRecorder?: RpcHttpRoleEvidenceRecorder,
   role: RpcHttpRole = 'SHARED_CLIENT',
+  attemptBudget?: OrdinaryRpcAttemptBudget,
 ): FetchFn {
   if (!isRpcProviderId(providerId) || typeof fetchImplementation !== 'function') invalid();
 
   return async (input, init): Promise<Response> => {
-    throwIfAborted(requestSignal(input, init));
-    if (recorder !== undefined) recordSafely(recorder, 'recordAttempt', providerId);
-    const finish = beginRoleSafely(roleRecorder, providerId, role);
-    try {
-      const response = await fetchImplementation(input, init);
-      const status = responseStatus(response);
-      finish(status ?? 0);
-      if (status === 429 && recorder !== undefined) recordSafely(recorder, 'recordHttp429', providerId);
-      return response;
-    } catch (error) {
-      finish(null);
-      throw error;
-    }
+    const signal = requestSignal(input, init);
+    const attempt = async (): Promise<Response> => {
+      throwIfAborted(signal);
+      if (recorder !== undefined) recordSafely(recorder, 'recordAttempt', providerId);
+      const finish = beginRoleSafely(roleRecorder, providerId, role);
+      try {
+        const response = await fetchImplementation(input, init);
+        const status = responseStatus(response);
+        finish(status ?? 0);
+        if (status === 429 && recorder !== undefined) recordSafely(recorder, 'recordHttp429', providerId);
+        return response;
+      } catch (error) {
+        finish(null);
+        throw error;
+      }
+    };
+    return attemptBudget === undefined ? attempt() : attemptBudget.run(attempt, signal);
   };
 }
 

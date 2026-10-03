@@ -1,4 +1,33 @@
-# Mainnet classification throughput — capacity evidence gate v1.1.2
+# Mainnet classification throughput — capacity evidence gate v1.2.0
+
+## Operator capacity policy amendment v1.2.0 (2026-10-03)
+
+The operator has explicitly selected a **local experiment policy**, not a
+project-specific Helius attestation: nominal Free plan 10 RPC requests/s,
+2 requests/s non-borrowable for a future emergency exit, and at most
+8 ordinary physical HTTP RPC attempts in every rolling second. The separate
+Free-plan `sendTransaction` cap is 1/s and is never included in, or enabled by,
+this observe-only work. The transport budget must be shared by all listener
+connections and provider roles; failover retries consume an additional
+attempt. The same API key may be used by unknown external processes, so this
+local cap does **not** prove provider-wide exit capacity or H2e/H2c readiness.
+
+Implementation is staged and defaults OFF until the complete contract is
+verified. First, add a bounded, abortable shared ordinary-attempt admission
+budget at the physical HTTP fetch boundary (source, finality, block and shared
+client). It must not reserve a token for an aborted request or record an HTTP
+attempt before admission. No in-process queue may grow without bound, and
+shutdown must reject waiters. Existing fetch timeout includes queue time.
+Second, version a V2 block-hydration admission/heartbeat/API/canary contract
+that explicitly permits two distinct slot/status groups while preserving the
+V1 one-group exact shape and all 19 existing pass/fail gates. Third, enable at
+most two groups only under explicit opt-in and the shared budget, while
+retaining provider affinity, exact finality keys, ordered durable writes,
+idempotence, worker fairness, cancellation, response-memory bounds and
+rollback to V1. A short controlled observe-only comparison starts at two
+hydrations in flight; three or four require a new measured amendment, not
+an implicit escalation. A full fresh exact-merge 15-minute canary remains
+mandatory. Zero observed 429 alone is not a PASS.
 
 Issue: [#218](https://github.com/pivox/sol-token-listener/issues/218).
 Base: `origin/main@8a99152f776b55ebff167323a17a5d4b336c76de`.
@@ -46,15 +75,16 @@ filter, cross-finality cache reuse or silent backlog truncation is justified.
   flights, so wider concurrency also needs cancellation, provider-switch,
   orphan/finality and RSS proofs.
 
-## Evidence required before implementation
+## Evidence required before live-readiness claims (historical v1.1.2 checklist)
 
 1. Record the actual Helius project/plan and fresh monthly credit quota via
    the existing H2e path. H2e's Admin `/usage` projection contains billing
    credits and a plan ID, **not** a per-project RPS, concurrency or live-exit
    allowance. Independently obtain a dated, authoritative per-project RPC
    rate-limit source from Helius dashboard, API or support, including custom
-   limits if applicable; otherwise instantaneous capacity remains
-   `INCONCLUSIVE` and no wider admission mode may be selected. Public
+   limits if applicable; otherwise provider-wide capacity remains
+   `INCONCLUSIVE` and no live-readiness claim may be made. The v1.2.0
+   operator policy above permits only a bounded, observe-only local trial. Public
    [Helius pricing](https://www.helius.dev/pricing) and zero observed 429 are
    not project-specific capacity proof. The current local configuration has
    no `HELIUS_PROJECT_ID`, H2e API-key file or dedicated attestation key. Do
@@ -62,10 +92,10 @@ filter, cross-finality cache reuse or silent backlog truncation is justified.
 2. Capture bounded per-provider total attempts, 429, latency and maximum
    simultaneous response/parse memory for source, finality, block, worker,
    health and any other listener traffic, on an exact clean commit. Record
-   workload mix and reserve a separately justified exit budget. A test with
+   workload mix and the operator's non-borrowable local exit headroom. A test with
    zero 429 is necessary but insufficient.
 3. Choose and version one specific option: a shared per-provider admission
-   budget with worker/exit priority and at most two distinct block groups,
+   ordinary-attempt budget with at most two distinct block groups,
    or a different source that supplies authoritative transaction identity
    without increasing requests. Do not ship a cache-only concurrency knob.
 
@@ -78,7 +108,8 @@ commitment promotion, orphan reconciliation, response-size/RSS bounds and
 shutdown. Version heartbeat/API/verdict evidence without weakening the
 requirements for backlog, age, zero 429, finality, idempotence, retention,
 RSS, terminal failures and cleanup. An opt-in short probe must show a causal
-gain within an attested budget. Only after one independent review cycle, green
+gain within the operator's bounded local policy; provider-wide capacity
+remains unproven until H2e and independent rate-limit evidence. Only after one independent review cycle, green
 CI and merge may a fresh exact-merge 15-minute observe-only canary be assessed.
 H2d/H2c, wallet and live-trade gates remain closed until that canary passes.
 

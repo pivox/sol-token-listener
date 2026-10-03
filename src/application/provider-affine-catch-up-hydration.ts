@@ -15,6 +15,7 @@ import {
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import type { PromotedProviderSelection } from './promoted-provider-selector.js';
 import type { PumpFunCatchUpTransactionLocator } from './pumpfun-catch-up-block-classifier.js';
+import { isOrdinaryRpcBudgetError } from '../solana/rpc/ordinary-rpc-attempt-budget.js';
 import {
   isStrictCatchUpPausedError, isStrictCatchUpRefreshRequiredError,
   StrictCatchUpAbortedError, StrictCatchUpPausedError, StrictCatchUpRefreshRequiredError,
@@ -194,6 +195,7 @@ export class ProviderAffineCatchUpHydration {
       this.assertOpen(combined);
       return result;
     } catch (error) {
+      if (isOrdinaryRpcBudgetError(error) && !this.closed && !signal.aborted) throw error;
       if (safeScannerError(error)
         && (error instanceof StrictCatchUpAbortedError || (!this.closed && !signal.aborted))) {
         throw reconstructScannerError(error);

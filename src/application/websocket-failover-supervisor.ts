@@ -1,5 +1,6 @@
 import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
+import { isOrdinaryRpcBudgetError } from '../solana/rpc/ordinary-rpc-attempt-budget.js';
 import {
   isStrictCatchUpPausedError,
   StrictCatchUpAbortedError,
@@ -132,6 +133,7 @@ interface SessionRecord {
 type ProviderAttemptResult =
   | Readonly<{ kind: 'promoted' }>
   | Readonly<{ kind: 'aborted' }>
+  | Readonly<{ kind: 'local_admission' }>
   | Readonly<{
       kind: 'paused';
       recoveryReason: 'RPC_UNAVAILABLE';
@@ -198,6 +200,7 @@ export class WebSocketFailoverSupervisor {
   #reporterStopPromise: Promise<void> | null = null;
   #permanentlyClosed = false;
   #failedCycleCount = 0;
+  #localAdmissionRetryProviderId: RpcProviderId | null = null;
   #lastPromotedProviderId: RpcProviderId | null = null;
   #pendingRecoveryReason: WebSocketRecoveryReasonCode = 'STARTUP';
   #unrecoverable = false;
@@ -413,20 +416,25 @@ export class WebSocketFailoverSupervisor {
       }
       if (this.#isPermanentlyClosed()) return;
       pinnedCycle ||= pinned !== null;
-      const providerId = pinned ?? ids.find((id) => !attempted.has(id));
+      const providerId = pinned ?? this.#localAdmissionRetryProviderId
+        ?? ids.find((id) => !attempted.has(id));
       if (providerId === undefined || attempted.has(providerId)) break;
+      this.#localAdmissionRetryProviderId = null;
       attempted.add(providerId);
       let result: ProviderAttemptResult;
       try {
         result = await this.#attemptProvider(providerId, recoveryReason);
-      } catch {
-        result = Object.freeze({
-          kind: 'transient',
-          recoveryReason: 'RPC_UNAVAILABLE',
-          disconnectReason: null,
-        });
+      } catch (error) {
+        result = isOrdinaryRpcBudgetError(error)
+          ? Object.freeze({ kind: 'local_admission' })
+          : Object.freeze({ kind: 'transient', recoveryReason: 'RPC_UNAVAILABLE', disconnectReason: null });
       }
       if (result.kind === 'promoted' || result.kind === 'aborted') return;
+      if (result.kind === 'local_admission') {
+        this.#localAdmissionRetryProviderId = providerId;
+        this.#scheduleCycleRetry();
+        return;
+      }
       recoveryReason = result.recoveryReason;
       if (result.kind === 'paused') {
         disconnectReason = result.disconnectReason;
@@ -1242,7 +1250,8 @@ export class WebSocketFailoverSupervisor {
         || this.#incumbent !== record
         || this.#currentState !== 'RUNNING') return;
       const failure = scanning ? strictScanFailureFrom(error, record) : attemptFailureFrom(error);
-      if (failure.kind === 'aborted' || failure.kind === 'promoted') return;
+      if (failure.kind === 'aborted' || failure.kind === 'promoted'
+        || failure.kind === 'local_admission') return;
       const recoveryReason = failure.recoveryReason;
       const pending = this.#activeFailurePromise;
       if (pending !== null) {
@@ -1905,6 +1914,7 @@ function disconnectReasonFromCompletion(
 }
 
 function attemptFailureFrom(error: unknown): ProviderAttemptResult {
+  if (isOrdinaryRpcBudgetError(error)) return Object.freeze({ kind: 'local_admission' });
   if (error instanceof StrictCatchUpAbortedError) return nonShutdownAbortFailure();
   if (error instanceof StrictCatchUpScannerError) {
     return Object.freeze({

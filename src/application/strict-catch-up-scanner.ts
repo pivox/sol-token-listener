@@ -37,6 +37,7 @@ import type {
   StrictCatchUpPageAdmitter,
 } from '../ports/strict-catch-up-page-admitter.js';
 import { assertValidCatchUpClassificationReceipt } from '../domain/catch-up-classification.js';
+import { isOrdinaryRpcBudgetError } from '../solana/rpc/ordinary-rpc-attempt-budget.js';
 import {
   MAX_CATCH_UP_PAGE_SIZE,
   snapshotCatchUpSignatures,
@@ -594,6 +595,7 @@ export class StrictCatchUpScanner {
         try {
           return await this.source.list(program.id, before, this.pageSize);
         } catch (error) {
+          if (isOrdinaryRpcBudgetError(error)) throw error;
           originalStage = trustedCatchUpSourceErrorStage(error) ?? 'request';
           throw this.failure('source', program.key, originalStage);
         }

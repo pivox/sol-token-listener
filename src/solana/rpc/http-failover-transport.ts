@@ -3,6 +3,7 @@ import type { RpcProviderId } from './rpc-provider-catalog.js';
 import { RPC_HTTP_ROLES, type RpcHttpRole } from '../../domain/rpc-http-role-evidence.js';
 import { beginRoleSafely, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
+import { OrdinaryRpcAttemptBudget, OrdinaryRpcBudgetError } from './ordinary-rpc-attempt-budget.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 type FetchInit = Parameters<FetchFn>[1];
@@ -43,6 +44,7 @@ export type RpcHttpFailoverFetchOptions = Readonly<{
   recorder?: RpcHttpEvidenceRecorder;
   roleRecorder?: RpcHttpRoleEvidenceRecorder;
   role?: RpcHttpRole;
+  attemptBudget?: OrdinaryRpcAttemptBudget;
 }>;
 
 interface EndpointState {
@@ -130,13 +132,19 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       const rewrittenInput = rewriteInput(input, endpoint.url);
       let response: Response;
       throwIfAborted(signal);
-      recordAttempt(recorder, endpoint.id);
-      const finishRole = beginRoleSafely(roleRecorder, endpoint.id, role);
+      let finishRole: (status: number | null) => void = () => undefined;
+      const attempt = (): Promise<Response> => {
+        throwIfAborted(signal);
+        recordAttempt(recorder, endpoint.id);
+        finishRole = beginRoleSafely(roleRecorder, endpoint.id, role);
+        return fetch(rewrittenInput, init);
+      };
       try {
-        response = await fetch(rewrittenInput, init);
+        response = await (validated.attemptBudget === undefined
+          ? attempt() : validated.attemptBudget.run(attempt, signal));
       } catch (error) {
         finishRole(null);
-        if (signal?.aborted === true) throw error;
+        if (signal?.aborted === true || error instanceof OrdinaryRpcBudgetError) throw error;
         const reason = 'NETWORK';
         degrade(endpoint, reason, DEFAULT_COOLDOWN_MS, now(), onEvent);
         lastFailure = { endpointId: endpoint.id, reason };
@@ -232,6 +240,9 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
   if (candidate.role !== undefined && !RPC_HTTP_ROLES.includes(candidate.role)) {
     throw new TypeError('HTTP RPC role is invalid.');
   }
+  if (candidate.attemptBudget !== undefined && !(candidate.attemptBudget instanceof OrdinaryRpcAttemptBudget)) {
+    throw new TypeError('HTTP RPC attempt budget is invalid.');
+  }
   return Object.freeze({
     endpoints: Object.freeze(endpoints),
     ...(candidate.fetch === undefined ? {} : { fetch: candidate.fetch }),
@@ -241,6 +252,7 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
     ...(candidate.recorder === undefined ? {} : { recorder: candidate.recorder }),
     ...(candidate.roleRecorder === undefined ? {} : { roleRecorder: candidate.roleRecorder }),
     ...(candidate.role === undefined ? {} : { role: candidate.role }),
+    ...(candidate.attemptBudget === undefined ? {} : { attemptBudget: candidate.attemptBudget }),
   });
 }
 
