@@ -6,6 +6,8 @@ import {
   type VersionedTransactionResponse,
 } from '@solana/web3.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { twoGroupHydrationEvidenceFixture } from './helpers/two-group-hydration-evidence-fixture.js';
+import { snapshotRuntimeTwoGroupHydrationEvidenceV2 } from '../src/domain/two-group-hydration-evidence.js';
 import {
   LISTENER_RUNTIME_STATES,
   MAX_FINALITY_EVIDENCE_VERSION,
@@ -343,6 +345,26 @@ function rpcEvidenceHeartbeat(): RuntimeHeartbeat {
     lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0, exhaustedCount: 0,
   });
 }
+
+void test('heartbeat accepts only a complete original V2 evidence bundle', () => {
+  const base = rpcEvidenceHeartbeat();
+  const evidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(twoGroupHydrationEvidenceFixture());
+  assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...base, ...evidence })); });
+  const { blockResponseMemory, ...partial } = evidence;
+  assert.ok(blockResponseMemory);
+  assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...base, ...partial })); }, TypeError);
+  assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...base, ...evidence,
+    ordinaryRpcBudget: undefined })); }, TypeError);
+  assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...base, ...evidence,
+    runtimeState: 'STOPPED' })); }, TypeError);
+  assert.throws(() => { assertValidRuntimeHeartbeat(Object.freeze({ ...base, ...evidence,
+    blockHydration: { ...evidence.blockHydration, queuedFetches: 3 } })); }, TypeError);
+  let reads = 0;
+  const accessor = Object.freeze({ ...base, ...evidence,
+    get ordinaryRpcBudget() { reads += 1; return evidence.ordinaryRpcBudget; } });
+  assert.throws(() => { assertValidRuntimeHeartbeat(accessor); }, TypeError);
+  assert.equal(reads, 0);
+});
 
 void test('heartbeat rejects a proxy envelope without invoking traps on RPC HTTP evidence', () => {
   let traps = 0;

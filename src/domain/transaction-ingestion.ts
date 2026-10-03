@@ -37,6 +37,15 @@ import {
   snapshotRuntimeBlockHydrationAdmissionMetrics,
   type RuntimeBlockHydrationAdmissionMetricsV1,
 } from './block-hydration-admission.js';
+import {
+  assertTwoGroupHydrationEvidenceForState,
+  snapshotRuntimeTwoGroupHydrationEvidenceV2,
+  type RuntimeBlockHydrationMetricsV2,
+  type RuntimeBlockHydrationAdmissionMetricsV2,
+  type RuntimeOrdinaryRpcBudgetMetricsV2,
+  type RuntimeBlockResponseMemoryMetricsV2,
+  type RuntimeTwoGroupHydrationEvidenceV2,
+} from './two-group-hydration-evidence.js';
 
 export const isCanonicalSolanaProgramId = isCanonicalSolanaPublicKey;
 
@@ -299,9 +308,11 @@ export interface RuntimeHeartbeat {
   readonly backlogCount: number;
   readonly leasedCount: number;
   readonly exhaustedCount: number;
-  readonly blockHydration?: RuntimeBlockHydrationMetricsV1;
+  readonly blockHydration?: RuntimeBlockHydrationMetricsV1 | RuntimeBlockHydrationMetricsV2;
   readonly blockHydrationPhaseEvidence?: RuntimeBlockHydrationPhaseEvidenceV1;
-  readonly blockHydrationAdmission?: RuntimeBlockHydrationAdmissionMetricsV1;
+  readonly blockHydrationAdmission?: RuntimeBlockHydrationAdmissionMetricsV1 | RuntimeBlockHydrationAdmissionMetricsV2;
+  readonly ordinaryRpcBudget?: RuntimeOrdinaryRpcBudgetMetricsV2;
+  readonly blockResponseMemory?: RuntimeBlockResponseMemoryMetricsV2;
   readonly catchUpAdmission?: RuntimeCatchUpAdmissionMetricsV1;
   readonly rpcHttpEvidence?: RuntimeRpcHttpEvidenceV1;
   readonly rpcHttpRoleEvidence?: RuntimeRpcHttpRoleEvidenceV1;
@@ -725,8 +736,28 @@ export function assertValidRuntimeHeartbeat(
   if (isProxy(value)) throw new TypeError('Runtime heartbeat is invalid.');
   let workerAdmissionClock: RuntimeWorkerAdmissionClockV1 | undefined;
   let scannerPhaseDiagnostics: ScannerPhaseDiagnosticsV1 | undefined;
+  let twoGroupEvidence: RuntimeTwoGroupHydrationEvidenceV2 | undefined;
   // Validate the original evidence before the generic durable snapshot can normalize proxies.
   if (typeof value === 'object' && value !== null) {
+    const sidecarFields = [
+      'blockHydration', 'blockHydrationAdmission', 'ordinaryRpcBudget', 'blockResponseMemory',
+    ] as const;
+    const sidecars = Object.fromEntries(sidecarFields.map((field) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field);
+      if (descriptor !== undefined && (!('value' in descriptor) || !descriptor.enumerable)) {
+        throw new TypeError(`Runtime heartbeat ${field} is invalid.`);
+      }
+      return [field, descriptor?.value];
+    })) as Record<(typeof sidecarFields)[number], unknown>;
+    const hasVersionTwo = (candidate: unknown): boolean => {
+      if (typeof candidate !== 'object' || candidate === null || isProxy(candidate)) return false;
+      const version = Object.getOwnPropertyDescriptor(candidate, 'version');
+      return version !== undefined && 'value' in version && version.value === 2;
+    };
+    if (Object.hasOwn(value, 'ordinaryRpcBudget') || Object.hasOwn(value, 'blockResponseMemory')
+      || hasVersionTwo(sidecars.blockHydration) || hasVersionTwo(sidecars.blockHydrationAdmission)) {
+      twoGroupEvidence = snapshotRuntimeTwoGroupHydrationEvidenceV2(sidecars);
+    }
     const evidence = Object.getOwnPropertyDescriptor(value, 'rpcHttpEvidence');
     if (evidence !== undefined) {
       if (!('value' in evidence) || evidence.enumerable !== true) {
@@ -823,10 +854,14 @@ export function assertValidRuntimeHeartbeat(
   if (record.leasedCount > record.backlogCount) {
     throw new TypeError('Runtime heartbeat leasedCount exceeds backlogCount.');
   }
-  if (record.blockHydration !== undefined) {
+  if (twoGroupEvidence !== undefined) {
+    const evidenceState = record.runtimeState === 'RUNNING' || record.runtimeState === 'STOPPED'
+      ? record.runtimeState : 'OTHER';
+    assertTwoGroupHydrationEvidenceForState(twoGroupEvidence, evidenceState);
+  } else if (record.blockHydration !== undefined) {
     assertValidRuntimeBlockHydrationMetrics(record.blockHydration);
   }
-  if (record.blockHydrationAdmission !== undefined) {
+  if (twoGroupEvidence === undefined && record.blockHydrationAdmission !== undefined) {
     snapshotRuntimeBlockHydrationAdmissionMetrics(record.blockHydrationAdmission);
   }
   if (record.catchUpAdmission !== undefined) {

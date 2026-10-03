@@ -26,6 +26,9 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Qualification"><p>Rapports courants : {health.qualification.currentCount}</p><p>Dernier succès : <Timestamp value={health.qualification.lastSuccessAt} /></p></HealthCard>
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
         <HealthCard title="Hydratation des blocs"><BlockHydrationDiagnostic value={health.heartbeat.blockHydration} /></HealthCard>
+        <HealthCard title="Admission hydratation"><HydrationAdmissionDiagnostic value={health.heartbeat.blockHydrationAdmission} /></HealthCard>
+        <HealthCard title="Budget RPC ordinaire"><OrdinaryRpcBudgetDiagnostic value={health.heartbeat.ordinaryRpcBudget} /></HealthCard>
+        <HealthCard title="Mémoire des réponses bloc"><BlockResponseMemoryDiagnostic value={health.heartbeat.blockResponseMemory} /></HealthCard>
         <HealthCard title="Admission catch-up"><CatchUpAdmissionDiagnostic value={health.heartbeat.catchUpAdmission} /></HealthCard>
         <HealthCard title="Admission worker Pump.fun"><WorkerAdmissionDiagnostic value={health.heartbeat.workerAdmission} /></HealthCard>
         <HealthCard title="HTTP RPC"><RpcHttpEvidenceDiagnostic value={health.heartbeat.rpcHttpEvidence} /></HealthCard>
@@ -125,11 +128,47 @@ function BlockHydrationDiagnostic({
   if (value === undefined) return <p>Non disponible — backend antérieur</p>;
   if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
   return <>
-    <p>{value.enabled ? 'Activée' : 'Désactivée'} ; concurrence appelante : {value.callerConcurrency}</p>
+    <p>{value.enabled ? 'Activée' : 'Désactivée'} ; {value.version === 1 ? <>concurrence appelante : {value.callerConcurrency}</> : <>groupes configurés : {value.configuredGroups}</>}</p>
+    {value.version === 2 && <>
+      <p>Groupes actifs/max : {value.activeGroups}/{value.maximumActiveGroups} ; en attente/max : {value.queuedGroups}/{value.maximumQueuedGroups}</p>
+      <p>Fetches actifs/max : {value.inFlightFetches}/{value.maximumInFlightFetches} ; en attente/max : {value.queuedFetches}/{value.maximumQueuedFetches}</p>
+      <p>Après annulation/max : {value.unsettledAfterCancel}/{value.maximumUnsettledAfterCancel} ; joins même groupe : {value.sameGroupJoins}</p>
+    </>}
     <p>Hits : {value.hits} ; misses : {value.misses} ; locates : {value.locates}</p>
     <p>Fetches : {value.fetches} ; échecs : {value.fetchFailures} ; refresh forcés : {value.forcedRefreshes}</p>
     <p>Queue : {value.queuedFetches} ; délai dernier/max : {value.queueDelayMs.last ?? 'Indisponible'}/{value.queueDelayMs.maximum ?? 'Indisponible'} ms</p>
     <p>Cache : {value.retainedEntries} entrée(s), {value.retainedBytes} octet(s) ; oversize : {value.oversizeBypasses}</p>
+  </>;
+}
+
+function HydrationAdmissionDiagnostic({ value }: { readonly value: ApiHealth['heartbeat']['blockHydrationAdmission'] }): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  return <>
+    <p>{value.enabled ? 'Activée' : 'Désactivée'}{value.version === 2 && <> ; groupes configurés : {value.configuredGroups}</>}</p>
+    <p>Workers enregistrés : {value.registeredWorkers} ; attentes/max : {value.pendingWorkers}/{value.maximumPendingWorkers}</p>
+    <p>Groupes classification en attente/max : {value.pendingClassifierGroups}/{value.maximumPendingClassifierGroups}</p>
+    <p>Réservations non liées : {value.unboundReservations} ; groupes actifs : {value.activeGroups} ; admis maximum : {value.maximumAdmitted}</p>
+  </>;
+}
+
+function OrdinaryRpcBudgetDiagnostic({ value }: { readonly value: ApiHealth['heartbeat']['ordinaryRpcBudget'] }): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  return <>
+    <p>Départs/max : {value.startsInWindow}/{value.maximumStartsInWindow} ; limite : {value.maxAttemptsPerWindow} par {value.windowMs} ms</p>
+    <p>Attentes/max : {value.queuedWaiters}/{value.maximumQueuedWaiters} ; limite : {value.maxWaiters} ; rejets locaux : {value.localRejections}</p>
+    <p>Fermé : {value.closed ? 'Oui' : 'Non'}</p>
+  </>;
+}
+
+function BlockResponseMemoryDiagnostic({ value }: { readonly value: ApiHealth['heartbeat']['blockResponseMemory'] }): ReactNode {
+  if (value === undefined) return <p>Non disponible — backend antérieur</p>;
+  if (value === null) return <p>Non disponible — heartbeat antérieur ou invalide</p>;
+  return <>
+    <p>Corps actifs : {value.activeBodies} ; octets en vol/max : {value.inFlightBytes}/{value.maximumInFlightBytes}</p>
+    <p>Limites réponse/total : {value.perResponseLimitBytes}/{value.totalInFlightLimitBytes} octet(s)</p>
+    <p>RSS maximum : {value.maximumRssBytes} octet(s) ; réponses oversized : {value.oversizedResponses}</p>
   </>;
 }
 

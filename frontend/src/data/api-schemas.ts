@@ -453,7 +453,7 @@ const jobCountsSchema = z.object({
   retryableFailedCount: countSchema,
   exhaustedCount: countSchema,
 }).loose();
-const blockHydrationSchema = z.object({
+const blockHydrationV1Schema = z.object({
   version: z.literal(1),
   enabled: z.boolean(),
   callerConcurrency: z.literal(1),
@@ -478,6 +478,72 @@ const blockHydrationSchema = z.object({
 }).strict().refine(({ queueDelayMs }) => queueDelayMs.last === null
   || queueDelayMs.maximum === null
   || queueDelayMs.last <= queueDelayMs.maximum);
+const v2CountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+  .refine((value) => !Object.is(value, -0));
+const blockHydrationV2Schema = z.object({
+  version: z.literal(2), enabled: z.literal(true), configuredGroups: z.literal(2),
+  locates: v2CountSchema, hits: v2CountSchema, misses: v2CountSchema, inFlightJoins: v2CountSchema,
+  fetches: v2CountSchema, forcedRefreshes: v2CountSchema, evictions: v2CountSchema,
+  oversizeBypasses: v2CountSchema, fetchFailures: v2CountSchema, epochInvalidations: v2CountSchema,
+  retainedEntries: v2CountSchema.max(64), retainedBytes: v2CountSchema.max(67_108_864),
+  inFlightFetches: v2CountSchema, queuedFetches: v2CountSchema,
+  queueDelayMs: z.object({ last: v2CountSchema.nullable(), maximum: v2CountSchema.nullable() }).strict(),
+  activeGroups: v2CountSchema, maximumActiveGroups: v2CountSchema.max(2),
+  queuedGroups: v2CountSchema, maximumQueuedGroups: v2CountSchema.max(2),
+  maximumInFlightFetches: v2CountSchema.max(2), maximumQueuedFetches: v2CountSchema.max(2),
+  sameGroupJoins: v2CountSchema, unsettledAfterCancel: v2CountSchema, maximumUnsettledAfterCancel: v2CountSchema.max(2),
+}).strict().superRefine((value, context) => {
+  const valid = value.activeGroups <= value.maximumActiveGroups
+  && value.queuedGroups <= value.maximumQueuedGroups && value.inFlightFetches <= value.maximumInFlightFetches
+  && value.queuedFetches <= value.maximumQueuedFetches && value.unsettledAfterCancel <= value.maximumUnsettledAfterCancel
+    && (value.queueDelayMs.last === null || value.queueDelayMs.maximum === null || value.queueDelayMs.last <= value.queueDelayMs.maximum);
+  if (!valid) context.addIssue({ code: 'custom', message: 'Invalid V2 hydration bounds.' });
+});
+const hydrationRoleSchema = z.object({
+  grants: v2CountSchema, cancellations: v2CountSchema, oldestWaitMs: v2CountSchema.nullable(),
+  lastWaitMs: v2CountSchema.nullable(), maximumWaitMs: v2CountSchema.nullable(),
+}).strict().refine((value) => (value.lastWaitMs === null) === (value.maximumWaitMs === null)
+  && (value.grants === 0 && value.cancellations === 0) === (value.lastWaitMs === null)
+  && (value.lastWaitMs === null || value.maximumWaitMs === null || value.lastWaitMs <= value.maximumWaitMs));
+const admissionFields = {
+  registeredWorkers: v2CountSchema, pendingWorkers: v2CountSchema, maximumPendingWorkers: v2CountSchema,
+  pendingClassifierGroups: v2CountSchema, maximumPendingClassifierGroups: v2CountSchema,
+  unboundReservations: v2CountSchema, activeGroups: v2CountSchema, maximumAdmitted: v2CountSchema,
+  worker: hydrationRoleSchema, classifier: hydrationRoleSchema,
+};
+function admissionCoherent(value: z.infer<z.ZodObject<typeof admissionFields>> & { readonly version: 1 | 2 }): boolean {
+  const limit = value.version === 1 ? 1 : 2;
+  return value.pendingWorkers <= value.registeredWorkers && value.pendingWorkers <= value.maximumPendingWorkers
+    && value.pendingClassifierGroups <= value.maximumPendingClassifierGroups && value.maximumPendingClassifierGroups <= limit
+    && value.unboundReservations + value.activeGroups <= value.maximumAdmitted && value.maximumAdmitted <= limit
+    && (value.pendingWorkers === 0) === (value.worker.oldestWaitMs === null)
+    && (value.pendingClassifierGroups === 0) === (value.classifier.oldestWaitMs === null)
+    && (value.version === 1 || (value.registeredWorkers <= 1 && value.maximumPendingWorkers <= 1));
+}
+const blockHydrationAdmissionSchema = z.union([
+  z.object({ version: z.literal(1), enabled: z.boolean(), ...admissionFields }).strict(),
+  z.object({ version: z.literal(2), enabled: z.literal(true), configuredGroups: z.literal(2), ...admissionFields }).strict(),
+]).superRefine((value, context) => {
+  if (!admissionCoherent(value)) context.addIssue({ code: 'custom', message: 'Invalid hydration admission bounds.' });
+});
+const ordinaryRpcBudgetSchema = z.object({
+  version: z.literal(2), enabled: z.literal(true), windowMs: z.literal(1000),
+  maxAttemptsPerWindow: z.literal(8), maxWaiters: z.literal(64), startsInWindow: v2CountSchema,
+  maximumStartsInWindow: v2CountSchema.max(8), queuedWaiters: v2CountSchema,
+  maximumQueuedWaiters: v2CountSchema.max(64), localRejections: v2CountSchema, closed: z.boolean(),
+}).strict().superRefine((value, context) => {
+  if (value.startsInWindow > value.maximumStartsInWindow || value.queuedWaiters > value.maximumQueuedWaiters) {
+    context.addIssue({ code: 'custom', message: 'Invalid V2 RPC budget bounds.' });
+  }
+});
+const blockResponseMemorySchema = z.object({
+  version: z.literal(2), perResponseLimitBytes: z.literal(33_554_432), totalInFlightLimitBytes: z.literal(67_108_864),
+  activeBodies: v2CountSchema.max(2), inFlightBytes: v2CountSchema, maximumInFlightBytes: v2CountSchema.max(67_108_864),
+  oversizedResponses: v2CountSchema, maximumRssBytes: v2CountSchema,
+}).strict().superRefine((value, context) => {
+  if (value.inFlightBytes > value.maximumInFlightBytes) context.addIssue({ code: 'custom', message: 'Invalid V2 response memory bounds.' });
+});
+const blockHydrationSchema = z.union([blockHydrationV1Schema, blockHydrationV2Schema]);
 const catchUpAdmissionCountSchema = countSchema.refine((value) => !Object.is(value, -0));
 const workerAdmissionCountSchema = countSchema.refine((value) => !Object.is(value, -0));
 const workerAdmissionSchema = z.object({
@@ -771,6 +837,9 @@ const healthSchema = z.object({
     activeSessions: countSchema.nullable(),
     websocket: websocketHealthSchema.optional(),
     blockHydration: blockHydrationSchema.nullish(),
+    blockHydrationAdmission: blockHydrationAdmissionSchema.nullish(),
+    ordinaryRpcBudget: ordinaryRpcBudgetSchema.nullish(),
+    blockResponseMemory: blockResponseMemorySchema.nullish(),
     catchUpAdmission: catchUpAdmissionSchema.nullish(),
     workerAdmission: workerAdmissionSchema.nullish(),
     rpcHttpEvidence: rpcHttpEvidenceSchema.nullish(),
@@ -778,7 +847,20 @@ const healthSchema = z.object({
     firstProcessingCanary: firstProcessingCanarySchema.nullish(),
     decoderQuarantine: decoderQuarantineSchema.nullish(),
     scannerPhaseDiagnostics: scannerPhaseDiagnosticsSchema.nullish(),
-  }).loose().refine(({ catchUpAdmission, backlogCount }) => {
+  }).loose().refine((value) => {
+    const { blockHydration: hydration, blockHydrationAdmission: admission, ordinaryRpcBudget: budget, blockResponseMemory: memory } = value;
+    const isV2 = hydration?.version === 2 || admission?.version === 2 || budget != null || memory != null;
+    if (!isV2) return true;
+    if (hydration?.version !== 2 || admission?.version !== 2 || budget == null || memory == null) return false;
+    if (value.runtimeState === 'RUNNING' && admission.registeredWorkers !== 1) return false;
+    return value.runtimeState !== 'STOPPED' || (
+      hydration.activeGroups === 0 && hydration.queuedGroups === 0 && hydration.inFlightFetches === 0
+      && hydration.queuedFetches === 0 && hydration.unsettledAfterCancel === 0
+      && hydration.retainedEntries === 0 && hydration.retainedBytes === 0
+      && admission.pendingWorkers === 0 && admission.pendingClassifierGroups === 0
+      && admission.unboundReservations === 0 && admission.activeGroups === 0
+      && budget.queuedWaiters === 0 && budget.closed && memory.activeBodies === 0 && memory.inFlightBytes === 0);
+  }).refine(({ catchUpAdmission, backlogCount }) => {
     if (catchUpAdmission === undefined || catchUpAdmission === null) return true;
     const source = catchUpAdmission.actionableBacklogBySource;
     return !Object.is(backlogCount, -0)

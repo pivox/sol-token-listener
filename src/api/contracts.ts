@@ -1,5 +1,11 @@
 import type { ApiErrorCode } from './errors.js';
 import type { RuntimeBlockHydrationAdmissionMetricsV1 } from '../domain/block-hydration-admission.js';
+import type {
+  RuntimeBlockHydrationMetricsV2,
+  RuntimeBlockHydrationAdmissionMetricsV2,
+  RuntimeOrdinaryRpcBudgetMetricsV2,
+  RuntimeBlockResponseMemoryMetricsV2,
+} from '../domain/two-group-hydration-evidence.js';
 import type { DomainEventType } from '../domain/events.js';
 import type { LaunchStatus } from '../domain/launch-status.js';
 import type { PaperPositionStatus } from '../domain/paper-trading.js';
@@ -62,6 +68,10 @@ export type ApiDomainPayload = ApiJsonValue & {
 };
 
 export type ApiBlockHydrationAdmissionMetricsV1 = RuntimeBlockHydrationAdmissionMetricsV1;
+export type ApiBlockHydrationMetricsV2 = RuntimeBlockHydrationMetricsV2;
+export type ApiBlockHydrationAdmissionMetricsV2 = RuntimeBlockHydrationAdmissionMetricsV2;
+export type ApiOrdinaryRpcBudgetMetricsV2 = RuntimeOrdinaryRpcBudgetMetricsV2;
+export type ApiBlockResponseMemoryMetricsV2 = RuntimeBlockResponseMemoryMetricsV2;
 
 export interface ApiMeta {
   readonly generatedAt: string;
@@ -548,10 +558,12 @@ export interface ApiHeartbeat {
   readonly activeSessions: number | null;
   readonly websocket: ApiWebSocketHealth;
   /** Optional only during rolling deployment from API V1 implementations predating issue #114. */
-  readonly blockHydration?: ApiBlockHydrationMetricsV1 | null;
+  readonly blockHydration?: ApiBlockHydrationMetricsV1 | ApiBlockHydrationMetricsV2 | null;
   /** Optional diagnostic sidecar; null until a physical block fetch has started. */
   readonly blockHydrationPhaseEvidence?: RuntimeBlockHydrationPhaseEvidenceV1 | null;
-  readonly blockHydrationAdmission?: ApiBlockHydrationAdmissionMetricsV1 | null;
+  readonly blockHydrationAdmission?: ApiBlockHydrationAdmissionMetricsV1 | ApiBlockHydrationAdmissionMetricsV2 | null;
+  readonly ordinaryRpcBudget?: ApiOrdinaryRpcBudgetMetricsV2 | null;
+  readonly blockResponseMemory?: ApiBlockResponseMemoryMetricsV2 | null;
   /** Optional during rolling deployment; null when admission metrics are absent. */
   readonly catchUpAdmission?: ApiCatchUpAdmissionMetricsV1 | null;
   /** Optional during rolling deployment; null when worker-admission metrics are absent. */

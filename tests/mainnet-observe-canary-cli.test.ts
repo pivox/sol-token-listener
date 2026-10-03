@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { twoGroupHydrationEvidenceFixture, stoppedTwoGroupHydrationEvidenceFixture } from './helpers/two-group-hydration-evidence-fixture.js';
 import {
   MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES,
   readBoundedRegularFile,
@@ -220,6 +221,29 @@ void test('bounded reader rejects a file that grows after reading starts', async
     await rejection;
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('command dispatches only explicit V2 evidence into the twenty-gate result', async () => {
+  const input = JSON.parse(fixtureText) as Record<string, unknown>;
+  input.schemaVersion = 'mainnet-observe-canary-input.v2';
+  const snapshots = input.snapshots as Record<string, Record<string, unknown>>;
+  for (const sample of Object.values(snapshots)) Object.assign(sample, twoGroupHydrationEvidenceFixture());
+  Object.assign(input.stoppedHeartbeat as object, stoppedTwoGroupHydrationEvidenceFixture());
+  const harness = commandHarness(async path => path === 'input' ? JSON.stringify(input) : '{}');
+  assert.equal(await runMainnetObserveCanaryCommand(['input', 'attribution'], harness.dependencies), 2);
+  const output = JSON.parse(harness.stdout[0] ?? '') as { schemaVersion: string; gates: Record<string, unknown> };
+  assert.equal(output.schemaVersion, 'mainnet-observe-canary-result.v2');
+  assert.equal(Object.keys(output.gates).length, 20);
+  assert.deepEqual(harness.stderr, []);
+  for (const schema of [undefined, 'mainnet-observe-canary-input.v3']) {
+    input.schemaVersion = schema;
+    const fallback = commandHarness(async path => path === 'input' ? JSON.stringify(input) : '{}');
+    assert.equal(await runMainnetObserveCanaryCommand(['input', 'attribution'], fallback.dependencies), 2);
+    const result = JSON.parse(fallback.stdout[0] ?? '') as { schemaVersion: string; overallVerdict: string; gates: Record<string, unknown> };
+    assert.equal(result.schemaVersion, 'mainnet-observe-canary-result.v1');
+    assert.equal(result.overallVerdict, 'INCONCLUSIVE');
+    assert.equal(Object.keys(result.gates).length, 19);
   }
 });
 

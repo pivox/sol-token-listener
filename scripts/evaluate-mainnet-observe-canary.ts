@@ -3,7 +3,9 @@ import type { BigIntStats } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isProxy } from 'node:util/types';
 import { evaluateMainnetObserveCanary } from './lib/mainnet-observe-canary-verdict.js';
+import { evaluateMainnetObserveCanaryV2 } from './lib/mainnet-observe-canary-v2.js';
 
 export const MAINNET_OBSERVE_CANARY_MAX_INPUT_BYTES = 1_048_576;
 const FIXED_ERROR = 'MAINNET_OBSERVE_CANARY_EVALUATION_FAILED\n';
@@ -41,7 +43,14 @@ export async function runMainnetObserveCanaryCommand(
     }
     const parsed: unknown = JSON.parse(input);
     const parsedTerminalAttribution: unknown = JSON.parse(terminalAttribution);
-    const result = evaluateMainnetObserveCanary(parsed, parsedTerminalAttribution);
+    const descriptor = typeof parsed === 'object' && parsed !== null && !isProxy(parsed)
+      && Object.getPrototypeOf(parsed) === Object.prototype
+      ? Object.getOwnPropertyDescriptor(parsed, 'schemaVersion') : undefined;
+    const explicitlyV2 = descriptor !== undefined && descriptor.enumerable
+      && 'value' in descriptor && descriptor.value === 'mainnet-observe-canary-input.v2';
+    const result = explicitlyV2
+      ? evaluateMainnetObserveCanaryV2(parsed, parsedTerminalAttribution)
+      : evaluateMainnetObserveCanary(parsed, parsedTerminalAttribution);
     dependencies.writeStdout(`${JSON.stringify(result)}\n`);
     return result.overallVerdict === 'PASS' ? 0 : 2;
   } catch {
