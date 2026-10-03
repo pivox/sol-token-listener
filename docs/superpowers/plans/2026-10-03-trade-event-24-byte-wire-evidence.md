@@ -1,7 +1,7 @@
-# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.2.0
+# Pump.fun TradeEvent 24-byte suffix — evidence plan v1.2.1
 
 Base: `main@ced66e7086911265012897a34239a59371204878`.
-Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.4.0.
+Issue: #215. Design: `../specs/2026-10-03-trade-event-24-byte-wire-evidence-design.md` v1.4.1.
 This plan does not authorize accepting a new wire variant, weakening quarantine,
 using a wallet, or submitting a transaction.
 

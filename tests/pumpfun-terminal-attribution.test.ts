@@ -70,6 +70,18 @@ void test('generic residual arguments have an explicit suffix boundary', () => {
   assert.equal(trustedTerminalAttribution(error)?.pumpWire?.suffixBytes, 3);
 });
 
+void test('unknown 24-byte TradeEvent suffix remains attributed and rejected', () => {
+  const value = tradeEventInstruction(new Uint8Array(8));
+  const error = capture(() => decodePumpCpiEvent(value));
+  assert.equal(trustedObservedPipelineOrigin(error), 'PUMP_BORSH_INVALID');
+  assert.deepEqual(trustedTerminalAttribution(error)?.pumpWire, {
+    surface: 'CPI_EVENT', location: 'INNER',
+    discriminatorHex: Buffer.from(PUMP_EVENTS.TradeEvent.discriminator).toString('hex'),
+    idlName: 'TradeEvent', totalBytes: value.data.length,
+    payloadBytes: value.data.length - 16, suffixBytes: 24,
+  });
+});
+
 void test('CreateEvent invalid suffix boolean preserves the original suffix length', () => {
   const value = createEventInstruction();
   const bytes = Uint8Array.from(value.data);

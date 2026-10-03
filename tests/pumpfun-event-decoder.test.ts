@@ -180,14 +180,15 @@ void test('échoue explicitement sur un suffixe d’événement connu incomplet'
 });
 
 void test('refuse les octets finaux sans schéma officiel', () => {
-  assert.throws(
-    () => decodePumpCpiEvent(tradeEventInstruction(
-      Uint8Array.of(0xaa, 0xbb),
-    )),
-    (error: unknown) =>
-      error instanceof PumpDecodingError
-      && error.code === 'PUMP_BORSH_INVALID',
-  );
+  for (const trailing of [Uint8Array.of(0xaa, 0xbb), new Uint8Array(8),
+    Uint8Array.of(0x2b, 0xea, 0x10, 0, 0, 0, 0, 0)]) {
+    assert.throws(
+      () => decodePumpCpiEvent(tradeEventInstruction(trailing)),
+      (error: unknown) =>
+        error instanceof PumpDecodingError
+        && error.code === 'PUMP_BORSH_INVALID',
+    );
+  }
 });
 
 export function createEventInstruction(

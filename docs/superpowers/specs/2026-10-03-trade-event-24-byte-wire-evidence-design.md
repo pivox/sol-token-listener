@@ -1,4 +1,18 @@
-# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.4.0
+# Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.4.1
+
+## Recheck and fail-closed regression (2026-10-03)
+
+The official `pump-public-docs` main still points to `cb188ce08b5069196eef1f3e4a0c43b70099793b`.
+Its `TradeEvent` ends with the two documented `u64` holder-reward fields;
+official SDK 2.0.0 embeds the same IDL. Upstream issue #54 remains open and
+has no maintainer serialization answer. Consequently the observed 24-byte
+suffix is still **not** an accepted decoding variant. Synthetic unit tests
+assert that both zero and nonzero extra eight-byte tails fail with
+`PUMP_BORSH_INVALID`, and that terminal attribution records `suffixBytes: 24`
+without exposing payload bytes. These tests protect the existing quarantine;
+they do not constitute a finalized 24-byte fixture or a parser acceptance
+test. Canary verdict stays FAIL/INCONCLUSIVE and #215 remains open pending
+authoritative wire evidence.
 
 ## Scope and current evidence
 
