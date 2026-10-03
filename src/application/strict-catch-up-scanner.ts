@@ -401,10 +401,8 @@ export class StrictCatchUpScanner {
     const liveEdgeBootstrap = this.policy === 'live-edge' && expected === null && run === null;
 
     for (let pageCount = 1; pageCount <= this.maxPages; pageCount += 1) {
-      const page = await this.awaited(
-        signal,
-        () => this.readPage(program, before, signal),
-      );
+      const sourceStarted = this.diagnosticStart();
+      const page = await this.readPage(program, before, signal, sourceStarted);
       const rows: CatchUpSignature[] = [];
       let boundaryFound = false;
       let crossedBoundarySlot = false;
@@ -414,18 +412,18 @@ export class StrictCatchUpScanner {
           || row.signature !== row.signature.trim()
           || Buffer.byteLength(row.signature, 'utf8') > 128
           || (row.blockTimeMs !== null && !validMilliseconds(row.blockTimeMs))) {
-          throw this.failure('source', program.key, 'response');
+          throw this.sourceValidationFailure(program, sourceStarted, 'response');
         }
         if (previousSlot !== null && row.slot > previousSlot) {
-          throw this.failure('source', program.key, 'response');
+          throw this.sourceValidationFailure(program, sourceStarted, 'response');
         }
         previousSlot = row.slot;
         if (signatures.has(row.signature)) {
-          throw this.failure('source', program.key, 'pagination');
+          throw this.sourceValidationFailure(program, sourceStarted, 'pagination');
         }
         signatures.add(row.signature);
         if (expected !== null && row.signature === expected.signature) {
-          if (row.slot !== expected.slot) throw this.failure('source', program.key, 'response');
+          if (row.slot !== expected.slot) throw this.sourceValidationFailure(program, sourceStarted, 'response');
           boundaryFound = true;
           break;
         }
@@ -443,7 +441,7 @@ export class StrictCatchUpScanner {
               ]);
               discoveries.set(row.signature, merged[0] ?? row);
             } catch {
-              throw this.failure('source', program.key, 'response');
+              throw this.sourceValidationFailure(program, sourceStarted, 'response');
             }
           } else {
             discoveries.set(row.signature, row);
@@ -451,15 +449,14 @@ export class StrictCatchUpScanner {
         }
         rows.push(row);
       }
+      this.observePhase(program.family, 'SOURCE_PAGE', sourceStarted, 'OK', null);
       observedHead ??= rows[0] ?? null;
       let pageClassifiedCount = 0n;
       let pageEnqueuedCount = 0n;
       if (!liveEdgeBootstrap) {
         const pageAdmitter = this.pageAdmitter;
         if (program.family === 'pumpfun' && pageAdmitter !== undefined && rows.length > 0) {
-          const admitted = await this.operation(signal, 'page-admit', program,
-            () => pageAdmitter.admitPage(program, Object.freeze(rows), signal));
-          const counts = snapshotPageAdmission(admitted, rows);
+          const counts = await this.admitPage(program, rows, pageAdmitter, signal);
           pageClassifiedCount = counts.signaturesClassified;
           pageEnqueuedCount = counts.signaturesEnqueued;
         } else {
@@ -589,8 +586,8 @@ export class StrictCatchUpScanner {
     program: ListenerIngestionProgram,
     before: string | undefined,
     signal: AbortSignal,
+    started: number | null,
   ): Promise<readonly CatchUpSignature[]> {
-    const started = this.diagnosticStart();
     let originalStage: CatchUpSourceStage = 'request';
     try {
       const value = await this.awaited(signal, async () => {
@@ -602,9 +599,7 @@ export class StrictCatchUpScanner {
         }
       });
       try {
-        const page = snapshotCatchUpSignatures(value, this.pageSize);
-        this.observePhase(program.family, 'SOURCE_PAGE', started, 'OK', null);
-        return page;
+        return snapshotCatchUpSignatures(value, this.pageSize);
       } catch {
         originalStage = 'response';
         throw this.failure('source', program.key, 'response');
@@ -613,6 +608,48 @@ export class StrictCatchUpScanner {
       this.observePhase(program.family, 'SOURCE_PAGE', started,
         signal.aborted ? 'ABORTED' : 'ERROR',
         signal.aborted ? null : sourceDiagnosticCode(originalStage));
+      throw error;
+    }
+  }
+
+  private sourceValidationFailure(
+    program: ListenerIngestionProgram,
+    started: number | null,
+    stage: CatchUpSourceStage,
+  ): StrictCatchUpScannerError {
+    this.observePhase(program.family, 'SOURCE_PAGE', started, 'ERROR', sourceDiagnosticCode(stage));
+    return this.failure('source', program.key, stage);
+  }
+
+  private async admitPage(
+    program: ListenerIngestionProgram,
+    rows: readonly CatchUpSignature[],
+    pageAdmitter: StrictCatchUpPageAdmitter,
+    signal: AbortSignal,
+  ): Promise<Pick<StrictCatchUpPageAdmissionResult, 'signaturesClassified' | 'signaturesEnqueued'>> {
+    const started = this.diagnosticStart();
+    let originalCode: ScannerDiagnosticCode = 'UNKNOWN';
+    try {
+      const admitted = await this.awaited(signal, async () => {
+        try {
+          return await pageAdmitter.admitPage(program, Object.freeze(rows), signal);
+        } catch (error) {
+          originalCode = originalDiagnosticCode(error);
+          throw this.failure('page-admit', program.key);
+        }
+      });
+      let counts: Pick<StrictCatchUpPageAdmissionResult, 'signaturesClassified' | 'signaturesEnqueued'>;
+      try {
+        counts = snapshotPageAdmission(admitted, rows);
+      } catch (error) {
+        originalCode = 'INVALID_RECEIPT';
+        throw error;
+      }
+      this.observePhase(program.family, 'PAGE_ADMIT', started, 'OK', null);
+      return counts;
+    } catch (error) {
+      this.observePhase(program.family, 'PAGE_ADMIT', started,
+        signal.aborted ? 'ABORTED' : 'ERROR', signal.aborted ? null : originalCode);
       throw error;
     }
   }

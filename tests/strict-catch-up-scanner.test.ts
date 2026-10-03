@@ -129,6 +129,39 @@ void test('records original finite source and admission error codes before scann
   ]);
 });
 
+void test('attributes invalid admission receipts to PAGE_ADMIT rather than recording success', async () => {
+  const collector = new ScannerPhaseDiagnosticsCollector();
+  const admitter = new FakePageAdmitter([], Object.freeze({
+    receipts: Object.freeze([]), signaturesClassified: 0n, signaturesEnqueued: 0n,
+  }));
+  await assert.rejects(scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('head', 12), sig('tail', 11)]],
+  }), new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) }), {
+    programs: LAUNCHPAD_ONLY, pageAdmitter: admitter, diagnosticObserver: collector,
+  }).scan(NEVER_ABORTED), TypeError);
+  assert.deepEqual(collector.snapshot(Date.now()).buckets.filter(bucket => bucket.phase === 'PAGE_ADMIT')
+    .map(bucket => [bucket.count, bucket.lastOutcome, bucket.lastCode]), [
+    [1, 'ERROR', 'INVALID_RECEIPT'],
+  ]);
+});
+
+void test('attributes source pagination and ordering failures before recording source success', async () => {
+  for (const { page, code } of [
+    { page: [sig('duplicate', 12), sig('duplicate', 12)], code: 'SOURCE_PAGINATION' },
+    { page: [sig('older', 11), sig('newer', 12)], code: 'SOURCE_RESPONSE' },
+  ]) {
+    const collector = new ScannerPhaseDiagnosticsCollector();
+    await assert.rejects(scanner(new FakeSource({ [PUMP_PROGRAM_ID]: [page] }),
+      new FakeRepository({ launchpad: checkpoint('launchpad', 'boundary', 10) }), {
+        programs: LAUNCHPAD_ONLY, diagnosticObserver: collector,
+      }).scan(NEVER_ABORTED), (error: unknown) => sourceFailure(error, 'launchpad'));
+    assert.deepEqual(collector.snapshot(Date.now()).buckets.filter(bucket => bucket.phase === 'SOURCE_PAGE')
+      .map(bucket => [bucket.count, bucket.lastOutcome, bucket.lastCode]), [
+      [1, 'ERROR', code],
+    ]);
+  }
+});
+
 void test('attributes early durable reads and unknown admission exceptions without raw text', async () => {
   const failedRead = new FakeRepository();
   failedRead.failRunOperation = 'read';
