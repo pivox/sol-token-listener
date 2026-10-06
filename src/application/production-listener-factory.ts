@@ -777,7 +777,9 @@ export function createProductionListenerRuntime(
   return Object.freeze({
     async start(): Promise<void> {
       try { await runtime.start(); } catch (error) { attemptBudget?.close(); throw error; }
-      try { await poller?.start(); } catch (error) { await runtime.close(); attemptBudget?.close(); throw error; }
+      // The first poll cycle can wait on RPC for seconds and app.ts only opens the API
+      // after start() resolves; start() never rejects (a failed cycle leaves it DEGRADED).
+      void poller?.start();
     },
     async close(): Promise<void> {
       await poller?.close();

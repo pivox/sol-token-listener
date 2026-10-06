@@ -78,7 +78,7 @@ void test('production wires one scanner diagnostic collector to both scan paths,
 void test('production builds the tracked pool poller only behind its flag and nests it inside the runtime lifecycle', async () => {
   const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
   assert.match(source, /config\.listenerTrackedPoolPollEnabled\s*\?\s*new TrackedPoolPoller\(/u);
-  assert.match(source, /await runtime\.start\(\);[\s\S]{0,80}await poller\?\.start\(\)/u);
+  assert.match(source, /await runtime\.start\(\);[\s\S]{0,400}void poller\?\.start\(\)/u);
   assert.match(source, /await poller\?\.close\(\);[\s\S]{0,80}return runtime\.close\(\)/u);
 });
 
