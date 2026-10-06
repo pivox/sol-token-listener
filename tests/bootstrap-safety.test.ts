@@ -12,7 +12,6 @@ import {
   waitForShutdownSignal,
   type ApplicationDependencies,
 } from '../src/app.js';
-import { createPaperMvpRunnerLifecycle } from '../src/cli/paper-mvp-runtime.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
@@ -459,38 +458,6 @@ void test('lifecycle ownership loss during shutdown wait is observed before clea
   })), (error: unknown) => error === loss);
   assert.ok(calls.indexOf('signal.wait') < calls.indexOf('listener.close'));
   assert.ok(calls.indexOf('listener.close') < calls.indexOf('database.close'));
-});
-
-void test('paper MVP runner ownership remains held through listener and API teardown', async () => {
-  const calls: string[] = [];
-  const pool = Object.freeze({});
-  const lifecycle = createPaperMvpRunnerLifecycle(async (receivedPool) => {
-    assert.equal(receivedPool, pool);
-    return Object.freeze({
-      ownerId: 'paper-mvp-owner-test',
-      lost: new Promise<void>(() => undefined),
-      isLost: () => false,
-      release: async () => { calls.push('runner.release'); },
-    });
-  });
-  await runApplication(dependencies(calls, {
-    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: false }),
-    getDatabasePool: () => { calls.push('pool'); return pool; },
-    beforeStart: lifecycle.beforeStart,
-    lifecycleGuard: Object.freeze({ checkpoint: lifecycle.checkpoint }),
-    beforeDatabaseClose: lifecycle.beforeDatabaseClose,
-    waitForShutdownSignal: async () => {
-      const scopedLease = await lifecycle.acquireRunner(pool);
-      await scopedLease.release();
-      calls.push('runner.scope.closed');
-      return 'SIGTERM';
-    },
-  }));
-  assert.ok(calls.indexOf('runner.scope.closed') < calls.indexOf('listener.close'));
-  assert.ok(calls.indexOf('listener.close') < calls.indexOf('server.close'));
-  assert.ok(calls.indexOf('server.close') < calls.indexOf('runner.release'));
-  assert.ok(calls.indexOf('runner.release') < calls.indexOf('database.close'));
-  assert.equal(calls.filter((call) => call === 'runner.release').length, 1);
 });
 
 void test('API bind failure aggregates listener, server, and database cleanup in order', async () => {

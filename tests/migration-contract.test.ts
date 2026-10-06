@@ -39,8 +39,6 @@ void test('la migration ne crée aucun chemin de secret ou d’exécution réell
 void test('la purge paper respecte l’ordre enfant avant parent et les lignées non expirées', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
   const order = [
-    'DELETE FROM paper_mvp_position_samples',
-    'DELETE FROM paper_mvp_runs',
     'DELETE FROM paper_external_buy_events',
     'DELETE FROM paper_strategy_sessions',
     'DELETE FROM trading_candidates',

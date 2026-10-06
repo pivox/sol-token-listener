@@ -10,8 +10,6 @@ import { FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL } from './foundation-retention
 type PgPool = InstanceType<typeof pg.Pool>;
 let sharedPool: PgPool | null = null;
 const migrationAdvisoryLockId = 7_347_662_125;
-const PAPER_MVP_RETENTION_FENCE_SQL =
-  "SELECT pg_advisory_xact_lock(hashtextextended('paper-mvp-owner-fence:v1', 0))";
 const EXECUTION_INTENT_EXPIRATION_BATCH_SIZE = 1_000;
 const DECODER_RECOVERY_RECEIPT_PURGE_BATCH_SIZE = 1_000;
 
@@ -148,8 +146,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly marketReserveSnapshots: number;
   readonly marketPools: number;
   readonly migrations: number;
-  readonly paperMvpSamples: number;
-  readonly paperMvpRuns: number;
   readonly paperExternalBuys: number;
   readonly paperSessions: number;
   readonly tradingCandidates: number;
@@ -217,7 +213,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   try {
     await client.query('BEGIN');
     await client.query(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL);
-    await client.query(PAPER_MVP_RETENTION_FENCE_SQL);
     const executionIntentsExpiredPreSubmission =
       await expireExecutionIntentsPreSubmissionInTransaction(
         client,
@@ -265,102 +260,25 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            )
          )`,
     );
-    await client.query(
-      `UPDATE paper_mvp_runs SET
-        state='FAILED',
-        terminal_at=deadline_at + INTERVAL '2 minutes',
-        purge_after=deadline_at + INTERVAL '4 hours 2 minutes',
-        updated_at=deadline_at + INTERVAL '2 minutes',
-        verdict=NULL,
-        failure_code='RUN_DEADLINE_ABANDONED',
-        report_payload=NULL,
-        runner_owner_id=NULL,
-        completion_reason=NULL
-       WHERE state='RUNNING'
-         AND deadline_at + INTERVAL '2 minutes' <= statement_timestamp()`,
-    );
     const bondingCurveSnapshots = await client.query(
       `DELETE FROM bonding_curve_snapshots snapshot USING token_launches launch
-       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.mint = snapshot.mint
-         )`,
+       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const launchTrades = await client.query(
       `DELETE FROM launch_trades trade USING token_launches launch
-       WHERE trade.mint = launch.mint AND launch.purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.mint = trade.mint
-         )`,
+       WHERE trade.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const marketTrades = await client.query(
-      `DELETE FROM market_trades trade WHERE purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.mint = trade.mint
-         )`,
+      `DELETE FROM market_trades trade WHERE purge_after <= NOW()`,
     );
     const marketReserveSnapshots = await client.query(
-      `DELETE FROM market_reserve_snapshots snapshot WHERE purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM market_pools pool
-           JOIN paper_positions position ON position.mint = pool.base_mint
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE pool.pool_address = snapshot.pool_address
-         )`,
+      `DELETE FROM market_reserve_snapshots snapshot WHERE purge_after <= NOW()`,
     );
     const marketPools = await client.query(
-      `DELETE FROM market_pools pool WHERE purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.mint = pool.base_mint
-         )`,
+      `DELETE FROM market_pools pool WHERE purge_after <= NOW()`,
     );
     const migrations = await client.query(
-      `DELETE FROM migrations migration WHERE purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.mint = migration.mint
-         )`,
-    );
-    const paperMvpSamples = await client.query(
-      `DELETE FROM paper_mvp_position_samples sample USING paper_mvp_runs run
-       WHERE sample.run_id = run.run_id
-         AND run.purge_after <= statement_timestamp()`,
-    );
-    const paperMvpRuns = await client.query(
-      'DELETE FROM paper_mvp_runs WHERE purge_after <= statement_timestamp()',
+      `DELETE FROM migrations migration WHERE purge_after <= NOW()`,
     );
     const paperExternalBuys = await client.query(
       'DELETE FROM paper_external_buy_events WHERE purge_after <= statement_timestamp()',
@@ -378,19 +296,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND NOT EXISTS (
            SELECT 1 FROM execution_intents intent
            WHERE intent.candidate_id = candidate.candidate_id
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_mvp_runs run
-           WHERE run.state='RUNNING'
-             AND run.strategy_id=candidate.strategy_id
-             AND run.strategy_version=candidate.strategy_version
-             AND candidate.created_at BETWEEN run.started_at AND run.deadline_at
-             AND candidate.reason_codes ?| ARRAY['CREATION_ENTRY_REJECTED','CREATION_ENTRY_EXPIRED']
-             AND EXISTS (
-               SELECT 1 FROM token_launches launch
-               WHERE launch.mint=candidate.mint
-                 AND launch.detected_at BETWEEN run.started_at AND run.deadline_at
-             )
          )`,
     );
     const qualificationReports = await client.query(
@@ -407,39 +312,16 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const paperDecisionJobs = await client.query(
       `DELETE FROM paper_decision_jobs job
-       WHERE job.purge_after <= statement_timestamp()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-            ON run.state='RUNNING'
-           AND run.strategy_id=position.strategy_id
-           AND run.strategy_version=position.strategy_version
-           AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.entry_decision_job_id=job.job_id
-         )`,
+       WHERE job.purge_after <= statement_timestamp()`,
     );
     const paperTrades = await client.query(
       `DELETE FROM paper_trades trade USING paper_positions position
        WHERE trade.position_id = position.position_id
-         AND position.purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_mvp_runs run
-           WHERE run.state = 'RUNNING'
-             AND run.strategy_id = position.strategy_id
-             AND run.strategy_version = position.strategy_version
-             AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-         )`,
+         AND position.purge_after <= NOW()`,
     );
     const paperPositions = await client.query(
       `DELETE FROM paper_positions position
-       WHERE position.purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_mvp_runs run
-           WHERE run.state = 'RUNNING'
-             AND run.strategy_id = position.strategy_id
-             AND run.strategy_version = position.strategy_version
-             AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-         )`,
+       WHERE position.purge_after <= NOW()`,
     );
     const executionIntentCutoffResult = await client.query<{ readonly purge_cutoff: Date }>(
       "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff",
@@ -1091,15 +973,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const expiredDomainEvents = await client.query(
       `DELETE FROM domain_events WHERE purge_after <= NOW()
          AND NOT EXISTS (
-           SELECT 1 FROM paper_positions position
-           JOIN paper_mvp_runs run
-             ON run.state = 'RUNNING'
-            AND run.strategy_id = position.strategy_id
-            AND run.strategy_version = position.strategy_version
-            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-           WHERE position.mint = domain_events.mint
-         )
-         AND NOT EXISTS (
            SELECT 1 FROM social_enrichment_jobs job
            WHERE job.source_launch_event_id = domain_events.event_id
              AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
@@ -1205,22 +1078,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
                OR session.purge_after > statement_timestamp())
          )
          AND NOT EXISTS (
-           SELECT 1 FROM paper_mvp_runs run
-           WHERE run.state='RUNNING'
-             AND launch.detected_at BETWEEN run.started_at AND run.deadline_at
-         )
-         AND NOT EXISTS (
            SELECT 1 FROM paper_positions position
            WHERE position.mint = launch.mint
              AND (position.purge_after IS NULL
-               OR position.purge_after > statement_timestamp()
-               OR EXISTS (
-                 SELECT 1 FROM paper_mvp_runs run
-                 WHERE run.state = 'RUNNING'
-                   AND run.strategy_id = position.strategy_id
-                   AND run.strategy_version = position.strategy_version
-                   AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-               ))
+               OR position.purge_after > statement_timestamp())
          )`,
     );
     await client.query('COMMIT');
@@ -1237,8 +1098,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       marketReserveSnapshots: marketReserveSnapshots.rowCount ?? 0,
       marketPools: marketPools.rowCount ?? 0,
       migrations: migrations.rowCount ?? 0,
-      paperMvpSamples: paperMvpSamples.rowCount ?? 0,
-      paperMvpRuns: paperMvpRuns.rowCount ?? 0,
       paperExternalBuys: paperExternalBuys.rowCount ?? 0,
       paperSessions: paperSessions.rowCount ?? 0,
       tradingCandidates: tradingCandidates.rowCount ?? 0,

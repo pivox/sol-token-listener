@@ -163,8 +163,6 @@ const canonicalRetentionCounters = Object.freeze([
   'observedWalletPositions',
   'paperDecisionJobs',
   'paperExternalBuys',
-  'paperMvpRuns',
-  'paperMvpSamples',
   'paperPositions',
   'paperSessions',
   'paperTrades',
