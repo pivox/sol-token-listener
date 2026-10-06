@@ -3,6 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
 import pg from 'pg';
+import {
+  ACTIVE_WALLET_SQL,
+  CURVE_RESERVES_SQL,
+  HISTORY_SQL,
+  OPEN_POSITIONS_SQL,
+  POOL_RESERVES_SQL,
+  REALIZED_TOTAL_SQL,
+} from '../src/operator-api/repository.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { LIVE_POSITION_LEDGER_INSERT_SQL } from '../src/storage/execution-live.repository.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
@@ -57,15 +65,77 @@ void test('PostgreSQL 16 grants on the live position ledger are exact', async (c
     assert.equal(await probe(pool, reader, LIVE_POSITION_LEDGER_INSERT_SQL,
       ['1', '795', 'signature', 'execution_live_position_missing']), 'denied');
 
-    for (const role of [
+    const unrelatedRoles = [
       'sol_token_public_api', 'sol_token_listener_writer', 'sol_token_executor_worker',
       'sol_token_executor_operations', 'sol_token_executor_readiness',
       'sol_token_executor_live', 'sol_token_retention_worker',
-    ]) assert.equal(
+    ];
+    for (const role of unrelatedRoles) assert.equal(
       await probe(pool, role, 'SELECT 1 FROM execution_live_position_ledger'), 'denied', role,
     );
+    // The ledger is append-only: nobody but recovery inserts, and nobody deletes or truncates.
+    for (const role of unrelatedRoles) {
+      assert.equal(await probe(pool, role, LIVE_POSITION_LEDGER_INSERT_SQL,
+        ['1', '795', 'signature', 'execution_live_position_missing']), 'denied', `INSERT ${role}`);
+    }
+    for (const role of [...unrelatedRoles, recovery, reader]) {
+      for (const statement of [
+        'DELETE FROM execution_live_position_ledger',
+        'TRUNCATE execution_live_position_ledger',
+      ]) assert.equal(await probe(pool, role, statement), 'denied', `${statement} ${role}`);
+    }
   });
 });
+
+void test('PostgreSQL 16 operator reader runs every overview query and pages the ledger by keyset', async (context) => {
+  await withProvisionedDatabase(context, async (pool) => {
+    const wallet = '11111111111111111111111111111111';
+    const mint = 'So11111111111111111111111111111111111111112';
+    for (const [letter, closedAt, net] of [
+      ['a', '2026-10-06 10:30:00+00', '-9000'], ['b', '2026-10-06 11:00:00+00', '900'],
+      ['c', '2026-10-06 11:00:00+00', '-4205'], ['d', '2026-10-06 11:30:00+00', '15'],
+    ] as const) {
+      await pool.query(`INSERT INTO execution_live_position_ledger (
+        position_id,wallet_public_key,mint,opened_at,closed_at,base_amount_raw,
+        entry_wallet_lamport_delta,exit_wallet_lamport_delta,net_lamports,
+        entry_signature,exit_signature
+      ) VALUES ('execution_live_position_'||repeat($1,64),$2,$3,TIMESTAMPTZ '2026-10-06 10:00:00+00',
+        $4::TIMESTAMPTZ,95,-1000,$5::NUMERIC+1000,$5::NUMERIC,repeat('1',64),repeat('2',64))`,
+      [letter, wallet, mint, closedAt, net]);
+    }
+    const reader = 'sol_token_operator_reader';
+    const firstPage = await readAs(pool, reader, HISTORY_SQL, [wallet, null, null, 3]);
+    assert.deepEqual(firstPage.map((row) => String(row.position_id).slice(-1)), ['d', 'c', 'b']);
+    const cursor = firstPage[2];
+    assert.ok(cursor?.closed_at instanceof Date);
+    const secondPage = await readAs(pool, reader, HISTORY_SQL,
+      [wallet, String(cursor.closed_at.getTime()), cursor.position_id, 3]);
+    assert.deepEqual(secondPage.map((row) => String(row.position_id).slice(-1)), ['a']);
+    assert.deepEqual(await readAs(pool, reader, REALIZED_TOTAL_SQL, [wallet]),
+      [{ realized_lamports: '-12290' }]);
+    assert.deepEqual(await readAs(pool, reader, ACTIVE_WALLET_SQL), []);
+    assert.deepEqual(await readAs(pool, reader, OPEN_POSITIONS_SQL, [wallet]), []);
+    assert.deepEqual(await readAs(pool, reader, POOL_RESERVES_SQL, [[mint], mint]), []);
+    assert.deepEqual(await readAs(pool, reader, CURVE_RESERVES_SQL, [[mint], mint]), []);
+  });
+});
+
+async function readAs(
+  pool: InstanceType<typeof pg.Pool>,
+  role: string,
+  text: string,
+  values: readonly unknown[] = [],
+): Promise<readonly Record<string, unknown>[]> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL ROLE ${role}`);
+    return (await client.query<Record<string, unknown>>(text, [...values])).rows;
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined);
+    client.release();
+  }
+}
 
 async function probe(
   pool: InstanceType<typeof pg.Pool>,
