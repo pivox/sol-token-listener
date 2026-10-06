@@ -793,43 +793,7 @@ retrouvé et vérifié dans les signatures de son bloc, un nom inédit et un
 décodage sans erreur avant l’écriture. Elle n’écrase aucun fichier et sa sortie
 ne révèle ni endpoint ni contenu de transaction.
 
-## Analytics participants et graphe observé
-
-Le service I1 reconstruit de façon déterministe le profil du créateur, ses
-achats initiaux, sa première vente, les positions nettes observées et les
-concentrations top 1/5/10. Il n'utilise que les trades de bonding curve
-persistés depuis la détection du token : il ne consulte ni historique antérieur
-ni RPC supplémentaire. Un flux net négatif est conservé comme preuve valide,
-pas ramené silencieusement à zéro.
-
-I2 ajoute un ledger de preuves de financement et un graphe passif. Un transfert
-direct du quote asset vers l'acheteur, antérieur à son achat dans la même
-transaction, est une preuve forte. Un fee payer distinct est une preuve
-moyenne exposée, mais ne fusionne jamais deux wallets. Les auto-transferts sont
-ignorés. SOL, SPL Token et Token-2022 sont décodés ; les quote assets restent
-séparés et ne sont jamais additionnés entre eux.
-
-La couverture distingue `NOT_PROCESSED`, `UNAVAILABLE` et `NO_EVIDENCE`.
-Seules les arêtes fortes forment les composantes connexes. Leur concentration
-utilise les flux positifs observés par I1 depuis l'arrivée du token, pas un
-solde SPL certifié ou un historique antérieur. Une analyse réussie sans
-cluster est `AVAILABLE` avec `clusters: []`.
-
-Le pipeline actif enchaîne détection launchpad, preuves de financement,
-reconstructions I1/I2 et PumpSwap. Une transaction échouée est rejouée depuis
-le début de ce pipeline; les écritures déterministes rendent ce replay complet
-idempotent, sans saut d'étape. Les reason codes
-`SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` existent comme
-contrats stables et sont `REPORT_ONLY` pendant le calibrage dry run : leurs
-preuves et déclenchements sont rapportés, mais ils ne peuvent ajouter aucun
-blocker ni modifier le verdict ou la décision paper.
-
-Toutes les projections et preuves I2 suivent la rétention terminale de quatre
-heures. Les transactions `finalized`, `orphaned`, non retryables ou épuisées
-devenues terminales sont purgeables; une transaction `processed` ou `confirmed`
-en attente de finalité ne l'est jamais. Cette fenêtre limite aussi la durée de conservation des
-données publiques de wallets observées; elle ne constitue pas un historique
-on-chain exhaustif.
+## Santé du listener
 
 `GET /api/v1/health` publie l'état courant des composants, le backlog, les
 leases, le compteur `exhaustedCount`, checkpoints et slots observés, sans URL
