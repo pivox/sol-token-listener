@@ -68,6 +68,7 @@ void test('migration 045 upgrades 044 so a superseded same-revision snapshot can
       '057_transaction_inbox_terminal_attribution.sql',
       '058_transaction_inbox_funding_attribution.sql',
       '059_transaction_inbox_qualification_attribution.sql',
+      '060_listener_tracked_pool_checkpoints.sql',
     ]);
     await assertSnapshotIndexes(pool);
 

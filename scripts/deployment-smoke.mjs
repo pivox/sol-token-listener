@@ -112,6 +112,7 @@ const canonicalMigrations = Object.freeze([
   '057_transaction_inbox_terminal_attribution.sql',
   '058_transaction_inbox_funding_attribution.sql',
   '059_transaction_inbox_qualification_attribution.sql',
+  '060_listener_tracked_pool_checkpoints.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
