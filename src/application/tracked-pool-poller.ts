@@ -44,7 +44,7 @@ export interface TrackedPoolPollerOptions {
   readonly repository: {
     listTrackedPools(trackingWindowSeconds: number): Promise<readonly TrackedPool[]>;
     readCheckpoint(poolAddress: string): Promise<PoolCheckpoint | null>;
-    seedCheckpoint(poolAddress: string, value: PoolCheckpoint, nowMs: number): Promise<void>;
+    seedCheckpoint(target: TrackedPool, value: PoolCheckpoint, nowMs: number): Promise<void>;
     storeCheckpoint(poolAddress: string, value: PoolCheckpoint, nowMs: number): Promise<void>;
   };
   readonly inbox: { enqueue(value: TransactionNotification): Promise<void> };
@@ -55,6 +55,9 @@ export interface TrackedPoolPollerOptions {
       commitment: 'finalized',
     ): Promise<unknown>;
   };
+  /** Inbox hint and program for the enqueued rows; defaults to the PumpSwap pool values. */
+  readonly ingestionHint?: 'PUMPSWAP_POOL_TRADE' | 'PUMPFUN_CURVE_TRADE';
+  readonly programId?: string;
   readonly intervalMs: number;
   readonly trackingWindowSeconds: number;
   readonly shutdownTimeoutMs: number;
@@ -211,7 +214,7 @@ export class TrackedPoolPoller {
     let checkpoint = await repository.readCheckpoint(pool.poolAddress);
     if (checkpoint === null) {
       checkpoint = { slot: pool.activationSlot, signature: pool.activationSignature };
-      await repository.seedCheckpoint(pool.poolAddress, checkpoint, this.now());
+      await repository.seedCheckpoint(pool, checkpoint, this.now());
     }
     const address = new PublicKey(pool.poolAddress);
     const rows: CatchUpSignature[] = [];
@@ -267,9 +270,9 @@ export class TrackedPoolPoller {
         signature: entry.signature,
         slot: entry.slot,
         source: 'CATCH_UP',
-        ingestionHint: 'PUMPSWAP_POOL_TRADE',
+        ingestionHint: this.options.ingestionHint ?? 'PUMPSWAP_POOL_TRADE',
         ingestionHintMint: pool.baseMint,
-        programIds: Object.freeze([PUMPSWAP_PROGRAM_ID]),
+        programIds: Object.freeze([this.options.programId ?? PUMPSWAP_PROGRAM_ID]),
         confirmationStatus: 'finalized',
         observedAtMs: this.now(),
       }));

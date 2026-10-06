@@ -25,6 +25,8 @@ export interface WsProgramEndpoint {
   readonly url: string;
 }
 
+export type WsProgramFilteredReason = 'PASSIVE_PUMP_ACCOUNT_MENTION' | 'NOT_A_CREATE';
+
 export interface WsProgramNotification {
   readonly endpointId: WsProgramEndpointId;
   readonly program: WsProgramFamily;
@@ -32,7 +34,7 @@ export interface WsProgramNotification {
   readonly slot: bigint;
   readonly hint: WsProgramHint;
   readonly hintMint: string | null;
-  readonly filteredReason?: 'PASSIVE_PUMP_ACCOUNT_MENTION';
+  readonly filteredReason?: WsProgramFilteredReason;
 }
 
 export type WsProgramSessionErrorReason =
@@ -96,6 +98,7 @@ export interface WsProgramSessionDependencies {
   readonly scheduler?: WsProgramSessionScheduler;
   readonly programs?: readonly ListenerIngestionProgram[];
   readonly workerAdmissionEnabled?: boolean;
+  readonly createsOnly?: boolean;
 }
 
 interface ProgramDefinition {
@@ -135,8 +138,10 @@ export function openWsProgramSession(
 ): Promise<WsProgramSession> {
   let programs: readonly ProgramDefinition[];
   let classificationMode: PumpFunWebSocketClassificationMode;
+  let createsOnly: boolean;
   try {
-    classificationMode = admissionOption(dependencies) ? 'strict-admission' : 'legacy';
+    classificationMode = booleanOption(dependencies, 'workerAdmissionEnabled') ? 'strict-admission' : 'legacy';
+    createsOnly = booleanOption(dependencies, 'createsOnly');
     programs = snapshotPrograms(dependencies.programs ?? DEFAULT_PROGRAMS);
   } catch {
     return Promise.reject(new WsProgramSessionError('PROTOCOL_INVALID'));
@@ -461,6 +466,10 @@ export function openWsProgramSession(
       const hintMint = hintResult?.hintMint ?? null;
       const passiveMention = program === 'pumpfun' && classificationMode === 'strict-admission'
         && hint === 'NONE' && isPassivePumpMentionFromLogs(ownData(value, 'logs'), PUMPFUN_HINT_VETO_PROGRAM_IDS);
+      const notACreate = createsOnly && program === 'pumpfun' && hint !== 'PUMPFUN_CREATE';
+      let filteredReason: WsProgramFilteredReason | null = null;
+      if (notACreate) filteredReason = 'NOT_A_CREATE';
+      else if (passiveMention) filteredReason = 'PASSIVE_PUMP_ACCOUNT_MENTION';
       let task: Promise<void>;
       try {
         task = observe(Object.freeze({
@@ -468,9 +477,9 @@ export function openWsProgramSession(
           program,
           signature,
           slot: BigInt(slot),
-          hint,
-          hintMint,
-          ...(passiveMention ? { filteredReason: 'PASSIVE_PUMP_ACCOUNT_MENTION' as const } : {}),
+          hint: notACreate ? 'NONE' : hint,
+          hintMint: notACreate ? null : hintMint,
+          ...(filteredReason === null ? {} : { filteredReason }),
         }));
       } catch {
         fail('NOTIFICATION_FAILED');
@@ -522,12 +531,12 @@ export function openWsProgramSession(
   });
 }
 
-function admissionOption(dependencies: unknown): boolean {
+function booleanOption(dependencies: unknown, key: 'workerAdmissionEnabled' | 'createsOnly'): boolean {
   if (isProxy(dependencies) || typeof dependencies !== 'object'
     || dependencies === null || Array.isArray(dependencies)) {
     throw new WsProgramSessionError('PROTOCOL_INVALID');
   }
-  const descriptor = Object.getOwnPropertyDescriptor(dependencies, 'workerAdmissionEnabled');
+  const descriptor = Object.getOwnPropertyDescriptor(dependencies, key);
   if (descriptor === undefined) return false;
   if (!('value' in descriptor) || descriptor.enumerable !== true) {
     throw new WsProgramSessionError('PROTOCOL_INVALID');

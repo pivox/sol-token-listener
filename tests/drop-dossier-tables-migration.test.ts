@@ -29,9 +29,9 @@ const keptTables = [
   'raw_chain_events', 'market_trades',
 ] as const;
 
-void test('062 is the catalog head and drops the 26 dossier, paper MVP and legacy tables', async (context) => {
+void test('062 drops the 26 dossier, paper MVP and legacy tables', async (context) => {
   assert.equal(droppedTables.length, 26);
-  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationName);
+  assert.ok(LIVE_EXECUTION_MIGRATION_CATALOG.some((entry) => entry.name === migrationName));
   await withTemporarySchema(context, async (pool) => {
     await migrateDatabase({ pool });
     assert.deepEqual(await migrateDatabase({ pool }), []);

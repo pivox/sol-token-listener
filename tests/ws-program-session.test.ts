@@ -298,6 +298,50 @@ void test('session OFF preserves legacy CREATE precedence and ON alone uses stri
   }
 });
 
+void test('createsOnly keeps create hints and filters every other Pump notification', async () => {
+  const mint = new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+  const create = `Program data: ${Buffer.from(PUMP_EVENTS.CreateEvent.discriminator).toString('base64')}`;
+  const trade = `Program data: ${Buffer.concat([
+    Buffer.from(PUMP_EVENTS.TradeEvent.discriminator), mint.toBytes(),
+  ]).toString('base64')}`;
+  const socket = new FakeWebSocket();
+  const frames: WsProgramNotification[] = [];
+  const session = await acknowledge(openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async (frame) => { frames.push(frame); }, new AbortController().signal,
+    { createWebSocket: () => socket, scheduler: new ManualScheduler(), createsOnly: true },
+  ), socket);
+  socket.message(notification(101, 42, '1'.repeat(64), null, [create]));
+  socket.message(notification(101, 43, '1'.repeat(63) + '2', null, [trade]));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(frames, [
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(64), slot: 42n,
+      hint: 'PUMPFUN_CREATE', hintMint: null },
+    { endpointId: 'primary', program: 'pumpfun', signature: '1'.repeat(63) + '2', slot: 43n,
+      hint: 'NONE', hintMint: null, filteredReason: 'NOT_A_CREATE' },
+  ]);
+  const closing = session.close(new AbortController().signal);
+  socket.message({ jsonrpc: '2.0', id: 3, result: true });
+  socket.message({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
+});
+
+void test('rejects a non-boolean createsOnly option before opening a socket', async () => {
+  let socketCalls = 0;
+  const createWebSocket = (): FakeWebSocket => { socketCalls += 1; return new FakeWebSocket(); };
+  for (const createsOnly of ['true', 1, null, {}]) {
+    const opening = openWsProgramSession(
+      { id: 'primary', url: 'wss://rpc.invalid/private' }, async () => undefined,
+      new AbortController().signal, { createWebSocket, createsOnly } as unknown as WsProgramSessionDependencies,
+    );
+    assert.equal(socketCalls, 0);
+    await assert.rejects(opening, (error: unknown) => {
+      assertStableError(error, 'PROTOCOL_INVALID');
+      return true;
+    });
+  }
+});
+
 void test('rejects invalid or hostile session admission options before opening a socket', async () => {
   let reads = 0;
   let socketCalls = 0;
@@ -686,7 +730,7 @@ void test('stops accepting and drains in-flight observers before close completes
 
   const closing = session.close(new AbortController().signal);
   const state = settlement(closing);
-  socket.message(notification(101, 43, '2'.repeat(64)));
+  socket.message(notification(101, 43, '1'.repeat(63) + '2'));
   socket.message({ jsonrpc: '2.0', id: 3, result: true });
   socket.message({ jsonrpc: '2.0', id: 4, result: true });
 

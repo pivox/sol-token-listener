@@ -57,14 +57,14 @@ export class PostgresTrackedPoolRepository {
   }
 
   public async seedCheckpoint(
-    poolAddress: string,
+    target: TrackedPool,
     value: PoolCheckpoint,
     nowMs: number,
   ): Promise<void> {
     await this.pool.query(
       `INSERT INTO listener_tracked_pool_checkpoints (pool_address, slot, signature, updated_at)
        VALUES ($1, $2, $3, $4) ON CONFLICT (pool_address) DO NOTHING`,
-      [poolAddress, value.slot.toString(), value.signature, new Date(nowMs)],
+      [target.poolAddress, value.slot.toString(), value.signature, new Date(nowMs)],
     );
   }
 

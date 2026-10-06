@@ -135,9 +135,15 @@ void test('tracked pool repository selects tracked pools and keeps monotonic che
         activationSlot: 100n,
       }]);
 
+      const trackedTarget = {
+        poolAddress: tracked.poolAddress,
+        baseMint: tracked.mint,
+        activationSignature: tracked.signature,
+        activationSlot: 100n,
+      };
       assert.equal(await repository.readCheckpoint(tracked.poolAddress), null);
-      await repository.seedCheckpoint(tracked.poolAddress, { slot: 100n, signature: 'a' }, 1_000);
-      await repository.seedCheckpoint(tracked.poolAddress, { slot: 200n, signature: 'b' }, 2_000);
+      await repository.seedCheckpoint(trackedTarget, { slot: 100n, signature: 'a' }, 1_000);
+      await repository.seedCheckpoint(trackedTarget, { slot: 200n, signature: 'b' }, 2_000);
       assert.deepEqual(await repository.readCheckpoint(tracked.poolAddress), { slot: 100n, signature: 'a' });
       await repository.storeCheckpoint(tracked.poolAddress, { slot: 150n, signature: 'c' }, 3_000);
       assert.deepEqual(await repository.readCheckpoint(tracked.poolAddress), { slot: 150n, signature: 'c' });

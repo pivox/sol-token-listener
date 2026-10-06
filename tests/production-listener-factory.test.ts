@@ -75,13 +75,14 @@ void test('production wires one scanner diagnostic collector to both scan paths,
   assert.match(source, /scannerPhaseDiagnosticsMetrics:\s*\(sampledAtMs\)/u);
 });
 
-void test('production builds the tracked pool poller only behind its flag and nests it inside the runtime lifecycle', async () => {
+void test('production builds the tracked pollers behind their scope and flag and nests them inside the runtime lifecycle', async () => {
   const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
-  assert.match(source, /config\.listenerTrackedPoolPollEnabled\s*\?\s*new TrackedPoolPoller\(/u);
-  assert.match(source, /await runtime\.start\(\);[\s\S]{0,400}void poller\?\.start\(\)/u);
+  assert.match(source, /if \(config\.listenerTrackedPoolPollEnabled\) \{\s*pollers\.push\(new TrackedPoolPoller\(\{\s*repository: new PostgresTrackedPoolRepository\(/u);
+  assert.match(source, /if \(createsOnly\) \{\s*pollers\.push\(new TrackedPoolPoller\(\{\s*repository: new PostgresTrackedCurveRepository\(databasePool\),\s*ingestionHint: 'PUMPFUN_CURVE_TRADE',\s*programId: PUMP_PROGRAM_ID,/u);
+  assert.match(source, /await runtime\.start\(\);[\s\S]{0,400}for \(const poller of pollers\) void poller\.start\(\)/u);
   assert.match(
     source,
-    /try \{ await poller\?\.close\(\); \} finally \{ attemptBudget\?\.close\(\); await runtime\.close\(\); \}/u,
+    /try \{ await Promise\.all\(pollers\.map\(\(poller\) => poller\.close\(\)\)\); \} finally \{ attemptBudget\?\.close\(\); await runtime\.close\(\); \}/u,
   );
 });
 
@@ -916,7 +917,10 @@ void test('production creates one bounded admission policy and injects it as the
   assert.equal(count(source, /new PostgresTransactionInboxRepository\(/gu), 1);
   assert.match(source, /createPumpFunWorkerAdmissionPolicy\(\{\s*enabled: config\.listenerPumpFunBoundedWorkerAdmissionEnabled,\s*trackingWindowSeconds: config\.listenerPumpFunTrackingWindowSeconds,\s*\}\)/u);
   assert.match(source, /new PostgresTransactionInboxRepository\(databasePool, Object\.freeze\(\{[^}]*\}\), workerAdmissionPolicy\)/u);
-  assert.match(source, /openWsProgramSession\(\s*endpoint,\s*observe,\s*signal,\s*\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*\}/u);
+  assert.match(source, /openWsProgramSession\(\s*endpoint,\s*observe,\s*signal,\s*\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*createsOnly,\s*\}/u);
+  assert.match(source, /if \(createsOnly \|\| config\.listenerCatchUpPolicy !== 'live-edge'\) return;/u);
+  assert.match(source, /readPinnedProviderId: \(signal\): Promise<RpcProviderId \| null> => \(createsOnly\s*\? Promise\.resolve\(null\)/u);
+  assert.match(source, /runStrictScan:[^\n]*\n[^\n]*\n\s*if \(createsOnly\) \{\s*return Promise\.resolve\(Object\.freeze\(\{/u);
   assert.match(source, /inboxSnapshot:\s*\(\):\s*ReturnType<PostgresTransactionInboxRepository\['heartbeatSnapshot'\]>\s*=>\s*inbox\.heartbeatSnapshot\(\)/u);
 });
 
@@ -2572,7 +2576,7 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /strictCheckpointKeys\s*=\s*Object\.freeze\(ingestionPrograms\.map/u);
   assert.match(
     source,
-    /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*\}/u,
+    /openSession:\s*\([^)]*\)[^=]*=>\s*openWsProgramSession\([\s\S]*?\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*createsOnly,\s*\}/u,
   );
   assert.match(source, /const recoveryScanner\s*=\s*new StrictCatchUpScanner\([\s\S]*?policy:\s*'strict'[\s\S]*?programs:\s*ingestionPrograms/u);
   assert.match(source, /const baselineScanner\s*=\s*new StrictCatchUpScanner\([\s\S]*?policy:\s*'live-edge'[\s\S]*?programs:\s*ingestionPrograms/u);

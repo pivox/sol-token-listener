@@ -36,7 +36,7 @@ export interface LiveRecoveryStartupDatabase {
 export interface LiveRecoveryStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live_recovery';
-  readonly migrationHead: '062_drop_dossier_and_legacy_tables.sql';
+  readonly migrationHead: '063_listener_tracked_curve_checkpoints.sql';
   readonly generationId: string;
   readonly providerId: string;
 }
@@ -262,7 +262,7 @@ export async function validateLiveRecoveryStartup(
     return Object.freeze({
       payloadVersion: 1,
       role: 'sol_token_executor_live_recovery',
-      migrationHead: '062_drop_dossier_and_legacy_tables.sql',
+      migrationHead: '063_listener_tracked_curve_checkpoints.sql',
       generationId: config.generationId,
       providerId: config.providerId,
     });
