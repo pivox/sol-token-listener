@@ -244,7 +244,7 @@ void test('production creates one opt-in budget, injects every role, and closes 
   assert.match(source, /createProviderPinnedFinalityPass\([^;]+attemptBudget/u);
   assert.match(source, /createProviderPinnedBlockRpc\([^;]+attemptBudget/u);
   assert.match(source, /createProviderPinnedCatchUpSource\([^;]+attemptBudget/u);
-  assert.match(source, /attemptBudget[\s\S]+close\(\): Promise<void>\s*\{\s*attemptBudget\.close\(\);\s*return runtime\.close\(\)/u);
+  assert.match(source, /attemptBudget[\s\S]+close\(\): Promise<void>\s*\{[^}]*\}\s*finally\s*\{\s*attemptBudget\?\.close\(\);\s*await runtime\.close\(\)/u);
 });
 
 void test('failover queue timeout and closed admission never degrade providers or record attempts', async () => {
