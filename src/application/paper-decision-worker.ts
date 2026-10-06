@@ -722,14 +722,26 @@ class PaperLeaseGuard {
   public get owned():boolean { return this.stillOwned; }
   public start():void { this.schedule(); }
   public async checkpoint():Promise<boolean> {
-    if(this.renewing!==null)await this.renewing;
+    await this.settleRenewal();
     return this.stillOwned;
   }
   public async finish():Promise<boolean> {
     this.stopped=true;
     if(this.handle!==null){this.scheduler.cancel(this.handle);this.handle=null;}
-    if(this.renewing!==null)await this.renewing;
+    await this.settleRenewal();
     return this.stillOwned;
+  }
+  // A renewal still pending after a full lease cannot prove ownership: give the job up.
+  private async settleRenewal():Promise<void> {
+    const renewing=this.renewing;
+    if(renewing===null)return;
+    let timer:unknown=null;
+    const expired=new Promise<'expired'>((resolve)=>{
+      timer=this.scheduler.schedule(()=>{resolve('expired');},this.leaseMs);
+    });
+    const outcome=await Promise.race([renewing.then(()=>'settled' as const),expired]);
+    this.scheduler.cancel(timer);
+    if(outcome==='expired')this.abandon();
   }
   public abandon():void {
     this.abandoned=true;this.stopped=true;this.stillOwned=false;
