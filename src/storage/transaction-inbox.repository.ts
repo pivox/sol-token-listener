@@ -242,7 +242,7 @@ const CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = 
       OR (processing_status='PROCESSING' AND lease_expires_at<=$1
         AND attempts_in_cycle<retry_max_attempts)
     )
-    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+    ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
 });
 
 // Keep the legacy queries byte-for-byte stable; enabled queries add only the
@@ -280,7 +280,7 @@ const ADMITTED_CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, st
       OR (processing_status='PROCESSING' AND lease_expires_at<=$1
         AND attempts_in_cycle<retry_max_attempts)
     )
-    ORDER BY observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+    ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
 });
 
 export interface TransactionInboxRetryPolicy {
@@ -1472,7 +1472,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            OR (inbox.processing_status='PROCESSING' AND inbox.lease_expires_at<=$1
              AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
          ) AND ${workerAdmissionClaimAuthoritySql('inbox')}
-       ORDER BY inbox.observed_slot,inbox.signature
+       ORDER BY (inbox.ingestion_hint='PUMPSWAP_POOL_TRADE'),inbox.observed_slot,inbox.signature
        FOR UPDATE OF inbox SKIP LOCKED LIMIT 1`,
       [now, workerAdmissionClaimPlan.trackedSignatures,
         workerAdmissionClaimPlan.trackedMints,
@@ -1560,7 +1560,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
          OR (processing_status='PROCESSING' AND lease_expires_at<=$1
            AND attempts_in_cycle<retry_max_attempts)
        )
-       ORDER BY observed_slot,signature LIMIT $2`,
+       ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature LIMIT $2`,
       [now, MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
     const demotionSignatures = demotionPreview.rows.map((row) => requiredText(

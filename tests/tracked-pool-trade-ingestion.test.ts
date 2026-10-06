@@ -5,6 +5,7 @@ import pg from 'pg';
 import { assertValidTransactionNotification } from '../src/domain/transaction-ingestion.js';
 import type { TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import { createPumpFunWorkerAdmissionPolicy } from '../src/domain/worker-admission.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
@@ -67,6 +68,23 @@ for (const enabled of [true, false]) {
     });
 }
 
+for (const enabled of [true, false]) {
+  void test(`claims tracked PUMPFUN_TRADE rows before older PUMPSWAP_POOL_TRADE rows with worker admission ${enabled ? 'enabled' : 'disabled'}`,
+    async (context) => {
+      await withInbox(context, async (pool) => {
+        await insertTrackedLaunch(pool);
+        const inbox = new PostgresTransactionInboxRepository(pool, undefined,
+          createPumpFunWorkerAdmissionPolicy({ enabled, trackingWindowSeconds: 45 }));
+        await inbox.enqueue(poolTrade('pool-trade-older', 100n));
+        await inbox.enqueue(bondingCurveTrade('pumpfun-trade-newer', 200n));
+        const first = await inbox.claim(Date.now(), 30);
+        const second = await inbox.claim(Date.now(), 30);
+        assert.deepEqual([first?.signature, second?.signature],
+          ['pumpfun-trade-newer', 'pool-trade-older']);
+      });
+    });
+}
+
 void test('PUMPSWAP_POOL_TRADE rows do not count as non-terminal PumpSwap program work', async (context) => {
   await withInbox(context, async (pool) => {
     const inbox = new PostgresTransactionInboxRepository(pool);
@@ -90,6 +108,33 @@ function poolTrade(signature: string, slot: bigint): TransactionNotification {
     confirmationStatus: 'finalized',
     observedAtMs: 1_000,
   });
+}
+
+function bondingCurveTrade(signature: string, slot: bigint): TransactionNotification {
+  return Object.freeze({
+    signature,
+    slot,
+    source: 'WEBSOCKET',
+    ingestionHint: 'PUMPFUN_TRADE',
+    ingestionHintMint: mint,
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
+    confirmationStatus: 'processed',
+    observedAtMs: 1_000,
+  });
+}
+
+async function insertTrackedLaunch(pool: pg.Pool): Promise<void> {
+  await pool.query(`INSERT INTO token_launches (
+    mint, launchpad, program_id, creator, token_program, current_state, created_signature,
+    created_slot, created_transaction_index, created_instruction_index, detected_at, updated_at
+  ) VALUES ($1,'pumpfun',$2,$1,$2,'OBSERVING','tracked-launch',1,0,0,clock_timestamp(),clock_timestamp())`,
+  [mint, PUMP_PROGRAM_ID]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status,observed_at,payload_version,payload
+  ) VALUES ('tracked-launch-event','TokenLaunchDetected',$1,'pumpfun',$2,
+    'tracked-launch',1,0,0,NULL,'confirmed',clock_timestamp(),1,'{}'::jsonb)`,
+  [mint, PUMP_PROGRAM_ID]);
 }
 
 async function withInbox(
