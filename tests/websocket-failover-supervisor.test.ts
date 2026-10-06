@@ -88,6 +88,29 @@ void test('passive observations retain activity and session fences without enque
   assert.equal(fixture.supervisor.filteredNotificationMetrics().byProvider.primary, 1);
 });
 
+void test('NOT_A_CREATE observations retain activity without enqueue or passive metrics', async () => {
+  const fixture = supervisorFixture();
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+  const notACreate = Object.freeze({ endpointId: 'primary' as const, program: 'pumpfun' as const,
+    hint: 'NONE' as const, hintMint: null, signature: '1'.repeat(64), slot: 44n,
+    filteredReason: 'NOT_A_CREATE' as const });
+  await observe(notACreate);
+  assert.equal(fixture.reporter.observations.length, 0);
+  assert.deepEqual(fixture.reporter.filteredObservations, [{ slot: 44n,
+    ownerGeneration: 1n, sessionGeneration: 1n }]);
+  assert.equal(fixture.supervisor.filteredNotificationMetrics().byProvider.primary, 0);
+  await assert.rejects(observe(Object.freeze({ ...notACreate, program: 'pumpswap' })));
+  await assert.rejects(observe(Object.freeze({ ...notACreate, hint: 'PUMPFUN_CREATE' })));
+  await fixture.supervisor.close();
+});
+
 void test('local genesis saturation retries the same provider without a degraded provider cycle', async (context) => {
   const admission = ordinaryRpcAdmissionFixture(context);
   const fixture = supervisorFixture({ providerIds: ['primary', 'fallback-1'], random: () => 0 });

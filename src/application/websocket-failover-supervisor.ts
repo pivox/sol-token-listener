@@ -971,6 +971,7 @@ export class WebSocketFailoverSupervisor {
     }
     let preliminary: TransactionNotification;
     let filtered = false;
+    let passiveMention = false;
     try {
       const untrusted: unknown = value;
       if (typeof untrusted !== 'object' || untrusted === null || isProxy(untrusted)) throw new TypeError();
@@ -979,10 +980,12 @@ export class WebSocketFailoverSupervisor {
         'endpointId', 'program', 'signature', 'slot', 'hint', 'hintMint',
         ...(filtered ? ['filteredReason'] : []),
       ]);
-      if (filtered && (payload.filteredReason !== 'PASSIVE_PUMP_ACCOUNT_MENTION'
+      if (filtered && ((payload.filteredReason !== 'PASSIVE_PUMP_ACCOUNT_MENTION'
+          && payload.filteredReason !== 'NOT_A_CREATE')
         || payload.program !== 'pumpfun' || payload.hint !== 'NONE' || payload.hintMint !== null)) {
         throw new TypeError();
       }
+      passiveMention = payload.filteredReason === 'PASSIVE_PUMP_ACCOUNT_MENTION';
       const programId = programIdFrom(payload.program);
       if (payload.endpointId !== providerId
         || programId === null
@@ -1016,6 +1019,7 @@ export class WebSocketFailoverSupervisor {
       return this.#dependencies.reporter.observeFiltered(notification.slot, ownerGeneration, sessionGeneration)
         .then((result: unknown) => {
           if (result === 'RECORDED') {
+            if (!passiveMention) return;
             const count = this.#filteredCounts.get(providerId) ?? 0;
             this.#filteredCounts.set(providerId, Math.min(Number.MAX_SAFE_INTEGER, count + 1));
           } else if (result !== 'STALE_SESSION') throw configurationError();
