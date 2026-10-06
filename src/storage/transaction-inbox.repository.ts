@@ -245,7 +245,8 @@ const CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = 
     ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
 });
 
-// Keep the legacy queries byte-for-byte stable; enabled queries add only the
+// Keep the legacy queries stable (the only later change is the TRACKED_TRADE
+// hint ordering, applied to both tables); enabled queries add only the
 // durable admission fence, including the retry and expired-lease branches.
 const ADMITTED_CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = Object.freeze({
   NORMAL: `SELECT signature, ingestion_priority
