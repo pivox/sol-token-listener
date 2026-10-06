@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '061_execution_live_position_ledger.sql';
+const latestMigrationName = '062_drop_dossier_and_legacy_tables.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -140,6 +140,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '058_transaction_inbox_funding_attribution.sql',
       '059_transaction_inbox_qualification_attribution.sql',
       '060_listener_tracked_pool_checkpoints.sql',
+      '061_execution_live_position_ledger.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);

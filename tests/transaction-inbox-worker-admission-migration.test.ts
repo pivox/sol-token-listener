@@ -60,8 +60,8 @@ void test('053 remains installed beneath the replay-safe clean database head', a
   await withDatabase(context, async (pool) => {
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '061_execution_live_position_ledger.sql');
-    assert.equal(applied.length, 61);
+    assert.equal(applied.at(-1), '062_drop_dossier_and_legacy_tables.sql');
+    assert.equal(applied.length, 62);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await assertCatalog(pool);
   });

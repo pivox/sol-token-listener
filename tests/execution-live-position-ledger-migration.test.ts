@@ -21,7 +21,7 @@ void test('061 defines an append-only ledger and the catalog pins it', async () 
   ]) assert.ok(sql.includes(fragment), `missing migration contract: ${fragment}`);
   assert.doesNotMatch(sql, /\bREFERENCES\b/u, 'the purged position must not be referenced');
   assert.doesNotMatch(sql, /\b(?:DELETE FROM|TRUNCATE|DROP TABLE)\b/u);
-  assert.equal(LIVE_EXECUTION_MIGRATION_CATALOG.at(-1)?.name, migrationName);
+  assert.ok(LIVE_EXECUTION_MIGRATION_CATALOG.some((entry) => entry.name === migrationName));
 });
 
 void test('061 stores one immutable, arithmetically consistent row per closed position', async (context) => {
