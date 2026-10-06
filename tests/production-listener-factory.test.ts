@@ -1415,7 +1415,7 @@ void test('production composes one canonical qualification writer before paper d
   assert.match(source, /new PostgresQualificationProjectionRepository\(databasePool,\s*qualificationRebuilder\)/u);
   assert.match(source, /new QualificationProjectionService\([\s\S]*?qualificationRebuilder,[\s\S]*?config\.paperQuoteMintAllowlist[\s\S]*?\)/u);
   assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualification,/u);
-  assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*\)/u);
+  assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*fastEntry,\s*\)/u);
 });
 
 void test('production injects the worker inbox into the observed pipeline for tracked-mint synchronization', async () => {
@@ -1427,7 +1427,20 @@ void test('production injects the worker inbox into the observed pipeline for tr
   assert.equal(count(source, /new PostgresTransactionInboxRepository\(/gu), 1);
   assert.match(
     source,
-    /const pipeline = new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*\)/u,
+    /const pipeline = new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*inbox,\s*fastEntry,\s*\)/u,
+  );
+});
+
+void test('production builds the fast entry service only in the fast entry mode', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.equal(count(source, /new DefaultFastEntryService\(/gu), 1);
+  assert.match(
+    source,
+    /const fastEntry = config\.entryMode === 'fast'\s*\?\s*new DefaultFastEntryService\([\s\S]*?\)\s*:\s*null;/u,
   );
 });
 

@@ -330,6 +330,27 @@ void test('synchronizes lexical unique launchpad mints before active events relo
   ]);
 });
 
+void test('runs the fast entry with the launchpad mints and survives its failure', async () => {
+  const h = harness({ launchpadAffectedMints: ['MintB', 'MintA'] });
+  const calls: Array<{ signature: string; mints: readonly string[] }> = [];
+  const d = h.dependencies;
+  const make = (fail: boolean) => new ObservedTransactionPipeline(
+    d.reader, d.launchpad, d.market, null, d.qualification, null,
+    {
+      onObserved: async (signature, mints) => {
+        calls.push({ signature, mints });
+        if (fail) throw new Error('boom');
+      },
+    },
+  );
+
+  await make(false).process(h.tx, 1_700_000_000_500);
+  assert.deepEqual(calls, [{ signature: SIGNATURE, mints: ['MintA', 'MintB'] }]);
+
+  await assert.doesNotReject(make(true).process(h.tx, 1_700_000_000_500));
+  assert.equal(calls.length, 2);
+});
+
 void test('uses the supplied durable inbox observation timestamp instead of its clock', async () => {
   const h = harness();
 
