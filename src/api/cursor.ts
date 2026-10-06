@@ -15,6 +15,11 @@ export interface PaperPositionPagePosition {
   readonly id: string;
 }
 
+export interface LedgerPagePosition {
+  readonly closedAtMs: number;
+  readonly id: string;
+}
+
 export interface TimelinePagePosition {
   readonly slot: string;
   readonly transactionIndex: number;
@@ -70,6 +75,29 @@ export function decodePaperPositionCursor(cursor: string): PaperPositionPagePosi
   if (encodePaperPositionCursor(position) !== cursor) {
     throw new TypeError('Non-canonical paper positions cursor');
   }
+  return Object.freeze(position);
+}
+
+export function encodeLedgerCursor(position: LedgerPagePosition): string {
+  assertTimestamp(position.closedAtMs, 'closedAtMs');
+  assertText(position.id, 'id');
+  return encodeTuple(['live_ledger', 1, position.closedAtMs, position.id]);
+}
+
+export function decodeLedgerCursor(cursor: string): LedgerPagePosition {
+  const tuple = decodeTuple(cursor);
+  if (tuple.length !== 4 || tuple[0] !== 'live_ledger' || tuple[1] !== 1) {
+    throw new TypeError('Invalid live ledger cursor');
+  }
+  const closedAtMs = tuple[2];
+  const id = tuple[3];
+  if (typeof closedAtMs !== 'number' || typeof id !== 'string') {
+    throw new TypeError('Invalid live ledger cursor');
+  }
+  const position: LedgerPagePosition = { closedAtMs, id };
+  assertTimestamp(position.closedAtMs, 'closedAtMs');
+  assertText(position.id, 'id');
+  if (encodeLedgerCursor(position) !== cursor) throw new TypeError('Non-canonical live ledger cursor');
   return Object.freeze(position);
 }
 
