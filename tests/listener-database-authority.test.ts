@@ -44,7 +44,7 @@ const FORBIDDEN_EXECUTION_TABLES = Object.freeze([
   'execution_attempts', 'execution_control_events', 'execution_control_state',
   'execution_dry_run_assessments', 'execution_exit_authorizations',
   'execution_exposure_reservations', 'execution_fault_ledger',
-  'execution_intent_transitions', 'execution_live_positions',
+  'execution_intent_transitions', 'execution_live_position_ledger', 'execution_live_positions',
   'execution_live_rpc_budgets', 'execution_live_unsigned_simulation_evidence',
   'execution_operator_authorizations', 'execution_pre_signature_locks',
   'execution_pre_submission_revocations', 'execution_provider_rate_limit_events',

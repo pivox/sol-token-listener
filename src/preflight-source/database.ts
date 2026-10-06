@@ -8,13 +8,19 @@ import pg from 'pg';
 import { PostgresExecutionPreflightSourceRepository } from './repository.js';
 
 export const EXECUTION_PREFLIGHT_SOURCE_ROLE = 'sol_token_operator_reader';
+// The same read-only role also serves the operator console API (src/operator-api), so its
+// exact authority includes the live ledger, the market snapshots and the position columns
+// listed below in addition to the preflight source tables.
 export const EXECUTION_PREFLIGHT_SOURCE_TABLES = Object.freeze([
+  'bonding_curve_snapshots',
   'execution_activation_armaments', 'execution_activation_events',
   'execution_control_events', 'execution_control_state', 'execution_exposure_reservations',
+  'execution_live_position_ledger',
   'execution_provider_usage_snapshots', 'execution_reconciliation_evidence',
   'execution_safety_gate_evidence', 'execution_safety_qualifications',
   'execution_simulation_artifacts', 'execution_wallet_generations',
-  'execution_wallet_risk_state', 'execution_wallet_snapshots', 'migration_history',
+  'execution_wallet_risk_state', 'execution_wallet_snapshots',
+  'market_pools', 'market_reserve_snapshots', 'migration_history',
 ] as const);
 export const EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS = Object.freeze([
   'attempt_count', 'base_amount_raw', 'candidate_id', 'created_at', 'decision_event_id',
@@ -36,6 +42,11 @@ export const EXECUTION_PREFLIGHT_SOURCE_RESTRICTED_COLUMNS = Object.freeze({
     'assessment_id', 'intent_id', 'result_fingerprint',
   ]),
   execution_intents: EXECUTION_PREFLIGHT_SOURCE_INTENT_COLUMNS,
+  execution_live_positions: Object.freeze([
+    'base_amount_raw', 'closed_at', 'exit_deadline_at', 'fee_lamports', 'mint', 'opened_at',
+    'position_id', 'quote_cost_raw', 'quote_mint', 'remaining_base_raw', 'state',
+    'wallet_public_key',
+  ]),
   execution_preflight_intent_pair_memberships: Object.freeze(['intent_id', 'lane', 'pair_id']),
   execution_preflight_intent_pairs: Object.freeze([
     'expires_at', 'pair_fingerprint', 'pair_id', 'simulation_intent_id', 'target_intent_id',
