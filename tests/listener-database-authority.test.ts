@@ -368,7 +368,8 @@ void test('PostgreSQL 16 listener login can write business projections but no li
         if (row.relation_name === 'execution_intents'
           || row.relation_name === 'execution_intent_tombstones'
           || row.relation_name === 'execution_preflight_intent_pairs'
-          || row.relation_name === 'execution_preflight_intent_pair_memberships') {
+          || row.relation_name === 'execution_preflight_intent_pair_memberships'
+          || row.relation_name === 'execution_entry_envelopes') {
           assert.equal(row.table_allowed, false, row.relation_name);
           assert.equal(row.column_allowed, true, row.relation_name);
         } else {

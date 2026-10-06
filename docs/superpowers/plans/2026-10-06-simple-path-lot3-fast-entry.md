@@ -20,7 +20,7 @@
 Spec: `docs/superpowers/specs/2026-10-06-simple-path-design.md` (« Entrée rapide », « Enveloppe »).
 
 **Deviations from the spec (simplest path, decided while planning):**
-1. **The envelope table moves from lot 4 into migration 064.** The fast entry needs it to check capacity and get the per-buy amount (`per_buy_quote_amount_raw`). The same migration adds the `envelope_id` and `scope` columns on the qualification table. Lot 4 keeps the envelope CLI, the counters and the lanes. Lot 3 only reads envelopes; the tests insert envelope rows directly.
+1. **The envelope table moves from lot 4 into migration 064.** The fast entry needs it to check capacity and get the per-buy amount (`per_buy_quote_amount_raw`). The qualification `envelope_id` and `scope` columns stay in lot 4 (065), with the envelope CLI, the counters and the lanes. Lot 3 only reads envelopes; the tests insert envelope rows directly.
 2. **Plain TEXT columns instead of foreign keys** for `entry_decisions.intent_id` and `entry_decisions.launch_event_id`. With `ON DELETE RESTRICT`, a reference would abort the `execution_intents` and `domain_events` purges, which run as one transaction (`purgeExpiredFoundationData`). `entry_decisions` gets its own `purge_after` (decided_at + 7 days) and its own retention DELETE.
 3. **A `FastEntryDecided` domain event is written only for BUY.** It exists for the `execution_intents.decision_event_id` foreign key; rejections stay in `entry_decisions`.
 4. **Fixed slippage of `1_000` bps (10%) for `minimumAmountOutRaw`.** It is a constant `FAST_ENTRY_SLIPPAGE_BPS` and not a new env var; the spec lists none.

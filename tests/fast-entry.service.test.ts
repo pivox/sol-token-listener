@@ -6,11 +6,12 @@ import type { PaperQuoteRequest } from '../src/ports/paper-quote-router.js';
 
 const SOL = 'So11111111111111111111111111111111111111112';
 const envelope = { envelopeId: 'env-1', perBuyQuoteAmountRaw: 100n };
+const NOW = 1_700_000_000_000;
 
 function launchOf(mint: string, over: Record<string, unknown> = {}): never {
   return {
     mint, quoteMint: SOL, quoteDecimals: 9, quoteTokenProgram: 'spl-token',
-    creator: 'c', createSlot: 1n, createBlockTimeMs: null, launchEvent: {},
+    creator: 'c', createSlot: 1n, createBlockTimeMs: null, launchEvent: { observedAtMs: NOW - 1_000 },
     creatorSoldInCreate: false, ...over,
   } as never;
 }
@@ -32,6 +33,7 @@ function setup(opts: {
   quoteFn?: (r: PaperQuoteRequest) => Promise<PaperExecutionQuote>;
   readThrows?: string;
   max?: bigint;
+  recorded?: 'RECORDED' | 'ALREADY_DECIDED';
 } = {}) {
   const calls = { rejections: [] as any[], buys: [] as any[], quotes: [] as PaperQuoteRequest[],
     decisions: [] as any[], errors: [] as any[] };
@@ -42,8 +44,11 @@ function setup(opts: {
         return (opts.launches ?? { M: launchOf('M') })[mint] as never ?? null;
       },
       readActiveEnvelope: async () => (opts.env === undefined ? envelope : opts.env),
-      recordRejection: async (i: unknown) => { calls.rejections.push(i); },
-      recordBuy: async (i: unknown) => { calls.buys.push(i); return { kind: 'RECORDED', intentId: 'i' }; },
+      recordRejection: async (i: unknown) => { calls.rejections.push(i); return opts.recorded ?? 'RECORDED'; },
+      recordBuy: async (i: unknown) => {
+        calls.buys.push(i);
+        return opts.recorded === 'ALREADY_DECIDED' ? { kind: 'ALREADY_DECIDED' } : { kind: 'RECORDED', intentId: 'i' };
+      },
     } as never,
     quotes: {
       quote: async (r) => {
@@ -55,6 +60,7 @@ function setup(opts: {
       },
     },
     maximumRoundTripLossBps: opts.max ?? 1_100n,
+    now: () => NOW,
     onDecision: (e) => calls.decisions.push(e),
     onError: (e) => calls.errors.push(e),
   });
@@ -149,4 +155,21 @@ void test('a repository throw goes to onError and the next mint is processed', a
 void test('onObserved resolves even when everything fails', async () => {
   const { service } = setup({ readThrows: 'M' });
   await assert.doesNotReject(service.onObserved('sig', ['M']));
+});
+
+void test('a create first observed more than 15 s ago is skipped', async () => {
+  const { service, calls } = setup({ launches: { M: launchOf('M', { launchEvent: { observedAtMs: NOW - 15_001 } }) } });
+  await service.onObserved('sig', ['M']);
+  assert.equal(calls.rejections.length + calls.buys.length + calls.quotes.length, 0);
+});
+
+void test('a decision lost to a concurrent writer is not reported', async () => {
+  const rejected = setup({ env: null, recorded: 'ALREADY_DECIDED' });
+  await rejected.service.onObserved('sig', ['M']);
+  assert.equal(rejected.calls.rejections.length, 1);
+  assert.equal(rejected.calls.decisions.length, 0);
+  const bought = setup({ recorded: 'ALREADY_DECIDED' });
+  await bought.service.onObserved('sig', ['M']);
+  assert.equal(bought.calls.buys.length, 1);
+  assert.equal(bought.calls.decisions.length, 0);
 });

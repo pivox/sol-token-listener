@@ -363,6 +363,16 @@ GRANT SELECT ON TABLE chain_transaction_inbox_claim_scheduler
 TO sol_token_listener_writer;
 GRANT SELECT,INSERT ON TABLE transaction_inbox_terminal_attributions
 TO sol_token_listener_writer;
+GRANT SELECT,INSERT,UPDATE ON TABLE
+  listener_tracked_pool_checkpoints,
+  listener_tracked_curve_checkpoints
+TO sol_token_listener_writer;
+GRANT SELECT,INSERT ON TABLE entry_decisions TO sol_token_listener_writer;
+-- Fast entry reads envelope capacity only; arming and counters stay executor-owned.
+GRANT SELECT (
+  envelope_id,per_buy_quote_amount_raw,max_buys,buys_armed,state,valid_from,valid_until,created_at
+)
+ON TABLE execution_entry_envelopes TO sol_token_listener_writer;
 GRANT UPDATE (consecutive_urgent_claims,launch_claims_since_tracked,updated_at)
 ON TABLE chain_transaction_inbox_claim_scheduler
 TO sol_token_listener_writer;
@@ -1450,6 +1460,7 @@ GRANT UPDATE (terminal_at,purge_after,updated_at)
 ON TABLE chain_transaction_inbox TO sol_token_retention_worker;
 GRANT SELECT,DELETE ON TABLE transaction_inbox_terminal_attributions
 TO sol_token_retention_worker;
+GRANT SELECT,DELETE ON TABLE entry_decisions TO sol_token_retention_worker;
 GRANT UPDATE (terminal_attribution_incomplete_count,terminal_attribution_incomplete_at)
 ON TABLE chain_transaction_inbox TO sol_token_retention_worker;
 GRANT UPDATE (expired_through_sequence)

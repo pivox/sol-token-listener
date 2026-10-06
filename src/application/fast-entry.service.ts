@@ -1,4 +1,5 @@
 import {
+  FAST_ENTRY_MAX_CREATE_AGE_MS,
   decideFastEntryQuotes,
   FAST_ENTRY_SLIPPAGE_BPS,
   precheckFastEntry,
@@ -60,17 +61,17 @@ export class DefaultFastEntryService implements FastEntryService {
     const startedAtMs = this.now();
     const launch = await repository.readLaunchForSignature(mint, signature);
     if (launch === null) return;
+    if (startedAtMs - launch.launchEvent.observedAtMs > FAST_ENTRY_MAX_CREATE_AGE_MS) return;
 
-    const decidedAtMs = this.now();
-    const envelope = await repository.readActiveEnvelope(decidedAtMs);
+    const envelope = await repository.readActiveEnvelope(startedAtMs);
     const precheck = precheckFastEntry(launch, envelope);
     if (precheck !== null || envelope === null) {
       const reason = precheck ?? 'NO_ENVELOPE_CAPACITY';
-      await repository.recordRejection({
-        launch, decidedAtMs, reason, roundTripLossBps: null,
+      const recorded = await repository.recordRejection({
+        launch, decidedAtMs: this.now(), reason, roundTripLossBps: null,
         buyQuote: null, reverseQuote: null, envelopeId: envelope?.envelopeId ?? null,
       });
-      this.emit(mint, 'REJECTED', reason, null, startedAtMs);
+      if (recorded === 'RECORDED') this.emit(mint, 'REJECTED', reason, null, startedAtMs);
       return;
     }
 
@@ -100,27 +101,29 @@ export class DefaultFastEntryService implements FastEntryService {
         slippageBps: FAST_ENTRY_SLIPPAGE_BPS,
       });
     } catch {
-      await repository.recordRejection({
-        launch, decidedAtMs, reason: 'QUOTE_UNAVAILABLE', roundTripLossBps: null,
+      const recorded = await repository.recordRejection({
+        launch, decidedAtMs: this.now(), reason: 'QUOTE_UNAVAILABLE', roundTripLossBps: null,
         buyQuote, reverseQuote: null, envelopeId: envelope.envelopeId,
       });
-      this.emit(mint, 'REJECTED', 'QUOTE_UNAVAILABLE', null, startedAtMs);
+      if (recorded === 'RECORDED') this.emit(mint, 'REJECTED', 'QUOTE_UNAVAILABLE', null, startedAtMs);
       return;
     }
 
     const decision = decideFastEntryQuotes(buyQuote, reverseQuote, this.deps.maximumRoundTripLossBps);
+    // Stamped after the quotes so the intent TTL starts at the decision, not before the RPCs.
+    const decidedAtMs = this.now();
     if (decision.decision === 'REJECTED') {
-      await repository.recordRejection({
+      const recorded = await repository.recordRejection({
         launch, decidedAtMs, reason: decision.reason, roundTripLossBps: decision.lossBps,
         buyQuote, reverseQuote, envelopeId: envelope.envelopeId,
       });
-      this.emit(mint, 'REJECTED', decision.reason, decision.lossBps, startedAtMs);
+      if (recorded === 'RECORDED') this.emit(mint, 'REJECTED', decision.reason, decision.lossBps, startedAtMs);
       return;
     }
-    await repository.recordBuy({
+    const bought = await repository.recordBuy({
       launch, decidedAtMs, envelope, buyQuote, reverseQuote, roundTripLossBps: decision.lossBps,
     });
-    this.emit(mint, 'BUY', null, decision.lossBps, startedAtMs);
+    if (bought.kind === 'RECORDED') this.emit(mint, 'BUY', null, decision.lossBps, startedAtMs);
   }
 
   private emit(

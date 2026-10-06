@@ -198,9 +198,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   try {
     await client.query('BEGIN');
     await client.query(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL);
-    const entryDecisions = await client.query(
-      'DELETE FROM entry_decisions WHERE purge_after <= statement_timestamp()',
+    // entry_decisions arrives with migration 064; older schemas have nothing to purge.
+    const entryDecisionsPresent = await client.query(
+      "SELECT to_regclass('entry_decisions') IS NOT NULL AS present",
     );
+    const entryDecisions = entryDecisionsPresent.rows[0]?.present === true
+      ? await client.query('DELETE FROM entry_decisions WHERE purge_after <= statement_timestamp()')
+      : { rowCount: 0 };
     const executionIntentsExpiredPreSubmission =
       await expireExecutionIntentsPreSubmissionInTransaction(
         client,
