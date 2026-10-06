@@ -874,7 +874,7 @@ const apiMetaSchema = z.object({
   nextCursor: z.string().nullable(),
 }).strict();
 
-function successEnvelope<T extends z.ZodType>(data: T): z.ZodObject<{
+export function successEnvelope<T extends z.ZodType>(data: T): z.ZodObject<{
   apiVersion: z.ZodLiteral<'v1'>;
   meta: typeof apiMetaSchema;
   data: T;
@@ -912,7 +912,7 @@ export const apiFailureSchema = z.object({
     code: z.enum([
       'ROUTE_NOT_FOUND', 'METHOD_NOT_ALLOWED', 'NOT_ACCEPTABLE', 'INVALID_MINT',
       'INVALID_LIMIT', 'INVALID_CURSOR', 'LAUNCH_NOT_FOUND', 'EVENT_CURSOR_EXPIRED',
-      'DEPENDENCY_UNAVAILABLE', 'INTERNAL_ERROR',
+      'DEPENDENCY_UNAVAILABLE', 'INTERNAL_ERROR', 'UNAUTHORIZED', 'HOST_NOT_ALLOWED',
     ]),
     message: z.string().min(1),
     correlationId: z.string().min(1).optional(),

@@ -6,10 +6,12 @@ const CONFIG_TIMEOUT_MS = 5_000;
 
 const runtimeConfigSchema = z.object({
   apiBaseUrl: z.string().min(1).max(2_048),
+  operatorApiBaseUrl: z.string().min(1).max(2_048).optional(),
 }).strict();
 
 export interface RuntimeConfig {
   readonly apiBaseUrl: string;
+  readonly operatorApiBaseUrl?: string;
 }
 
 export type RuntimeConfigErrorCode =
@@ -57,7 +59,13 @@ export async function loadRuntimeConfig(
   }
   const parsed = runtimeConfigSchema.safeParse(decoded);
   if (!parsed.success) throw new RuntimeConfigError('CONFIG_INVALID');
-  return Object.freeze({ apiBaseUrl: normalizeApiBaseUrl(parsed.data.apiBaseUrl, currentOrigin) });
+  const { apiBaseUrl, operatorApiBaseUrl } = parsed.data;
+  return Object.freeze({
+    apiBaseUrl: normalizeApiBaseUrl(apiBaseUrl, currentOrigin),
+    ...(operatorApiBaseUrl === undefined
+      ? {}
+      : { operatorApiBaseUrl: normalizeApiBaseUrl(operatorApiBaseUrl, currentOrigin) }),
+  });
 }
 
 function assertContentLength(value: string | null): void {

@@ -61,13 +61,22 @@ export interface ApiClientOptions {
   readonly maxResponseBytes?: number;
 }
 
-export function createApiClient(options: ApiClientOptions): ApiClient {
-  const fetchFn = options.fetchFn ?? fetch;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+export interface JsonRequesterOptions {
+  readonly apiBaseUrl: string;
+  readonly fetchFn: typeof fetch;
+  readonly timeoutMs: number;
+  readonly maxResponseBytes: number;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+export type JsonRequester = <T>(route: string, schema: z.ZodType<T>, signal?: AbortSignal) => Promise<T>;
+
+/** Bounded, timed, GET-only JSON request with schema validation, shared by every client. */
+export function createJsonRequester(options: JsonRequesterOptions): JsonRequester {
+  const { fetchFn, timeoutMs, maxResponseBytes } = options;
   const baseUrl = `${options.apiBaseUrl.replace(/\/+$/u, '')}/`;
 
-  async function request<T>(route: string, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T> {
+  return async function request<T>(route: string, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T> {
     if (didAbort(signal)) throw signal?.reason;
     const requestController = new AbortController();
     const timeout = setTimeout(() => {
@@ -82,7 +91,7 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       try {
         response = await fetchFn(new URL(route.replace(/^\/+/, ''), baseUrl), {
           method: 'GET',
-          headers: { Accept: 'application/json' },
+          headers: options.headers,
           signal: requestController.signal,
         });
       } catch (error) {
@@ -119,7 +128,17 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       clearTimeout(timeout);
       signal?.removeEventListener('abort', propagateAbort);
     }
-  }
+  };
+}
+
+export function createApiClient(options: ApiClientOptions): ApiClient {
+  const request = createJsonRequester({
+    apiBaseUrl: options.apiBaseUrl,
+    fetchFn: options.fetchFn ?? fetch,
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+    headers: { Accept: 'application/json' },
+  });
 
   function pageRoute(route: string, input: PageInput = {}): string {
     const query = new URLSearchParams();

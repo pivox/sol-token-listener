@@ -12,7 +12,14 @@ async function bootstrap(): Promise<void> {
   const root = createRoot(container);
   try {
     const config = await loadRuntimeConfig(fetch);
-    root.render(<StrictMode><App apiBaseUrl={config.apiBaseUrl} /></StrictMode>);
+    root.render(
+      <StrictMode>
+        <App
+          apiBaseUrl={config.apiBaseUrl}
+          {...(config.operatorApiBaseUrl === undefined ? {} : { operatorApiBaseUrl: config.operatorApiBaseUrl })}
+        />
+      </StrictMode>,
+    );
   } catch {
     root.render(<StrictMode><ConfigurationError /></StrictMode>);
   }

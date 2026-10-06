@@ -345,3 +345,34 @@ export function success<T>(data: T, nextCursor: string | null = null): {
 } {
   return { apiVersion: 'v1', meta: { generatedAt: NOW, nextCursor }, data };
 }
+
+export const SIGNATURE = '5'.repeat(88);
+
+export const liveOverview = {
+  availability: 'AVAILABLE',
+  wallet: MINT,
+  balance: { lamports: '2500000000', observedAt: NOW },
+  open: [{
+    positionId: 'execution_live_position_open',
+    mint: QUOTE_MINT,
+    state: 'OPEN',
+    openedAt: '2026-08-10T23:55:00.000Z',
+    exitDeadlineAt: '2026-08-11T00:10:00.000Z',
+    remainingRaw: '35000000000',
+    costLamports: '1005000',
+    spotValueLamports: '1200000',
+    unrealizedLamports: '195000',
+  }],
+  history: [{
+    positionId: 'execution_live_position_closed',
+    mint: QUOTE_MINT,
+    openedAt: '2026-08-10T22:00:00.000Z',
+    closedAt: '2026-08-10T22:05:00.000Z',
+    entrySignature: SIGNATURE,
+    exitSignature: SIGNATURE,
+    realizedLamports: '-4205',
+  }],
+  totals: {
+    realizedLamports: '-4205', unrealizedLamports: '195000', openCount: 1, positionsWithoutPnl: 0,
+  },
+} as const;

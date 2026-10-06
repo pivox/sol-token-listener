@@ -159,6 +159,7 @@ void test('inventories every destructive database cleanup and guards forced term
     'executor-roles-provisioning.test.ts': 2,
     'executor-worker-database-authority.test.ts': 2,
     'listener-database-authority.test.ts': 1,
+    'live-ledger-roles.test.ts': 1,
   });
   assert.deepEqual(violations, []);
 });
@@ -170,6 +171,7 @@ const FORCED_DATABASE_CLEANUPS = Object.freeze({
   'executor-roles-provisioning.test.ts': 2,
   'executor-worker-database-authority.test.ts': 2,
   'listener-database-authority.test.ts': 1,
+  'live-ledger-roles.test.ts': 1,
 });
 
 const GRACEFUL_DATABASE_CLEANUPS = Object.freeze({

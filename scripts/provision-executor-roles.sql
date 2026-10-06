@@ -1204,7 +1204,8 @@ ON TABLE execution_wallet_generations TO sol_token_executor_live_recovery;
 GRANT SELECT (
   position_id,buy_intent_id,generation_id,armament_id,wallet_public_key,mint,
   quote_mint,state,state_revision,exit_intent_id,remaining_base_raw,
-  quote_cost_raw,exit_deadline_at,entry_reconciliation_fingerprint
+  quote_cost_raw,base_amount_raw,opened_at,exit_deadline_at,
+  entry_reconciliation_fingerprint
 ), INSERT (
   position_id,payload_version,buy_intent_id,generation_id,armament_id,
   wallet_public_key,mint,quote_mint,entry_venue,quote_cost_raw,base_amount_raw,
@@ -1262,6 +1263,15 @@ GRANT SELECT (
   observed_at,finalized_at,result,reason_code,purge_after
 ), UPDATE (resolved_by_evidence_id,resolved_at,purge_after)
 ON TABLE execution_reconciliation_evidence TO sol_token_executor_live_recovery;
+
+-- The recovery runtime appends one immutable ledger row in the transaction that closes a
+-- live position. It never reads, updates or deletes the ledger.
+GRANT INSERT (
+  position_id,wallet_public_key,mint,opened_at,closed_at,base_amount_raw,
+  entry_wallet_lamport_delta,exit_wallet_lamport_delta,net_lamports,
+  entry_signature,exit_signature
+)
+ON TABLE execution_live_position_ledger TO sol_token_executor_live_recovery;
 
 GRANT INSERT (
   intent_id,previous_status,next_status,reason_code,human_message,
@@ -1522,6 +1532,10 @@ REVOKE ALL ON TABLE
   execution_live_positions,
   execution_exit_authorizations,
   execution_reconciliation_evidence
+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,
+  sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api;
+
+REVOKE ALL ON TABLE execution_live_position_ledger
 FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,
   sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api;
 
@@ -2532,8 +2546,20 @@ GRANT SELECT ON TABLE
   execution_activation_armaments,
   execution_activation_events,
   execution_simulation_artifacts,
+  execution_live_position_ledger,
+  bonding_curve_snapshots,
+  market_pools,
+  market_reserve_snapshots,
   migration_history
 TO sol_token_operator_reader;
+
+-- The operator console reads only the position columns it displays, never the intent,
+-- authorization, armament or fingerprint columns.
+GRANT SELECT (
+  position_id,wallet_public_key,mint,quote_mint,quote_cost_raw,base_amount_raw,
+  remaining_base_raw,fee_lamports,opened_at,exit_deadline_at,state,closed_at
+)
+ON TABLE execution_live_positions TO sol_token_operator_reader;
 
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,candidate_id,

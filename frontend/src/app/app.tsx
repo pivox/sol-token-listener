@@ -11,16 +11,20 @@ import { RadarPage } from '../features/radar/radar-page.js';
 import { LaunchPage } from '../features/launch/launch-page.js';
 import { PaperPage } from '../features/paper/paper-page.js';
 import { HealthPage } from '../features/health/health-page.js';
+import { LivePage } from '../features/live/live-page.js';
 import { AppShell } from './app-shell.js';
 import { ErrorBoundary } from './error-boundary.js';
 
 export interface AppProps {
   readonly apiBaseUrl: string;
+  readonly operatorApiBaseUrl?: string;
   readonly realtimeClient?: SseClient;
   readonly apiClient?: ApiClient;
 }
 
-export function App({ apiBaseUrl, realtimeClient, apiClient: providedApiClient }: AppProps): ReactNode {
+export function App({
+  apiBaseUrl, operatorApiBaseUrl, realtimeClient, apiClient: providedApiClient,
+}: AppProps): ReactNode {
   const [queryClient] = useState(() => new QueryClient({
     defaultOptions: { queries: { staleTime: 5_000, gcTime: 5 * 60_000 } },
   }));
@@ -34,6 +38,7 @@ export function App({ apiBaseUrl, realtimeClient, apiClient: providedApiClient }
               <Route element={<AppShell />}>
                 <Route index element={<RadarPage />} />
                 <Route path="launches/:mint" element={<LaunchPage />} />
+                <Route path="live" element={<LivePage operatorApiBaseUrl={operatorApiBaseUrl ?? null} />} />
                 <Route path="paper-positions" element={<PaperPage />} />
                 <Route path="health" element={<HealthPage />} />
                 <Route path="*" element={<NotFoundPage />} />

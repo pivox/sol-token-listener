@@ -457,7 +457,9 @@ publique en lecture seule. Elle se déploie comme un artefact statique séparé,
 lit son `apiBaseUrl` dans `frontend/public/config.json`, puis consomme les huit
 projections JSON et le flux SSE reprenable. Ses routes produit sont le radar
 `/`, la fiche `/launches/:mint`, les simulations `/paper-positions` et la santé
-`/health`.
+`/health`. La route `/live` (lecture seule) lit l'API opérateur séparée
+`npm run operator:api:start`, authentifiée par jeton ; voir le
+[runbook](docs/operations/executor-live-canary.md).
 
 ```bash
 npm run frontend:dev

@@ -24,8 +24,8 @@ void test('060 defines the pool checkpoint table and the widened hint check', as
 void test('060 accepts pool trade hints with a canonical mint and keeps checkpoints bounded', async (context) => {
   await withTemporarySchema(context, async (pool) => {
     await migrateDatabase({ pool });
-    assert.equal((await pool.query('SELECT version FROM migration_history ORDER BY version DESC LIMIT 1'))
-      .rows[0]?.version, migrationName);
+    assert.equal((await pool.query('SELECT 1 FROM migration_history WHERE version = $1',
+      [migrationName])).rowCount, 1);
     await seedPool(pool, 'POOL');
 
     await pool.query(`INSERT INTO listener_tracked_pool_checkpoints (pool_address, slot, signature, updated_at)

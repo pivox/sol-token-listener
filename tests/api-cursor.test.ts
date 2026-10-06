@@ -7,10 +7,12 @@ import {
   MAX_TIMELINE_INDEX,
   MAX_TIMELINE_SLOT,
   decodeLaunchCursor,
+  decodeLedgerCursor,
   decodePaperPositionCursor,
   decodeStreamCursor,
   decodeTimelineCursor,
   encodeLaunchCursor,
+  encodeLedgerCursor,
   encodePaperPositionCursor,
   encodeStreamCursor,
   encodeTimelineCursor,
@@ -117,4 +119,15 @@ void test('timeline cursors use PostgreSQL numeric and integer bounds independen
   assert.throws(() => encodeTimelineCursor({
     ...maximum, innerInstructionIndex: MAX_TIMELINE_INDEX + 1,
   }), TypeError);
+});
+
+void test('the live ledger cursor is canonical, bounded and route-specific', () => {
+  const position = { closedAtMs: 1_780_000_000_000, id: 'execution_live_position_a' };
+  const cursor = encodeLedgerCursor(position);
+  assert.deepEqual(decodeLedgerCursor(cursor), position);
+  assert.throws(() => decodeLedgerCursor(encodePaperPositionCursor({ openedAtMs: 1, id: 'p' })), TypeError);
+  assert.throws(() => decodePaperPositionCursor(cursor), TypeError);
+  assert.throws(() => decodeLedgerCursor(`${cursor}A`), TypeError);
+  assert.throws(() => encodeLedgerCursor({ closedAtMs: -1, id: 'x' }), TypeError);
+  assert.throws(() => encodeLedgerCursor({ closedAtMs: 1, id: '' }), TypeError);
 });
