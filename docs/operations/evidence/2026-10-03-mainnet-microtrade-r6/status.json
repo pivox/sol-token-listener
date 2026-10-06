@@ -1,0 +1,20 @@
+{
+  "startedAt": "2026-10-03T22:50:22.922Z",
+  "deadlineAt": "2026-10-04T02:50:22.922Z",
+  "status": "finished",
+  "stage": "done",
+  "waves": 0,
+  "observed": 0,
+  "buys": 0,
+  "sells": 0,
+  "failed": 0,
+  "estimatedEconomicPnlUsdt": 0,
+  "walletLamports": 444768915,
+  "currentMint": null,
+  "currentLog": null,
+  "lastError": null,
+  "trades": [],
+  "preflightAt": "2026-10-03T22:50:23.144Z",
+  "updatedAt": "2026-10-03T22:50:23.192Z",
+  "lastTradeEvent": null
+}

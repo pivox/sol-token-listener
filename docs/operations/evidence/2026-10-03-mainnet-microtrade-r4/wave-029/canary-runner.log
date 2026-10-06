@@ -1,0 +1,24 @@
+bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)
+{"at":"2026-10-03T20:51:17.676Z","event":"preflight","mint":"C8GemFi1XmhWRHCKArYM4YKCfq2y3kv8maY3VCFaPXRd","wallet":"2LvenbX1TdhX8EbxGBmcZYiXuZFN4utA8QZY1UgGXwmZ","initialWalletLamports":446206328,"krakenSolUsdt":119.84,"maxBuyLamports":8344459,"targetTokenRaw":"207286845946","expectedBuyLamports":"8094124","immediateSellQuoteLamports":"7890686","curveRealQuoteLamports":"5230008237","extensions":[18,19]}
+{"at":"2026-10-03T20:51:17.682Z","event":"building_buy_instructions"}
+{"at":"2026-10-03T20:51:17.688Z","event":"buy_instructions_built","count":2}
+{"at":"2026-10-03T20:51:17.766Z","event":"buy_simulation","err":null,"unitsConsumed":111137}
+{"at":"2026-10-03T20:51:17.809Z","event":"buy_submitted","signature":"xorfDqdNJdnVxd2ke1ASDPGh8jTWaJBEeBBBG26GHKGZF1Qyw7NT1wgYxe6bttZmdTB3YdnjviXWtpDT9gCKrQM"}
+{"at":"2026-10-03T20:51:19.987Z","event":"buy_confirmed","signature":"xorfDqdNJdnVxd2ke1ASDPGh8jTWaJBEeBBBG26GHKGZF1Qyw7NT1wgYxe6bttZmdTB3YdnjviXWtpDT9gCKrQM","slot":453046203,"feeLamports":45000,"walletBalanceBeforeLamports":446206328,"walletBalanceAfterLamports":436553364,"actualTradeSolLamports":"7994196"}
+{"at":"2026-10-03T20:51:20.062Z","event":"position_open","signature":"xorfDqdNJdnVxd2ke1ASDPGh8jTWaJBEeBBBG26GHKGZF1Qyw7NT1wgYxe6bttZmdTB3YdnjviXWtpDT9gCKrQM","slot":453046203,"tokenRaw":"207286845946","buySolLamports":"7994196","walletSol":0.436553364}
+{"at":"2026-10-03T20:51:20.105Z","event":"hold_progress","elapsedSeconds":0,"qualifyingFinalizedSales":0,"pendingSignals":0}
+{"at":"2026-10-03T20:51:35.985Z","event":"hold_progress","elapsedSeconds":16,"qualifyingFinalizedSales":0,"pendingSignals":1}
+{"at":"2026-10-03T20:51:43.655Z","event":"external_sale_finalized","ordinal":1,"seller":"CtypBtuREmcupYzfA7Y8afwQtorMRc5HBkbE3qhwroNr","signature":"46busoJ7nX8jmXS4PGwz8nxMYEsoT5q2dFzqU4GT4naRfHK9tPt5643TCjKZSRhmurYcfajTz3AMDunZF7euVmaT","slot":453046264,"solAmountLamports":"133954134","ownBuySolLamports":"7994196","suffixBytes":24}
+{"at":"2026-10-03T20:51:50.952Z","event":"hold_progress","elapsedSeconds":31,"qualifyingFinalizedSales":1,"pendingSignals":0}
+{"at":"2026-10-03T20:52:05.495Z","event":"hold_progress","elapsedSeconds":45,"qualifyingFinalizedSales":1,"pendingSignals":0}
+{"at":"2026-10-03T20:52:20.124Z","event":"hold_progress","elapsedSeconds":60,"qualifyingFinalizedSales":1,"pendingSignals":0}
+{"at":"2026-10-03T20:52:30.984Z","event":"external_sale_finalized","ordinal":2,"seller":"9Y8dMukU9JPwsVugockUnw7jEwQFpjgp2pzQGy1bYSLh","signature":"3C1vz6EhnYPefCGmk8nDznrT4auQjHH5uTnmU58rxk3TMsrr9eHigfq4oysYg9r95EhAf31u6mZbyJoaiJuV64DT","slot":453046435,"solAmountLamports":"531583927","ownBuySolLamports":"7994196","suffixBytes":24}
+{"at":"2026-10-03T20:52:31.033Z","event":"external_sale_finalized","ordinal":3,"seller":"A8W81KDBVEovvmkUbKCWoaNx744E5T4PQ1iJsZLA2H8","signature":"3Unerp3WwUPEs8mvsdHjP1ArWWoBTNhKpaZTh1Bu26kY4j1HPFC9B1Mv3S2fyb4eWYW2yhTW5bQoxgDHA7cf8ovs","slot":453046435,"solAmountLamports":"336074673","ownBuySolLamports":"7994196","suffixBytes":24}
+{"at":"2026-10-03T20:52:31.069Z","event":"external_sale_finalized","ordinal":4,"seller":"FELNr58cb72kWjoqh7TvRQpyU7unLHTrqUz2nHToTXCx","signature":"5jvUfeHLEJf33rjhdqVVo5tHVEMax9LMynuLEtVwb7pjVn7dFkwR21RVocQRkhtArQLj3HN48UFmHabAoxYMrTnh","slot":453046435,"solAmountLamports":"778104631","ownBuySolLamports":"7994196","suffixBytes":24}
+{"at":"2026-10-03T20:52:31.122Z","event":"sell_started","reason":"three_external_sales_each_above_our_buy","qualifyingSales":4}
+{"at":"2026-10-03T20:52:31.261Z","event":"sell_quote","attempt":1,"tokenRaw":"207286845946","expectedLamports":"7849616","minimumLamports":"7064654","curveRealQuoteLamports":"5138194604"}
+{"at":"2026-10-03T20:52:31.344Z","event":"sell_simulation","err":null,"unitsConsumed":78512}
+{"at":"2026-10-03T20:52:31.381Z","event":"sell_submitted","signature":"4SXqjfCC7jvznXDunc4tUE7gdKqSZ69eVofGyc8Qf57iwJBvveGeHyrN3wqhbLpxqe2j5p7vTVayGrQJtwMakjyh"}
+{"at":"2026-10-03T20:52:35.656Z","event":"sell_confirmed","signature":"4SXqjfCC7jvznXDunc4tUE7gdKqSZ69eVofGyc8Qf57iwJBvveGeHyrN3wqhbLpxqe2j5p7vTVayGrQJtwMakjyh","slot":453046484,"feeLamports":45000,"walletBalanceBeforeLamports":436553364,"walletBalanceAfterLamports":444357980,"actualTradeSolLamports":null}
+{"at":"2026-10-03T20:52:35.736Z","event":"sell_result","signature":"4SXqjfCC7jvznXDunc4tUE7gdKqSZ69eVofGyc8Qf57iwJBvveGeHyrN3wqhbLpxqe2j5p7vTVayGrQJtwMakjyh","remainingTokenRaw":"0","walletSol":0.44435798}
+{"at":"2026-10-03T20:52:35.776Z","event":"complete","buySignature":"xorfDqdNJdnVxd2ke1ASDPGh8jTWaJBEeBBBG26GHKGZF1Qyw7NT1wgYxe6bttZmdTB3YdnjviXWtpDT9gCKrQM","qualifyingFinalizedSales":4,"finalWalletLamports":444357980}

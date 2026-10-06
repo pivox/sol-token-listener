@@ -1,0 +1,19 @@
+bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)
+{"at":"2026-10-03T23:31:10.530Z","event":"recovery_preflight","tokenRaw":"130508977177","walletLamports":435113248}
+{"at":"2026-10-03T23:31:10.531Z","event":"sell_started","reason":"recover_expired_sell","requiredMinimumLamports":null}
+{"at":"2026-10-03T23:31:10.654Z","event":"sell_quote","attempt":1,"tokenRaw":"130508977177","expectedLamports":"3605091","minimumLamports":"3064327","curveRealQuoteLamports":"9335795"}
+{"at":"2026-10-03T23:31:10.751Z","event":"sell_simulation","err":null,"unitsConsumed":70539}
+{"at":"2026-10-03T23:31:10.800Z","event":"sell_submitted","signature":"3HGeTLg9FjgMwxxMXKo1TsBK2YvgEnJvB3K8sBjaWReLjnfHXYKUKkKdznnv1MXrKAfKmrHF1Z7MDUNu66qcZTBk"}
+{"at":"2026-10-03T23:48:27.079Z","event":"sell_confirmed","signature":"3HGeTLg9FjgMwxxMXKo1TsBK2YvgEnJvB3K8sBjaWReLjnfHXYKUKkKdznnv1MXrKAfKmrHF1Z7MDUNu66qcZTBk","slot":453082004,"feeLamports":45000,"walletBalanceBeforeLamports":435113248,"walletBalanceAfterLamports":438673339,"actualTradeSolLamports":null}
+{"at":"2026-10-03T23:48:27.167Z","event":"sell_result","signature":"3HGeTLg9FjgMwxxMXKo1TsBK2YvgEnJvB3K8sBjaWReLjnfHXYKUKkKdznnv1MXrKAfKmrHF1Z7MDUNu66qcZTBk","remainingTokenRaw":"0","walletSol":0.438673339}
+{"at":"2026-10-03T23:48:27.284Z","event":"recovery_complete","walletLamports":438673339}
+bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)
+{"at":"2026-10-04T05:59:46.482Z","event":"recovery_preflight","tokenRaw":"0","walletLamports":438673339}
+{"at":"2026-10-04T05:59:46.484Z","event":"sell_started","reason":"recover_expired_sell","requiredMinimumLamports":null}
+{"at":"2026-10-04T05:59:46.519Z","event":"sell_skipped_zero_balance"}
+{"at":"2026-10-04T05:59:46.556Z","event":"recovery_complete","walletLamports":438673339}
+bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)
+{"at":"2026-10-04T07:51:22.906Z","event":"recovery_preflight","tokenRaw":"0","walletLamports":420861924}
+{"at":"2026-10-04T07:51:22.908Z","event":"sell_started","reason":"recover_expired_sell","requiredMinimumLamports":null}
+{"at":"2026-10-04T07:51:22.944Z","event":"sell_skipped_zero_balance"}
+{"at":"2026-10-04T07:51:22.983Z","event":"recovery_complete","walletLamports":420861924}

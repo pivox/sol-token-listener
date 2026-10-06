@@ -1,0 +1,13 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { isEligibleForCanary } from './selection-policy.mjs';
+const base = { creationFinalized: true, quoteMint: '11111111111111111111111111111111', mayhem: false, complete: false, mintOwner: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb', realQuoteLamports: '7000000000', realTokenRaw: '500000000000000' };
+const summary = { uniqueBuyers: 5 };
+test('accepts a liquid SOL curve with recent distinct buyers', () => assert.equal(isEligibleForCanary(base, summary), true));
+test('rejects reserve at the buy guard threshold', () => assert.equal(isEligibleForCanary({ ...base, realQuoteLamports: '20000000000' }, summary), false));
+test('rejects depleted token reserve at the buy guard threshold', () => assert.equal(isEligibleForCanary({ ...base, realTokenRaw: '300000000000000' }, summary), false));
+test('rejects a curve with too few buyers', () => assert.equal(isEligibleForCanary(base, { uniqueBuyers: 2 }), false));
+import { failedBuyNeedsRecovery } from './trade-recovery-policy.mjs';
+test('failed finalized BUY without a token account does not need recovery', () => assert.equal(failedBuyNeedsRecovery({ confirmationStatus: 'finalized', err: { InstructionError: [3, { Custom: 6002 }] } }, false), false));
+test('successful BUY needs position reconciliation', () => assert.equal(failedBuyNeedsRecovery({ confirmationStatus: 'finalized', err: null }, true), true));
+test('unknown BUY status needs recovery or stop', () => assert.equal(failedBuyNeedsRecovery(null, false), true));

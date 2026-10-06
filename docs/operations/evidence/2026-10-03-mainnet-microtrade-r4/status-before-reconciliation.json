@@ -1,0 +1,94 @@
+{
+  "startedAt": "2026-10-03T18:07:35.056Z",
+  "deadlineAt": "2026-10-03T22:07:35.056Z",
+  "status": "open_position_or_uncertain",
+  "stage": "done",
+  "waves": 17,
+  "observed": 255,
+  "buys": 6,
+  "sells": 5,
+  "failed": 2,
+  "estimatedEconomicPnlUsdt": -0.34102864521000004,
+  "walletLamports": 448253355,
+  "currentMint": "8618iPkvBaq6zE5pTLxK7fQTEFM5qda5Xdhj2DGtpump",
+  "currentLog": "/Users/haythem.mabrouk/workspace/perso/sol-token-listener/docs/operations/evidence/2026-10-03-mainnet-microtrade-r4/wave-017/canary.jsonl",
+  "lastError": "Récupération impossible pour 8618iPkvBaq6zE5pTLxK7fQTEFM5qda5Xdhj2DGtpump",
+  "trades": [
+    {
+      "mint": "EfQ2pVTshDhgWAarSGB1hKKmqxbned1inK4DJXVWU8LK",
+      "wave": 1,
+      "buySignature": "2rXBYBUAwPtaBaz7qAKN3Sc7P78ubFbgdRQmQ2ZfCcH57Kvt2PHGrYAZsAs3gzqz15EcBW3WMT9QepnaVE2jjj1A",
+      "sellSignature": "82DMMzN3i2BnkXGo2x3bVKLcRrVTtaYyri4BRDkZTEajLximkKQ6Lg2jsukuuziSSHF5KFnTwGCpWKDHnC17nCi",
+      "buyers": 5,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.05526176876
+    },
+    {
+      "mint": "Bd4PmXrWJTyziWfXy2mZ1P9vwHarnfe1aSjphjgfpump",
+      "wave": 2,
+      "buySignature": null,
+      "sellSignature": null,
+      "buyers": 0,
+      "status": "achat non soumis",
+      "pnlUsdt": null
+    },
+    {
+      "mint": "BCF8g6T3H9F6ZYnJhgGjY7kXHymBf8qWaTa66yykpump",
+      "wave": 4,
+      "buySignature": null,
+      "sellSignature": null,
+      "buyers": 0,
+      "status": "achat non soumis",
+      "pnlUsdt": null
+    },
+    {
+      "mint": "GXosqLXVtkcqUgg9aAejSBiZApmvsc5gT7ab1AxEpump",
+      "wave": 5,
+      "buySignature": "3DXxgTvmZUW7s9NWucQKVruhb3sSqg2APJnNLrWUnhy8RhFqLbXav755jgPtyXjwvErDiBoaYXk4njvNYHCFRN5r",
+      "sellSignature": "5xaumpp3rbwrBzB9DkhvyqjNRxeBxeDQYZbjpLLDKh3PG6W4PHPR4jEdLc3NTkXPmyKdQUzFaAAcW9nynEAuuNwM",
+      "buyers": 5,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": 0.25490674879999997
+    },
+    {
+      "mint": "fdAny17n6AJXFN4uaf5t6GEv9ALiSq79S45VvBBpump",
+      "wave": 9,
+      "buySignature": "3pJA3MPathHxTCVWTFr9qnyrbvLgERyWgsiwxqespTWcdoCpVnUTvragpfpwziWPdUu9x5PeD67KsARSkkfL54DG",
+      "sellSignature": "1aL4vXTqUroH74rpHeB9AdL167LRa1jG5QRSn9V5XpXk9iTgPoJA27KWJAsckjupgox459irvL75mNnufMJ74MF",
+      "buyers": 1,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.55203313428
+    },
+    {
+      "mint": "EYcGyvAvC4zJx1Ubq29ejdhauHcveosTFAEkqfGnRNWS",
+      "wave": 11,
+      "buySignature": "3stwiYTMbNkncxmgi4Xs4ttzXecFT8tQVTKwsa9z6Hvg9Jc2qMuqQhKZHrY5XeRsSzGWGugXiJMRCNUfr2AuYvYF",
+      "sellSignature": "5ZkSzcjCpwWbe3vP9bAQPkcotXnFLACfn1CFhWTzSWcmwYpW9nzrmCiGryybYm5hJcDtoZsJMHPbs7tZ6YKxib57",
+      "buyers": 5,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": 0.1905082866
+    },
+    {
+      "mint": "FshDDX7vg1dftPkf37ypiEUE8vTH4S7qLAa6SQhE1gYJ",
+      "wave": 14,
+      "buySignature": "2aewfdM4TioqnuHmY7WCfZtqrYihJje386U6SiTZpymowmcv49DQiEKaZd9W3k4LnxoLYiheFPYo8KnwiP5BbLua",
+      "sellSignature": "2EEe5FzkMvvtwtSd3gXP4cWcVBP2HmGFFySfAZU93nJEqocgJMzP1FPJDT4P6dmMNYZmCxmL92ryTGrQigaYGHtQ",
+      "buyers": 1,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.17914877757
+    },
+    {
+      "mint": "8618iPkvBaq6zE5pTLxK7fQTEFM5qda5Xdhj2DGtpump",
+      "wave": 17,
+      "buySignature": "3nzrWAsyD17eVpkqPCe7QrYT5T99YRHFNDBr8jYCKfw1gamri5AFCXZBysTXZhMELFy17TK2JV9cihmJWBTdKhEe",
+      "sellSignature": null,
+      "buyers": 0,
+      "status": "vérification manuelle requise",
+      "pnlUsdt": null
+    }
+  ],
+  "preflightAt": "2026-10-03T18:07:35.258Z",
+  "waveAt": "2026-10-03T18:59:42.386Z",
+  "updatedAt": "2026-10-03T20:28:32.466Z",
+  "lastTradeEvent": "fatal"
+}

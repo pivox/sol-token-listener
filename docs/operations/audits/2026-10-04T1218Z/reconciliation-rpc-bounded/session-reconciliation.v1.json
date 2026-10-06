@@ -1,0 +1,216 @@
+{
+  "schema": "session_transaction_reconciliation.v1",
+  "session": "2026-10-04-mainnet-microtrade-r8",
+  "wallet": "2LvenbX1TdhX8EbxGBmcZYiXuZFN4utA8QZY1UgGXwmZ",
+  "rpcResponses": {
+    "indexedSignatures": 1916,
+    "collectedSignatures": 12,
+    "statuses": {
+      "RPC_ERROR": 12
+    }
+  },
+  "A_walletCash": {
+    "startLamportsRaw": "420861924",
+    "endLamportsRaw": "402939765",
+    "deltaLamportsRaw": "-17922159",
+    "chainDeltaForTradeSignaturesRaw": null,
+    "unexplainedVersusTradeTransactionsLamportsRaw": null
+  },
+  "B_externalMovements": {
+    "identifiedCandidates": [],
+    "coverage": "INCOMPLETE",
+    "netLamportsRaw": null,
+    "note": "Transaction index does not establish complete wallet history or counterparty ownership. Candidates require explicit review."
+  },
+  "C_recoverableAccountBalances": {
+    "accounts": [
+      {
+        "mint": "HKEZKN1ev8hD2utDdefpcujufTwALCsVvdRcJXwGpump",
+        "address": "8UmaYwrHcmjBn1xzmaLRjxVRHYZqwcrWybRJEKqM3JYE",
+        "lifecycle": "UNKNOWN",
+        "startLamportsRaw": null,
+        "endLamportsRaw": null,
+        "deltaLamportsRaw": null
+      },
+      {
+        "mint": "Bvh9xjVqTWA2AAM7HE2Lt11fbhsdAf3WyEALQwHMgSut",
+        "address": "5iPwwccgYqoeBHk3MnnFVDsTjjUmZAaaCN7RejN1QvRo",
+        "lifecycle": "UNKNOWN",
+        "startLamportsRaw": null,
+        "endLamportsRaw": null,
+        "deltaLamportsRaw": null
+      },
+      {
+        "mint": "3bqjGQ7HQC7JxG6fq8K6U3QYGKNMWEYsfAGn1HWc27yY",
+        "address": "GdtyZRokXvaR8Lx82r12SDtCXyPgCUJ9EcKEufSK9LzB",
+        "lifecycle": "UNKNOWN",
+        "startLamportsRaw": null,
+        "endLamportsRaw": null,
+        "deltaLamportsRaw": null
+      },
+      {
+        "mint": "2Uc6S4C5aQ5NH1J5Co4HPwdSuZCS8QGmBPd5SRxppump",
+        "address": "HXa6WT2ezrddpLyo1FDr965WCSWC4P7ytoB1aRbRcWQq",
+        "lifecycle": "UNKNOWN",
+        "startLamportsRaw": null,
+        "endLamportsRaw": null,
+        "deltaLamportsRaw": null
+      },
+      {
+        "mint": "BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump",
+        "address": "hkWVomAdPmPkqvb6DX4wZkibtii4eJ411Zwid2765Vi",
+        "lifecycle": "UNKNOWN",
+        "startLamportsRaw": null,
+        "endLamportsRaw": null,
+        "deltaLamportsRaw": null
+      },
+      {
+        "mint": "Cbq36xHU7ynVrrwcAN75SDYkvCmLZRX5cwUPYmUJpump",
+        "address": "7i3sGjE4cPFGj1ean2EfVRmCeFa2YDkVd3szLjMww1WV",
+        "lifecycle": "UNKNOWN",
+        "startLamportsRaw": null,
+        "endLamportsRaw": null,
+        "deltaLamportsRaw": null
+      }
+    ],
+    "deltaLamportsRaw": null,
+    "coverage": "INCOMPLETE"
+  },
+  "D_residualPositions": {
+    "positions": [
+      {
+        "mint": "HKEZKN1ev8hD2utDdefpcujufTwALCsVvdRcJXwGpump",
+        "tokenAmountRaw": null,
+        "liquidationValueRaw": null
+      },
+      {
+        "mint": "Bvh9xjVqTWA2AAM7HE2Lt11fbhsdAf3WyEALQwHMgSut",
+        "tokenAmountRaw": null,
+        "liquidationValueRaw": null
+      },
+      {
+        "mint": "3bqjGQ7HQC7JxG6fq8K6U3QYGKNMWEYsfAGn1HWc27yY",
+        "tokenAmountRaw": null,
+        "liquidationValueRaw": null
+      },
+      {
+        "mint": "2Uc6S4C5aQ5NH1J5Co4HPwdSuZCS8QGmBPd5SRxppump",
+        "tokenAmountRaw": null,
+        "liquidationValueRaw": null
+      },
+      {
+        "mint": "BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump",
+        "tokenAmountRaw": null,
+        "liquidationValueRaw": null
+      },
+      {
+        "mint": "Cbq36xHU7ynVrrwcAN75SDYkvCmLZRX5cwUPYmUJpump",
+        "tokenAmountRaw": null,
+        "liquidationValueRaw": null
+      }
+    ],
+    "liquidationValueRaw": null,
+    "coverage": "INCOMPLETE"
+  },
+  "E_economicResultLamportsRaw": null,
+  "E_status": "INCOMPLETE_WALLET_HISTORY",
+  "fees": {
+    "observedNetworkFeesRaw": "0",
+    "walletFeePayerTransactions": 0,
+    "feeRowsCompleteForCollectedTransactions": true,
+    "alreadyIncludedInWalletBalanceDeltas": true,
+    "subtractedAgain": false
+  },
+  "positions": [
+    {
+      "wave": 1,
+      "mint": "HKEZKN1ev8hD2utDdefpcujufTwALCsVvdRcJXwGpump",
+      "ata": "8UmaYwrHcmjBn1xzmaLRjxVRHYZqwcrWybRJEKqM3JYE",
+      "buySignature": "43zoVkSwd749ja5iTzvty93DV9cKbyBVTZw3Rc1FhCuNp95DxhGGQKuuUd4EWcxNS78a6GaDwkbCqhMdrTtTNR99",
+      "sellSignature": "Xs5QUTAfpS5XVz6WxNyTUBjaPi64VESt9nhGEAbZvxEQ9tJMbtBqckB6RXdDgPLpXiSmwfWtN6FWo3xHpM2AURM",
+      "buyTransactionStatus": "RPC_ERROR",
+      "sellTransactionStatus": "RPC_ERROR",
+      "ataLifecycle": "UNKNOWN",
+      "startLamportsRaw": null,
+      "endLamportsRaw": null,
+      "lockedBalanceDeltaRaw": null,
+      "residualTokenRaw": null,
+      "residualValueRaw": null
+    },
+    {
+      "wave": 2,
+      "mint": "Bvh9xjVqTWA2AAM7HE2Lt11fbhsdAf3WyEALQwHMgSut",
+      "ata": "5iPwwccgYqoeBHk3MnnFVDsTjjUmZAaaCN7RejN1QvRo",
+      "buySignature": "5vN5Q8LvGRdf4jRJJGmz8xEWxkLoQBzCcAJkzuMQJ4myqnRumehZJfzXkCxz4x1Ga1Q9RNw4wRxZsaUi82vCiGc8",
+      "sellSignature": "4WSJSSj55gWA8bikD9wjuZEpaWjtDRzDCsPCk5LPi7Fkr9FnMx6FjedtCVumEqU7rnVe9SvqhMbxZSMTqWZMMTDB",
+      "buyTransactionStatus": "RPC_ERROR",
+      "sellTransactionStatus": "RPC_ERROR",
+      "ataLifecycle": "UNKNOWN",
+      "startLamportsRaw": null,
+      "endLamportsRaw": null,
+      "lockedBalanceDeltaRaw": null,
+      "residualTokenRaw": null,
+      "residualValueRaw": null
+    },
+    {
+      "wave": 3,
+      "mint": "3bqjGQ7HQC7JxG6fq8K6U3QYGKNMWEYsfAGn1HWc27yY",
+      "ata": "GdtyZRokXvaR8Lx82r12SDtCXyPgCUJ9EcKEufSK9LzB",
+      "buySignature": "4xHtQLMx9WpaVXsRDBHMhtcoauFiqvG2ZjGfvxGsWhjYLNNcWsMrbTnoZMfa9M7PzCafPwofJ9uUx1M9atm1K1Bp",
+      "sellSignature": "2eNr8uRteftEb7oorecw3RwvsSTDzLhmCYxSfrnznoSRXsgVAjUwubtFpGjQJc8cmSmXf5hUoix2ZAd8SpNbrz4h",
+      "buyTransactionStatus": "RPC_ERROR",
+      "sellTransactionStatus": "RPC_ERROR",
+      "ataLifecycle": "UNKNOWN",
+      "startLamportsRaw": null,
+      "endLamportsRaw": null,
+      "lockedBalanceDeltaRaw": null,
+      "residualTokenRaw": null,
+      "residualValueRaw": null
+    },
+    {
+      "wave": 4,
+      "mint": "2Uc6S4C5aQ5NH1J5Co4HPwdSuZCS8QGmBPd5SRxppump",
+      "ata": "HXa6WT2ezrddpLyo1FDr965WCSWC4P7ytoB1aRbRcWQq",
+      "buySignature": "2WjRhYkTSUFL64msgwiqu6jaTDqLciGD8ndAoaMC8qUCNAuop46uscnRbBKCj6PXWBisyesfQLnqTPhpsAokykGc",
+      "sellSignature": "3ntQh5YwLWTSMkM1LEy1gD2F5rfEbHGMfaMVc6nLTq4Br9qzCbp1MKfKNP1BonvvRNgUFQmdLajF2HMcXJcaCRk3",
+      "buyTransactionStatus": "RPC_ERROR",
+      "sellTransactionStatus": "RPC_ERROR",
+      "ataLifecycle": "UNKNOWN",
+      "startLamportsRaw": null,
+      "endLamportsRaw": null,
+      "lockedBalanceDeltaRaw": null,
+      "residualTokenRaw": null,
+      "residualValueRaw": null
+    },
+    {
+      "wave": 7,
+      "mint": "BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump",
+      "ata": "hkWVomAdPmPkqvb6DX4wZkibtii4eJ411Zwid2765Vi",
+      "buySignature": "5iRpc16DexuYPwSKLwEXdw65x2tRJo7q1Cwp31pDTzsDosYPmvtptPyQZdCEb8VzYojT68AJ5KY8mcUWW4aR94up",
+      "sellSignature": "4gWkjZvjgmCwvY6yQwFTyBtAEwpy4bbcnDvPL6JxEGuzb1nNfQ2DHmifvqsDzENXNqwKh7E7wqzW41HhMSAe6tg8",
+      "buyTransactionStatus": "RPC_ERROR",
+      "sellTransactionStatus": "RPC_ERROR",
+      "ataLifecycle": "UNKNOWN",
+      "startLamportsRaw": null,
+      "endLamportsRaw": null,
+      "lockedBalanceDeltaRaw": null,
+      "residualTokenRaw": null,
+      "residualValueRaw": null
+    },
+    {
+      "wave": 8,
+      "mint": "Cbq36xHU7ynVrrwcAN75SDYkvCmLZRX5cwUPYmUJpump",
+      "ata": "7i3sGjE4cPFGj1ean2EfVRmCeFa2YDkVd3szLjMww1WV",
+      "buySignature": "3TVpSP47WK4ZEZaaKUvW8D69AMXnifLjXXHaiZtd8xX6TgXAAHdQXzBbWavutNEqkyqAnaf95usYJk6XQnFo6UvJ",
+      "sellSignature": "4CQmUtKmD8qHwdwkeM2LdaWVUhaErUUpeX9SkKRXm324gRVeDcaumPQquHLneTNS55RopKxhUZDP5CyfasRUaL7g",
+      "buyTransactionStatus": "RPC_ERROR",
+      "sellTransactionStatus": "RPC_ERROR",
+      "ataLifecycle": "UNKNOWN",
+      "startLamportsRaw": null,
+      "endLamportsRaw": null,
+      "lockedBalanceDeltaRaw": null,
+      "residualTokenRaw": null,
+      "residualValueRaw": null
+    }
+  ]
+}

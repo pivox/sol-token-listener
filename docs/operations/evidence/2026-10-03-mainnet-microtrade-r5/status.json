@@ -1,0 +1,48 @@
+{
+  "startedAt": "2026-10-03T21:36:23.564Z",
+  "deadlineAt": "2026-10-03T22:06:23.564Z",
+  "status": "finished",
+  "stage": "done",
+  "waves": 6,
+  "observed": 90,
+  "buys": 2,
+  "sells": 2,
+  "failed": 0,
+  "estimatedEconomicPnlUsdt": -0.4715885772,
+  "walletLamports": 446173140,
+  "currentMint": null,
+  "currentLog": null,
+  "lastError": null,
+  "trades": [
+    {
+      "mint": "AT32f1p51FHjTqMJk54mM4i5vMAsRL1CFoxNQUg5pump",
+      "wave": 5,
+      "buySignature": "NgykNoFdqffcPwqfjhnNYRupnYVPo3JPhD2WXPQrUiiGMZE4B1suJDXDjPKXavyMToYsudhpKnrqK1iuKfxkBrT",
+      "sellSignature": "2uXNinUktBBkRTQtbkMrrvdJDoWsY1tGvAvyGtQijKCivQiUabJdfzmpBKf859GZh6CtKS55Z6q4A5xYiNwRn6Kz",
+      "buyers": 0,
+      "qualifyingBuys": 0,
+      "trigger": "net_profit_target",
+      "targetProfitUsdt": "0.01",
+      "exitReason": "net_profit_target",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": 0.029639493960000002
+    },
+    {
+      "mint": "7JGeJDmu9vdENkWuxtRdZfawBZRsWaaoUJDaNEJRpWxU",
+      "wave": 6,
+      "buySignature": "512nUGf3z6LQukxubg5zNNR7RuP5BoWt6vjkCfE5rnvhWLP6yATPsq2YoSLCvoQwad7XieocEpnnqQ52tiPZtPLe",
+      "sellSignature": "3Qscst2TsqVECKmdsSuJK9XSjw8U1mJGFMLNF9bBATKzK52TpUuu3V2ZNeoZbkXLTy8BxtrPP2DkKq8BaBdu9uy4",
+      "buyers": 0,
+      "qualifyingBuys": 0,
+      "trigger": "net_profit_target",
+      "targetProfitUsdt": "0.01",
+      "exitReason": "max_hold_15_minutes",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.50122807116
+    }
+  ],
+  "preflightAt": "2026-10-03T21:36:23.708Z",
+  "waveAt": "2026-10-03T21:42:55.113Z",
+  "updatedAt": "2026-10-03T22:06:23.607Z",
+  "lastTradeEvent": null
+}

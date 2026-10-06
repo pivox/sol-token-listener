@@ -1,0 +1,27 @@
+{"at":"2026-10-03T22:39:45.458Z","event":"preflight_ok","walletLamports":446173140}
+{"at":"2026-10-03T22:39:45.498Z","event":"wave_started","wave":1}
+{"at":"2026-10-03T22:39:45.500Z","event":"child_started","script":"discover.mjs","pid":55838,"log":"runner.log"}
+{"at":"2026-10-03T22:41:03.495Z","event":"wave_complete","wave":1,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-03T22:41:08.595Z","event":"wave_started","wave":2}
+{"at":"2026-10-03T22:41:08.598Z","event":"child_started","script":"discover.mjs","pid":56564,"log":"runner.log"}
+{"at":"2026-10-03T22:42:21.545Z","event":"wave_complete","wave":2,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-03T22:42:26.627Z","event":"wave_started","wave":3}
+{"at":"2026-10-03T22:42:26.630Z","event":"child_started","script":"discover.mjs","pid":57230,"log":"runner.log"}
+{"at":"2026-10-03T22:43:45.258Z","event":"wave_complete","wave":3,"observed":15,"chosen":"EKXPRCENhYVMA2jn4dQgMqZwaMcVgqL1WudhHyKU185s","code":0}
+{"at":"2026-10-03T22:43:45.260Z","event":"trade_started","mint":"EKXPRCENhYVMA2jn4dQgMqZwaMcVgqL1WudhHyKU185s","wave":3}
+{"at":"2026-10-03T22:43:45.264Z","event":"child_started","script":"canary.mjs","pid":57881,"log":"canary-runner.log"}
+{"at":"2026-10-03T22:44:33.095Z","event":"trade_complete","mint":"EKXPRCENhYVMA2jn4dQgMqZwaMcVgqL1WudhHyKU185s","status":"vendu, solde token 0","pnlUsdt":0.0131406462}
+{"at":"2026-10-03T22:44:38.175Z","event":"wave_started","wave":4}
+{"at":"2026-10-03T22:44:38.179Z","event":"child_started","script":"discover.mjs","pid":58289,"log":"runner.log"}
+{"at":"2026-10-03T22:45:48.779Z","event":"wave_complete","wave":4,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-03T22:45:53.875Z","event":"wave_started","wave":5}
+{"at":"2026-10-03T22:45:53.879Z","event":"child_started","script":"discover.mjs","pid":58865,"log":"runner.log"}
+{"at":"2026-10-03T22:47:10.511Z","event":"wave_complete","wave":5,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-03T22:47:15.624Z","event":"wave_started","wave":6}
+{"at":"2026-10-03T22:47:15.628Z","event":"child_started","script":"discover.mjs","pid":59605,"log":"runner.log"}
+{"at":"2026-10-03T22:48:26.185Z","event":"wave_complete","wave":6,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-03T22:48:31.249Z","event":"no_new_buy","status":"operator_stop"}
+{"at":"2026-10-03T22:48:31.251Z","event":"session_finished","walletLamports":444768915}
+{"at":"2026-10-03T22:50:23.144Z","event":"preflight_ok","walletLamports":444768915}
+{"at":"2026-10-03T22:50:23.191Z","event":"no_new_buy","status":"operator_stop"}
+{"at":"2026-10-03T22:50:23.192Z","event":"session_finished","walletLamports":444768915}

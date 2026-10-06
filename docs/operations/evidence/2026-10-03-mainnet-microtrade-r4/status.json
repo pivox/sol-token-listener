@@ -1,0 +1,172 @@
+{
+  "startedAt": "2026-10-03T18:07:35.056Z",
+  "deadlineAt": "2026-10-03T22:07:35.056Z",
+  "status": "finished",
+  "stage": "done",
+  "waves": 42,
+  "observed": 630,
+  "buys": 12,
+  "sells": 11,
+  "failed": 5,
+  "estimatedEconomicPnlUsdt": -0.72416584338,
+  "walletLamports": 453142550,
+  "currentMint": null,
+  "currentLog": null,
+  "lastError": "Découverte vague 42, code null",
+  "trades": [
+    {
+      "mint": "EfQ2pVTshDhgWAarSGB1hKKmqxbned1inK4DJXVWU8LK",
+      "wave": 1,
+      "buySignature": "2rXBYBUAwPtaBaz7qAKN3Sc7P78ubFbgdRQmQ2ZfCcH57Kvt2PHGrYAZsAs3gzqz15EcBW3WMT9QepnaVE2jjj1A",
+      "sellSignature": "82DMMzN3i2BnkXGo2x3bVKLcRrVTtaYyri4BRDkZTEajLximkKQ6Lg2jsukuuziSSHF5KFnTwGCpWKDHnC17nCi",
+      "buyers": 5,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.05526176876
+    },
+    {
+      "mint": "Bd4PmXrWJTyziWfXy2mZ1P9vwHarnfe1aSjphjgfpump",
+      "wave": 2,
+      "buySignature": null,
+      "sellSignature": null,
+      "buyers": 0,
+      "status": "achat non soumis",
+      "pnlUsdt": null
+    },
+    {
+      "mint": "BCF8g6T3H9F6ZYnJhgGjY7kXHymBf8qWaTa66yykpump",
+      "wave": 4,
+      "buySignature": null,
+      "sellSignature": null,
+      "buyers": 0,
+      "status": "achat non soumis",
+      "pnlUsdt": null
+    },
+    {
+      "mint": "GXosqLXVtkcqUgg9aAejSBiZApmvsc5gT7ab1AxEpump",
+      "wave": 5,
+      "buySignature": "3DXxgTvmZUW7s9NWucQKVruhb3sSqg2APJnNLrWUnhy8RhFqLbXav755jgPtyXjwvErDiBoaYXk4njvNYHCFRN5r",
+      "sellSignature": "5xaumpp3rbwrBzB9DkhvyqjNRxeBxeDQYZbjpLLDKh3PG6W4PHPR4jEdLc3NTkXPmyKdQUzFaAAcW9nynEAuuNwM",
+      "buyers": 5,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": 0.25490674879999997
+    },
+    {
+      "mint": "fdAny17n6AJXFN4uaf5t6GEv9ALiSq79S45VvBBpump",
+      "wave": 9,
+      "buySignature": "3pJA3MPathHxTCVWTFr9qnyrbvLgERyWgsiwxqespTWcdoCpVnUTvragpfpwziWPdUu9x5PeD67KsARSkkfL54DG",
+      "sellSignature": "1aL4vXTqUroH74rpHeB9AdL167LRa1jG5QRSn9V5XpXk9iTgPoJA27KWJAsckjupgox459irvL75mNnufMJ74MF",
+      "buyers": 1,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.55203313428
+    },
+    {
+      "mint": "EYcGyvAvC4zJx1Ubq29ejdhauHcveosTFAEkqfGnRNWS",
+      "wave": 11,
+      "buySignature": "3stwiYTMbNkncxmgi4Xs4ttzXecFT8tQVTKwsa9z6Hvg9Jc2qMuqQhKZHrY5XeRsSzGWGugXiJMRCNUfr2AuYvYF",
+      "sellSignature": "5ZkSzcjCpwWbe3vP9bAQPkcotXnFLACfn1CFhWTzSWcmwYpW9nzrmCiGryybYm5hJcDtoZsJMHPbs7tZ6YKxib57",
+      "buyers": 5,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": 0.1905082866
+    },
+    {
+      "mint": "FshDDX7vg1dftPkf37ypiEUE8vTH4S7qLAa6SQhE1gYJ",
+      "wave": 14,
+      "buySignature": "2aewfdM4TioqnuHmY7WCfZtqrYihJje386U6SiTZpymowmcv49DQiEKaZd9W3k4LnxoLYiheFPYo8KnwiP5BbLua",
+      "sellSignature": "2EEe5FzkMvvtwtSd3gXP4cWcVBP2HmGFFySfAZU93nJEqocgJMzP1FPJDT4P6dmMNYZmCxmL92ryTGrQigaYGHtQ",
+      "buyers": 1,
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.17914877757
+    },
+    {
+      "mint": "8618iPkvBaq6zE5pTLxK7fQTEFM5qda5Xdhj2DGtpump",
+      "wave": 17,
+      "buySignature": "3nzrWAsyD17eVpkqPCe7QrYT5T99YRHFNDBr8jYCKfw1gamri5AFCXZBysTXZhMELFy17TK2JV9cihmJWBTdKhEe",
+      "sellSignature": null,
+      "buyers": 0,
+      "status": "BUY rejeté sur chaîne, aucun token reçu",
+      "pnlUsdt": -0.0053982
+    },
+    {
+      "mint": "HcxLXJ4WC6qLnRQSyjkFm2pgLRTZz92djtZACBeupump",
+      "wave": 19,
+      "buySignature": "3GgAZNmkxt383zjhbYqPcg15iiQCGL2y8SoJeVuot969cuyRswMfPeJbWVneg8aWAMWntg7nLNfq9t14gjEp4z7f",
+      "sellSignature": "3skPKPneHgm4WcMxC5b1vEyivzVio1xScVUJ8MH9wUyBHmfvwhDfWakBBEKqKWLirF6xWeuCq89usQgLSt9ziJo5",
+      "buyers": 0,
+      "sales": 3,
+      "trigger": "three_external_sales_each_above_our_buy",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.06398789188
+    },
+    {
+      "mint": "C8GemFi1XmhWRHCKArYM4YKCfq2y3kv8maY3VCFaPXRd",
+      "wave": 29,
+      "buySignature": "xorfDqdNJdnVxd2ke1ASDPGh8jTWaJBEeBBBG26GHKGZF1Qyw7NT1wgYxe6bttZmdTB3YdnjviXWtpDT9gCKrQM",
+      "sellSignature": "4SXqjfCC7jvznXDunc4tUE7gdKqSZ69eVofGyc8Qf57iwJBvveGeHyrN3wqhbLpxqe2j5p7vTVayGrQJtwMakjyh",
+      "buyers": 0,
+      "sales": 4,
+      "trigger": "three_external_sales_each_above_our_buy",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.04008743872
+    },
+    {
+      "mint": "8jgc9VFikDoUkUjGxnssQJepTpQwk5i68ZyHNnhspAd",
+      "wave": 31,
+      "buySignature": "2bd2e8TDEGD73YTgH2ne7EvJNoKGsbFXLLZoqKkwwJN3esMREWkrXJQHxZ8nAak8TRzWP9Bqpu64ucpsdcyuU4e8",
+      "sellSignature": "5w2d46LwDiXwqcFTM2r4cU1716sQS7sTjczEDhjh9wRiw5KA6gUB42s2mkDohdAmNZohSND6ywdQbSrka6tmcGmb",
+      "buyers": 0,
+      "sales": 6,
+      "trigger": "three_external_sales_each_above_our_buy",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.02818775392
+    },
+    {
+      "mint": "AoUWYtabsfpoSVH8YkmxuhVRnTeUGoRPWeDT29kHpump",
+      "wave": 36,
+      "buySignature": "2jdYMVkRo7QKgKaWDnzj2dUgA6qaZucP7EvvjsQWVNu5aBvHsK7xeC8X2skPpvsndD6EkohaAGBvYE8Xkoe8EMou",
+      "sellSignature": "41J7AGJyNh2jb5YdBmyr6txXEatjp6WbfgB6VHnwpajjedUXbAdDa2cTiRMJipAA5ebiqMHyS7UkxUUJqVQ2ACf5",
+      "buyers": 0,
+      "qualifyingBuys": 3,
+      "trigger": "three_external_buys_each_above_our_buy",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.08165393125
+    },
+    {
+      "mint": "6wvBPGkUDXSHdnxs3q5QpuExT5PWuAYj5SzbyrQfpump",
+      "wave": 37,
+      "buySignature": null,
+      "sellSignature": null,
+      "buyers": 0,
+      "qualifyingBuys": 0,
+      "trigger": "three_external_buys_each_above_our_buy",
+      "status": "achat non soumis",
+      "pnlUsdt": null
+    },
+    {
+      "mint": "DpKxYthSRrPmzeoyud7tmdUnbZL9cWvSY2UTU4x2pump",
+      "wave": 40,
+      "buySignature": "tyLuufYyKsMeCWWWMxBTqZiZwyMBvf4optNB5karyUsi7Hfh2uc73qaNDaUMHmKZTMgxd8UVXk3uHvrt9df7Kn5",
+      "sellSignature": "66M1d1KKknLKKV7GoRdh9yVAEtFGkYkregaz4ca7oWmQQeu5BpqzLj5G8eL6rVp5BdH9AaEq13vg4FPaLPZHymzt",
+      "buyers": 0,
+      "qualifyingBuys": 3,
+      "trigger": "three_external_buys_each_above_our_buy",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.15596127372000002
+    },
+    {
+      "mint": "2jJYw8hvJvBBGEC7Y1nrUtJTi36tNd9qkNdmjwVapump",
+      "wave": 41,
+      "buySignature": "5oTsHv5bjvLuHQPUiFGBcZvAskyTt1YUQZVQXGv8b22usJjyk88vox6qjH8JExTu6RovDJWhvCD4NLcpzrdx19Yw",
+      "sellSignature": "4fDdibNk1w7FAX78C39yMrBw84CY4R3fRqL8zGrJsYLsksdojfkwYrL3qGSk5iX7FGuo7N9iPds7SbkRczbUk3wb",
+      "buyers": 0,
+      "qualifyingBuys": 3,
+      "trigger": "three_external_buys_each_above_our_buy",
+      "status": "vendu, solde token 0",
+      "pnlUsdt": -0.00786070868
+    }
+  ],
+  "preflightAt": "2026-10-03T21:06:56.556Z",
+  "waveAt": "2026-10-03T21:19:39.138Z",
+  "updatedAt": "2026-10-03T21:20:40.839Z",
+  "lastTradeEvent": null,
+  "reconciliation": "Signature BUY finalisée en erreur Custom 6002; aucun compte token; frais 45000 lamports; cinq autres comptes token à zéro sur chaîne."
+}

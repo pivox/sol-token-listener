@@ -1,0 +1,49 @@
+{"at":"2026-10-04T10:24:01.819Z","event":"preflight_ok","walletLamports":420861924}
+{"at":"2026-10-04T10:24:01.858Z","event":"wave_started","wave":1}
+{"at":"2026-10-04T10:24:01.860Z","event":"child_started","script":"discover.mjs","pid":1529,"log":"runner.log"}
+{"at":"2026-10-04T10:25:37.434Z","event":"wave_complete","wave":1,"observed":15,"chosen":"HKEZKN1ev8hD2utDdefpcujufTwALCsVvdRcJXwGpump","code":0}
+{"at":"2026-10-04T10:25:37.436Z","event":"trade_started","mint":"HKEZKN1ev8hD2utDdefpcujufTwALCsVvdRcJXwGpump","wave":1}
+{"at":"2026-10-04T10:25:37.439Z","event":"child_started","script":"canary.mjs","pid":2303,"log":"canary-runner.log"}
+{"at":"2026-10-04T10:30:46.138Z","event":"trade_complete","mint":"HKEZKN1ev8hD2utDdefpcujufTwALCsVvdRcJXwGpump","status":"vendu, solde token 0","pnlUsdt":-0.1119436684}
+{"at":"2026-10-04T10:30:51.241Z","event":"wave_started","wave":2}
+{"at":"2026-10-04T10:30:51.245Z","event":"child_started","script":"discover.mjs","pid":4997,"log":"runner.log"}
+{"at":"2026-10-04T10:32:24.632Z","event":"wave_complete","wave":2,"observed":15,"chosen":"Bvh9xjVqTWA2AAM7HE2Lt11fbhsdAf3WyEALQwHMgSut","code":0}
+{"at":"2026-10-04T10:32:24.633Z","event":"trade_started","mint":"Bvh9xjVqTWA2AAM7HE2Lt11fbhsdAf3WyEALQwHMgSut","wave":2}
+{"at":"2026-10-04T10:32:24.636Z","event":"child_started","script":"canary.mjs","pid":5797,"log":"canary-runner.log"}
+{"at":"2026-10-04T10:37:33.407Z","event":"trade_complete","mint":"Bvh9xjVqTWA2AAM7HE2Lt11fbhsdAf3WyEALQwHMgSut","status":"vendu, solde token 0","pnlUsdt":-0.32935728756000004}
+{"at":"2026-10-04T10:37:38.484Z","event":"wave_started","wave":3}
+{"at":"2026-10-04T10:37:38.488Z","event":"child_started","script":"discover.mjs","pid":8390,"log":"runner.log"}
+{"at":"2026-10-04T10:39:09.602Z","event":"wave_complete","wave":3,"observed":15,"chosen":"3bqjGQ7HQC7JxG6fq8K6U3QYGKNMWEYsfAGn1HWc27yY","code":0}
+{"at":"2026-10-04T10:39:09.603Z","event":"trade_started","mint":"3bqjGQ7HQC7JxG6fq8K6U3QYGKNMWEYsfAGn1HWc27yY","wave":3}
+{"at":"2026-10-04T10:39:09.605Z","event":"child_started","script":"canary.mjs","pid":9232,"log":"canary-runner.log"}
+{"at":"2026-10-04T10:39:30.722Z","event":"trade_complete","mint":"3bqjGQ7HQC7JxG6fq8K6U3QYGKNMWEYsfAGn1HWc27yY","status":"vendu, solde token 0","pnlUsdt":0.08253842358999999}
+{"at":"2026-10-04T10:39:35.789Z","event":"wave_started","wave":4}
+{"at":"2026-10-04T10:39:35.792Z","event":"child_started","script":"discover.mjs","pid":9458,"log":"runner.log"}
+{"at":"2026-10-04T10:41:18.888Z","event":"wave_complete","wave":4,"observed":15,"chosen":"2Uc6S4C5aQ5NH1J5Co4HPwdSuZCS8QGmBPd5SRxppump","code":0}
+{"at":"2026-10-04T10:41:18.890Z","event":"trade_started","mint":"2Uc6S4C5aQ5NH1J5Co4HPwdSuZCS8QGmBPd5SRxppump","wave":4}
+{"at":"2026-10-04T10:41:18.892Z","event":"child_started","script":"canary.mjs","pid":10301,"log":"canary-runner.log"}
+{"at":"2026-10-04T10:46:29.149Z","event":"trade_complete","mint":"2Uc6S4C5aQ5NH1J5Co4HPwdSuZCS8QGmBPd5SRxppump","status":"vendu, solde token 0","pnlUsdt":-0.22081096267}
+{"at":"2026-10-04T10:46:34.214Z","event":"wave_started","wave":5}
+{"at":"2026-10-04T10:46:34.216Z","event":"child_started","script":"discover.mjs","pid":12852,"log":"runner.log"}
+{"at":"2026-10-04T10:48:01.212Z","event":"wave_complete","wave":5,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-04T10:48:06.276Z","event":"wave_started","wave":6}
+{"at":"2026-10-04T10:48:06.278Z","event":"child_started","script":"discover.mjs","pid":13624,"log":"runner.log"}
+{"at":"2026-10-04T10:49:26.824Z","event":"wave_complete","wave":6,"observed":15,"chosen":null,"code":0}
+{"at":"2026-10-04T10:49:31.893Z","event":"wave_started","wave":7}
+{"at":"2026-10-04T10:49:31.897Z","event":"child_started","script":"discover.mjs","pid":14346,"log":"runner.log"}
+{"at":"2026-10-04T10:50:56.645Z","event":"wave_complete","wave":7,"observed":15,"chosen":"BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump","code":0}
+{"at":"2026-10-04T10:50:56.647Z","event":"trade_started","mint":"BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump","wave":7}
+{"at":"2026-10-04T10:50:56.649Z","event":"child_started","script":"canary.mjs","pid":15040,"log":"canary-runner.log"}
+{"at":"2026-10-04T10:56:06.881Z","event":"trade_complete","mint":"BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump","status":"vendu, solde token 0","pnlUsdt":-0.27422656506}
+{"at":"2026-10-04T10:56:11.947Z","event":"wave_started","wave":8}
+{"at":"2026-10-04T10:56:11.950Z","event":"child_started","script":"discover.mjs","pid":17602,"log":"runner.log"}
+{"at":"2026-10-04T10:57:39.079Z","event":"wave_complete","wave":8,"observed":15,"chosen":"Cbq36xHU7ynVrrwcAN75SDYkvCmLZRX5cwUPYmUJpump","code":0}
+{"at":"2026-10-04T10:57:39.080Z","event":"trade_started","mint":"Cbq36xHU7ynVrrwcAN75SDYkvCmLZRX5cwUPYmUJpump","wave":8}
+{"at":"2026-10-04T10:57:39.082Z","event":"child_started","script":"canary.mjs","pid":18304,"log":"canary-runner.log"}
+{"at":"2026-10-04T11:02:51.978Z","event":"trade_complete","mint":"Cbq36xHU7ynVrrwcAN75SDYkvCmLZRX5cwUPYmUJpump","status":"vendu, solde token 0","pnlUsdt":-0.21884513834999997}
+{"at":"2026-10-04T11:02:57.087Z","event":"wave_started","wave":9}
+{"at":"2026-10-04T11:02:57.090Z","event":"child_started","script":"discover.mjs","pid":20981,"log":"runner.log"}
+{"at":"2026-10-04T11:03:21.799Z","event":"wave_complete","wave":9,"observed":15,"chosen":null,"code":null}
+{"at":"2026-10-04T11:03:21.801Z","event":"discovery_error"}
+{"at":"2026-10-04T11:03:36.881Z","event":"no_new_buy","status":"operator_stop"}
+{"at":"2026-10-04T11:03:36.883Z","event":"session_finished","walletLamports":402939765}

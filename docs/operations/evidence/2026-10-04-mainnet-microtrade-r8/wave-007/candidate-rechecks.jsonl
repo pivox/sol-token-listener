@@ -1,0 +1,3 @@
+{"at":"2026-10-04T10:50:56.171Z","event":"candidate_recheck","mint":"BQgvrXhbCgTG94DG4UToJY4Ggv1mmXRKw72z4eb9pump","realQuoteLamports":"4709973075","realTokenRaw":"647499163902433","complete":false,"eligible":true}
+{"at":"2026-10-04T10:50:56.208Z","event":"candidate_recheck","mint":"6udwQdTw1oiQNTipZQp73fcUXzTMRTS6vBphss9Lpump","realQuoteLamports":"871762956","realTokenRaw":"762800413869818","complete":false,"eligible":false}
+{"at":"2026-10-04T10:50:56.247Z","event":"candidate_recheck","mint":"xKkwYx1aQEvz5LNxstpkoLWkcWB23cLxU9FSMW7pump","realQuoteLamports":"883553805","realTokenRaw":"762402328441012","complete":false,"eligible":false}

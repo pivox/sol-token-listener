@@ -1,0 +1,10 @@
+{"at":"2026-10-03T17:50:49.451Z","event":"continued_started","watchedTokens":15,"maxSeconds":120}
+{"at":"2026-10-03T17:51:04.456Z","event":"continued_progress","elapsedSeconds":15,"recent45Seconds":{}}
+{"at":"2026-10-03T17:51:19.458Z","event":"continued_progress","elapsedSeconds":30,"recent45Seconds":{}}
+{"at":"2026-10-03T17:51:34.460Z","event":"continued_progress","elapsedSeconds":45,"recent45Seconds":{}}
+{"at":"2026-10-03T17:51:49.462Z","event":"continued_progress","elapsedSeconds":60,"recent45Seconds":{}}
+{"at":"2026-10-03T17:52:04.465Z","event":"continued_progress","elapsedSeconds":75,"recent45Seconds":{}}
+{"at":"2026-10-03T17:52:19.467Z","event":"continued_progress","elapsedSeconds":90,"recent45Seconds":{}}
+{"at":"2026-10-03T17:52:34.469Z","event":"continued_progress","elapsedSeconds":105,"recent45Seconds":{}}
+{"at":"2026-10-03T17:52:49.470Z","event":"continued_progress","elapsedSeconds":120,"recent45Seconds":{}}
+{"at":"2026-10-03T17:52:49.504Z","event":"continued_stopped","chosen":null,"reason":"max_120_seconds","totalObservedEvents":0}

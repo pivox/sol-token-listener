@@ -1,0 +1,20 @@
+bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)
+{"at":"2026-10-04T06:42:52.758Z","event":"preflight","mint":"DCzyKYrwaxK3Bi1vMCfGf4j2jaYicYmgbGpDgoKbpump","wallet":"2LvenbX1TdhX8EbxGBmcZYiXuZFN4utA8QZY1UgGXwmZ","initialWalletLamports":421978050,"krakenSolUsdt":120.88,"maxBuyLamports":8272667,"targetTokenRaw":"247548191848","expectedBuyLamports":"8024486","immediateSellQuoteLamports":"7822485","targetProfitUsdt":"0.01","targetProfitLamports":"82727","sellNetworkFeeReserveLamports":"50000","curveRealQuoteLamports":"2098745683","extensions":[18,19]}
+{"at":"2026-10-04T06:42:52.760Z","event":"building_buy_instructions"}
+{"at":"2026-10-04T06:42:52.766Z","event":"buy_instructions_built","count":2}
+{"at":"2026-10-04T06:42:52.849Z","event":"buy_simulation","err":null,"unitsConsumed":105819}
+{"at":"2026-10-04T06:42:52.900Z","event":"buy_submitted","signature":"4ewFHVMhByEGVKCQtFBUkWwZWUzJCCyqfHG2GX3dBtxGJ4sGi661vLDF3n9YiytDTjm4X3a6drCHqTFTGwNhnZSs"}
+{"at":"2026-10-04T06:42:55.085Z","event":"buy_confirmed","signature":"4ewFHVMhByEGVKCQtFBUkWwZWUzJCCyqfHG2GX3dBtxGJ4sGi661vLDF3n9YiytDTjm4X3a6drCHqTFTGwNhnZSs","slot":453178976,"feeLamports":45000,"walletBalanceBeforeLamports":421978050,"walletBalanceAfterLamports":412394724,"actualTradeSolLamports":"7925417"}
+{"at":"2026-10-04T06:42:55.169Z","event":"position_open","signature":"4ewFHVMhByEGVKCQtFBUkWwZWUzJCCyqfHG2GX3dBtxGJ4sGi661vLDF3n9YiytDTjm4X3a6drCHqTFTGwNhnZSs","slot":453178976,"tokenRaw":"247548191848","buySolLamports":"7925417","buyEconomicCostLamports":"8069486","tokenAccountRentLamports":1513840,"requiredSellQuoteLamports":"8202213","walletSol":0.412394724}
+{"at":"2026-10-04T06:42:55.305Z","event":"price_progress","elapsedSeconds":0,"expectedSellQuoteLamports":"7826347","expectedNetProfitLamports":"-293139","targetProfitLamports":"82727","requiredSellQuoteLamports":"8202213"}
+{"at":"2026-10-04T06:43:00.445Z","event":"price_progress","elapsedSeconds":5,"expectedSellQuoteLamports":"7707041","expectedNetProfitLamports":"-412445","targetProfitLamports":"82727","requiredSellQuoteLamports":"8202213"}
+{"at":"2026-10-04T06:43:05.574Z","event":"price_progress","elapsedSeconds":10,"expectedSellQuoteLamports":"7707041","expectedNetProfitLamports":"-412445","targetProfitLamports":"82727","requiredSellQuoteLamports":"8202213"}
+{"at":"2026-10-04T06:43:10.750Z","event":"price_progress","elapsedSeconds":16,"expectedSellQuoteLamports":"8454353","expectedNetProfitLamports":"334867","targetProfitLamports":"82727","requiredSellQuoteLamports":"8202213"}
+{"at":"2026-10-04T06:43:10.751Z","event":"profit_target_reached","expectedSellQuoteLamports":"8454353","requiredSellQuoteLamports":"8202213"}
+{"at":"2026-10-04T06:43:10.752Z","event":"sell_started","reason":"net_profit_target","requiredMinimumLamports":"8202213"}
+{"at":"2026-10-04T06:43:10.849Z","event":"sell_quote","attempt":1,"tokenRaw":"247548191848","expectedLamports":"8454353","minimumLamports":"8202213","curveRealQuoteLamports":"3370140424"}
+{"at":"2026-10-04T06:43:10.934Z","event":"sell_simulation","err":null,"unitsConsumed":77875}
+{"at":"2026-10-04T06:43:10.969Z","event":"sell_submitted","signature":"3us4KAFWph4M2rtxMw6VRJdpKGTguUW2AoQBSF6UDyyuynXK4MN6jSA28x75QJ7bpBAEXUGLFcvMxMuPG6ZMmyFM"}
+{"at":"2026-10-04T06:43:13.209Z","event":"sell_confirmed","signature":"3us4KAFWph4M2rtxMw6VRJdpKGTguUW2AoQBSF6UDyyuynXK4MN6jSA28x75QJ7bpBAEXUGLFcvMxMuPG6ZMmyFM","slot":453179043,"feeLamports":45000,"walletBalanceBeforeLamports":412394724,"walletBalanceAfterLamports":420804077,"actualTradeSolLamports":null}
+{"at":"2026-10-04T06:43:13.295Z","event":"sell_result","signature":"3us4KAFWph4M2rtxMw6VRJdpKGTguUW2AoQBSF6UDyyuynXK4MN6jSA28x75QJ7bpBAEXUGLFcvMxMuPG6ZMmyFM","remainingTokenRaw":"0","walletSol":0.420804077}
+{"at":"2026-10-04T06:43:13.339Z","event":"complete","buySignature":"4ewFHVMhByEGVKCQtFBUkWwZWUzJCCyqfHG2GX3dBtxGJ4sGi661vLDF3n9YiytDTjm4X3a6drCHqTFTGwNhnZSs","exitReason":"net_profit_target","finalWalletLamports":420804077}
