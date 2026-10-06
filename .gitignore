@@ -1,7 +1,11 @@
 .DS_Store
 .env
 .env.*
+live.env
+live.env.bak*
 !.env.example
+!.env.live.example
+.key
 .worktrees/
 coverage/
 dist/
@@ -11,3 +15,4 @@ frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
 frontend/.vite/
+.idea/
