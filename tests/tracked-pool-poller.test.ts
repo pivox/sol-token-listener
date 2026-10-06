@@ -3,11 +3,13 @@ import test from 'node:test';
 import type { PublicKey } from '@solana/web3.js';
 import {
   TrackedPoolPoller,
+  type TrackedPoolPollerOptions,
   type TrackedPoolCycleReport,
   type TrackedPoolReport,
 } from '../src/application/tracked-pool-poller.js';
 import type { TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import type { PoolCheckpoint, TrackedPool } from '../src/storage/tracked-pool.repository.js';
 
 const POOL_A = '11111111111111111111111111111111';
@@ -36,7 +38,11 @@ function trackedPool(poolAddress: string, baseMint: string): TrackedPool {
   return { poolAddress, baseMint, activationSignature: `act-${poolAddress}`, activationSlot: 100n };
 }
 
-function harness(pools: TrackedPool[], scripts: Record<string, PoolScript>) {
+function harness(
+  pools: TrackedPool[],
+  scripts: Record<string, PoolScript>,
+  extra: Partial<TrackedPoolPollerOptions> = {},
+) {
   const checkpoints = new Map<string, PoolCheckpoint>();
   const seeded: string[] = [];
   const stored: { pool: string; value: PoolCheckpoint }[] = [];
@@ -59,9 +65,9 @@ function harness(pools: TrackedPool[], scripts: Record<string, PoolScript>) {
     },
     readCheckpoint: (pool: string): Promise<PoolCheckpoint | null> =>
       Promise.resolve(checkpoints.get(pool) ?? null),
-    seedCheckpoint: (pool: string, value: PoolCheckpoint): Promise<void> => {
-      seeded.push(pool);
-      if (!checkpoints.has(pool)) checkpoints.set(pool, value);
+    seedCheckpoint: (target: TrackedPool, value: PoolCheckpoint): Promise<void> => {
+      seeded.push(target.poolAddress);
+      if (!checkpoints.has(target.poolAddress)) checkpoints.set(target.poolAddress, value);
       return Promise.resolve();
     },
     storeCheckpoint: (pool: string, value: PoolCheckpoint): Promise<void> => {
@@ -106,6 +112,7 @@ function harness(pools: TrackedPool[], scripts: Record<string, PoolScript>) {
     now: () => NOW,
     onCycle: (report) => { cycles.push(report); },
     onPool: (report) => { poolReports.push(report); },
+    ...extra,
   });
   async function tick(): Promise<void> {
     const task = scheduled.pop();
@@ -146,6 +153,16 @@ void test('a pool without checkpoint is seeded from its activation, then polled'
   assert.equal(h.calls[0]?.options.until, `act-${POOL_A}`);
   assert.deepEqual(h.enqueued.map((entry) => entry.signature), ['t1']);
   assert.deepEqual(h.checkpoints.get(POOL_A), { signature: 't1', slot: 120n });
+});
+
+void test('the poller enqueues with the configured hint and program', async () => {
+  const h = harness([trackedPool(POOL_A, MINT_A)], {
+    [POOL_A]: historyScript([row('s2', 102), row('s1', 101), row(`act-${POOL_A}`, 100)]),
+  }, { ingestionHint: 'PUMPFUN_CURVE_TRADE', programId: PUMP_PROGRAM_ID });
+  await h.poller.start();
+  assert.deepEqual(h.enqueued.map((value) => [value.ingestionHint, value.programIds[0]]), [
+    ['PUMPFUN_CURVE_TRADE', PUMP_PROGRAM_ID], ['PUMPFUN_CURVE_TRADE', PUMP_PROGRAM_ID],
+  ]);
 });
 
 void test('an idle pool reads one empty page and one probe and changes nothing', async () => {
