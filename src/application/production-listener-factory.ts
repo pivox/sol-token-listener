@@ -59,6 +59,7 @@ import {
 } from '../launchpads/pumpfun/pumpfun-launchpad.adapter.js';
 import { PumpSwapFeeStateReader } from '../markets/pumpswap/pumpswap-fee-state.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
+import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PumpSwapMarketAdapter } from '../markets/pumpswap/pumpswap-market.adapter.js';
 import { PumpSwapQuoteProvider } from '../markets/pumpswap/pumpswap-quote.provider.js';
 import { PumpSwapReserveReader } from '../markets/pumpswap/pumpswap-reserve-reader.js';
@@ -100,6 +101,7 @@ import { PostgresPaperTradingRepository } from '../storage/paper-trading.reposit
 import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
 import { PostgresQualificationProjectionRepository } from '../storage/qualification-projection.repository.js';
 import { PostgresTrackedPoolRepository } from '../storage/tracked-pool.repository.js';
+import { PostgresTrackedCurveRepository } from '../storage/tracked-curve.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWebSocketHealthRepository } from '../storage/websocket-health.repository.js';
 import {
@@ -132,7 +134,7 @@ import {
   TransactionInboxWorker,
   type TransactionInboxWorkerLocator,
 } from './transaction-inbox-worker.js';
-import { TrackedPoolPoller } from './tracked-pool-poller.js';
+import { TrackedPoolPoller, type TrackedPoolPollerOptions } from './tracked-pool-poller.js';
 import { TransactionInboxWorkerPool } from './transaction-inbox-worker-pool.js';
 import { ListenerRpcWorkGate, gateBlockTransactionRpc } from './listener-rpc-work-gate.js';
 import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
@@ -708,39 +710,60 @@ export function createProductionListenerRuntime(
     shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
     marketIngestionEnabled: config.listenerIngestionScope === 'launchpad-and-market',
   });
-  const poller = config.listenerTrackedPoolPollEnabled
-    ? new TrackedPoolPoller({
+  const pollerRpc: TrackedPoolPollerOptions['rpc'] = {
+    getSignaturesForAddress: (address, { before, ...options }, commitment): Promise<unknown> => rpc.http.getSignaturesForAddress(
+      address,
+      before === undefined ? options : { ...options, before },
+      commitment,
+    ),
+  };
+  const pollerTiming = {
+    intervalMs: config.listenerTrackedPoolPollIntervalMs,
+    trackingWindowSeconds: config.listenerPumpFunTrackingWindowSeconds,
+    shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    scheduler: listenerScheduler,
+  };
+  const pollers: TrackedPoolPoller[] = [];
+  if (config.listenerTrackedPoolPollEnabled) {
+    pollers.push(new TrackedPoolPoller({
       repository: new PostgresTrackedPoolRepository(databasePool),
       inbox,
-      rpc: {
-        getSignaturesForAddress: (address, { before, ...options }, commitment): Promise<unknown> => rpc.http.getSignaturesForAddress(
-          address,
-          before === undefined ? options : { ...options, before },
-          commitment,
-        ),
-      },
-      intervalMs: config.listenerTrackedPoolPollIntervalMs,
-      trackingWindowSeconds: config.listenerPumpFunTrackingWindowSeconds,
-      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
-      scheduler: listenerScheduler,
+      rpc: pollerRpc,
+      ...pollerTiming,
       onCycle: (report): void => {
         logger.info({ event: 'listener.tracked_pool_poll_cycle', ...report }, 'Cycle de sondage des pools suivis terminé.');
       },
       onPool: (report): void => {
         logger.warn({ event: 'listener.tracked_pool_poll_pool', ...report }, 'Pool suivi hors succès.');
       },
-    })
-    : null;
-  if (poller === null && attemptBudget === undefined) return runtime;
+    }));
+  }
+  if (createsOnly) {
+    pollers.push(new TrackedPoolPoller({
+      repository: new PostgresTrackedCurveRepository(databasePool),
+      ingestionHint: 'PUMPFUN_CURVE_TRADE',
+      programId: PUMP_PROGRAM_ID,
+      inbox,
+      rpc: pollerRpc,
+      ...pollerTiming,
+      onCycle: (report): void => {
+        logger.info({ event: 'listener.tracked_curve_poll_cycle', ...report }, 'Cycle de sondage des bonding curves suivies terminé.');
+      },
+      onPool: (report): void => {
+        logger.warn({ event: 'listener.tracked_curve_poll_curve', ...report }, 'Bonding curve suivie hors succès.');
+      },
+    }));
+  }
+  if (pollers.length === 0 && attemptBudget === undefined) return runtime;
   return Object.freeze({
     async start(): Promise<void> {
       try { await runtime.start(); } catch (error) { attemptBudget?.close(); throw error; }
       // The first poll cycle can wait on RPC for seconds and app.ts only opens the API
       // after start() resolves; start() never rejects (a failed cycle leaves it DEGRADED).
-      void poller?.start();
+      for (const poller of pollers) void poller.start();
     },
     async close(): Promise<void> {
-      try { await poller?.close(); } finally { attemptBudget?.close(); await runtime.close(); }
+      try { await Promise.all(pollers.map((poller) => poller.close())); } finally { attemptBudget?.close(); await runtime.close(); }
     },
     state: () => runtime.state(),
     pipelineState: () => runtime.pipelineState(),
