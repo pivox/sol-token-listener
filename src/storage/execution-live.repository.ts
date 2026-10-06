@@ -4497,6 +4497,26 @@ function createEntryRecords(
   return Object.freeze({ position, authorization });
 }
 
+// Appends the durable, never-purged result of a closed live position. The BUY evidence is
+// still retained when the position closes (holding time is at most 15 minutes and evidence
+// is purged four hours after finalization); without it no row is written. ON CONFLICT DO
+// NOTHING (without a conflict target, so no SELECT privilege on the ledger is needed)
+// keeps a replayed close from failing. $1 closed-at epoch ms, $2 exit wallet lamport delta,
+// $3 exit signature, $4 position id.
+export const LIVE_POSITION_LEDGER_INSERT_SQL = `INSERT INTO execution_live_position_ledger (
+  position_id,wallet_public_key,mint,opened_at,closed_at,base_amount_raw,
+  entry_wallet_lamport_delta,exit_wallet_lamport_delta,net_lamports,
+  entry_signature,exit_signature
+) SELECT position.position_id,position.wallet_public_key,position.mint,position.opened_at,
+    TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond'),position.base_amount_raw,
+    buy.wallet_lamport_delta,$2::NUMERIC,buy.wallet_lamport_delta+$2::NUMERIC,
+    buy.signature,$3::TEXT
+  FROM execution_live_positions position
+  JOIN execution_reconciliation_evidence buy
+    ON buy.evidence_fingerprint=position.entry_reconciliation_fingerprint AND buy.side='BUY'
+  WHERE position.position_id=$4::TEXT
+  ON CONFLICT DO NOTHING`;
+
 async function commitSellReconciliation(
   client: DatabaseClient,
   claim: ClaimedExecutionIntent,
@@ -4942,6 +4962,9 @@ async function commitSellReconciliation(
   if (requiredUpdates.some((result) => result.rowCount !== 1)) {
     throw failure('CONFLICT');
   }
+  await client.query(LIVE_POSITION_LEDGER_INSERT_SQL, [
+    finalizedAtMs, evidence.walletLamportDelta.toString(), evidence.signature, row.position_id,
+  ]);
   await insertLiveStateEvent(
     client, artifact, 'CONFIRMED', 'RECONCILED', 'INTENT_SUCCEEDED', finalizedAtMs,
   );

@@ -155,6 +155,45 @@ void test('SELL UNKNOWN from CONFIRMED journals ambiguity then allows finalized 
     });
   });
 
+void test('SELL MATCHED appends one immutable ledger row and a replay appends none',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(pool, 'ACCEPTED');
+      const matched = sellEvidence(fixture, 'MATCHED', fixture.observedAtMs);
+      assert.deepEqual((await pool.query('SELECT 1 FROM execution_live_position_ledger')).rows, []);
+
+      await fixture.live.commitReconciliation(fixture.claim, matched);
+      await fixture.live.commitReconciliation(fixture.claim, matched);
+
+      const ledger = await pool.query(`SELECT
+        ledger.base_amount_raw::TEXT AS base_amount_raw,
+        ledger.entry_wallet_lamport_delta::TEXT AS entry_wallet_lamport_delta,
+        ledger.exit_wallet_lamport_delta::TEXT AS exit_wallet_lamport_delta,
+        ledger.net_lamports::TEXT AS net_lamports,
+        ledger.entry_signature,ledger.exit_signature,
+        ledger.wallet_public_key=position.wallet_public_key AS same_wallet,
+        ledger.mint=position.mint AS same_mint,
+        ledger.opened_at=position.opened_at AS same_opened_at,
+        ledger.closed_at=position.closed_at AS same_closed_at
+        FROM execution_live_position_ledger ledger
+        JOIN execution_live_positions position ON position.position_id=ledger.position_id
+        WHERE position.state='CLOSED'`);
+      assert.deepEqual(ledger.rows, [{
+        base_amount_raw: '95', entry_wallet_lamport_delta: '-5000',
+        exit_wallet_lamport_delta: '795', net_lamports: '-4205',
+        entry_signature: fixture.buyEvidence.signature,
+        exit_signature: fixture.artifact.signature,
+        same_wallet: true, same_mint: true, same_opened_at: true, same_closed_at: true,
+      }]);
+      await assert.rejects(pool.query('UPDATE execution_live_position_ledger SET net_lamports=0'),
+        { code: '55000' });
+      await assert.rejects(pool.query('DELETE FROM execution_live_position_ledger'),
+        { code: '55000' });
+    });
+  });
+
 void test('SELL MATCHED direct from ACCEPTED journals confirmation before success',
   async (context) => {
     const databaseUrl = requiredDatabaseUrl(context);
