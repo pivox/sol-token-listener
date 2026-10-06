@@ -286,7 +286,7 @@ void test('uses the canonical report snapshot and reloads trade evidence after q
   const services = fakeServices('ELIGIBLE');
   const canonical = snapshot({ launch:{ ...snapshot().launch, creator:'canonical-creator' } });
   services.qualification.rebuildWithQuotes = async () => {
-    return { kind:'UPDATED', projection:canonicalQualification(), snapshot:{ ...canonical, asOfRawEventId:'raw_source' } };
+    return { kind:'UPDATED', projection:canonicalQualification(), snapshot:{ ...canonical, asOfRawEventId:'raw_source', creatorHasSold:false } };
   };
   const worker = new PaperDecisionWorker(repository, new FakeQuotes(), services.qualification,
     services.candidates, services.strategy, options(), new ManualScheduler());
@@ -1324,7 +1324,7 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       return Object.freeze({
         kind:'UPDATED' as const,
         projection:canonicalQualification(),
-        snapshot:{ ...snapshot(), asOfRawEventId:'raw_source' },
+        snapshot:{ ...snapshot(), asOfRawEventId:'raw_source', creatorHasSold:false },
       });
     },
   };
@@ -1437,6 +1437,7 @@ function realCanonicalQualification(
     snapshot:Object.freeze({
       mint:paper.mint,asOfEvent:paper.asOfEvent,launch:paper.launch,
       metadata:paper.metadata,social:paper.social,creatorProfile:paper.creatorProfile,
+      creatorHasSold:false,
       holderSnapshot:null,walletGraph:paper.walletGraph,
     }),buyQuote:undefined,reverseSellQuote:undefined,
   });

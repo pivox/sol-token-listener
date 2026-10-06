@@ -309,10 +309,8 @@ function evaluationFrom(input: QualificationRebuildInput): QualificationEvaluati
     Object.assign(signals, social.signals);
     for (const condition of social.upstreamConditions) mergeCondition(upstream, condition);
   }
-  if (snapshot.creatorProfile !== null) {
-    signals.creatorHasNotSold = !snapshot.creatorProfile.hasSold;
-    upstream.set('CREATOR_EARLY_SELL', snapshot.creatorProfile.hasSold);
-  }
+  signals.creatorHasNotSold = !snapshot.creatorHasSold;
+  upstream.set('CREATOR_EARLY_SELL', snapshot.creatorHasSold);
   for (const condition of input.upstreamConditions ?? []) mergeCondition(upstream, condition);
   if (snapshot.holderSnapshot !== null) {
     signals.externalBuyersObserved = snapshot.holderSnapshot.uniqueExternalBuyers > 0;

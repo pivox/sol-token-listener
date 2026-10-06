@@ -485,6 +485,28 @@ implements QualificationProjectionTransaction {
     const creatorProfile = creatorRow === undefined
       ? null
       : creatorProfileFromRow(creatorRow, mint);
+    const creatorSellResult = await this.client.query(
+      `SELECT /* qualification_sell_by_creator */ EXISTS (
+         SELECT 1
+         FROM domain_events AS domain
+         JOIN raw_chain_events AS raw ON raw.event_id=domain.raw_event_id
+          AND raw.source=domain.source AND raw.program=domain.program
+          AND raw.mint=domain.mint AND raw.signature=domain.signature
+          AND raw.slot=domain.slot AND raw.transaction_index=domain.transaction_index
+          AND raw.instruction_index=domain.instruction_index
+          AND raw.inner_instruction_index IS NOT DISTINCT FROM domain.inner_instruction_index
+         WHERE domain.mint=$1
+           AND domain.type='BondingCurveTradeObserved'
+           AND domain.raw_event_id IS NOT NULL
+           AND domain.confirmation_status <> 'orphaned'
+           AND raw.confirmation_status <> 'orphaned'
+           AND domain.confirmation_status=raw.confirmation_status
+           AND domain.payload #>> '{trade,kind}'='SELL'
+           AND domain.payload #>> '{trade,trader}'=$2
+       ) AS creator_has_sold`,
+      [mint, launch.creator],
+    );
+    const creatorHasSold = creatorSellResult.rows[0]?.creator_has_sold === true;
     const holderResult = await this.client.query(
       `SELECT /* qualification_holders */ holder.snapshot_id,holder.mint,
           holder.input_fingerprint,holder.holder_event_id,holder.payload_version,
@@ -524,12 +546,9 @@ implements QualificationProjectionTransaction {
       ? null
       : holderSummaryFromRow(holderResult.rows[0], mint, creatorProfile?.creator ?? null);
     if (
-      (creatorProfile === null) !== (holderSnapshot === null)
-      || (
-        creatorProfile !== null
-        && holderSnapshot !== null
-        && creatorProfile.inputFingerprint !== holderSnapshot.inputFingerprint
-      )
+      creatorProfile !== null
+      && holderSnapshot !== null
+      && creatorProfile.inputFingerprint !== holderSnapshot.inputFingerprint
     ) throw invalid();
     const participantInputFingerprint = creatorProfile?.inputFingerprint
       ?? 'NO_PARTICIPANT_PROJECTION';
@@ -605,6 +624,7 @@ implements QualificationProjectionTransaction {
       metadata,
       social,
       creatorProfile,
+      creatorHasSold,
       holderSnapshot,
       walletGraph,
     });

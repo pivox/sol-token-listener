@@ -16,6 +16,7 @@ export interface QualificationEvidenceSnapshot {
   readonly metadata: TokenMetadataSnapshot | null;
   readonly social: SocialEvidenceCollectionV1 | null;
   readonly creatorProfile: CreatorProfile | null;
+  readonly creatorHasSold: boolean;
   readonly holderSnapshot: QualificationHolderSummary | null;
   readonly walletGraph: WalletGraphAnalysis | null;
 }

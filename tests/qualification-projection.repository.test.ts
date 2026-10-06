@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import pg from 'pg';
 import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
@@ -1561,6 +1561,50 @@ for (const policy of [undefined, 'bounded-serialization'] as const) {
 }
 }
 
+void test('live PostgreSQL derives creatorHasSold from an active creator SELL trade', async (context) => {
+  await withLiveCreatorTradeSchema(context, async (pool, repository) => {
+    await insertLiveCreatorTrade(pool, { id: 'creator-buy', kind: 'BUY', trader: 'creator', slot: 11 });
+    await insertLiveCreatorTrade(pool, { id: 'creator-sell', kind: 'SELL', trader: 'creator', slot: 12 });
+
+    const snapshot = await repository.transact('mint', (transaction) => (
+      transaction.loadCanonicalInput('mint')
+    ));
+
+    assert.equal(snapshot?.creatorHasSold, true);
+    assert.equal(snapshot?.creatorProfile, null);
+  });
+});
+
+void test('live PostgreSQL keeps creatorHasSold false without a creator SELL trade', async (context) => {
+  await withLiveCreatorTradeSchema(context, async (pool, repository) => {
+    await insertLiveCreatorTrade(pool, { id: 'creator-buy', kind: 'BUY', trader: 'creator', slot: 11 });
+    await insertLiveCreatorTrade(pool, { id: 'other-sell', kind: 'SELL', trader: 'other', slot: 12 });
+
+    const snapshot = await repository.transact('mint', (transaction) => (
+      transaction.loadCanonicalInput('mint')
+    ));
+
+    assert.equal(snapshot?.creatorHasSold, false);
+  });
+});
+
+for (const orphaned of ['domain', 'raw'] as const) {
+  void test(`live PostgreSQL ignores a creator SELL whose ${orphaned} row is orphaned`, async (context) => {
+    await withLiveCreatorTradeSchema(context, async (pool, repository) => {
+      await insertLiveCreatorTrade(pool, {
+        id: 'creator-sell', kind: 'SELL', trader: 'creator', slot: 11, orphaned,
+      });
+
+      const snapshot = await repository.transact('mint', (transaction) => (
+        transaction.loadCanonicalInput('mint')
+      ));
+
+      assert.ok(snapshot);
+      assert.equal(snapshot.creatorHasSold, false);
+    });
+  });
+}
+
 void test('live PostgreSQL rejects present oversized social and creator JSON evidence', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -2604,7 +2648,7 @@ function projectionFixture(options: Readonly<{
           }),
           fetchedAtMs: observedAtMs, payloadVersion: 1,
         }),
-      social: null, creatorProfile: null,
+      social: null, creatorProfile: null, creatorHasSold: false,
       holderSnapshot: null, walletGraph: options.walletGraph ?? null,
     }),
     buyQuote,
@@ -2827,6 +2871,83 @@ async function insertLiveTrade(
     'trade-event','raw-trade','BondingCurveTradeObserved','mint','pumpfun',
     'pump-program','trade-signature',11,0,2,NULL,'finalized',$1,$2,1,'{}'::jsonb
   )`, [new Date(observedAtMs - 100), new Date(observedAtMs)]);
+}
+
+async function withLiveCreatorTradeSchema(
+  context: TestContext,
+  run: (
+    pool: InstanceType<typeof pg.Pool>,
+    repository: PostgresQualificationProjectionRepository,
+  ) => Promise<void>,
+): Promise<void> {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live creator trade test skipped');
+    return;
+  }
+  const schema = `qualification_creator_trade_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    await insertLiveLaunch(pool);
+    await run(pool, new PostgresQualificationProjectionRepository(pool, qualificationService()));
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+}
+
+async function insertLiveCreatorTrade(
+  pool: InstanceType<typeof pg.Pool>,
+  trade: Readonly<{
+    id: string;
+    kind: 'BUY' | 'SELL';
+    trader: string;
+    slot: number;
+    orphaned?: 'domain' | 'raw';
+  }>,
+): Promise<void> {
+  const signature = `${trade.id}-signature`;
+  const cursor = {
+    slot: BigInt(trade.slot), transactionIndex: 0, instructionIndex: 2,
+    innerInstructionIndex: null,
+  };
+  const payload = toJsonValue({
+    trade: {
+      id: trade.id, launchMint: 'mint', kind: trade.kind, trader: trade.trader,
+      baseAmountRaw: 1_000n, quoteAmountRaw: 100n,
+      quoteAsset: { mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' },
+      cursor,
+    },
+  });
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status,blockchain_time,observed_at,
+    payload_version,payload,processing_status
+  ) VALUES (
+    $1,'pumpfun','pump-program','mint',$2,$3,0,2,NULL,$4,$5,$6,1,'{}'::jsonb,'processed'
+  )`, [
+    `raw-${trade.id}`, signature, trade.slot,
+    trade.orphaned === 'raw' ? 'orphaned' : 'confirmed', new Date(1_900), new Date(2_000),
+  ]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,raw_event_id,type,mint,source,program,signature,slot,
+    transaction_index,instruction_index,inner_instruction_index,
+    confirmation_status,blockchain_time,observed_at,payload_version,payload
+  ) VALUES (
+    $1,$2,'BondingCurveTradeObserved','mint','pumpfun','pump-program',$3,$4,0,2,NULL,
+    $5,$6,$7,1,$8
+  )`, [
+    `event-${trade.id}`, `raw-${trade.id}`, signature, trade.slot,
+    trade.orphaned === 'domain' ? 'orphaned' : 'confirmed',
+    new Date(1_900), new Date(2_000), payload,
+  ]);
 }
 
 async function liveCounts(

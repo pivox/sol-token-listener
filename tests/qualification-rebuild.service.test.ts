@@ -27,7 +27,10 @@ void test('rebuilds from qualification evidence independently of paper state', (
   assert.equal(rebuilt.event.id, rebuilt.reportEventId);
   assert.equal(rebuilt.event.payload.reportId, rebuilt.reportId);
   assert.deepEqual(rebuilt.event.payload.evaluation, rebuilt.evaluation);
-  assert.equal(rebuilt.report.evidence.every((item) => item.status === 'UNKNOWN'), true);
+  assert.equal(rebuilt.report.evidence
+    .filter((item) => item.signal !== 'creatorHasNotSold')
+    .every((item) => item.status === 'UNKNOWN'), true);
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'SATISFIED');
   assert.equal(condition(rebuilt, 'BUY_SIMULATION_FAILED').status, 'UNKNOWN');
   assert.equal(condition(rebuilt, 'SELL_QUOTE_UNAVAILABLE').status, 'UNKNOWN');
   assert.deepEqual(condition(rebuilt, 'HOLDER_CONCENTRATION_EXCEEDED').observed, {
@@ -50,6 +53,7 @@ void test('maps explicit creator, holder and quote evidence and computes integer
         },
       },
       creatorProfile: creatorProfile(false),
+      creatorHasSold: false,
       holderSnapshot: holderDistribution(),
     }),
     buyQuote: quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n),
@@ -68,7 +72,7 @@ void test('maps explicit creator, holder and quote evidence and computes integer
 void test('keeps an enforced creator sell separate from the score', () => {
   const service = new QualificationRebuildService(engine());
   const rebuilt = service.rebuild({
-    snapshot: snapshot({ creatorProfile: creatorProfile(true) }),
+    snapshot: snapshot({ creatorProfile: creatorProfile(true), creatorHasSold: true }),
     buyQuote: null,
     reverseSellQuote: null,
   });
@@ -76,6 +80,42 @@ void test('keeps an enforced creator sell separate from the score', () => {
   assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'TRIGGERED');
   assert.deepEqual(rebuilt.report.blockers.map((item) => item.code), ['CREATOR_EARLY_SELL', 'BUY_SIMULATION_FAILED', 'SELL_QUOTE_UNAVAILABLE']);
   assert.equal(rebuilt.report.verdict, 'REJECTED');
+});
+
+void test('derives creatorHasNotSold from the mint trade flag without a creator profile', () => {
+  const service = new QualificationRebuildService(engine());
+  const rebuilt = service.rebuild({
+    snapshot: snapshot({ creatorProfile: null, creatorHasSold: false }),
+    buyQuote: undefined,
+    reverseSellQuote: undefined,
+  });
+
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'SATISFIED');
+  assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'PASSED');
+});
+
+void test('flags a creator sell from the mint trade flag without a creator profile', () => {
+  const service = new QualificationRebuildService(engine());
+  const rebuilt = service.rebuild({
+    snapshot: snapshot({ creatorProfile: null, creatorHasSold: true }),
+    buyQuote: undefined,
+    reverseSellQuote: undefined,
+  });
+
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'NOT_SATISFIED');
+  assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'TRIGGERED');
+});
+
+void test('ignores a creator profile that disagrees with the mint trade flag', () => {
+  const service = new QualificationRebuildService(engine());
+  const rebuilt = service.rebuild({
+    snapshot: snapshot({ creatorProfile: creatorProfile(true), creatorHasSold: false }),
+    buyQuote: undefined,
+    reverseSellQuote: undefined,
+  });
+
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'SATISFIED');
+  assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'PASSED');
 });
 
 void test('revises qualification identity when source confirmation advances', () => {
@@ -411,7 +451,7 @@ function snapshot(
       quoteAssets: Object.freeze([Object.freeze({ mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' as const })]),
       launchpad: 'pumpfun', createdAt: Object.freeze({ ...asOfEvent.cursor }), parameters: Object.freeze({}),
     }),
-    metadata: null, social: null, creatorProfile: null, holderSnapshot: null,
+    metadata: null, social: null, creatorProfile: null, creatorHasSold: false, holderSnapshot: null,
     walletGraph: null,
     ...overrides,
   });

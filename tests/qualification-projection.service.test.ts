@@ -90,7 +90,7 @@ void test('rejects a creator first-sell profile with CREATOR_EARLY_SELL', async 
   const creatorProfile = soldCreatorProfile();
   assert.equal(creatorProfile.hasSold, true);
   assert.equal(creatorProfile.firstSell?.tradeId, 'creator-sell');
-  const repository = new FakeRepository(snapshot({ creatorProfile }), ['UPDATED']);
+  const repository = new FakeRepository(snapshot({ creatorProfile, creatorHasSold: true }), ['UPDATED']);
 
   const result = await service(repository, ['SOL']).rebuild('MINT');
 
@@ -522,7 +522,8 @@ function snapshot(
   });
   return Object.freeze({
     mint: 'MINT', asOfEvent, asOfRawEventId: 'raw_source', launch: launch([quoteAsset('SOL')]),
-    metadata: null, social: null, creatorProfile: null, holderSnapshot: null, walletGraph: null,
+    metadata: null, social: null, creatorProfile: null, creatorHasSold: false,
+    holderSnapshot: null, walletGraph: null,
     ...overrides,
   });
 }

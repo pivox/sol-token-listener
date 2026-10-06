@@ -589,7 +589,7 @@ for (const diagnosticCode of ['QUALIFICATION_LAUNCH_MISSING', 'QUALIFICATION_REB
         loadCanonicalInput: async () => diagnosticCode === 'QUALIFICATION_LAUNCH_MISSING' ? null : {
           mint: 'MintA', asOfEvent: { ...launchEvent, payload: { ...launchEvent.payload } }, asOfRawEventId: 'raw-source',
           launch: launchEvent.payload.launch, metadata: null, social: null,
-          creatorProfile: null, holderSnapshot: null, walletGraph: null,
+          creatorProfile: null, creatorHasSold: false, holderSnapshot: null, walletGraph: null,
         },
         dissolveCurrent: async () => { assert.fail('must not dissolve'); },
         replaceProjection: async () => { assert.fail('must not persist'); },
