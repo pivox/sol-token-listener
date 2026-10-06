@@ -23,8 +23,6 @@ import {
   type ApiQualificationSummary,
   type ApiQualification,
   type ApiQualificationCondition,
-  type ApiSocial,
-  type ApiHolders,
   type ApiDomainEvent,
   type ApiSseEvent,
   type ApiSuccess,
@@ -327,130 +325,6 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     error: { code: 'INVALID_CURSOR', message: 'The cursor is invalid', correlationId: 'req_123' },
   };
   const availability: ApiAvailability = 'NOT_AVAILABLE';
-  const social: ApiSocial = { status: 'NOT_AVAILABLE', links: [], evidence: [] };
-  const availableSocial: ApiSocial = {
-    status: 'AVAILABLE', collectionStatus: 'PARTIAL', collectionId: 'social_collection_a',
-    metadataSnapshotId: 'pumpfun_metadata_a', observedAt: '2026-08-10T12:00:00.000Z',
-    linkCount: 1, linksTruncated: false,
-    links: [{
-      id: 'social_link_a', kind: 'WEBSITE', declaredValueSha256: 'a'.repeat(64),
-      syntaxStatus: 'VALID', canonicalUrl: 'https://project.example/', invalidReason: null,
-      observedAt: '2026-08-10T12:00:00.000Z',
-    }],
-    evidenceCount: 1, evidenceTruncated: false,
-    evidence: [{
-      id: 'social_evidence_a', type: 'URL_REACHABLE', outcome: 'CONFIRMED',
-      subjectKind: 'WEBSITE', relatedKind: null, subjectUrl: 'https://project.example/',
-      finalUrl: 'https://project.example/', httpStatus: 200, redirectCount: 0,
-      contentSha256: 'b'.repeat(64), reasonCode: 'HTTP_2XX',
-      observedAt: '2026-08-10T12:00:00.000Z',
-    }],
-    coverage: {
-      declaredLinkCount: 1, inspectedLinkCount: 1, confirmedEvidenceCount: 1,
-      rejectedEvidenceCount: 0, unknownEvidenceCount: 0,
-    },
-  };
-  const holders: ApiHolders = {
-    status: 'NOT_AVAILABLE',
-    snapshots: [],
-    positions: [],
-    clusters: [],
-    clusterAnalysisStatus: 'NOT_AVAILABLE',
-  };
-  const availableHolders: ApiHolders = {
-    status: 'AVAILABLE',
-    methodology: 'OBSERVED_BONDING_CURVE_TRADES',
-    creatorProfile: {
-      mint: 'Mint111',
-      creator: 'Creator111',
-      buyCount: 1,
-      sellCount: 0,
-      totalBoughtBaseRaw: '10',
-      totalSoldBaseRaw: '0',
-      observedNetBaseRaw: '10',
-      hasSold: false,
-      firstSell: null,
-      initialBuys: [],
-      quoteFlows: [],
-      uniqueExternalBuyers: 1,
-      unknownTraderTradeCount: 0,
-    },
-    latestSnapshot: {
-      id: 'snapshot',
-      inputFingerprint: 'fingerprint',
-      observedAt: '2026-07-29T12:00:00.000Z',
-      confirmationStatus: 'confirmed',
-      cursor: {
-        slot: '1',
-        transactionIndex: '0',
-        instructionIndex: '0',
-        innerInstructionIndex: null,
-      },
-      totalPositiveNetBaseRaw: '10',
-      top1Bps: '10000',
-      top5Bps: '10000',
-      top10Bps: '10000',
-      creatorBps: '0',
-      uniqueKnownBuyers: 1,
-      uniqueExternalBuyers: 1,
-      positivePositionCount: 1,
-      unknownTraderTradeCount: 0,
-    },
-    snapshots: [],
-    positions: [],
-    clusters: [],
-    clusterAnalysisStatus: 'NOT_AVAILABLE',
-  };
-  const clusteredHolders: ApiHolders = {
-    ...availableHolders,
-    clusterAnalysisStatus: 'AVAILABLE',
-    clusterMethodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-    clusterCoverage: {
-      knownBuyCount: 2,
-      knownBuyerCount: 2,
-      strongEvidenceBuyCount: 2,
-      strongEvidenceBuyerCount: 2,
-      mediumOnlyBuyCount: 0,
-      mediumOnlyBuyerCount: 0,
-      noEvidenceBuyCount: 0,
-      noEvidenceBuyerCount: 0,
-      unavailableBuyCount: 0,
-      unavailableBuyerCount: 0,
-      notProcessedBuyCount: 0,
-      notProcessedBuyerCount: 0,
-      analyzedTransactionCount: 2,
-      evidenceCount: 2,
-    },
-    clusterCount: 1,
-    clustersTruncated: false,
-    clusters: [{
-      id: 'cluster',
-      quoteAssetCount: 1,
-      quoteAssetsTruncated: false,
-      quoteAssets: [{
-        mint: 'quote',
-        decimals: 9,
-        tokenProgram: 'SPL_TOKEN',
-      }],
-      participantWalletCount: 2,
-      auxiliaryWalletCount: 1,
-      positiveHolderCount: 2,
-      observedPositiveBaseRaw: '75',
-      concentrationBps: '7500',
-      containsCreator: false,
-      sharedFunderCount: 1,
-      strongRelationshipCount: 2,
-      strongEvidenceCount: 2,
-      memberCount: 3,
-      membersTruncated: true,
-      members: [{
-        wallet: 'buyer-a',
-        role: 'PARTICIPANT',
-        isCreator: false,
-        observedNetBaseRaw: '50',
-      }],
-    }],
-  };
   const qualification: ApiQualification = {
     ruleSet: {
       id: 'rules-v1', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
@@ -473,9 +347,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   const health: ApiHealth = {
     status: 'OK', observedAt: '2026-07-29T12:00:00.000Z',
     postgresql: { status: 'AVAILABLE' }, http: { status: 'AVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'RUNNING', paperDecision: 'IDLE', social: 'RUNNING' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'RUNNING', paperDecision: 'IDLE' },
     qualification: { currentCount: 1, lastSuccessAt: '2026-07-29T12:00:00.000Z' },
-    socialJobs: { pendingCount: 1, leasedCount: 1, retryableFailedCount: 0, exhaustedCount: 0 },
     paperDecisionJobs: {
       pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
       lastSuccessAt: null, lastErrorCode: null,
@@ -517,18 +390,11 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(failure.error.correlationId, 'req_123');
   assert.equal(availability, 'NOT_AVAILABLE');
   assert.deepEqual(success.data.qualificationSummary, qualificationSummary);
-  assert.equal(social.links.length, 0);
-  assert.equal(availableSocial.status, 'AVAILABLE');
-  assert.equal(holders.snapshots.length, 0);
-  assert.equal(availableHolders.status, 'AVAILABLE');
-  assert.equal(clusteredHolders.clusterAnalysisStatus, 'AVAILABLE');
   assert.equal(qualification.verdict, 'WATCHLISTED');
   assert.equal(condition.observed.roundTripLossBps, '3001');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
-  assert.equal(health.pipeline.social, 'RUNNING');
   assert.equal(health.pipeline.qualification, 'RUNNING');
   assert.equal(health.qualification.currentCount, 1);
-  assert.equal(health.socialJobs.pendingCount, 1);
   const websocket: ApiWebSocketHealth = health.heartbeat.websocket;
   assert.equal(websocket.state, 'ACKNOWLEDGED');
   assert.equal(sseEvent.eventId, 'evt_1');

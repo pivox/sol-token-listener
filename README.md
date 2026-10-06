@@ -239,7 +239,9 @@ remplace le minimum effectif lorsqu'il est défini (de 0 à 100). En son absence
 le minimum du profil sélectionné est conservé; celui du profil initial vaut 60. Le
 profil initial porte le statut `UNVALIDATED_RULE_SET`: c'est une calibration
 initiale NONVALIDATED, pas une calibration officiellement ou
-empiriquement validée.
+empiriquement validée. Les conditions `REPORT_ONLY` sont rapportées avec leurs
+preuves mais ne peuvent ajouter aucun blocker ni modifier le verdict ou la
+décision paper.
 
 Le chargeur construit un fingerprint SHA-256 du profil canonique effectif,
 donc y compris le remplacement `QUALIFICATION_MIN_SCORE`; le fingerprint est
@@ -575,7 +577,7 @@ npm run db:migrate
 Avec `LISTENER_ENABLED=true`, PostgreSQL et les endpoints Solana HTTP/WebSocket
 sont des dépendances de démarrage. L'ordre est : migrations optionnelles,
 health check RPC, baseline bornée, souscriptions, second rattrapage de fermeture
-de fenêtre, worker inbox, worker social public, réconciliation de finalité,
+de fenêtre, worker inbox, réconciliation de finalité,
 heartbeat, puis API. Un échec
 de dépendance ou de composant interrompt le
 démarrage et ferme les ressources déjà ouvertes. `LISTENER_ENABLED=false`
@@ -747,14 +749,9 @@ l'écoute. Utiliser une adresse accessible publiquement est un choix de
 déploiement explicite : l'API n'est pas authentifiée et doit être placée
 derrière les contrôles réseau/TLS appropriés.
 
-Les huit routes JSON sont `launches`, détail/timeline/risk/social/holders d'un
+Les six routes JSON sont `launches`, détail/timeline/risk d'un
 lancement, `paper-positions` et `health`; `/api/v1/events` est le flux SSE.
-Les montants et `bigint` sont des chaînes décimales. La projection sociale vaut
-`NOT_AVAILABLE` avant la première collection canonique, puis `AVAILABLE` avec
-un `collectionStatus` `COMPLETE`, `PARTIAL` ou `FAILED`, des preuves typées et
-des limites/troncatures explicites. La projection holders devient
-`AVAILABLE` après une reconstruction explicite des trades Pump.fun persistés;
-sinon elle reste `NOT_AVAILABLE`.
+Les montants et `bigint` sont des chaînes décimales.
 
 ```bash
 npm start
@@ -798,59 +795,10 @@ retrouvé et vérifié dans les signatures de son bloc, un nom inédit et un
 décodage sans erreur avant l’écriture. Elle n’écrase aucun fichier et sa sortie
 ne révèle ni endpoint ni contenu de transaction.
 
-## Analytics participants et graphe observé
-
-Le service I1 reconstruit de façon déterministe le profil du créateur, ses
-achats initiaux, sa première vente, les positions nettes observées et les
-concentrations top 1/5/10. Il n'utilise que les trades de bonding curve
-persistés depuis la détection du token : il ne consulte ni historique antérieur
-ni RPC supplémentaire. Un flux net négatif est conservé comme preuve valide,
-pas ramené silencieusement à zéro.
-
-I2 ajoute un ledger de preuves de financement et un graphe passif. Un transfert
-direct du quote asset vers l'acheteur, antérieur à son achat dans la même
-transaction, est une preuve forte. Un fee payer distinct est une preuve
-moyenne exposée, mais ne fusionne jamais deux wallets. Les auto-transferts sont
-ignorés. SOL, SPL Token et Token-2022 sont décodés ; les quote assets restent
-séparés et ne sont jamais additionnés entre eux.
-
-La couverture distingue `NOT_PROCESSED`, `UNAVAILABLE` et `NO_EVIDENCE`.
-Seules les arêtes fortes forment les composantes connexes. Leur concentration
-utilise les flux positifs observés par I1 depuis l'arrivée du token, pas un
-solde SPL certifié ou un historique antérieur. Une analyse réussie sans
-cluster est `AVAILABLE` avec `clusters: []`.
-
-Le pipeline actif enchaîne détection launchpad, preuves de financement,
-reconstructions I1/I2 et PumpSwap. Une transaction échouée est rejouée depuis
-le début de ce pipeline; les écritures déterministes rendent ce replay complet
-idempotent, sans saut d'étape. Les reason codes
-`SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` existent comme
-contrats stables et sont `REPORT_ONLY` pendant le calibrage dry run : leurs
-preuves et déclenchements sont rapportés, mais ils ne peuvent ajouter aucun
-blocker ni modifier le verdict ou la décision paper.
-
-`API_HOLDER_POSITION_LIMIT` et `API_HOLDER_SNAPSHOT_LIMIT` valent 100. Les
-limites clusters/membres valent respectivement 50/50, avec un budget total de
-500 membres, 8 quote assets par cluster et 64 au total ; les troncatures sont
-explicites.
-Toutes les projections et preuves I2 suivent la rétention terminale de quatre
-heures. Les transactions `finalized`, `orphaned`, non retryables ou épuisées
-devenues terminales sont purgeables; une transaction `processed` ou `confirmed`
-en attente de finalité ne l'est jamais. Cette fenêtre limite aussi la durée de conservation des
-données publiques de wallets observées; elle ne constitue pas un historique
-on-chain exhaustif.
-
-Les métadonnées et preuves sociales publiques utilisent un transport HTTP
-borné qui revalide DNS et redirections afin d'écarter les destinations privées.
-Le worker ne dépend d'aucune API payante X ou Telegram, ni token, cookie ou
-proxy. Il persiste uniquement des URL normalisées, empreintes et preuves
-structurées : aucun corps HTTP brut, header, résultat DNS ou adresse IP. Les
-collections et jobs sociaux terminaux sont conservés quatre heures puis purgés
-dans l'ordre des dépendances.
+## Santé du listener
 
 `GET /api/v1/health` publie l'état courant des composants, le backlog, les
-leases, le compteur `exhaustedCount`, `pipeline.social`, les compteurs
-`socialJobs`, checkpoints et slots observés, sans URL
+leases, le compteur `exhaustedCount`, checkpoints et slots observés, sans URL
 RPC/DB ni secret. `RUNNING`
 exige tous les composants actifs; une dépendance, un heartbeat périmé ou un
 nettoyage incomplet produit `DEGRADED`; `STOPPED` désigne l'arrêt ou la

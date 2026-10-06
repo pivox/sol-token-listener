@@ -25,7 +25,6 @@ import { trustedTerminalAttribution, trustedTerminalAttributionContext } from '.
 import { createPumpSwapDecodingError } from '../src/markets/pumpswap/errors.js';
 import {
   failurePipeline,
-  fundingObservationFailure,
   realPumpPipeline,
   malformedPumpTransaction,
 } from './observed-pipeline-failure-fixtures.js';
@@ -346,48 +345,6 @@ void test('adds immutable transaction locator to UNKNOWN failures without changi
     originCode: null, locator: { signature: 'sig', slot: 1n, transactionIndex: 3,
       confirmationStatus: 'processed', instructionIndex: null, innerInstructionIndex: null },
   });
-});
-
-void test('keeps funding diagnostics beside the unchanged retryable failure and worker locator', async () => {
-  const cases = [
-    ['validate', 'FUNDING_OBSERVATION_VALIDATE'],
-    ['extract', 'FUNDING_OBSERVATION_EXTRACT'],
-    ['record', 'FUNDING_OBSERVATION_RECORD'],
-  ] as const;
-  for (const [stage, diagnosticCode] of cases) {
-    const boundary = await fundingObservationFailure(stage, new Error('private'));
-    let marked: IngestionFailure | null = null;
-    const worker = new TransactionInboxWorker(repositoryWith({
-      async claim() { return claim(); },
-      async markFailed(_signature, _token, value) { marked = value; },
-    }), locator(), failurePipeline(
-      () => { throw boundary; },
-      'funding_observation',
-    ), options());
-
-    await worker.runOnce();
-
-    assert.deepEqual(marked, failure(
-      'PIPELINE_STAGE_FAILED',
-      'ObservedPipelineFailure.v1.funding_observation.UNKNOWN',
-      true,
-    ));
-    assert.equal(
-      trustedTerminalAttribution(marked)?.diagnosticCode,
-      diagnosticCode,
-    );
-    assert.deepEqual(trustedTerminalAttributionContext(marked), {
-      originCode: null,
-      locator: {
-        signature: 'sig',
-        slot: 1n,
-        transactionIndex: 3,
-        confirmationStatus: 'processed',
-        instructionIndex: null,
-        innerInstructionIndex: null,
-      },
-    });
-  }
 });
 
 void test('preserves an authenticated PumpSwap origin when the worker adds its locator', async () => {

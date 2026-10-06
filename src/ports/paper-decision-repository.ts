@@ -6,13 +6,9 @@ import type {
   PaperStrategySession,
 } from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
-import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
-import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
 import type { QualificationReport } from '../domain/qualification.js';
-import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
-import type { WalletGraphAnalysis } from '../domain/wallet-graph.js';
 import type { CanonicalQualificationProjection } from './qualification-projection-repository.js';
 
 export interface PaperDecisionJobInput {
@@ -47,11 +43,6 @@ export interface PaperDecisionSnapshot {
   readonly launch: TokenLaunch;
   readonly launchDetectedAtMs: number;
   readonly launchConfirmationStatus: ChainConfirmationStatus;
-  readonly metadata: TokenMetadataSnapshot | null;
-  readonly social: SocialEvidenceCollectionV1 | null;
-  readonly creatorProfile: CreatorProfile | null;
-  readonly holderSnapshot: HolderDistribution | null;
-  readonly walletGraph: WalletGraphAnalysis | null;
   readonly activeLaunchTrades: readonly Extract<
     LaunchpadObservationEventV1,
     { readonly type: 'BondingCurveTradeObserved' }

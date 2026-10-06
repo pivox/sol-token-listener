@@ -23,8 +23,6 @@ function fakeApiClient(): ApiClient {
     getLaunch: unavailable,
     listLaunchEvents: unavailable,
     getLaunchRisk: unavailable,
-    getLaunchSocial: unavailable,
-    getLaunchHolders: unavailable,
     listPaperPositions: async () => ({ items: [], nextCursor: null }),
     getHealth: async () => healthProjection,
   };

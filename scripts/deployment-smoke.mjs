@@ -114,11 +114,11 @@ const canonicalMigrations = Object.freeze([
   '059_transaction_inbox_qualification_attribution.sql',
   '060_listener_tracked_pool_checkpoints.sql',
   '061_execution_live_position_ledger.sql',
+  '062_drop_dossier_and_legacy_tables.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
   'bondingCurveSnapshots',
-  'creatorProfiles',
   'domainEvents',
   'executionActivationArmaments',
   'executionActivationEvents',
@@ -150,8 +150,6 @@ const canonicalRetentionCounters = Object.freeze([
   'executionSignedTransactions',
   'executionSimulationArtifacts',
   'executionSubmissionEvents',
-  'holderSnapshots',
-  'launchTrades',
   'listenerCatchUpGaps',
   'listenerStrictCatchUpFailures',
   'listenerStrictCatchUpRuns',
@@ -160,7 +158,6 @@ const canonicalRetentionCounters = Object.freeze([
   'marketTrades',
   'metadataSnapshots',
   'migrations',
-  'observedWalletPositions',
   'paperDecisionJobs',
   'paperExternalBuys',
   'paperPositions',
@@ -168,11 +165,6 @@ const canonicalRetentionCounters = Object.freeze([
   'paperTrades',
   'qualificationReports',
   'rawChainEvents',
-  'socialCollections',
-  'socialEvidence',
-  'socialJobs',
-  'socialLinks',
-  'socialObservations',
   'stateTransitions',
   'tokenLaunches',
   'tradingCandidates',
@@ -181,13 +173,6 @@ const canonicalRetentionCounters = Object.freeze([
   'transactionInboxIncompleteAttributions',
   'transactionInboxRecoveries',
   'transactionInboxTerminalAttributions',
-  'walletClusterMembers',
-  'walletClusters',
-  'walletFundingEvidence',
-  'walletFundingObservations',
-  'walletGraphProfiles',
-  'walletGraphSnapshots',
-  'walletRelationships',
   'websocketHealthEvidence',
 ]);
 const projectResourceChecks = projectResourceChecksFor(projectLabel);
@@ -830,7 +815,7 @@ async function assertPublicHealth() {
   assertEqual(envelope?.data?.status, 'DEGRADED', 'Observe-only health is not DEGRADED.');
   assertEqual(envelope?.data?.postgresql?.status, 'AVAILABLE', 'PostgreSQL is not AVAILABLE.');
   assertEqual(envelope?.data?.http?.status, 'AVAILABLE', 'HTTP is not AVAILABLE.');
-  for (const pipeline of ['pumpfun', 'pumpswap', 'paperDecision', 'social']) {
+  for (const pipeline of ['pumpfun', 'pumpswap', 'paperDecision']) {
     assertEqual(envelope?.data?.pipeline?.[pipeline], 'STOPPED', `${pipeline} pipeline is not STOPPED.`);
   }
 }

@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
 import { ObservedTransactionPipeline } from '../src/application/observed-transaction-pipeline.js';
-import { LaunchParticipantAnalyticsService } from '../src/application/launch-participant-analytics.service.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import {
   createBondingCurveTradeObservedEvent,
@@ -17,7 +16,6 @@ import type { TransactionNotification } from '../src/domain/transaction-ingestio
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
-import { PostgresParticipantAnalyticsRepository } from '../src/storage/participant-analytics.repository.js';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -49,9 +47,6 @@ void test('persists a deferred trade without a body fetch until creation persist
           observed.signature === creationSignature ? creationBatch : tradeBatch,
         ),
       },
-      { observe: async () => ({ assessments: [], evidence: [] }) },
-      { rebuild: async () => undefined },
-      { rebuild: async () => undefined },
       { processObserved: async () => ({ migrations: [], activations: [], affectedMints: [] }) },
       null,
       null,
@@ -93,7 +88,7 @@ void test('persists a deferred trade without a body fetch until creation persist
   }
 });
 
-void test('two workers keep an early trade deferred then converge the creation and holder projection', async (context) => {
+void test('two workers keep an early trade deferred then converge the creation and trade projections', async (context) => {
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: tracked-trade pipeline integration skipped');
     return;
@@ -106,9 +101,6 @@ void test('two workers keep an early trade deferred then converge the creation a
     await migrateDatabase({ pool });
     const inbox = new PostgresTransactionInboxRepository(pool);
     const launches = new PostgresLaunchpadEventRepository(pool);
-    const participantService = new LaunchParticipantAnalyticsService(
-      new PostgresParticipantAnalyticsRepository(pool),
-    );
     const creationReachedProjection = deferred();
     const releaseCreationProjection = deferred();
     let projectionCalls = 0;
@@ -121,21 +113,17 @@ void test('two workers keep an early trade deferred then converge the creation a
             : tradeObservation(tradeSignature, mint),
         ),
       },
-      { observe: async () => ({ assessments: [], evidence: [] }) },
+      { processObserved: async () => ({ migrations: [], activations: [], affectedMints: [] }) },
+      null,
       {
-        rebuild: async (projectionMint, missingLaunchPolicy) => {
+        rebuild: async () => {
           projectionCalls += 1;
           if (projectionCalls === 1) {
             creationReachedProjection.resolve();
             await releaseCreationProjection.promise;
           }
-          return participantService.rebuild(projectionMint, missingLaunchPolicy);
         },
       },
-      { rebuild: async () => undefined },
-      { processObserved: async () => ({ migrations: [], activations: [], affectedMints: [] }) },
-      null,
-      null,
       inbox,
     );
     await inbox.enqueue(tradeNotification(tradeSignature, 11n));
@@ -182,16 +170,15 @@ void test('two workers keep an early trade deferred then converge the creation a
       await creating.catch(() => undefined);
     }
 
-    const latest = await pool.query(`SELECT as_of_slot::text AS as_of_slot,
-      unique_external_buyers,total_positive_net_base_raw::text AS total_positive_net_base_raw
-      FROM token_holders_snapshots WHERE mint=$1
-      ORDER BY as_of_slot DESC, snapshot_id DESC LIMIT 1`, [mint]);
-    assert.deepEqual(latest.rows[0], {
-      as_of_slot: '11', unique_external_buyers: 1, total_positive_net_base_raw: '1',
-    });
-    assert.equal((await pool.query(
-      `SELECT COUNT(*)::int AS count FROM launch_trades WHERE mint=$1`, [mint],
-    )).rows[0]?.count, 1);
+    assert.equal(projectionCalls, 2);
+    assert.deepEqual(
+      (await launches.listActiveEventsBySignature(creationSignature)).map((event) => event.type),
+      ['TokenLaunchDetected'],
+    );
+    assert.deepEqual(
+      (await launches.listActiveEventsBySignature(tradeSignature)).map((event) => event.type),
+      ['BondingCurveTradeObserved'],
+    );
     assert.equal(await inbox.hasNonTerminalProgramWork(PUMPSWAP_PROGRAM_ID), false);
     await pool.query(
       'UPDATE chain_transaction_inbox SET program_ids=$2 WHERE signature=$1',

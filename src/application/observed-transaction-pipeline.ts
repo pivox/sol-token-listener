@@ -37,11 +37,7 @@ const MAX_OBSERVED_PIPELINE_SNAPSHOT_NODES =
 export interface ObservedPipelineResult {
   readonly launchpadEventCount: number;
   readonly activeEventCount: number;
-  readonly fundingAssessmentCount: number;
-  readonly fundingEvidenceCount: number;
   readonly affectedMintCount: number;
-  readonly participantAnalyticsCount: number;
-  readonly walletGraphCount: number;
   readonly marketMigrationCount: number;
   readonly marketActivationCount: number;
   readonly qualificationRebuildCount: number;
@@ -80,21 +76,6 @@ export interface TrackedMintInboxSynchronizer {
   syncTrackedMint(mint: string): Promise<void>;
 }
 
-interface FundingObservationResult {
-  readonly assessments: readonly unknown[];
-  readonly evidence: readonly unknown[];
-}
-
-interface FundingObserver {
-  observe(
-    transaction: SolanaObservedTransaction,
-    events: readonly Extract<
-      LaunchpadObservationEventV1,
-      { readonly type: 'BondingCurveTradeObserved' }
-    >[],
-  ): Promise<FundingObservationResult>;
-}
-
 interface MintProjectionRebuilder {
   rebuild(mint: string, missingLaunchPolicy: MissingCanonicalLaunchPolicy): Promise<unknown>;
 }
@@ -123,9 +104,6 @@ export class ObservedTransactionPipeline {
   public constructor(
     private readonly reader: LaunchpadProjectionReader,
     private readonly launchpad: LaunchpadObserver,
-    private readonly funding: FundingObserver,
-    private readonly participants: MintProjectionRebuilder,
-    private readonly graph: MintProjectionRebuilder,
     private readonly market: MarketObserver,
     private readonly paperDecisions: PaperDecisionScheduler | null = null,
     private readonly qualification: MintProjectionRebuilder | null = null,
@@ -153,29 +131,11 @@ export class ObservedTransactionPipeline {
       snapshotActiveContext(
         await this.reader.listActiveEventsBySignature(observed.signature),
       ));
-    const funding = await this.stage('funding_observation', null, async () =>
-      snapshotNamedCounts(
-        await this.funding.observe(observed, active.trades),
-        ['assessments', 'evidence'],
-      ));
     const affectedMints = await this.stage('reload_active_events', null, () =>
       affectedMintList(active.mints, launchpad.affectedMints));
     const missingLaunchPolicy = missingCanonicalLaunchPolicy(
       transaction.confirmationStatus,
     );
-
-    let participantAnalyticsCount = 0;
-    let walletGraphCount = 0;
-    for (const mint of affectedMints) {
-      await this.stage('participant_analytics', mint, () =>
-        this.participants.rebuild(mint, missingLaunchPolicy));
-      participantAnalyticsCount += 1;
-    }
-    for (const mint of affectedMints) {
-      await this.stage('wallet_graph', mint, () =>
-        this.graph.rebuild(mint, missingLaunchPolicy));
-      walletGraphCount += 1;
-    }
 
     const market = await this.stage('pumpswap_observation', null, async () =>
       snapshotMarketResult(await this.market.processObserved(observed)));
@@ -205,11 +165,7 @@ export class ObservedTransactionPipeline {
     return Object.freeze({
       launchpadEventCount: launchpad.eventCount,
       activeEventCount: active.events.length,
-      fundingAssessmentCount: funding[0],
-      fundingEvidenceCount: funding[1],
       affectedMintCount: affectedMints.length,
-      participantAnalyticsCount,
-      walletGraphCount,
       marketMigrationCount: market.migrationCount,
       marketActivationCount: market.activationCount,
       qualificationRebuildCount,
@@ -258,10 +214,6 @@ function boundedMintSet(values: ReadonlySet<string>): ReadonlySet<string> {
 
 interface ActiveContext {
   readonly events: readonly LaunchpadObservationEventV1[];
-  readonly trades: readonly Extract<
-    LaunchpadObservationEventV1,
-    { readonly type: 'BondingCurveTradeObserved' }
-  >[];
   readonly mints: readonly string[];
 }
 
@@ -285,14 +237,8 @@ function snapshotActiveContext(value: unknown): ActiveContext {
     events.push(event);
   }
   const frozenEvents = Object.freeze(events);
-  const trades = Object.freeze(frozenEvents.filter(
-    (event): event is Extract<
-      LaunchpadObservationEventV1,
-      { readonly type: 'BondingCurveTradeObserved' }
-    > => event.type === 'BondingCurveTradeObserved',
-  ));
   const mints = Object.freeze([...new Set(frozenEvents.map((event) => event.mint))]);
-  return Object.freeze({ events: frozenEvents, trades, mints });
+  return Object.freeze({ events: frozenEvents, mints });
 }
 
 function affectedMintList(
@@ -339,17 +285,6 @@ function snapshotMintIterable(value: unknown): readonly string[] {
     mints.add(mint);
   }
   throw new RangeError('too many mints');
-}
-
-function snapshotNamedCounts(
-  value: unknown,
-  fields: readonly [string, string],
-): readonly [number, number] {
-  const result = dataRecord(value, fields);
-  return Object.freeze([
-    denseArrayLength(result[fields[0]]),
-    denseArrayLength(result[fields[1]]),
-  ]);
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

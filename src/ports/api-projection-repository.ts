@@ -1,12 +1,10 @@
 import type {
   ApiHealth,
-  ApiHolders,
   ApiLaunchDetail,
   ApiLaunchSummary,
   ApiPage,
   ApiPaperPosition,
   ApiQualification,
-  ApiSocial,
   ApiTimelineEntry,
 } from '../api/contracts.js';
 import type { LaunchPagePosition, PaperPositionPagePosition, TimelinePagePosition } from '../api/cursor.js';
@@ -23,8 +21,6 @@ export interface ApiProjectionRepository {
   getLaunch(mint: string): Promise<ApiLaunchDetail | null>;
   listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>>;
   getLaunchRisk(mint: string): Promise<ApiQualification | null>;
-  getLaunchSocial(mint: string): Promise<ApiSocial | null>;
-  getLaunchHolders(mint: string): Promise<ApiHolders | null>;
   listPaperPositions(
     request: PageRequest<PaperPositionPagePosition>,
   ): Promise<ApiPage<ApiPaperPosition>>;

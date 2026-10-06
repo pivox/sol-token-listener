@@ -153,7 +153,7 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('la purge retire les projections participants expirées avant leurs événements', async () => {
+void test('la purge ne touche plus aux tables du dossier social, participants et graphe', async () => {
   const queries: string[] = [];
   const client = {
     query: async (text: string) => {
@@ -167,19 +167,9 @@ void test('la purge retire les projections participants expirées avant leurs é
       if (text.includes('AS expired_count FROM updated')) {
         return { rows: [{ expired_count: 0 }], rowCount: 1 };
       }
-      if (text.includes('DELETE FROM creator_profiles')) return { rows: [], rowCount: 1 };
-      if (text.includes('DELETE FROM observed_wallet_positions')) return { rows: [], rowCount: 2 };
-      if (text.includes('DELETE FROM token_holders_snapshots')) return { rows: [], rowCount: 1 };
-      if (text.includes('DELETE FROM wallet_funding_evidence')) return { rows: [], rowCount: 2 };
-      if (text.includes('DELETE FROM wallet_funding_observations')) return { rows: [], rowCount: 2 };
-      if (text.includes('DELETE FROM wallet_relationships')) return { rows: [], rowCount: 3 };
-      if (text.includes('DELETE FROM wallet_graph_profiles')) return { rows: [], rowCount: 1 };
-      if (text.includes('DELETE FROM wallet_cluster_members')) return { rows: [], rowCount: 4 };
-      if (text.includes('DELETE FROM wallet_clusters')) return { rows: [], rowCount: 2 };
-      if (text.includes('DELETE FROM wallet_graph_snapshots')) return { rows: [], rowCount: 2 };
-      if (
-        text.includes('DELETE FROM domain_events event USING token_launches launch')
-      ) return { rows: [], rowCount: 4 };
+      if (text.includes('DELETE FROM domain_events WHERE purge_after <= NOW()')) {
+        return { rows: [], rowCount: 4 };
+      }
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -190,39 +180,12 @@ void test('la purge retire les projections participants expirées avant leurs é
 
   const result = await purgeExpiredFoundationData(pool);
 
-  assert.equal(result.websocketHealthEvidence, 0);
-  assert.equal(result.creatorProfiles, 1);
-  assert.equal(result.observedWalletPositions, 2);
-  assert.equal(result.holderSnapshots, 1);
-  assert.equal(result.walletFundingEvidence, 2);
-  assert.equal(result.walletFundingObservations, 2);
-  assert.equal(result.walletRelationships, 3);
-  assert.equal(result.walletGraphProfiles, 1);
-  assert.equal(result.walletClusterMembers, 4);
-  assert.equal(result.walletClusters, 2);
-  assert.equal(result.walletGraphSnapshots, 2);
   assert.equal(result.domainEvents, 4);
-  const participantQueries = queries.filter((query) =>
-    /DELETE FROM (?:creator_profiles|observed_wallet_positions|token_holders_snapshots)/u.test(query));
-  assert.equal(participantQueries.length, 3);
-  for (const query of participantQueries) {
-    assert.match(query, /USING token_launches launch/u);
-    assert.match(query, /launch\.purge_after <= NOW\(\)/u);
-  }
-  const domainDeletion = queries.findIndex((query) =>
-    query.includes('DELETE FROM domain_events WHERE purge_after <= NOW()'));
-  assert.ok(domainDeletion > queries.findIndex((query) => query.includes('DELETE FROM creator_profiles')));
-  assert.ok(queries.some((query) =>
-    query.includes('DELETE FROM domain_events event USING token_launches launch')
-    && query.includes("'CreatorProfileUpdated'")
-    && query.includes("'HolderDistributionUpdated'")
-    && query.includes("'WalletClusterDetected'")
-    && query.includes('launch.purge_after <= NOW()')));
-  const graphProfileDeletion = queries.findIndex((query) =>
-    query.includes('DELETE FROM wallet_graph_profiles'));
-  const graphEventDeletion = queries.findIndex((query) =>
-    query.includes('DELETE FROM domain_events event USING token_launches launch'));
-  assert.ok(graphProfileDeletion >= 0 && graphProfileDeletion < graphEventDeletion);
+  assert.equal(queries.some((query) =>
+    /\b(?:social_[a-z_]+|creator_profiles|token_holders_snapshots|observed_wallet_positions|wallet_[a-z_]+|launch_trades)\b/u
+      .test(query)), false);
+  assert.equal(queries.some((query) =>
+    query.includes('DELETE FROM domain_events event USING token_launches launch')), false);
 });
 
 void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est configurée', async (context) => {
@@ -322,6 +285,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '059_transaction_inbox_qualification_attribution.sql',
       '060_listener_tracked_pool_checkpoints.sql',
       '061_execution_live_position_ledger.sql',
+      '062_drop_dossier_and_legacy_tables.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

@@ -4,13 +4,11 @@ import test from 'node:test';
 import bs58 from 'bs58';
 import type {
   ApiHealth,
-  ApiHolders,
   ApiLaunchDetail,
   ApiLaunchSummary,
   ApiPage,
   ApiPaperPosition,
   ApiQualification,
-  ApiSocial,
   ApiTimelineEntry,
 } from '../src/api/contracts.js';
 import { ApiError } from '../src/api/errors.js';
@@ -73,14 +71,9 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     marketCapQuote: null, liquidityQuote: null,
     qualificationSummary: null, candidate: null, paperStrategy: null,
   };
-  const social: ApiSocial = { status: 'NOT_AVAILABLE', links: [], evidence: [] };
-  const holders: ApiHolders = {
-    status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
-    clusterAnalysisStatus: 'NOT_AVAILABLE',
-  };
   const detail: ApiLaunchDetail = {
     ...summary, creator: MINT, tokenProgram: MINT, launchpad: 'pumpfun', initialTokenAmount: null,
-    initialQuoteAmount: null, reserveBase: null, reserveQuote: null, feeBps: null, social, holders,
+    initialQuoteAmount: null, reserveBase: null, reserveQuote: null, feeBps: null,
   };
   const timeline: ApiTimelineEntry = {
     id: 'event-1', type: 'TokenLaunchDetected', occurredAt: summary.detectedAt, slot: '1',
@@ -106,9 +99,8 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
   };
   const health: ApiHealth = {
     status: 'OK', observedAt: summary.detectedAt, postgresql: { status: 'AVAILABLE' },
-    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE' },
     qualification: { currentCount: 0, lastSuccessAt: null },
-    socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
     paperDecisionJobs: {
       pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
       lastSuccessAt: null, lastErrorCode: null,
@@ -125,8 +117,6 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     async getLaunch(mint) { calls.push(`launch:${mint}`); return mint === MINT ? detail : null; },
     async listLaunchEvents(mint, request) { calls.push(`events:${mint}:${request.limit}:${request.after?.id ?? 'none'}`); return page([timeline]); },
     async getLaunchRisk(mint) { calls.push(`risk:${mint}`); return risk; },
-    async getLaunchSocial(mint) { calls.push(`social:${mint}`); return social; },
-    async getLaunchHolders(mint) { calls.push(`holders:${mint}`); return holders; },
     async listPaperPositions(request) { calls.push(`positions:${request.limit}:${request.after?.id ?? 'none'}`); return page([position]); },
     async getHealth() { calls.push('health'); return health; },
   };
@@ -192,8 +182,6 @@ void test('serves every public GET route with its projection and validates route
     [`/api/v1/launches/${MINT}`, `launch:${MINT}`],
     [`/api/v1/launches/${MINT}/events?cursor=${encodeTimelineCursor({ slot: '1', transactionIndex: 0, instructionIndex: 0, innerInstructionIndex: null, id: 'event-0' })}`, `events:${MINT}:20:event-0`],
     [`/api/v1/launches/${MINT}/risk`, `risk:${MINT}`],
-    [`/api/v1/launches/${MINT}/social`, `social:${MINT}`],
-    [`/api/v1/launches/${MINT}/holders`, `holders:${MINT}`],
     [`/api/v1/paper-positions?cursor=${encodePaperPositionCursor({ openedAtMs: 1, id: 'position-0' })}`, 'positions:20:position-0'],
     ['/api/v1/health', 'health'],
   ];
@@ -206,46 +194,24 @@ void test('serves every public GET route with its projection and validates route
     assert.equal((parseBody(response) as { apiVersion: string }).apiVersion, 'v1');
     assert.equal(repository.calls.includes(expectedCall), true, expectedCall);
   }
-  assert.equal(repository.calls.filter((call) => call.startsWith('launch:')).length, 5);
+  assert.equal(repository.calls.filter((call) => call.startsWith('launch:')).length, 3);
 });
 
-void test('serves the additive AVAILABLE social contract without exposing raw content', async () => {
-  const repository = makeRepository();
-  const available: ApiSocial = {
-    status: 'AVAILABLE', collectionStatus: 'COMPLETE', collectionId: 'social_collection_a',
-    metadataSnapshotId: 'pumpfun_metadata_a', observedAt: '2026-08-10T12:00:00.000Z',
-    linkCount: 0, linksTruncated: false, links: [], evidenceCount: 1,
-    evidenceTruncated: false,
-    evidence: [{
-      id: 'social_evidence_a', type: 'VERIFICATION_UNKNOWN', outcome: 'UNKNOWN',
-      subjectKind: null, relatedKind: null, subjectUrl: null, finalUrl: null,
-      httpStatus: null, redirectCount: 0, contentSha256: null,
-      reasonCode: 'METADATA_UNAVAILABLE', observedAt: '2026-08-10T12:00:00.000Z',
-    }],
-    coverage: {
-      declaredLinkCount: 0, inspectedLinkCount: 0, confirmedEvidenceCount: 0,
-      rejectedEvidenceCount: 0, unknownEvidenceCount: 1,
-    },
-  };
-  Object.assign(repository, { async getLaunchSocial() { return available; } });
-  const { router } = makeRouter(repository);
-
-  const response = await invoke(router, 'GET', `/api/v1/launches/${MINT}/social`);
-  const body = parseBody(response) as { readonly data: Record<string, unknown> };
-
-  assert.equal(response.status, 200);
-  assert.deepEqual(body.data, available);
-  assert.equal('rawBody' in body.data, false);
-  assert.equal('responseHeaders' in body.data, false);
-  assert.equal('dnsAnswers' in body.data, false);
+void test('no longer serves the removed social and holders routes', async () => {
+  const { router, repository } = makeRouter();
+  for (const suffix of ['social', 'holders']) {
+    const response = await invoke(router, 'GET', `/api/v1/launches/${MINT}/${suffix}`);
+    assert.equal(response.status, 404, suffix);
+    assert.equal((parseBody(response) as { error: { code: string } }).error.code, 'ROUTE_NOT_FOUND', suffix);
+  }
+  assert.deepEqual(repository.calls, []);
 });
 
 void test('HEAD mirrors GET headers and status without a response body, and OPTIONS is public', async () => {
   const { router } = makeRouter();
   const routes = [
     '/api/v1/launches', `/api/v1/launches/${MINT}`, `/api/v1/launches/${MINT}/events`,
-    `/api/v1/launches/${MINT}/risk`, `/api/v1/launches/${MINT}/social`,
-    `/api/v1/launches/${MINT}/holders`, '/api/v1/paper-positions', '/api/v1/health',
+    `/api/v1/launches/${MINT}/risk`, '/api/v1/paper-positions', '/api/v1/health',
   ];
 
   for (const route of routes) {
@@ -264,7 +230,7 @@ void test('HEAD mirrors GET headers and status without a response body, and OPTI
 
 void test('maps missing launches across every detail and subroute without route-specific reads', async () => {
   const cases: readonly [string, string | null][] = [
-    ['', null], ['/events', 'events'], ['/risk', 'risk'], ['/social', 'social'], ['/holders', 'holders'],
+    ['', null], ['/events', 'events'], ['/risk', 'risk'],
   ];
   for (const [suffix, routeMethod] of cases) {
     const { router, repository } = makeRouter();
@@ -473,7 +439,7 @@ void test('maps a malformed WebSocket projection to a redacted HTTP 503 dependen
   };
   const repository = new PostgresApiProjectionRepository(database, () => timestamp, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING',
   });
   const { router } = makeRouter(repository);
 

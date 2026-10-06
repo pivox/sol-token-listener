@@ -1,10 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  ObservedPipelineError,
-  trustedObservedPipelineFailure,
-} from '../src/application/observed-transaction-pipeline.js';
-import { WalletEvidenceObservationError } from '../src/application/wallet-evidence-observation.service.js';
+import { ObservedPipelineError } from '../src/application/observed-transaction-pipeline.js';
 import {
   isDecoderQuarantineFailure,
   OBSERVED_PIPELINE_ORIGIN_CODES,
@@ -22,12 +18,10 @@ import { PumpDecodingError } from '../src/launchpads/pumpfun/errors.js';
 import * as pumpErrors from '../src/launchpads/pumpfun/errors.js';
 import * as swapErrors from '../src/markets/pumpswap/errors.js';
 import { PumpSwapDecodingError } from '../src/markets/pumpswap/errors.js';
-import { trustedTerminalAttribution } from '../src/domain/terminal-attribution.js';
 import { decodePumpSwapTransaction } from '../src/markets/pumpswap/transaction-decoder.js';
 import {
   failurePipeline,
   failureTransaction,
-  fundingObservationFailure,
   realPumpPipeline,
   malformedPumpTransaction,
 } from './observed-pipeline-failure-fixtures.js';
@@ -308,57 +302,6 @@ void test('preserves the raw cause in memory but excludes it from durable metada
     assert.doesNotMatch(error.message, /secret/);
     return true;
   });
-});
-
-void test('real funding boundaries preserve retryable UNKNOWN and propagate only trusted diagnostics', async () => {
-  const cases = [
-    ['validate', 'FUNDING_OBSERVATION_VALIDATE'],
-    ['extract', 'FUNDING_OBSERVATION_EXTRACT'],
-    ['record', 'FUNDING_OBSERVATION_RECORD'],
-  ] as const;
-  for (const [stage, diagnosticCode] of cases) {
-    const boundary = await fundingObservationFailure(stage, new Error('private'));
-    const pipeline = failurePipeline(
-      () => { throw boundary; },
-      'funding_observation',
-    );
-    await assert.rejects(
-      pipeline.process(failureTransaction(), 1_000),
-      (error: unknown) => {
-        assert.ok(error instanceof ObservedPipelineError);
-        const failure = trustedObservedPipelineFailure(error);
-        assert.deepEqual(failure, {
-          code: 'PIPELINE_STAGE_FAILED',
-          errorName: 'ObservedPipelineFailure.v1.funding_observation.UNKNOWN',
-          retryable: true,
-        });
-        assert.ok(Object.isFrozen(failure));
-        assert.equal(
-          trustedTerminalAttribution(failure)?.diagnosticCode,
-          diagnosticCode,
-        );
-        return true;
-      },
-    );
-  }
-
-  const authentic = await fundingObservationFailure('extract', new Error('private'));
-  const publicWrapper = new WalletEvidenceObservationError('extract', {
-    cause: authentic,
-  });
-  await assert.rejects(
-    failurePipeline(
-      () => { throw publicWrapper; },
-      'funding_observation',
-    ).process(failureTransaction(), 1_000),
-    (error: unknown) => {
-      assert.ok(error instanceof ObservedPipelineError);
-      const failure = trustedObservedPipelineFailure(error);
-      assert.equal(trustedTerminalAttribution(failure), null);
-      assert.equal(failure?.retryable, true);
-      return true;
-    },
-  );
 });
 
 void test('foreign DB/RPC values, public constructions, subclasses and hostile proxies remain UNKNOWN without introspection', async () => {

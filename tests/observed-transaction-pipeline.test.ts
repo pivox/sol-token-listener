@@ -208,8 +208,6 @@ interface HarnessOptions {
   readonly launchpadEventCount?: number;
   readonly launchpadAffectedMints?: readonly string[];
   readonly launchpadAffectedValue?: unknown;
-  readonly fundingAssessmentCount?: number;
-  readonly fundingEvidenceCount?: number;
   readonly marketMigrationCount?: number;
   readonly marketActivationCount?: number;
   readonly marketAffectedMints?: readonly string[];
@@ -253,42 +251,6 @@ function harness(options: HarnessOptions = {}) {
         affectedMints: (options.launchpadAffectedValue
           ?? Object.freeze([...(options.launchpadAffectedMints ?? [])])) as readonly string[],
       });
-    },
-  };
-  const funding = {
-    observe: async (input: unknown, events: readonly LaunchpadObservationEventV1[]) => {
-      order.push(`funding:${events.map((item) =>
-        item.type === 'BondingCurveTradeObserved'
-          ? item.payload.trade.id
-          : item.type).join(',')}`);
-      observed.push(input);
-      fail('funding_observation');
-      return Object.freeze({
-        assessments: Object.freeze(Array.from(
-          { length: options.fundingAssessmentCount ?? 0 },
-          () => Object.freeze({}),
-        )),
-        evidence: Object.freeze(Array.from(
-          { length: options.fundingEvidenceCount ?? 0 },
-          () => Object.freeze({}),
-        )),
-      });
-    },
-  };
-  const participants = {
-    rebuild: async (mint: string, policy: string) => {
-      order.push(`i1:${mint}`);
-      rebuildPolicies.push(`i1:${mint}:${policy}`);
-      fail('participant_analytics', mint);
-      return Object.freeze({});
-    },
-  };
-  const graph = {
-    rebuild: async (mint: string, policy: string) => {
-      order.push(`i2:${mint}`);
-      rebuildPolicies.push(`i2:${mint}:${policy}`);
-      fail('wallet_graph', mint);
-      return Object.freeze({});
     },
   };
   const qualification = {
@@ -339,9 +301,6 @@ function harness(options: HarnessOptions = {}) {
   const pipeline = new ObservedTransactionPipeline(
     reader,
     launchpad,
-    funding,
-    participants,
-    graph,
     market,
     paperDecisions,
     options.qualification ?? qualification,
@@ -353,7 +312,7 @@ function harness(options: HarnessOptions = {}) {
     order,
     rebuildPolicies,
     observed,
-    dependencies: { reader, launchpad, funding, participants, graph, market, qualification },
+    dependencies: { reader, launchpad, market, qualification },
   };
 }
 
@@ -366,8 +325,7 @@ void test('synchronizes lexical unique launchpad mints before active events relo
   await h.pipeline.process(h.tx, 1_700_000_000_500);
 
   assert.deepEqual(h.order, [
-    'tracked', 'launchpad', 'sync:MintA', 'sync:MintB', 'reload', 'funding:',
-    'i1:MintA', 'i1:MintB', 'i2:MintA', 'i2:MintB', 'pumpswap',
+    'tracked', 'launchpad', 'sync:MintA', 'sync:MintB', 'reload', 'pumpswap',
     'qualification:MintA', 'qualification:MintB',
   ]);
 });
@@ -416,16 +374,6 @@ void test('replays an expired mint only for its exact finalized transaction sign
         });
       },
     },
-    {
-      observe: async (observed, events) => {
-        assert.equal(observed.confirmationStatus, 'finalized');
-        assert.equal(events.length, 1);
-        assert.equal(events[0]?.confirmationStatus, observed.confirmationStatus);
-        return Object.freeze({ assessments: Object.freeze([]), evidence: Object.freeze([]) });
-      },
-    },
-    h.dependencies.participants,
-    h.dependencies.graph,
     h.dependencies.market,
   );
 
@@ -467,8 +415,6 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
       event('trade-a', 'MintA'),
     ]),
     launchpadEventCount: 3,
-    fundingAssessmentCount: 2,
-    fundingEvidenceCount: 1,
   });
 
   const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
@@ -477,27 +423,17 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     'tracked',
     'launchpad',
     'reload',
-    'funding:trade-b,trade-a',
-    'i1:MintA',
-    'i1:MintB',
-    'i2:MintA',
-    'i2:MintB',
     'pumpswap',
     'qualification:MintA',
     'qualification:MintB',
   ]);
-  assert.equal(h.observed.length, 3);
+  assert.equal(h.observed.length, 2);
   assert.equal(h.observed[0], h.observed[1]);
-  assert.equal(h.observed[1], h.observed[2]);
   assert.ok(Object.isFrozen(h.observed[0]));
   assert.deepEqual(result, {
     launchpadEventCount: 3,
     activeEventCount: 3,
-    fundingAssessmentCount: 2,
-    fundingEvidenceCount: 1,
     affectedMintCount: 2,
-    participantAnalyticsCount: 2,
-    walletGraphCount: 2,
     marketMigrationCount: 0,
     marketActivationCount: 0,
     qualificationRebuildCount: 2,
@@ -510,7 +446,7 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
 void test('keeps an irrelevant active transaction write-minimal while PumpSwap still gets a chance', async () => {
   const h = harness({ tracked: ['ExistingMint'] });
   const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
-  assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload', 'funding:', 'pumpswap']);
+  assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload', 'pumpswap']);
   assert.equal(result.affectedMintCount, 0);
   assert.equal(result.qualificationRebuildCount, 0);
 });
@@ -548,9 +484,7 @@ void test('rebuilds the sorted affected and market union before paper decisions'
 
   const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
 
-  assert.deepEqual(h.order.slice(4), [
-    'i1:MintA', 'i1:MintB',
-    'i2:MintA', 'i2:MintB',
+  assert.deepEqual(h.order.slice(3), [
     'pumpswap',
     'qualification:MintA', 'qualification:MintB', 'qualification:MintC',
     `paper:MintA:${SIGNATURE}:confirmed`,
@@ -588,8 +522,7 @@ for (const diagnosticCode of ['QUALIFICATION_LAUNCH_MISSING', 'QUALIFICATION_REB
       transact: async (_mint, operation) => operation({
         loadCanonicalInput: async () => diagnosticCode === 'QUALIFICATION_LAUNCH_MISSING' ? null : {
           mint: 'MintA', asOfEvent: { ...launchEvent, payload: { ...launchEvent.payload } }, asOfRawEventId: 'raw-source',
-          launch: launchEvent.payload.launch, metadata: null, social: null,
-          creatorProfile: null, holderSnapshot: null, walletGraph: null,
+          launch: launchEvent.payload.launch, metadata: null, creatorHasSold: false,
         },
         dissolveCurrent: async () => { assert.fail('must not dissolve'); },
         replaceProjection: async () => { assert.fail('must not persist'); },
@@ -641,7 +574,7 @@ void test('pairs creation and initial buy for one mint only once', async () => {
     activeEvents: [event('create', 'NewMint', 'TokenLaunchDetected'), event('buy', 'NewMint')],
   });
   const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
-  assert.deepEqual(h.order.slice(4, 6), ['i1:NewMint', 'i2:NewMint']);
+  assert.deepEqual(h.order.slice(3), ['pumpswap', 'qualification:NewMint']);
   assert.equal(result.affectedMintCount, 1);
 });
 
@@ -654,16 +587,11 @@ void test('uses persisted launchpad impact to dissolve orphaned projections afte
   h.tx.confirmationStatus = 'ORPHANED';
   const result = await h.pipeline.process(h.tx, 1_700_000_000_500);
   assert.deepEqual(h.order, [
-    'tracked', 'launchpad', 'reload', 'funding:',
-    'i1:MintA', 'i1:MintZ', 'i2:MintA', 'i2:MintZ', 'pumpswap',
+    'tracked', 'launchpad', 'reload', 'pumpswap',
     'qualification:MintA', 'qualification:MintZ',
   ]);
   assert.equal(result.affectedMintCount, 2);
   assert.deepEqual(h.rebuildPolicies, [
-    'i1:MintA:DISSOLVE_CURRENT',
-    'i1:MintZ:DISSOLVE_CURRENT',
-    'i2:MintA:DISSOLVE_CURRENT',
-    'i2:MintZ:DISSOLVE_CURRENT',
     'qualification:MintA:DISSOLVE_CURRENT',
     'qualification:MintZ:DISSOLVE_CURRENT',
   ]);
@@ -675,29 +603,9 @@ void test('uses error policy for every active confirmation status', async () => 
     h.tx.confirmationStatus = status;
     await h.pipeline.process(h.tx, 1_700_000_000_500);
     assert.deepEqual(h.rebuildPolicies, [
-      'i1:MintA:ERROR',
-      'i2:MintA:ERROR',
       'qualification:MintA:ERROR',
     ]);
   }
-});
-
-void test('stops before every I2 rebuild when I1 fails on a later lexical mint', async () => {
-  const h = harness({
-    activeEvents: [event('event-b', 'MintB'), event('event-a', 'MintA')],
-    fail: 'participant_analytics',
-    failMint: 'MintB',
-  });
-  await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
-    assert.ok(error instanceof ObservedPipelineError);
-    assert.equal(error.stage, 'participant_analytics');
-    assert.equal(error.mint, 'MintB');
-    return true;
-  });
-  assert.deepEqual(h.order, [
-    'tracked', 'launchpad', 'reload', 'funding:event-b,event-a',
-    'i1:MintA', 'i1:MintB',
-  ]);
 });
 
 void test('keeps orphan impact on replay after tracked and active rows have already disappeared', async () => {
@@ -708,10 +616,7 @@ void test('keeps orphan impact on replay after tracked and active rows have alre
   });
   h.tx.confirmationStatus = 'ORPHANED';
   await h.pipeline.process(h.tx, 1_700_000_000_500);
-  assert.deepEqual(h.order.slice(4, 7), [
-    'i1:RetractedMint', 'i2:RetractedMint', 'pumpswap',
-  ]);
-  assert.equal(h.order.at(-1), 'qualification:RetractedMint');
+  assert.deepEqual(h.order.slice(3), ['pumpswap', 'qualification:RetractedMint']);
 });
 
 void test('runs migration activation through PumpSwap then qualification and paper enqueue', async () => {
@@ -738,11 +643,8 @@ void test('cuts off after each failed stage and identifies the exact stable stag
     ['load_tracked_mints', ['tracked'], null],
     ['launchpad_observation', ['tracked', 'launchpad'], null],
     ['reload_active_events', ['tracked', 'launchpad', 'reload'], null],
-    ['funding_observation', ['tracked', 'launchpad', 'reload', 'funding:event-a'], null],
-    ['participant_analytics', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA'], 'MintA'],
-    ['wallet_graph', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA'], 'MintA'],
-    ['pumpswap_observation', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA', 'pumpswap'], null],
-    ['qualification', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA', 'pumpswap', 'qualification:MintA'], 'MintA'],
+    ['pumpswap_observation', ['tracked', 'launchpad', 'reload', 'pumpswap'], null],
+    ['qualification', ['tracked', 'launchpad', 'reload', 'pumpswap', 'qualification:MintA'], 'MintA'],
   ];
   const invalidTimestamp = harness({ activeEvents: [event('event-a', 'MintA')] });
   await assert.rejects(invalidTimestamp.pipeline.process(invalidTimestamp.tx, -1), (error: unknown) => {
@@ -813,9 +715,6 @@ void test('redacts hostile dependency errors without consulting their properties
       throw hostile;
     } },
     h.dependencies.launchpad,
-    h.dependencies.funding,
-    h.dependencies.participants,
-    h.dependencies.graph,
     h.dependencies.market,
   );
   await assert.rejects(pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
@@ -830,7 +729,7 @@ void test('rejects unsafe dependency-provided mint labels before they reach stag
   const secret = 'https://private.example/token';
   const h = harness({
     launchpadAffectedMints: [secret],
-    fail: 'participant_analytics',
+    fail: 'qualification',
   });
   await assert.rejects(h.pipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
     assert.ok(error instanceof ObservedPipelineError);
@@ -962,9 +861,6 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
       listTrackedMints: async () => iterable(MAX_OBSERVED_PIPELINE_ITEMS + 1) as ReadonlySet<string>,
     },
     h.dependencies.launchpad,
-    h.dependencies.funding,
-    h.dependencies.participants,
-    h.dependencies.graph,
     h.dependencies.market,
   );
   await assert.rejects(trackedPipeline.process(h.tx, 1_700_000_000_500), (error: unknown) => {
@@ -1005,9 +901,6 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
         listTrackedMints: async () => throwing as ReadonlySet<string>,
       },
       h.dependencies.launchpad,
-      h.dependencies.funding,
-      h.dependencies.participants,
-      h.dependencies.graph,
       h.dependencies.market,
     ),
     harness({ launchpadAffectedValue: throwing }).pipeline,
@@ -1045,7 +938,7 @@ void test('applies the serialized bound within the active-event item bound and r
   });
 });
 
-void test('counts every visited leaf at the snapshot node limit and rejects one more before funding', async () => {
+void test('counts every visited leaf at the snapshot node limit and rejects one more before later stages', async () => {
   const { exact, leaves } = launchAtSnapshotNodeLimit();
   assert.equal(visitedSnapshotValues([exact]), MAX_SNAPSHOT_NODES);
   const accepted = harness({ activeEvents: [exact] });
@@ -1102,7 +995,7 @@ void test('charges a shared event subtree for every logical occurrence', async (
   assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload']);
 });
 
-void test('rejects 4096 shared padded events before funding without expanding them for final serialization', async () => {
+void test('rejects 4096 shared padded events before later stages without expanding them for final serialization', async () => {
   const shared = launchWithNumericLeaves(
     'shared-serialized-bound',
     0,

@@ -38,20 +38,10 @@ import type {
   PaperStrategySessionState,
 } from '../domain/paper-strategy.js';
 import type { TradingCandidateState } from '../domain/trading-candidate.js';
-import type {
-  SocialCollectionStatus,
-  SocialEvidenceOutcome,
-  SocialEvidenceType,
-  SocialLinkKind,
-} from '../domain/social-evidence.js';
 
 export const API_VERSION = 'v1' as const;
 export const MAX_API_JSON_DEPTH = 64;
 export const MAX_API_JSON_NODES = 10_000;
-export const MAX_API_CLUSTER_QUOTE_ASSETS = 8;
-export const MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS = 64;
-export const MAX_API_SOCIAL_LINKS = 64;
-export const MAX_API_SOCIAL_EVIDENCE = 64;
 
 export type ApiJsonPrimitive = string | number | boolean | null;
 export interface ApiJsonObject {
@@ -125,8 +115,6 @@ export interface ApiLaunchDetail extends ApiLaunchSummary {
   readonly reserveBase: string | null;
   readonly reserveQuote: string | null;
   readonly feeBps: string | null;
-  readonly social: ApiSocial;
-  readonly holders: ApiHolders;
 }
 
 export interface ApiQualificationSummary {
@@ -226,218 +214,6 @@ export interface ApiQualificationEvidence {
   readonly message: string;
 }
 
-export type ApiSocial = ApiSocialUnavailable | ApiSocialAvailable;
-
-export interface ApiSocialUnavailable {
-  readonly status: 'NOT_AVAILABLE';
-  readonly links: readonly [];
-  readonly evidence: readonly [];
-}
-
-export interface ApiSocialAvailable {
-  readonly status: 'AVAILABLE';
-  readonly collectionStatus: SocialCollectionStatus;
-  readonly collectionId: string;
-  readonly metadataSnapshotId: string;
-  readonly observedAt: string;
-  readonly linkCount: number;
-  readonly linksTruncated: boolean;
-  readonly links: readonly ApiSocialLink[];
-  readonly evidenceCount: number;
-  readonly evidenceTruncated: boolean;
-  readonly evidence: readonly ApiSocialEvidence[];
-  readonly coverage: ApiSocialCoverage;
-}
-
-export interface ApiSocialLink {
-  readonly id: string;
-  readonly kind: SocialLinkKind;
-  readonly declaredValueSha256: string;
-  readonly syntaxStatus: 'VALID' | 'INVALID';
-  readonly canonicalUrl: string | null;
-  readonly invalidReason: string | null;
-  readonly observedAt: string;
-}
-
-export interface ApiSocialEvidence {
-  readonly id: string;
-  readonly type: SocialEvidenceType;
-  readonly outcome: SocialEvidenceOutcome;
-  readonly subjectKind: SocialLinkKind | null;
-  readonly relatedKind: SocialLinkKind | null;
-  readonly subjectUrl: string | null;
-  readonly finalUrl: string | null;
-  readonly httpStatus: number | null;
-  readonly redirectCount: number;
-  readonly contentSha256: string | null;
-  readonly reasonCode: string;
-  readonly observedAt: string;
-}
-
-export interface ApiSocialCoverage {
-  readonly declaredLinkCount: number;
-  readonly inspectedLinkCount: number;
-  readonly confirmedEvidenceCount: number;
-  readonly rejectedEvidenceCount: number;
-  readonly unknownEvidenceCount: number;
-}
-
-export type ApiHolders = ApiHoldersUnavailable | ApiHoldersAvailable;
-
-export interface ApiHoldersUnavailable {
-  readonly status: 'NOT_AVAILABLE';
-  readonly snapshots: readonly [];
-  readonly positions: readonly [];
-  readonly clusters: readonly [];
-  readonly clusterAnalysisStatus: 'NOT_AVAILABLE';
-}
-
-export type ApiHoldersAvailable = ApiHoldersAvailableBase & (
-  | ApiWalletGraphUnavailable
-  | ApiWalletGraphAvailable
-);
-
-export interface ApiHoldersAvailableBase {
-  readonly status: 'AVAILABLE';
-  readonly methodology: 'OBSERVED_BONDING_CURVE_TRADES';
-  readonly creatorProfile: ApiCreatorProfile;
-  readonly latestSnapshot: ApiHolderSnapshot;
-  readonly snapshots: readonly ApiHolderSnapshot[];
-  readonly positions: readonly ApiObservedWalletPosition[];
-}
-
-export interface ApiWalletGraphUnavailable {
-  readonly clusters: readonly [];
-  readonly clusterAnalysisStatus: 'NOT_AVAILABLE';
-}
-
-export interface ApiWalletGraphAvailable {
-  readonly clusterAnalysisStatus: 'AVAILABLE';
-  readonly clusterMethodology: 'OBSERVED_PUMPFUN_TRANSACTIONS';
-  readonly clusterCoverage: ApiWalletGraphCoverage;
-  readonly clusterCount: number;
-  readonly clustersTruncated: boolean;
-  readonly clusters: readonly ApiWalletCluster[];
-}
-
-export interface ApiWalletGraphCoverage {
-  readonly knownBuyCount: number;
-  readonly knownBuyerCount: number;
-  readonly strongEvidenceBuyCount: number;
-  readonly strongEvidenceBuyerCount: number;
-  readonly mediumOnlyBuyCount: number;
-  readonly mediumOnlyBuyerCount: number;
-  readonly noEvidenceBuyCount: number;
-  readonly noEvidenceBuyerCount: number;
-  readonly unavailableBuyCount: number;
-  readonly unavailableBuyerCount: number;
-  readonly notProcessedBuyCount: number;
-  readonly notProcessedBuyerCount: number;
-  readonly analyzedTransactionCount: number;
-  readonly evidenceCount: number;
-}
-
-export interface ApiWalletCluster {
-  readonly id: string;
-  readonly quoteAssetCount: number;
-  readonly quoteAssetsTruncated: boolean;
-  readonly quoteAssets: readonly ApiQuoteAsset[];
-  readonly participantWalletCount: number;
-  readonly auxiliaryWalletCount: number;
-  readonly positiveHolderCount: number;
-  readonly observedPositiveBaseRaw: string;
-  readonly concentrationBps: string;
-  readonly containsCreator: boolean;
-  readonly sharedFunderCount: number;
-  readonly strongRelationshipCount: number;
-  readonly strongEvidenceCount: number;
-  readonly memberCount: number;
-  readonly membersTruncated: boolean;
-  readonly members: readonly ApiWalletClusterMember[];
-}
-
-export interface ApiWalletClusterMember {
-  readonly wallet: string;
-  readonly role: 'PARTICIPANT' | 'AUXILIARY_FUNDER';
-  readonly isCreator: boolean;
-  readonly observedNetBaseRaw: string;
-}
-
-export interface ApiCreatorProfile {
-  readonly mint: string;
-  readonly creator: string;
-  readonly buyCount: number;
-  readonly sellCount: number;
-  readonly totalBoughtBaseRaw: string;
-  readonly totalSoldBaseRaw: string;
-  readonly observedNetBaseRaw: string;
-  readonly hasSold: boolean;
-  readonly firstSell: ApiCreatorTradeEvidence | null;
-  readonly initialBuys: readonly ApiCreatorTradeEvidence[];
-  readonly quoteFlows: readonly ApiParticipantQuoteFlow[];
-  readonly uniqueExternalBuyers: number;
-  readonly unknownTraderTradeCount: number;
-}
-
-export interface ApiCreatorTradeEvidence {
-  readonly eventId: string;
-  readonly tradeId: string;
-  readonly signature: string;
-  readonly cursor: ApiAnalyticsCursor;
-  readonly baseAmountRaw: string;
-  readonly quoteAmountRaw: string;
-  readonly quoteAsset: ApiQuoteAsset;
-}
-
-export interface ApiParticipantQuoteFlow {
-  readonly quoteAsset: ApiQuoteAsset;
-  readonly boughtQuoteRaw: string;
-  readonly soldQuoteRaw: string;
-}
-
-export interface ApiQuoteAsset {
-  readonly mint: string;
-  readonly decimals: number;
-  readonly tokenProgram: 'SPL_TOKEN' | 'TOKEN_2022';
-}
-
-export interface ApiAnalyticsCursor {
-  readonly slot: string;
-  readonly transactionIndex: string;
-  readonly instructionIndex: string;
-  readonly innerInstructionIndex: string | null;
-}
-
-export interface ApiHolderSnapshot {
-  readonly id: string;
-  readonly inputFingerprint: string;
-  readonly observedAt: string;
-  readonly confirmationStatus: Exclude<ChainConfirmationStatus, 'orphaned'>;
-  readonly cursor: ApiAnalyticsCursor;
-  readonly totalPositiveNetBaseRaw: string;
-  readonly top1Bps: string;
-  readonly top5Bps: string;
-  readonly top10Bps: string;
-  readonly creatorBps: string;
-  readonly uniqueKnownBuyers: number;
-  readonly uniqueExternalBuyers: number;
-  readonly positivePositionCount: number;
-  readonly unknownTraderTradeCount: number;
-}
-
-export interface ApiObservedWalletPosition {
-  readonly wallet: string;
-  readonly isCreator: boolean;
-  readonly buyCount: number;
-  readonly sellCount: number;
-  readonly boughtBaseRaw: string;
-  readonly soldBaseRaw: string;
-  readonly observedNetBaseRaw: string;
-  readonly quoteFlows: readonly ApiParticipantQuoteFlow[];
-  readonly firstObservedCursor: ApiAnalyticsCursor;
-  readonly lastObservedCursor: ApiAnalyticsCursor;
-}
-
 export interface ApiPaperPosition {
   readonly id: string;
   readonly mint: string;
@@ -468,7 +244,6 @@ export interface ApiHealth {
   readonly http: ApiHealthDependency;
   readonly pipeline: ApiPipelineHealth;
   readonly qualification: ApiQualificationHealth;
-  readonly socialJobs: ApiSocialJobHealth;
   readonly paperDecisionJobs: ApiPaperDecisionJobHealth;
   readonly checkpoints: ApiCheckpoints;
   readonly heartbeat: ApiHeartbeat;
@@ -484,19 +259,11 @@ export interface ApiPipelineHealth {
   readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly qualification: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly paperDecision: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
-  readonly social: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
 }
 
 export interface ApiQualificationHealth {
   readonly currentCount: number;
   readonly lastSuccessAt: string | null;
-}
-
-export interface ApiSocialJobHealth {
-  readonly pendingCount: number;
-  readonly leasedCount: number;
-  readonly retryableFailedCount: number;
-  readonly exhaustedCount: number;
 }
 
 export interface ApiPaperDecisionJobHealth {

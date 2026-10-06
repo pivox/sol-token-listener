@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
-import type { CreatorProfile, HolderDistribution } from '../src/domain/participant-analytics.js';
 import type {
   CanonicalQualificationProjection,
   QualificationEvidenceSnapshot,
@@ -27,15 +26,45 @@ void test('rebuilds from qualification evidence independently of paper state', (
   assert.equal(rebuilt.event.id, rebuilt.reportEventId);
   assert.equal(rebuilt.event.payload.reportId, rebuilt.reportId);
   assert.deepEqual(rebuilt.event.payload.evaluation, rebuilt.evaluation);
-  assert.equal(rebuilt.report.evidence.every((item) => item.status === 'UNKNOWN'), true);
+  assert.equal(rebuilt.report.evidence
+    .filter((item) => item.signal !== 'creatorHasNotSold')
+    .every((item) => item.status === 'UNKNOWN'), true);
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'SATISFIED');
   assert.equal(condition(rebuilt, 'BUY_SIMULATION_FAILED').status, 'UNKNOWN');
   assert.equal(condition(rebuilt, 'SELL_QUOTE_UNAVAILABLE').status, 'UNKNOWN');
   assert.deepEqual(condition(rebuilt, 'HOLDER_CONCENTRATION_EXCEEDED').observed, {
     top1HolderBps: null, top5HoldersBps: null, top10HoldersBps: null,
   });
+  assert.deepEqual(condition(rebuilt, 'RELATED_WALLET_CLUSTER_EXCEEDED').observed, {
+    maximumRelatedClusterBps: null,
+  });
+  assert.deepEqual(condition(rebuilt, 'SHARED_FUNDER_CLUSTER').observed, {
+    maximumSharedFunderCount: null,
+  });
 });
 
-void test('maps explicit creator, holder and quote evidence and computes integer round trip loss', () => {
+void test('leaves social, holder and wallet-cluster evidence unknown and never blocks on it', () => {
+  const service = new QualificationRebuildService(engine());
+  const rebuilt = service.rebuild({
+    snapshot: snapshot(),
+    buyQuote: quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n),
+    reverseSellQuote: quote('sell', 'MINT', 'SOL', 900n, 820n, 800n),
+  });
+
+  for (const signal of ['linksReachable', 'socialCrossLinkConfirmed', 'externalBuyersObserved'] as const) {
+    assert.equal(rebuilt.evaluation.signals[signal], undefined, signal);
+  }
+  const unavailable = [
+    'MINT_SOCIAL_MISMATCH', 'IMPERSONATION_SUSPECTED', 'HOLDER_CONCENTRATION_EXCEEDED',
+    'RELATED_WALLET_CLUSTER_EXCEEDED', 'SHARED_FUNDER_CLUSTER',
+  ];
+  for (const code of unavailable) {
+    assert.notEqual(condition(rebuilt, code).status, 'TRIGGERED', code);
+  }
+  assert.equal(rebuilt.report.blockers.some((item) => unavailable.includes(item.code)), false);
+});
+
+void test('maps explicit metadata, creator and quote evidence and computes integer round trip loss', () => {
   const service = new QualificationRebuildService(engine());
   const rebuilt = service.rebuild({
     snapshot: snapshot({
@@ -49,8 +78,7 @@ void test('maps explicit creator, holder and quote evidence and computes integer
           },
         },
       },
-      creatorProfile: creatorProfile(false),
-      holderSnapshot: holderDistribution(),
+      creatorHasSold: false,
     }),
     buyQuote: quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n),
     reverseSellQuote: quote('sell', 'MINT', 'SOL', 900n, 820n, 800n),
@@ -59,7 +87,7 @@ void test('maps explicit creator, holder and quote evidence and computes integer
   assert.equal(evidence(rebuilt, 'imageValid').status, 'SATISFIED');
   assert.equal(rebuilt.evaluation.signals.descriptionAvailable, true);
   assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'SATISFIED');
-  assert.equal(evidence(rebuilt, 'externalBuyersObserved').status, 'SATISFIED');
+  assert.equal(evidence(rebuilt, 'externalBuyersObserved').status, 'UNKNOWN');
   assert.deepEqual(condition(rebuilt, 'ROUND_TRIP_LOSS_EXCEEDED').observed, {
     roundTripLossBps: 2_000n,
   });
@@ -68,7 +96,7 @@ void test('maps explicit creator, holder and quote evidence and computes integer
 void test('keeps an enforced creator sell separate from the score', () => {
   const service = new QualificationRebuildService(engine());
   const rebuilt = service.rebuild({
-    snapshot: snapshot({ creatorProfile: creatorProfile(true) }),
+    snapshot: snapshot({ creatorHasSold: true }),
     buyQuote: null,
     reverseSellQuote: null,
   });
@@ -76,6 +104,30 @@ void test('keeps an enforced creator sell separate from the score', () => {
   assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'TRIGGERED');
   assert.deepEqual(rebuilt.report.blockers.map((item) => item.code), ['CREATOR_EARLY_SELL', 'BUY_SIMULATION_FAILED', 'SELL_QUOTE_UNAVAILABLE']);
   assert.equal(rebuilt.report.verdict, 'REJECTED');
+});
+
+void test('derives creatorHasNotSold from the mint trade flag', () => {
+  const service = new QualificationRebuildService(engine());
+  const rebuilt = service.rebuild({
+    snapshot: snapshot({ creatorHasSold: false }),
+    buyQuote: undefined,
+    reverseSellQuote: undefined,
+  });
+
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'SATISFIED');
+  assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'PASSED');
+});
+
+void test('flags a creator sell from the mint trade flag', () => {
+  const service = new QualificationRebuildService(engine());
+  const rebuilt = service.rebuild({
+    snapshot: snapshot({ creatorHasSold: true }),
+    buyQuote: undefined,
+    reverseSellQuote: undefined,
+  });
+
+  assert.equal(evidence(rebuilt, 'creatorHasNotSold').status, 'NOT_SATISFIED');
+  assert.equal(condition(rebuilt, 'CREATOR_EARLY_SELL').status, 'TRIGGERED');
 });
 
 void test('revises qualification identity when source confirmation advances', () => {
@@ -411,28 +463,8 @@ function snapshot(
       quoteAssets: Object.freeze([Object.freeze({ mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' as const })]),
       launchpad: 'pumpfun', createdAt: Object.freeze({ ...asOfEvent.cursor }), parameters: Object.freeze({}),
     }),
-    metadata: null, social: null, creatorProfile: null, holderSnapshot: null,
-    walletGraph: null,
+    metadata: null, creatorHasSold: false,
     ...overrides,
-  });
-}
-
-function creatorProfile(hasSold: boolean): CreatorProfile {
-  return Object.freeze({
-    mint: 'MINT', creator: 'creator', payloadVersion: 1, inputFingerprint: 'a'.repeat(64),
-    buyCount: 0, sellCount: hasSold ? 1 : 0, totalBoughtBaseRaw: 0n,
-    totalSoldBaseRaw: hasSold ? 1n : 0n, observedNetBaseRaw: hasSold ? -1n : 0n,
-    hasSold, firstSell: null, initialBuys: Object.freeze([]), quoteFlows: Object.freeze([]),
-    uniqueExternalBuyers: 2, unknownTraderTradeCount: 0,
-  });
-}
-
-function holderDistribution(): HolderDistribution {
-  return Object.freeze({
-    mint: 'MINT', creator: 'creator', payloadVersion: 1, inputFingerprint: 'b'.repeat(64),
-    positions: Object.freeze([]), totalPositiveNetBaseRaw: 1_000n, top1Bps: 1_000n,
-    top5Bps: 2_000n, top10Bps: 3_000n, creatorBps: 0n, uniqueKnownBuyers: 2,
-    uniqueExternalBuyers: 2, positivePositionCount: 2, unknownTraderTradeCount: 0,
   });
 }
 

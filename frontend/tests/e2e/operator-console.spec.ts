@@ -13,10 +13,6 @@ test('public operator journey is resumable and read-only across origins', async 
   await page.getByRole('link', { name: 'Ouvrir la fiche' }).click();
   await page.getByRole('tab', { name: 'Risque' }).click();
   await expect(page.getByRole('alert', { name: /condition éliminatoire/i })).toBeVisible();
-  await page.getByRole('tab', { name: 'Social' }).click();
-  await expect(page.getByText('Preuves sociales indisponibles')).toBeVisible();
-  await page.getByRole('tab', { name: 'Détenteurs' }).click();
-  await expect(page.getByText('Détenteurs observés indisponibles')).toBeVisible();
   await page.getByRole('tab', { name: 'Timeline' }).click();
   await expect(page.getByText('QualificationUpdated')).toBeVisible();
   await page.getByRole('link', { name: 'Positions paper' }).click();

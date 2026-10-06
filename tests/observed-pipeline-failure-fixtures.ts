@@ -1,24 +1,16 @@
 import { ObservedTransactionPipeline } from '../src/application/observed-transaction-pipeline.js';
-import {
-  WalletEvidenceObservationError,
-  WalletEvidenceObservationService,
-  type WalletEvidenceObservationStage,
-} from '../src/application/wallet-evidence-observation.service.js';
-import { createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
-import type { LaunchpadTrade } from '../src/domain/types.js';
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { PumpFunLaunchpadAdapter } from '../src/launchpads/pumpfun/pumpfun-launchpad.adapter.js';
 import { PUMP_INSTRUCTIONS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
-import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 
 export function failurePipeline(
   operation: () => unknown,
   stage: 'launchpad_observation' | 'pumpswap_observation' | 'load_tracked_mints'
-    | 'funding_observation' = 'launchpad_observation',
+    = 'launchpad_observation',
   launchpad?: ConstructorParameters<typeof ObservedTransactionPipeline>[1],
-  market?: ConstructorParameters<typeof ObservedTransactionPipeline>[5],
+  market?: ConstructorParameters<typeof ObservedTransactionPipeline>[2],
 ): ObservedTransactionPipeline {
   return new ObservedTransactionPipeline({
     async listTrackedMints() {
@@ -31,77 +23,12 @@ export function failurePipeline(
       if (stage === 'launchpad_observation') await operation();
       return { events: [], affectedMints: [] };
     },
-  }, {
-    async observe() {
-      if (stage === 'funding_observation') await operation();
-      return { assessments: [], evidence: [] };
-    },
-  },
-  { async rebuild() {} }, { async rebuild() {} }, market ?? {
+  }, market ?? {
     async processObserved() {
       if (stage === 'pumpswap_observation') await operation();
       return { migrations: [], activations: [], affectedMints: [] };
     },
   });
-}
-
-export async function fundingObservationFailure(
-  stage: WalletEvidenceObservationStage,
-  cause: unknown,
-): Promise<WalletEvidenceObservationError> {
-  const raw = failureTransaction();
-  const observed = createSolanaObservedTransaction(raw, 1_000);
-  const trade: LaunchpadTrade = Object.freeze({
-    id: `funding-${stage}`,
-    launchMint: 'mint',
-    kind: 'BUY',
-    trader: 'buyer',
-    baseAmountRaw: 10n,
-    quoteAmountRaw: 20n,
-    quoteAsset: Object.freeze({
-      mint: 'So11111111111111111111111111111111111111112',
-      decimals: 9,
-      tokenProgram: 'SPL_TOKEN',
-    }),
-    cursor: Object.freeze({
-      slot: 1n,
-      transactionIndex: 0,
-      instructionIndex: 0,
-      innerInstructionIndex: null,
-    }),
-  });
-  const event = createBondingCurveTradeObservedEvent({
-    source: 'pumpfun',
-    program: PUMP_PROGRAM_ID,
-    transaction: observed,
-    trade,
-  });
-  const service = new WalletEvidenceObservationService(
-    {
-      extract: () => {
-        if (stage === 'extract') throw cause;
-        return Object.freeze({
-          assessments: Object.freeze([]),
-          evidence: Object.freeze([]),
-        });
-      },
-    },
-    {
-      record: async () => {
-        if (stage === 'record') throw cause;
-      },
-    },
-  );
-  const input = stage === 'validate'
-    ? new Proxy(observed, { get: () => { throw cause; } })
-    : observed;
-  try {
-    await service.observe(input, Object.freeze([event]));
-  } catch (error) {
-    if (error instanceof WalletEvidenceObservationError) return error;
-    throw error;
-  }
-  throw new Error(`Expected ${stage} funding observation failure.`);
 }
 
 export function realPumpPipeline(): ObservedTransactionPipeline {

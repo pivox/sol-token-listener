@@ -10,7 +10,6 @@ import {
 import { PostgresApiEventStreamRepository } from './storage/api-event-stream.repository.js';
 import {
   PostgresApiProjectionRepository,
-  type ApiHolderProjectionLimits,
   type ApiProjectionPipelineState,
   type ApiProjectionPipelineStateProvider,
 } from './storage/api-projection.repository.js';
@@ -43,7 +42,6 @@ export interface ApplicationDependencies {
   readonly createProjectionRepository: (
     pool: ApplicationPool,
     pipeline: ApiProjectionPipelineStateProvider,
-    holderLimits: ApiHolderProjectionLimits,
     qualificationProfile: QualificationProfileSummary,
   ) => ApiProjectionRepository;
   readonly createEventStreamRepository: (pool: ApplicationPool) => ApiEventStreamRepository;
@@ -92,13 +90,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
         const pipeline = listener === null
           ? disabledPipelineState
           : (): ApiProjectionPipelineState => listener?.pipelineState() ?? disabledPipelineState();
-        const projections = dependencies.createProjectionRepository(pool, pipeline, {
-          positions: config.apiHolderPositionLimit,
-          snapshots: config.apiHolderSnapshotLimit,
-          clusters: config.apiWalletClusterLimit,
-          clusterMembers: config.apiWalletClusterMemberLimit,
-          totalClusterMembers: config.apiWalletClusterTotalMemberLimit,
-        }, qualificationEngine.profileSummary);
+        const projections = dependencies.createProjectionRepository(pool, pipeline, qualificationEngine.profileSummary);
         const stream = dependencies.createEventStreamRepository(pool);
         server = dependencies.createApiServer({
           host: config.apiHost,
@@ -179,11 +171,10 @@ const productionDependencies: ApplicationDependencies = {
     config,
     pool as ReturnType<typeof getDatabasePool>,
   ),
-  createProjectionRepository: (pool, pipeline, holderLimits, qualificationProfile) => new PostgresApiProjectionRepository(
+  createProjectionRepository: (pool, pipeline, qualificationProfile) => new PostgresApiProjectionRepository(
     pool as ConstructorParameters<typeof PostgresApiProjectionRepository>[0],
     () => new Date(),
     pipeline,
-    holderLimits,
     qualificationProfile,
   ),
   createEventStreamRepository: (pool) => new PostgresApiEventStreamRepository(
@@ -224,7 +215,6 @@ function disabledPipelineState(): ApiProjectionPipelineState {
     pumpswap: 'STOPPED',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'STOPPED',
   });
 }
 

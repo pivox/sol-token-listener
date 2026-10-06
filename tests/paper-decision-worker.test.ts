@@ -286,7 +286,7 @@ void test('uses the canonical report snapshot and reloads trade evidence after q
   const services = fakeServices('ELIGIBLE');
   const canonical = snapshot({ launch:{ ...snapshot().launch, creator:'canonical-creator' } });
   services.qualification.rebuildWithQuotes = async () => {
-    return { kind:'UPDATED', projection:canonicalQualification(), snapshot:{ ...canonical, asOfRawEventId:'raw_source' } };
+    return { kind:'UPDATED', projection:canonicalQualification(), snapshot:{ ...canonical, asOfRawEventId:'raw_source', metadata:null, creatorHasSold:false } };
   };
   const worker = new PaperDecisionWorker(repository, new FakeQuotes(), services.qualification,
     services.candidates, services.strategy, options(), new ManualScheduler());
@@ -1324,7 +1324,7 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       return Object.freeze({
         kind:'UPDATED' as const,
         projection:canonicalQualification(),
-        snapshot:{ ...snapshot(), asOfRawEventId:'raw_source' },
+        snapshot:{ ...snapshot(), asOfRawEventId:'raw_source', metadata:null, creatorHasSold:false },
       });
     },
   };
@@ -1358,7 +1358,7 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:asOfEvent.cursor,parameters:Object.freeze({}),
-    }),metadata:null,social:null,creatorProfile:null,holderSnapshot:null,walletGraph:null,
+    }),
     activeLaunchTrades:Object.freeze([]),activeMarketTrades:Object.freeze([]),
     currentQualification:canonicalQualification(),currentCandidate:null,currentDecision:null,
     currentSession:null,activePosition:null,...overrides,
@@ -1436,8 +1436,7 @@ function realCanonicalQualification(
   const rebuilt=service.rebuild({
     snapshot:Object.freeze({
       mint:paper.mint,asOfEvent:paper.asOfEvent,launch:paper.launch,
-      metadata:paper.metadata,social:paper.social,creatorProfile:paper.creatorProfile,
-      holderSnapshot:null,walletGraph:paper.walletGraph,
+      metadata:null,creatorHasSold:false,
     }),buyQuote:undefined,reverseSellQuote:undefined,
   });
   return Object.freeze({

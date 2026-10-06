@@ -6,16 +6,14 @@ import { ApiHttpError } from '../../data/api-errors.js';
 import { launchQuery } from '../../data/queries.js';
 import { useApiClient } from '../../data/use-api-client.js';
 import { isSolanaPublicKey } from '../../data/solana-address.js';
-import { HoldersPanel } from './holders-panel.js';
 import { OverviewPanel } from './overview-panel.js';
 import { RiskPanel } from './risk-panel.js';
-import { SocialPanel } from './social-panel.js';
 import { TimelinePanel } from './timeline-panel.js';
 
-const tabs = ['overview', 'timeline', 'risk', 'social', 'holders'] as const;
+const tabs = ['overview', 'timeline', 'risk'] as const;
 type Tab = (typeof tabs)[number];
 const labels: Readonly<Record<Tab, string>> = {
-  overview: 'Aperçu', timeline: 'Timeline', risk: 'Risque', social: 'Social', holders: 'Détenteurs',
+  overview: 'Aperçu', timeline: 'Timeline', risk: 'Risque'
 };
 
 export function LaunchPage(): ReactNode {
@@ -60,8 +58,6 @@ export function LaunchPage(): ReactNode {
         {activeTab === 'overview' && <OverviewPanel launch={launch} />}
         {activeTab === 'timeline' && <TimelinePanel mint={mint} />}
         {activeTab === 'risk' && <RiskPanel mint={mint} />}
-        {activeTab === 'social' && <SocialPanel mint={mint} />}
-        {activeTab === 'holders' && <HoldersPanel mint={mint} />}
       </section>
     </article>
   );

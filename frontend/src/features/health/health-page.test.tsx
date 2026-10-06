@@ -90,8 +90,6 @@ function renderHealth(value: ApiHealth): ReturnType<typeof vi.fn<ApiClient['getH
     getLaunch: unavailable,
     listLaunchEvents: unavailable,
     getLaunchRisk: unavailable,
-    getLaunchSocial: unavailable,
-    getLaunchHolders: unavailable,
     listPaperPositions: unavailable,
     getHealth,
   };

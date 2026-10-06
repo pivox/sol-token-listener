@@ -10,20 +10,11 @@ import type {
   PaperStrategySessionV2,
 } from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
-import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
-import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
-import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
 import type {
   QualificationProfileIdentity,
   TradingCandidateV1,
 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
-import type {
-  WalletCluster,
-  WalletClusterMember,
-  WalletGraphAnalysis,
-  WalletRelationship,
-} from '../domain/wallet-graph.js';
 import type {
   ClaimedPaperDecisionJob,
   PaperDecisionFailure,
@@ -343,17 +334,6 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const asOfEvent = decodeDomainEvent(requiredRow(sourceResult, 'Source event is missing.'));
       const includeOrphaned = asOfEvent.confirmationStatus === 'orphaned';
       const launchSnapshot = await loadLaunch(client, job.mint, includeOrphaned);
-      const metadata = await latestMetadata(client, job.mint);
-      const social = await latestPayload<SocialEvidenceCollectionV1>(client,
-        `SELECT payload #> '{collection}' AS payload FROM domain_events
-          WHERE mint=$1 AND type='SocialEvidenceCollected'
-            AND confirmation_status<>'orphaned'
-          ORDER BY observed_at DESC,event_id DESC LIMIT 1`,job.mint);
-      const creatorProfile = await latestPayload<CreatorProfile>(client,
-        'SELECT payload FROM creator_profiles WHERE mint=$1 LIMIT 1',job.mint);
-      const holderSnapshot = await latestPayload<HolderDistribution>(client,
-        'SELECT payload FROM token_holders_snapshots WHERE mint=$1 ORDER BY observed_at DESC,snapshot_id DESC LIMIT 1',job.mint);
-      const walletGraph = await latestWalletGraph(client, job.mint);
       const currentQualification = await loadQualification(
         client,
         job.mint,
@@ -378,8 +358,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         hasPaperLineage,launch:launchSnapshot.launch,
         launchDetectedAtMs:launchSnapshot.launchDetectedAtMs,
         launchConfirmationStatus:launchSnapshot.launchConfirmationStatus,
-        metadata,social,creatorProfile,holderSnapshot,
-        walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
+        activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
         currentQualification,currentCandidate: candidate,currentDecision,
         currentSession: session,activePosition: position,
       });
@@ -1272,29 +1251,6 @@ function assertLeaseRow(row: unknown, job: ClaimedPaperDecisionJob): void {
   ) throw new PaperDecisionLeaseLostError();
 }
 
-async function latestMetadata(client: Client, mint: string): Promise<TokenMetadataSnapshot | null> {
-  const result = await client.query(`SELECT uri,resolution_status,failure_reason,
-    failure_message,failure_retryable,metadata,fetched_at,payload_version
-    FROM token_metadata_snapshots WHERE mint=$1 ORDER BY fetched_at DESC,snapshot_id DESC LIMIT 1`, [mint]);
-  const row = result.rows[0];
-  if (row === undefined) return null;
-  const status = textField(row, 'resolution_status');
-  const resolution = status === 'resolved'
-    ? { status: 'RESOLVED' as const, metadata: (decoded(
-      { status: 'RESOLVED', metadata: field(row, 'metadata') }, 'Metadata payload is invalid.',
-    ) as Extract<TokenMetadataSnapshot['resolution'], { status: 'RESOLVED' }>).metadata }
-    : {
-      status: 'FAILED' as const,
-      reason: textField(row, 'failure_reason') as Extract<TokenMetadataSnapshot['resolution'], { status: 'FAILED' }>['reason'],
-      message: nullableTextField(row, 'failure_message') ?? 'Metadata resolution failed.',
-      retryable: booleanField(row, 'failure_retryable'),
-    };
-  return deepFreeze({
-    mint,uri:textField(row, 'uri'),resolution,
-    fetchedAtMs:dateField(row, 'fetched_at').getTime(),payloadVersion:integerField(row, 'payload_version'),
-  });
-}
-
 async function loadLaunch(
   client: Client,
   mint: string,
@@ -1613,12 +1569,6 @@ function exactPaperLineagePredicate(jobAlias:string):string{
     )`;
 }
 
-async function latestPayload<T>(client: Client, sql: string, mint: string): Promise<T | null> {
-  const result = await client.query(sql, [mint]);
-  const row = result.rows[0];
-  return row === undefined ? null : decoded(field(row, 'payload'), 'Projection payload is invalid.') as T;
-}
-
 const QUALIFICATION_SELECT = `SELECT report.report_id,report.mint AS report_mint,
   report.source_event_id,report.source_raw_event_id,report.qualification_event_id,
   report.profile_id,report.profile_version,report.profile_fingerprint,
@@ -1906,63 +1856,6 @@ async function activeMarketTrades(
   ) as MarketTrade));
 }
 
-async function latestWalletGraph(client: Client, mint: string): Promise<WalletGraphAnalysis | null> {
-  const snapshotResult = await client.query(`SELECT snapshot.input_fingerprint,snapshot.coverage
-    FROM wallet_graph_snapshots snapshot
-    JOIN domain_events event ON event.event_id=snapshot.graph_event_id
-    WHERE snapshot.mint=$1 AND event.confirmation_status<>'orphaned'
-    ORDER BY snapshot.observed_at DESC,snapshot.snapshot_id DESC LIMIT 1`, [mint]);
-  const snapshot = snapshotResult.rows[0];
-  if (snapshot === undefined) return null;
-  const inputFingerprint = textField(snapshot, 'input_fingerprint');
-  const relationshipResult = await client.query(`SELECT * FROM wallet_relationships
-    WHERE mint=$1 AND input_fingerprint=$2 ORDER BY relationship_id`, [mint,inputFingerprint]);
-  const clusterResult = await client.query(`SELECT * FROM wallet_clusters
-    WHERE mint=$1 AND input_fingerprint=$2 ORDER BY cluster_id`, [mint,inputFingerprint]);
-  const memberResult = await client.query(`SELECT * FROM wallet_cluster_members
-    WHERE mint=$1 AND input_fingerprint=$2 ORDER BY cluster_id,wallet`, [mint,inputFingerprint]);
-  const membersByCluster = new Map<string, WalletClusterMember[]>();
-  for (const row of memberResult.rows) {
-    const clusterId = textField(row, 'cluster_id');
-    const members = membersByCluster.get(clusterId) ?? [];
-    members.push(deepFreeze({
-      wallet:textField(row,'wallet'),role:textField(row,'member_role') as WalletClusterMember['role'],
-      isCreator:booleanField(row,'is_creator'),
-      observedNetBaseRaw:BigInt(textField(row,'observed_net_base_raw')),
-    }));
-    membersByCluster.set(clusterId, members);
-  }
-  const relationships = Object.freeze(relationshipResult.rows.map((row): WalletRelationship => deepFreeze({
-    id:textField(row,'relationship_id'),mint,leftWallet:textField(row,'left_wallet'),
-    rightWallet:textField(row,'right_wallet'),type:textField(row,'relationship_type') as WalletRelationship['type'],
-    confidence:textField(row,'confidence') as WalletRelationship['confidence'],
-    evidenceCount:integerField(row,'evidence_count'),
-    quoteTotals:decodedArray(field(row,'quote_totals'),'Wallet relationship quote totals are invalid.') as WalletRelationship['quoteTotals'],
-    firstObservedCursor:decoded(field(row,'first_observed_cursor'),'Wallet relationship cursor is invalid.') as WalletRelationship['firstObservedCursor'],
-    lastObservedCursor:decoded(field(row,'last_observed_cursor'),'Wallet relationship cursor is invalid.') as WalletRelationship['lastObservedCursor'],
-  })));
-  const clusters = Object.freeze(clusterResult.rows.map((row): WalletCluster => {
-    const clusterId = textField(row, 'cluster_id');
-    return deepFreeze({
-      id:clusterId,mint,members:Object.freeze(membersByCluster.get(clusterId) ?? []),
-      participantWalletCount:integerField(row,'participant_wallet_count'),
-      auxiliaryWalletCount:integerField(row,'auxiliary_wallet_count'),
-      positiveHolderCount:integerField(row,'positive_holder_count'),
-      observedPositiveBaseRaw:BigInt(textField(row,'observed_positive_base_raw')),
-      concentrationBps:BigInt(textField(row,'concentration_bps')),
-      containsCreator:booleanField(row,'contains_creator'),
-      sharedFunderCount:integerField(row,'shared_funder_count'),
-      strongRelationshipCount:integerField(row,'strong_relationship_count'),
-      strongEvidenceCount:integerField(row,'strong_evidence_count'),
-      quoteAssets:decodedArray(field(row,'quote_assets'),'Wallet cluster quote assets are invalid.') as WalletCluster['quoteAssets'],
-    });
-  }));
-  return deepFreeze({
-    relationships,clusters,
-    coverage:decoded(field(snapshot,'coverage'),'Wallet graph coverage is invalid.') as WalletGraphAnalysis['coverage'],
-  });
-}
-
 function decodeDomainEvent(row: unknown): DomainEvent {
   return deepFreeze({
     id:textField(row,'event_id'),type:textField(row,'type') as DomainEvent['type'],
@@ -2081,14 +1974,6 @@ function decoded(value: unknown, message: string): object {
   if (typeof decodedValue !== 'object' || decodedValue === null) throw new TypeError(message);
   canonicalStringifyJson(decodedValue);
   return deepFreeze(decodedValue);
-}
-
-function decodedArray(value: unknown, message: string): readonly object[] {
-  const decodedValue = fromJsonValue(value);
-  if (!Array.isArray(decodedValue) || decodedValue.some((item) => typeof item !== 'object' || item === null)) {
-    throw new TypeError(message);
-  }
-  return deepFreeze(decodedValue) as readonly object[];
 }
 
 function deepFreeze<T>(value: T): T {

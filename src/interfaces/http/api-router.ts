@@ -51,8 +51,6 @@ type Route =
   | Readonly<{ name: 'launch'; mint: string }>
   | Readonly<{ name: 'events'; mint: string }>
   | Readonly<{ name: 'risk'; mint: string }>
-  | Readonly<{ name: 'social'; mint: string }>
-  | Readonly<{ name: 'holders'; mint: string }>
   | Readonly<{ name: 'paperPositions' }>
   | Readonly<{ name: 'health' }>
   | Readonly<{ name: 'eventStream' }>;
@@ -136,18 +134,6 @@ async function dispatch(
       const launch = await requireLaunch(deps.projections, route.mint);
       void launch;
       return { data: await deps.projections.getLaunchRisk(route.mint), nextCursor: null };
-    }
-    case 'social': {
-      requireNoQuery(query);
-      const launch = await requireLaunch(deps.projections, route.mint);
-      void launch;
-      return { data: await deps.projections.getLaunchSocial(route.mint), nextCursor: null };
-    }
-    case 'holders': {
-      requireNoQuery(query);
-      const launch = await requireLaunch(deps.projections, route.mint);
-      void launch;
-      return { data: await deps.projections.getLaunchHolders(route.mint), nextCursor: null };
     }
     case 'paperPositions': {
       const page = await deps.projections.listPaperPositions(
@@ -372,15 +358,13 @@ function matchRoute(pathname: string): Route {
   if (pathname === '/api/v1/paper-positions') return { name: 'paperPositions' };
   if (pathname === '/api/v1/health') return { name: 'health' };
   if (pathname === '/api/v1/events') return { name: 'eventStream' };
-  const match = /^\/api\/v1\/launches\/([^/]+)(?:\/(events|risk|social|holders))?$/u.exec(pathname);
+  const match = /^\/api\/v1\/launches\/([^/]+)(?:\/(events|risk))?$/u.exec(pathname);
   if (match === null) throw new ApiRequestError({ code: 'ROUTE_NOT_FOUND', httpStatus: 404 });
   const mint = parseMint(match[1]);
   switch (match[2]) {
     case undefined: return { name: 'launch', mint };
     case 'events': return { name: 'events', mint };
     case 'risk': return { name: 'risk', mint };
-    case 'social': return { name: 'social', mint };
-    case 'holders': return { name: 'holders', mint };
     default: throw new ApiRequestError({ code: 'ROUTE_NOT_FOUND', httpStatus: 404 });
   }
 }

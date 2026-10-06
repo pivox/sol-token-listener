@@ -7708,7 +7708,6 @@ async function withAuthoritySession(
         database,
         4,
         Date.now,
-        undefined,
         admissionPolicy,
       ),
       client: connection,

@@ -21,7 +21,6 @@ export function HealthPage(): ReactNode {
       <div className="row g-3">
         <HealthCard title="Dépendances"><p>PostgreSQL : <strong>{health.postgresql.status}</strong></p><p>HTTP : <strong>{health.http.status}</strong></p></HealthCard>
         <HealthCard title="Pipelines"><PipelineRows health={health} /></HealthCard>
-        <HealthCard title="Jobs sociaux"><JobCounts value={health.socialJobs} /></HealthCard>
         <HealthCard title="Décisions paper"><JobCounts value={health.paperDecisionJobs} /><p>Dernier succès : <Timestamp value={health.paperDecisionJobs.lastSuccessAt} /></p><p>Dernière erreur : <code>{health.paperDecisionJobs.lastErrorCode ?? 'Aucune'}</code></p></HealthCard>
         <HealthCard title="Qualification"><p>Rapports courants : {health.qualification.currentCount}</p><p>Dernier succès : <Timestamp value={health.qualification.lastSuccessAt} /></p></HealthCard>
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
@@ -177,7 +176,7 @@ function HealthCard({ title, children }: { readonly title: string; readonly chil
 }
 
 function PipelineRows({ health }: { readonly health: ApiHealth }): ReactNode {
-  return <><p>Pompe Pump.fun : <span aria-label={`Pump.fun : ${health.pipeline.pumpfun}`}>{health.pipeline.pumpfun}</span></p><p>Pool PumpSwap : {health.pipeline.pumpswap}</p><p>Paper decision : <span aria-label={`Paper decision : ${health.pipeline.paperDecision}`}>{health.pipeline.paperDecision}</span></p><p>Qualification : <span aria-label={`Qualification : ${health.pipeline.qualification}`}>{health.pipeline.qualification}</span></p><p>Social : {health.pipeline.social}</p></>;
+  return <><p>Pompe Pump.fun : <span aria-label={`Pump.fun : ${health.pipeline.pumpfun}`}>{health.pipeline.pumpfun}</span></p><p>Pool PumpSwap : {health.pipeline.pumpswap}</p><p>Paper decision : <span aria-label={`Paper decision : ${health.pipeline.paperDecision}`}>{health.pipeline.paperDecision}</span></p><p>Qualification : <span aria-label={`Qualification : ${health.pipeline.qualification}`}>{health.pipeline.qualification}</span></p></>;
 }
 
 function WebSocketDiagnostic({

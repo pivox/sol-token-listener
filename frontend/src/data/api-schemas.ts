@@ -7,7 +7,6 @@ const safeIntegerSchema = z.number().int();
 const countSchema = safeIntegerSchema.nonnegative();
 const versionSchema = countSchema;
 const mintSchema = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/u);
-const emptyArraySchema = z.array(z.never()).length(0);
 
 const jsonValueSchema: z.ZodType = z.lazy(() => z.union([
   z.string(),
@@ -41,7 +40,6 @@ export const domainEventTypeSchema = z.enum([
 ]);
 
 const confirmationStatusSchema = z.enum(['processed', 'confirmed', 'finalized', 'orphaned']);
-const finalConfirmationStatusSchema = z.enum(['processed', 'confirmed', 'finalized']);
 const launchStatusSchema = z.enum([
   'DETECTED', 'METADATA_PENDING', 'METADATA_RESOLVED', 'OBSERVING',
   'SOCIAL_CHECKING', 'ONCHAIN_CHECKING', 'QUALIFIED', 'WATCHLISTED',
@@ -138,198 +136,6 @@ const launchSummarySchema = z.object({
   paperStrategy: paperStrategySchema.nullable(),
 }).loose();
 
-const socialLinkKindSchema = z.enum(['WEBSITE', 'X', 'TELEGRAM']);
-const socialLinkSchema = z.object({
-  id: z.string().min(1),
-  kind: socialLinkKindSchema,
-  declaredValueSha256: z.string().regex(/^[a-f\d]{64}$/u),
-  syntaxStatus: z.enum(['VALID', 'INVALID']),
-  canonicalUrl: z.url().nullable(),
-  invalidReason: z.string().nullable(),
-  observedAt: timestampSchema,
-}).loose();
-const socialEvidenceSchema = z.object({
-  id: z.string().min(1),
-  type: z.enum([
-    'URL_SYNTAX_VALID', 'URL_SYNTAX_INVALID', 'URL_REACHABLE',
-    'CROSS_LINK_CONFIRMED', 'MINT_PUBLISHED', 'ACCOUNT_TOO_RECENT',
-    'DOMAIN_MISMATCH', 'CONTENT_UNAVAILABLE', 'VERIFICATION_UNKNOWN',
-  ]),
-  outcome: z.enum(['CONFIRMED', 'REJECTED', 'UNKNOWN']),
-  subjectKind: socialLinkKindSchema.nullable(),
-  relatedKind: socialLinkKindSchema.nullable(),
-  subjectUrl: z.url().nullable(),
-  finalUrl: z.url().nullable(),
-  httpStatus: countSchema.max(999).nullable(),
-  redirectCount: countSchema,
-  contentSha256: z.string().regex(/^[a-f\d]{64}$/u).nullable(),
-  reasonCode: z.string().min(1),
-  observedAt: timestampSchema,
-}).loose();
-const socialUnavailableSchema = z.object({
-  status: z.literal('NOT_AVAILABLE'),
-  links: emptyArraySchema,
-  evidence: emptyArraySchema,
-}).loose();
-const socialAvailableSchema = z.object({
-  status: z.literal('AVAILABLE'),
-  collectionStatus: z.enum(['COMPLETE', 'PARTIAL', 'FAILED']),
-  collectionId: z.string().min(1),
-  metadataSnapshotId: z.string().min(1),
-  observedAt: timestampSchema,
-  linkCount: countSchema,
-  linksTruncated: z.boolean(),
-  links: z.array(socialLinkSchema),
-  evidenceCount: countSchema,
-  evidenceTruncated: z.boolean(),
-  evidence: z.array(socialEvidenceSchema),
-  coverage: z.object({
-    declaredLinkCount: countSchema,
-    inspectedLinkCount: countSchema,
-    confirmedEvidenceCount: countSchema,
-    rejectedEvidenceCount: countSchema,
-    unknownEvidenceCount: countSchema,
-  }).loose(),
-}).loose();
-const socialSchema = z.discriminatedUnion('status', [socialUnavailableSchema, socialAvailableSchema]);
-
-const quoteAssetSchema = z.object({
-  mint: mintSchema,
-  decimals: countSchema,
-  tokenProgram: z.enum(['SPL_TOKEN', 'TOKEN_2022']),
-}).loose();
-const cursorSchema = z.object({
-  slot: unsignedIntegerSchema,
-  transactionIndex: unsignedIntegerSchema,
-  instructionIndex: unsignedIntegerSchema,
-  innerInstructionIndex: unsignedIntegerSchema.nullable(),
-}).loose();
-const quoteFlowSchema = z.object({
-  quoteAsset: quoteAssetSchema,
-  boughtQuoteRaw: decimalIntegerSchema,
-  soldQuoteRaw: decimalIntegerSchema,
-}).loose();
-const creatorTradeEvidenceSchema = z.object({
-  eventId: z.string().min(1),
-  tradeId: z.string().min(1),
-  signature: z.string().min(1),
-  cursor: cursorSchema,
-  baseAmountRaw: decimalIntegerSchema,
-  quoteAmountRaw: decimalIntegerSchema,
-  quoteAsset: quoteAssetSchema,
-}).loose();
-const creatorProfileSchema = z.object({
-  mint: mintSchema,
-  creator: mintSchema,
-  buyCount: countSchema,
-  sellCount: countSchema,
-  totalBoughtBaseRaw: decimalIntegerSchema,
-  totalSoldBaseRaw: decimalIntegerSchema,
-  observedNetBaseRaw: decimalIntegerSchema,
-  hasSold: z.boolean(),
-  firstSell: creatorTradeEvidenceSchema.nullable(),
-  initialBuys: z.array(creatorTradeEvidenceSchema),
-  quoteFlows: z.array(quoteFlowSchema),
-  uniqueExternalBuyers: countSchema,
-  unknownTraderTradeCount: countSchema,
-}).loose();
-const holderSnapshotSchema = z.object({
-  id: z.string().min(1),
-  inputFingerprint: z.string().regex(/^[a-f\d]{64}$/u),
-  observedAt: timestampSchema,
-  confirmationStatus: finalConfirmationStatusSchema,
-  cursor: cursorSchema,
-  totalPositiveNetBaseRaw: decimalIntegerSchema,
-  top1Bps: decimalIntegerSchema,
-  top5Bps: decimalIntegerSchema,
-  top10Bps: decimalIntegerSchema,
-  creatorBps: decimalIntegerSchema,
-  uniqueKnownBuyers: countSchema,
-  uniqueExternalBuyers: countSchema,
-  positivePositionCount: countSchema,
-  unknownTraderTradeCount: countSchema,
-}).loose();
-const walletPositionSchema = z.object({
-  wallet: mintSchema,
-  isCreator: z.boolean(),
-  buyCount: countSchema,
-  sellCount: countSchema,
-  boughtBaseRaw: decimalIntegerSchema,
-  soldBaseRaw: decimalIntegerSchema,
-  observedNetBaseRaw: decimalIntegerSchema,
-  quoteFlows: z.array(quoteFlowSchema),
-  firstObservedCursor: cursorSchema,
-  lastObservedCursor: cursorSchema,
-}).loose();
-const clusterMemberSchema = z.object({
-  wallet: mintSchema,
-  role: z.enum(['PARTICIPANT', 'AUXILIARY_FUNDER']),
-  isCreator: z.boolean(),
-  observedNetBaseRaw: decimalIntegerSchema,
-}).loose();
-const walletClusterSchema = z.object({
-  id: z.string().min(1),
-  quoteAssetCount: countSchema,
-  quoteAssetsTruncated: z.boolean(),
-  quoteAssets: z.array(quoteAssetSchema),
-  participantWalletCount: countSchema,
-  auxiliaryWalletCount: countSchema,
-  positiveHolderCount: countSchema,
-  observedPositiveBaseRaw: decimalIntegerSchema,
-  concentrationBps: decimalIntegerSchema,
-  containsCreator: z.boolean(),
-  sharedFunderCount: countSchema,
-  strongRelationshipCount: countSchema,
-  strongEvidenceCount: countSchema,
-  memberCount: countSchema,
-  membersTruncated: z.boolean(),
-  members: z.array(clusterMemberSchema),
-}).loose();
-const walletGraphCoverageSchema = z.object({
-  knownBuyCount: countSchema,
-  knownBuyerCount: countSchema,
-  strongEvidenceBuyCount: countSchema,
-  strongEvidenceBuyerCount: countSchema,
-  mediumOnlyBuyCount: countSchema,
-  mediumOnlyBuyerCount: countSchema,
-  noEvidenceBuyCount: countSchema,
-  noEvidenceBuyerCount: countSchema,
-  unavailableBuyCount: countSchema,
-  unavailableBuyerCount: countSchema,
-  notProcessedBuyCount: countSchema,
-  notProcessedBuyerCount: countSchema,
-  analyzedTransactionCount: countSchema,
-  evidenceCount: countSchema,
-}).loose();
-const holdersUnavailableSchema = z.object({
-  status: z.literal('NOT_AVAILABLE'),
-  snapshots: emptyArraySchema,
-  positions: emptyArraySchema,
-  clusters: emptyArraySchema,
-  clusterAnalysisStatus: z.literal('NOT_AVAILABLE'),
-}).loose();
-const holdersAvailableBase = z.object({
-  status: z.literal('AVAILABLE'),
-  methodology: z.literal('OBSERVED_BONDING_CURVE_TRADES'),
-  creatorProfile: creatorProfileSchema,
-  latestSnapshot: holderSnapshotSchema,
-  snapshots: z.array(holderSnapshotSchema),
-  positions: z.array(walletPositionSchema),
-});
-const holdersGraphUnavailableSchema = holdersAvailableBase.extend({
-  clusters: emptyArraySchema,
-  clusterAnalysisStatus: z.literal('NOT_AVAILABLE'),
-}).loose();
-const holdersGraphAvailableSchema = holdersAvailableBase.extend({
-  clusterAnalysisStatus: z.literal('AVAILABLE'),
-  clusterMethodology: z.literal('OBSERVED_PUMPFUN_TRANSACTIONS'),
-  clusterCoverage: walletGraphCoverageSchema,
-  clusterCount: countSchema,
-  clustersTruncated: z.boolean(),
-  clusters: z.array(walletClusterSchema),
-}).loose();
-const holdersAvailableSchema = z.union([holdersGraphUnavailableSchema, holdersGraphAvailableSchema]);
-const holdersSchema = z.union([holdersUnavailableSchema, holdersAvailableSchema]);
 
 const launchDetailSchema = launchSummarySchema.extend({
   creator: mintSchema,
@@ -340,8 +146,6 @@ const launchDetailSchema = launchSummarySchema.extend({
   reserveBase: decimalIntegerSchema.nullable(),
   reserveQuote: decimalIntegerSchema.nullable(),
   feeBps: decimalIntegerSchema.nullable(),
-  social: socialSchema,
-  holders: holdersSchema,
 }).loose();
 
 const qualificationSchema = z.object({
@@ -446,6 +250,12 @@ const websocketHealthSchema = z.object({
       'CHECKPOINT_CONFLICT', 'CATCH_UP_WINDOW_EXCEEDED',
     ]).nullable(),
   }).loose(),
+}).loose();
+const cursorSchema = z.object({
+  slot: unsignedIntegerSchema,
+  transactionIndex: unsignedIntegerSchema,
+  instructionIndex: unsignedIntegerSchema,
+  innerInstructionIndex: unsignedIntegerSchema.nullable(),
 }).loose();
 const jobCountsSchema = z.object({
   pendingCount: countSchema,
@@ -803,13 +613,11 @@ const healthSchema = z.object({
     pumpswap: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
     paperDecision: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
     qualification: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
-    social: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
   }).loose(),
   qualification: z.object({
     currentCount: countSchema,
     lastSuccessAt: timestampSchema.nullable(),
   }).loose(),
-  socialJobs: jobCountsSchema,
   paperDecisionJobs: jobCountsSchema.extend({
     lastSuccessAt: timestampSchema.nullable(),
     lastErrorCode: z.enum(['RPC_TRANSIENT', 'QUOTE_UNAVAILABLE', 'LEASE_EXPIRED', 'DECISION_INVALID']).nullable(),
@@ -886,8 +694,6 @@ export const apiLaunchListEnvelopeSchema = successEnvelope(z.array(launchSummary
 export const apiLaunchDetailEnvelopeSchema = successEnvelope(launchDetailSchema);
 export const apiTimelineEnvelopeSchema = successEnvelope(z.array(timelineEntrySchema));
 export const apiQualificationEnvelopeSchema = successEnvelope(qualificationSchema.nullable());
-export const apiSocialEnvelopeSchema = successEnvelope(socialSchema);
-export const apiHoldersEnvelopeSchema = successEnvelope(holdersSchema);
 export const apiPaperPositionListEnvelopeSchema = successEnvelope(z.array(paperPositionSchema));
 export const apiHealthEnvelopeSchema = successEnvelope(healthSchema);
 
@@ -923,8 +729,6 @@ export type ApiLaunchSummary = z.infer<typeof launchSummarySchema>;
 export type ApiLaunchDetail = z.infer<typeof launchDetailSchema>;
 export type ApiTimelineEntry = z.infer<typeof timelineEntrySchema>;
 export type ApiQualification = z.infer<typeof qualificationSchema>;
-export type ApiSocial = z.infer<typeof socialSchema>;
-export type ApiHolders = z.infer<typeof holdersSchema>;
 export type ApiPaperPosition = z.infer<typeof paperPositionSchema>;
 export type ApiHealth = z.infer<typeof healthSchema>;
 export type ApiSseEvent = z.infer<typeof apiSseEventSchema>;

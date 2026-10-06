@@ -34,10 +34,6 @@ describe('event-driven query invalidation', () => {
   });
 
   it('invalidates each specialized projection only for relevant event families', () => {
-    expect(invalidationKeysForEvent(event('SocialEvidenceCollected'))).toContainEqual(queryKeys.social(MINT));
-    for (const type of ['CreatorProfileUpdated', 'HolderDistributionUpdated', 'WalletClusterDetected'] as const) {
-      expect(invalidationKeysForEvent(event(type))).toContainEqual(queryKeys.holders(MINT));
-    }
     expect(invalidationKeysForEvent(event('QualificationUpdated'))).toContainEqual(queryKeys.risk(MINT));
     for (const type of [
       'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
@@ -45,7 +41,14 @@ describe('event-driven query invalidation', () => {
     ] as const) {
       expect(invalidationKeysForEvent(event(type))).toContainEqual(queryKeys.paperPositions.all);
     }
-    expect(invalidationKeysForEvent(event('TokenMetadataResolved'))).not.toContainEqual(queryKeys.social(MINT));
+  });
+
+  it('only invalidates the common keys for the retired social and holder event types', () => {
+    for (const type of ['SocialEvidenceCollected', 'CreatorProfileUpdated', 'HolderDistributionUpdated', 'WalletClusterDetected'] as const) {
+      expect(invalidationKeysForEvent(event(type))).toEqual([
+        queryKeys.launches.all, queryKeys.launch(MINT), queryKeys.events(MINT),
+      ]);
+    }
   });
 
   it('returns fresh arrays so callers cannot mutate shared cache keys', () => {

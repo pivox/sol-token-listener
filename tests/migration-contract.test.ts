@@ -52,7 +52,7 @@ void test('la purge paper respecte l’ordre enfant avant parent et les lignées
   ].map((statement) => source.indexOf(statement));
   assert.ok(order.every((index) => index >= 0));
   assert.deepEqual([...order].sort((left, right) => left - right), order);
-  assert.match(source, /NOT EXISTS \([\s\S]*social_evidence_collections[\s\S]*purge_after > statement_timestamp\(\)/u);
+  assert.doesNotMatch(source, /social_evidence_collections|social_enrichment_jobs|launch_trades/u);
   assert.match(source, /NOT EXISTS \([\s\S]*paper_strategy_sessions[\s\S]*purge_after IS NULL/u);
   assert.match(source, /NOT EXISTS \([\s\S]*paper_positions position[\s\S]*position\.close_event_id = domain_events\.event_id/u);
 });
