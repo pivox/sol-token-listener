@@ -41,6 +41,7 @@ export class PumpSwapReserveReader {
       pool.baseVault,
       pool.quoteVault,
     ]);
+    const stateReceivedAtMs = this.now();
     const poolAccount = required(accounts[0], pool.address);
     const baseVault = required(accounts[1], pool.baseVault);
     const quoteVault = required(accounts[2], pool.quoteVault);
@@ -90,6 +91,7 @@ export class PumpSwapReserveReader {
       effectiveQuoteReservesRaw,
       observedSlot: poolAccount.slot,
       observedAtMs,
+      stateReceivedAtMs,
     });
   }
 }

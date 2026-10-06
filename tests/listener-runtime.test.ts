@@ -13,7 +13,7 @@ void test('starts dependencies in exact order and exposes honest frozen pipeline
   await runtime.start();
 
   assert.deepEqual(calls, [
-    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'rpc.health', 'subscriber.start', 'scanner.scan', 'worker.start',
     'paperWorker.start', 'socialWorker.start', 'reconciler.start', 'heartbeat.start',
   ]);
   assert.equal(runtime.state(), 'RUNNING');
@@ -73,8 +73,24 @@ void test('rolls back the inbox worker when paper startup fails', async () => {
     return true;
   });
   assert.deepEqual(calls, [
-    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'paperWorker.start', 'worker.close', 'subscriber.close',
+    'rpc.health', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'paperWorker.start', 'scanner.close', 'worker.close', 'subscriber.close',
+  ]);
+});
+
+void test('closes the rolling scanner before producers when a later startup component fails', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  deps.paperWorker.start = async () => {
+    calls.push('paperWorker.start');
+    throw new Error('private paper startup');
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+
+  await assert.rejects(runtime.start(), ListenerRuntimeError);
+  assert.deepEqual(calls, [
+    'rpc.health', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'paperWorker.start', 'scanner.close', 'worker.close', 'subscriber.close',
   ]);
 });
 
@@ -96,8 +112,8 @@ void test('rolls back the transaction worker and producers when social startup f
     return true;
   });
   assert.deepEqual(calls, [
-    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'paperWorker.start', 'socialWorker.start', 'paperWorker.close', 'worker.close',
+    'rpc.health', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'paperWorker.start', 'socialWorker.start', 'scanner.close', 'paperWorker.close', 'worker.close',
     'subscriber.close',
   ]);
 });
@@ -105,32 +121,41 @@ void test('rolls back the transaction worker and producers when social startup f
 void test('rolls back only started resources in reverse after startup failure', async () => {
   const calls: string[] = [];
   const deps = dependencies(calls);
-  deps.worker.start = async () => { calls.push('worker.start'); throw new Error('private startup'); };
+  const startupFailure = Object.assign(new Error('private startup'), { code: 'ECONNREFUSED' });
+  const cleanupFailure = new Error('private cleanup');
+  deps.worker.start = async () => { calls.push('worker.start'); throw startupFailure; };
+  deps.subscriber.close = async () => { calls.push('subscriber.close'); throw cleanupFailure; };
   const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
 
   await assert.rejects(runtime.start(), (error: unknown) => {
     assert.ok(error instanceof ListenerRuntimeError);
     assert.deepEqual(error.failures, [
       Object.freeze({ stage: 'worker-start', errorName: 'ListenerDependencyError' }),
+      Object.freeze({ stage: 'subscriber-close', errorName: 'ListenerDependencyError' }),
     ]);
-    assert.equal(Object.hasOwn(error, 'cause'), false);
+    assert.equal(error.diagnostics[0]?.stage, 'worker-start');
+    assert.equal(error.diagnostics[0]?.phase, 'startup');
+    assert.equal(error.diagnostics[0]?.cause, startupFailure);
+    assert.equal(error.diagnostics[1]?.phase, 'startup-cleanup');
+    assert.equal(error.diagnostics[1]?.stage, 'subscriber-close');
+    assert.equal(error.diagnostics[1]?.cause, cleanupFailure);
     return true;
   });
   assert.deepEqual(calls, [
-    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan',
-    'worker.start', 'subscriber.close',
+    'rpc.health', 'subscriber.start', 'scanner.scan',
+    'worker.start', 'scanner.close', 'subscriber.close',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
 });
 
-void test('closes the subscriber when the post-subscription catch-up fails', async () => {
+void test('closes the subscriber when catch-up after subscription fails', async () => {
   const calls: string[] = [];
   const deps = dependencies(calls);
   let scans = 0;
   deps.scanner.scan = async () => {
     calls.push('scanner.scan');
     scans += 1;
-    if (scans === 2) throw new Error('private gap scan');
+    if (scans === 1) throw new Error('private gap scan');
   };
   const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
 
@@ -143,10 +168,32 @@ void test('closes the subscriber when the post-subscription catch-up fails', asy
     return true;
   });
   assert.deepEqual(calls, [
-    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan',
+    'rpc.health', 'subscriber.start', 'scanner.scan',
     'subscriber.close',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
+});
+
+void test('does not start workers when websocket disconnects during bootstrap catch-up', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  let subscription: 'RUNNING' | 'DEGRADED' = 'RUNNING';
+  deps.subscriber.state = () => subscription;
+  deps.scanner.scan = async () => {
+    calls.push('scanner.scan');
+    subscription = 'DEGRADED';
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  await assert.rejects(runtime.start(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'scanner-scan', errorName: 'ListenerDependencyError' }),
+    ]);
+    return true;
+  });
+  assert.deepEqual(calls, [
+    'rpc.health', 'subscriber.start', 'scanner.scan', 'scanner.close', 'subscriber.close',
+  ]);
 });
 
 void test('stops claims, closes producers, drains worker, and writes STOPPED heartbeat', async () => {

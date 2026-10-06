@@ -9,3 +9,4 @@ if (signature === undefined) throw new Error('Usage: npm run tx:diagnose -- <sig
 const fetcher = new TransactionFetcher(new SolanaRpcClient(loadConfig()));
 const transaction = await fetcher.fetch(signature, 'FINALIZED');
 process.stdout.write(`${stringifyJson({ event: 'transaction.diagnosed', transaction })}\n`);
+import 'dotenv/config';

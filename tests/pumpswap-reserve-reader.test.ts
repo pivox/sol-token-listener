@@ -34,6 +34,25 @@ void test('PumpSwap reserves include signed virtual quote reserves', async () =>
   assert.equal(snapshot.virtualQuoteReservesRaw, 5_000_000n);
   assert.equal(snapshot.effectiveQuoteReservesRaw, 25_000_000n);
   assert.equal(snapshot.observedSlot, 123n);
+  assert.equal(snapshot.stateReceivedAtMs, 2_000);
+});
+
+void test('PumpSwap pool decoder preserves negative, zero, positive and legacy missing virtual reserves', async () => {
+  for (const value of [-5_000_000n, 0n, 5_000_000n]) {
+    const reader = new PumpSwapReserveReader({
+      readAccountsAtSameSlot: () => Promise.resolve(fixtures(value)),
+    });
+    const snapshot = await reader.read(canonicalPool());
+    assert.equal(snapshot.virtualQuoteReservesRaw, value);
+    assert.equal(snapshot.effectiveQuoteReservesRaw, 20_000_000n + value);
+  }
+
+  const reader = new PumpSwapReserveReader({
+    readAccountsAtSameSlot: () => Promise.resolve(fixtures(0n, false)),
+  });
+  const legacy = await reader.read(canonicalPool());
+  assert.equal(legacy.virtualQuoteReservesRaw, 0n);
+  assert.equal(legacy.effectiveQuoteReservesRaw, 20_000_000n);
 });
 
 void test('PumpSwap reserves reject inconsistent slot, owner and mint', async () => {
@@ -115,15 +134,16 @@ function canonicalPool(): CanonicalMarketPool {
 
 function fixtures(
   virtualQuoteReservesRaw = 5_000_000n,
+  includeVirtualQuoteReserves = true,
 ): readonly [ReadonlyAccountSnapshot, ReadonlyAccountSnapshot, ReadonlyAccountSnapshot] {
   return [
-    poolAccount(virtualQuoteReservesRaw),
+    poolAccount(virtualQuoteReservesRaw, includeVirtualQuoteReserves),
     tokenAccount(BASE_VAULT, BASE, 10_000_000n, TOKEN_2022_PROGRAM_ID),
     tokenAccount(QUOTE_VAULT, QUOTE, 20_000_000n, TOKEN_PROGRAM_ID),
   ];
 }
 
-function poolAccount(virtualQuoteReservesRaw: bigint): ReadonlyAccountSnapshot {
+function poolAccount(virtualQuoteReservesRaw: bigint, includeVirtualQuoteReserves = true): ReadonlyAccountSnapshot {
   const values: Record<string, string | bigint | boolean> = {
     pool_bump: 1n,
     index: 0n,
@@ -144,7 +164,8 @@ function poolAccount(virtualQuoteReservesRaw: bigint): ReadonlyAccountSnapshot {
     owner: PUMPSWAP_PROGRAM_ID,
     data: Uint8Array.from([
       ...PUMPSWAP_ACCOUNTS.Pool.discriminator,
-      ...PUMPSWAP_TYPES.Pool.type.fields.flatMap((field) =>
+      ...PUMPSWAP_TYPES.Pool.type.fields.filter((field) =>
+        includeVirtualQuoteReserves || field.name !== 'virtual_quote_reserves').flatMap((field) =>
         encode(field.type, values[field.name])),
     ]),
     lamports: 1n,

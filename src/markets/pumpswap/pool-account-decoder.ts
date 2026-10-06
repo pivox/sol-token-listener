@@ -29,7 +29,12 @@ export function decodePumpSwapPoolAccount(
   const coinCreator = reader.readPubkey();
   const isMayhemMode = reader.readBool();
   const isCashbackCoin = reader.readBool();
-  const virtualQuoteReservesRaw = reader.readI128();
+  // PumpSwap appends fields over time. Historical Pool accounts end exactly
+  // after `is_cashback_coin`; only that exact legacy layout defaults to zero.
+  // A partial appended i128 is malformed and must not be reinterpreted.
+  const virtualQuoteReservesRaw = reader.remaining === 0
+    ? 0n
+    : reader.readI128();
   return Object.freeze({
     poolBump,
     index,

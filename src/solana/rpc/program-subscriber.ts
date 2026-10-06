@@ -30,6 +30,7 @@ export interface ProgramLogsConnection {
     callback: ProgramLogsCallback,
     commitment: typeof PROGRAM_SUBSCRIBER_COMMITMENT,
   ): unknown;
+  watchSubscriptionState(id: number, callback: (state: string) => void): () => void;
   removeOnLogsListener(id: number): Promise<void>;
 }
 
@@ -37,6 +38,13 @@ export type ProgramSubscriberRepository = Pick<TransactionInboxRepository, 'enqu
 
 export interface ProgramSubscriberOptions {
   readonly now?: () => number;
+  readonly subscriptionAckTimeoutMs?: number;
+  readonly programIds?: readonly string[];
+}
+
+export interface ProgramSubscriberMetrics {
+  readonly eventsReceived: number;
+  readonly enqueuesCompleted: number;
 }
 
 export class ProgramSubscriberError extends Error {
@@ -54,7 +62,10 @@ const PROGRAM_IDS = Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID] as cons
 
 export class SolanaProgramSubscriber {
   private readonly now: () => number;
+  private readonly subscriptionAckTimeoutMs: number;
+  private readonly programIds: readonly string[];
   private readonly listenerIds: number[] = [];
+  private readonly stateWatchers: (() => void)[] = [];
   private readonly inFlight = new Set<Promise<void>>();
   private startPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -62,6 +73,8 @@ export class SolanaProgramSubscriber {
   private permanentlyClosed = false;
   private currentState: ProgramSubscriberState = 'STOPPED';
   private currentError: ProgramSubscriberError | null = null;
+  private eventsReceived = 0;
+  private enqueuesCompleted = 0;
 
   public constructor(
     private readonly connection: ProgramLogsConnection,
@@ -70,6 +83,12 @@ export class SolanaProgramSubscriber {
   ) {
     const now = clockOption(options);
     this.now = now ?? Date.now;
+    this.subscriptionAckTimeoutMs = ackTimeoutOption(options);
+    const programIds = options.programIds ?? PROGRAM_IDS;
+    if (programIds.length === 0 || new Set(programIds).size !== programIds.length) {
+      throw new TypeError('Program subscriber program list is invalid.');
+    }
+    this.programIds = Object.freeze([...programIds]);
   }
 
   public get state(): ProgramSubscriberState {
@@ -78,6 +97,19 @@ export class SolanaProgramSubscriber {
 
   public get lastError(): ProgramSubscriberError | null {
     return this.currentError;
+  }
+
+  public metrics(): ProgramSubscriberMetrics {
+    return Object.freeze({
+      eventsReceived: this.eventsReceived,
+      enqueuesCompleted: this.enqueuesCompleted,
+    });
+  }
+
+  public async drainDurableEnqueues(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.all([...this.inFlight]);
+    }
   }
 
   public start(): Promise<void> {
@@ -118,8 +150,10 @@ export class SolanaProgramSubscriber {
 
   private async installListeners(): Promise<void> {
     const installed: number[] = [];
+    const watchers: (() => void)[] = [];
+    const acknowledged = new Set<number>();
     try {
-      for (const programId of PROGRAM_IDS) {
+      for (const programId of this.programIds) {
         const listenerId = this.connection.onLogs(
           new PublicKey(programId),
           (notification, context) => { this.receive(programId, notification, context); },
@@ -129,9 +163,23 @@ export class SolanaProgramSubscriber {
           throw new ProgramSubscriberError('subscribe');
         }
         installed.push(listenerId);
+        const unwatch = this.connection.watchSubscriptionState(listenerId, (state) => {
+          if (state === 'subscribed') {
+            acknowledged.add(listenerId);
+          } else if (acknowledged.has(listenerId) && this.accepting) {
+            this.accepting = false;
+            this.currentState = 'DEGRADED';
+            this.currentError = new ProgramSubscriberError('subscribe');
+          }
+        });
+        if (typeof unwatch !== 'function') throw new ProgramSubscriberError('subscribe');
+        watchers.push(unwatch);
       }
+      this.accepting = true;
+      await this.waitForAcknowledgements(installed, acknowledged);
     } catch {
       this.accepting = false;
+      watchers.forEach((unwatch) => { unwatch(); });
       const failedIds = await removeListeners(this.connection, installed);
       this.listenerIds.push(...failedIds);
       this.currentState = failedIds.length === 0 ? 'STOPPED' : 'DEGRADED';
@@ -153,9 +201,25 @@ export class SolanaProgramSubscriber {
     }
 
     this.listenerIds.push(...installed);
+    this.stateWatchers.push(...watchers);
     this.accepting = true;
     this.currentState = 'RUNNING';
     this.currentError = null;
+  }
+
+  private async waitForAcknowledgements(
+    installed: readonly number[],
+    acknowledged: ReadonlySet<number>,
+  ): Promise<void> {
+    const deadline = Date.now() + this.subscriptionAckTimeoutMs;
+    while (installed.some((id) => !acknowledged.has(id))) {
+      if (this.permanentlyClosed || this.currentState === 'DEGRADED') {
+        throw new ProgramSubscriberError('subscribe');
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new ProgramSubscriberError('subscribe');
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(remainingMs, 10)));
+    }
   }
 
   private receive(programId: string, value: unknown, context: unknown): void {
@@ -167,10 +231,14 @@ export class SolanaProgramSubscriber {
       this.report('notification');
       return;
     }
+    this.eventsReceived += 1;
     if (notification === null) return;
 
     const task = Promise.resolve()
-      .then(async () => { await this.repository.enqueue(notification); })
+      .then(async () => {
+        await this.repository.enqueue(notification);
+        this.enqueuesCompleted += 1;
+      })
       .catch(() => { this.report('enqueue'); });
     this.inFlight.add(task);
     void task.then(() => { this.inFlight.delete(task); });
@@ -201,6 +269,7 @@ export class SolanaProgramSubscriber {
     }
 
     const ids = this.listenerIds.splice(0);
+    this.stateWatchers.splice(0).forEach((unwatch) => { unwatch(); });
     const failedIds = await removeListeners(this.connection, ids);
     this.listenerIds.push(...failedIds);
     await Promise.all([...this.inFlight]);
@@ -213,7 +282,7 @@ export class SolanaProgramSubscriber {
   }
 }
 
-function snapshotNotification(
+export function snapshotNotification(
   programId: string,
   value: unknown,
   context: unknown,
@@ -299,6 +368,22 @@ function clockOption(options: ProgramSubscriberOptions): (() => number) | undefi
   if (value === undefined) return undefined;
   if (!isClock(value)) throw new TypeError('Program subscriber clock is invalid.');
   return value;
+}
+
+function ackTimeoutOption(options: ProgramSubscriberOptions): number {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(options, 'subscriptionAckTimeoutMs');
+    if (descriptor === undefined) return 15_000;
+    if (!('value' in descriptor) || descriptor.enumerable !== true) throw new TypeError('invalid');
+    const value: unknown = descriptor.value;
+    if (value === undefined) return 15_000;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 60_000) {
+      throw new TypeError('invalid');
+    }
+    return value;
+  } catch {
+    throw new TypeError('Program subscriber acknowledgement timeout is invalid.');
+  }
 }
 
 function isClock(value: unknown): value is () => number {

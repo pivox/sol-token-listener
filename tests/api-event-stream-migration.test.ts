@@ -263,6 +263,11 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '013_paper_e2e.sql',
       '014_social_persistence_retry.sql',
       '015_paper_active_session_per_mint.sql',
+      '016_live_order_journal.sql',
+      '017_live_positions.sql',
+      '018_live_position_market_route.sql',
+      '019_live_position_market_route_recovery.sql',
+      '020_live_position_market_resolution.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
@@ -271,6 +276,15 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     assert.equal((await pool.query(
       "SELECT 1 FROM api_event_stream WHERE domain_event_id = 'backfill-live'",
     )).rowCount, 1);
+    assert.deepEqual((await pool.query<{ event_id: string }>(
+      "SELECT event_id FROM domain_events WHERE event_id IN ('legacy-live','backfill-live') ORDER BY event_id",
+    )).rows.map((row) => row.event_id), ['backfill-live', 'legacy-live']);
+    assert.notEqual((await pool.query(
+      "SELECT to_regclass(format('%I.live_orders', current_schema())) AS table_name",
+    )).rows[0]?.table_name, null);
+    assert.notEqual((await pool.query(
+      "SELECT to_regclass(format('%I.live_position_market_routes', current_schema())) AS table_name",
+    )).rows[0]?.table_name, null);
     assert.equal((await pool.query<{ readonly backfill_completed: boolean }>(
       'SELECT backfill_completed FROM api_event_stream_state WHERE id = 1',
     )).rows[0]?.backfill_completed, true);

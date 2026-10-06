@@ -7,6 +7,13 @@ export const MAX_CATCH_UP_SIGNATURE_LENGTH = 128;
 export type CatchUpSourceStage = 'request' | 'response' | 'pagination';
 export type CatchUpConfirmationStatus = Exclude<ChainConfirmationStatus, 'orphaned'>;
 
+export interface CatchUpSourceScanDiagnostic {
+  readonly pageCount: number;
+  readonly signaturesRead: number;
+  readonly newestSlot: string | null;
+  readonly oldestSlot: string | null;
+}
+
 export interface CatchUpSignature {
   readonly signature: string;
   readonly slot: bigint;
@@ -28,6 +35,7 @@ export class CatchUpSourceError extends Error {
   public constructor(
     public readonly stage: CatchUpSourceStage,
     public readonly program: 'launchpad' | 'market' | null = null,
+    public readonly scanDiagnostic: CatchUpSourceScanDiagnostic | null = null,
   ) {
     super('Catch-up RPC source failed.');
     this.name = 'CatchUpSourceError';

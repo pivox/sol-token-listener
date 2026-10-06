@@ -112,6 +112,7 @@ function assertValidatedPool(
       !== tokenProgramAddress(pool.baseTokenProgram)
     || action.quote_token_program
       !== tokenProgramAddress(pool.quoteAsset.tokenProgram)
+    || pool.activatedAt === null
     || pool.activatedAt.slot !== migration.cursor.slot
     || pool.activatedAt.transactionIndex !== migration.cursor.transactionIndex
     || pool.activatedAt.instructionIndex !== cursor.instructionIndex

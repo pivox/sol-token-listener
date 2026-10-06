@@ -36,15 +36,24 @@ export interface ExternalBuysStrategyResult {
   readonly position: PaperPosition | null;
 }
 
+export interface LiveExternalBuyEvaluation {
+  readonly countedTradeIds: readonly string[];
+  readonly newlyCountedTradeIds: readonly string[];
+  readonly targetReached: boolean;
+}
+
 export class ValidatedExternalBuysStrategy {
+  private readonly clock: () => number;
+
   public constructor(
     private readonly ledger: PaperTradingActions,
     private readonly quotes: PaperQuoteRouter,
-    private readonly options: Readonly<{ retentionMs: number }>,
+    private readonly options: Readonly<{ retentionMs: number; clock?: () => number }>,
   ) {
     if (options.retentionMs !== 14_400_000) {
       throw new RangeError('Validated external buys retention must be four hours.');
     }
+    this.clock = options.clock ?? Date.now;
   }
 
   public prepare(
@@ -63,6 +72,42 @@ export class ValidatedExternalBuysStrategy {
       minimumConfirmation:input.minimumConfirmation,lastQuote:candidate.buyQuote,
       lastError:null,createdAtMs:input.nowMs,updatedAtMs:input.nowMs,
       purgeAfterMs:input.nowMs + this.options.retentionMs,
+    });
+  }
+
+  /** Uses the same canonical trade filters as paper reconciliation, without touching the paper ledger. */
+  public evaluateLiveExternalBuys(input: Readonly<{
+    candidate: TradingCandidateV1;
+    creator: string;
+    launchTrades: Parameters<typeof canonicalBuys>[0]['launchTrades'];
+    marketTrades: Parameters<typeof canonicalBuys>[0]['marketTrades'];
+    entryCursor: PaperStrategySessionV1['entryCursor'];
+    minimumConfirmation: PaperStrategySessionV1['minimumConfirmation'];
+    countedTradeIds: readonly string[];
+    externalBuyTarget: number;
+  }>): LiveExternalBuyEvaluation {
+    if (input.creator.length === 0
+      || !Number.isSafeInteger(input.externalBuyTarget) || input.externalBuyTarget < 1
+      || new Set(input.countedTradeIds).size !== input.countedTradeIds.length) {
+      throw new TypeError('Live external-buy evaluation input is invalid.');
+    }
+    const seen = new Set(input.countedTradeIds);
+    const newlyCounted: string[] = [];
+    for (const trade of canonicalBuys({
+      candidate:input.candidate,creator:input.creator,launchTrades:input.launchTrades,
+      marketTrades:input.marketTrades,
+      session:Object.freeze({
+        entryCursor:input.entryCursor,minimumConfirmation:input.minimumConfirmation,
+      }),
+    })) {
+      if (seen.has(trade.id)) continue;
+      seen.add(trade.id);
+      newlyCounted.push(trade.id);
+    }
+    const countedTradeIds = Object.freeze([...input.countedTradeIds,...newlyCounted]);
+    return Object.freeze({
+      countedTradeIds,newlyCountedTradeIds:Object.freeze(newlyCounted),
+      targetReached:countedTradeIds.length >= input.externalBuyTarget,
     });
   }
 
@@ -291,6 +336,23 @@ export class ValidatedExternalBuysStrategy {
         mint:input.candidate.mint,quoteAsset:input.candidate.quoteAsset,side:'SELL',
         amountInRaw:input.position.remainingBaseRaw,
         slippageBps:input.candidate.buyQuote?.slippageBps ?? 0n,
+        observationContext: {
+          sessionId: session.id,
+          positionId: input.position.id,
+          buyTradeId: input.position.entryTradeId,
+          signalAtMs: input.nowMs,
+          economicCostRaw: input.position.quoteCostRaw.toString(),
+          // Paper execution has no network fee; live execution must provide an explicit estimate.
+          sellNetworkFeeEstimateRaw: '0',
+        },
+      });
+      this.quotes.recordDecision?.({
+        sessionId: session.id,
+        positionId: input.position.id,
+        buyTradeId: input.position.entryTradeId,
+        quoteId: sellQuote.id,
+        signalAtMs: input.nowMs,
+        decisionAtMs: this.clock(),
       });
     } catch (error: unknown) {
       const known = error instanceof PaperQuoteError ? error : null;
@@ -329,7 +391,13 @@ interface CanonicalBuy {
   readonly trigger: DomainEvent;
 }
 
-function canonicalBuys(input: Parameters<ValidatedExternalBuysStrategy['reconcile']>[0]): readonly CanonicalBuy[] {
+function canonicalBuys(input: Readonly<{
+  candidate: TradingCandidateV1;
+  session: Pick<PaperStrategySessionV1,'entryCursor'|'minimumConfirmation'>;
+  creator: string;
+  launchTrades: readonly BondingCurveTradeObservedEventV1[];
+  marketTrades: readonly MarketTrade[];
+}>): readonly CanonicalBuy[] {
   const buys: CanonicalBuy[] = [];
   for (const event of input.launchTrades) {
     const trade = event.payload.trade;

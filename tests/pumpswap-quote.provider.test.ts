@@ -89,6 +89,18 @@ void test('PumpSwap quote SELL matches official SDK and real liquidity rule', ()
   );
 });
 
+void test('PumpSwap SELL quote matches SDK when virtual quote reserves are negative', () => {
+  const request={pool:pool(),reserves:{...reserves(),virtualQuoteReservesRaw:-5_000_000n,
+    effectiveQuoteReservesRaw:15_000_000n},inputMint:BASE.toBase58(),amountInRaw:400_000n,slippageBps:137n};
+  const quote=createPumpSwapQuote(request,state(),2_000);
+  const official=sellBaseInput({base:bn(request.amountInRaw),slippage:1.37,
+    baseReserve:bn(request.reserves.baseReservesRaw),quoteReserve:bn(request.reserves.quoteVaultAmountRaw),
+    virtualQuoteReserves:bn(-5_000_000n),globalConfig:globalConfig(),baseMintAccount:mint(),
+    baseMint:BASE,coinCreator:COIN_CREATOR,creator:CREATOR,feeConfig:null});
+  assert.equal(quote.amountOutRaw,BigInt(official.uiQuote.toString()));
+  assert.equal(quote.minimumAmountOutRaw,BigInt(official.minQuote.toString()));
+});
+
 void test('PumpSwap quote selects dynamic tier and disables null creator fee', () => {
   const dynamic: PumpSwapFeeState = {
     ...state(),

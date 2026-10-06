@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import type { Connection, Context, Logs, PublicKey } from '@solana/web3.js';
+import type { Context, Logs, PublicKey } from '@solana/web3.js';
 import type { TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
@@ -13,14 +13,15 @@ import {
 } from '../src/solana/rpc/program-subscriber.js';
 
 const signature = '1'.repeat(64);
-const web3ConnectionSatisfiesPort: Connection extends ProgramLogsConnection ? true : false = true;
-
 void test('subscribes exactly once to both official programs at processed commitment', async () => {
-  assert.equal(web3ConnectionSatisfiesPort, true);
-  const connection = new FakeConnection();
+  const connection = new FakeConnection([1, 2], false);
   const subscriber = makeSubscriber(connection, new FakeInbox());
 
-  await Promise.all([subscriber.start(), subscriber.start()]);
+  const starting = Promise.all([subscriber.start(), subscriber.start()]);
+  await tick();
+  assert.equal(subscriber.state, 'STARTING');
+  connection.acknowledgeAll();
+  await starting;
 
   assert.deepEqual(connection.subscriptions.map(({ programId, commitment }) => [
     programId, commitment,
@@ -30,6 +31,46 @@ void test('subscribes exactly once to both official programs at processed commit
   ]);
   assert.equal(subscriber.state, 'RUNNING');
   assert.equal(subscriber.lastError, null);
+});
+
+void test('subscribes only to the configured programs when programIds is given', async () => {
+  const connection = new FakeConnection([1]);
+  const subscriber = new SolanaProgramSubscriber(connection, new FakeInbox(), {
+    now: () => 1_720_000_000_000,
+    programIds: [PUMP_PROGRAM_ID],
+  });
+  await subscriber.start();
+  assert.equal(connection.subscribeAttempts, 1);
+  assert.deepEqual(connection.subscriptions.map(({ programId }) => programId), [PUMP_PROGRAM_ID]);
+  await subscriber.close();
+});
+
+void test('does not report RUNNING until both websocket subscriptions are acknowledged', async () => {
+  const connection = new FakeConnection([1, 2], false);
+  const subscriber = makeSubscriber(connection, new FakeInbox());
+  const starting = subscriber.start();
+  await tick();
+  connection.acknowledge(1);
+  await tick();
+  assert.equal(subscriber.state, 'STARTING');
+  connection.acknowledge(2);
+  await starting;
+  assert.equal(subscriber.state, 'RUNNING');
+  await subscriber.close();
+});
+
+void test('fails closed when the websocket acknowledgement does not arrive in time', async () => {
+  const connection = new FakeConnection([1, 2], false);
+  const subscriber = new SolanaProgramSubscriber(connection, new FakeInbox(), {
+    now: () => 1_720_000_000_000,
+    subscriptionAckTimeoutMs: 10,
+  });
+  await assert.rejects(subscriber.start(), (error) => {
+    assertStableError(error, 'subscribe');
+    return true;
+  });
+  assert.equal(subscriber.state, 'STOPPED');
+  assert.deepEqual(connection.removed, [1, 2]);
 });
 
 void test('enqueues a shared signature twice with distinct frozen program provenance', async () => {
@@ -48,6 +89,7 @@ void test('enqueues a shared signature twice with distinct frozen program proven
   ]);
   assert.ok(inbox.notifications.every((value) => Object.isFrozen(value)));
   assert.ok(inbox.notifications.every((value) => Object.isFrozen(value.programIds)));
+  assert.deepEqual(subscriber.metrics(), { eventsReceived: 2, enqueuesCompleted: 2 });
 });
 
 void test('deliberately ignores failed log notifications', async () => {
@@ -134,7 +176,9 @@ void test('awaits in-flight enqueues during shutdown', async () => {
 void test('contains enqueue rejection and reports only a stable redacted error seam', async () => {
   const connection = new FakeConnection();
   const inbox = new FakeInbox();
-  inbox.enqueueResult = Promise.reject(new Error('secret https://rpc.invalid/key'));
+  const enqueueFailure = Promise.reject(new Error('secret https://rpc.invalid/key'));
+  void enqueueFailure.catch(() => undefined);
+  inbox.enqueueResult = enqueueFailure;
   const subscriber = makeSubscriber(connection, inbox);
   await subscriber.start();
 
@@ -286,10 +330,14 @@ class FakeConnection implements ProgramLogsConnection {
   public readonly removed: number[] = [];
   public readonly removeFailures = new Set<number>();
   public readonly active = new Set<number>();
+  private readonly stateCallbacks = new Map<number, (state: string) => void>();
   public subscribeAttempts = 0;
   public subscribeFailureAt: number | null = null;
 
-  public constructor(private readonly ids: readonly unknown[] = [1, 2]) {}
+  public constructor(
+    private readonly ids: readonly unknown[] = [1, 2],
+    private readonly autoAcknowledge = true,
+  ) {}
 
   public onLogs(
     filter: PublicKey,
@@ -309,6 +357,20 @@ class FakeConnection implements ProgramLogsConnection {
     this.removed.push(id);
     if (this.removeFailures.has(id)) throw new Error(`removal secret ${id}`);
     this.active.delete(id);
+  }
+
+  public watchSubscriptionState(id: number, callback: (state: string) => void): () => void {
+    this.stateCallbacks.set(id, callback);
+    if (this.autoAcknowledge) setImmediate(() => { callback('subscribed'); });
+    return () => { this.stateCallbacks.delete(id); };
+  }
+
+  public acknowledge(id: number): void {
+    this.stateCallbacks.get(id)?.('subscribed');
+  }
+
+  public acknowledgeAll(): void {
+    for (const id of this.active) this.acknowledge(id);
   }
 
   public emit(programId: string, value: unknown, ctx: unknown): void {

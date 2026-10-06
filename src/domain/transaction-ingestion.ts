@@ -177,6 +177,8 @@ export interface RuntimeHeartbeat {
   readonly backlogCount: number;
   readonly leasedCount: number;
   readonly exhaustedCount: number;
+  readonly websocketEventsReceived?: number;
+  readonly websocketEnqueuesCompleted?: number;
 }
 
 export interface InboxCounts {
@@ -429,6 +431,12 @@ export function assertValidRuntimeHeartbeat(
   assertCount(record.backlogCount, 'Runtime heartbeat backlogCount');
   assertCount(record.leasedCount, 'Runtime heartbeat leasedCount');
   assertCount(record.exhaustedCount, 'Runtime heartbeat exhaustedCount');
+  if (record.websocketEventsReceived !== undefined) {
+    assertCount(record.websocketEventsReceived, 'Runtime heartbeat websocketEventsReceived');
+  }
+  if (record.websocketEnqueuesCompleted !== undefined) {
+    assertCount(record.websocketEnqueuesCompleted, 'Runtime heartbeat websocketEnqueuesCompleted');
+  }
   if (record.leasedCount > record.backlogCount) {
     throw new TypeError('Runtime heartbeat leasedCount exceeds backlogCount.');
   }

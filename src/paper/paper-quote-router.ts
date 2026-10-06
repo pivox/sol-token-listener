@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { CanonicalMarketPool, MarketQuoteRequest } from '../domain/market.js';
 import type { PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { PumpSwapMarketAdapter } from '../markets/pumpswap/pumpswap-market.adapter.js';
@@ -7,6 +8,11 @@ import {
   type PaperQuoteRouter,
 } from '../ports/paper-quote-router.js';
 import { toPaperExecutionQuote } from './market-paper-quote.js';
+import {
+  buildRuntimeDecisionObservationRow,
+  buildRuntimeQuoteObservationRow,
+  type QuoteObservationRecorder,
+} from '../telemetry/quote-recorder.js';
 
 export interface CanonicalPaperVenueState {
   readonly mint: string;
@@ -20,9 +26,15 @@ export interface CanonicalPaperVenueState {
     readonly pool: CanonicalMarketPool;
   } | null;
   readonly headSlot: bigint;
+  readonly resolutionSource?: 'LOCAL_INDEX' | 'RPC_CANONICAL_PDA';
+  readonly resolutionSlot?: bigint | null;
+  readonly resolutionAtMs?: number | null;
+  readonly pumpSwapCashback?: boolean | null;
+  readonly resolutionError?: string | null;
 }
 
 export interface CanonicalPaperVenueReader {
+  readonly resolutionSource?: 'LOCAL_INDEX' | 'RPC_CANONICAL_PDA';
   read(mint: string): Promise<CanonicalPaperVenueState>;
 }
 
@@ -30,10 +42,17 @@ export interface CanonicalPaperQuoteRouterOptions {
   readonly maxAgeMs: number;
   readonly maxSlotLag: bigint;
   readonly clock?: () => number;
+  readonly quoteRecorder?: QuoteObservationRecorder;
 }
 
 export class CanonicalPaperQuoteRouter implements PaperQuoteRouter {
   private readonly clock: () => number;
+  private readonly pendingDecisionRows = new Map<string, Readonly<{
+    context: NonNullable<PaperQuoteRequest['observationContext']>;
+    quoteId: string;
+    availableAtMs: number;
+    quote: PaperExecutionQuote;
+  }>>();
 
   public constructor(
     private readonly venues: CanonicalPaperVenueReader,
@@ -73,8 +92,83 @@ export class CanonicalPaperQuoteRouter implements PaperQuoteRouter {
         'Aucune venue canonique active ne permet une cotation paper.',
       );
     }
-    validateQuote(quote, request, state.headSlot, this.clock(), this.options);
+    const availableAtMs = this.clock();
+    validateQuote(quote, request, state.headSlot, availableAtMs, this.options);
+    if (request.side === 'SELL' && request.observationContext !== undefined && this.options.quoteRecorder !== undefined) {
+      try {
+        const context = request.observationContext;
+        const quoteCalculatedAtMs = quote.quoteCalculatedAtMs ?? quote.observedAtMs;
+        const row = buildRuntimeQuoteObservationRow({
+          id: `quote_observation_${createHash('sha256').update(JSON.stringify([
+            context.sessionId, context.positionId, quote.id, context.signalAtMs,
+          ])).digest('hex')}`,
+          mint: request.mint,
+          quoteMint: request.quoteAsset.mint,
+          context,
+          amountInRaw: quote.amountInRaw.toString(),
+          amountOutRaw: quote.amountOutRaw.toString(),
+          minimumAmountOutRaw: quote.minimumAmountOutRaw.toString(),
+          feesRaw: quote.feesRaw.toString(),
+          slippageBps: quote.slippageBps.toString(),
+          priceImpactBps: quote.priceImpactBps.toString(),
+          stateReceivedAtMs: quote.stateReceivedAtMs ?? null,
+          stateSlot: quote.observedSlot.toString(),
+          quoteCalculatedAtMs,
+          availableAtMs,
+          maxAgeMs: this.options.maxAgeMs,
+        });
+        this.options.quoteRecorder.record(row);
+        this.pendingDecisionRows.set(decisionKey(context.positionId, quote.id), {
+          context,
+          quoteId: quote.id,
+          availableAtMs,
+          quote,
+        });
+      } catch {
+        // Measurement must never change the quote returned to the strategy.
+      }
+    }
     return quote;
+  }
+
+  public recordDecision(input: {
+    readonly sessionId: string;
+    readonly positionId: string;
+    readonly buyTradeId: string;
+    readonly quoteId: string;
+    readonly signalAtMs: number;
+    readonly decisionAtMs: number;
+  }): void {
+    const recorder = this.options.quoteRecorder;
+    if (!recorder?.health().enabled) return;
+    const key = decisionKey(input.positionId, input.quoteId);
+    const captured = this.pendingDecisionRows.get(key);
+    if (captured === undefined) return;
+    this.pendingDecisionRows.delete(key);
+    if (captured.context.sessionId !== input.sessionId
+      || captured.context.buyTradeId !== input.buyTradeId
+      || captured.context.signalAtMs !== input.signalAtMs) return;
+    const quote = captured.quote;
+    const stateReceivedAtMs = quote.stateReceivedAtMs ?? null;
+    const quoteCalculatedAtMs = quote.quoteCalculatedAtMs ?? quote.observedAtMs;
+    const row = buildRuntimeDecisionObservationRow({
+      id: `quote_decision_${createHash('sha256').update(JSON.stringify([
+        input.sessionId, input.positionId, input.quoteId, input.decisionAtMs,
+      ])).digest('hex')}`,
+      sessionId: input.sessionId,
+      positionId: input.positionId,
+      buyTradeId: input.buyTradeId,
+      quoteId: input.quoteId,
+      signalAtMs: input.signalAtMs,
+      availableAtMs: captured.availableAtMs,
+      decisionAtMs: input.decisionAtMs,
+      stateReceivedAtMs,
+      stateSlot: quote.observedSlot.toString(),
+      quoteCalculatedAtMs,
+      maxAgeMs: this.options.maxAgeMs,
+      validity: 'VALID',
+    });
+    recorder.record(row);
   }
 
   private async readVenue(mint: string): Promise<CanonicalPaperVenueState> {
@@ -109,6 +203,10 @@ export class CanonicalPaperQuoteRouter implements PaperQuoteRouter {
       );
     }
   }
+}
+
+function decisionKey(positionId: string, quoteId: string): string {
+  return `${positionId}\0${quoteId}`;
 }
 
 function validateVenue(state: CanonicalPaperVenueState, request: PaperQuoteRequest): void {

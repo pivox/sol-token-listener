@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { MintLayout } from '@solana/spl-token';
+import { ExtensionType, getExtensionTypes, MintLayout, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, unpackMint } from '@solana/spl-token';
 import {
   bondingCurvePda,
   getBuySolAmountFromTokenAmount,
@@ -27,6 +27,7 @@ import type {
   MarketRpcReader,
   ReadonlyAccountSnapshot,
 } from '../ports/market-rpc-reader.js';
+import type { PumpCurveAdmissionEvidence } from '../live/live-token-eligibility.js';
 import {
   PaperQuoteError,
   type PaperQuoteRequest,
@@ -36,6 +37,17 @@ import {
 const U64_MAX = 18_446_744_073_709_551_615n;
 const BASIS_POINTS = 10_000n;
 
+export interface PumpFunQuoteAndState {
+  readonly quote: PaperExecutionQuote;
+  readonly mint: PublicKey;
+  readonly tokenProgram: PublicKey;
+  readonly stateSlot: bigint;
+  readonly global: Global;
+  readonly bondingCurve: BondingCurve;
+  readonly bondingCurveAccountInfo: AccountInfo<Buffer>;
+  readonly admissionEvidence: PumpCurveAdmissionEvidence;
+}
+
 export class PumpFunPaperQuoteProvider implements PaperQuoteRouter {
   public constructor(
     private readonly rpc: MarketRpcReader,
@@ -43,6 +55,11 @@ export class PumpFunPaperQuoteProvider implements PaperQuoteRouter {
   ) {}
 
   public async quote(request: PaperQuoteRequest): Promise<PaperExecutionQuote> {
+    return (await this.quoteAndState(request)).quote;
+  }
+
+  /** Returns a quote and the exact validated state snapshot used to calculate it. */
+  public async quoteAndState(request: PaperQuoteRequest): Promise<PumpFunQuoteAndState> {
     const addresses = accountAddresses(request.mint);
     let accounts: readonly (ReadonlyAccountSnapshot | null)[];
     try {
@@ -53,8 +70,9 @@ export class PumpFunPaperQuoteProvider implements PaperQuoteRouter {
         'Les comptes de cotation Pump.fun sont temporairement indisponibles.',
       );
     }
+    const stateReceivedAtMs = this.clock();
     try {
-      return createQuote(request, addresses, accounts, this.clock());
+      return createQuote(request, addresses, accounts, this.clock(), stateReceivedAtMs);
     } catch (error) {
       if (error instanceof PaperQuoteError) throw error;
       throw new PaperQuoteError(
@@ -70,7 +88,8 @@ function createQuote(
   addresses: readonly [string, string, string, string],
   accounts: readonly (ReadonlyAccountSnapshot | null)[],
   observedAtMs: number,
-): PaperExecutionQuote {
+  stateReceivedAtMs: number,
+): PumpFunQuoteAndState {
   validateRequest(request, observedAtMs);
   const globalAccount = required(accounts[0], addresses[0]);
   const feeConfigAccount = required(accounts[1], addresses[1]);
@@ -88,6 +107,7 @@ function createQuote(
   const global = decodeGlobal(globalAccount);
   const feeConfig = decodeFeeConfig(feeConfigAccount);
   const curve = decodeCurve(curveAccount);
+  const admissionEvidence = readAdmissionEvidence(request.mint, curveAccount, mintAccount, stateReceivedAtMs);
   const mintSupply = decodeMintSupply(mintAccount);
   validateState(request, global, feeConfig, curve, mintSupply);
 
@@ -112,7 +132,7 @@ function createQuote(
     request.slippageBps.toString(),
     request.side,
   ]);
-  return Object.freeze({
+  const quote = Object.freeze({
     id: `quote_${createHash('sha256').update(identity).digest('hex')}`,
     inputMint,
     outputMint,
@@ -130,6 +150,56 @@ function createQuote(
     ),
     observedAtMs,
     observedSlot: globalAccount.slot,
+    stateReceivedAtMs,
+    quoteCalculatedAtMs: observedAtMs,
+  });
+  return Object.freeze({
+    quote,
+    mint: new PublicKey(request.mint),
+    tokenProgram: new PublicKey(mintAccount.owner),
+    stateSlot: globalAccount.slot,
+    global,
+    bondingCurve: curve,
+    bondingCurveAccountInfo: accountInfo(curveAccount),
+    admissionEvidence,
+  });
+}
+
+/** Account layout offsets are tied to the locked Pump SDK 1.36 IDL. Unknown lengths/booleans stay unknown. */
+function readAdmissionEvidence(
+  mint: string,
+  account: ReadonlyAccountSnapshot,
+  mintAccount: ReadonlyAccountSnapshot,
+  receivedAtMs: number,
+): PumpCurveAdmissionEvidence {
+  // Anchor discriminator + five u64 reserves + complete + creator + mayhem + cashback + quoteMint.
+  const layout = account.data.length === 115 ? 'pump-sdk-1.36-bonding-curve-v2'
+    : account.data.length === 116 ? 'pump-sdk-1.36-bonding-curve-v2-holder-reward' : 'unsupported';
+  const cashbackByte = account.data.length >= 83 ? account.data[82] : undefined;
+  const holderByte = layout === 'pump-sdk-1.36-bonding-curve-v2-holder-reward' ? account.data[115] : 0;
+  let mintExtensions: readonly string[] | null = null;
+  try {
+    if (mintAccount.owner === TOKEN_PROGRAM_ID.toBase58() && mintAccount.data.length === MintLayout.span) {
+      mintExtensions = Object.freeze([]);
+    } else if (mintAccount.owner === TOKEN_2022_PROGRAM_ID.toBase58()) {
+      const decoded = unpackMint(new PublicKey(mint), accountInfo(mintAccount), TOKEN_2022_PROGRAM_ID);
+      mintExtensions = Object.freeze(getExtensionTypes(decoded.tlvData).map((extension) => {
+        const name=ExtensionType[extension];
+        return typeof name==='string'?name:`UNKNOWN_${extension}`;
+      }));
+    }
+  } catch { mintExtensions = null; }
+  return Object.freeze({
+    mint,
+    tokenProgram: mintAccount.owner,
+    owner: account.owner,
+    layout,
+    slot: account.slot,
+    receivedAtMs,
+    source: 'validated_getMultipleAccounts_same_slot',
+    isCashbackCoin: cashbackByte === 0 || cashbackByte === 1 ? cashbackByte === 1 : null,
+    isHolderReward: layout === 'unsupported' ? null : holderByte === 0 || holderByte === 1 ? holderByte === 1 : null,
+    mintExtensions,
   });
 }
 

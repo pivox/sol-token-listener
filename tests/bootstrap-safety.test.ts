@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { readFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
@@ -10,8 +12,10 @@ import {
   reportEntrypointFailure,
   runApplication,
   waitForShutdownSignal,
+  parseListenerStartupOptions,
   type ApplicationDependencies,
 } from '../src/app.js';
+import { ListenerRuntimeError } from '../src/application/listener-runtime.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
@@ -183,11 +187,9 @@ void test('selected invalid profile prevents every database, listener, and API r
 
   const logs: object[] = [];
   reportEntrypointFailure(new QualificationProfileError('PROFILE_SCHEMA_INVALID'), { exitCode: undefined }, (context) => { logs.push(context); });
-  assert.deepEqual(logs, [{
-    event: 'listener.start_failed',
-    errorName: 'QualificationProfileError',
-  }]);
-  assert.doesNotMatch(JSON.stringify(logs), /path|content|cause/u);
+  assert.match(JSON.stringify(logs), /QualificationProfileError/u);
+  assert.match(JSON.stringify(logs), /PROFILE_SCHEMA_INVALID/u);
+  assert.doesNotMatch(JSON.stringify(logs), /qualification-profile-path|file-content|"cause":/u);
 });
 
 void test('explicit listener disablement exposes STOPPED pipeline state to the API', async () => {
@@ -264,7 +266,8 @@ void test('terminal handler redacts the failure and sets exitCode', () => {
   const logs: object[] = [];
   reportEntrypointFailure(new Error('credential-like-detail'), runtime, (context) => { logs.push(context); });
   assert.equal(runtime.exitCode, 1);
-  assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'UnknownError' }]);
+  assert.match(JSON.stringify(logs), /"errorName":"Error"/u);
+  assert.match(JSON.stringify(logs), /credential-like-detail/u);
 });
 
 void test('terminal handler reads only a bounded own enumerable name data descriptor', () => {
@@ -282,7 +285,7 @@ void test('terminal handler reads only a bounded own enumerable name data descri
     get() { throw new Error('proxy get secret'); },
   });
   const errors: unknown[] = [getter, prototype, proxy, 'primitive secret', {
-    name: 'x'.repeat(65), message: 'message secret',
+    name: 'x'.repeat(65), message: 'password=FAKE_SECRET_113',
   }];
 
   for (const error of errors) {
@@ -294,19 +297,156 @@ void test('terminal handler reads only a bounded own enumerable name data descri
         (context) => { logs.push(context); },
       );
     });
-    assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'UnknownError' }]);
-    assert.doesNotMatch(JSON.stringify(logs), /secret/u);
+    assert.equal(logs.length, 1);
+    assert.doesNotMatch(JSON.stringify(logs), /FAKE_SECRET_113/u);
   }
   assert.equal(getterReads, 0);
 
   const logs: object[] = [];
   reportEntrypointFailure(
-    { name: 'ListenerStartupError', message: 'message secret' },
+    { name: 'ListenerStartupError', message: 'password=FAKE_PASSWORD_992' },
     { exitCode: undefined },
     (context) => { logs.push(context); },
   );
-  assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'ListenerStartupError' }]);
-  assert.doesNotMatch(JSON.stringify(logs), /secret/u);
+  assert.match(JSON.stringify(logs), /ListenerStartupError/u);
+  assert.doesNotMatch(JSON.stringify(logs), /FAKE_PASSWORD_992/u);
+});
+
+void test('startup failure diagnostics retain stage, safe code, and nested causes while redacting credentials', () => {
+  const runtime: { exitCode: number | string | undefined } = { exitCode: undefined };
+  const logs: object[] = [];
+  const rootCause = Object.assign(new Error('request failed https://rpc.example.invalid/path?api-key=FAKE_RPC_TOKEN_87'), {
+    code: 'ECONNREFUSED',
+    cause: new Error('database postgresql://user:FAKE_DB_PASSWORD_21@localhost/db failed'),
+  });
+  const runtimeError = new ListenerRuntimeError([{
+    phase: 'startup', stage: 'subscriber-start', errorName: 'ListenerDependencyError', cause: rootCause,
+  }]);
+  const error = new AggregateError([runtimeError, new Error('password=FAKE_CLEANUP_SECRET_41')], 'shutdown failed');
+
+  reportEntrypointFailure(error, runtime, (context) => { logs.push(context); });
+
+  const serialized = JSON.stringify(logs);
+  assert.match(serialized, /subscriber-start/u);
+  assert.match(serialized, /ECONNREFUSED/u);
+  assert.match(serialized, /request failed/u);
+  assert.match(serialized, /database/u);
+  assert.match(serialized, /application-cleanup/u);
+  assert.doesNotMatch(serialized, /FAKE_RPC_TOKEN_87|FAKE_DB_PASSWORD_21|FAKE_CLEANUP_SECRET_41|user:/u);
+  assert.equal(runtime.exitCode, 1);
+});
+
+void test('catch-up window diagnostics retain bounded scanner facts but never endpoints', () => {
+  const logs: object[] = [];
+  const scannerError = Object.assign(new Error('Catch-up scan window was exceeded.'), {
+    name: 'CatchUpWindowExceededError',
+    code: 'CATCH_UP_WINDOW_EXCEEDED',
+    diagnostic: {
+      program: 'launchpad',
+      checkpointSlot: '453623653',
+      checkpointSignature: '12345678…abcdefgh',
+      frontierSlot: '453700000',
+      frontierSignature: 'ABCDEFGH…abcdefgh',
+      pageSize: 100,
+      maxPages: 20,
+      pageCount: 20,
+      signaturesRead: 2_000,
+      newestSlot: '453623700',
+      oldestSlot: '453623690',
+      checkpointSignatureFound: false,
+      exhaustion: 'page-budget-exhausted',
+      endpoint: 'https://rpc-user:FAKE_RPC_PASSWORD@rpc.invalid/?api-key=FAKE_RPC_KEY',
+    },
+  });
+  const error = new ListenerRuntimeError([{
+    phase: 'startup', stage: 'scanner-scan', errorName: 'ListenerDependencyError', cause: scannerError,
+  }]);
+
+  reportEntrypointFailure(error, { exitCode: undefined }, (context) => { logs.push(context); });
+
+  const serialized = JSON.stringify(logs);
+  assert.match(serialized, /CATCH_UP_WINDOW_EXCEEDED/u);
+  assert.match(serialized, /"program":"launchpad"/u);
+  assert.match(serialized, /"pageCount":20/u);
+  assert.match(serialized, /"signaturesRead":2000/u);
+  assert.match(serialized, /"frontierSignature":"ABCDEFGH…abcdefgh"/u);
+  assert.match(serialized, /"checkpointSignatureFound":false/u);
+  assert.doesNotMatch(serialized, /FAKE_RPC_PASSWORD|FAKE_RPC_KEY|rpc-user|endpoint/u);
+});
+
+void test('cutover failure keeps the initial window proof and a separately filtered cause', () => {
+  const logs: object[] = [];
+  const window = Object.assign(new Error('Catch-up scan window was exceeded.'), {
+    name: 'CatchUpWindowExceededError',
+    code: 'CATCH_UP_WINDOW_EXCEEDED',
+    diagnostic: {
+      program: 'launchpad', checkpointSlot: '10', checkpointSignature: '12345678…abcdefgh',
+      frontierSlot: '20', frontierSignature: 'ABCDEFGH…abcdefgh', pageSize: 1_000, maxPages: 20,
+      pageCount: 20, signaturesRead: 20_000, newestSlot: '20', oldestSlot: '11',
+      checkpointSignatureFound: false, exhaustion: 'page-budget-exhausted',
+    },
+  });
+  const failure = new AggregateError([
+    window,
+    new Error('RPC failed for https://user:FAKE_PASSWORD@rpc.invalid/?token=FAKE_TOKEN'),
+  ], 'cutover failed');
+  failure.name = 'CatchUpCutoverFailureError';
+  const runtimeError = new ListenerRuntimeError([{
+    phase: 'startup', stage: 'scanner-scan', errorName: 'ListenerDependencyError', cause: failure,
+  }]);
+
+  reportEntrypointFailure(runtimeError, { exitCode: undefined }, (context) => { logs.push(context); });
+
+  const parsed = logs[0] as { diagnostics: readonly Record<string, unknown>[] };
+  assert.equal(parsed.diagnostics[0]?.stage, 'scanner-scan');
+  const causes = parsed.diagnostics[0]?.causes as readonly Record<string, unknown>[];
+  const primary = causes.find((cause) => cause.code === 'CATCH_UP_WINDOW_EXCEEDED');
+  assert.ok(primary);
+  assert.equal((primary.catchUpWindow as Record<string, unknown>)?.frontierSlot, '20');
+  assert.ok(causes.some((cause) => cause.errorName === 'CatchUpCutoverFailureError'));
+  assert.ok(causes.some((cause) => cause.errorName === 'Error'));
+  assert.doesNotMatch(JSON.stringify(parsed.diagnostics), /application-cleanup/u);
+  const serialized = JSON.stringify(logs);
+  assert.doesNotMatch(serialized, /FAKE_PASSWORD|FAKE_TOKEN|rpc.invalid/u);
+});
+
+void test('isolated app startup honors DOTENV_CONFIG_PATH and does not read cwd .env', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'observe-env-isolation-'));
+  const appPath = fileURLToPath(new URL('../src/app.ts', import.meta.url));
+  const tsxLoader = fileURLToPath(import.meta.resolve('tsx'));
+  try {
+    await writeFile(join(root, '.env'), [
+      'EXECUTION_MODE=paper',
+      'PAPER_STRATEGY_ENABLED=true',
+    ].join('\n'));
+    await writeFile(join(root, 'live.env'), [
+      'EXECUTION_MODE=observe',
+      'SOLANA_HTTP_RPC_URL=https://rpc.example.invalid',
+      'SOLANA_WS_RPC_URL=wss://rpc.example.invalid',
+      'LISTENER_ENABLED=false',
+      'API_ENABLED=false',
+      'DASHBOARD_ENABLED=false',
+      'POSTGRES_AUTO_MIGRATE=false',
+    ].join('\n'));
+    const child = spawnSync(process.execPath, [
+      '--env-file=live.env', '--import', tsxLoader, appPath,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        HOME: root,
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        DOTENV_CONFIG_PATH: '/dev/null',
+      },
+      timeout: 15_000,
+    });
+
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /"executionMode":"observe"/u);
+    assert.doesNotMatch(child.stdout + child.stderr, /PAPER_STRATEGY_ENABLED requires|FAKE_DOTENV_SENTINEL/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 void test('signal waiter removes both listeners after the first signal', async () => {
@@ -316,6 +456,17 @@ void test('signal waiter removes both listeners after the first signal', async (
   assert.equal(await waiting, 'SIGINT');
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
+});
+
+void test('recorded live-edge cutover requires its exact explicit startup option', () => {
+  assert.deepEqual(parseListenerStartupOptions([]), { allowRecordedLiveEdgeCutover: false });
+  assert.deepEqual(parseListenerStartupOptions(['--allow-recorded-live-edge-cutover']), {
+    allowRecordedLiveEdgeCutover: true,
+  });
+  assert.throws(() => parseListenerStartupOptions(['--force']), /Unsupported listener startup option/u);
+  assert.throws(() => parseListenerStartupOptions([
+    '--allow-recorded-live-edge-cutover', '--allow-recorded-live-edge-cutover',
+  ]), /Unsupported listener startup option/u);
 });
 
 function dependencies(

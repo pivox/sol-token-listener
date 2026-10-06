@@ -78,6 +78,27 @@ npm run lint
 npm test
 ```
 
+### Démarrage local rapide (PostgreSQL)
+
+Le listener fonctionne avec `DATABASE_URL` au format standard PostgreSQL. Exemple
+minimal :
+
+```dotenv
+DATABASE_URL=postgresql://solanabot:solanabot@127.0.0.1:5432/solanabot
+```
+
+Si votre instance PostgreSQL locale ne crée pas ce rôle, démarrez PostgreSQL puis
+exécutez :
+
+```bash
+createdb -U postgres solanabot
+psql -U postgres -d postgres -c "CREATE ROLE solanabot LOGIN PASSWORD 'solanabot';"
+psql -U postgres -d postgres -c "ALTER DATABASE solanabot OWNER TO solanabot;"
+```
+
+Si vous préférez un autre couple utilisateur/base, adaptez `DATABASE_URL`
+en conséquence.
+
 ## Console frontend indépendante
 
 Le workspace `frontend/` fournit maintenant la console opérateur React/Vite

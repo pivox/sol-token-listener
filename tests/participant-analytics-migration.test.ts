@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
+import { assertCurrentMigrationsApplied } from './helpers/current-migration-assertions.js';
 
 const migrationUrl = new URL('../migrations/007_participant_analytics.sql', import.meta.url);
 
@@ -45,7 +46,7 @@ void test('applique 001–014 sur une base vide et accepte les événements SSE'
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '015_paper_active_session_per_mint.sql');
+    assertCurrentMigrationsApplied(applied, '007_participant_analytics.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

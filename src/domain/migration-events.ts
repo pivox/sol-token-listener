@@ -52,8 +52,10 @@ export function createPumpSwapPoolActivatedEvent(
     readonly pool: CanonicalMarketPool;
   },
 ): PumpSwapPoolActivatedEventV1 {
+  const activationCursor=input.pool.activatedAt;
+  if(activationCursor===null)throw new TypeError('An activation event requires a proven historical pool activation cursor.');
   const pool = snapshotPool(input.pool);
-  return event(input, 'PumpSwapPoolActivated', pool.baseMint, pool.activatedAt, {
+  return event(input, 'PumpSwapPoolActivated', pool.baseMint, activationCursor, {
     migrationEventId: input.migrationEventId,
     pool,
   });
@@ -108,6 +110,7 @@ function snapshotMigration(value: MigrationObservation): MigrationObservation {
 }
 
 function snapshotPool(value: CanonicalMarketPool): CanonicalMarketPool {
+  if(value.activatedAt===null)throw new TypeError('An activation event requires a proven historical pool activation cursor.');
   return Object.freeze({
     address: value.address,
     market: value.market,

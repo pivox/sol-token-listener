@@ -779,7 +779,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           value.reconcilerState,
           dateFromMs(value.startedAtMs),
           value.leasedCount,
-          toJsonValue({ startedAt: dateFromMs(value.startedAtMs).toISOString() }),
+          toJsonValue({
+            startedAt: dateFromMs(value.startedAtMs).toISOString(),
+            ...(value.websocketEventsReceived === undefined ? {} : {
+              websocketEventsReceived: value.websocketEventsReceived,
+            }),
+            ...(value.websocketEnqueuesCompleted === undefined ? {} : {
+              websocketEnqueuesCompleted: value.websocketEnqueuesCompleted,
+            }),
+          }),
           value.exhaustedCount,
         ],
       );

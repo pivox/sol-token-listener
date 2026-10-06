@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
+import { assertCurrentMigrationsApplied } from './helpers/current-migration-assertions.js';
 
 const migrationUrl=new URL('../migrations/015_paper_active_session_per_mint.sql',import.meta.url);
 
@@ -26,7 +27,7 @@ void test('applies migration 015 on an empty PostgreSQL schema and replays clean
   try{
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied=await migrateDatabase({ pool });
-    assert.equal(applied.at(-1),'015_paper_active_session_per_mint.sql');
+    assertCurrentMigrationsApplied(applied, '015_paper_active_session_per_mint.sql');
     assert.deepEqual(await migrateDatabase({ pool }),[]);
     const index=await pool.query<{readonly definition:string}>(`SELECT indexdef AS definition
       FROM pg_indexes WHERE schemaname=current_schema()

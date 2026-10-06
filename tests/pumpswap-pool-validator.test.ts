@@ -74,6 +74,18 @@ void test('refuse les contradictions de vault, programme et extension Token-2022
   );
 });
 
+void test('accepts the Pump create_v2 Token-2022 metadata-pointer mint extension on the canonical PumpSwap pair', () => {
+  const account=poolAccount();const decoded=decodePumpSwapPoolAccount(account);const baseProgram=TOKEN_2022_PROGRAM_ID;
+  const valid=validationInput(account,decoded);
+  const result=validateCanonicalPumpSwapPool({
+    ...valid,
+    creation:creation({baseTokenProgram:baseProgram.toBase58()}),
+    baseMintAccount:mintAccount(BASE,baseProgram,6,ExtensionType.MetadataPointer),
+    baseTokenProgram:'TOKEN_2022',
+  });
+  assert.equal(result.baseTokenProgram,'TOKEN_2022');
+});
+
 function poolAccount(overrides: { readonly index?: bigint } = {}): ReadonlyAccountSnapshot {
   const values: Record<string, string | bigint | boolean> = {
     pool_bump: 1n,
@@ -193,7 +205,8 @@ function mintAccount(
   decimals: number,
   extension: ExtensionType | null = null,
 ): ReadonlyAccountSnapshot {
-  const data = Buffer.alloc(extension === null ? MintLayout.span : 170);
+  const extensionLength=extension===ExtensionType.MetadataPointer?64:0;
+  const data = Buffer.alloc(extension === null ? MintLayout.span : 170+extensionLength);
   MintLayout.encode({
     mintAuthorityOption: 0,
     mintAuthority: PublicKey.default,
@@ -206,7 +219,7 @@ function mintAccount(
   if (extension !== null) {
     data[165] = AccountType.Mint;
     data.writeUInt16LE(extension, 166);
-    data.writeUInt16LE(0, 168);
+    data.writeUInt16LE(extensionLength, 168);
   }
   return {
     address: address.toBase58(),

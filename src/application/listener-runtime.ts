@@ -28,13 +28,22 @@ export interface ListenerRuntimeFailure {
   readonly errorName: 'ListenerDependencyError' | 'ListenerTimeoutError';
 }
 
+export type ListenerRuntimeFailurePhase = 'startup' | 'startup-cleanup' | 'shutdown';
+
+export interface ListenerRuntimeFailureDiagnostic extends ListenerRuntimeFailure {
+  readonly phase: ListenerRuntimeFailurePhase;
+  readonly cause?: unknown;
+}
+
 export class ListenerRuntimeError extends Error {
   public readonly failures: readonly ListenerRuntimeFailure[];
+  public readonly diagnostics: readonly ListenerRuntimeFailureDiagnostic[];
 
-  public constructor(failures: readonly ListenerRuntimeFailure[]) {
+  public constructor(failures: readonly ListenerRuntimeFailureDiagnostic[]) {
     super('Solana listener runtime operation failed.');
     this.name = 'ListenerRuntimeError';
-    this.failures = Object.freeze(failures.map((failure) => Object.freeze({ ...failure })));
+    this.diagnostics = Object.freeze(failures.map((failure) => Object.freeze({ ...failure })));
+    this.failures = Object.freeze(failures.map(({ stage, errorName }) => Object.freeze({ stage, errorName })));
     Object.freeze(this);
   }
 }
@@ -97,7 +106,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
 
   public start(): Promise<void> {
     if (this.permanentlyClosed) {
-      return Promise.reject(new ListenerRuntimeError([failure('rpc-health')]));
+      return Promise.reject(new ListenerRuntimeError([failure('rpc-health', 'startup')]));
     }
     if (this.started) return Promise.resolve();
     if (this.startPromise !== null) return this.startPromise;
@@ -175,9 +184,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     try {
       await this.dependencies.rpc.checkHealth();
       this.assertStartOpen();
-      stage = 'scanner-scan';
-      await this.dependencies.scanner.scan();
-      this.assertStartOpen();
       stage = 'subscriber-start';
       await this.dependencies.subscriber.start();
       started.push('subscriber');
@@ -185,7 +191,11 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       this.assertStartOpen();
       stage = 'scanner-scan';
       await this.dependencies.scanner.scan();
+      this.scannerNeedsClose = true;
       this.assertStartOpen();
+      if (this.dependencies.subscriber.state() !== 'RUNNING') {
+        throw new Error('Listener subscription degraded during startup catch-up.');
+      }
       stage = 'worker-start';
       await this.dependencies.worker.start();
       started.push('worker');
@@ -211,11 +221,18 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       started.push('heartbeat');
       this.activeResources.add('heartbeat');
       this.assertStartOpen();
-      this.scannerNeedsClose = true;
       this.started = true;
       this.currentState = 'RUNNING';
-    } catch {
-      const failures: ListenerRuntimeFailure[] = [failure(stage)];
+    } catch (error) {
+      const failures: ListenerRuntimeFailureDiagnostic[] = [failure(stage, 'startup', error)];
+      if (this.scannerNeedsClose) {
+        try {
+          await this.dependencies.scanner.close();
+          this.scannerNeedsClose = false;
+        } catch (cleanupError) {
+          failures.push(failure('scanner-close', 'startup-cleanup', cleanupError));
+        }
+      }
       await this.rollbackStart(started, failures);
       this.currentState = 'DEGRADED';
       throw new ListenerRuntimeError(failures);
@@ -224,7 +241,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
 
   private async rollbackStart(
     started: readonly ActiveRuntimeResource[],
-    failures: ListenerRuntimeFailure[],
+    failures: ListenerRuntimeFailureDiagnostic[],
   ): Promise<void> {
     for (let index = started.length - 1; index >= 0; index -= 1) {
       const component = started[index];
@@ -240,22 +257,22 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         if (component === 'heartbeat') await this.dependencies.heartbeat.stop('STOPPED');
         else await this.dependencies[component].close();
         this.activeResources.delete(component);
-      } catch {
-        failures.push(failure(closeStage));
+      } catch (error) {
+        failures.push(failure(closeStage, 'startup-cleanup', error));
       }
     }
   }
 
   private async performClose(): Promise<void> {
     const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
-    const failures: ListenerRuntimeFailure[] = [];
+    const failures: ListenerRuntimeFailureDiagnostic[] = [];
     const starting = this.startPromise;
     let startupTimedOut = false;
     if (starting !== null) {
       const result = await settleUntil(starting, deadlineMs);
-      if (result === 'timeout') {
+      if (result.status === 'timeout') {
         startupTimedOut = true;
-        failures.push(timeoutFailure('startup-timeout'));
+        failures.push(timeoutFailure('startup-timeout', 'shutdown'));
       }
     }
     if (!this.started
@@ -330,15 +347,15 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       result: await settleUntil(item.operation, deadlineMs),
     })));
     for (const result of results) {
-      if (result.result === 'complete') {
+      if (result.result.status === 'complete') {
         if (result.resource === 'scanner') this.scannerNeedsClose = false;
         else this.activeResources.delete(result.resource);
-      } else if (result.result === 'failed') {
+      } else if (result.result.status === 'failed') {
         if (result.resource === 'scanner') this.scannerNeedsClose = true;
         else this.activeResources.add(result.resource);
-        failures.push(failure(result.stage));
+        failures.push(failure(result.stage, 'shutdown', result.result.error));
       }
-      if (result.result === 'timeout') {
+      if (result.result.status === 'timeout') {
         if (result.resource === 'scanner') this.scannerNeedsClose = true;
         else this.activeResources.add(result.resource);
         failures.push(timeoutFailure(
@@ -347,6 +364,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
             : result.stage === 'paper-worker-close'
               ? 'paper-worker-timeout'
               : result.stage === 'social-worker-close' ? 'social-worker-timeout' : result.stage,
+          'shutdown',
         ));
       }
     }
@@ -356,14 +374,14 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         invoke(() => this.dependencies.heartbeat.stop('STOPPED')),
         deadlineMs,
       );
-      if (heartbeatResult === 'complete') this.activeResources.delete('heartbeat');
-      if (heartbeatResult === 'failed') {
+      if (heartbeatResult.status === 'complete') this.activeResources.delete('heartbeat');
+      if (heartbeatResult.status === 'failed') {
         this.activeResources.add('heartbeat');
-        failures.push(failure('heartbeat-stop'));
+        failures.push(failure('heartbeat-stop', 'shutdown', heartbeatResult.error));
       }
-      if (heartbeatResult === 'timeout') {
+      if (heartbeatResult.status === 'timeout') {
         this.activeResources.add('heartbeat');
-        failures.push(timeoutFailure('heartbeat-stop'));
+        failures.push(timeoutFailure('heartbeat-stop', 'shutdown'));
       }
     }
     this.started = false;
@@ -399,31 +417,44 @@ export class SolanaListenerRuntime implements ListenerRuntime {
 }
 
 function invoke(operation: () => Promise<void>): Promise<void> {
-  try { return operation(); } catch { return Promise.reject(new Error('Listener cleanup failed.')); }
+  return Promise.resolve().then(operation);
 }
 
 async function settleUntil(
   operation: Promise<unknown>,
   deadlineMs: number,
-): Promise<'complete' | 'failed' | 'timeout'> {
+): Promise<
+  | Readonly<{ status: 'complete' }>
+  | Readonly<{ status: 'failed'; error: unknown }>
+  | Readonly<{ status: 'timeout' }>
+> {
   const remainingMs = Math.max(0, deadlineMs - Date.now());
   const timer: { handle?: ReturnType<typeof setTimeout> } = {};
-  const timeout = new Promise<'timeout'>((resolve) => {
-    timer.handle = setTimeout(() => { resolve('timeout'); }, remainingMs);
+  const timeout = new Promise<Readonly<{ status: 'timeout' }>>((resolve) => {
+    timer.handle = setTimeout(() => { resolve(Object.freeze({ status: 'timeout' })); }, remainingMs);
   });
-  const settled: Promise<'complete' | 'failed'> = operation.then(
-    () => 'complete',
-    () => 'failed',
+  const settled = operation.then(
+    () => Object.freeze({ status: 'complete' as const }),
+    (error: unknown) => Object.freeze({ status: 'failed' as const, error }),
   );
   const result = await Promise.race([settled, timeout]);
   if (timer.handle !== undefined) clearTimeout(timer.handle);
   return result;
 }
 
-function failure(stage: ListenerRuntimeFailureStage): ListenerRuntimeFailure {
-  return Object.freeze({ stage, errorName: 'ListenerDependencyError' });
+function failure(
+  stage: ListenerRuntimeFailureStage,
+  phase: ListenerRuntimeFailurePhase,
+  cause?: unknown,
+): ListenerRuntimeFailureDiagnostic {
+  return Object.freeze({
+    stage,
+    phase,
+    errorName: 'ListenerDependencyError',
+    ...(cause === undefined ? {} : { cause }),
+  });
 }
 
-function timeoutFailure(stage: ListenerRuntimeFailureStage): ListenerRuntimeFailure {
-  return Object.freeze({ stage, errorName: 'ListenerTimeoutError' });
+function timeoutFailure(stage: ListenerRuntimeFailureStage, phase: ListenerRuntimeFailurePhase): ListenerRuntimeFailureDiagnostic {
+  return Object.freeze({ stage, phase, errorName: 'ListenerTimeoutError' });
 }

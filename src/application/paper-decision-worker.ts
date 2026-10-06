@@ -40,6 +40,8 @@ export interface PaperDecisionWorkerOptions {
   readonly leaseMs: number;
   readonly renewalIntervalMs: number;
   readonly shutdownTimeoutMs: number;
+  readonly liveCandidateFeedEnabled?: boolean;
+  readonly onDecisionResult?: (result: PaperDecisionResult, snapshot: PaperDecisionSnapshot) => Promise<void>;
 }
 
 export interface PaperDecisionWorkerScheduler {
@@ -165,6 +167,7 @@ export class PaperDecisionWorker {
     }
 
     const paperEnabled=this.options.executionMode === 'paper' && this.options.paperStrategyEnabled;
+    const candidateQuotesEnabled=paperEnabled || this.options.liveCandidateFeedEnabled === true;
     if (
       paperEnabled
       && snapshot.currentSession !== null
@@ -197,7 +200,7 @@ export class PaperDecisionWorker {
     let buyQuote: PaperExecutionQuote | null | undefined;
     let reverseSellQuote: PaperExecutionQuote | null | undefined;
     let quoteFailure: PaperQuoteError | null = null;
-    if (paperEnabled && quoteAsset !== null) {
+    if (candidateQuotesEnabled && quoteAsset !== null) {
       try {
         buyQuote=await this.quotes.quote({
           mint:snapshot.mint,quoteAsset,side:'BUY',
@@ -232,7 +235,7 @@ export class PaperDecisionWorker {
       return this.fail(job,lease,'QUOTE_UNAVAILABLE',quoteFailure.retryable,base);
     }
     if (!paperEnabled || candidateResult.candidate.state !== 'ELIGIBLE') {
-      return this.complete(job,lease,base);
+      return this.complete(job,lease,base,snapshot);
     }
 
     const session=snapshot.currentSession;
@@ -241,7 +244,7 @@ export class PaperDecisionWorker {
         externalBuyTarget:this.options.externalBuyTarget,
         minimumConfirmation:this.options.minimumConfirmation,nowMs:this.readNow(),
       });
-      if (pending === null) return this.complete(job,lease,base);
+      if (pending === null) return this.complete(job,lease,base,snapshot);
       const pendingEvent=sessionEvent(pending,rebuilt.event);
       const staged=decision(rebuilt,candidateResult,pending,pendingEvent,[],'OPEN');
       if (!await lease.checkpoint()) return this.leaseLost(job,lease);
@@ -267,7 +270,7 @@ export class PaperDecisionWorker {
       return this.complete(job,lease,decision(
         rebuilt,candidateResult,opened.session,opened.sessionEvent,
         opened.countedExternalBuys,opened.requestedAction,
-      ));
+      ),snapshot);
     }
     return this.fail(job,lease,'DECISION_INVALID',false,base);
   }
@@ -304,7 +307,7 @@ export class PaperDecisionWorker {
     ) {
       return this.complete(job,lease,decision(
         context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
-      ));
+      ),snapshot);
     }
     if(
       session.state==='BUY_PENDING'
@@ -346,7 +349,7 @@ export class PaperDecisionWorker {
       return this.complete(job,lease,decision(
         context,candidateResult,opened.session,opened.sessionEvent,
         opened.countedExternalBuys,opened.requestedAction,
-      ));
+      ),snapshot);
     }
     if (snapshot.activePosition === null || session.candidateId !== candidate.id) {
       const terminal=manualReviewDecision(
@@ -398,14 +401,19 @@ export class PaperDecisionWorker {
     return this.complete(job,lease,decision(
       context,candidateResult,reconciled.session,reconciled.sessionEvent,
       reconciled.countedExternalBuys,reconciled.requestedAction,
-    ));
+    ),snapshot);
   }
 
   private async complete(
     job: ClaimedPaperDecisionJob,
     lease: PaperLeaseGuard,
     value: PaperDecisionResult,
+    snapshot: PaperDecisionSnapshot,
   ): Promise<PaperDecisionRunResult> {
+    if (this.options.liveCandidateFeedEnabled === true && this.options.onDecisionResult !== undefined) {
+      try { await this.options.onDecisionResult(value,snapshot); }
+      catch { return this.fail(job,lease,'RPC_TRANSIENT',true,value); }
+    }
     if (!await this.finishLease(lease)) return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
     try { await this.repository.complete(job,value); }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
@@ -623,6 +631,12 @@ function validateOptions(options:PaperDecisionWorkerOptions):void {
   }
   if(options.renewalIntervalMs>=options.leaseMs)throw new RangeError('Paper lease renewal must precede expiry.');
   if(options.paperStrategyEnabled&&options.executionMode!=='paper')throw new TypeError('Paper strategy requires paper mode.');
+  if(options.liveCandidateFeedEnabled===true&&(
+    options.executionMode!=='observe'||options.paperStrategyEnabled||options.onDecisionResult===undefined
+  ))throw new TypeError('Live candidate feed requires observe mode, paper disabled, and an explicit consumer.');
+  if(options.onDecisionResult!==undefined&&options.liveCandidateFeedEnabled!==true){
+    throw new TypeError('Decision consumer requires explicit live candidate feed activation.');
+  }
 }
 
 async function settleWithin(promise:Promise<void>,timeoutMs:number):Promise<boolean>{

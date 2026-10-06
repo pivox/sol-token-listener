@@ -14,7 +14,11 @@ export interface BoundedPublicHttpClientOptions {
   readonly maxRedirects: number;
   readonly maxConcurrency: number;
   readonly maxPerHostConcurrency: 1;
+  readonly rateLimitBaseDelayMs: number;
+  readonly rateLimitMaxDelayMs: number;
 }
+
+type BoundedPublicHttpClientOptionsOverrides = Partial<BoundedPublicHttpClientOptions>;
 
 export type HostResolver = (hostname: string) => Promise<readonly string[]>;
 
@@ -43,19 +47,30 @@ const DEFAULT_OPTIONS: BoundedPublicHttpClientOptions = Object.freeze({
   maxRedirects: 3,
   maxConcurrency: 8,
   maxPerHostConcurrency: 1,
+  rateLimitBaseDelayMs: 1_000,
+  rateLimitMaxDelayMs: 60_000,
 });
 
 export class BoundedPublicHttpClient implements PublicHttpClient {
+  private readonly options: BoundedPublicHttpClientOptions;
   readonly #global: Semaphore;
   readonly #byHost = new Map<string, Semaphore>();
+  readonly #rateLimitResumeAt = new Map<string, number>();
 
   public constructor(
     private readonly transport: PublicHttpTransport = nodePublicHttpTransport,
     private readonly resolveHost: HostResolver = resolveHostAddresses,
-    private readonly options: BoundedPublicHttpClientOptions = DEFAULT_OPTIONS,
+    options: BoundedPublicHttpClientOptionsOverrides = DEFAULT_OPTIONS,
   ) {
-    validateOptions(options);
-    this.#global = new Semaphore(options.maxConcurrency);
+    const effective: BoundedPublicHttpClientOptions = Object.freeze({
+      ...DEFAULT_OPTIONS,
+      ...options,
+      rateLimitBaseDelayMs: options.rateLimitBaseDelayMs ?? DEFAULT_OPTIONS.rateLimitBaseDelayMs,
+      rateLimitMaxDelayMs: options.rateLimitMaxDelayMs ?? DEFAULT_OPTIONS.rateLimitMaxDelayMs,
+    });
+    validateOptions(effective);
+    this.options = effective;
+    this.#global = new Semaphore(effective.maxConcurrency);
   }
 
   public get retainedHostCount(): number {
@@ -79,7 +94,12 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
     for (let redirectCount = 0; redirectCount <= this.options.maxRedirects; redirectCount += 1) {
       const destination = await this.#destination(current);
       if (destination.status === 'FAILED') return destination;
-      const response = await this.#request(current, destination.address, destination.family);
+      const response = await this.#request(
+        current,
+        destination.hostname,
+        destination.address,
+        destination.family,
+      );
       if (response.status === 'FAILED') return response;
       try {
         const statusCode = response.value.statusCode;
@@ -169,17 +189,28 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
     if (address === undefined || (family !== 4 && family !== 6)) {
       return failure('UNSAFE_DESTINATION', false);
     }
-    return Object.freeze({ status: 'RESOLVED' as const, address, family });
+    return Object.freeze({
+      status: 'RESOLVED' as const,
+      hostname,
+      address,
+      family,
+    });
   }
 
-  async #request(url: URL, address: string, family: 4 | 6): Promise<RequestResult> {
-    const hostname = normalizedHostname(url.hostname).toLowerCase();
-    const hostSemaphore = this.#hostSemaphore(hostname);
+  async #request(
+    url: URL,
+    hostname: string,
+    address: string,
+    family: 4 | 6,
+  ): Promise<RequestResult> {
+    const normalizedHost = normalizedHostname(hostname).toLowerCase();
+    await this.#sleepIfRateLimited(normalizedHost);
+    const hostSemaphore = this.#hostSemaphore(normalizedHost);
     const releaseHostLease = await hostSemaphore.acquire();
     const releaseHost = (): void => {
       releaseHostLease();
-      if (hostSemaphore.idle && this.#byHost.get(hostname) === hostSemaphore) {
-        this.#byHost.delete(hostname);
+      if (hostSemaphore.idle && this.#byHost.get(normalizedHost) === hostSemaphore) {
+        this.#byHost.delete(normalizedHost);
       }
     };
     const releaseGlobal = await this.#global.acquire();
@@ -202,6 +233,9 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
           'user-agent': 'sol-token-listener/observe',
         }),
       })), controller.signal);
+      if (value.statusCode === 429) {
+        this.#setRateLimitResumeAt(normalizedHost, value.headers);
+      }
       return Object.freeze({
         status: 'SUCCEEDED' as const,
         value,
@@ -223,10 +257,37 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
     this.#byHost.set(hostname, created);
     return created;
   }
+
+  async #sleepIfRateLimited(hostname: string): Promise<void> {
+    const resumeAtMs = this.#rateLimitResumeAt.get(hostname);
+    if (resumeAtMs === undefined) return;
+    const delayMs = resumeAtMs - Date.now();
+    if (delayMs <= 0) {
+      this.#rateLimitResumeAt.delete(hostname);
+      return;
+    }
+    await sleep(delayMs);
+    this.#rateLimitResumeAt.delete(hostname);
+  }
+
+  #setRateLimitResumeAt(hostname: string, headers: Readonly<Record<string, string>>): void {
+    const delayMs = Math.max(parseRetryAfterMs(headers), this.options.rateLimitBaseDelayMs);
+    const clampedDelayMs = clamp(delayMs, this.options.rateLimitBaseDelayMs, this.options.rateLimitMaxDelayMs);
+    const candidate = Date.now() + clampedDelayMs;
+    const current = this.#rateLimitResumeAt.get(hostname) ?? 0;
+    if (candidate > current) {
+      this.#rateLimitResumeAt.set(hostname, candidate);
+    }
+  }
 }
 
 type FailedResult = Extract<PublicHttpResult, { readonly status: 'FAILED' }>;
-type Destination = Readonly<{ status: 'RESOLVED'; address: string; family: 4 | 6 }>;
+type Destination = Readonly<{
+  status: 'RESOLVED';
+  hostname: string;
+  address: string;
+  family: 4 | 6;
+}>;
 type RequestResult = FailedResult | Readonly<{
   status: 'SUCCEEDED';
   value: PublicHttpTransportResponse;
@@ -315,12 +376,17 @@ function validateOptions(options: BoundedPublicHttpClientOptions): void {
   positiveInteger(options.timeoutMs, 'timeoutMs');
   positiveInteger(options.maxBytes, 'maxBytes');
   positiveInteger(options.maxConcurrency, 'maxConcurrency');
+  positiveInteger(options.rateLimitBaseDelayMs, 'rateLimitBaseDelayMs');
+  positiveInteger(options.rateLimitMaxDelayMs, 'rateLimitMaxDelayMs');
   if (!Number.isSafeInteger(options.maxRedirects) || options.maxRedirects < 0) {
     throw new RangeError('maxRedirects must be a non-negative safe integer.');
   }
   const maxPerHostConcurrency: unknown = options.maxPerHostConcurrency;
   if (maxPerHostConcurrency !== 1) {
     throw new RangeError('maxPerHostConcurrency must be 1.');
+  }
+  if (options.rateLimitBaseDelayMs > options.rateLimitMaxDelayMs) {
+    throw new RangeError('rateLimitBaseDelayMs must be at most rateLimitMaxDelayMs.');
   }
 }
 
@@ -494,6 +560,31 @@ function once(action: () => void): () => void {
 
 function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function parseRetryAfterMs(headers: Readonly<Record<string, string>>): number {
+  const retryAfterHeader = header(headers, 'retry-after');
+  if (retryAfterHeader === null) return 0;
+  const trimmed = retryAfterHeader.trim();
+  if (trimmed.length === 0) return 0;
+
+  const asNumber = Number(trimmed);
+  if (Number.isInteger(asNumber) && asNumber > 0) return asNumber * 1_000;
+
+  const parsed = Date.parse(trimmed);
+  if (Number.isNaN(parsed)) return 0;
+  const deltaMs = parsed - Date.now();
+  return deltaMs > 0 ? deltaMs : 0;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  if (value < minimum) return minimum;
+  if (value > maximum) return maximum;
+  return value;
+}
+
+function sleep(delayMs: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, delayMs); });
 }
 
 function discard(response: PublicHttpTransportResponse): void {

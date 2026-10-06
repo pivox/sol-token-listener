@@ -332,7 +332,10 @@ void test('serializes concurrent pools so each canonical migration is recorded o
     const canonical = (await readdir(new URL('../migrations/', import.meta.url)))
       .filter((name) => /^\d+_[a-z0-9_-]+\.sql$/u.test(name))
       .sort((left, right) => left.localeCompare(right));
-    assert.equal(canonical.length, 15);
+    assert.ok(canonical.includes('015_paper_active_session_per_mint.sql'));
+    assert.ok(canonical.includes('016_live_order_journal.sql'));
+    assert.ok(canonical.includes('020_live_position_market_resolution.sql'));
+    assert.ok(canonical.length >= 20, 'current repository includes the complete live schema migration set');
 
     const [firstApplied, secondApplied] = await Promise.all([
       migrateDatabase({ pool: firstPool }),

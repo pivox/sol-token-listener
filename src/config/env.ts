@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import { isIP } from 'node:net';
 import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 
@@ -30,6 +29,8 @@ export interface AppConfig {
   readonly paperEntryWindowSeconds: number;
   readonly paperQuoteMaxAgeMs: number;
   readonly paperQuoteMaxSlotLag: number;
+  readonly quoteObservationEnabled: boolean;
+  readonly quoteObservationPath: string;
   readonly paperSlippageBps: bigint | null;
   readonly paperDecisionWorkerPollMs: number;
   readonly paperDecisionWorkerLeaseSeconds: number;
@@ -43,12 +44,19 @@ export interface AppConfig {
   readonly listenerWorkerLeaseSeconds: number;
   readonly listenerCatchUpMaxPages: number;
   readonly listenerCatchUpPageSize: number;
+  readonly listenerRollingCatchUpIntervalMs: number;
+  readonly listenerRollingCatchUpLaunchpadIntervalMs: number;
+  readonly listenerRollingCatchUpMarketIntervalMs: number;
+  readonly marketTrackingWindowHours: number;
+  readonly marketTrackedPoolsMax: number;
   readonly listenerFinalityMissingPolls: number;
   readonly listenerShutdownTimeoutMs: number;
   readonly socialHttpTimeoutMs: number;
   readonly socialHttpMaxBytes: number;
   readonly socialHttpMaxRedirects: number;
   readonly socialHttpConcurrency: number;
+  readonly socialHttpRateLimitBaseDelayMs: number;
+  readonly socialHttpRateLimitMaxDelayMs: number;
   readonly socialWorkerPollMs: number;
   readonly socialWorkerLeaseSeconds: number;
   readonly socialRetryMaxAttempts: number;
@@ -84,7 +92,7 @@ export interface AppConfig {
   readonly dashboardPort: number;
   readonly dashboardRefreshSeconds: number;
   readonly dashboardMaxRows: number;
-  readonly dashboardActionsEnabled: false;
+  readonly dashboardActionsEnabled: boolean;
   readonly apiEnabled: boolean;
   readonly apiHost: string;
   readonly apiPort: number;
@@ -170,7 +178,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     qualificationProfilePath,
   );
 
-  return {
+  const config = {
     cluster: optional(environment.SOLANA_CLUSTER, 'mainnet-beta'),
     httpRpcUrl: requiredUrl(environment.SOLANA_HTTP_RPC_URL, 'SOLANA_HTTP_RPC_URL', ['http:', 'https:']),
     wsRpcUrl: requiredUrl(environment.SOLANA_WS_RPC_URL, 'SOLANA_WS_RPC_URL', ['ws:', 'wss:']),
@@ -181,6 +189,10 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     executionMode,
     paperQuoteMintAllowlist,
     ...paperStrategyConfig,
+    quoteObservationEnabled: parseBoolean(
+      environment.QUOTE_OBSERVATION_ENABLED, false, 'QUOTE_OBSERVATION_ENABLED',
+    ),
+    quoteObservationPath: optional(environment.QUOTE_OBSERVATION_PATH, 'data/quote-observations.v1.jsonl'),
     qualificationProfilePath,
     qualificationRuleSetStatus: parseQualificationRuleSetStatus(environment.QUALIFICATION_RULE_SET_STATUS),
     qualificationMinimumScore: parseOptionalInteger(
@@ -199,7 +211,46 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       environment.LISTENER_CATCH_UP_MAX_PAGES, 20, 'LISTENER_CATCH_UP_MAX_PAGES', 1, 100,
     ),
     listenerCatchUpPageSize: parseInteger(
-      environment.LISTENER_CATCH_UP_PAGE_SIZE, 100, 'LISTENER_CATCH_UP_PAGE_SIZE', 1, 1_000,
+      environment.LISTENER_CATCH_UP_PAGE_SIZE, 1_000, 'LISTENER_CATCH_UP_PAGE_SIZE', 1, 1_000,
+    ),
+    listenerRollingCatchUpIntervalMs: parseCanonicalBoundedInteger(
+      environment.LISTENER_ROLLING_CATCH_UP_INTERVAL_MS,
+      15_000,
+      'LISTENER_ROLLING_CATCH_UP_INTERVAL_MS',
+      5_000,
+      120_000,
+    ),
+    listenerRollingCatchUpLaunchpadIntervalMs: parseCanonicalBoundedInteger(
+      environment.LISTENER_ROLLING_CATCH_UP_LAUNCHPAD_INTERVAL_MS,
+      parseCanonicalBoundedInteger(
+        environment.LISTENER_ROLLING_CATCH_UP_INTERVAL_MS,
+        15_000,
+        'LISTENER_ROLLING_CATCH_UP_INTERVAL_MS',
+        5_000,
+        120_000,
+      ),
+      'LISTENER_ROLLING_CATCH_UP_LAUNCHPAD_INTERVAL_MS',
+      5_000,
+      120_000,
+    ),
+    listenerRollingCatchUpMarketIntervalMs: parseCanonicalBoundedInteger(
+      environment.LISTENER_ROLLING_CATCH_UP_MARKET_INTERVAL_MS,
+      parseCanonicalBoundedInteger(
+        environment.LISTENER_ROLLING_CATCH_UP_INTERVAL_MS,
+        15_000,
+        'LISTENER_ROLLING_CATCH_UP_INTERVAL_MS',
+        5_000,
+        120_000,
+      ),
+      'LISTENER_ROLLING_CATCH_UP_MARKET_INTERVAL_MS',
+      5_000,
+      120_000,
+    ),
+    marketTrackingWindowHours: parseCanonicalBoundedInteger(
+      environment.MARKET_TRACKING_WINDOW_HOURS, 6, 'MARKET_TRACKING_WINDOW_HOURS', 1, 168,
+    ),
+    marketTrackedPoolsMax: parseCanonicalBoundedInteger(
+      environment.MARKET_TRACKED_POOLS_MAX, 50, 'MARKET_TRACKED_POOLS_MAX', 1, 200,
     ),
     listenerFinalityMissingPolls: parseInteger(
       environment.LISTENER_FINALITY_MISSING_POLLS, 3, 'LISTENER_FINALITY_MISSING_POLLS', 2, 20,
@@ -215,6 +266,12 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     socialHttpMaxRedirects: parseCanonicalBoundedInteger(
       environment.SOCIAL_HTTP_MAX_REDIRECTS, 3, 'SOCIAL_HTTP_MAX_REDIRECTS', 0, 10,
+    ),
+    socialHttpRateLimitBaseDelayMs: parseCanonicalBoundedInteger(
+      environment.SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS, 1_000, 'SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS', 100, 60_000,
+    ),
+    socialHttpRateLimitMaxDelayMs: parseCanonicalBoundedInteger(
+      environment.SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS, 60_000, 'SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS', 1_000, 300_000,
     ),
     socialHttpConcurrency: parseCanonicalBoundedInteger(
       environment.SOCIAL_HTTP_CONCURRENCY, 2, 'SOCIAL_HTTP_CONCURRENCY', 1, 8,
@@ -268,7 +325,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     dashboardPort: parseInteger(environment.DASHBOARD_PORT, 3_000, 'DASHBOARD_PORT', 1, 65_535),
     dashboardRefreshSeconds: parseInteger(environment.DASHBOARD_REFRESH_SECONDS, 5, 'DASHBOARD_REFRESH_SECONDS', 1),
     dashboardMaxRows: parseInteger(environment.DASHBOARD_MAX_ROWS, 250, 'DASHBOARD_MAX_ROWS', 1),
-    dashboardActionsEnabled: false,
+    dashboardActionsEnabled: false as const,
     apiEnabled: parseBoolean(environment.API_ENABLED, true, 'API_ENABLED'),
     apiHost: parseApiHost(environment.API_HOST),
     apiPort: parseInteger(environment.API_PORT, 3_000, 'API_PORT', 1, 65_535),
@@ -303,6 +360,10 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     apiSsePollMs: parseInteger(environment.API_SSE_POLL_MS, 1_000, 'API_SSE_POLL_MS', 100, 10_000),
     logLevel: optional(environment.LOG_LEVEL, 'info'),
   };
+  if (config.socialHttpRateLimitBaseDelayMs > config.socialHttpRateLimitMaxDelayMs) {
+    throw new Error('SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS must not exceed SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS.');
+  }
+  return config;
 }
 
 function parsePaperStrategyConfig(
@@ -422,8 +483,8 @@ function parsePaperStrategyConfig(
   };
 }
 
-export function loadConfig(): AppConfig {
-  return parseConfig(process.env);
+export function loadConfig(environment: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): AppConfig {
+  return parseConfig(environment);
 }
 
 function parseExecutionMode(raw: string | undefined): ExecutionMode {

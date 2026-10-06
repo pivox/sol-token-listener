@@ -44,6 +44,36 @@ void test('merges a shared signature once and orders oldest to newest determinis
     enqueuedCount: 5,
     checkpointWriteCount: 2,
     pageCount: 2,
+    programs: {
+      launchpad: {
+        checkpointSlot: '4',
+        checkpointSignature: 'z',
+        priorCheckpointSlot: null,
+        priorCheckpointSignature: null,
+        frontierSlot: null,
+        frontierSignature: null,
+        durableFrontier: { signature: 'z', slot: '4' },
+        pageCount: 1,
+        signaturesRead: 3,
+        signaturesEnqueued: 3,
+        newestSlot: '4',
+        oldestSlot: '2',
+      },
+      market: {
+        checkpointSlot: '4',
+        checkpointSignature: 'm',
+        priorCheckpointSlot: null,
+        priorCheckpointSignature: null,
+        frontierSlot: null,
+        frontierSignature: null,
+        durableFrontier: { signature: 'm', slot: '4' },
+        pageCount: 1,
+        signaturesRead: 3,
+        signaturesEnqueued: 3,
+        newestSlot: '4',
+        oldestSlot: '2',
+      },
+    },
   });
   assert.ok(Object.isFrozen(result));
 });
@@ -105,6 +135,25 @@ void test('treats empty and short pages as true exhaustion and never invents che
   assert.equal(result.checkpointWriteCount, 1);
 });
 
+void test('does not treat a short page without the durable checkpoint as a covered gap', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('newer', 12), sig('older-but-not-checkpoint', 10)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const prior = checkpoint('launchpad', 'checkpoint-not-returned', 5);
+  const inbox = new FakeInbox({ launchpad: prior });
+
+  await assert.rejects(scanner(source, inbox, { pageSize: 3 }).scan(), (error) => {
+    assert.ok(error instanceof CatchUpWindowExceededError);
+    assert.equal(error.program, 'launchpad');
+    assert.equal(error.diagnostic.checkpointSignatureFound, false);
+    assert.equal(error.diagnostic.signaturesRead, 2);
+    return true;
+  });
+  assert.deepEqual(inbox.enqueued, []);
+  assert.deepEqual(inbox.stored, []);
+});
+
 void test('uses one full newest page as the bounded baseline without a checkpoint', async () => {
   const source = new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('launch-new', 4), sig('launch-old', 3)]],
@@ -129,6 +178,36 @@ void test('uses one full newest page as the bounded baseline without a checkpoin
     enqueuedCount: 4,
     checkpointWriteCount: 2,
     pageCount: 2,
+    programs: {
+      launchpad: {
+        checkpointSlot: '4',
+        checkpointSignature: 'launch-new',
+        priorCheckpointSlot: null,
+        priorCheckpointSignature: null,
+        frontierSlot: null,
+        frontierSignature: null,
+        durableFrontier: { signature: 'launch-new', slot: '4' },
+        pageCount: 1,
+        signaturesRead: 2,
+        signaturesEnqueued: 2,
+        newestSlot: '4',
+        oldestSlot: '3',
+      },
+      market: {
+        checkpointSlot: '6',
+        checkpointSignature: 'market-new',
+        priorCheckpointSlot: null,
+        priorCheckpointSignature: null,
+        frontierSlot: null,
+        frontierSignature: null,
+        durableFrontier: { signature: 'market-new', slot: '6' },
+        pageCount: 1,
+        signaturesRead: 2,
+        signaturesEnqueued: 2,
+        newestSlot: '6',
+        oldestSlot: '5',
+      },
+    },
   });
 });
 
@@ -143,11 +222,134 @@ void test('throws on a full max-page restart window and performs no durable writ
     assert.equal(error.program, 'launchpad');
     assert.equal(error.stage, 'window');
     assert.equal(error.message, 'Catch-up scan window was exceeded.');
+    assert.deepEqual(error.diagnostic, {
+      program: 'launchpad',
+      checkpointSlot: '0',
+      checkpointSignature: 'missing',
+      frontierSlot: null,
+      frontierSignature: null,
+      pageSize: 2,
+      maxPages: 2,
+      pageCount: 2,
+      signaturesRead: 4,
+      newestSlot: '4',
+      oldestSlot: '1',
+      checkpointSignatureFound: false,
+      frontierSignatureFound: false,
+      exhaustion: 'page-budget-exhausted',
+    });
     assert.equal(Object.hasOwn(error, 'cause'), false);
     return true;
   });
   assert.deepEqual(inbox.enqueued, []);
   assert.deepEqual(inbox.stored, []);
+});
+
+void test('truncates long checkpoint signatures in the bounded window diagnostic', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('four', 4), sig('three', 3)], [sig('two', 2), sig('one', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const checkpointSignature = '123456789012345678901234';
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', checkpointSignature, 0) });
+
+  await assert.rejects(scanner(source, inbox, { pageSize: 2, maxPages: 2 }).scan(), (error) => {
+    assert.ok(error instanceof CatchUpWindowExceededError);
+    assert.equal(error.diagnostic.checkpointSignature, '12345678…78901234');
+    return true;
+  });
+});
+
+void test('startup frontier catches up more than 2,000 signatures within 20 pages and does not advance past frontier', async () => {
+  const oldCheckpoint = checkpoint('launchpad', 'checkpoint-zero', 0);
+  const rows: CatchUpSignature[] = [
+    sig('after-frontier', 2_002),
+    ...Array.from({ length: 2_001 }, (_, index) => sig(`tx-${2_001 - index}`, 2_001 - index)),
+    sig('checkpoint-zero', 0),
+  ];
+  const makeSource = (): CatchUpSource => ({
+    async list(programId, before, limit) {
+      if (programId === PUMPSWAP_PROGRAM_ID) return [sig('frontier-market-2001', 2_001)];
+      const offset = before === undefined ? 0 : rows.findIndex((row) => row.signature === before) + 1;
+      return rows.slice(offset, offset + limit);
+    },
+  });
+  const oldScannerInbox = new FakeInbox({ launchpad: oldCheckpoint });
+  await assert.rejects(new CatchUpScanner(makeSource(), oldScannerInbox, {
+    pageSize: 100, maxPages: 20,
+  }).scan(), CatchUpWindowExceededError);
+  assert.deepEqual(oldScannerInbox.stored, []);
+
+  const bootstrapInbox = new FakeInbox({ launchpad: oldCheckpoint });
+  const bootstrap = new CatchUpScanner(makeSource(), bootstrapInbox, {
+    pageSize: 1_000,
+    maxPages: 20,
+  });
+  const result = await bootstrap.scan(frontiers(2_001));
+
+  assert.equal(result.discoveredCount, 2_002);
+  assert.equal(result.pageCount, 4);
+  assert.equal(bootstrapInbox.enqueued.length, 2_002);
+  assert.deepEqual(bootstrapInbox.stored.map((row) => [row.slot, row.signature]), [
+    [2_001n, 'tx-2001'], [2_001n, 'frontier-market-2001'],
+  ]);
+  const stored = bootstrapInbox.stored[0];
+  assert.ok(stored);
+  assert.ok(stored.slot <= 2_001n);
+});
+
+void test('rolling scan requires the exact finalized frontier before persisting it', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('newer-than-checkpoint', 11), sig('checkpoint-zero', 0)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', 'checkpoint-zero', 0) });
+  const rolling = scanner(source, inbox, { pageSize: 3, maxPages: 2 });
+  const frontier = Object.freeze({
+    program: 'launchpad' as const,
+    signature: 'missing-frontier',
+    slot: 12n,
+    confirmationStatus: 'finalized' as const,
+  });
+
+  await assert.rejects(rolling.scanProgram('launchpad', frontier), (error: unknown) => {
+    assert.ok(error instanceof CatchUpScannerError);
+    assert.equal(error.stage, 'frontier-validation');
+    assert.equal(error.program, 'launchpad');
+    return true;
+  });
+  assert.deepEqual(inbox.stored, []);
+  assert.deepEqual(inbox.enqueued, []);
+});
+
+void test('scans only the enabled programs when a launchpad-only program list is given', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('tx-12', 12), sig('launchpad-old', 10)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market-new', 12)]],
+  });
+  const inbox = new FakeInbox();
+  const launchpadOnly = new CatchUpScanner(source, inbox, {
+    pageSize: 3, maxPages: 2, now: () => 9_000, programs: ['launchpad'],
+  });
+
+  const result = await launchpadOnly.scan({ launchpad: frontiers(12).launchpad });
+
+  assert.deepEqual(source.calls.map(([programId]) => programId), [PUMP_PROGRAM_ID]);
+  assert.equal(result.programs.market, undefined);
+  assert.equal(result.programs.launchpad?.durableFrontier?.signature, 'tx-12');
+  assert.deepEqual(inbox.stored.map(({ key }) => key), ['launchpad']);
+  await assert.rejects(
+    launchpadOnly.scanProgram('market', frontiers(12).market),
+    (error: unknown) => error instanceof CatchUpScannerError && error.stage === 'frontier-validation',
+  );
+});
+
+void test('rejects an empty, duplicated, unknown or launchpad-less program list', () => {
+  for (const programs of [[], ['launchpad', 'launchpad'], ['unknown'], ['market']]) {
+    assert.throws(() => new CatchUpScanner(new FakeSource({}), new FakeInbox(), {
+      pageSize: 2, maxPages: 2, programs: programs as never,
+    }), TypeError);
+  }
 });
 
 void test('rejects pagination cursor cycles and repeated rows', async () => {
@@ -421,6 +623,19 @@ function checkpoint(
   updatedAtMs = 100,
 ): ProcessingCheckpoint {
   return Object.freeze({ key, signature, slot: BigInt(slot), updatedAtMs });
+}
+
+function frontiers(slot: number) {
+  return Object.freeze({
+    launchpad: Object.freeze({
+      program: 'launchpad' as const, signature: `tx-${slot}`,
+      slot: BigInt(slot), confirmationStatus: 'finalized' as const,
+    }),
+    market: Object.freeze({
+      program: 'market' as const, signature: `frontier-market-${slot}`,
+      slot: BigInt(slot), confirmationStatus: 'finalized' as const,
+    }),
+  });
 }
 
 class FakeSource implements CatchUpSource {

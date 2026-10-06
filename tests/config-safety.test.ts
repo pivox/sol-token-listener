@@ -16,6 +16,12 @@ void test('le mode par défaut est strictement observe', () => {
   assert.equal(config.executionMode, 'observe');
 });
 
+void test('quote observation recording is disabled by default and has a local JSONL path', () => {
+  const config = parseConfig(base);
+  assert.equal(config.quoteObservationEnabled, false);
+  assert.equal(config.quoteObservationPath, 'data/quote-observations.v1.jsonl');
+});
+
 void test('le mode paper est accepté avec SOL dans son allowlist initiale', () => {
   const config = parseConfig({ ...base, EXECUTION_MODE: 'paper' });
   assert.equal(config.executionMode, 'paper');
@@ -265,12 +271,33 @@ void test('le listener durable est activé avec des bornes sûres par défaut', 
   assert.equal(config.listenerEnabled, true);
   assert.equal(config.listenerWorkerLeaseSeconds, 120);
   assert.equal(config.listenerCatchUpMaxPages, 20);
-  assert.equal(config.listenerCatchUpPageSize, 100);
+  assert.equal(config.listenerCatchUpPageSize, 1_000);
+  assert.equal(config.listenerRollingCatchUpIntervalMs, 15_000);
+  assert.equal(config.listenerRollingCatchUpLaunchpadIntervalMs, 15_000);
+  assert.equal(config.listenerRollingCatchUpMarketIntervalMs, 15_000);
   assert.equal(config.listenerFinalityMissingPolls, 3);
   assert.equal(config.listenerShutdownTimeoutMs, 30_000);
   assert.equal(config.rpcRetryMaxAttempts, 5);
   assert.equal(config.rpcRetryBaseDelayMs, 500);
   assert.equal(config.reconcileSeconds, 15);
+});
+
+void test('les cadences rolling peuvent différer par programme avec fallback global', () => {
+  const perProgram = parseConfig({
+    ...base,
+    LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '15000',
+    LISTENER_ROLLING_CATCH_UP_MARKET_INTERVAL_MS: '5000',
+  });
+  assert.equal(perProgram.listenerRollingCatchUpLaunchpadIntervalMs, 15_000);
+  assert.equal(perProgram.listenerRollingCatchUpMarketIntervalMs, 5_000);
+
+  const fallback = parseConfig({
+    ...base,
+    LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '10000',
+    LISTENER_ROLLING_CATCH_UP_LAUNCHPAD_INTERVAL_MS: '20000',
+  });
+  assert.equal(fallback.listenerRollingCatchUpLaunchpadIntervalMs, 20_000);
+  assert.equal(fallback.listenerRollingCatchUpMarketIntervalMs, 10_000);
 });
 
 void test('la configuration listener accepte ses bornes exactes', () => {
@@ -280,6 +307,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
     LISTENER_WORKER_LEASE_SECONDS: '30',
     LISTENER_CATCH_UP_MAX_PAGES: '1',
     LISTENER_CATCH_UP_PAGE_SIZE: '1',
+    LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '5000',
     LISTENER_FINALITY_MISSING_POLLS: '2',
     LISTENER_SHUTDOWN_TIMEOUT_MS: '1000',
   });
@@ -287,6 +315,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
   assert.equal(minimums.listenerWorkerLeaseSeconds, 30);
   assert.equal(minimums.listenerCatchUpMaxPages, 1);
   assert.equal(minimums.listenerCatchUpPageSize, 1);
+  assert.equal(minimums.listenerRollingCatchUpIntervalMs, 5_000);
   assert.equal(minimums.listenerFinalityMissingPolls, 2);
   assert.equal(minimums.listenerShutdownTimeoutMs, 1_000);
 
@@ -295,6 +324,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
     LISTENER_WORKER_LEASE_SECONDS: '900',
     LISTENER_CATCH_UP_MAX_PAGES: '100',
     LISTENER_CATCH_UP_PAGE_SIZE: '1000',
+    LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '120000',
     LISTENER_FINALITY_MISSING_POLLS: '20',
     LISTENER_SHUTDOWN_TIMEOUT_MS: '120000',
     RPC_RETRY_MAX_ATTEMPTS: '100',
@@ -303,6 +333,7 @@ void test('la configuration listener accepte ses bornes exactes', () => {
   assert.equal(maximums.listenerWorkerLeaseSeconds, 900);
   assert.equal(maximums.listenerCatchUpMaxPages, 100);
   assert.equal(maximums.listenerCatchUpPageSize, 1_000);
+  assert.equal(maximums.listenerRollingCatchUpIntervalMs, 120_000);
   assert.equal(maximums.listenerFinalityMissingPolls, 20);
   assert.equal(maximums.listenerShutdownTimeoutMs, 120_000);
   assert.equal(maximums.rpcRetryMaxAttempts, 100);
@@ -320,6 +351,12 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
     { LISTENER_CATCH_UP_MAX_PAGES: '101' },
     { LISTENER_CATCH_UP_PAGE_SIZE: '0' },
     { LISTENER_CATCH_UP_PAGE_SIZE: '1001' },
+    { LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '4999' },
+    { LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '120001' },
+    { LISTENER_ROLLING_CATCH_UP_INTERVAL_MS: '15_000' },
+    { LISTENER_ROLLING_CATCH_UP_LAUNCHPAD_INTERVAL_MS: '4999' },
+    { LISTENER_ROLLING_CATCH_UP_MARKET_INTERVAL_MS: '120001' },
+    { LISTENER_ROLLING_CATCH_UP_MARKET_INTERVAL_MS: '5_000' },
     { LISTENER_FINALITY_MISSING_POLLS: '1' },
     { LISTENER_FINALITY_MISSING_POLLS: '21' },
     { LISTENER_SHUTDOWN_TIMEOUT_MS: '999' },
@@ -339,10 +376,34 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
     'LISTENER_ENABLED=true',
     'LISTENER_WORKER_LEASE_SECONDS=120',
     'LISTENER_CATCH_UP_MAX_PAGES=20',
-    'LISTENER_CATCH_UP_PAGE_SIZE=100',
+    'LISTENER_CATCH_UP_PAGE_SIZE=1000',
+    'LISTENER_ROLLING_CATCH_UP_INTERVAL_MS=15000',
+    'LISTENER_ROLLING_CATCH_UP_LAUNCHPAD_INTERVAL_MS=15000',
+    'LISTENER_ROLLING_CATCH_UP_MARKET_INTERVAL_MS=15000',
     'LISTENER_FINALITY_MISSING_POLLS=3',
     'LISTENER_SHUTDOWN_TIMEOUT_MS=30000',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
+});
+
+void test('market pool tracking config has bounded defaults and rejects out-of-range values', () => {
+  const defaults = parseConfig(base);
+  assert.equal(defaults.marketTrackingWindowHours, 6);
+  assert.equal(defaults.marketTrackedPoolsMax, 50);
+
+  const custom = parseConfig({
+    ...base,
+    MARKET_TRACKING_WINDOW_HOURS: '12',
+    MARKET_TRACKED_POOLS_MAX: '20',
+  });
+  assert.equal(custom.marketTrackingWindowHours, 12);
+  assert.equal(custom.marketTrackedPoolsMax, 20);
+
+  for (const values of [
+    { MARKET_TRACKING_WINDOW_HOURS: '0' },
+    { MARKET_TRACKING_WINDOW_HOURS: '169' },
+    { MARKET_TRACKED_POOLS_MAX: '0' },
+    { MARKET_TRACKED_POOLS_MAX: '201' },
+  ]) assert.throws(() => parseConfig({ ...base, ...values }));
 });
 
 void test('public social enrichment uses strict bounded non-secret defaults', () => {
@@ -368,26 +429,31 @@ void test('public social enrichment accepts only its exact inclusive bounds', ()
     SOCIAL_HTTP_MAX_REDIRECTS: '0', SOCIAL_HTTP_CONCURRENCY: '1',
     SOCIAL_WORKER_POLL_MS: '100', SOCIAL_WORKER_LEASE_SECONDS: '5',
     SOCIAL_RETRY_MAX_ATTEMPTS: '1', SOCIAL_RETRY_BASE_DELAY_MS: '100',
+    SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS: '100', SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS: '1000',
   });
   assert.deepEqual([
     minimums.socialHttpTimeoutMs, minimums.socialHttpMaxBytes,
     minimums.socialHttpMaxRedirects, minimums.socialHttpConcurrency,
     minimums.socialWorkerPollMs, minimums.socialWorkerLeaseSeconds,
     minimums.socialRetryMaxAttempts, minimums.socialRetryBaseDelayMs,
-  ], [100, 1_024, 0, 1, 100, 5, 1, 100]);
+    minimums.socialHttpRateLimitBaseDelayMs, minimums.socialHttpRateLimitMaxDelayMs,
+  ], [100, 1_024, 0, 1, 100, 5, 1, 100, 100, 1_000]);
 
   const maximums = parseConfig({
     ...base, SOCIAL_HTTP_TIMEOUT_MS: '30000', SOCIAL_HTTP_MAX_BYTES: '1048576',
     SOCIAL_HTTP_MAX_REDIRECTS: '10', SOCIAL_HTTP_CONCURRENCY: '8',
     SOCIAL_WORKER_POLL_MS: '60000', SOCIAL_WORKER_LEASE_SECONDS: '300',
     SOCIAL_RETRY_MAX_ATTEMPTS: '10', SOCIAL_RETRY_BASE_DELAY_MS: '60000',
+    SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS: '60000',
+    SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS: '300000',
   });
   assert.deepEqual([
     maximums.socialHttpTimeoutMs, maximums.socialHttpMaxBytes,
     maximums.socialHttpMaxRedirects, maximums.socialHttpConcurrency,
     maximums.socialWorkerPollMs, maximums.socialWorkerLeaseSeconds,
     maximums.socialRetryMaxAttempts, maximums.socialRetryBaseDelayMs,
-  ], [30_000, 1_048_576, 10, 8, 60_000, 300, 10, 60_000]);
+    maximums.socialHttpRateLimitBaseDelayMs, maximums.socialHttpRateLimitMaxDelayMs,
+  ], [30_000, 1_048_576, 10, 8, 60_000, 300, 10, 60_000, 60_000, 300_000]);
 });
 
 void test('public social enrichment rejects ambiguous integers without reflecting configured values', () => {
@@ -395,6 +461,7 @@ void test('public social enrichment rejects ambiguous integers without reflectin
     'SOCIAL_HTTP_TIMEOUT_MS', 'SOCIAL_HTTP_MAX_BYTES', 'SOCIAL_HTTP_MAX_REDIRECTS',
     'SOCIAL_HTTP_CONCURRENCY', 'SOCIAL_WORKER_POLL_MS', 'SOCIAL_WORKER_LEASE_SECONDS',
     'SOCIAL_RETRY_MAX_ATTEMPTS', 'SOCIAL_RETRY_BASE_DELAY_MS',
+    'SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS', 'SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS',
   ] as const;
   for (const field of fields) {
     for (const value of ['01', '+1', '-1', ' 1', '1 ', '1e3', '1.0']) {
@@ -412,6 +479,7 @@ void test('public social enrichment rejects ambiguous integers without reflectin
     SOCIAL_HTTP_MAX_REDIRECTS: '11', SOCIAL_HTTP_CONCURRENCY: '9',
     SOCIAL_WORKER_POLL_MS: '60001', SOCIAL_WORKER_LEASE_SECONDS: '301',
     SOCIAL_RETRY_MAX_ATTEMPTS: '11', SOCIAL_RETRY_BASE_DELAY_MS: '60001',
+    SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS: '60001', SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS: '300001',
   } as const;
   for (const [field, value] of Object.entries(aboveMaximum)) {
     assert.throws(() => parseConfig({ ...base, [field]: value }));
@@ -425,6 +493,7 @@ void test('the environment example contains only safe public-social settings', a
     'SOCIAL_HTTP_MAX_REDIRECTS=3', 'SOCIAL_HTTP_CONCURRENCY=2',
     'SOCIAL_WORKER_POLL_MS=1000', 'SOCIAL_WORKER_LEASE_SECONDS=30',
     'SOCIAL_RETRY_MAX_ATTEMPTS=3', 'SOCIAL_RETRY_BASE_DELAY_MS=1000',
+    'SOCIAL_HTTP_RATE_LIMIT_BASE_DELAY_MS=1000', 'SOCIAL_HTTP_RATE_LIMIT_MAX_DELAY_MS=60000',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
   assert.doesNotMatch(source, /(?:X|TWITTER|TELEGRAM).*(?:TOKEN|COOKIE|SECRET|PROXY)|PRIVATE_KEY|KEYPAIR_PATH/iu);
 });

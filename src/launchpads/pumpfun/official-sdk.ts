@@ -16,6 +16,8 @@ export const {
   PUMP_FEE_PROGRAM_ID,
   PUMP_PROGRAM_ID,
   PUMP_SDK,
+  userVolumeAccumulatorPda,
+  pumpPoolAuthorityPda,
 } = sdk;
 
 export type { BondingCurve, FeeConfig, Global } from '@pump-fun/pump-sdk';

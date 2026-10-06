@@ -21,7 +21,8 @@ export interface MarketPool {
   readonly market: string;
   readonly baseMint: string;
   readonly quoteAsset: QuoteAsset;
-  readonly activatedAt: ChainCursor;
+  /** Null when resolved from current accounts without a historical activation transaction. */
+  readonly activatedAt: ChainCursor | null;
 }
 
 export interface CanonicalMarketPool extends MarketPool {
@@ -67,6 +68,7 @@ export interface MarketReserves {
   readonly effectiveQuoteReservesRaw: bigint;
   readonly observedSlot: bigint;
   readonly observedAtMs: number;
+  readonly stateReceivedAtMs?: number | null;
 }
 
 export interface MarketQuote {
@@ -82,6 +84,7 @@ export interface MarketQuote {
   readonly priceImpactBps: bigint;
   readonly observedAtMs: number;
   readonly observedSlot: bigint;
+  readonly stateReceivedAtMs?: number | null;
 }
 
 export interface MarketTrade {

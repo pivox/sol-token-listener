@@ -5,6 +5,7 @@ import test from 'node:test';
 import pg from 'pg';
 import { PublicKey } from '@solana/web3.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { assertCurrentMigrationsApplied } from './helpers/current-migration-assertions.js';
 
 const migrationUrl = new URL('../migrations/009_transaction_ingestion.sql', import.meta.url);
 
@@ -162,7 +163,7 @@ void test('applies migrations 001-014 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '015_paper_active_session_per_mint.sql');
+    assertCurrentMigrationsApplied(applied, '009_transaction_ingestion.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

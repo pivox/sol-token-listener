@@ -12,12 +12,12 @@ import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
 import type { DomainEvent } from '../src/domain/events.js';
 import { ValidatedExternalBuysStrategy } from '../src/application/validated-external-buys.strategy.js';
-import { PaperQuoteError } from '../src/ports/paper-quote-router.js';
+import { PaperQuoteError, type PaperQuoteRequest, type PaperQuoteRouter } from '../src/ports/paper-quote-router.js';
 
 void test('stages an entry, opens once and closes only on the target external BUY', async () => {
   const ledger = new FakeLedger();
   const router = new FakeRouter();
-  const strategy = new ValidatedExternalBuysStrategy(ledger, router, { retentionMs: 14_400_000 });
+  const strategy = new ValidatedExternalBuysStrategy(ledger, router, { retentionMs: 14_400_000, clock: () => 3_001 });
   const candidate = eligibleCandidate();
   const pending = strategy.prepare(candidate, {
     externalBuyTarget:10,minimumConfirmation:'confirmed',nowMs:1_000,
@@ -69,6 +69,13 @@ void test('stages an entry, opens once and closes only on the target external BU
   assert.equal(ledger.closeCalls.length, 1);
   assert.equal(router.requests.length, 1);
   assert.equal(router.requests[0]?.side, 'SELL');
+  assert.equal(router.requests[0]?.observationContext?.signalAtMs, 3_000);
+  assert.equal(router.requests[0]?.observationContext?.economicCostRaw, '1000');
+  assert.equal(router.requests[0]?.observationContext?.sellNetworkFeeEstimateRaw, '0');
+  assert.deepEqual(router.decisions[0], {
+    sessionId: second.session.id, positionId: POSITION.id, buyTradeId: POSITION.entryTradeId,
+    quoteId: 'exit', signalAtMs: 3_000, decisionAtMs: 3_001,
+  });
 });
 
 void test('ignores sells, creator, unknown, pre-entry, wrong quote, orphaned and duplicate trades', async () => {
@@ -91,6 +98,19 @@ void test('ignores sells, creator, unknown, pre-entry, wrong quote, orphaned and
   });
   assert.equal(result.session.externalBuyCount, 1);
   assert.deepEqual(result.session.countedTradeIds, ['valid']);
+});
+
+void test('live strategy evidence counts a duplicated canonical trade identity only once in one snapshot', () => {
+  const strategy = new ValidatedExternalBuysStrategy(new FakeLedger(), new FakeRouter(), { retentionMs:14_400_000 });
+  const candidate = eligibleCandidate();
+  const duplicate = launchBuy('same-chain-trade', 2, 'wallet');
+  const result = strategy.evaluateLiveExternalBuys({
+    candidate,creator:'creator',launchTrades:[duplicate,duplicate],marketTrades:[],
+    entryCursor:candidate.asOf.cursor,minimumConfirmation:'confirmed',countedTradeIds:[],externalBuyTarget:2,
+  });
+
+  assert.deepEqual(result.newlyCountedTradeIds, ['same-chain-trade']);
+  assert.equal(result.targetReached, false);
 });
 
 void test('keeps an explicit exit-pending state when the sell quote is unavailable', async () => {
@@ -281,12 +301,16 @@ class FakeLedger {
 }
 
 class FakeRouter {
-  public readonly requests: { readonly side:string }[] = [];
+  public readonly requests: PaperQuoteRequest[] = [];
+  public readonly decisions: Parameters<NonNullable<PaperQuoteRouter['recordDecision']>>[0][] = [];
   public error: Error | null = null;
-  public async quote(request: { readonly side:'BUY'|'SELL' }): Promise<PaperExecutionQuote> {
+  public async quote(request: PaperQuoteRequest): Promise<PaperExecutionQuote> {
     this.requests.push(request);
     if (this.error !== null) throw this.error;
     return quote('exit','MINT','SOL',900n,1_100n,1_100n);
+  }
+  public recordDecision(input: Parameters<NonNullable<PaperQuoteRouter['recordDecision']>>[0]): void {
+    this.decisions.push(input);
   }
 }
 

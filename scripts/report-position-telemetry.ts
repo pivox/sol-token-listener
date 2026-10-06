@@ -1,0 +1,13 @@
+import { readFile, writeFile } from 'node:fs/promises';
+import { parseArgs } from 'node:util';
+import { parseJournal } from '../src/telemetry/journal.js';
+import { loadDataset } from '../src/telemetry/dataset.js';
+import { analyzeDataset, renderReport } from '../src/telemetry/report.js';
+const {values}=parseArgs({options:{input:{type:'string'},out:{type:'string'}}});
+if(!values.input||!values.out)throw new Error('Usage: tsx scripts/report-position-telemetry.ts --input inputs.v1.jsonl --out report.md');
+const text=await readFile(values.input,'utf8');
+const rows=parseJournal(text.slice(0,text.lastIndexOf('\n')+1));
+const report=analyzeDataset(loadDataset(rows));
+await writeFile(values.out,renderReport(report),{mode:0o600});
+await writeFile(values.out+'.json',JSON.stringify(report,null,2)+'\n',{mode:0o600});
+console.log(JSON.stringify({positions:report.positions.length,report:values.out,additionalRpcRequests:0}));

@@ -68,6 +68,8 @@ void test('ne traverse pas la frontière d’un sibling CPI', () => {
   const laterCreate = instruction(PUMPSWAP_PROGRAM_ID, 2, 2, 3);
   const originalCreation = evidence().poolCreations[0];
   assert.ok(originalCreation);
+  const poolActivationCursor = pool.activatedAt;
+  assert.ok(poolActivationCursor, 'fixture pool includes a proven activation cursor');
   const observed = createSolanaObservedTransaction({
     ...transaction(),
     instructions: [innerMigration, sibling, laterCreate],
@@ -94,7 +96,7 @@ void test('ne traverse pas la frontière d’un sibling CPI', () => {
     },
     new Map([['pool', {
       ...pool,
-      activatedAt: { ...pool.activatedAt, innerInstructionIndex: 2 },
+      activatedAt: { ...poolActivationCursor, innerInstructionIndex: 2 },
     }]]),
   );
   assert.equal(match?.activationEvent, null);

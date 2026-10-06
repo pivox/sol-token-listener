@@ -7,12 +7,18 @@ const sdk = createRequire(import.meta.url)('@pump-fun/pump-swap-sdk') as typeof 
 
 export const {
   buyQuoteInput,
+  coinCreatorVaultAtaPda,
+  coinCreatorVaultAuthorityPda,
   GLOBAL_CONFIG_PDA,
+  PUMP_AMM_EVENT_AUTHORITY_PDA,
   poolPda,
+  poolV2Pda,
   PUMP_AMM_FEE_CONFIG_PDA,
+  OFFLINE_PUMP_AMM_PROGRAM,
   PUMP_AMM_SDK,
   PUMP_FEE_PROGRAM_ID,
   sellBaseInput,
+  userVolumeAccumulatorPda,
 } = sdk;
 
 export type { GlobalConfig } from '@pump-fun/pump-swap-sdk';

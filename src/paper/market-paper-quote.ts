@@ -16,5 +16,7 @@ export function toPaperExecutionQuote(
     priceImpactBps: quote.priceImpactBps,
     observedAtMs: quote.observedAtMs,
     observedSlot: quote.observedSlot,
+    stateReceivedAtMs: quote.stateReceivedAtMs ?? null,
+    quoteCalculatedAtMs: quote.observedAtMs,
   });
 }

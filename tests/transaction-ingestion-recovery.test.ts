@@ -461,6 +461,8 @@ function marketPipeline(
   pump: PumpFunLaunchpadAdapter,
 ): PumpSwapObservationPipeline {
   const canonical = canonicalPool();
+  assert.ok(canonical.activatedAt, 'ingestion fixture has an observed activation cursor');
+  const activationCursor = canonical.activatedAt;
   const market = new PumpSwapMarketAdapter(
     () => marketEvidence(),
     { validate: (_creation, transaction) => Promise.resolve(Object.freeze({
@@ -473,7 +475,7 @@ function marketPipeline(
       quoteVaultAmountRaw: 20_000n,
       virtualQuoteReservesRaw: 5_000n,
       effectiveQuoteReservesRaw: 25_000n,
-      observedSlot: canonical.activatedAt.slot,
+      observedSlot: activationCursor.slot,
       observedAtMs: 1_800_000_000_000,
     }) },
     { quote: () => Promise.reject(new Error('unused market quote')) },

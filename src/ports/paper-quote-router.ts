@@ -7,10 +7,26 @@ export interface PaperQuoteRequest {
   readonly side: 'BUY' | 'SELL';
   readonly amountInRaw: bigint;
   readonly slippageBps: bigint;
+  readonly observationContext?: {
+    readonly sessionId: string;
+    readonly positionId: string;
+    readonly buyTradeId: string;
+    readonly signalAtMs: number;
+    readonly economicCostRaw: string | null;
+    readonly sellNetworkFeeEstimateRaw: string | null;
+  };
 }
 
 export interface PaperQuoteRouter {
   quote(request: PaperQuoteRequest): Promise<PaperExecutionQuote>;
+  recordDecision?(input: {
+    readonly sessionId: string;
+    readonly positionId: string;
+    readonly buyTradeId: string;
+    readonly quoteId: string;
+    readonly signalAtMs: number;
+    readonly decisionAtMs: number;
+  }): void;
 }
 
 export type PaperQuoteFailureCode =

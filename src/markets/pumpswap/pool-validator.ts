@@ -181,6 +181,15 @@ function decodeMint(
   account: ReadonlyAccountSnapshot,
   address: string,
   programKind: TokenProgramKind,
+  allowedExtensions: ReadonlySet<ExtensionType> = new Set<ExtensionType>([
+    ExtensionType.MintCloseAuthority,
+    ExtensionType.MetadataPointer,
+    ExtensionType.TokenMetadata,
+    ExtensionType.GroupPointer,
+    ExtensionType.TokenGroup,
+    ExtensionType.GroupMemberPointer,
+    ExtensionType.TokenGroupMember,
+  ]),
 ): ReturnType<typeof unpackMint> {
   if (account.address !== address) mismatch('mint account');
   const program = tokenProgram(programKind);
@@ -200,17 +209,8 @@ function decodeMint(
   } catch {
     mismatch('mint layout ou programme token');
   }
-  const allowed = new Set<ExtensionType>([
-    ExtensionType.MintCloseAuthority,
-    ExtensionType.MetadataPointer,
-    ExtensionType.TokenMetadata,
-    ExtensionType.GroupPointer,
-    ExtensionType.TokenGroup,
-    ExtensionType.GroupMemberPointer,
-    ExtensionType.TokenGroupMember,
-  ]);
   for (const extension of getExtensionTypes(mint.tlvData)) {
-    if (!allowed.has(extension)) {
+    if (!allowedExtensions.has(extension)) {
       throw new MarketError(
         'UNSUPPORTED_TOKEN_EXTENSION',
         `Extension Token-2022 non supportée: ${ExtensionType[extension]}.`,
@@ -218,6 +218,18 @@ function decodeMint(
     }
   }
   return mint;
+}
+
+/** Reuses the exact legacy/Token-2022 mint and extension allowlist used when admitting canonical pools. */
+export function validateSupportedPumpSwapMint(
+  account: ReadonlyAccountSnapshot,
+  address: string,
+  programKindValue: TokenProgramKind,
+  allowedExtensions?: ReadonlySet<ExtensionType>,
+): ReturnType<typeof unpackMint> {
+  return allowedExtensions === undefined
+    ? decodeMint(account, address, programKindValue)
+    : decodeMint(account, address, programKindValue, allowedExtensions);
 }
 
 function decodedAddress(

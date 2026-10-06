@@ -9,3 +9,4 @@ process.stdout.write(`${JSON.stringify({
   httpSlot: health.httpSlot.toString(),
   finalizedSlot: health.finalizedSlot.toString(),
 })}\n`);
+import 'dotenv/config';

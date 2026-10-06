@@ -1,5 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
+import { config as loadDotenv } from 'dotenv';
 import { runApplication } from '../app.js';
 import { loadConfig, type AppConfig } from '../config/env.js';
 import {
@@ -402,6 +403,7 @@ function delay(durationMs: number): Promise<void> {
 
 async function main(): Promise<void> {
   try {
+    loadDotenv();
     const options = parsePaperDryRunArguments(process.argv.slice(2));
     const config = loadConfig();
     await runPaperDryRun(options, {

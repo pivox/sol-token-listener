@@ -17,6 +17,8 @@ export interface PaperExecutionQuote {
   readonly priceImpactBps: bigint;
   readonly observedAtMs: number;
   readonly observedSlot: bigint;
+  readonly stateReceivedAtMs?: number | null;
+  readonly quoteCalculatedAtMs?: number | null;
 }
 
 export interface PaperRoundTrip {

@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
+import { assertCurrentMigrationsApplied } from './helpers/current-migration-assertions.js';
 
 const migrationUrl = new URL('../migrations/011_transaction_inbox_retry_recovery.sql', import.meta.url);
 
@@ -53,7 +54,7 @@ void test('applies migrations through 014, replays and backfills legacy retries'
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '015_paper_active_session_per_mint.sql');
+    assertCurrentMigrationsApplied(applied, '011_transaction_inbox_retry_recovery.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,

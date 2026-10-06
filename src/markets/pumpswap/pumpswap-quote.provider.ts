@@ -93,6 +93,9 @@ export function createPumpSwapQuote(
       request.reserves.observedSlot < state.observedSlot
         ? request.reserves.observedSlot
         : state.observedSlot,
+    stateReceivedAtMs: request.reserves.stateReceivedAtMs == null || state.stateReceivedAtMs == null
+      ? null
+      : Math.max(request.reserves.stateReceivedAtMs, state.stateReceivedAtMs),
   });
 }
 

@@ -51,6 +51,27 @@ void test('persists explainable observe decisions without requesting quotes or p
   assert.equal(repository.completions[0]?.result.session, null);
 });
 
+void test('publishes the persisted listener decision and source snapshot to the explicit candidate consumer without paper fills', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('NOT_ELIGIBLE');
+  const emitted: Array<{ result: PaperDecisionResult; snapshot: PaperDecisionSnapshot }> = [];
+  const worker = new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options({
+      executionMode:'observe',paperStrategyEnabled:false,liveCandidateFeedEnabled:true,
+      onDecisionResult:async (result, sourceSnapshot) => { emitted.push({ result, snapshot:sourceSnapshot }); },
+    }),new ManualScheduler(),
+  );
+
+  await worker.runOnce();
+
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0]?.result, repository.completions[0]?.result);
+  assert.equal(emitted[0]?.result.candidateEvent.id, repository.completions[0]?.result.candidateEvent.id);
+  assert.equal(emitted[0]?.snapshot.asOfEvent.id, 'evt_source');
+  assert.equal(repository.completions[0]?.result.session, null);
+});
+
 void test('retries before quotes when no canonical qualification is persisted', async () => {
   const repository = new FakeRepository([claim()]);
   repository.snapshotValue = snapshot({ currentQualification:null });

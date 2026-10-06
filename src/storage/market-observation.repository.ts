@@ -298,6 +298,7 @@ implements MarketObservationRepository {
     );
     const current = requiredText(launch.rows[0], 'current_state');
     const pool = event.payload.pool;
+    if(pool.activatedAt===null)throw new TypeError('Market pool indexing requires a proven activation cursor.');
     await client.query(
       `INSERT INTO market_pools (
         pool_address,market,program_id,pool_index,creator,base_mint,quote_mint,

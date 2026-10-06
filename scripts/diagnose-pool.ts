@@ -10,3 +10,4 @@ const config = loadConfig();
 const rpc = new SolanaRpcClient(config);
 const result = await readPoolState(rpc.http, poolAddress, config.raydiumCpmmProgramId);
 process.stdout.write(`${stringifyJson({ event: 'raydium.pool_diagnosed', ...result })}\n`);
+import 'dotenv/config';

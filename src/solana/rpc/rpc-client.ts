@@ -6,6 +6,8 @@ import {
 } from '@solana/web3.js';
 import type { AppConfig } from '../../config/env.js';
 import type { LegacyConfirmationStatus } from './types.js';
+import { CatchUpRpcTelemetry } from './catch-up-rpc-telemetry.js';
+import { RpcMethodTelemetry } from './rpc-method-telemetry.js';
 
 export interface RpcHealth {
   readonly version: string;
@@ -15,15 +17,27 @@ export interface RpcHealth {
 
 export class SolanaRpcClient {
   readonly http: Connection;
+  readonly httpTelemetry: RpcMethodTelemetry;
+  readonly catchUpHttp: Connection;
+  readonly catchUpTelemetry: CatchUpRpcTelemetry;
   readonly commitment: Commitment;
   readonly finality: Finality;
 
   constructor(config: Pick<AppConfig, 'httpRpcUrl' | 'wsRpcUrl' | 'commitment' | 'finality'>) {
     this.commitment = config.commitment;
     this.finality = config.finality;
+    this.httpTelemetry = new RpcMethodTelemetry();
     this.http = new Connection(config.httpRpcUrl, {
       commitment: config.commitment,
       wsEndpoint: config.wsRpcUrl,
+      disableRetryOnRateLimit: true,
+      fetch: (input, init): Promise<Response> => this.httpTelemetry.fetch(input, init),
+    });
+    this.catchUpTelemetry = new CatchUpRpcTelemetry();
+    this.catchUpHttp = new Connection(config.httpRpcUrl, {
+      commitment: config.commitment,
+      disableRetryOnRateLimit: true,
+      fetch: (input, init): Promise<Response> => this.catchUpTelemetry.fetch(input, init),
     });
   }
 

@@ -35,6 +35,7 @@ export interface PumpSwapFeeState {
   readonly baseMintSupplyRaw: bigint;
   readonly tiers: readonly PumpSwapFeeTier[];
   readonly observedSlot: bigint;
+  readonly stateReceivedAtMs?: number | null;
 }
 
 export class InvalidPumpSwapFeeStateError extends Error {
@@ -45,18 +46,18 @@ export class InvalidPumpSwapFeeStateError extends Error {
 }
 
 export class PumpSwapFeeStateReader {
-  public constructor(private readonly rpc: MarketRpcReader) {}
+  public constructor(private readonly rpc: MarketRpcReader, private readonly clock: () => number = Date.now) {}
 
   public async read(pool: CanonicalMarketPool): Promise<PumpSwapFeeState> {
-    return decodePumpSwapFeeState(
-      await this.rpc.readAccountsAtSameSlot([
-        GLOBAL_CONFIG_PDA.toBase58(),
-        PUMP_AMM_FEE_CONFIG_PDA.toBase58(),
-        pool.baseMint,
-        pool.address,
-      ]),
-      pool,
-    );
+    const accounts = await this.rpc.readAccountsAtSameSlot([
+      GLOBAL_CONFIG_PDA.toBase58(),
+      PUMP_AMM_FEE_CONFIG_PDA.toBase58(),
+      pool.baseMint,
+      pool.address,
+    ]);
+    const stateReceivedAtMs = this.clock();
+    const decoded = decodePumpSwapFeeState(accounts, pool);
+    return Object.freeze({ ...decoded, stateReceivedAtMs });
   }
 }
 

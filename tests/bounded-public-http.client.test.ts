@@ -155,6 +155,45 @@ void test('marks DNS, timeout and network failures retryable without leaking cau
   }
 });
 
+void test('waits before retrying a host after a rate-limit response', async () => {
+  const timestamps: number[] = [];
+  const transport: PublicHttpTransport = async () => {
+    timestamps.push(Date.now());
+    if (timestamps.length === 1) {
+      return response(
+        429,
+        'rate limited',
+        { 'content-type': 'text/plain', 'retry-after': '0' },
+      );
+    }
+    return response(200, 'ok', { 'content-type': 'text/plain' });
+  };
+  const client = new BoundedPublicHttpClient(transport, publicResolver, {
+    ...OPTIONS,
+    rateLimitBaseDelayMs: 40,
+    rateLimitMaxDelayMs: 80,
+  });
+
+  const first = await client.get('https://a.test/data', ['text/plain']);
+  assert.deepEqual(first, { status: 'FAILED', reason: 'HTTP_STATUS_INVALID', retryable: true });
+  const second = await client.get('https://a.test/data', ['text/plain']);
+  assert.deepEqual(second, {
+    status: 'SUCCEEDED',
+    finalUrl: 'https://a.test/data',
+    httpStatus: 200,
+    contentType: 'text/plain',
+    redirectCount: 0,
+    body: new TextEncoder().encode('ok'),
+  });
+  assert.equal(timestamps.length, 2);
+  const firstRequest = timestamps[0];
+  const secondRequest = timestamps[1];
+  if (firstRequest === undefined || secondRequest === undefined) {
+    throw new Error('Expected two request timestamps for rate-limit cooldown test.');
+  }
+  assert.ok(secondRequest - firstRequest >= 35, `expected cooldown between calls, got ${secondRequest - firstRequest}`);
+});
+
 void test('bounds global concurrency and serializes requests to one host', async () => {
   let active = 0;
   let peak = 0;

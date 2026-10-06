@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
+import { assertCurrentMigrationsApplied } from './helpers/current-migration-assertions.js';
 
 const migrationUrl=new URL('../migrations/014_social_persistence_retry.sql',import.meta.url);
 const databaseUrl=process.env.TEST_DATABASE_URL;
@@ -26,7 +27,7 @@ void test('applies social persistence retry migration and replays cleanly',async
   try{
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied=await migrateDatabase({ pool });
-    assert.equal(applied.at(-1),'015_paper_active_session_per_mint.sql');
+    assertCurrentMigrationsApplied(applied, '014_social_persistence_retry.sql');
     assert.deepEqual(await migrateDatabase({ pool }),[]);
     const row=await pool.query(`SELECT column_default,is_nullable FROM information_schema.columns
       WHERE table_schema=current_schema() AND table_name='social_enrichment_jobs'

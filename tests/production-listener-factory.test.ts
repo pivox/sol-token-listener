@@ -86,6 +86,14 @@ void test('production composes one canonical qualification writer before paper d
   assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*\)/u);
 });
 
+void test('production market ingestion is per pool, not program-wide', async () => {
+  const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
+  assert.match(source, /programIds:\s*\[PUMP_PROGRAM_ID\]/u, 'WebSocket subscriber is launchpad-only');
+  assert.match(source, /programs:\s*\['launchpad'\]/u, 'program-wide catch-up is launchpad-only');
+  assert.match(source, /new MarketPoolTracker\(/u);
+  assert.match(source, /isMintCovered\(snapshot\.mint\)/u, 'live guard is per mint');
+});
+
 void test('public social runtime components have no signer or submission path', async () => {
   for (const path of [
     '../src/application/social-enrichment-worker.ts',
@@ -177,6 +185,39 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
   assert.equal(writes[0]?.leasedCount, 1);
   assert.equal(writes[0]?.exhaustedCount, 1);
   await heartbeat.stop();
+});
+
+void test('heartbeat hands each durable write to the RPC pressure observer', async () => {
+  const observed: { readonly runtimeState: string; readonly backlogCount: number }[] = [];
+  const heartbeat = new PersistentListenerHeartbeat(
+    {
+      async counts() {
+        return {
+          pending: 7, processing: 0, processed: 0, failed: 0,
+          retryableFailed: 3, exhaustedFailed: 0,
+        };
+      },
+      async writeHeartbeat() {},
+    },
+    { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler: new ManualScheduler(),
+      onWritten: (value) => { observed.push(value); },
+    },
+  );
+
+  await heartbeat.start();
+  await heartbeat.stop();
+  assert.deepEqual(
+    observed.map(({ runtimeState, backlogCount }) => ({ runtimeState, backlogCount })),
+    [{ runtimeState: 'RUNNING', backlogCount: 10 }, { runtimeState: 'STOPPED', backlogCount: 10 }],
+  );
 });
 
 void test('heartbeat refreshes post-drain counts without another shutdown RPC read', async () => {
