@@ -107,7 +107,6 @@ export const HISTORY_SQL = `SELECT position_id, mint, opened_at, closed_at, entr
 export interface LiveOverviewReaderOptions {
   readonly database: ExecutorDatabaseSource;
   readonly balances: BalanceCache;
-  readonly now: () => number;
 }
 
 export function createLiveOverviewReader(options: LiveOverviewReaderOptions): LiveOverviewReader {

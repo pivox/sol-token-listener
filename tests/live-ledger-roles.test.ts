@@ -15,6 +15,7 @@ import {
 import type { ExecutorDatabaseSource } from '../src/executor/database.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { LIVE_POSITION_LEDGER_INSERT_SQL } from '../src/storage/execution-live.repository.js';
+import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const WSOL = 'So11111111111111111111111111111111111111112';
@@ -202,7 +203,7 @@ void test('PostgreSQL 16 operator reader values open positions from the latest n
       },
     };
     const overview = createLiveOverviewReader({
-      database: source, now: () => 0, balances: { read: () => Promise.resolve(null) },
+      database: source, balances: { read: () => Promise.resolve(null) },
     });
     // One open position per generation: the same position is re-pointed at each mint in turn.
     const expectations: readonly (readonly [string, bigint | null, bigint | null])[] = [
@@ -326,7 +327,14 @@ async function withProvisionedDatabase(
   } finally {
     try {
       await isolated?.end();
-      await maintenance.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+      await waitForBackendDrain(maintenance, databaseName);
+      const terminated = await maintenance.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname=$1 AND pid<>pg_backend_pid()`,
+        [databaseName],
+      );
+      assert.equal(terminated.rowCount, 0);
+      await maintenance.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
     } finally {
       try { await release(); } finally { await maintenance.end(); }
     }

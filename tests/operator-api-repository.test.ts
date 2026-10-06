@@ -61,7 +61,7 @@ const balances = {
 
 void test('without an active wallet generation the overview is NOT_AVAILABLE and reads nothing else', async () => {
   const database = fakeDatabase(new Map([[ACTIVE_WALLET_SQL, []]]));
-  const reader = createLiveOverviewReader({ database: database.source, balances, now: () => NOW });
+  const reader = createLiveOverviewReader({ database: database.source, balances });
 
   const page = await reader.read({ limit: 50, cursor: null });
 
@@ -99,7 +99,7 @@ void test('assembles open PnL from pool then curve reserves, realized totals and
       historyRow('execution_live_position_a', '2026-10-06T10:30:00.000Z', '-9000'),
     ]],
   ]));
-  const reader = createLiveOverviewReader({ database: database.source, balances, now: () => NOW });
+  const reader = createLiveOverviewReader({ database: database.source, balances });
 
   const { data, nextCursor } = await reader.read({ limit: 2, cursor: null });
 
@@ -138,7 +138,7 @@ void test('the last history page has no cursor and a cursor request is a keyset 
     [HISTORY_SQL, [historyRow('execution_live_position_a', '2026-10-06T10:30:00.000Z', '-9000')]],
   ]));
   const reader = createLiveOverviewReader({
-    database: database.source, balances: { read: () => Promise.resolve(null) }, now: () => NOW,
+    database: database.source, balances: { read: () => Promise.resolve(null) },
   });
 
   const page = await reader.read({ limit: 2, cursor });
@@ -152,7 +152,7 @@ void test('the last history page has no cursor and a cursor request is a keyset 
 
 void test('the database client is released when a query fails', async () => {
   const database = fakeDatabase(new Map());
-  const reader = createLiveOverviewReader({ database: database.source, balances, now: () => NOW });
+  const reader = createLiveOverviewReader({ database: database.source, balances });
 
   await assert.rejects(reader.read({ limit: 50, cursor: null }));
   assert.equal(database.released(), 1);
@@ -169,7 +169,7 @@ void test('a latest pool snapshot with zero base reserves yields no spot value a
     [REALIZED_TOTAL_SQL, [{ realized_lamports: '0' }]],
     [HISTORY_SQL, []],
   ]));
-  const reader = createLiveOverviewReader({ database: database.source, balances, now: () => NOW });
+  const reader = createLiveOverviewReader({ database: database.source, balances });
 
   const { data } = await reader.read({ limit: 50, cursor: null });
 

@@ -147,7 +147,7 @@ function OpenPositionsTable({ positions }: { readonly positions: readonly Operat
       {positions.length === 0 ? <EmptyState>Aucune position ouverte.</EmptyState> : (
         <div className="table-responsive"><table className="table table-sm align-middle">
           <thead><tr>
-            <th scope="col">Token</th><th scope="col">État</th><th scope="col">Quantité restante</th>
+            <th scope="col">Token</th><th scope="col">État</th><th scope="col">Quantité restante (brut)</th>
             <th scope="col">Coût</th><th scope="col">Valeur spot</th><th scope="col">PnL non réalisé</th>
             <th scope="col">Sortie avant</th>
           </tr></thead>

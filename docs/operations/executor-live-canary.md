@@ -178,9 +178,9 @@ npm run executor:live:start
 Elles ne sont pas une procédure d'armement. La procédure H2c ci-dessous reste
 séquentielle, interactive et sans commande englobante.
 
-## Frontières des sept environnements PostgreSQL
+## Frontières des huit environnements PostgreSQL
 
-Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
+Créer huit fichiers hors Git, lisibles seulement par leur compte de service :
 
 - listener H2i : login `NOINHERIT` membre uniquement de
   `sol_token_listener_writer`, connexion avec
@@ -207,7 +207,8 @@ Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
 - H2a : login membre uniquement de `sol_token_executor_live_recovery`, aucun
   nom de variable keypair ;
 - H2b : login membre uniquement de `sol_token_executor_live`, keypair externe
-  `0400` ou `0600`, `EXECUTOR_MODE=live` et activation explicite.
+  `0400` ou `0600`, `EXECUTOR_MODE=live` et activation explicite ;
+- console opérateur : huitième frontière, voir « Console opérateur live ».
 
 Après les migrations 040 et 041, l'administrateur rejoue
 `scripts/provision-executor-roles.sql`. Chaque login doit être `NOINHERIT`, ne
@@ -326,13 +327,25 @@ runtime H2a reçoit `INSERT` sur `execution_live_position_ledger`, le rôle
 `sol_token_operator_reader` reçoit `SELECT` sur le ledger, `SELECT` sur
 `bonding_curve_snapshots`, `market_pools`, `market_reserve_snapshots` et un
 `SELECT` par colonnes sur `execution_live_positions`. Le ledger n'est jamais
-purgé. Les positions fermées avant la migration ne sont pas reconstituées.
+purgé. Les positions fermées avant la migration ne sont pas reconstituées. Si
+la preuve de réconciliation du BUY d'une position a été purgée avant sa
+clôture (par exemple une position restée UNKNOWN plus de 4 h), aucune ligne de
+ledger n'est écrite et le PnL réalisé sous-estime cette position (la clôture
+elle-même n'est jamais bloquée).
+
+Le PnL non réalisé utilise un coût = `quote_cost_raw + fee_lamports` (hors loyer
+ATA et pourboires), tandis que le PnL réalisé utilise le delta lamports complet
+du wallet : le non réalisé est donc légèrement optimiste. L'historique et le
+total réalisé ne couvrent que la génération de wallet active.
 
 Mise à jour en bloc : après la migration 061 et le rejeu du script de
-provisionnement, redémarrer ensemble H2a (recovery), H2h et la console
+provisionnement, redémarrer ensemble H2a (recovery), H2b, H2h et la console
 opérateur sur les nouveaux binaires. Les anciens binaires H2h échouent fermés
 contre les nouveaux grants et les nouveaux échouent fermés contre les anciens :
-ne jamais mélanger les versions.
+ne jamais mélanger les versions. Retour arrière : tant que
+`061_execution_live_position_ledger.sql` figure dans `migration_history`, les
+anciens binaires ne peuvent pas démarrer (le validateur de démarrage de H2b
+épingle aussi le head 061).
 
 ```bash
 npm run build:backend

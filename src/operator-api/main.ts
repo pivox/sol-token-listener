@@ -17,7 +17,11 @@ export async function main(): Promise<void> {
   const database = openOperatorApiDatabase({
     databaseUrl: config.databaseUrl,
     statementTimeoutMs: 10_000,
-    onIdleError: () => { process.stderr.write('OPERATOR_API_DATABASE_ERROR\n'); stop(); },
+    onIdleError: () => {
+      process.stderr.write('OPERATOR_API_DATABASE_ERROR\n');
+      process.exitCode = 1;
+      stop();
+    },
   });
   // Fail fast on a drifted role instead of at the first browser request.
   (await database.source.connect()).release();
@@ -32,7 +36,6 @@ export async function main(): Promise<void> {
         fetchLamports: createRpcBalanceReader({ rpcUrl: config.solanaHttpRpcUrl }),
         now: Date.now,
       }),
-      now: Date.now,
     }),
     logError: (name) => { process.stderr.write(`OPERATOR_API_REQUEST_FAILED ${name}\n`); },
   }));
@@ -55,8 +58,12 @@ export async function main(): Promise<void> {
 
 const invokedPath = process.argv[1];
 if (invokedPath !== undefined && import.meta.url === pathToFileURL(invokedPath).href) {
-  void main().catch(() => {
-    process.stderr.write('OPERATOR_API_FAILED\n');
+  void main().catch((error: unknown) => {
+    // Only a short symbolic code is printed, never the message or the stack: no secret leaks.
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      && typeof error.code === 'string' && /^[A-Z_]{1,64}$/u.test(error.code)
+      ? ` ${error.code}` : '';
+    process.stderr.write(`OPERATOR_API_FAILED${code}\n`);
     process.exitCode = 1;
   });
 }
