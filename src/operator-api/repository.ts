@@ -67,15 +67,15 @@ export const OPEN_POSITIONS_SQL = `SELECT position_id, mint, state, opened_at, e
   WHERE wallet_public_key = $1 AND state IN ('OPEN','EXIT_PENDING','UNKNOWN')
   ORDER BY opened_at DESC, position_id DESC`;
 
-// $1 mints, $2 quote mint. Latest non-orphaned PumpSwap reserve snapshot per mint.
+// $1 mints, $2 quote mint. Latest non-orphaned reserve snapshot of the active PumpSwap pool per
+// mint. A zero-base snapshot is deliberately kept: spotValueLamports turns it into "no value".
 export const POOL_RESERVES_SQL = `SELECT DISTINCT ON (pool.base_mint) pool.base_mint AS mint,
     snapshot.effective_quote_reserves_raw::TEXT AS quote_reserves_raw,
     snapshot.base_reserves_raw::TEXT AS base_reserves_raw
   FROM market_pools pool
   JOIN market_reserve_snapshots snapshot ON snapshot.pool_address = pool.pool_address
-  WHERE pool.base_mint = ANY($1::TEXT[]) AND pool.quote_mint = $2
+  WHERE pool.base_mint = ANY($1::TEXT[]) AND pool.quote_mint = $2 AND pool.pool_state = 'active'
     AND pool.confirmation_status <> 'orphaned' AND snapshot.confirmation_status <> 'orphaned'
-    AND snapshot.base_reserves_raw > 0
   ORDER BY pool.base_mint, snapshot.observed_slot DESC, snapshot.trigger_slot DESC,
     snapshot.transaction_index DESC, snapshot.instruction_index DESC,
     COALESCE(snapshot.inner_instruction_index, -1) DESC, snapshot.snapshot_id DESC`;
@@ -86,7 +86,7 @@ export const CURVE_RESERVES_SQL = `SELECT DISTINCT ON (curve.mint) curve.mint,
     curve.virtual_base_reserves_raw::TEXT AS base_reserves_raw
   FROM bonding_curve_snapshots curve
   WHERE curve.mint = ANY($1::TEXT[]) AND curve.quote_mint = $2
-    AND curve.confirmation_status <> 'orphaned' AND curve.virtual_base_reserves_raw > 0
+    AND curve.confirmation_status <> 'orphaned'
   ORDER BY curve.mint, curve.slot DESC, curve.transaction_index DESC,
     curve.instruction_index DESC, COALESCE(curve.inner_instruction_index, -1) DESC,
     curve.snapshot_id DESC`;

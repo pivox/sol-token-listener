@@ -157,3 +157,25 @@ void test('the database client is released when a query fails', async () => {
   await assert.rejects(reader.read({ limit: 50, cursor: null }));
   assert.equal(database.released(), 1);
 });
+
+void test('a latest pool snapshot with zero base reserves yields no spot value and no curve fallback', async () => {
+  const database = fakeDatabase(new Map<string, readonly Row[]>([
+    [ACTIVE_WALLET_SQL, [{ wallet_public_key: WALLET }]],
+    [OPEN_POSITIONS_SQL, [openRow('execution_live_position_pool', MINT_POOL, '35000000000')]],
+    [CURVE_RESERVES_SQL, [
+      { mint: MINT_POOL, quote_reserves_raw: '30000000000', base_reserves_raw: '1073000000000000' },
+    ]],
+    [POOL_RESERVES_SQL, [{ mint: MINT_POOL, quote_reserves_raw: '60000000000', base_reserves_raw: '0' }]],
+    [REALIZED_TOTAL_SQL, [{ realized_lamports: '0' }]],
+    [HISTORY_SQL, []],
+  ]));
+  const reader = createLiveOverviewReader({ database: database.source, balances, now: () => NOW });
+
+  const { data } = await reader.read({ limit: 50, cursor: null });
+
+  assert.deepEqual(data.open.map((position) => [position.spotValueLamports, position.unrealizedLamports]),
+    [[null, null]]);
+  assert.deepEqual(data.totals, {
+    realizedLamports: 0n, unrealizedLamports: 0n, openCount: 1, positionsWithoutPnl: 1,
+  });
+});
