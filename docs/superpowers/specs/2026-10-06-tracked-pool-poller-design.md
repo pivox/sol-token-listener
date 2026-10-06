@@ -58,6 +58,9 @@ sequentially:
   keep the existing `NORMAL/NONE` rule.
 - `storedIngestionDecision` accepts the hint with `TRACKED_TRADE`; `enqueue` takes the mint lock for
   it as for `PUMPFUN_TRADE`; the admitted `TRACKED_TRADE` claim and preview SQL accept both hints.
+- Within the `TRACKED_TRADE` lane, `PUMPFUN_TRADE` rows are claimed before `PUMPSWAP_POOL_TRADE` rows
+  (then by slot as today): finalized pool rows are 15-25 s older than live bonding-curve rows and must
+  not delay the trades that drive entries and exits. Ratios between lanes are unchanged.
 - `hasNonTerminalProgramWork` ignores rows with `ingestion_hint='PUMPSWAP_POOL_TRADE'`, so poller
   rows cannot block a multi-worker restart.
 - `syncTrackedMint`, `DEFERRED` handling and retention stay as they are: when a mint stops being
@@ -83,16 +86,23 @@ bonding-curve only; the deadline exit guarantees an exit).
 
 ### Errors
 
-Per pool, per cycle: RPC error, 429 or timeout → the pool fails this cycle, checkpoint unchanged,
-other pools continue. Window exceeded (5 full pages without reaching the checkpoint) → checkpoint
-unchanged, exponential backoff (1, 2, 4… cycles, cap 64); under-counting buyers only delays the
-"N buyers" exit, the deadline exit still sells. Selection or database failure → cycle fails, logged,
-retried next cycle. Shutdown waits at most the listener shutdown timeout for an in-flight cycle.
+Per pool, per cycle: RPC error, 429, timeout, or an inconsistent page (increasing slots, duplicate
+signature, row older than the checkpoint, non-finalized row) → the pool fails this cycle, checkpoint
+unchanged, other pools continue; a timed-out sweep makes no further RPC call. Failed transactions
+(`err` set) are not enqueued but still advance the checkpoint. **Page budget exhausted** (5 full pages
+without reaching the checkpoint, probe unconfirmed) → the pool catches up to the live edge: the rows
+read are enqueued, the checkpoint moves to the newest one, and the pool is reported `GAP_SKIPPED` with
+the oldest slot read, so the gap is auditable. Trades older than the gap are lost for the "N buyers"
+count (the deadline exit still sells); a pool is never left blind. Selection or database failure →
+cycle fails, logged, retried next cycle. Shutdown waits at most the listener shutdown timeout for an
+in-flight cycle and always proceeds to the runtime shutdown. The first cycle does not block
+`start()`, so the API opens without waiting for it.
 
 ### Observability
 
-One log per cycle (`listener.tracked_pool_poll_cycle`: tracked, enqueued, failed, awaiting
-finalization, backing off) and one per pool only on failure or state change. No URLs or keys.
+One log per cycle (`listener.tracked_pool_poll_cycle`: tracked, enqueued, succeeded, failed,
+awaiting boundary, gap skipped) and one per pool unless it succeeded this cycle and the previous one.
+No URLs or keys.
 
 ## Lot 2 — cleanup
 
