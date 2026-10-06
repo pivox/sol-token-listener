@@ -9,6 +9,7 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 const migrationUrl = new URL('../migrations/006_api_event_stream.sql', import.meta.url);
 const PAPER_EVENT_TYPES = new Set([
   'TradingCandidateUpdated', 'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
+  'FastEntryDecided',
 ]);
 
 void test('la migration crée une outbox append-only publique, indexée et sans FK parent', async () => {
@@ -287,6 +288,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '061_execution_live_position_ledger.sql',
       '062_drop_dossier_and_legacy_tables.sql',
       '063_listener_tracked_curve_checkpoints.sql',
+      '064_fast_entry_decisions.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

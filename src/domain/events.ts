@@ -22,6 +22,7 @@ export const DOMAIN_EVENT_TYPES = [
   'PaperPositionClosed',
   'MigrationObserved',
   'PumpSwapPoolActivated',
+  'FastEntryDecided',
 ] as const;
 
 export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];

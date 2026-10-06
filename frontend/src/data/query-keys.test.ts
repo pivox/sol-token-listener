@@ -12,7 +12,7 @@ const ALL_TYPES = [
   'BondingCurveCompleted', 'QualificationUpdated', 'TradingCandidateUpdated',
   'PaperStrategySessionUpdated', 'PaperExternalBuyCounted', 'PaperPositionOpened',
   'PaperPositionUpdated', 'PaperPositionClosed', 'MigrationObserved',
-  'PumpSwapPoolActivated',
+  'PumpSwapPoolActivated', 'FastEntryDecided',
 ] as const;
 
 function event(type: (typeof ALL_TYPES)[number]): ApiSseEvent {

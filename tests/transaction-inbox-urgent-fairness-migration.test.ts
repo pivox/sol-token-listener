@@ -47,8 +47,8 @@ void test('052 upgrades 051, preserves durable state and replays without replaci
 void test('052 is the replay-safe clean database head', async (context) => {
   await withDatabase(context, async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '063_listener_tracked_curve_checkpoints.sql');
-    assert.equal(applied.length, 63);
+    assert.equal(applied.at(-1), '064_fast_entry_decisions.sql');
+    assert.equal(applied.length, 64);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await assertCatalog(pool);
   });
