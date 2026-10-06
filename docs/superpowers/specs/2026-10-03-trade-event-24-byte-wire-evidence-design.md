@@ -1,5 +1,15 @@
 # Pump.fun TradeEvent CPI 24-byte suffix — evidence gate v1.4.2
 
+## Operator decision (2026-10-06): quarantine lifted, opaque tail
+
+The operator decided to accept the 24-byte suffix without waiting for the evidence gate below,
+because the quarantine blocks every current trade and therefore paper sessions and the bounded
+round-trip (#89). The decoder now reads the two documented `u64` holder-reward fields and consumes
+the last eight bytes without assigning them any meaning or type. Every other suffix length is still
+rejected with `PUMP_BORSH_INVALID`. Known risk: if those eight bytes change the meaning of the
+documented amounts, decisions use amounts that may be wrong. The evidence sections below are kept
+as the record of what was and was not proved; #215 stays open until Pump.fun documents the field.
+
 ## Recheck and fail-closed regression (2026-10-03)
 
 The official `pump-public-docs` main still points to `cb188ce08b5069196eef1f3e4a0c43b70099793b`.

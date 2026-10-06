@@ -150,11 +150,13 @@ function decodeTradeEvent(
   const fields = decodeIdlFields(definition.slice(0, -2), reader);
   const suffixLength = reader.remaining;
   observeSuffix(suffixLength);
-  if (suffixLength !== 0 && suffixLength !== 16) {
-    throw invalidEventSuffix('TradeEvent', suffixLength, '0 ou 16');
+  if (suffixLength !== 0 && suffixLength !== 16 && suffixLength !== 24) {
+    throw invalidEventSuffix('TradeEvent', suffixLength, '0, 16 ou 24');
   }
-  const holderRewardsBps = suffixLength === 16 ? reader.readU64() : 0n;
-  const holderRewards = suffixLength === 16 ? reader.readU64() : 0n;
+  const holderRewardsBps = suffixLength >= 16 ? reader.readU64() : 0n;
+  const holderRewards = suffixLength >= 16 ? reader.readU64() : 0n;
+  // Mainnet emits 8 undocumented trailing bytes (#215); consumed without inventing a meaning.
+  if (suffixLength === 24) reader.readBytes(8);
   const event: DecodedPumpTradeEvent = Object.freeze({
     mint: requireString(fields, 'mint'),
     solAmount: requireBigInt(fields, 'sol_amount'),
