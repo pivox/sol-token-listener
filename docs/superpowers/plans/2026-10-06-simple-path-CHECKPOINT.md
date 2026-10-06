@@ -15,32 +15,33 @@ Plan lot 1 : `docs/superpowers/plans/2026-10-06-simple-path-lot1-deletions.md`.
   `e827dc3` migration 062 (DROP de 26-27 tables, sans CASCADE) + `ce23cee` droits retirés.
   Partie de `93b0c4a` : **pas encore réunie** avec B3.
 
-## Reste à faire (lot 1) — mis à jour 2026-10-06 soir
+## Lot 1 — terminé
 
-1. ~~config-safety~~ : seule l'assertion `NOT_AVAILABLE.*AVAILABLE.*COMPLETE.*PARTIAL.*FAILED`
-   échouait ; retirée dans `cb95471` (63/63 verts).
-2. ~~Cherry-pick~~ fait sans conflit : `22d3b64` (062) et `261a15c` (droits) sur
-   `refactor/remove-dossier`. Non poussé.
-3. Suite complète : front vert (vitest 203/203, playwright 1/1). Backend lancé
-   (build OK, web3.js 1.99.0, Postgres `sol-token-listener-test-postgres-1` sur 55432 redémarré)
-   mais **résultat non lu** au moment de l'arrêt : relancer
-   `rm -rf dist && npm run build:backend && TEST_DATABASE_URL=postgresql://test:test@127.0.0.1:55432/sol_token_listener_test npm run test:backend`.
-4. Pousser `refactor/remove-dossier`, puis PR B vers `main`. À noter dans la PR : B2 et 062
-   doivent être déployés ensemble (sinon FK des tables dossier bloquent la rétention) ; le profil
-   par défaut `pumpfun-v1-unvalidated` exige des signaux sociaux que plus rien n'alimente
-   (paper → WATCHLISTED ; le profil technique est inchangé). Remarque : `docs/api/v1.md` cite
-   encore les étapes `participant_analytics` / `wallet_graph` dans la section qualification.
-5. CI verte, merge, `main` local à jour.
+- PR B (#238) **mergée** dans `main` (`4f18b88`) : B1-B5, migration 062, droits, smoke sans
+  pipeline `social`. Déployer B2 et 062 ensemble. Reste : profil `pumpfun-v1-unvalidated` exige des
+  signaux sociaux (paper → WATCHLISTED) ; `docs/api/v1.md` cite encore `participant_analytics` /
+  `wallet_graph`.
+
+## Lot 2 — PR ouverte (branche `feat/creates-only`)
+
+Plan : `docs/superpowers/plans/2026-10-06-simple-path-lot2-creates-only.md`. Fait : scope
+`creates-only` (filtre `NOT_A_CREATE`, scans stricts no-op, pin strict ignoré), migration 063,
+indice `PUMPFUN_CURVE_TRADE` (ordre de claim TRADE < CURVE < POOL), poller réutilisé pour les
+bonding curves (`PostgresTrackedCurveRepository`, PDA dérivée du mint, cap 20, positions live
+d'abord). Suite complète verte (4052/4052 hors skips).
+
+Points ouverts relevés en revue (à traiter dans les lots suivants si besoin) :
+- En `creates-only`, `market_pools` n'est pas alimenté (programme PumpSwap non ingéré) : le poller
+  de pools ne suit donc rien après migration. À régler avant le lot 4 (sortie après migration).
+- Avec l'admission bornée activée, un `create` aux logs ambigus a l'indice NONE → filtré
+  `NOT_A_CREATE` (perte acceptée par la spec).
+- Charge RPC : 2-6 `getSignaturesForAddress` par curve et par cycle (≤ 20 curves / 10 s).
 
 ## Ensuite
 
-- Lot 2 : plan à réécrire dans `docs/superpowers/plans/2026-10-06-simple-path-lot2-creates-only.md`
-  (l'inventaire est fait ; résumé : scope `creates-only` = `launchpad-only` + filtre `NOT_A_CREATE`
-  dans `ws-program-session.ts` + `runStrictScan` no-op dans la factory ; indice
-  `PUMPFUN_CURVE_TRADE` calqué sur `PUMPSWAP_POOL_TRADE` + migration 063 ; poller de pools
-  généralisé, instancié pour les bonding curves (adresse dans `TokenLaunchDetected`
-  `payload.launch.parameters.bondingCurve`, graine `token_launches.created_signature/slot`).
-- Lots 3-5 : voir la spec.
+- Lot 3 : entrée rapide, `entry_decisions`, `FastEntryDecided`, `ENTRY_MODE`, migration 064
+  (voir la spec). Plan à écrire dans `docs/superpowers/plans/2026-10-06-simple-path-lot3-fast-entry.md`.
+- Lots 4-5 : voir la spec.
 
 ## Environnement
 
