@@ -1197,9 +1197,9 @@ async function insertDomainEvent(client: Client, job: ClaimedPaperDecisionJob, e
   await insertDomainEventWithRaw(client, job.sourceRawEventId, event);
 }
 
-async function insertDomainEventWithRaw(
-  client: Client,
-  rawEventId: string,
+export async function insertDomainEventWithRaw(
+  client: ExecutionIntentTransactionClient,
+  rawEventId: string | null,
   event: DomainEvent,
 ): Promise<void> {
   await client.query(`INSERT INTO domain_events (
