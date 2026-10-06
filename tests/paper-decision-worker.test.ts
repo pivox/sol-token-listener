@@ -861,6 +861,29 @@ void test('suppresses all commit work after renewal reports a lost lease', async
   assert.equal(repository.failures.length, 0);
 });
 
+void test('treats a renewal that never settles as a lost lease instead of stalling the worker', async () => {
+  const scheduler = new ManualScheduler();
+  const repository = new FakeRepository([claim()]);
+  repository.renewGate = new Promise<boolean>(() => {});
+  const services = fakeServices('NOT_ELIGIBLE');
+  const gate = deferred<undefined>();
+  services.candidates.gate = gate.promise;
+  const worker = new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),scheduler,
+  );
+  const running = worker.runOnce();
+  await scheduler.waitForScheduled();
+  await scheduler.fireNext();
+  gate.resolve(undefined);
+  await scheduler.waitForScheduled();
+  await scheduler.fireNext();
+
+  assert.deepEqual(await running, { kind:'lease-lost',jobId:'paper-job' });
+  assert.equal(repository.completions.length, 0);
+  assert.equal(scheduler.activeCount, 0);
+});
+
 void test('starts idempotently, polls without a busy loop and closes all timers', async () => {
   const scheduler = new ManualScheduler();
   const repository = new FakeRepository([null]);
@@ -1130,7 +1153,8 @@ class FakeRepository implements PaperDecisionRepository {
     this.claimCalls += 1;
     return this.claims.shift() ?? null;
   }
-  public async renew(): Promise<boolean> { return this.renewResult; }
+  public renewGate: Promise<boolean> | null = null;
+  public async renew(): Promise<boolean> { return this.renewGate ?? this.renewResult; }
   public async loadSnapshot(): Promise<PaperDecisionSnapshot> { return this.snapshotValue; }
   public async stageDecision(_job:ClaimedPaperDecisionJob,result:PaperDecisionResult): Promise<void> {
     this.operations.push('stage'); await this.stageGate; this.stages.push(result);
