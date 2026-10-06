@@ -1037,7 +1037,7 @@ for (const orphaned of ['domain', 'raw'] as const) {
   });
 }
 
-void test('live PostgreSQL ignores historical social and creator rows', async (context) => {
+void test('live PostgreSQL ignores historical social and creator events', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: live qualification historical dossier test skipped');
@@ -1077,16 +1077,6 @@ void test('live PostgreSQL ignores historical social and creator rows', async (c
     )`, [new Date(observedAtMs - 100), new Date(observedAtMs), {
       inputFingerprint: participantFingerprint, padding: oversized,
     }]);
-    await pool.query(`INSERT INTO creator_profiles (
-      mint,creator,payload_version,input_fingerprint,profile_event_id,
-      as_of_slot,as_of_transaction_index,as_of_instruction_index,
-      as_of_inner_instruction_index,confirmation_status,total_bought_base_raw,
-      total_sold_base_raw,observed_net_base_raw,has_sold,payload,observed_at,purge_after
-    ) VALUES ('mint','creator',1,$1,'creator-oversized-event',10,0,1,NULL,
-      'confirmed',0,1,0,TRUE,$2,$3,NULL)`, [
-      participantFingerprint, { padding: oversized }, new Date(observedAtMs),
-    ]);
-
     const snapshot = await repository.transact('mint', (transaction) => (
       transaction.loadCanonicalInput('mint')
     ));

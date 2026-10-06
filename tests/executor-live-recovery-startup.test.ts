@@ -15,10 +15,10 @@ const GENERATION_ID = `execution_wallet_generation_${'a'.repeat(64)}`;
 const PUBLIC_KEY = '11111111111111111111111111111111';
 
 void test('pins every migration through 060 to a non-placeholder sha256', async () => {
-  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 61);
+  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 62);
   assert.equal(
     LIVE_RECOVERY_MIGRATION_CATALOG.at(-1)?.name,
-    '061_execution_live_position_ledger.sql',
+    '062_drop_dossier_and_legacy_tables.sql',
   );
   for (const entry of LIVE_RECOVERY_MIGRATION_CATALOG) {
     assert.match(entry.name, /^\d{3}_[a-z0-9_-]+\.sql$/u);
@@ -38,7 +38,7 @@ void test('validates role, exact migration history, generation and open-work aff
   assert.deepEqual(evidence, {
     payloadVersion: 1,
     role: 'sol_token_executor_live_recovery',
-    migrationHead: '061_execution_live_position_ledger.sql',
+    migrationHead: '062_drop_dossier_and_legacy_tables.sql',
     generationId: GENERATION_ID,
     providerId: 'primary',
   });
