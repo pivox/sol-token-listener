@@ -199,7 +199,11 @@ Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
 - opérations : login membre uniquement de `sol_token_executor_operations`,
   `LIVE_TRADING_ENABLED=false`, aucun nom de variable keypair et aucun RPC ;
 - export H2h : login membre uniquement de `sol_token_operator_reader`, aucune
-  variable RPC, wallet, keypair, mode live ou armement ;
+  variable RPC, wallet, keypair, mode live ou armement. Ce rôle partagé lit
+  désormais aussi le ledger des positions live, 12 colonnes de
+  `execution_live_positions` et les tables market (`bonding_curve_snapshots`,
+  `market_pools`, `market_reserve_snapshots`) : la console opérateur utilise le
+  même rôle et le contrôle d'autorité exacte est partagé ;
 - H2a : login membre uniquement de `sol_token_executor_live_recovery`, aucun
   nom de variable keypair ;
 - H2b : login membre uniquement de `sol_token_executor_live`, keypair externe
@@ -287,6 +291,61 @@ apporter sa preuve PumpSwap dans la même transaction ; le suivi global des
 swaps PumpSwap est volontairement inactif et l'API doit exposer
 `pipeline.pumpswap=IDLE`. Aucune preuve market antérieure ne doit dégrader cet
 état. Ce scope ne change aucune gate H2c et n'autorise aucune action réelle.
+
+## Console opérateur live (huitième frontière)
+
+La page `/live` de la console lit l'API opérateur `src/operator-api/`, un
+processus séparé, en lecture seule et authentifié par jeton. Il n'est pas
+déployé par Docker Compose ni exposé par nginx : le lancer à la main, sur la
+boucle locale.
+
+- login PostgreSQL membre uniquement de `sol_token_operator_reader`, comme
+  l'export H2h : `NOINHERIT`, `ADMIN FALSE, INHERIT FALSE, SET TRUE`, aucun
+  objet possédé. Le processus force `SET ROLE`, `search_path=pg_catalog,public`
+  et `session_replication_role=origin` à chaque checkout et refuse de servir si
+  l'autorité exacte du rôle dérive (même contrôle que H2h) ;
+- endpoint HTTP Mainnet, utilisé uniquement pour `getBalance` du wallet de la
+  génération active ;
+- aucune variable keypair, mode live, armement ou écriture : le processus refuse
+  de démarrer si l'une d'elles est présente.
+
+| Variable | Règle |
+|---|---|
+| `OPERATOR_API_DATABASE_URL` | login membre uniquement de `sol_token_operator_reader` |
+| `OPERATOR_API_TOKEN` | au moins 32 caractères ASCII imprimables |
+| `OPERATOR_API_HOST` / `OPERATOR_API_PORT` | `127.0.0.1` / `3100` par défaut ; l'en-tête `Host` doit valoir exactement `HOST:PORT` |
+| `OPERATOR_API_ALLOWED_ORIGIN` | origine exacte de la console, par exemple `http://127.0.0.1:4173` |
+| `SOLANA_HTTP_RPC_URL` | endpoint HTTP, appelé au plus toutes les 15 secondes |
+
+Les valeurs peuvent être exportées ou placées dans `.env.operator` à la racine
+(ignoré par Git, chargé s'il existe). Générer le jeton avec
+`openssl rand -base64 48 | tr -d '\n'`.
+
+Après la migration 061, rejouer `scripts/provision-executor-roles.sql` : le
+runtime H2a reçoit `INSERT` sur `execution_live_position_ledger`, le rôle
+`sol_token_operator_reader` reçoit `SELECT` sur le ledger, `SELECT` sur
+`bonding_curve_snapshots`, `market_pools`, `market_reserve_snapshots` et un
+`SELECT` par colonnes sur `execution_live_positions`. Le ledger n'est jamais
+purgé. Les positions fermées avant la migration ne sont pas reconstituées.
+
+Mise à jour en bloc : après la migration 061 et le rejeu du script de
+provisionnement, redémarrer ensemble H2a (recovery), H2h et la console
+opérateur sur les nouveaux binaires. Les anciens binaires H2h échouent fermés
+contre les nouveaux grants et les nouveaux échouent fermés contre les anciens :
+ne jamais mélanger les versions.
+
+```bash
+npm run build:backend
+npm run operator:api:start
+```
+
+Seule la route `GET /operator/v1/live/overview?limit=&cursor=` existe, avec
+`Authorization: Bearer <jeton>` ; `OPTIONS` répond au préflight CORS de l'unique
+origine autorisée. Toute autre méthode renvoie 405. Côté console, renseigner
+`operatorApiBaseUrl` dans `frontend/public/config.json`. Les montants affichés
+en PnL non réalisé sont un prix mid indicatif (sans glissement ni frais) ; le
+PnL réalisé est la somme `entrée + sortie` des deltas de lamports du wallet,
+frais et rent inclus.
 
 ## Exécuter H2j sans autorité live
 
