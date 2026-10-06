@@ -15,19 +15,21 @@ Plan lot 1 : `docs/superpowers/plans/2026-10-06-simple-path-lot1-deletions.md`.
   `e827dc3` migration 062 (DROP de 26-27 tables, sans CASCADE) + `ce23cee` droits retirés.
   Partie de `93b0c4a` : **pas encore réunie** avec B3.
 
-## Reste à faire (lot 1)
+## Reste à faire (lot 1) — mis à jour 2026-10-06 soir
 
-1. `tests/config-safety.test.ts` test « Pump.fun calibration documentation states… » (~:1080-1120) :
-   retirer les assertions sur la doc sociale supprimée (liste `CROSS_LINK_CONFIRMED`,
-   `sans API payante`, regex `/NOT_AVAILABLE.*AVAILABLE.*COMPLETE.*PARTIAL.*FAILED/`). C'est le seul
-   échec connu des tests ciblés de B3 (399/400).
-2. Cherry-pick `e827dc3` et `ce23cee` sur `refactor/remove-dossier` (résoudre conflits éventuels).
-3. Vérifier la suite complète de B6 (jamais confirmée après coupure de session) :
-   `rm -rf dist && npm run build:backend && TEST_DATABASE_URL=postgresql://test:test@127.0.0.1:55432/sol_token_listener_test npm run test:backend`,
-   puis `cd frontend && npm test && npx playwright test`.
-4. PR B vers `main`. À noter dans la PR : B2 et 062 doivent être déployés ensemble (sinon FK des
-   tables dossier bloquent la rétention) ; le profil par défaut `pumpfun-v1-unvalidated` exige des
-   signaux sociaux que plus rien n'alimente (paper → WATCHLISTED ; le profil technique est inchangé).
+1. ~~config-safety~~ : seule l'assertion `NOT_AVAILABLE.*AVAILABLE.*COMPLETE.*PARTIAL.*FAILED`
+   échouait ; retirée dans `cb95471` (63/63 verts).
+2. ~~Cherry-pick~~ fait sans conflit : `22d3b64` (062) et `261a15c` (droits) sur
+   `refactor/remove-dossier`. Non poussé.
+3. Suite complète : front vert (vitest 203/203, playwright 1/1). Backend lancé
+   (build OK, web3.js 1.99.0, Postgres `sol-token-listener-test-postgres-1` sur 55432 redémarré)
+   mais **résultat non lu** au moment de l'arrêt : relancer
+   `rm -rf dist && npm run build:backend && TEST_DATABASE_URL=postgresql://test:test@127.0.0.1:55432/sol_token_listener_test npm run test:backend`.
+4. Pousser `refactor/remove-dossier`, puis PR B vers `main`. À noter dans la PR : B2 et 062
+   doivent être déployés ensemble (sinon FK des tables dossier bloquent la rétention) ; le profil
+   par défaut `pumpfun-v1-unvalidated` exige des signaux sociaux que plus rien n'alimente
+   (paper → WATCHLISTED ; le profil technique est inchangé). Remarque : `docs/api/v1.md` cite
+   encore les étapes `participant_analytics` / `wallet_graph` dans la section qualification.
 5. CI verte, merge, `main` local à jour.
 
 ## Ensuite
