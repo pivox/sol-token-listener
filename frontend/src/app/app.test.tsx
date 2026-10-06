@@ -50,6 +50,24 @@ describe('read-only operator shell', () => {
     expect(screen.getByRole('heading', { name: 'Radar des lancements' })).toBeVisible();
   });
 
+  it('adds a Live link whose page swaps the simulation badge for the read-only live badge', async () => {
+    const user = userEvent.setup();
+    render(<App apiBaseUrl="https://api.example" realtimeClient={fakeRealtimeClient()} apiClient={fakeApiClient()} />);
+    const links = screen.getAllByRole('link').map((link) => link.textContent);
+    expect(links.indexOf('Live')).toBe(links.indexOf('Radar') + 1);
+    expect(links.indexOf('Positions paper')).toBe(links.indexOf('Live') + 1);
+    expect(screen.getByText('Simulation uniquement')).toBeVisible();
+    expect(screen.queryByText('Live · lecture seule')).toBeNull();
+
+    await user.click(screen.getByRole('link', { name: 'Live' }));
+
+    expect(await screen.findByText('Surface opérateur non configurée')).toBeVisible();
+    expect(screen.getByText('Live · lecture seule')).toBeVisible();
+    expect(screen.queryByText('Simulation uniquement')).toBeNull();
+    await user.click(screen.getByRole('link', { name: 'Radar' }));
+    expect(screen.getByText('Simulation uniquement')).toBeVisible();
+  });
+
   it('renders a useful not-found route', () => {
     window.history.replaceState({}, '', '/unknown');
     render(<App apiBaseUrl="https://api.example" realtimeClient={fakeRealtimeClient('DISCONNECTED')} apiClient={fakeApiClient()} />);

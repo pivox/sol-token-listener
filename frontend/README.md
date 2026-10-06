@@ -1,9 +1,11 @@
 # Console opérateur Pump.fun
 
 Application React/Vite/Bootstrap publique et indépendante du processus backend.
-Elle consomme exclusivement l’API HTTP/SSE V1 en lecture seule. La console ne
-demande aucun wallet, aucune clé privée et ne construit, signe ou envoie aucune
-transaction. Le libellé permanent `Simulation uniquement` rappelle que le PnL
+Elle consomme l’API HTTP/SSE V1 en lecture seule et, pour `/live`, l’API
+opérateur en lecture seule. La console ne demande aucun wallet, aucune clé
+privée (le jeton opérateur n’en est pas une) et ne construit, signe ou envoie
+aucune transaction. Le libellé `Simulation uniquement` (remplacé par
+`Live · lecture seule` sur `/live`) rappelle que le PnL
 paper est estimé et qu’il n’existe aucune garantie de profit ou de sellabilité.
 
 ## Démarrage local
@@ -37,10 +39,22 @@ relatives ne sont pas acceptées. Ce fichier est une configuration publique :
 aucun secret ne doit y être placé. Une configuration invalide arrête le
 bootstrap avant toute requête métier ou connexion SSE.
 
+`operatorApiBaseUrl` est optionnel, suit les mêmes règles de validation et
+désigne l'API opérateur `src/operator-api/` (par exemple
+`"operatorApiBaseUrl": "http://127.0.0.1:3100"`). Sans lui, la page `/live`
+affiche « Surface opérateur non configurée ». Cette adresse n'est pas un secret ;
+le jeton opérateur, lui, n'est jamais écrit dans `config.json`.
+
 ## Routes produit
 
 - `/` : radar paginé des lancements retenus ;
 - `/launches/:mint` : aperçu, timeline, risque, social et détenteurs ;
+- `/live` : solde, positions ouvertes, PnL réalisé et non réalisé, historique des
+  positions live fermées, en lecture seule. La page demande le jeton opérateur
+  une fois, le garde dans `sessionStorage` (effacé à la fermeture de l'onglet,
+  bouton « Oublier le token ») et le redemande après un 401. Le PnL non réalisé
+  est un prix mid indicatif ; le badge de l'en-tête affiche « Live · lecture
+  seule » sur cette route ;
 - `/paper-positions` : positions et PnL paper estimés ;
 - `/health` : état public du listener, des workers et checkpoints.
 

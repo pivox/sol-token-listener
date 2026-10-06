@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { useRealtimeSnapshot } from '../data/realtime-context.js';
 import type { RealtimeState } from '../data/sse-client.js';
@@ -15,6 +15,7 @@ const realtimeLabels: Readonly<Record<RealtimeState, string>> = {
 
 export function AppShell(): ReactNode {
   const realtime = useRealtimeSnapshot();
+  const live = useLocation().pathname === '/live';
   return (
     <div className="min-vh-100 d-flex flex-column bg-body-tertiary">
       <header className="navbar navbar-expand-md navbar-dark bg-dark border-bottom border-secondary sticky-top">
@@ -22,11 +23,14 @@ export function AppShell(): ReactNode {
           <NavLink className="navbar-brand fw-semibold" to="/">Pump Radar</NavLink>
           <nav className="navbar-nav flex-row gap-2" aria-label="Navigation principale">
             <NavItem to="/">Radar</NavItem>
+            <NavItem to="/live">Live</NavItem>
             <NavItem to="/paper-positions">Positions paper</NavItem>
             <NavItem to="/health">Santé</NavItem>
           </nav>
           <div className="ms-auto d-flex flex-wrap align-items-center justify-content-end gap-2 small">
-            <span className="badge text-bg-warning">Simulation uniquement</span>
+            {live
+              ? <span className="badge text-bg-danger">Live · lecture seule</span>
+              : <span className="badge text-bg-warning">Simulation uniquement</span>}
             <span className="text-light" role="status" aria-live="polite">
               Temps réel : {realtimeLabels[realtime.state]}
             </span>
