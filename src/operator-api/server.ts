@@ -77,12 +77,19 @@ export function createOperatorApiHandler(options: OperatorApiHandlerOptions): Op
       fail(response, 401, 'UNAUTHORIZED', { 'www-authenticate': 'Bearer' });
       return;
     }
-    const url = new URL(request.url ?? '/', 'http://operator.invalid');
-    if (url.pathname !== OPERATOR_OVERVIEW_PATH) {
+    // Origin-form targets only, matched on the raw path: no absolute-form, `//` or dot-segment aliases.
+    const target = request.url;
+    if (target === undefined || !target.startsWith('/') || target.startsWith('//')) {
       fail(response, 404, 'ROUTE_NOT_FOUND');
       return;
     }
-    const parsed = parseRequest(url.searchParams);
+    const queryStart = target.indexOf('?');
+    const rawPath = queryStart === -1 ? target : target.slice(0, queryStart);
+    if (rawPath !== OPERATOR_OVERVIEW_PATH) {
+      fail(response, 404, 'ROUTE_NOT_FOUND');
+      return;
+    }
+    const parsed = parseRequest(new URLSearchParams(queryStart === -1 ? '' : target.slice(queryStart + 1)));
     if (typeof parsed === 'string') {
       fail(response, 400, parsed);
       return;

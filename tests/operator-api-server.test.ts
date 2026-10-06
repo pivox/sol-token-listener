@@ -197,3 +197,52 @@ void test('serializes concurrent overview reads', async () => {
     assert.equal(peak, 1);
   } finally { await api.close(); }
 });
+
+void test('the 401 carries the console origin so the browser can tell it from a network error', async () => {
+  const api = await start();
+  try {
+    const response = await api.send({});
+    assert.equal(response.status, 401);
+    assert.equal(response.headers['access-control-allow-origin'], ORIGIN);
+  } finally { await api.close(); }
+});
+
+void test('an unknown path without a token is a 401, not a 404, and never reaches the reader', async () => {
+  const api = await start();
+  try {
+    for (const path of ['/operator/v1/live/other', '/', 'http://evil.example/operator/v1/live/overview']) {
+      const response = await api.send({ path });
+      assert.equal(response.status, 401, path);
+    }
+    assert.deepEqual(api.requests, []);
+  } finally { await api.close(); }
+});
+
+void test('a failed read does not poison the queue for the next request', async () => {
+  let calls = 0;
+  const api = await start(() => {
+    calls += 1;
+    return calls === 1 ? Promise.reject(new TypeError('boom')) : Promise.resolve(page);
+  });
+  try {
+    assert.equal((await api.send({ headers: authorized })).status, 500);
+    assert.equal((await api.send({ headers: authorized })).status, 200);
+  } finally { await api.close(); }
+});
+
+void test('with a valid token only an exact origin-form overview target is routed', async () => {
+  const api = await start();
+  try {
+    for (const path of [
+      'http://evil.example/operator/v1/live/overview', '//x/operator/v1/live/overview',
+      'http://[/', '*', '/operator/v1/x/../live/overview', '/operator/v1/live/%2e/overview',
+      '/operator/v1/live/overview/', '/operator/v1/live/%6fverview',
+    ]) {
+      const response = await api.send({ path, headers: authorized });
+      assert.equal(response.status, 404, path);
+      assert.equal(JSON.parse(response.body).error.code, 'ROUTE_NOT_FOUND', path);
+    }
+    assert.deepEqual(api.requests, []);
+    assert.deepEqual(api.errors, []);
+  } finally { await api.close(); }
+});
