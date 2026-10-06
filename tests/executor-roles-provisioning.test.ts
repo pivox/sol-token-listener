@@ -308,7 +308,7 @@ void test('foundation retention has an isolated executable role without signed-b
   assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public\s+FROM sol_token_retention_worker/iu);
   assert.match(sql, /GRANT DELETE ON TABLE[\s\S]*?execution_signed_transactions[\s\S]*?TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT INSERT ON TABLE\s+execution_risk_tombstones,\s+execution_intent_tombstones\s+TO sol_token_retention_worker/iu);
-  assert.match(sql, /GRANT UPDATE \([^)]+\)\s+ON TABLE paper_mvp_runs TO sol_token_retention_worker/iu);
+  assert.doesNotMatch(sql, /paper_mvp_runs/iu);
   assert.match(sql, /GRANT SELECT \(\s*artifact_id,state,purge_after,exit_authorization_id,pre_signature_lock_id,reservation_id\s*\)\s+ON TABLE execution_signed_transactions TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT SELECT \(lock_id,state,purge_after,armament_id,reservation_id\)\s+ON TABLE execution_pre_signature_locks TO sol_token_retention_worker/iu);
   assert.doesNotMatch(

@@ -20,23 +20,14 @@ const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta
 
 const BUSINESS_TABLES = Object.freeze([
   'api_event_stream', 'api_event_stream_state', 'bonding_curve_snapshots',
-  'chain_transaction_finality_replay_receipts', 'chain_transaction_inbox',
-  'creator_profiles', 'discovered_pools', 'domain_events', 'ignored_assets',
-  'launch_trades', 'listener_catch_up_gaps', 'listener_checkpoints',
-  'listener_heartbeats', 'listener_strict_catch_up_failures', 'listener_strict_catch_up_runs',
-  'listener_websocket_health', 'market_pools', 'market_reserve_snapshots',
-  'market_trades', 'migrations', 'observed_wallet_positions',
-  'paper_decision_jobs', 'paper_external_buy_events', 'paper_mvp_position_samples',
-  'paper_mvp_runs', 'paper_positions', 'paper_strategy_sessions', 'paper_trades',
-  'processing_checkpoints', 'qualification_reports', 'raw_chain_events',
-  'risk_settings', 'social_enrichment_jobs', 'social_evidence_collections',
-  'social_http_observations', 'social_links', 'social_verification_evidence',
-  'state_transitions', 'swap_events', 'token_holders_snapshots', 'token_launches',
-  'token_metadata_snapshots', 'token_risk_reports', 'token_sessions', 'trades',
-  'trading_candidates', 'transaction_inbox_decoder_recoveries',
-  'transaction_inbox_recoveries', 'wallet_cluster_members',
-  'wallet_clusters', 'wallet_funding_evidence', 'wallet_funding_observations',
-  'wallet_graph_profiles', 'wallet_graph_snapshots', 'wallet_relationships',
+  'chain_transaction_finality_replay_receipts', 'chain_transaction_inbox', 'domain_events',
+  'listener_catch_up_gaps', 'listener_heartbeats', 'listener_strict_catch_up_failures',
+  'listener_strict_catch_up_runs', 'listener_websocket_health', 'market_pools',
+  'market_reserve_snapshots', 'market_trades', 'migrations', 'paper_decision_jobs',
+  'paper_external_buy_events', 'paper_positions', 'paper_strategy_sessions', 'paper_trades',
+  'processing_checkpoints', 'qualification_reports', 'raw_chain_events', 'state_transitions',
+  'token_launches', 'token_metadata_snapshots', 'trading_candidates',
+  'transaction_inbox_decoder_recoveries', 'transaction_inbox_recoveries',
 ] as const);
 
 const FORBIDDEN_EXECUTION_TABLES = Object.freeze([
