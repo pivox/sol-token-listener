@@ -26,7 +26,6 @@ import {
   MAX_SERIALIZED_BIGINT_DIGITS,
 } from '../utils/json.js';
 import type { QualificationEngine } from '../qualification/qualification-engine.js';
-import { toSocialQualificationObservations } from '../social/social-qualification-observations.js';
 
 export interface QualificationRebuildInput {
   readonly snapshot: QualificationEvidenceSnapshot;
@@ -304,31 +303,21 @@ function evaluationFrom(input: QualificationRebuildInput): QualificationEvaluati
       upstream.set('METADATA_FETCH_FAILED', true);
     }
   }
-  if (snapshot.social !== null) {
-    const social = toSocialQualificationObservations(snapshot.social);
-    Object.assign(signals, social.signals);
-    for (const condition of social.upstreamConditions) mergeCondition(upstream, condition);
-  }
   signals.creatorHasNotSold = !snapshot.creatorHasSold;
   upstream.set('CREATOR_EARLY_SELL', snapshot.creatorHasSold);
   for (const condition of input.upstreamConditions ?? []) mergeCondition(upstream, condition);
-  if (snapshot.holderSnapshot !== null) {
-    signals.externalBuyersObserved = snapshot.holderSnapshot.uniqueExternalBuyers > 0;
-  }
   if (input.reverseSellQuote !== undefined) {
     signals.reverseQuoteAvailable = input.reverseSellQuote !== null;
   }
 
+  // Holder, wallet-cluster and social evidence is no longer collected: those
+  // facts and signals stay unknown, as the engine treats any missing evidence.
   const facts: QualificationCalibrationFacts = Object.freeze({
-    top1HolderBps:snapshot.holderSnapshot?.top1Bps ?? null,
-    top5HoldersBps:snapshot.holderSnapshot?.top5Bps ?? null,
-    top10HoldersBps:snapshot.holderSnapshot?.top10Bps ?? null,
-    maximumRelatedClusterBps:maximumBigInt(
-      snapshot.walletGraph?.clusters.map((cluster) => cluster.concentrationBps),
-    ),
-    maximumSharedFunderCount:maximumNumber(
-      snapshot.walletGraph?.clusters.map((cluster) => cluster.sharedFunderCount),
-    ),
+    top1HolderBps:null,
+    top5HoldersBps:null,
+    top10HoldersBps:null,
+    maximumRelatedClusterBps:null,
+    maximumSharedFunderCount:null,
     buySimulationSucceeded:quoteAvailability(input.buyQuote),
     sellQuoteAvailable:quoteAvailability(input.reverseSellQuote),
     roundTripLossBps:roundTripLoss(input.buyQuote, input.reverseSellQuote),
@@ -387,16 +376,6 @@ function roundTripLoss(
 
 function quoteAvailability(value: PaperExecutionQuote | null | undefined): boolean | null {
   return value === undefined ? null : value !== null;
-}
-
-function maximumBigInt(values: readonly bigint[] | undefined): bigint | null {
-  if (values === undefined) return null;
-  return values.reduce((maximum, value) => value > maximum ? value : maximum, 0n);
-}
-
-function maximumNumber(values: readonly number[] | undefined): number | null {
-  if (values === undefined) return null;
-  return values.reduce((maximum, value) => Math.max(maximum, value), 0);
 }
 
 function validPublicUrl(value: string | null): boolean {

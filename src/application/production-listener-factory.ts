@@ -65,8 +65,6 @@ import { PumpSwapReserveReader } from '../markets/pumpswap/pumpswap-reserve-read
 import { CanonicalPaperQuoteRouter } from '../paper/paper-quote-router.js';
 import { PaperTradingEngine } from '../paper/paper-trading-engine.js';
 import { PumpFunPaperQuoteProvider } from '../paper/pumpfun-paper-quote.provider.js';
-import { BoundedPublicHttpClient } from '../metadata/bounded-public-http.client.js';
-import { HttpMetadataProvider } from '../metadata/http-metadata.provider.js';
 import { RpcPumpSwapPoolValidator } from '../markets/pumpswap/pool-validator.js';
 import type { ListenerRuntime } from '../ports/listener-runtime.js';
 import type { MarketRpcReader } from '../ports/market-rpc-reader.js';
@@ -94,21 +92,16 @@ import {
   CachedSolanaBlockTransactionLocator,
   type EpochTransactionBlockRpc,
 } from '../solana/rpc/block-transaction-cache.js';
-import { SolanaWalletFundingEvidenceExtractor } from '../solana/wallet-funding-evidence-extractor.js';
 import { getDatabasePool } from '../storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../storage/launchpad-event.repository.js';
 import { PostgresMarketObservationRepository } from '../storage/market-observation.repository.js';
-import { PostgresParticipantAnalyticsRepository } from '../storage/participant-analytics.repository.js';
 import { PostgresPaperDecisionRepository } from '../storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../storage/paper-trading.repository.js';
 import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
 import { PostgresQualificationProjectionRepository } from '../storage/qualification-projection.repository.js';
-import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
 import { PostgresTrackedPoolRepository } from '../storage/tracked-pool.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWebSocketHealthRepository } from '../storage/websocket-health.repository.js';
-import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
-import { PostgresWalletGraphRepository } from '../storage/wallet-graph.repository.js';
 import {
   FinalityReconciler,
   FinalityReconcilerError,
@@ -120,7 +113,6 @@ import {
   type FinalityDiagnosticTrackerState,
 } from './finality-reconciler-diagnostic-tracker.js';
 import { createFinalityReconcilerDiagnosticSink } from './finality-reconciler-diagnostic-logger.js';
-import { LaunchParticipantAnalyticsService } from './launch-participant-analytics.service.js';
 import { listenerIngestionPrograms } from './listener-ingestion-programs.js';
 import { LaunchpadObservationService } from './launchpad-observation.service.js';
 import { MarketObservationService } from './market-observation.service.js';
@@ -145,17 +137,12 @@ import { TransactionInboxWorkerPool } from './transaction-inbox-worker-pool.js';
 import { ListenerRpcWorkGate, gateBlockTransactionRpc } from './listener-rpc-work-gate.js';
 import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
 import { PersistentWebSocketHealthReporter } from './websocket-health-reporter.js';
-import { WalletEvidenceObservationService } from './wallet-evidence-observation.service.js';
-import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
-import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
-import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
 import {
   PaperDecisionWorker,
   createPaperDecisionStrategyRegistry,
 } from './paper-decision-worker.js';
 import { QualificationProjectionService } from './qualification-projection.service.js';
 import { QualificationRebuildService } from './qualification-rebuild.service.js';
-import { SocialQualificationRefreshService } from './social-qualification-refresh.service.js';
 import { TradingCandidateService } from './trading-candidate.service.js';
 import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
 import { CreationEntryV1Strategy } from './creation-entry-v1.strategy.js';
@@ -514,31 +501,10 @@ export function createProductionListenerRuntime(
     databasePool,
     config.dataRetentionHours,
     Date.now,
-    {
-      maxAttempts: config.socialRetryMaxAttempts,
-      baseDelayMs: config.socialRetryBaseDelayMs,
-    },
     workerAdmissionPolicy,
   );
-  const publicHttp = new BoundedPublicHttpClient(undefined, undefined, {
-    timeoutMs: config.socialHttpTimeoutMs,
-    maxBytes: config.socialHttpMaxBytes,
-    maxRedirects: config.socialHttpMaxRedirects,
-    maxConcurrency: config.socialHttpConcurrency,
-    maxPerHostConcurrency: 1,
-  });
   const pump = new PumpFunLaunchpadAdapter(createUnavailableBondingCurveReader());
   const launchpad = new LaunchpadObservationService(pump, launchpadRepository);
-  const funding = new WalletEvidenceObservationService(
-    new SolanaWalletFundingEvidenceExtractor(),
-    new PostgresWalletEvidenceRepository(databasePool),
-  );
-  const participants = new LaunchParticipantAnalyticsService(
-    new PostgresParticipantAnalyticsRepository(databasePool),
-  );
-  const graph = new WalletGraphRebuildService(
-    new PostgresWalletGraphRepository(databasePool),
-  );
 
   const directMarketRpc = new SolanaMarketRpcReader(rpc.http, config.commitment);
   const marketRpc: MarketRpcReader = rpcWorkGate === null
@@ -581,18 +547,6 @@ export function createProductionListenerRuntime(
     new PostgresQualificationProjectionRepository(databasePool, qualificationRebuilder),
     qualificationRebuilder,
     config.paperQuoteMintAllowlist,
-  );
-  const socialWorker = new SocialEnrichmentWorker(
-    new PostgresSocialEvidenceRepository(databasePool),
-    new HttpMetadataProvider(publicHttp),
-    new PublicSocialVerificationProvider(publicHttp),
-    new SocialQualificationRefreshService(qualification,paperRepository),
-    {
-      pollIntervalMs: config.socialWorkerPollMs,
-      leaseMs: config.socialWorkerLeaseSeconds * 1_000,
-      renewalIntervalMs: Math.floor(config.socialWorkerLeaseSeconds * 1_000 / 3),
-      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
-    },
   );
   const quoteRouter = new CanonicalPaperQuoteRouter(
     new PostgresPaperVenueReader(() => rpc.getSlot(), databasePool),
@@ -672,9 +626,6 @@ export function createProductionListenerRuntime(
   const pipeline = new ObservedTransactionPipeline(
     launchpadRepository,
     launchpad,
-    funding,
-    participants,
-    graph,
     marketPipeline,
     paperRepository,
     qualification,
@@ -703,7 +654,6 @@ export function createProductionListenerRuntime(
     blockHydration.close,
     (): void => { rpcWorkGate?.close(); },
   );
-  const socialWorkerComponent = lifecycleComponent(socialWorker);
   const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
     inbox,
@@ -743,7 +693,6 @@ export function createProductionListenerRuntime(
       logger.info(event, 'Bilan des phases worker à la fermeture du listener.');
     }),
     paperWorker: paperWorkerComponent,
-    socialWorker: socialWorkerComponent,
     reconciler,
     heartbeat,
   }, {

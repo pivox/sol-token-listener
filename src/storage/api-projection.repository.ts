@@ -73,6 +73,7 @@ import {
   SOCIAL_EVIDENCE_OUTCOMES,
   SOCIAL_EVIDENCE_TYPES,
   SOCIAL_LINK_KINDS,
+  SOCIAL_URL_INVALID_REASONS,
 } from '../domain/social-evidence.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
 import { isRpcProviderId, RPC_PROVIDER_IDS } from '../domain/rpc-provider.js';
@@ -108,7 +109,6 @@ import {
   fromJsonValue,
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
-import { SOCIAL_URL_INVALID_REASONS } from '../social/social-url-normalizer.js';
 
 export interface Queryable {
   query(

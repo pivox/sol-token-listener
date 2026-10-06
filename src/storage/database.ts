@@ -135,13 +135,7 @@ function releasedMigrationAdvisoryLock(rows: unknown): boolean {
 
 export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool()): Promise<{
   readonly metadataSnapshots: number;
-  readonly socialEvidence: number;
-  readonly socialObservations: number;
-  readonly socialLinks: number;
-  readonly socialCollections: number;
-  readonly socialJobs: number;
   readonly bondingCurveSnapshots: number;
-  readonly launchTrades: number;
   readonly marketTrades: number;
   readonly marketReserveSnapshots: number;
   readonly marketPools: number;
@@ -184,16 +178,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly executionRiskProviderSnapshots: number;
   readonly executionRiskTombstones: number;
   readonly stateTransitions: number;
-  readonly observedWalletPositions: number;
-  readonly holderSnapshots: number;
-  readonly creatorProfiles: number;
-  readonly walletFundingObservations: number;
-  readonly walletFundingEvidence: number;
-  readonly walletRelationships: number;
-  readonly walletGraphProfiles: number;
-  readonly walletClusterMembers: number;
-  readonly walletClusters: number;
-  readonly walletGraphSnapshots: number;
   readonly transactionInboxRecoveries: number;
   readonly transactionInboxDecoderRecoveries: number;
   readonly transactionInboxTerminalAttributions: number;
@@ -218,55 +202,17 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
         client,
         EXECUTION_INTENT_EXPIRATION_BATCH_SIZE,
       );
-    const socialEvidence = await client.query(
-      `DELETE FROM social_verification_evidence evidence
-       USING social_evidence_collections collection
-       WHERE evidence.collection_id = collection.collection_id
-         AND collection.purge_after <= statement_timestamp()`,
-    );
-    const socialObservations = await client.query(
-      `DELETE FROM social_http_observations observation
-       USING social_evidence_collections collection
-       WHERE observation.collection_id = collection.collection_id
-         AND collection.purge_after <= statement_timestamp()`,
-    );
-    const socialLinks = await client.query(
-      `DELETE FROM social_links link
-       USING social_evidence_collections collection
-       WHERE link.collection_id = collection.collection_id
-         AND collection.purge_after <= statement_timestamp()`,
-    );
-    const socialCollections = await client.query(
-      `DELETE FROM social_evidence_collections
-       WHERE purge_after <= statement_timestamp()`,
-    );
-    const socialJobs = await client.query(
-      `DELETE FROM social_enrichment_jobs
-       WHERE purge_after <= statement_timestamp()`,
-    );
     const metadataSnapshots = await client.query(
       `DELETE FROM token_metadata_snapshots snapshot USING token_launches launch
        WHERE snapshot.mint = launch.mint
          AND (
            snapshot.purge_after <= statement_timestamp()
-           OR (
-             launch.purge_after <= statement_timestamp()
-             AND NOT EXISTS (
-               SELECT 1 FROM social_evidence_collections collection
-               WHERE collection.metadata_snapshot_id = snapshot.snapshot_id
-                 AND (collection.purge_after IS NULL
-                   OR collection.purge_after > statement_timestamp())
-             )
-           )
+           OR launch.purge_after <= statement_timestamp()
          )`,
     );
     const bondingCurveSnapshots = await client.query(
       `DELETE FROM bonding_curve_snapshots snapshot USING token_launches launch
        WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const launchTrades = await client.query(
-      `DELETE FROM launch_trades trade USING token_launches launch
-       WHERE trade.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const marketTrades = await client.query(
       `DELETE FROM market_trades trade WHERE purge_after <= NOW()`,
@@ -780,46 +726,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
     );
-    const walletFundingEvidence = await client.query(
-      `DELETE FROM wallet_funding_evidence evidence USING token_launches launch
-       WHERE evidence.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const walletFundingObservations = await client.query(
-      `DELETE FROM wallet_funding_observations observation USING token_launches launch
-       WHERE observation.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const walletRelationships = await client.query(
-      `DELETE FROM wallet_relationships relationship USING token_launches launch
-       WHERE relationship.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const walletClusterMembers = await client.query(
-      `DELETE FROM wallet_cluster_members member USING token_launches launch
-       WHERE member.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const walletClusters = await client.query(
-      `DELETE FROM wallet_clusters cluster USING token_launches launch
-       WHERE cluster.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const walletGraphSnapshots = await client.query(
-      `DELETE FROM wallet_graph_snapshots snapshot USING token_launches launch
-       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const walletGraphProfiles = await client.query(
-      `DELETE FROM wallet_graph_profiles profile USING token_launches launch
-       WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const observedWalletPositions = await client.query(
-      `DELETE FROM observed_wallet_positions position USING token_launches launch
-       WHERE position.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const holderSnapshots = await client.query(
-      `DELETE FROM token_holders_snapshots snapshot USING token_launches launch
-       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
-    const creatorProfiles = await client.query(
-      `DELETE FROM creator_profiles profile USING token_launches launch
-       WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
-    );
     const transactionInboxTerminalAttributions = await client.query(
       `DELETE FROM transaction_inbox_terminal_attributions WHERE purge_after<=clock_timestamp()`,
     );
@@ -945,43 +851,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        )
        SELECT deleted_count FROM summary`,
     );
-    const participantDomainEvents = await client.query(
-      `DELETE FROM domain_events event USING token_launches launch
-       WHERE event.mint = launch.mint
-         AND event.type IN (
-           'CreatorProfileUpdated',
-           'HolderDistributionUpdated',
-           'WalletClusterDetected'
-         )
-         AND launch.purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM qualification_reports report
-           WHERE report.source_event_id = event.event_id
-              OR report.qualification_event_id = event.event_id
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM trading_candidates candidate
-           WHERE candidate.source_event_id = event.event_id
-              OR candidate.candidate_event_id = event.event_id
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM paper_strategy_sessions session
-           WHERE session.source_event_id = event.event_id
-              OR session.session_event_id = event.event_id
-         )`,
-    );
     const expiredDomainEvents = await client.query(
       `DELETE FROM domain_events WHERE purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM social_enrichment_jobs job
-           WHERE job.source_launch_event_id = domain_events.event_id
-             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM social_evidence_collections collection
-           WHERE collection.source_launch_event_id = domain_events.event_id
-             AND (collection.purge_after IS NULL OR collection.purge_after > statement_timestamp())
-         )
          AND NOT EXISTS (
            SELECT 1 FROM paper_decision_jobs job
            WHERE job.source_event_id = domain_events.event_id
@@ -1017,11 +888,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            SELECT 1 FROM domain_events domain_event WHERE domain_event.raw_event_id = raw.event_id
          )
          AND NOT EXISTS (
-           SELECT 1 FROM social_enrichment_jobs job
-           WHERE job.source_raw_event_id = raw.event_id
-             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
-         )
-         AND NOT EXISTS (
            SELECT 1 FROM paper_decision_jobs job
            WHERE job.source_raw_event_id = raw.event_id
          )
@@ -1043,18 +909,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const launches = await client.query(
       `DELETE FROM token_launches launch WHERE purge_after <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM social_enrichment_jobs social_job
-           WHERE social_job.mint = launch.mint
-             AND (social_job.purge_after IS NULL
-               OR social_job.purge_after > statement_timestamp())
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM social_evidence_collections social_collection
-           WHERE social_collection.mint = launch.mint
-             AND (social_collection.purge_after IS NULL
-               OR social_collection.purge_after > statement_timestamp())
-         )
          AND NOT EXISTS (
            SELECT 1 FROM paper_decision_jobs paper_job
            WHERE paper_job.mint = launch.mint
@@ -1087,13 +941,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     await client.query('COMMIT');
     return {
       metadataSnapshots: metadataSnapshots.rowCount ?? 0,
-      socialEvidence: socialEvidence.rowCount ?? 0,
-      socialObservations: socialObservations.rowCount ?? 0,
-      socialLinks: socialLinks.rowCount ?? 0,
-      socialCollections: socialCollections.rowCount ?? 0,
-      socialJobs: socialJobs.rowCount ?? 0,
       bondingCurveSnapshots: bondingCurveSnapshots.rowCount ?? 0,
-      launchTrades: launchTrades.rowCount ?? 0,
       marketTrades: marketTrades.rowCount ?? 0,
       marketReserveSnapshots: marketReserveSnapshots.rowCount ?? 0,
       marketPools: marketPools.rowCount ?? 0,
@@ -1139,16 +987,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       executionRiskProviderSnapshots: executionRiskProviderSnapshots.rowCount ?? 0,
       executionRiskTombstones,
       stateTransitions: transitions.rowCount ?? 0,
-      observedWalletPositions: observedWalletPositions.rowCount ?? 0,
-      holderSnapshots: holderSnapshots.rowCount ?? 0,
-      creatorProfiles: creatorProfiles.rowCount ?? 0,
-      walletFundingObservations: walletFundingObservations.rowCount ?? 0,
-      walletFundingEvidence: walletFundingEvidence.rowCount ?? 0,
-      walletRelationships: walletRelationships.rowCount ?? 0,
-      walletGraphProfiles: walletGraphProfiles.rowCount ?? 0,
-      walletClusterMembers: walletClusterMembers.rowCount ?? 0,
-      walletClusters: walletClusters.rowCount ?? 0,
-      walletGraphSnapshots: walletGraphSnapshots.rowCount ?? 0,
       transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
       transactionInboxDecoderRecoveries: transactionInboxDecoderRecoveries.rowCount ?? 0,
       transactionInboxTerminalAttributions: transactionInboxTerminalAttributions.rowCount ?? 0,
@@ -1159,8 +997,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       websocketHealthEvidence: websocketHealthEvidence.rowCount ?? 0,
       transactionInbox: transactionInbox.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
-      domainEvents: (participantDomainEvents.rowCount ?? 0)
-        + (expiredDomainEvents.rowCount ?? 0),
+      domainEvents: expiredDomainEvents.rowCount ?? 0,
       rawChainEvents: rawEvents.rowCount ?? 0,
       tokenLaunches: launches.rowCount ?? 0,
     };

@@ -7,7 +7,6 @@ export type ListenerRuntimeFailureStage =
   | 'supervisor-start'
   | 'worker-start'
   | 'paper-worker-start'
-  | 'social-worker-start'
   | 'reconciler-start'
   | 'heartbeat-start'
   | 'startup-timeout'
@@ -15,8 +14,6 @@ export type ListenerRuntimeFailureStage =
   | 'supervisor-timeout'
   | 'paper-worker-close'
   | 'paper-worker-timeout'
-  | 'social-worker-close'
-  | 'social-worker-timeout'
   | 'reconciler-close'
   | 'reconciler-timeout'
   | 'worker-close'
@@ -60,7 +57,6 @@ export interface ListenerRuntimeDependencies {
   readonly supervisor: RuntimeSupervisor;
   readonly worker: RuntimeComponent & { onCloseTimeout?: () => void };
   readonly paperWorker: RuntimeComponent;
-  readonly socialWorker: RuntimeComponent;
   readonly reconciler: RuntimeComponent;
   readonly heartbeat: RuntimeHeartbeat;
 }
@@ -74,14 +70,12 @@ type ActiveRuntimeResource =
   | 'supervisor'
   | 'worker'
   | 'paperWorker'
-  | 'socialWorker'
   | 'reconciler'
   | 'heartbeat';
 
 const CLEANUP_ORDER: readonly ActiveRuntimeResource[] = Object.freeze([
   'supervisor',
   'paperWorker',
-  'socialWorker',
   'reconciler',
   'worker',
   'heartbeat',
@@ -160,7 +154,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         pumpswap: this.marketPipelineState('STOPPED'),
         qualification: 'STOPPED',
         paperDecision: 'STOPPED',
-        social: 'STOPPED',
+        social: 'IDLE',
       });
     }
     if (this.currentState !== 'RUNNING') {
@@ -170,19 +164,17 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         pumpswap: this.marketPipelineState('DEGRADED'),
         qualification: 'DEGRADED',
         paperDecision: 'DEGRADED',
-        social: 'DEGRADED',
+        social: 'IDLE',
       });
     }
 
     let chain: 'RUNNING' | 'DEGRADED' = 'DEGRADED';
     let paperDecision: ApiProjectionPipelineState['paperDecision'] = 'DEGRADED';
-    let social: ApiProjectionPipelineState['social'] = 'DEGRADED';
     try {
       chain = this.chainComponentStates().every((state) => state === 'RUNNING')
         ? 'RUNNING'
         : 'DEGRADED';
       paperDecision = projectionComponentState(this.dependencies.paperWorker.state());
-      social = projectionComponentState(this.dependencies.socialWorker.state());
     } catch {
       // A hostile or failing component stays degraded without exposing its error.
     }
@@ -192,7 +184,8 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       pumpswap: this.marketPipelineState(chain),
       qualification: chain,
       paperDecision,
-      social,
+      // No social worker runs any more; the API field stays until it is removed.
+      social: 'IDLE',
     });
   }
 
@@ -212,8 +205,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       await this.startComponent('reconciler');
       stage = 'paper-worker-start';
       await this.startComponent('paperWorker');
-      stage = 'social-worker-start';
-      await this.startComponent('socialWorker');
       stage = 'heartbeat-start';
       await this.startComponent('heartbeat');
       this.started = true;
@@ -307,7 +298,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       this.dependencies.worker.state(),
       this.dependencies.reconciler.state(),
       this.dependencies.paperWorker.state(),
-      this.dependencies.socialWorker.state(),
       this.dependencies.heartbeat.state(),
     ];
   }
@@ -335,7 +325,6 @@ function projectionComponentState(
 function closeStage(resource: ActiveRuntimeResource): ListenerRuntimeFailureStage {
   if (resource === 'supervisor') return 'supervisor-close';
   if (resource === 'paperWorker') return 'paper-worker-close';
-  if (resource === 'socialWorker') return 'social-worker-close';
   if (resource === 'reconciler') return 'reconciler-close';
   if (resource === 'worker') return 'worker-close';
   return 'heartbeat-stop';
@@ -344,7 +333,6 @@ function closeStage(resource: ActiveRuntimeResource): ListenerRuntimeFailureStag
 function timeoutStage(resource: ActiveRuntimeResource): ListenerRuntimeFailureStage {
   if (resource === 'supervisor') return 'supervisor-timeout';
   if (resource === 'paperWorker') return 'paper-worker-timeout';
-  if (resource === 'socialWorker') return 'social-worker-timeout';
   if (resource === 'reconciler') return 'reconciler-timeout';
   if (resource === 'worker') return 'worker-timeout';
   return 'heartbeat-timeout';

@@ -19,7 +19,6 @@ void test('starts the supervisor before every consumer and exposes honest frozen
     'worker.start',
     'reconciler.start',
     'paperWorker.start',
-    'socialWorker.start',
     'heartbeat.start',
   ]);
   assert.equal(runtime.state(), 'RUNNING');
@@ -29,7 +28,7 @@ void test('starts the supervisor before every consumer and exposes honest frozen
     pumpswap: 'RUNNING',
     qualification: 'RUNNING',
     paperDecision: 'RUNNING',
-    social: 'RUNNING',
+    social: 'IDLE',
   });
   assert.ok(Object.isFrozen(runtime.pipelineState()));
 });
@@ -49,7 +48,7 @@ void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime hea
     pumpswap: 'IDLE',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'STOPPED',
+    social: 'IDLE',
   });
 
   await runtime.start();
@@ -60,7 +59,7 @@ void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime hea
     pumpswap: 'IDLE',
     qualification: 'RUNNING',
     paperDecision: 'RUNNING',
-    social: 'RUNNING',
+    social: 'IDLE',
   });
 
   supervisorState = 'STARTING';
@@ -71,7 +70,7 @@ void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime hea
     pumpswap: 'IDLE',
     qualification: 'DEGRADED',
     paperDecision: 'RUNNING',
-    social: 'RUNNING',
+    social: 'IDLE',
   });
 });
 
@@ -84,14 +83,12 @@ void test('chain health requires the supervisor, inbox worker, reconciler, and h
     reconciler: 'RUNNING',
     heartbeat: 'RUNNING',
     paperWorker: 'RUNNING',
-    socialWorker: 'RUNNING',
   };
   deps.supervisor.state = () => states.supervisor as 'RUNNING';
   deps.worker.state = () => states.worker as 'RUNNING';
   deps.reconciler.state = () => states.reconciler as 'RUNNING';
   deps.heartbeat.state = () => states.heartbeat as 'RUNNING';
   deps.paperWorker.state = () => states.paperWorker as 'RUNNING';
-  deps.socialWorker.state = () => states.socialWorker as 'RUNNING';
   const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
   await runtime.start();
 
@@ -104,7 +101,7 @@ void test('chain health requires the supervisor, inbox worker, reconciler, and h
       pumpswap: 'DEGRADED',
       qualification: 'DEGRADED',
       paperDecision: 'RUNNING',
-      social: 'RUNNING',
+      social: 'IDLE',
     });
     states[component] = 'RUNNING';
   }
@@ -116,17 +113,7 @@ void test('chain health requires the supervisor, inbox worker, reconciler, and h
     pumpswap: 'RUNNING',
     qualification: 'RUNNING',
     paperDecision: 'DEGRADED',
-    social: 'RUNNING',
-  });
-  states.paperWorker = 'RUNNING';
-  states.socialWorker = 'STOPPED';
-  assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true,
-    pumpfun: 'RUNNING',
-    pumpswap: 'RUNNING',
-    qualification: 'RUNNING',
-    paperDecision: 'RUNNING',
-    social: 'STOPPED',
+    social: 'IDLE',
   });
 });
 
@@ -159,21 +146,12 @@ void test('rolls back each startup failure in the fixed producer-first shutdown 
       ],
     },
     {
-      component: 'socialWorker' as const,
-      stage: 'social-worker-start',
-      expected: [
-        'supervisor.start', 'worker.start', 'reconciler.start', 'paperWorker.start',
-        'socialWorker.start', 'supervisor.close', 'paperWorker.close',
-        'socialWorker.close', 'reconciler.close', 'worker.close',
-      ],
-    },
-    {
       component: 'heartbeat' as const,
       stage: 'heartbeat-start',
       expected: [
         'supervisor.start', 'worker.start', 'reconciler.start', 'paperWorker.start',
-        'socialWorker.start', 'heartbeat.start', 'supervisor.close',
-        'paperWorker.close', 'socialWorker.close', 'reconciler.close', 'worker.close',
+        'heartbeat.start', 'supervisor.close',
+        'paperWorker.close', 'reconciler.close', 'worker.close',
         'heartbeat.stop:STOPPED',
       ],
     },
@@ -225,7 +203,6 @@ void test('awaits supervisor shutdown before draining any consumer', async () =>
     'supervisor.close:start',
     'supervisor.close:done',
     'paperWorker.close',
-    'socialWorker.close',
     'reconciler.close',
     'worker.close',
     'heartbeat.stop:STOPPED',
@@ -239,7 +216,6 @@ void test('uses one global deadline while invoking every shutdown stage sequenti
   const hanging = (): Promise<void> => new Promise<void>(() => undefined);
   deps.supervisor.close = () => { calls.push('supervisor.close'); return hanging(); };
   deps.paperWorker.close = () => { calls.push('paperWorker.close'); return hanging(); };
-  deps.socialWorker.close = () => { calls.push('socialWorker.close'); return hanging(); };
   deps.reconciler.close = () => { calls.push('reconciler.close'); return hanging(); };
   deps.worker.close = () => { calls.push('worker.close'); return hanging(); };
   deps.heartbeat.stop = (state) => { calls.push(`heartbeat.stop:${state}`); return hanging(); };
@@ -253,7 +229,6 @@ void test('uses one global deadline while invoking every shutdown stage sequenti
     assert.deepEqual(error.failures, [
       Object.freeze({ stage: 'supervisor-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'paper-worker-timeout', errorName: 'ListenerTimeoutError' }),
-      Object.freeze({ stage: 'social-worker-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'reconciler-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'worker-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'heartbeat-timeout', errorName: 'ListenerTimeoutError' }),
@@ -262,7 +237,7 @@ void test('uses one global deadline while invoking every shutdown stage sequenti
   });
   assert.ok(Date.now() - startedAt < 80);
   assert.deepEqual(calls, [
-    'supervisor.close', 'paperWorker.close', 'socialWorker.close',
+    'supervisor.close', 'paperWorker.close',
     'reconciler.close', 'worker.close', 'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -290,7 +265,7 @@ void test('aggregates fixed close failures and retries only unresolved resources
     return true;
   });
   assert.deepEqual(calls, [
-    'supervisor.close', 'paperWorker.close', 'socialWorker.close',
+    'supervisor.close', 'paperWorker.close',
     'reconciler.close', 'worker.close', 'heartbeat.stop:STOPPED',
   ]);
   calls.length = 0;
@@ -305,8 +280,7 @@ void test('close owns every currently starting component before a late resolutio
     { component: 'supervisor' as const, closeCall: 'supervisor.close', next: 'worker.start' },
     { component: 'worker' as const, closeCall: 'worker.close', next: 'reconciler.start' },
     { component: 'reconciler' as const, closeCall: 'reconciler.close', next: 'paperWorker.start' },
-    { component: 'paperWorker' as const, closeCall: 'paperWorker.close', next: 'socialWorker.start' },
-    { component: 'socialWorker' as const, closeCall: 'socialWorker.close', next: 'heartbeat.start' },
+    { component: 'paperWorker' as const, closeCall: 'paperWorker.close', next: 'heartbeat.start' },
     { component: 'heartbeat' as const, closeCall: 'heartbeat.stop:STOPPED', next: null },
   ];
 
@@ -430,7 +404,7 @@ void test('validates shutdown bounds and returns STOPPED projections before star
     pumpswap: 'STOPPED',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'STOPPED',
+    social: 'IDLE',
   });
   assert.throws(
     () => new SolanaListenerRuntime(dependencies([]), { shutdownTimeoutMs: 0 }),
@@ -473,7 +447,7 @@ void test('worker timeout publishes active phase evidence before pending close s
     assert.deepEqual(events, [{ ...recorder.snapshot(),
       event: 'listener_worker_phase_diagnostic_shutdown', closeStatus: 'INCOMPLETE' }]);
     assert.equal(recorder.snapshot().phases[phase].active, 1);
-    assert.deepEqual(calls, ['supervisor.close', 'paperWorker.close', 'socialWorker.close',
+    assert.deepEqual(calls, ['supervisor.close', 'paperWorker.close',
       'reconciler.close', 'worker.close', 'worker.diagnostic', 'heartbeat.stop:STOPPED']);
     await assert.rejects(runtime.close(), ListenerRuntimeError);
     assert.equal(events.length, 1);
@@ -505,7 +479,7 @@ void test('throwing worker timeout callback preserves cleanup order and failure 
     ]);
     return true;
   });
-  assert.deepEqual(calls, ['supervisor.close', 'paperWorker.close', 'socialWorker.close',
+  assert.deepEqual(calls, ['supervisor.close', 'paperWorker.close',
     'reconciler.close', 'worker.close', 'worker.diagnostic', 'heartbeat.stop:STOPPED']);
 });
 
@@ -525,11 +499,6 @@ function dependencies(calls: string[]): ListenerRuntimeDependencies {
     paperWorker: {
       async start() { calls.push('paperWorker.start'); },
       async close() { calls.push('paperWorker.close'); },
-      state: () => 'RUNNING',
-    },
-    socialWorker: {
-      async start() { calls.push('socialWorker.start'); },
-      async close() { calls.push('socialWorker.close'); },
       state: () => 'RUNNING',
     },
     reconciler: {

@@ -8,9 +8,7 @@ import {
 import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { DomainEvent } from '../src/domain/events.js';
 import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
-import type { CreatorProfile, HolderDistribution } from '../src/domain/participant-analytics.js';
 import type { QuoteAsset } from '../src/domain/types.js';
-import type { WalletGraphAnalysis } from '../src/domain/wallet-graph.js';
 import {
   registerTrustedTerminalAttribution,
   trustedTerminalAttribution,
@@ -57,40 +55,31 @@ void test('keeps the canonical projection exactly replayable when the repository
   assert.deepEqual(repository.replacements[1], repository.replacements[0]);
 });
 
-void test('rebuilds holder then graph buy progression as sequential canonical updates', async () => {
-  const holder = holderDistribution();
+void test('rebuilds a creator-sell progression as sequential canonical updates', async () => {
   const repository = new ProgressionRepository([
-    { label: 'holder', input: snapshot({ holderSnapshot: holder }) },
-    { label: 'graph', input: snapshot({ holderSnapshot: holder, walletGraph: walletGraph() }) },
+    { label: 'unsold', input: snapshot({ creatorHasSold: false }) },
+    { label: 'sold', input: snapshot({ creatorHasSold: true }) },
   ]);
   const projectionService = service(repository, ['SOL']);
 
-  const holderResult = await projectionService.rebuild('MINT');
-  const graphResult = await projectionService.rebuild('MINT');
+  const unsoldResult = await projectionService.rebuild('MINT');
+  const soldResult = await projectionService.rebuild('MINT');
 
   assert.deepEqual(repository.trace, [
-    'load:holder', 'replace:holder', 'load:graph', 'replace:graph',
+    'load:unsold', 'replace:unsold', 'load:sold', 'replace:sold',
   ]);
-  assert.equal(holderResult.kind, 'UPDATED');
-  assert.equal(graphResult.kind, 'UPDATED');
-  assert.ok(holderResult.projection);
-  assert.ok(graphResult.projection);
-  const holderFacts = holderResult.projection.evaluation.calibrationFacts;
-  const graphFacts = graphResult.projection.evaluation.calibrationFacts;
-  assert.ok(holderFacts);
-  assert.ok(graphFacts);
-  assert.equal(holderResult.projection.evaluation.signals.externalBuyersObserved, true);
-  assert.equal(holderFacts.maximumRelatedClusterBps, null);
-  assert.equal(graphFacts.maximumRelatedClusterBps, 2_500n);
-  assert.notEqual(graphResult.projection.evidenceFingerprint, holderResult.projection.evidenceFingerprint);
-  assert.notEqual(graphResult.projection.reportId, holderResult.projection.reportId);
+  assert.equal(unsoldResult.kind, 'UPDATED');
+  assert.equal(soldResult.kind, 'UPDATED');
+  assert.ok(unsoldResult.projection);
+  assert.ok(soldResult.projection);
+  assert.equal(unsoldResult.projection.evaluation.signals.creatorHasNotSold, true);
+  assert.equal(soldResult.projection.evaluation.signals.creatorHasNotSold, false);
+  assert.notEqual(soldResult.projection.evidenceFingerprint, unsoldResult.projection.evidenceFingerprint);
+  assert.notEqual(soldResult.projection.reportId, unsoldResult.projection.reportId);
 });
 
-void test('rejects a creator first-sell profile with CREATOR_EARLY_SELL', async () => {
-  const creatorProfile = soldCreatorProfile();
-  assert.equal(creatorProfile.hasSold, true);
-  assert.equal(creatorProfile.firstSell?.tradeId, 'creator-sell');
-  const repository = new FakeRepository(snapshot({ creatorProfile, creatorHasSold: true }), ['UPDATED']);
+void test('rejects a creator sell with CREATOR_EARLY_SELL', async () => {
+  const repository = new FakeRepository(snapshot({ creatorHasSold: true }), ['UPDATED']);
 
   const result = await service(repository, ['SOL']).rebuild('MINT');
 
@@ -522,8 +511,7 @@ function snapshot(
   });
   return Object.freeze({
     mint: 'MINT', asOfEvent, asOfRawEventId: 'raw_source', launch: launch([quoteAsset('SOL')]),
-    metadata: null, social: null, creatorProfile: null, creatorHasSold: false,
-    holderSnapshot: null, walletGraph: null,
+    metadata: null, creatorHasSold: false,
     ...overrides,
   });
 }
@@ -554,67 +542,6 @@ function quote(
   return Object.freeze({
     id,inputMint,outputMint,amountInRaw,amountOutRaw,minimumAmountOutRaw,
     feesRaw:1n,slippageBps:100n,priceImpactBps:10n,observedAtMs:1_000,observedSlot:10n,
-  });
-}
-
-function holderDistribution(): HolderDistribution {
-  return Object.freeze({
-    mint: 'MINT', creator: 'creator', payloadVersion: 1,
-    inputFingerprint: 'a'.repeat(64), positions: Object.freeze([]),
-    totalPositiveNetBaseRaw: 4n, top1Bps: 2_500n, top5Bps: 5_000n,
-    top10Bps: 5_000n, creatorBps: 0n, uniqueKnownBuyers: 2,
-    uniqueExternalBuyers: 2, positivePositionCount: 2, unknownTraderTradeCount: 0,
-  });
-}
-
-function walletGraph(): WalletGraphAnalysis {
-  return Object.freeze({
-    relationships: Object.freeze([]),
-    clusters: Object.freeze([Object.freeze({
-      id: 'cluster', mint: 'MINT', members: Object.freeze([
-        Object.freeze({
-          wallet: 'buyer-a', role: 'PARTICIPANT' as const, isCreator: false,
-          observedNetBaseRaw: 3n,
-        }),
-        Object.freeze({
-          wallet: 'buyer-b', role: 'PARTICIPANT' as const, isCreator: false,
-          observedNetBaseRaw: 1n,
-        }),
-      ]),
-      participantWalletCount: 2, auxiliaryWalletCount: 0, positiveHolderCount: 2,
-      observedPositiveBaseRaw: 4n, concentrationBps: 2_500n, containsCreator: false,
-      sharedFunderCount: 1, strongRelationshipCount: 1, strongEvidenceCount: 1,
-      quoteAssets: Object.freeze([]),
-    })]),
-    coverage: Object.freeze({
-      knownBuyCount: 2, knownBuyerCount: 2,
-      strongEvidenceBuyCount: 2, strongEvidenceBuyerCount: 2,
-      mediumOnlyBuyCount: 0, mediumOnlyBuyerCount: 0,
-      noEvidenceBuyCount: 0, noEvidenceBuyerCount: 0,
-      unavailableBuyCount: 0, unavailableBuyerCount: 0,
-      notProcessedBuyCount: 0, notProcessedBuyerCount: 0,
-      analyzedTransactionCount: 1, evidenceCount: 1,
-    }),
-  });
-}
-
-function soldCreatorProfile(): CreatorProfile {
-  const quote = quoteAsset('SOL');
-  return Object.freeze({
-    mint: 'MINT', creator: 'creator', payloadVersion: 1,
-    inputFingerprint: 'b'.repeat(64), buyCount: 1, sellCount: 1,
-    totalBoughtBaseRaw: 10n, totalSoldBaseRaw: 2n, observedNetBaseRaw: 8n,
-    hasSold: true,
-    firstSell: Object.freeze({
-      eventId: 'creator-sell-event', tradeId: 'creator-sell',
-      signature: 'creator-sell-signature', cursor: Object.freeze({
-        slot: 11n, transactionIndex: 0, instructionIndex: 2,
-        innerInstructionIndex: null,
-      }),
-      baseAmountRaw: 2n, quoteAmountRaw: 1n, quoteAsset: quote,
-    }),
-    initialBuys: Object.freeze([]), quoteFlows: Object.freeze([]),
-    uniqueExternalBuyers: 1, unknownTraderTradeCount: 0,
   });
 }
 

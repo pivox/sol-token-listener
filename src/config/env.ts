@@ -88,14 +88,6 @@ export interface AppConfig {
   readonly listenerBlockHydrationConfirmedTtlMs: number;
   readonly listenerBlockHydrationFinalizedTtlMs: number;
   readonly listenerBlockHydrationFetchIntervalMs: number;
-  readonly socialHttpTimeoutMs: number;
-  readonly socialHttpMaxBytes: number;
-  readonly socialHttpMaxRedirects: number;
-  readonly socialHttpConcurrency: number;
-  readonly socialWorkerPollMs: number;
-  readonly socialWorkerLeaseSeconds: number;
-  readonly socialRetryMaxAttempts: number;
-  readonly socialRetryBaseDelayMs: number;
   readonly raydiumCpmmProgramId: string;
   readonly wsolMint: string;
   readonly buyAmountLamports: bigint;
@@ -392,30 +384,6 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       environment.LISTENER_SHUTDOWN_TIMEOUT_MS, 30_000, 'LISTENER_SHUTDOWN_TIMEOUT_MS', 1_000, 120_000,
     ),
     ...blockHydration,
-    socialHttpTimeoutMs: parseCanonicalBoundedInteger(
-      environment.SOCIAL_HTTP_TIMEOUT_MS, 5_000, 'SOCIAL_HTTP_TIMEOUT_MS', 100, 30_000,
-    ),
-    socialHttpMaxBytes: parseCanonicalBoundedInteger(
-      environment.SOCIAL_HTTP_MAX_BYTES, 262_144, 'SOCIAL_HTTP_MAX_BYTES', 1_024, 1_048_576,
-    ),
-    socialHttpMaxRedirects: parseCanonicalBoundedInteger(
-      environment.SOCIAL_HTTP_MAX_REDIRECTS, 3, 'SOCIAL_HTTP_MAX_REDIRECTS', 0, 10,
-    ),
-    socialHttpConcurrency: parseCanonicalBoundedInteger(
-      environment.SOCIAL_HTTP_CONCURRENCY, 2, 'SOCIAL_HTTP_CONCURRENCY', 1, 8,
-    ),
-    socialWorkerPollMs: parseCanonicalBoundedInteger(
-      environment.SOCIAL_WORKER_POLL_MS, 1_000, 'SOCIAL_WORKER_POLL_MS', 100, 60_000,
-    ),
-    socialWorkerLeaseSeconds: parseCanonicalBoundedInteger(
-      environment.SOCIAL_WORKER_LEASE_SECONDS, 30, 'SOCIAL_WORKER_LEASE_SECONDS', 5, 300,
-    ),
-    socialRetryMaxAttempts: parseCanonicalBoundedInteger(
-      environment.SOCIAL_RETRY_MAX_ATTEMPTS, 3, 'SOCIAL_RETRY_MAX_ATTEMPTS', 1, 10,
-    ),
-    socialRetryBaseDelayMs: parseCanonicalBoundedInteger(
-      environment.SOCIAL_RETRY_BASE_DELAY_MS, 1_000, 'SOCIAL_RETRY_BASE_DELAY_MS', 100, 60_000,
-    ),
     raydiumCpmmProgramId: optional(environment.RAYDIUM_CPMM_PROGRAM_ID, DEFAULT_RAYDIUM_CPMM_PROGRAM_ID),
     wsolMint,
     buyAmountLamports: parseSolToLamports(environment.BUY_AMOUNT_SOL, '0.01', 'BUY_AMOUNT_SOL'),
