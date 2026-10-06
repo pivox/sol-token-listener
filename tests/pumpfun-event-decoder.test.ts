@@ -179,9 +179,22 @@ void test('échoue explicitement sur un suffixe d’événement connu incomplet'
   );
 });
 
-void test('refuse les octets finaux sans schéma officiel', () => {
-  for (const trailing of [Uint8Array.of(0xaa, 0xbb), new Uint8Array(8),
-    Uint8Array.of(0x2b, 0xea, 0x10, 0, 0, 0, 0, 0)]) {
+void test('décode TradeEvent avec le suffixe observé de 24 octets sans interpréter les 8 derniers', () => {
+  for (const opaque of [new Uint8Array(8), Uint8Array.of(0x2b, 0xea, 0x10, 0, 0, 0, 0, 0)]) {
+    const decoded = decodePumpCpiEvent(tradeEventInstruction(opaque));
+
+    assert.ok(decoded);
+    assert.equal(decoded.kind, 'TRADE');
+    assert.equal(decoded.event.tokenAmount, 9_007_199_254_740_993n);
+    assert.equal(decoded.event.quoteAmount, 250_000_001n);
+    assert.equal(decoded.event.holderRewardsBps, 30n);
+    assert.equal(decoded.event.holderRewards, 750_000n);
+  }
+});
+
+void test('refuse les autres octets finaux sans schéma officiel', () => {
+  for (const trailing of [Uint8Array.of(0xaa, 0xbb), new Uint8Array(7), new Uint8Array(9),
+    new Uint8Array(16)]) {
     assert.throws(
       () => decodePumpCpiEvent(tradeEventInstruction(trailing)),
       (error: unknown) =>
