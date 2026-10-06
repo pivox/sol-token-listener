@@ -281,6 +281,7 @@ export function createProductionListenerRuntime(
     RPC_PROVIDER_IDS.slice(0, config.httpRpcFallbackUrls.length + 1),
   );
   const ingestionPrograms = listenerIngestionPrograms(config.listenerIngestionScope);
+  const createsOnly = config.listenerIngestionScope === 'creates-only';
   const databasePool = pool ?? getDatabasePool();
   const recorder = createRpcHttpEvidenceRecorder();
   const roleRecorder = createRpcHttpRoleEvidenceRecorder();
@@ -444,7 +445,7 @@ export function createProductionListenerRuntime(
         return source.verifyGenesis(signal);
       },
       prepareInitialFrontier: async (providerId, signal): Promise<void> => {
-        if (config.listenerCatchUpPolicy !== 'live-edge') return;
+        if (createsOnly || config.listenerCatchUpPolicy !== 'live-edge') return;
         const source = pinnedCatchUpSources.get(providerId);
         if (source === undefined) {
           throw new TypeError('Provider-pinned catch-up source is unavailable.');
@@ -466,9 +467,17 @@ export function createProductionListenerRuntime(
         {
           programs: ingestionPrograms,
           workerAdmissionEnabled: workerAdmissionPolicy.enabled,
+          createsOnly,
         },
       ),
       runStrictScan: (providerId, signal): ReturnType<StrictCatchUpCoordinator['run']> => {
+        // A missed create is a lost opportunity, not a gap to repair.
+        if (createsOnly) {
+          return Promise.resolve(Object.freeze({
+            providerId, discoveredCount: 0, enqueuedCount: 0, checkpointCasCount: 0, pageCount: 0,
+            boundaries: Object.freeze({ launchpad: null, market: null }),
+          }));
+        }
         const coordinator = strictCoordinators.get(providerId);
         if (coordinator === undefined) {
           return Promise.reject(new TypeError('Strict catch-up coordinator is unavailable.'));
