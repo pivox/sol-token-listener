@@ -60,120 +60,6 @@ export const launchSummary = {
   paperStrategy,
 } as const;
 
-export const socialUnavailable = {
-  status: 'NOT_AVAILABLE',
-  links: [],
-  evidence: [],
-} as const;
-
-export const socialAvailable = {
-  status: 'AVAILABLE',
-  collectionStatus: 'PARTIAL',
-  collectionId: 'social_collection_a',
-  metadataSnapshotId: 'pumpfun_metadata_a',
-  observedAt: NOW,
-  linkCount: 1,
-  linksTruncated: false,
-  links: [{
-    id: 'social_link_a',
-    kind: 'WEBSITE',
-    declaredValueSha256: 'd'.repeat(64),
-    syntaxStatus: 'VALID',
-    canonicalUrl: 'https://project.example/',
-    invalidReason: null,
-    observedAt: NOW,
-  }],
-  evidenceCount: 1,
-  evidenceTruncated: false,
-  evidence: [{
-    id: 'social_evidence_a',
-    type: 'URL_REACHABLE',
-    outcome: 'CONFIRMED',
-    subjectKind: 'WEBSITE',
-    relatedKind: null,
-    subjectUrl: 'https://project.example/',
-    finalUrl: 'https://project.example/',
-    httpStatus: 200,
-    redirectCount: 0,
-    contentSha256: 'e'.repeat(64),
-    reasonCode: 'HTTP_2XX',
-    observedAt: NOW,
-  }],
-  coverage: {
-    declaredLinkCount: 1,
-    inspectedLinkCount: 1,
-    confirmedEvidenceCount: 1,
-    rejectedEvidenceCount: 0,
-    unknownEvidenceCount: 0,
-  },
-} as const;
-
-export const holdersUnavailable = {
-  status: 'NOT_AVAILABLE',
-  snapshots: [],
-  positions: [],
-  clusters: [],
-  clusterAnalysisStatus: 'NOT_AVAILABLE',
-} as const;
-
-export const holdersAvailable = {
-  status: 'AVAILABLE',
-  methodology: 'OBSERVED_BONDING_CURVE_TRADES',
-  creatorProfile: {
-    mint: MINT,
-    creator: MINT,
-    buyCount: 1,
-    sellCount: 0,
-    totalBoughtBaseRaw: '1000000',
-    totalSoldBaseRaw: '0',
-    observedNetBaseRaw: '1000000',
-    hasSold: false,
-    firstSell: null,
-    initialBuys: [],
-    quoteFlows: [{
-      quoteAsset: { mint: QUOTE_MINT, decimals: 9, tokenProgram: 'SPL_TOKEN' },
-      boughtQuoteRaw: '100000000',
-      soldQuoteRaw: '0',
-    }],
-    uniqueExternalBuyers: 8,
-    unknownTraderTradeCount: 0,
-  },
-  latestSnapshot: {
-    id: 'holder-snapshot-a',
-    inputFingerprint: 'f'.repeat(64),
-    observedAt: NOW,
-    confirmationStatus: 'confirmed',
-    cursor: {
-      slot: '100', transactionIndex: '0', instructionIndex: '1', innerInstructionIndex: null,
-    },
-    totalPositiveNetBaseRaw: '2000000',
-    top1Bps: '1200',
-    top5Bps: '4200',
-    top10Bps: '6500',
-    creatorBps: '500',
-    uniqueKnownBuyers: 9,
-    uniqueExternalBuyers: 8,
-    positivePositionCount: 9,
-    unknownTraderTradeCount: 0,
-  },
-  snapshots: [],
-  positions: [],
-  clusterAnalysisStatus: 'AVAILABLE',
-  clusterMethodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-  clusterCoverage: {
-    knownBuyCount: 8, knownBuyerCount: 8,
-    strongEvidenceBuyCount: 2, strongEvidenceBuyerCount: 2,
-    mediumOnlyBuyCount: 1, mediumOnlyBuyerCount: 1,
-    noEvidenceBuyCount: 5, noEvidenceBuyerCount: 5,
-    unavailableBuyCount: 0, unavailableBuyerCount: 0,
-    notProcessedBuyCount: 0, notProcessedBuyerCount: 0,
-    analyzedTransactionCount: 8, evidenceCount: 3,
-  },
-  clusterCount: 0,
-  clustersTruncated: false,
-  clusters: [],
-} as const;
-
 export const launchDetail = {
   ...launchSummary,
   creator: MINT,
@@ -184,8 +70,6 @@ export const launchDetail = {
   reserveBase: '2000000',
   reserveQuote: '200000000',
   feeBps: '100',
-  social: socialAvailable,
-  holders: holdersAvailable,
 } as const;
 
 export const qualification = {
@@ -267,10 +151,9 @@ export const health = {
   postgresql: { status: 'AVAILABLE' },
   http: { status: 'AVAILABLE' },
   pipeline: {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', qualification: 'RUNNING', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', qualification: 'RUNNING',
   },
   qualification: { currentCount: 2, lastSuccessAt: null },
-  socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
   paperDecisionJobs: {
     pendingCount: 1, leasedCount: 0, retryableFailedCount: 1, exhaustedCount: 0,
     lastSuccessAt: NOW, lastErrorCode: 'QUOTE_UNAVAILABLE',

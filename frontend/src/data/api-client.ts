@@ -2,22 +2,18 @@ import type { z } from 'zod';
 import {
   apiFailureSchema,
   apiHealthEnvelopeSchema,
-  apiHoldersEnvelopeSchema,
   apiLaunchDetailEnvelopeSchema,
   apiLaunchListEnvelopeSchema,
   apiPaperPositionListEnvelopeSchema,
   apiQualificationEnvelopeSchema,
-  apiSocialEnvelopeSchema,
   apiTimelineEnvelopeSchema,
 } from './api-schemas.js';
 import type {
   ApiHealth,
-  ApiHolders,
   ApiLaunchDetail,
   ApiLaunchSummary,
   ApiPaperPosition,
   ApiQualification,
-  ApiSocial,
   ApiTimelineEntry,
 } from './api-schemas.js';
 import { ApiContractError, ApiHttpError, ApiNetworkError } from './api-errors.js';
@@ -48,8 +44,6 @@ export interface ApiClient {
   getLaunch(mint: string, input?: RequestInput): Promise<ApiLaunchDetail>;
   listLaunchEvents(mint: string, input?: PageInput): Promise<ApiPage<ApiTimelineEntry>>;
   getLaunchRisk(mint: string, input?: RequestInput): Promise<ApiQualification | null>;
-  getLaunchSocial(mint: string, input?: RequestInput): Promise<ApiSocial>;
-  getLaunchHolders(mint: string, input?: RequestInput): Promise<ApiHolders>;
   listPaperPositions(input?: PageInput): Promise<ApiPage<ApiPaperPosition>>;
   getHealth(input?: RequestInput): Promise<ApiHealth>;
 }
@@ -169,12 +163,6 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
     },
     async getLaunchRisk(mint: string, input: RequestInput = {}): Promise<ApiQualification | null> {
       return (await request(mintRoute(mint, '/risk'), apiQualificationEnvelopeSchema, input.signal)).data;
-    },
-    async getLaunchSocial(mint: string, input: RequestInput = {}): Promise<ApiSocial> {
-      return (await request(mintRoute(mint, '/social'), apiSocialEnvelopeSchema, input.signal)).data;
-    },
-    async getLaunchHolders(mint: string, input: RequestInput = {}): Promise<ApiHolders> {
-      return (await request(mintRoute(mint, '/holders'), apiHoldersEnvelopeSchema, input.signal)).data;
     },
     async listPaperPositions(input: PageInput = {}): Promise<ApiPage<ApiPaperPosition>> {
       const envelope = await request(pageRoute('/api/v1/paper-positions', input), apiPaperPositionListEnvelopeSchema, input.signal);

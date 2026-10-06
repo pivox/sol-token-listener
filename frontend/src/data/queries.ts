@@ -9,12 +9,10 @@ import type { ApiClient, ApiPage, PageInput } from './api-client.js';
 import type { OperatorClient, OperatorOverviewPage } from './operator-client.js';
 import type {
   ApiHealth,
-  ApiHolders,
   ApiLaunchDetail,
   ApiLaunchSummary,
   ApiPaperPosition,
   ApiQualification,
-  ApiSocial,
   ApiTimelineEntry,
 } from './api-schemas.js';
 import { ApiHttpError, ApiNetworkError } from './api-errors.js';
@@ -93,28 +91,6 @@ export function riskQuery(
   return queryOptions({
     queryKey: queryKeys.risk(mint),
     queryFn: async ({ signal }) => await client.getLaunchRisk(mint, { signal }),
-    ...retryOptions,
-  });
-}
-
-export function socialQuery(
-  client: ApiClient,
-  mint: string,
-): StandardOptions<ApiSocial, ReturnType<typeof queryKeys.social>> {
-  return queryOptions({
-    queryKey: queryKeys.social(mint),
-    queryFn: async ({ signal }) => await client.getLaunchSocial(mint, { signal }),
-    ...retryOptions,
-  });
-}
-
-export function holdersQuery(
-  client: ApiClient,
-  mint: string,
-): StandardOptions<ApiHolders, ReturnType<typeof queryKeys.holders>> {
-  return queryOptions({
-    queryKey: queryKeys.holders(mint),
-    queryFn: async ({ signal }) => await client.getLaunchHolders(mint, { signal }),
     ...retryOptions,
   });
 }

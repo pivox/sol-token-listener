@@ -95,12 +95,10 @@ describe('two-group frontend evidence', () => {
 import {
   apiFailureSchema,
   apiHealthEnvelopeSchema,
-  apiHoldersEnvelopeSchema,
   apiLaunchDetailEnvelopeSchema,
   apiLaunchListEnvelopeSchema,
   apiPaperPositionListEnvelopeSchema,
   apiQualificationEnvelopeSchema,
-  apiSocialEnvelopeSchema,
   apiSseEventSchema,
   apiTimelineEnvelopeSchema,
   domainEventTypeSchema,
@@ -108,14 +106,10 @@ import {
 import {
   firstProcessingCanary,
   health,
-  holdersAvailable,
-  holdersUnavailable,
   launchDetail,
   launchSummary,
   paperPosition,
   qualification,
-  socialAvailable,
-  socialUnavailable,
   sseEvent,
   success,
   timelineEntry,
@@ -318,12 +312,10 @@ describe('frontend-owned API V1 schemas', () => {
   it('accepts every complete public projection fixture', () => {
     expect(apiLaunchListEnvelopeSchema.parse(success([launchSummary], 'cursor-a')).data).toHaveLength(1);
     expect(apiLaunchDetailEnvelopeSchema.parse(success(launchDetail)).data.mint).toBe(launchDetail.mint);
+    expect(launchDetail).not.toHaveProperty('social');
+    expect(launchDetail).not.toHaveProperty('holders');
     expect(apiTimelineEnvelopeSchema.parse(success([timelineEntry])).data[0]?.type).toBe('QualificationUpdated');
     expect(apiQualificationEnvelopeSchema.parse(success(qualification)).data?.verdict).toBe('REJECTED');
-    expect(apiSocialEnvelopeSchema.parse(success(socialAvailable)).data.status).toBe('AVAILABLE');
-    expect(apiSocialEnvelopeSchema.parse(success(socialUnavailable)).data.status).toBe('NOT_AVAILABLE');
-    expect(apiHoldersEnvelopeSchema.parse(success(holdersAvailable)).data.status).toBe('AVAILABLE');
-    expect(apiHoldersEnvelopeSchema.parse(success(holdersUnavailable)).data.status).toBe('NOT_AVAILABLE');
     expect(apiPaperPositionListEnvelopeSchema.parse(success([paperPosition])).data[0]?.status).toBe('PAPER_CLOSED');
     expect(apiHealthEnvelopeSchema.parse(success(health)).data.status).toBe('DEGRADED');
     expect(apiSseEventSchema.parse(sseEvent).eventId).toBe(sseEvent.eventId);
@@ -368,8 +360,6 @@ describe('frontend-owned API V1 schemas', () => {
 
   it('rejects malformed timestamps, discriminators, and unknown enums', () => {
     expect(() => apiLaunchListEnvelopeSchema.parse(success([{ ...launchSummary, detectedAt: 'today' }]))).toThrow();
-    expect(() => apiSocialEnvelopeSchema.parse(success({ status: 'NOT_AVAILABLE', links: [{}], evidence: [] }))).toThrow();
-    expect(() => apiHoldersEnvelopeSchema.parse(success({ ...holdersUnavailable, status: 'EMPTY' }))).toThrow();
     expect(() => apiSseEventSchema.parse({ ...sseEvent, confirmationStatus: 'trusted' })).toThrow();
   });
 

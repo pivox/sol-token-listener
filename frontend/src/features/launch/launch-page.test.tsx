@@ -4,19 +4,15 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  holdersAvailable,
   launchDetail,
   qualification,
-  socialUnavailable,
   success,
   timelineEntry,
 } from '../../../tests/fixtures/api.js';
 import type { ApiClient } from '../../data/api-client.js';
 import {
-  apiHoldersEnvelopeSchema,
   apiLaunchDetailEnvelopeSchema,
   apiQualificationEnvelopeSchema,
-  apiSocialEnvelopeSchema,
   apiTimelineEnvelopeSchema,
 } from '../../data/api-schemas.js';
 import { ApiClientProvider } from '../../data/api-provider.js';
@@ -24,8 +20,6 @@ import { LaunchPage } from './launch-page.js';
 
 const detail = apiLaunchDetailEnvelopeSchema.parse(success(launchDetail)).data;
 const risk = apiQualificationEnvelopeSchema.parse(success(qualification)).data;
-const socialMissing = apiSocialEnvelopeSchema.parse(success(socialUnavailable)).data;
-const holders = apiHoldersEnvelopeSchema.parse(success(holdersAvailable)).data;
 const orphanedEvent = apiTimelineEnvelopeSchema.parse(success([{
   ...timelineEntry,
   confirmationStatus: 'orphaned',
@@ -39,8 +33,6 @@ function client(overrides: Partial<ApiClient> = {}): ApiClient {
     getLaunch: async () => detail,
     listLaunchEvents: async () => ({ items: [orphanedEvent], nextCursor: null }),
     getLaunchRisk: async () => risk,
-    getLaunchSocial: async () => socialMissing,
-    getLaunchHolders: async () => holders,
     listPaperPositions: unavailable,
     getHealth: unavailable,
     ...overrides,
@@ -93,14 +85,16 @@ describe('launch detail route', () => {
     expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', timeline.id);
   });
 
-  it('renders unavailable social evidence, observed holder methodology, and escaped orphan diagnostics', async () => {
-    const user = userEvent.setup();
-    renderPage(client(), `/launches/${detail.mint}?tab=social`);
-    expect(await screen.findByText('Preuves sociales indisponibles')).toBeVisible();
-    await user.click(screen.getByRole('tab', { name: 'Détenteurs' }));
-    expect(await screen.findByText(/données observées sur la bonding curve/i)).toBeVisible();
-    expect(screen.getByLabelText('Acheteurs externes uniques : 8')).toBeVisible();
-    await user.click(screen.getByRole('tab', { name: 'Timeline' }));
+  it('shows exactly the overview, timeline and risk tabs', async () => {
+    renderPage(client(), `/launches/${detail.mint}`);
+    await screen.findByRole('tab', { name: 'Aperçu' });
+    expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Aperçu', 'Timeline', 'Risque']);
+    expect(screen.queryByRole('tab', { name: 'Social' })).toBeNull();
+    expect(screen.queryByRole('tab', { name: 'Détenteurs' })).toBeNull();
+  });
+
+  it('renders escaped orphan diagnostics in the timeline', async () => {
+    renderPage(client(), `/launches/${detail.mint}?tab=timeline`);
     expect(await screen.findByText('orphaned')).toBeVisible();
     const diagnostic = screen.getByText(/<script>alert/);
     expect(diagnostic.tagName).toBe('PRE');
