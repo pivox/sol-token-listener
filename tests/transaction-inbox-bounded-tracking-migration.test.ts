@@ -49,7 +49,7 @@ void test('056 installs from empty, upgrades from 055 and replays without replac
   async (context) => {
     await withSchema(context, async (pool) => {
       const applied = await migrateDatabase({ pool });
-      assert.equal(applied.length, 59);
+      assert.equal(applied.length, 60);
       assert.equal(applied.at(-1), '060_listener_tracked_pool_checkpoints.sql');
       assert.deepEqual(await migrateDatabase({ pool }), []);
       const identities = await objectIdentities(pool);
