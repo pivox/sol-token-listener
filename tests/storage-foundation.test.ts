@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createRepositoryId } from '../src/storage/repositories.js';
+import { createRepositoryId } from '../src/storage/repository-id.js';
 import {
   canonicalStringifyJson,
   MAX_SERIALIZED_BIGINT_DIGITS,

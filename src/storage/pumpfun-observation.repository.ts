@@ -6,7 +6,7 @@ import type {
 } from '../domain/pumpfun-observation.js';
 import { toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
-import { createRepositoryId } from './repositories.js';
+import { createRepositoryId } from './repository-id.js';
 
 interface Queryable {
   query<R extends QueryResultRow = QueryResultRow>(
