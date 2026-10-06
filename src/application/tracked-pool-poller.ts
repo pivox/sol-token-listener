@@ -14,17 +14,15 @@ import {
 const PAGE_SIZE = 1_000;
 const MAX_PAGES = 5;
 const SWEEP_TIMEOUT_MS = 30_000;
-const MAX_BACKOFF_CYCLES = 64;
 
-export type TrackedPoolOutcome = 'SUCCEEDED' | 'AWAITING_BOUNDARY' | 'WINDOW_EXCEEDED' | 'FAILED';
+export type TrackedPoolOutcome = 'SUCCEEDED' | 'AWAITING_BOUNDARY' | 'GAP_SKIPPED' | 'FAILED';
 
 export interface TrackedPoolCycleReport {
   readonly tracked: number;
   readonly capReached: boolean;
   readonly succeeded: number;
   readonly awaitingBoundary: number;
-  readonly windowExceeded: number;
-  readonly backingOff: number;
+  readonly gapSkipped: number;
   readonly failed: number;
   readonly enqueued: number;
   readonly durationMs: number;
@@ -37,6 +35,8 @@ export interface TrackedPoolReport {
   readonly outcome: TrackedPoolOutcome;
   readonly pageCount: number;
   readonly signaturesRead: number;
+  /** Oldest slot read when the page budget ran out before the checkpoint (GAP_SKIPPED). */
+  readonly gapClosedAtSlot: bigint | null;
   readonly errorName: string | null;
 }
 
@@ -68,13 +68,13 @@ interface PollResult {
   outcome: TrackedPoolOutcome;
   pageCount: number;
   signaturesRead: number;
+  gapClosedAtSlot: bigint | null;
   enqueued: number;
 }
 
 export class TrackedPoolPoller {
   private currentState: ListenerRuntimeState = 'STOPPED';
   private readonly now: () => number;
-  private readonly backoff = new Map<string, { streak: number; skip: number }>();
   private readonly lastOutcome = new Map<string, TrackedPoolOutcome>();
   private timer: unknown = null;
   private inFlight: Promise<void> | null = null;
@@ -137,8 +137,8 @@ export class TrackedPoolPoller {
   private async cycle(): Promise<void> {
     const startedAtMs = this.now();
     const report = {
-      tracked: 0, capReached: false, succeeded: 0, awaitingBoundary: 0, windowExceeded: 0,
-      backingOff: 0, failed: 0, enqueued: 0, durationMs: 0, errorName: null as string | null,
+      tracked: 0, capReached: false, succeeded: 0, awaitingBoundary: 0, gapSkipped: 0,
+      failed: 0, enqueued: 0, durationMs: 0, errorName: null as string | null,
     };
     try {
       const pools = await this.options.repository.listTrackedPools(this.options.trackingWindowSeconds);
@@ -146,17 +146,11 @@ export class TrackedPoolPoller {
       report.capReached = pools.length >= MAX_TRACKED_POOLS;
       for (const pool of pools) {
         if (this.closed) break;
-        const backoff = this.backoff.get(pool.poolAddress);
-        if (backoff !== undefined && backoff.skip > 0) {
-          backoff.skip -= 1;
-          report.backingOff += 1;
-          continue;
-        }
         const result = await this.pollWithTimeout(pool);
         report.enqueued += result.enqueued;
         if (result.outcome === 'SUCCEEDED') report.succeeded += 1;
         else if (result.outcome === 'AWAITING_BOUNDARY') report.awaitingBoundary += 1;
-        else if (result.outcome === 'WINDOW_EXCEEDED') report.windowExceeded += 1;
+        else if (result.outcome === 'GAP_SKIPPED') report.gapSkipped += 1;
         else report.failed += 1;
       }
     } catch (error) {
@@ -170,7 +164,9 @@ export class TrackedPoolPoller {
 
   private async pollWithTimeout(pool: TrackedPool): Promise<PollResult> {
     const deadline = { expired: false };
-    const progress: PollResult = { outcome: 'FAILED', pageCount: 0, signaturesRead: 0, enqueued: 0 };
+    const progress: PollResult = {
+      outcome: 'FAILED', pageCount: 0, signaturesRead: 0, gapClosedAtSlot: null, enqueued: 0,
+    };
     let error: unknown = null;
     try {
       const result = await withTimeout(
@@ -193,14 +189,6 @@ export class TrackedPoolPoller {
   }
 
   private recordOutcome(poolAddress: string, result: PollResult, error: unknown): void {
-    if (result.outcome === 'SUCCEEDED') this.backoff.delete(poolAddress);
-    if (result.outcome === 'WINDOW_EXCEEDED') {
-      const streak = (this.backoff.get(poolAddress)?.streak ?? 0) + 1;
-      this.backoff.set(poolAddress, {
-        streak,
-        skip: Math.min(2 ** (streak - 1), MAX_BACKOFF_CYCLES),
-      });
-    }
     const previous = this.lastOutcome.get(poolAddress);
     this.lastOutcome.set(poolAddress, result.outcome);
     if (result.outcome === 'SUCCEEDED' && previous === 'SUCCEEDED') return;
@@ -209,6 +197,7 @@ export class TrackedPoolPoller {
       outcome: result.outcome,
       pageCount: result.pageCount,
       signaturesRead: result.signaturesRead,
+      gapClosedAtSlot: result.gapClosedAtSlot,
       errorName: error === null ? null : errorName(error),
     }));
   }
@@ -268,7 +257,9 @@ export class TrackedPoolPoller {
     const confirmed = probe.length === 1
       && probe[0]?.signature === checkpoint.signature
       && probe[0].slot === checkpoint.slot;
-    if (!confirmed) return reachedEnd ? 'AWAITING_BOUNDARY' : 'WINDOW_EXCEEDED';
+    // Unconfirmed boundary: a short page waits for it; an exhausted page budget skips the gap and
+    // catches up to the live edge (enqueue what was read, checkpoint at the newest row).
+    if (!confirmed && reachedEnd) return 'AWAITING_BOUNDARY';
     for (const entry of rows) {
       if (deadline.expired) throw new Error('Tracked pool sweep timed out.');
       if (entry.transactionFailed) continue;
@@ -292,7 +283,9 @@ export class TrackedPoolPoller {
         this.now(),
       );
     }
-    return 'SUCCEEDED';
+    if (confirmed) return 'SUCCEEDED';
+    progress.gapClosedAtSlot = rows.at(-1)?.slot ?? null;
+    return 'GAP_SKIPPED';
   }
 }
 

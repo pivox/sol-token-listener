@@ -191,36 +191,45 @@ void test('an unconfirmed boundary enqueues nothing and reports awaitingBoundary
   assert.equal(h.poolReports[0]?.outcome, 'AWAITING_BOUNDARY');
 });
 
-void test('an exceeded window backs off 1, 2 then 4 cycles and resets after success', async () => {
-  let history = [...rows('w', 6_000, 100_000), row('cp', 1_000)];
+void test('an exhausted page budget with an unconfirmed boundary catches up to the live edge', async () => {
+  const history = [...rows('w', 6_000, 100_000), row('cp', 1_000)];
+  history[1] = { ...row('w-1', 99_999), err: { InstructionError: [0, 'Custom'] } };
   const h = harness([trackedPool(POOL_A, MINT_A)], {
     [POOL_A]: (options) => historyScript(history)(options),
   });
   h.checkpoints.set(POOL_A, { signature: 'cp', slot: 1_000n });
   await h.poller.start();
-  assert.equal(h.enqueued.length, 0);
-  assert.equal(h.cycles[0]?.windowExceeded, 1);
-  const outcomes: string[] = [];
-  for (let cycle = 0; cycle < 8; cycle += 1) {
-    await h.tick();
-    const report = h.cycles.at(-1);
-    outcomes.push(report?.backingOff === 1 ? 'skip' : report?.windowExceeded === 1 ? 'exceeded' : 'other');
-  }
-  assert.deepEqual(outcomes, [
-    'skip', 'exceeded', 'skip', 'skip', 'exceeded', 'skip', 'skip', 'skip',
-  ]);
-  history = [row('fresh', 200_000), row('cp', 1_000)];
+  assert.equal(h.calls.length, 6);
+  assert.equal(h.enqueued.length, 4_999);
+  assert.equal(h.enqueued.some((entry) => entry.signature === 'w-1'), false);
+  assert.deepEqual(h.stored, [{ pool: POOL_A, value: { signature: 'w-0', slot: 100_000n } }]);
+  assert.equal(h.cycles[0]?.gapSkipped, 1);
+  assert.equal(h.cycles[0]?.failed, 0);
+  assert.equal(h.cycles[0]?.enqueued, 4_999);
+  assert.equal(h.poller.state(), 'RUNNING');
+  assert.deepEqual(h.poolReports[0], {
+    poolAddress: POOL_A, outcome: 'GAP_SKIPPED', pageCount: 5, signaturesRead: 5_000,
+    gapClosedAtSlot: 95_001n, errorName: null,
+  });
+  history.unshift(row('fresh', 200_000));
   await h.tick();
-  assert.equal(h.cycles.at(-1)?.backingOff, 1);
-  await h.tick();
+  assert.equal(h.calls[6]?.options.until, 'w-0');
   assert.equal(h.cycles.at(-1)?.succeeded, 1);
-  history = [...rows('w2', 6_000, 300_000), row('fresh', 200_000)];
-  await h.tick();
-  assert.equal(h.cycles.at(-1)?.windowExceeded, 1);
-  await h.tick();
-  assert.equal(h.cycles.at(-1)?.backingOff, 1);
-  await h.tick();
-  assert.equal(h.cycles.at(-1)?.windowExceeded, 1, 'backoff restarted at one cycle');
+  assert.equal(h.cycles.at(-1)?.gapSkipped, 0);
+  assert.equal(h.enqueued.at(-1)?.signature, 'fresh');
+  assert.deepEqual(h.checkpoints.get(POOL_A), { signature: 'fresh', slot: 200_000n });
+});
+
+void test('an exhausted page budget with a confirmed boundary is a plain success', async () => {
+  const h = harness([trackedPool(POOL_A, MINT_A)], {
+    [POOL_A]: historyScript([...rows('s', 5_000, 10_000), row('cp', 1_000)]),
+  });
+  h.checkpoints.set(POOL_A, { signature: 'cp', slot: 1_000n });
+  await h.poller.start();
+  assert.equal(h.cycles[0]?.succeeded, 1);
+  assert.equal(h.cycles[0]?.gapSkipped, 0);
+  assert.equal(h.enqueued.length, 5_000);
+  assert.deepEqual(h.stored, [{ pool: POOL_A, value: { signature: 's-0', slot: 10_000n } }]);
 });
 
 void test('invalid pages fail the pool while other pools continue', async () => {
