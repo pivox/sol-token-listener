@@ -75,7 +75,7 @@ Nouvelle valeur de `LISTENER_INGESTION_SCOPE`, restart-only.
   `false`. Volume attendu : ~20 créations/min.
 - Les transactions `create` suivent le pipeline existant : `raw_chain_events`, `domain_events`
   (`TokenLaunchDetected`, et `BondingCurveTradeObserved` pour l'achat initial du créateur),
-  `token_launches`, `token_metadata_snapshots`.
+  `token_launches`, `state_transitions`.
 
 ### Pollers des mints suivis
 
@@ -97,7 +97,7 @@ Deux pollers, même mécanisme, toutes les 10 s, 5 pages max, sonde de frontièr
 - Le pipeline produit `BondingCurveTradeObserved` pour ces trades comme pour ceux du WebSocket ;
   l'inbox déduplique par signature.
 
-Migration **062** : table de checkpoints, élargissement du CHECK `ingestion_hint`.
+Migration **063** : table de checkpoints, élargissement du CHECK `ingestion_hint`.
 
 ### Entrée rapide
 
@@ -127,7 +127,7 @@ domain_events`, `create_slot NUMERIC(78,0)`, `create_block_time TIMESTAMPTZ NULL
 `round_trip_loss_bps INTEGER NULL`, `buy_quote JSONB NULL`, `reverse_quote JSONB NULL`,
 `intent_id TEXT NULL REFERENCES execution_intents`, `envelope_id TEXT NULL`, `purge_after`.
 
-Migration **063** : table `entry_decisions`, `FastEntryDecided` ajouté au CHECK des types de
+Migration **064** : table `entry_decisions`, `FastEntryDecided` ajouté au CHECK des types de
 `api_event_stream` (le trigger copie chaque événement de domaine dans le flux SSE).
 
 ### Enveloppe
@@ -151,7 +151,7 @@ jour dans la transaction de réconciliation SELL, à partir de la ligne
 `buys_armed = max_buys`, exposition ou perte au plafond → `EXHAUSTED`. `valid_until` dépassé →
 `EXPIRED`, constaté par la lane `arm`.
 
-Migration **064** : table d'enveloppes, colonnes `scope` et `envelope_id` de la qualification,
+Migration **065** : table d'enveloppes, colonnes `scope` et `envelope_id` de la qualification,
 `LiveExitDecided` ajouté au CHECK des types de `api_event_stream`.
 
 ### Lane `arm` (exécuteur live)
@@ -216,15 +216,31 @@ n'écrit (clé étrangère `043`, présomption forte par lecture du code).
 |---|---|
 | Code mort | `src/dashboard/`, `src/strategy/session-engine.ts`, `src/execution/trade-executor.ts`, `src/security/token-risk.service.ts`, `src/storage/repositories.ts`, `src/storage/ignored-asset.repository.ts`, `src/executor-live/confirmation-worker.ts`, `src/executor-live/reconciliation-worker.ts`, leurs tests ; tables `discovered_pools`, `token_sessions`, `swap_events`, `trades`, `token_risk_reports`, `listener_checkpoints`, `risk_settings`, `ignored_assets` |
 | Dossier | `src/social/`, worker d'enrichissement social, `HttpMetadataProvider` et vérification sociale, graphe de wallets (`wallet-graph-rebuild.service`, `wallet-graph.repository`, `wallet-evidence.repository`), analytics participants (`src/analytics/`, `participant-analytics.repository`), étapes correspondantes de `ObservedTransactionPipeline` (funding, participants, graphe), file `social_enrichment_jobs` dans `launchpad-event.repository`, signaux et conditions sociaux/holders/clusters de la qualification (profils réduits aux signaux techniques), `loadSnapshot` du paper allégé ; tables `social_*` (5), `creator_profiles`, `token_holders_snapshots`, `observed_wallet_positions`, `wallet_funding_observations`, `wallet_funding_evidence`, `wallet_graph_profiles`, `wallet_graph_snapshots`, `wallet_relationships`, `wallet_clusters`, `wallet_cluster_members` |
-| Sans lecteur | `launch_trades`, `state_transitions` |
+| Sans lecteur | `launch_trades` (écrit par `launchpad-event.repository`, lu seulement par les analytics participants) |
 | Harnais paper MVP | `src/cli/paper-mvp*`, `paper-mvp.repository`, tables `paper_mvp_runs`, `paper_mvp_position_samples` |
 
 `creatorHasNotSold` (profil technique) est recalculé depuis les `BondingCurveTradeObserved` du
-mint, et non plus depuis `creator_profiles`.
+mint, et non plus depuis `creator_profiles` ; la règle « profil créateur et snapshot holders
+présents ensemble » disparaît.
+
+Volontairement conservés, pour rester simple :
+
+- Signaux, conditions et codes de qualification, et les deux profils JSON tels quels : les signaux
+  sociaux, image et holders passent à « inconnu » faute de données. Éditer un profil change son
+  empreinte, et chaque profil doit lister les 14 codes.
+- Les types d'événements `SocialEvidenceCollected`, `CreatorProfileUpdated`,
+  `HolderDistributionUpdated`, `WalletClusterDetected` dans les enums (domaine, CHECK, front) : plus
+  rien ne les émet, et les retirer ferait échouer la lecture des lignes historiques.
+- Les noms d'étapes `funding_observation`, `participant_analytics`, `wallet_graph` de la taxonomie
+  du pipeline, pour les attributions historiques ; le pipeline ne les émet plus.
+- `state_transitions` : `market-observation.repository` le relit pour restaurer l'état d'un
+  lancement quand une migration est rétractée. Seule la Timeline de l'API cesse de le lire.
+- `token_metadata_snapshots` : son seul écrivain était le chemin social ; la table et sa lecture
+  par l'API restent, sans nouvelles lignes.
 
 Conservé : inbox et ses tables de correction, checkpoints, finalité, heartbeats, santé WebSocket,
 attributions terminales ; `raw_chain_events`, `domain_events`, `token_launches`,
-`token_metadata_snapshots`, `bonding_curve_snapshots` (non réparé ici), `market_pools`,
+`state_transitions`, `token_metadata_snapshots`, `bonding_curve_snapshots` (non réparé ici), `market_pools`,
 `migrations`, `market_trades`, `market_reserve_snapshots` ; tables paper et
 `qualification_reports` ; toutes les tables `execution_*` existantes, état et preuves, sans
 modification autre que celles décrites ci-dessus ; `api_event_stream` et le SSE.
@@ -294,11 +310,12 @@ Sortie tableau ou JSON, sans signature ni URL ni clé.
 
 ## Lots
 
-1. Suppressions : code mort (PR courte), puis dossier + API/front (PR mécanique).
-2. Ingestion `creates-only`, `TrackedCurvePoller`, `PUMPFUN_CURVE_TRADE`, migration 062.
-3. Entrée rapide, `entry_decisions`, `FastEntryDecided`, `ENTRY_MODE`, migration 063.
+1. Suppressions : code mort et harnais paper MVP (PR courte), puis dossier + API/front + migration
+   062 de suppression des tables (PR mécanique).
+2. Ingestion `creates-only`, `TrackedCurvePoller`, `PUMPFUN_CURVE_TRADE`, migration 063.
+3. Entrée rapide, `entry_decisions`, `FastEntryDecided`, `ENTRY_MODE`, migration 064.
 4. Exécuteur : enveloppe et CLI, qualification `ENVELOPE`, lane `arm`, lane `exit`, correction de
-   la clé étrangère de l'échéance, CLI `report`, migration 064.
+   la clé étrangère de l'échéance, CLI `report`, migration 065.
 5. Premier run réel, K = 1, enveloppe minimale (0,01 SOL par achat, 5 achats), puis bilan chiffré.
 
 ## Prérequis et hors périmètre
