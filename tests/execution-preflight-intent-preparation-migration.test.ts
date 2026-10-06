@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '042_execution_preflight_intent_preparation.sql';
-const migrationHeadName = '060_listener_tracked_pool_checkpoints.sql';
+const migrationHeadName = '061_execution_live_position_ledger.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 042 declares the bounded preparation-run authority', async () => {
