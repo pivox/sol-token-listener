@@ -71,6 +71,8 @@ export interface AppConfig {
   readonly listenerPumpFunCatchUpPageAdmissionEnabled: boolean;
   readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
+  readonly listenerTrackedPoolPollEnabled: boolean;
+  readonly listenerTrackedPoolPollIntervalMs: number;
   readonly expectedGenesisHash: string | null;
   readonly listenerWorkerCount: number;
   readonly listenerWorkerLeaseSeconds: number;
@@ -375,6 +377,12 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerPumpFunCatchUpPageAdmissionEnabled,
     listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,
+    listenerTrackedPoolPollEnabled: parseBoolean(
+      environment.LISTENER_TRACKED_POOL_POLL_ENABLED, false, 'LISTENER_TRACKED_POOL_POLL_ENABLED',
+    ),
+    listenerTrackedPoolPollIntervalMs: parseCanonicalBoundedInteger(
+      environment.LISTENER_TRACKED_POOL_POLL_INTERVAL_MS, 10_000, 'LISTENER_TRACKED_POOL_POLL_INTERVAL_MS', 5_000, 60_000,
+    ),
     expectedGenesisHash,
     listenerWorkerCount,
     listenerWorkerLeaseSeconds: parseInteger(

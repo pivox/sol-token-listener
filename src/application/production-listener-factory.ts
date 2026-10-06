@@ -104,6 +104,7 @@ import { PostgresPaperTradingRepository } from '../storage/paper-trading.reposit
 import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
 import { PostgresQualificationProjectionRepository } from '../storage/qualification-projection.repository.js';
 import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
+import { PostgresTrackedPoolRepository } from '../storage/tracked-pool.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWebSocketHealthRepository } from '../storage/websocket-health.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
@@ -139,6 +140,7 @@ import {
   TransactionInboxWorker,
   type TransactionInboxWorkerLocator,
 } from './transaction-inbox-worker.js';
+import { TrackedPoolPoller } from './tracked-pool-poller.js';
 import { TransactionInboxWorkerPool } from './transaction-inbox-worker-pool.js';
 import { ListenerRpcWorkGate, gateBlockTransactionRpc } from './listener-rpc-work-gate.js';
 import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
@@ -748,13 +750,38 @@ export function createProductionListenerRuntime(
     shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
     marketIngestionEnabled: config.listenerIngestionScope === 'launchpad-and-market',
   });
-  if (attemptBudget === undefined) return runtime;
+  const poller = config.listenerTrackedPoolPollEnabled
+    ? new TrackedPoolPoller({
+      repository: new PostgresTrackedPoolRepository(databasePool),
+      inbox,
+      rpc: {
+        getSignaturesForAddress: (address, { before, ...options }, commitment): Promise<unknown> => rpc.http.getSignaturesForAddress(
+          address,
+          before === undefined ? options : { ...options, before },
+          commitment,
+        ),
+      },
+      intervalMs: config.listenerTrackedPoolPollIntervalMs,
+      trackingWindowSeconds: config.listenerPumpFunTrackingWindowSeconds,
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+      scheduler: listenerScheduler,
+      onCycle: (report): void => {
+        logger.info({ event: 'listener.tracked_pool_poll_cycle', ...report }, 'Cycle de sondage des pools suivis terminé.');
+      },
+      onPool: (report): void => {
+        logger.warn({ event: 'listener.tracked_pool_poll_pool', ...report }, 'Pool suivi hors succès.');
+      },
+    })
+    : null;
+  if (poller === null && attemptBudget === undefined) return runtime;
   return Object.freeze({
     async start(): Promise<void> {
-      try { await runtime.start(); } catch (error) { attemptBudget.close(); throw error; }
+      try { await runtime.start(); } catch (error) { attemptBudget?.close(); throw error; }
+      try { await poller?.start(); } catch (error) { await runtime.close(); attemptBudget?.close(); throw error; }
     },
-    close(): Promise<void> {
-      attemptBudget.close();
+    async close(): Promise<void> {
+      await poller?.close();
+      attemptBudget?.close();
       return runtime.close();
     },
     state: () => runtime.state(),

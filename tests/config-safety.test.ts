@@ -97,6 +97,25 @@ void test('the Pump.fun tracking window rejects ambiguous values even while admi
   }
 });
 
+void test('the tracked pool poller is disabled by default with a bounded interval', () => {
+  const defaults = parseConfig(base);
+  assert.equal(defaults.listenerTrackedPoolPollEnabled, false);
+  assert.equal(defaults.listenerTrackedPoolPollIntervalMs, 10_000);
+  const enabled = parseConfig({
+    ...base,
+    LISTENER_TRACKED_POOL_POLL_ENABLED: 'true',
+    LISTENER_TRACKED_POOL_POLL_INTERVAL_MS: '15000',
+  });
+  assert.equal(enabled.listenerTrackedPoolPollEnabled, true);
+  assert.equal(enabled.listenerTrackedPoolPollIntervalMs, 15_000);
+  for (const value of ['4999', '60001']) {
+    assert.throws(
+      () => parseConfig({ ...base, LISTENER_TRACKED_POOL_POLL_INTERVAL_MS: value }),
+      /LISTENER_TRACKED_POOL_POLL_INTERVAL_MS/u,
+    );
+  }
+});
+
 void test('Pump.fun catch-up page admission is disabled by default', () => {
   assert.equal(parseConfig(base).listenerPumpFunCatchUpPageAdmissionEnabled, false);
   for (const value of ['TRUE', '1', ' true', 'true ', ' ', '']) {
