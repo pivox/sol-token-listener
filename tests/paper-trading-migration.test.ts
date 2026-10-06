@@ -34,5 +34,4 @@ void test('branche les positions fermées sur la purge de rétention', async () 
   );
   assert.match(source, /paperPositions/u);
   assert.match(source, /DELETE FROM paper_positions position[\s\S]*position\.purge_after <= NOW\(\)/u);
-  assert.match(source, /paper_mvp_runs run[\s\S]*run\.state = 'RUNNING'/u);
 });

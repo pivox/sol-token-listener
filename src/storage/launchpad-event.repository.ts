@@ -27,7 +27,7 @@ import {
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 import { FOUNDATION_RETENTION_SHARED_FENCE_SQL } from './foundation-retention-fence.js';
-import { createRepositoryId } from './repositories.js';
+import { createRepositoryId } from './repository-id.js';
 import {
   listWorkerTrackingMints,
   lockWorkerTrackingMints,

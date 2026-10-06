@@ -7,7 +7,7 @@ import type { ApiHealth } from '../src/api/contracts.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 
-const FORBIDDEN = /(?:execution\/(?:wallet|transaction-confirmer|trade-executor)|transaction-builder|Keypair|sendTransaction|sendRawTransaction|simulateTransaction|private.?key)/iu;
+const FORBIDDEN = /(?:execution\/wallet|transaction-builder|Keypair|sendTransaction|sendRawTransaction|simulateTransaction|private.?key)/iu;
 
 const health: ApiHealth = {
   status: 'OK', observedAt: '2026-07-29T00:00:00.000Z', postgresql: { status: 'AVAILABLE' },

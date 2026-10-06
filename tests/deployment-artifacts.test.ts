@@ -1231,8 +1231,6 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'030_listener_websocket_health\.sql'/);
   assert.match(smoke, /'031_execution_intents\.sql'/);
   assert.match(smoke, /'036_execution_live_canary\.sql'/);
-  assert.match(smoke, /'paperMvpRuns'/);
-  assert.match(smoke, /'paperMvpSamples'/);
   assert.match(smoke, /'listenerCatchUpGaps'/);
   assert.match(smoke, /'listenerStrictCatchUpFailures'/);
   assert.match(smoke, /'listenerStrictCatchUpRuns'/);

@@ -770,7 +770,6 @@ void test('process integration registers each child immediately and bounds TERM 
 
 void test('source and compiled live capability remains isolated in exact files', async () => {
   const expectedLiveFiles = [
-    'confirmation-worker',
     'config',
     'database',
     'execution-worker',
@@ -779,7 +778,6 @@ void test('source and compiled live capability remains isolated in exact files',
     'lanes',
     'logger',
     'main',
-    'reconciliation-worker',
     'rpc-gateway',
     'runtime',
     'signed-simulation-context',

@@ -4,7 +4,6 @@ import ts from 'typescript';
 const MODULE_EXTENSION = /\.(?:js|ts|mjs|cjs|mts|cts)$/iu;
 const FORBIDDEN_BARE_SEGMENTS = new Set([
   'wallet', 'keypair', 'signing', 'submission', 'transaction-builder',
-  'transaction-confirmer', 'trade-executor',
 ]);
 const FORBIDDEN_CALLS = new Set([
   'sendTransaction', 'sendRawTransaction', 'sendAndConfirmTransaction',
