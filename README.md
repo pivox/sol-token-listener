@@ -575,7 +575,7 @@ npm run db:migrate
 Avec `LISTENER_ENABLED=true`, PostgreSQL et les endpoints Solana HTTP/WebSocket
 sont des dépendances de démarrage. L'ordre est : migrations optionnelles,
 health check RPC, baseline bornée, souscriptions, second rattrapage de fermeture
-de fenêtre, worker inbox, worker social public, réconciliation de finalité,
+de fenêtre, worker inbox, réconciliation de finalité,
 heartbeat, puis API. Un échec
 de dépendance ou de composant interrompt le
 démarrage et ferme les ressources déjà ouvertes. `LISTENER_ENABLED=false`
@@ -747,14 +747,9 @@ l'écoute. Utiliser une adresse accessible publiquement est un choix de
 déploiement explicite : l'API n'est pas authentifiée et doit être placée
 derrière les contrôles réseau/TLS appropriés.
 
-Les huit routes JSON sont `launches`, détail/timeline/risk/social/holders d'un
+Les six routes JSON sont `launches`, détail/timeline/risk d'un
 lancement, `paper-positions` et `health`; `/api/v1/events` est le flux SSE.
-Les montants et `bigint` sont des chaînes décimales. La projection sociale vaut
-`NOT_AVAILABLE` avant la première collection canonique, puis `AVAILABLE` avec
-un `collectionStatus` `COMPLETE`, `PARTIAL` ou `FAILED`, des preuves typées et
-des limites/troncatures explicites. La projection holders devient
-`AVAILABLE` après une reconstruction explicite des trades Pump.fun persistés;
-sinon elle reste `NOT_AVAILABLE`.
+Les montants et `bigint` sont des chaînes décimales.
 
 ```bash
 npm start
@@ -829,10 +824,6 @@ contrats stables et sont `REPORT_ONLY` pendant le calibrage dry run : leurs
 preuves et déclenchements sont rapportés, mais ils ne peuvent ajouter aucun
 blocker ni modifier le verdict ou la décision paper.
 
-`API_HOLDER_POSITION_LIMIT` et `API_HOLDER_SNAPSHOT_LIMIT` valent 100. Les
-limites clusters/membres valent respectivement 50/50, avec un budget total de
-500 membres, 8 quote assets par cluster et 64 au total ; les troncatures sont
-explicites.
 Toutes les projections et preuves I2 suivent la rétention terminale de quatre
 heures. Les transactions `finalized`, `orphaned`, non retryables ou épuisées
 devenues terminales sont purgeables; une transaction `processed` ou `confirmed`
@@ -840,17 +831,8 @@ en attente de finalité ne l'est jamais. Cette fenêtre limite aussi la durée d
 données publiques de wallets observées; elle ne constitue pas un historique
 on-chain exhaustif.
 
-Les métadonnées et preuves sociales publiques utilisent un transport HTTP
-borné qui revalide DNS et redirections afin d'écarter les destinations privées.
-Le worker ne dépend d'aucune API payante X ou Telegram, ni token, cookie ou
-proxy. Il persiste uniquement des URL normalisées, empreintes et preuves
-structurées : aucun corps HTTP brut, header, résultat DNS ou adresse IP. Les
-collections et jobs sociaux terminaux sont conservés quatre heures puis purgés
-dans l'ordre des dépendances.
-
 `GET /api/v1/health` publie l'état courant des composants, le backlog, les
-leases, le compteur `exhaustedCount`, `pipeline.social`, les compteurs
-`socialJobs`, checkpoints et slots observés, sans URL
+leases, le compteur `exhaustedCount`, checkpoints et slots observés, sans URL
 RPC/DB ni secret. `RUNNING`
 exige tous les composants actifs; une dépendance, un heartbeat périmé ou un
 nettoyage incomplet produit `DEGRADED`; `STOPPED` désigne l'arrêt ou la
