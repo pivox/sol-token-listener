@@ -781,10 +781,6 @@ void test('toute configuration de clé privée est refusée', () => {
   }), /private key/u);
 });
 
-void test('les actions dashboard exigent leur confirmation indépendante', () => {
-  assert.throws(() => parseConfig({ ...base, DASHBOARD_ACTIONS_ENABLED: 'true' }), /read-only/u);
-});
-
 void test('le seuil de qualification absent reste sans override et un seuil explicite est borné', () => {
   assert.equal(parseConfig(base).qualificationMinimumScore, null);
   assert.equal(parseConfig({ ...base, QUALIFICATION_MIN_SCORE: '61' }).qualificationMinimumScore, 61);

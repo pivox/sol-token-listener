@@ -122,12 +122,6 @@ export interface AppConfig {
   readonly riskMaxTop1HolderBps: number | null;
   readonly riskMaxTop5HoldersBps: number | null;
   readonly riskMaxTop10HoldersBps: number | null;
-  readonly dashboardEnabled: boolean;
-  readonly dashboardHost: string;
-  readonly dashboardPort: number;
-  readonly dashboardRefreshSeconds: number;
-  readonly dashboardMaxRows: number;
-  readonly dashboardActionsEnabled: false;
   readonly apiEnabled: boolean;
   readonly apiHost: string;
   readonly apiPort: number;
@@ -245,10 +239,6 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     false,
     'EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED',
   );
-  const dashboardActionsEnabled = parseBoolean(environment.DASHBOARD_ACTIONS_ENABLED, false, 'DASHBOARD_ACTIONS_ENABLED');
-  if (dashboardActionsEnabled) {
-    throw new Error('Pump.fun V1 exposes a read-only dashboard; dashboard actions cannot be enabled.');
-  }
 
   const wsolMint = optional(environment.WSOL_MINT, DEFAULT_WSOL_MINT);
   const paperQuoteMintAllowlist = parseMintAllowlist(environment.PAPER_QUOTE_MINT_ALLOWLIST, wsolMint);
@@ -458,12 +448,6 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     riskMaxTop1HolderBps: parseOptionalInteger(environment.RISK_MAX_TOP1_HOLDER_BPS, null, 'RISK_MAX_TOP1_HOLDER_BPS', 0, 10_000),
     riskMaxTop5HoldersBps: parseOptionalInteger(environment.RISK_MAX_TOP5_HOLDERS_BPS, null, 'RISK_MAX_TOP5_HOLDERS_BPS', 0, 10_000),
     riskMaxTop10HoldersBps: parseOptionalInteger(environment.RISK_MAX_TOP10_HOLDERS_BPS, null, 'RISK_MAX_TOP10_HOLDERS_BPS', 0, 10_000),
-    dashboardEnabled: parseBoolean(environment.DASHBOARD_ENABLED, true, 'DASHBOARD_ENABLED'),
-    dashboardHost: optional(environment.DASHBOARD_HOST, '127.0.0.1'),
-    dashboardPort: parseInteger(environment.DASHBOARD_PORT, 3_000, 'DASHBOARD_PORT', 1, 65_535),
-    dashboardRefreshSeconds: parseInteger(environment.DASHBOARD_REFRESH_SECONDS, 5, 'DASHBOARD_REFRESH_SECONDS', 1),
-    dashboardMaxRows: parseInteger(environment.DASHBOARD_MAX_ROWS, 250, 'DASHBOARD_MAX_ROWS', 1),
-    dashboardActionsEnabled: false,
     apiEnabled: parseBoolean(environment.API_ENABLED, true, 'API_ENABLED'),
     apiHost: parseApiHost(environment.API_HOST),
     apiPort: parseInteger(environment.API_PORT, 3_000, 'API_PORT', 1, 65_535),
