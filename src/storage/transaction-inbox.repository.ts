@@ -199,7 +199,7 @@ const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 })
 type TransactionInboxPriority = 'NORMAL' | 'LAUNCH_CANDIDATE' | 'TRACKED_TRADE';
 type InboxStatus = 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'DEFERRED'
   | 'IGNORED' | 'QUARANTINED';
-type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE' | 'PUMPSWAP_POOL_TRADE';
+type StoredIngestionHint = 'NONE' | 'PUMPFUN_CREATE' | 'PUMPFUN_TRADE' | 'PUMPFUN_CURVE_TRADE' | 'PUMPSWAP_POOL_TRADE';
 
 interface WorkerAdmissionClaimPlan {
   readonly authorityAt: Date;

@@ -464,7 +464,7 @@ void test('publishes exact frozen ingestion status constants', () => {
     'DECODER_RECOVERY_NOT_ELIGIBLE',
   ]);
   assert.ok(Object.isFrozen(DECODER_RECOVERY_RESULT_CODES));
-  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE', 'PUMPSWAP_POOL_TRADE']);
+  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE', 'PUMPFUN_CURVE_TRADE', 'PUMPSWAP_POOL_TRADE']);
   assert.ok(Object.isFrozen(TRANSACTION_INGESTION_HINTS));
 });
 
@@ -1358,6 +1358,23 @@ void test('enforces exact source-compatible ingestion hint and mint pairs withou
     })); },
     /catch-up/u,
   );
+  for (const hint of ['PUMPFUN_CURVE_TRADE', 'PUMPSWAP_POOL_TRADE']) {
+    assert.doesNotThrow(() => { assertValidTransactionNotification(Object.freeze({
+      ...canonical, source: 'CATCH_UP', ingestionHint: hint, ingestionHintMint: mint,
+    })); });
+    assert.throws(
+      () => { assertValidTransactionNotification(Object.freeze({
+        ...canonical, source: 'WEBSOCKET', ingestionHint: hint, ingestionHintMint: mint,
+      })); },
+      /ingestion hint/u,
+    );
+    assert.throws(
+      () => { assertValidTransactionNotification(Object.freeze({
+        ...canonical, source: 'CATCH_UP', ingestionHint: hint, ingestionHintMint: null,
+      })); },
+      /ingestion hint/u,
+    );
+  }
   assert.throws(
     () => { assertValidTransactionNotification(Object.freeze({
       ...canonical, logs: Object.freeze(['private websocket log']),

@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '043_execution_intent_causal_lineage.sql';
-const migrationHeadName = '062_drop_dossier_and_legacy_tables.sql';
+const migrationHeadName = '063_listener_tracked_curve_checkpoints.sql';
 
 void test('migration 043 adds nullable lineage identity and non-blocking foreign keys', async () => {
   const sql = await readFile(new URL(`../migrations/${migrationName}`, import.meta.url), 'utf8');

@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '062_drop_dossier_and_legacy_tables.sql';
+  readonly migrationHead: '063_listener_tracked_curve_checkpoints.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -589,7 +589,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '062_drop_dossier_and_legacy_tables.sql',
+    migrationHead: '063_listener_tracked_curve_checkpoints.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,

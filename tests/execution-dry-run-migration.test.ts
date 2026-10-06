@@ -9,7 +9,7 @@ import { insertExecutionDecisionEvent } from './helpers/execution-decision-event
 
 const migrationName = '032_execution_dry_run_assessments.sql';
 const simulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '062_drop_dossier_and_legacy_tables.sql';
+const latestMigrationName = '063_listener_tracked_curve_checkpoints.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -117,6 +117,7 @@ void test('execution dry-run migration applies, upgrades 031, and replays safely
         '059_transaction_inbox_qualification_attribution.sql',
         '060_listener_tracked_pool_checkpoints.sql',
         '061_execution_live_position_ledger.sql',
+        '062_drop_dossier_and_legacy_tables.sql',
         latestMigrationName,
       ]);
       assert.equal((await upgradePool.query('SELECT id FROM execution_intents WHERE id = $1', [parent.id])).rowCount, 1);
