@@ -1250,7 +1250,6 @@ void test('composes the passive production listener without opening resources', 
     pumpswap: 'STOPPED',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'IDLE',
   });
 });
 
@@ -1271,7 +1270,6 @@ void test('composes launchpad-only ingestion with PumpSwap explicitly idle', () 
     pumpswap: 'IDLE',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'IDLE',
   });
 });
 

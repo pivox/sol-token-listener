@@ -154,7 +154,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         pumpswap: this.marketPipelineState('STOPPED'),
         qualification: 'STOPPED',
         paperDecision: 'STOPPED',
-        social: 'IDLE',
       });
     }
     if (this.currentState !== 'RUNNING') {
@@ -164,7 +163,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         pumpswap: this.marketPipelineState('DEGRADED'),
         qualification: 'DEGRADED',
         paperDecision: 'DEGRADED',
-        social: 'IDLE',
       });
     }
 
@@ -184,8 +182,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       pumpswap: this.marketPipelineState(chain),
       qualification: chain,
       paperDecision,
-      // No social worker runs any more; the API field stays until it is removed.
-      social: 'IDLE',
     });
   }
 

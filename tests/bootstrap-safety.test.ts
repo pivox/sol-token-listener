@@ -215,7 +215,7 @@ void test('migrates, starts listener before API, then closes listener before API
   const calls: string[] = [];
   const pool = {};
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING',
   });
   await runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
@@ -239,7 +239,7 @@ void test('migrates, starts listener before API, then closes listener before API
       calls.push('listener.create');
       return runtime;
     },
-    createProjectionRepository: (received, pipeline, _holderLimits, qualificationProfile) => {
+    createProjectionRepository: (received, pipeline, qualificationProfile) => {
       assert.equal(received, pool);
       assert.deepEqual(pipeline(), runtime.pipelineState());
       assert.deepEqual(qualificationProfile, {
@@ -364,7 +364,7 @@ void test('explicit listener disablement exposes STOPPED pipeline state to the A
   }));
   assert.notEqual(pipeline, null);
   assert.deepEqual((pipeline as unknown as () => ApiProjectionPipelineState)(), {
-    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', qualification: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', qualification: 'STOPPED', paperDecision: 'STOPPED',
   });
   assert.ok(calls.includes('log:listener.disabled'));
   assert.doesNotMatch(calls.join(','), /listener\.create|listener\.start|listener\.close/u);
@@ -380,7 +380,7 @@ void test('listener startup failure fails the process and cleans listener before
       async close() { calls.push('listener.close'); },
       state: () => 'DEGRADED',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED',
       }),
     }),
     beforeDatabaseClose: async () => { calls.push('runner.release'); },
@@ -430,7 +430,7 @@ void test('lifecycle ownership loss during listener start closes it before API s
       async close() { calls.push('listener.close'); },
       state: () => 'RUNNING',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING',
       }),
     }),
   })), (error: unknown) => error === loss);
@@ -473,7 +473,7 @@ void test('API bind failure aggregates listener, server, and database cleanup in
       async close() { calls.push('listener.close'); throw listenerFailure; },
       state: () => 'RUNNING',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING',
       }),
     }),
     createApiServer: () => ({
@@ -554,7 +554,7 @@ function dependencies(
   overrides: Partial<ApplicationDependencies> = {},
 ): Partial<ApplicationDependencies> {
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING',
   });
   return {
     loadConfig: () => config,

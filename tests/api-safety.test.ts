@@ -11,9 +11,8 @@ const FORBIDDEN = /(?:execution\/wallet|transaction-builder|Keypair|sendTransact
 
 const health: ApiHealth = {
   status: 'OK', observedAt: '2026-07-29T00:00:00.000Z', postgresql: { status: 'AVAILABLE' },
-  http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+  http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE' },
   qualification: { currentCount: 0, lastSuccessAt: null },
-  socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
   paperDecisionJobs: {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
     lastSuccessAt: null, lastErrorCode: null,
@@ -34,8 +33,6 @@ const projections: ApiProjectionRepository = {
   async getLaunch() { return null; },
   async listLaunchEvents() { return { items: [], nextCursor: null }; },
   async getLaunchRisk() { return null; },
-  async getLaunchSocial() { return null; },
-  async getLaunchHolders() { return null; },
   async listPaperPositions() { return { items: [], nextCursor: null }; },
   async getHealth() { return health; },
 };

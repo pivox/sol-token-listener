@@ -5,58 +5,9 @@ import { assertValidTimestampMs } from './timestamp.js';
 import { canonicalStringifyJson } from '../utils/json.js';
 
 /*
- * Social evidence is no longer collected. What remains here is only what is still
- * read: the enums the API exposes for historical social rows, and the metadata
+ * Social evidence is no longer collected. What remains here is only the metadata
  * snapshot identity used to verify historical `token_metadata_snapshots` rows.
  */
-
-export const SOCIAL_LINK_KINDS = Object.freeze([
-  'WEBSITE',
-  'X',
-  'TELEGRAM',
-] as const);
-
-export const SOCIAL_COLLECTION_STATUSES = Object.freeze([
-  'COMPLETE',
-  'PARTIAL',
-  'FAILED',
-] as const);
-
-export const SOCIAL_EVIDENCE_OUTCOMES = Object.freeze([
-  'CONFIRMED',
-  'REJECTED',
-  'UNKNOWN',
-] as const);
-
-export const SOCIAL_EVIDENCE_TYPES = Object.freeze([
-  'URL_SYNTAX_VALID',
-  'URL_SYNTAX_INVALID',
-  'URL_REACHABLE',
-  'CROSS_LINK_CONFIRMED',
-  'MINT_PUBLISHED',
-  'ACCOUNT_TOO_RECENT',
-  'DOMAIN_MISMATCH',
-  'CONTENT_UNAVAILABLE',
-  'VERIFICATION_UNKNOWN',
-] as const);
-
-export type SocialLinkKind = (typeof SOCIAL_LINK_KINDS)[number];
-export type SocialCollectionStatus = (typeof SOCIAL_COLLECTION_STATUSES)[number];
-export type SocialEvidenceOutcome = (typeof SOCIAL_EVIDENCE_OUTCOMES)[number];
-export type SocialEvidenceType = (typeof SOCIAL_EVIDENCE_TYPES)[number];
-
-export const SOCIAL_URL_INVALID_REASONS = Object.freeze([
-  'VALUE_MISSING',
-  'VALUE_NOT_TEXT',
-  'URL_INVALID',
-  'URL_TOO_LONG',
-  'SCHEME_UNSUPPORTED',
-  'CREDENTIALS_FORBIDDEN',
-  'HOST_UNSUPPORTED',
-  'PROFILE_PATH_UNSUPPORTED',
-] as const);
-
-export type SocialUrlInvalidReason = (typeof SOCIAL_URL_INVALID_REASONS)[number];
 
 const MAX_TEXT_BYTES = 2_048;
 const BASE58_PUBLIC_KEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u;

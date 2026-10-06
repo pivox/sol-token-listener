@@ -28,7 +28,6 @@ void test('starts the supervisor before every consumer and exposes honest frozen
     pumpswap: 'RUNNING',
     qualification: 'RUNNING',
     paperDecision: 'RUNNING',
-    social: 'IDLE',
   });
   assert.ok(Object.isFrozen(runtime.pipelineState()));
 });
@@ -48,7 +47,6 @@ void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime hea
     pumpswap: 'IDLE',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'IDLE',
   });
 
   await runtime.start();
@@ -59,7 +57,6 @@ void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime hea
     pumpswap: 'IDLE',
     qualification: 'RUNNING',
     paperDecision: 'RUNNING',
-    social: 'IDLE',
   });
 
   supervisorState = 'STARTING';
@@ -70,7 +67,6 @@ void test('keeps PumpSwap idle while launchpad-only Pump.fun follows runtime hea
     pumpswap: 'IDLE',
     qualification: 'DEGRADED',
     paperDecision: 'RUNNING',
-    social: 'IDLE',
   });
 });
 
@@ -101,7 +97,6 @@ void test('chain health requires the supervisor, inbox worker, reconciler, and h
       pumpswap: 'DEGRADED',
       qualification: 'DEGRADED',
       paperDecision: 'RUNNING',
-      social: 'IDLE',
     });
     states[component] = 'RUNNING';
   }
@@ -113,7 +108,6 @@ void test('chain health requires the supervisor, inbox worker, reconciler, and h
     pumpswap: 'RUNNING',
     qualification: 'RUNNING',
     paperDecision: 'DEGRADED',
-    social: 'IDLE',
   });
 });
 
@@ -404,7 +398,6 @@ void test('validates shutdown bounds and returns STOPPED projections before star
     pumpswap: 'STOPPED',
     qualification: 'STOPPED',
     paperDecision: 'STOPPED',
-    social: 'IDLE',
   });
   assert.throws(
     () => new SolanaListenerRuntime(dependencies([]), { shutdownTimeoutMs: 0 }),

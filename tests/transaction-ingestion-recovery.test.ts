@@ -584,7 +584,7 @@ void test('exposes a real retryable failed inbox row through persisted API healt
     const health = await new PostgresApiProjectionRepository(
       pool,
       () => new Date(),
-      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING' },
+      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING' },
     ).getHealth();
     assert.equal(health.heartbeat.backlogCount, 1);
     assert.equal(health.heartbeat.leasedCount, 0);
@@ -616,7 +616,7 @@ void test('counts only qualification reports with canonical active lineage in Po
     });
     const health = async () => new PostgresApiProjectionRepository(pool, () => new Date(), {
       httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING',
-      paperDecision: 'RUNNING', social: 'RUNNING',
+      paperDecision: 'RUNNING',
     }).getHealth();
     assert.equal((await health()).qualification.currentCount, 1);
     const lineage = (await pool.query(`SELECT qualification.event_id, qualification.source,

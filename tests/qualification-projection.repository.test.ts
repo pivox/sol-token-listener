@@ -744,7 +744,7 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     const repository = new PostgresQualificationProjectionRepository(pool, service);
     const confirmed = projectionFixture({ observedAtMs });
     const api = new PostgresApiProjectionRepository(
-      pool, () => new Date(), undefined, undefined, confirmed.report.ruleSet,
+      pool, () => new Date(), undefined, confirmed.report.ruleSet,
     );
 
     const creationOutcomes = await Promise.all([

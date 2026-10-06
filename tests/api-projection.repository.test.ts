@@ -33,7 +33,7 @@ interface Call {
 // @ts-expect-error qualification is mandatory for every pipeline provider.
 const missingQualificationPipeline: ApiProjectionPipelineState = {
   httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-  paperDecision: 'RUNNING', social: 'RUNNING',
+  paperDecision: 'RUNNING',
 };
 void missingQualificationPipeline;
 
@@ -295,14 +295,10 @@ void test('reads an exact launch and returns null only when it is absent', async
     initialTokenAmount: null, initialQuoteAmount: null,
     reserveBase: '100', reserveQuote: '200', feeBps: null,
     candidate: null, paperStrategy: null,
-    social: { status: 'NOT_AVAILABLE', links: [], evidence: [] },
-    holders: {
-      status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
-      clusterAnalysisStatus: 'NOT_AVAILABLE',
-    },
   });
   assert.equal(Object.isFrozen(detail), true);
-  assert.equal(Object.isFrozen(detail?.social ?? {}), true);
+  assert.equal('social' in (detail ?? {}), false);
+  assert.equal('holders' in (detail ?? {}), false);
 
   const absent = new PostgresApiProjectionRepository(new FakeQueryable(() => []));
   assert.equal(await absent.getLaunch('absent'), null);
@@ -545,573 +541,11 @@ void test('rejects an invalid launch page before acquiring a snapshot client', a
   assert.equal(database.calls.length, 0);
 });
 
-void test('returns NOT_AVAILABLE social and holders only for an existing launch', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    return projectionRows(call);
-  });
-  const repository = new PostgresApiProjectionRepository(database);
-
-  assert.deepEqual(await repository.getLaunchSocial('mint-a'), {
-    status: 'NOT_AVAILABLE', links: [], evidence: [],
-  });
-  assert.deepEqual(await repository.getLaunchHolders('mint-a'), {
-    status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
-    clusterAnalysisStatus: 'NOT_AVAILABLE',
-  });
-  assert.equal(await new PostgresApiProjectionRepository(new FakeQueryable(() => [])).getLaunchSocial('none'), null);
-  assert.equal(await new PostgresApiProjectionRepository(new FakeQueryable(() => [])).getLaunchHolders('none'), null);
-});
-
-void test('exposes the latest completed non-orphaned social collection with stable bounded evidence', async () => {
-  const observedAt = new Date('2026-08-10T12:00:00.000Z');
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
-      collection_id: 'social_collection_a', metadata_snapshot_id: 'pumpfun_metadata_a',
-      collection_status: 'PARTIAL', observed_at: observedAt,
-      declared_link_count: '2', inspected_link_count: '1', evidence_count: '2',
-      confirmed_evidence_count: '1', rejected_evidence_count: '0', unknown_evidence_count: '1',
-    }];
-    if (call.text.includes('FROM social_links AS link')) return [{
-      link_id: 'social_link_website', link_kind: 'WEBSITE', declared_value_sha256: 'a'.repeat(64),
-      syntax_status: 'VALID', canonical_url: 'https://project.example/', invalid_reason: null,
-      observed_at: observedAt,
-    }, {
-      link_id: 'social_link_x', link_kind: 'X', declared_value_sha256: 'b'.repeat(64),
-      syntax_status: 'INVALID', canonical_url: null, invalid_reason: 'URL_INVALID',
-      observed_at: observedAt,
-    }];
-    if (call.text.includes('FROM social_verification_evidence AS evidence')) return [{
-      evidence_id: 'social_evidence_reachable', evidence_type: 'URL_REACHABLE',
-      outcome: 'CONFIRMED', subject_kind: 'WEBSITE', related_kind: null,
-      subject_url: 'https://project.example/', final_url: 'https://project.example/',
-      http_status: 200, redirect_count: 0, content_sha256: 'c'.repeat(64),
-      reason_code: 'HTTP_2XX', observed_at: observedAt,
-    }, {
-      evidence_id: 'social_evidence_unknown', evidence_type: 'VERIFICATION_UNKNOWN',
-      outcome: 'UNKNOWN', subject_kind: 'X', related_kind: null,
-      subject_url: null, final_url: null, http_status: null, redirect_count: 0,
-      content_sha256: null, reason_code: 'URL_INVALID', observed_at: observedAt,
-    }];
-    return [];
-  });
-  const repository = new PostgresApiProjectionRepository(database);
-
-  const social = await repository.getLaunchSocial('mint-a');
-
-  assert.deepEqual(social, {
-    status: 'AVAILABLE', collectionStatus: 'PARTIAL', collectionId: 'social_collection_a',
-    metadataSnapshotId: 'pumpfun_metadata_a', observedAt: observedAt.toISOString(),
-    linkCount: 2, linksTruncated: false,
-    links: [{
-      id: 'social_link_website', kind: 'WEBSITE', declaredValueSha256: 'a'.repeat(64),
-      syntaxStatus: 'VALID', canonicalUrl: 'https://project.example/', invalidReason: null,
-      observedAt: observedAt.toISOString(),
-    }, {
-      id: 'social_link_x', kind: 'X', declaredValueSha256: 'b'.repeat(64),
-      syntaxStatus: 'INVALID', canonicalUrl: null, invalidReason: 'URL_INVALID',
-      observedAt: observedAt.toISOString(),
-    }],
-    evidenceCount: 2, evidenceTruncated: false,
-    evidence: [{
-      id: 'social_evidence_reachable', type: 'URL_REACHABLE', outcome: 'CONFIRMED',
-      subjectKind: 'WEBSITE', relatedKind: null, subjectUrl: 'https://project.example/',
-      finalUrl: 'https://project.example/', httpStatus: 200, redirectCount: 0,
-      contentSha256: 'c'.repeat(64), reasonCode: 'HTTP_2XX', observedAt: observedAt.toISOString(),
-    }, {
-      id: 'social_evidence_unknown', type: 'VERIFICATION_UNKNOWN', outcome: 'UNKNOWN',
-      subjectKind: 'X', relatedKind: null, subjectUrl: null, finalUrl: null,
-      httpStatus: null, redirectCount: 0, contentSha256: null, reasonCode: 'URL_INVALID',
-      observedAt: observedAt.toISOString(),
-    }],
-    coverage: {
-      declaredLinkCount: 2, inspectedLinkCount: 1, confirmedEvidenceCount: 1,
-      rejectedEvidenceCount: 0, unknownEvidenceCount: 1,
-    },
-  });
-  assert.equal(Object.isFrozen(social ?? {}), true);
-  assert.equal(Object.isFrozen(social?.links ?? []), true);
-  assert.match(database.calls[1]?.text ?? '', /SocialEvidenceCollected/u);
-  assert.match(database.calls[1]?.text ?? '', /confirmation_status <> 'orphaned'/u);
-  assert.match(database.calls[2]?.text ?? '', /ORDER BY CASE link\.link_kind/u);
-  assert.match(database.calls[3]?.text ?? '', /ORDER BY CASE evidence\.evidence_type/u);
-});
-
-void test('fails closed on malformed social projection data', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
-      collection_id: 'social_collection_a', metadata_snapshot_id: 'pumpfun_metadata_a',
-      collection_status: 'COMPLETE', observed_at: detectedAt,
-      declared_link_count: '-1', inspected_link_count: '0', evidence_count: '0',
-      confirmed_evidence_count: '0', rejected_evidence_count: '0', unknown_evidence_count: '0',
-    }];
-    return [];
-  });
-
-  await assert.rejects(
-    new PostgresApiProjectionRepository(database).getLaunchSocial('mint-a'),
-    ApiProjectionDataError,
-  );
-});
-
-void test('returns failed metadata evidence as AVAILABLE and truncates oversized evidence explicitly', async () => {
-  const evidenceRows = Array.from({ length: 64 }, (_, index) => ({
-    evidence_id: `social_evidence_${String(index).padStart(2, '0')}`,
-    evidence_type: 'VERIFICATION_UNKNOWN', outcome: 'UNKNOWN', subject_kind: null,
-    related_kind: null, subject_url: null, final_url: null, http_status: null,
-    redirect_count: 0, content_sha256: null, reason_code: 'METADATA_UNAVAILABLE',
-    observed_at: detectedAt,
-  }));
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
-      collection_id: 'social_collection_failed', metadata_snapshot_id: 'pumpfun_metadata_failed',
-      collection_status: 'FAILED', observed_at: detectedAt,
-      declared_link_count: '0', inspected_link_count: '0', evidence_count: '65',
-      confirmed_evidence_count: '0', rejected_evidence_count: '0', unknown_evidence_count: '65',
-    }];
-    if (call.text.includes('FROM social_verification_evidence AS evidence')) return evidenceRows;
-    return [];
-  });
-
-  const social = await new PostgresApiProjectionRepository(database).getLaunchSocial('mint-a');
-
-  assert.equal(social?.status, 'AVAILABLE');
-  if (social?.status !== 'AVAILABLE') return;
-  assert.equal(social.collectionStatus, 'FAILED');
-  assert.equal(social.linkCount, 0);
-  assert.equal(social.evidenceCount, 65);
-  assert.equal(social.evidence.length, 64);
-  assert.equal(social.evidenceTruncated, true);
-  assert.deepEqual(database.calls.at(-1)?.values, ['social_collection_failed', 64]);
-});
-
-void test('embeds the same immutable social projection in launch detail as the dedicated route', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('token_metadata_snapshots')) return [];
-    if (call.text.includes('bonding_curve_snapshots')) return [];
-    if (call.text.includes('FROM migrations AS migration')) return [];
-    if (call.text.includes('FROM creator_profiles')) return [];
-    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
-      collection_id: 'social_collection_empty', metadata_snapshot_id: 'pumpfun_metadata_empty',
-      collection_status: 'COMPLETE', observed_at: detectedAt,
-      declared_link_count: '0', inspected_link_count: '0', evidence_count: '0',
-      confirmed_evidence_count: '0', rejected_evidence_count: '0', unknown_evidence_count: '0',
-    }];
-    return [];
-  });
-  const repository = new PostgresApiProjectionRepository(database);
-
-  const detail = await repository.getLaunch('mint-a');
-  const dedicated = await repository.getLaunchSocial('mint-a');
-
-  assert.deepEqual(detail?.social, dedicated);
-  assert.equal(detail?.social.status, 'AVAILABLE');
-  assert.equal(Object.isFrozen(detail?.social ?? {}), true);
-});
-
-void test('expose les profils et positions observés avec des limites SQL bornées', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM creator_profiles')) return [{
-      payload: toJsonValue({
-        mint: 'mint-a',
-        creator: 'creator',
-        payloadVersion: 1,
-        inputFingerprint: 'fingerprint',
-        buyCount: 1,
-        sellCount: 0,
-        totalBoughtBaseRaw: 10n,
-        totalSoldBaseRaw: 0n,
-        observedNetBaseRaw: 10n,
-        hasSold: false,
-        firstSell: null,
-        initialBuys: [],
-        quoteFlows: [{
-          quoteAsset: { mint: 'sol', decimals: 9, tokenProgram: 'SPL_TOKEN' },
-          boughtQuoteRaw: 2n,
-          soldQuoteRaw: 0n,
-        }],
-        uniqueExternalBuyers: 1,
-        unknownTraderTradeCount: 0,
-      }),
-    }];
-    if (call.text.includes('FROM token_holders_snapshots')) return [{
-      snapshot_id: 'snapshot',
-      input_fingerprint: 'fingerprint',
-      observed_at: detectedAt,
-      confirmation_status: 'confirmed',
-      as_of_slot: '10',
-      as_of_transaction_index: 0,
-      as_of_instruction_index: 2,
-      as_of_inner_instruction_index: null,
-      total_positive_net_base_raw: '10',
-      top1_bps: '10000',
-      top5_bps: '10000',
-      top10_bps: '10000',
-      creator_bps: '0',
-      unique_known_buyers: 1,
-      unique_external_buyers: 1,
-      positive_position_count: 1,
-      unknown_trader_trade_count: 0,
-    }];
-    if (call.text.includes('FROM observed_wallet_positions')) return [{
-      payload: toJsonValue({
-        wallet: 'buyer',
-        isCreator: false,
-        buyCount: 1,
-        sellCount: 0,
-        boughtBaseRaw: 10n,
-        soldBaseRaw: 0n,
-        observedNetBaseRaw: 10n,
-        quoteFlows: [],
-        firstObservedCursor: {
-          slot: 10n,
-          transactionIndex: 0,
-          instructionIndex: 2,
-          innerInstructionIndex: null,
-        },
-        lastObservedCursor: {
-          slot: 10n,
-          transactionIndex: 0,
-          instructionIndex: 2,
-          innerInstructionIndex: null,
-        },
-      }),
-    }];
-    return [];
-  });
-  const repository = new PostgresApiProjectionRepository(
-    database,
-    () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
-    {
-      positions: 1,
-      snapshots: 2,
-      clusters: 50,
-      clusterMembers: 50,
-      totalClusterMembers: 500,
-    },
-  );
-
-  const holders = await repository.getLaunchHolders('mint-a');
-
-  assert.deepEqual(holders, {
-    status: 'AVAILABLE',
-    methodology: 'OBSERVED_BONDING_CURVE_TRADES',
-    creatorProfile: {
-      mint: 'mint-a', creator: 'creator', buyCount: 1, sellCount: 0,
-      totalBoughtBaseRaw: '10', totalSoldBaseRaw: '0', observedNetBaseRaw: '10',
-      hasSold: false, firstSell: null, initialBuys: [],
-      quoteFlows: [{
-        quoteAsset: { mint: 'sol', decimals: 9, tokenProgram: 'SPL_TOKEN' },
-        boughtQuoteRaw: '2', soldQuoteRaw: '0',
-      }],
-      uniqueExternalBuyers: 1, unknownTraderTradeCount: 0,
-    },
-    latestSnapshot: {
-      id: 'snapshot', inputFingerprint: 'fingerprint',
-      observedAt: detectedAt.toISOString(), confirmationStatus: 'confirmed',
-      cursor: {
-        slot: '10', transactionIndex: '0', instructionIndex: '2',
-        innerInstructionIndex: null,
-      },
-      totalPositiveNetBaseRaw: '10', top1Bps: '10000', top5Bps: '10000',
-      top10Bps: '10000', creatorBps: '0', uniqueKnownBuyers: 1,
-      uniqueExternalBuyers: 1, positivePositionCount: 1,
-      unknownTraderTradeCount: 0,
-    },
-    snapshots: [{
-      id: 'snapshot', inputFingerprint: 'fingerprint',
-      observedAt: detectedAt.toISOString(), confirmationStatus: 'confirmed',
-      cursor: {
-        slot: '10', transactionIndex: '0', instructionIndex: '2',
-        innerInstructionIndex: null,
-      },
-      totalPositiveNetBaseRaw: '10', top1Bps: '10000', top5Bps: '10000',
-      top10Bps: '10000', creatorBps: '0', uniqueKnownBuyers: 1,
-      uniqueExternalBuyers: 1, positivePositionCount: 1,
-      unknownTraderTradeCount: 0,
-    }],
-    positions: [{
-      wallet: 'buyer', isCreator: false, buyCount: 1, sellCount: 0,
-      boughtBaseRaw: '10', soldBaseRaw: '0', observedNetBaseRaw: '10',
-      quoteFlows: [],
-      firstObservedCursor: {
-        slot: '10', transactionIndex: '0', instructionIndex: '2',
-        innerInstructionIndex: null,
-      },
-      lastObservedCursor: {
-        slot: '10', transactionIndex: '0', instructionIndex: '2',
-        innerInstructionIndex: null,
-      },
-    }],
-    clusters: [],
-    clusterAnalysisStatus: 'NOT_AVAILABLE',
-  });
-  assert.deepEqual(
-    database.calls.find((call) =>
-      call.text.includes('FROM token_holders_snapshots')
-      && call.text.includes('ORDER BY as_of_slot DESC'))?.values,
-    ['mint-a', 2],
-  );
-  assert.deepEqual(
-    database.calls.find((call) => call.text.includes('FROM observed_wallet_positions'))?.values,
-    ['mint-a', 1],
-  );
-});
-
-void test('utilise le snapshot de l’empreinte courante après orphaning', async () => {
-  const current = {
-    snapshot_id: 'current',
-    input_fingerprint: 'current-fingerprint',
-    observed_at: detectedAt,
-    confirmation_status: 'confirmed',
-    as_of_slot: '10',
-    as_of_transaction_index: 0,
-    as_of_instruction_index: 1,
-    as_of_inner_instruction_index: null,
-    total_positive_net_base_raw: '0',
-    top1_bps: '0',
-    top5_bps: '0',
-    top10_bps: '0',
-    creator_bps: '0',
-    unique_known_buyers: 0,
-    unique_external_buyers: 0,
-    positive_position_count: 0,
-    unknown_trader_trade_count: 0,
-  };
-  const stale = {
-    ...current,
-    snapshot_id: 'stale',
-    input_fingerprint: 'stale-fingerprint',
-    as_of_instruction_index: 2,
-    total_positive_net_base_raw: '10',
-    top1_bps: '10000',
-    top5_bps: '10000',
-    top10_bps: '10000',
-    positive_position_count: 1,
-  };
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM creator_profiles')) return [{
-      payload: toJsonValue({
-        mint: 'mint-a', creator: 'creator', payloadVersion: 1,
-        inputFingerprint: 'current-fingerprint', buyCount: 0, sellCount: 0,
-        totalBoughtBaseRaw: 0n, totalSoldBaseRaw: 0n, observedNetBaseRaw: 0n,
-        hasSold: false, firstSell: null, initialBuys: [], quoteFlows: [],
-        uniqueExternalBuyers: 0, unknownTraderTradeCount: 0,
-      }),
-    }];
-    if (
-      call.text.includes('FROM token_holders_snapshots')
-      && call.text.includes('input_fingerprint = $2')
-    ) return [current];
-    if (call.text.includes('FROM token_holders_snapshots')) return [stale, current];
-    return [];
-  });
-
-  const holders = await new PostgresApiProjectionRepository(database).getLaunchHolders('mint-a');
-
-  assert.equal(holders?.status, 'AVAILABLE');
-  if (holders?.status !== 'AVAILABLE') return;
-  assert.equal(holders.latestSnapshot.id, 'current');
-  assert.deepEqual(holders.snapshots.map((snapshot) => snapshot.id), ['stale', 'current']);
-});
-
-void test('exposes current clusters with per-cluster truncation and one shared member budget', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
-    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
-    if (call.text.includes('FROM observed_wallet_positions')) return [];
-    if (call.text.includes('FROM wallet_graph_profiles')) return [{
-      input_fingerprint: 'graph-current',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-    }];
-    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
-      input_fingerprint: 'graph-current',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-      coverage: graphCoverage(),
-      cluster_count: 3,
-    }];
-    if (call.text.includes('FROM wallet_clusters AS cluster')) return [
-      clusterRow('cluster-high', '9000', '3', 40),
-      clusterRow('cluster-low', '5000', '2'),
-      clusterRow('cluster-truncated', '1000', '2'),
-    ];
-    if (call.text.includes('WITH ranked_members AS')) return [
-      memberRow('cluster-high', 'buyer-a', '50'),
-      memberRow('cluster-high', 'buyer-b', '25'),
-      memberRow('cluster-low', 'buyer-c', '10'),
-    ];
-    return [];
-  });
-  const repository = new PostgresApiProjectionRepository(
-    database,
-    () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
-    {
-      positions: 1,
-      snapshots: 1,
-      clusters: 2,
-      clusterMembers: 2,
-      totalClusterMembers: 3,
-    },
-  );
-
-  const holders = await repository.getLaunchHolders('mint-a');
-
-  assert.equal(holders?.status, 'AVAILABLE');
-  if (holders?.status !== 'AVAILABLE') return;
-  assert.equal(holders.clusterAnalysisStatus, 'AVAILABLE');
-  if (holders.clusterAnalysisStatus !== 'AVAILABLE') return;
-  assert.equal(holders.clusterCount, 3);
-  assert.equal(holders.clustersTruncated, true);
-  assert.deepEqual(holders.clusters.map((cluster) => cluster.id), [
-    'cluster-high',
-    'cluster-low',
-  ]);
-  assert.deepEqual(holders.clusters.map((cluster) => cluster.members.length), [2, 1]);
-  assert.equal(holders.clusters[0]?.quoteAssets.length, 8);
-  assert.equal(holders.clusters[0]?.quoteAssetCount, 40);
-  assert.equal(holders.clusters[0]?.quoteAssetsTruncated, true);
-  assert.deepEqual(holders.clusters.map((cluster) => cluster.membersTruncated), [
-    true,
-    true,
-  ]);
-  assert.equal(
-    holders.clusters.reduce((count, cluster) => count + cluster.members.length, 0),
-    3,
-  );
-  assert.deepEqual(
-    database.calls.find((call) =>
-      call.text.includes('FROM wallet_clusters AS cluster'))?.values,
-    ['mint-a', 'graph-current', 3],
-  );
-  assert.deepEqual(
-    database.calls.find((call) =>
-      call.text.includes('WITH ranked_members AS'))?.values,
-    ['mint-a', 'graph-current', ['cluster-high', 'cluster-low'], 2, 3],
-  );
-  assert.equal(database.calls.some((call) =>
-    call.text.includes('FROM wallet_relationships')), false);
-});
-
-void test('distinguishes a successful zero-cluster analysis from unavailable graph data', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
-    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
-    if (call.text.includes('FROM observed_wallet_positions')) return [];
-    if (call.text.includes('FROM wallet_graph_profiles')) return [{
-      input_fingerprint: 'graph-empty',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-    }];
-    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
-      input_fingerprint: 'graph-empty',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-      coverage: graphCoverage(),
-      cluster_count: 0,
-    }];
-    return [];
-  });
-  const holders = await new PostgresApiProjectionRepository(database)
-    .getLaunchHolders('mint-a');
-  assert.equal(holders?.status, 'AVAILABLE');
-  if (holders?.status !== 'AVAILABLE') return;
-  assert.equal(holders.clusterAnalysisStatus, 'AVAILABLE');
-  if (holders.clusterAnalysisStatus !== 'AVAILABLE') return;
-  assert.deepEqual(holders.clusters, []);
-  assert.equal(holders.clusterCount, 0);
-  assert.equal(holders.clustersTruncated, false);
-});
-
-void test('shares one bounded quote-asset budget across emitted clusters', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
-    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
-    if (call.text.includes('FROM observed_wallet_positions')) return [];
-    if (call.text.includes('FROM wallet_graph_profiles')) return [{
-      input_fingerprint: 'graph-quotes',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-    }];
-    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
-      input_fingerprint: 'graph-quotes',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-      coverage: graphCoverage(),
-      cluster_count: 9,
-    }];
-    if (call.text.includes('FROM wallet_clusters AS cluster')) {
-      return Array.from({ length: 9 }, (_, index) =>
-        clusterRow(`cluster-${index}`, '1000', '0', 40));
-    }
-    if (call.text.includes('WITH ranked_members AS')) return [];
-    return [];
-  });
-  const repository = new PostgresApiProjectionRepository(
-    database,
-    () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
-    {
-      positions: 1,
-      snapshots: 1,
-      clusters: 9,
-      clusterMembers: 1,
-      totalClusterMembers: 1,
-    },
-  );
-
-  const holders = await repository.getLaunchHolders('mint-a');
-
-  assert.equal(holders?.status, 'AVAILABLE');
-  if (holders?.status !== 'AVAILABLE'
-    || holders.clusterAnalysisStatus !== 'AVAILABLE') return;
-  assert.equal(holders.clusters.reduce(
-    (count, cluster) => count + cluster.quoteAssets.length,
-    0,
-  ), 64);
-  assert.equal(holders.clusters[8]?.quoteAssets.length, 0);
-  assert.equal(holders.clusters[8]?.quoteAssetsTruncated, true);
-});
-
-void test('rejects a graph snapshot whose current cluster rows are incomplete', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
-    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
-    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
-    if (call.text.includes('FROM wallet_graph_profiles')) return [{
-      input_fingerprint: 'graph-incomplete',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-    }];
-    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
-      input_fingerprint: 'graph-incomplete',
-      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
-      coverage: graphCoverage(),
-      cluster_count: 1,
-    }];
-    return [];
-  });
-
-  await assert.rejects(
-    new PostgresApiProjectionRepository(database).getLaunchHolders('mint-a'),
-    ApiProjectionDataError,
-  );
-});
-
-void test('orders domain events and explicit transitions by the complete cursor', async () => {
+void test('orders domain events by the complete cursor without reading state transitions', async () => {
   const database = new FakeQueryable((call) => {
     if (
-      call.text.includes('WITH timeline')
-      && call.text.includes('UNION ALL')
-      && call.text.includes('FROM state_transitions AS transition')
-      && call.text.includes('transition.mint = $1')
-      && call.text.includes('domain_event.event_id = transition.event_id')
-      && call.text.includes('jsonb_build_object')
+      call.text.includes('FROM domain_events AS domain_event')
+      && call.text.includes('domain_event.mint = $1')
       && call.text.includes('ORDER BY slot, transaction_index, instruction_index, inner_sort, id')
     ) return [{
       id: 'domain-1', type: 'QualificationUpdated', occurred_at: detectedAt,
@@ -1119,10 +553,10 @@ void test('orders domain events and explicit transitions by the complete cursor'
       inner_instruction_index: null, confirmation_status: 'confirmed', payload_version: 1,
       payload: { score: 90, amount: '42' },
     }, {
-      id: 'transition-1', type: 'TokenLaunchDetected', occurred_at: openedAt,
+      id: 'domain-2', type: 'TokenLaunchDetected', occurred_at: openedAt,
       slot: '900719925474099312346', transaction_index: 0, instruction_index: 0,
       inner_instruction_index: 1, confirmation_status: 'finalized', payload_version: 1,
-      payload: { previousStatus: null, newStatus: 'DETECTED', reasonCode: null, message: 'Token launch detected', evidence: {} },
+      payload: {},
     }];
     return [];
   });
@@ -1135,121 +569,19 @@ void test('orders domain events and explicit transitions by the complete cursor'
     slot: '900719925474099312345', confirmationStatus: 'confirmed', payloadVersion: 1,
     payload: { score: 90, amount: '42' },
   }, {
-    id: 'transition-1', type: 'TokenLaunchDetected', occurredAt: openedAt.toISOString(),
+    id: 'domain-2', type: 'TokenLaunchDetected', occurredAt: openedAt.toISOString(),
     slot: '900719925474099312346', confirmationStatus: 'finalized', payloadVersion: 1,
-    payload: { previousStatus: null, newStatus: 'DETECTED', reasonCode: null, message: 'Token launch detected', evidence: {} },
+    payload: {},
   }]);
-  assert.match(database.calls[0]?.text ?? '', /WITH timeline/u);
-  assert.match(database.calls[0]?.text ?? '', /COALESCE\(domain_event\.inner_instruction_index, -1\) AS inner_sort/u);
-  assert.match(database.calls[0]?.text ?? '', /ORDER BY slot, transaction_index, instruction_index, inner_sort, id/u);
+  const sql = database.calls[0]?.text ?? '';
+  assert.doesNotMatch(sql, /state_transitions/u);
+  assert.doesNotMatch(sql, /UNION/u);
+  assert.match(sql, /COALESCE\(domain_event\.inner_instruction_index, -1\) AS inner_sort/u);
+  assert.match(sql, /ORDER BY slot, transaction_index, instruction_index, inner_sort, id/u);
   assert.equal(Object.isFrozen(entries), true);
   assert.equal(Object.isFrozen(entries[0]?.payload ?? {}), true);
   assert.equal(page.nextCursor, null);
 });
-
-function creatorProfileRow(): Record<string, unknown> {
-  return {
-    payload: toJsonValue({
-      mint: 'mint-a',
-      creator: 'creator',
-      payloadVersion: 1,
-      inputFingerprint: 'holder-current',
-      buyCount: 0,
-      sellCount: 0,
-      totalBoughtBaseRaw: 0n,
-      totalSoldBaseRaw: 0n,
-      observedNetBaseRaw: 0n,
-      hasSold: false,
-      firstSell: null,
-      initialBuys: [],
-      quoteFlows: [],
-      uniqueExternalBuyers: 0,
-      unknownTraderTradeCount: 0,
-    }),
-  };
-}
-
-function holderSnapshotRow(): Record<string, unknown> {
-  return {
-    snapshot_id: 'holder-current',
-    input_fingerprint: 'holder-current',
-    observed_at: detectedAt,
-    confirmation_status: 'confirmed',
-    as_of_slot: '10',
-    as_of_transaction_index: 0,
-    as_of_instruction_index: 1,
-    as_of_inner_instruction_index: null,
-    total_positive_net_base_raw: '0',
-    top1_bps: '0',
-    top5_bps: '0',
-    top10_bps: '0',
-    creator_bps: '0',
-    unique_known_buyers: 0,
-    unique_external_buyers: 0,
-    positive_position_count: 0,
-    unknown_trader_trade_count: 0,
-  };
-}
-
-function graphCoverage(): Record<string, number> {
-  return {
-    knownBuyCount: 3,
-    knownBuyerCount: 3,
-    strongEvidenceBuyCount: 2,
-    strongEvidenceBuyerCount: 2,
-    mediumOnlyBuyCount: 0,
-    mediumOnlyBuyerCount: 0,
-    noEvidenceBuyCount: 0,
-    noEvidenceBuyerCount: 0,
-    unavailableBuyCount: 0,
-    unavailableBuyerCount: 0,
-    notProcessedBuyCount: 1,
-    notProcessedBuyerCount: 1,
-    analyzedTransactionCount: 2,
-    evidenceCount: 2,
-  };
-}
-
-function clusterRow(
-  clusterId: string,
-  concentrationBps: string,
-  memberCount: string,
-  quoteAssetCount = 1,
-): Record<string, unknown> {
-  return {
-    cluster_id: clusterId,
-    quote_assets: Array.from({ length: quoteAssetCount }, (_, index) => ({
-      mint: `quote-mint-${index.toString().padStart(3, '0')}`,
-      decimals: 9,
-      tokenProgram: 'SPL_TOKEN',
-    })),
-    participant_wallet_count: 2,
-    auxiliary_wallet_count: 1,
-    positive_holder_count: 2,
-    observed_positive_base_raw: '75',
-    concentration_bps: concentrationBps,
-    contains_creator: false,
-    shared_funder_count: 1,
-    strong_relationship_count: 2,
-    strong_evidence_count: 2,
-    member_count: memberCount,
-  };
-}
-
-function memberRow(
-  clusterId: string,
-  wallet: string,
-  observedNetBaseRaw: string,
-): Record<string, unknown> {
-  return {
-    cluster_id: clusterId,
-    wallet,
-    member_role: 'PARTICIPANT',
-    is_creator: false,
-    observed_net_base_raw: observedNetBaseRaw,
-    member_rank: '1',
-  };
-}
 
 void test('wraps invalid timeline payload conversion in a safe projection error', async () => {
   const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{
@@ -1327,7 +659,7 @@ void test('loads the current canonical qualification wrapper for the effective p
   };
   const database = new FakeQueryable(() => [canonicalRiskRow(report)]);
   const value = await new PostgresApiProjectionRepository(
-    database, () => new Date(), undefined, undefined,
+    database, () => new Date(), undefined,
     { id: 'rules', version: 1, fingerprint: 'a'.repeat(64) },
   ).getLaunchRisk('mint-a');
   assert.deepEqual(value, {
@@ -1687,9 +1019,6 @@ void test('returns health without exposing database URLs or secrets', async () =
       leased_transactions: 0, exhausted_transactions: 2,
       payload: { blockHydration: blockHydrationMetrics() },
     }];
-    if (call.text.includes('FROM social_enrichment_jobs')) return [{
-      pending_count: 2, leased_count: 1, retryable_failed_count: 3, exhausted_count: 4,
-    }];
     if (call.text.includes('FROM paper_decision_jobs')) return [{
       pending_count: 5, leased_count: 2, retryable_failed_count: 1, exhausted_count: 3,
       last_success_at: openedAt, last_error_code: 'QUOTE_UNAVAILABLE',
@@ -1700,16 +1029,15 @@ void test('returns health without exposing database URLs or secrets', async () =
     return [];
   });
   const repository = new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE',
   });
   const health = await repository.getHealth();
 
   assert.deepEqual(health, {
     status: 'DEGRADED', observedAt: openedAt.toISOString(),
     postgresql: { status: 'AVAILABLE' }, http: { status: 'UNAVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE' },
     qualification: { currentCount: 2, lastSuccessAt: openedAt.toISOString() },
-    socialJobs: { pendingCount: 2, leasedCount: 1, retryableFailedCount: 3, exhaustedCount: 4 },
     paperDecisionJobs: {
       pendingCount: 5, leasedCount: 2, retryableFailedCount: 1, exhaustedCount: 3,
       lastSuccessAt: openedAt.toISOString(), lastErrorCode: 'QUOTE_UNAVAILABLE',
@@ -1826,7 +1154,7 @@ void test('evaluates heartbeat freshness after the causal health snapshot is rea
     return clockValue;
   }, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING',
   });
 
   const health = await repository.getHealth();
@@ -2014,36 +1342,6 @@ void test('redacts malformed WebSocket rows and WebSocket dependency failures', 
   }
 });
 
-void test('degrades only social health when its bounded count projection fails', async () => {
-  const database = new FakeQueryable((call) => {
-    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
-    if (call.text.includes('listener_heartbeats')) return [{
-      updated_at: openedAt, started_at: openedAt, last_http_slot: '60',
-      last_websocket_slot: '60', last_finalized_slot: '59', last_signature: null,
-      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
-      exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
-      scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
-    }];
-    if (call.text.includes('FROM social_enrichment_jobs')) {
-      throw new Error('https://metadata.example/private social count failure');
-    }
-    return [];
-  });
-  const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
-  }).getHealth();
-
-  assert.equal(health.status, 'DEGRADED');
-  assert.equal(health.postgresql.status, 'AVAILABLE');
-  assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'DEGRADED',
-  });
-  assert.deepEqual(health.socialJobs, {
-    pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
-  });
-  assert.doesNotMatch(JSON.stringify(health), /metadata|private|failure|:\/\//u);
-});
-
 void test('degrades only qualification health when its bounded current aggregate fails', async () => {
   const database = new FakeQueryable((call) => {
     if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
@@ -2053,9 +1351,6 @@ void test('degrades only qualification health when its bounded current aggregate
       pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
       exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
       scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
-    }];
-    if (call.text.includes('FROM social_enrichment_jobs')) return [{
-      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
     }];
     if (call.text.includes('FROM paper_decision_jobs')) return [{
       pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
@@ -2068,14 +1363,14 @@ void test('degrades only qualification health when its bounded current aggregate
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
   assert.equal(health.postgresql.status, 'AVAILABLE');
   assert.deepEqual(health.pipeline, {
     pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'DEGRADED',
-    paperDecision: 'RUNNING', social: 'RUNNING',
+    paperDecision: 'RUNNING',
   });
   assert.deepEqual(health.qualification, { currentCount: 0, lastSuccessAt: null });
   assert.doesNotMatch(JSON.stringify(health), /postgres:\/\/|private|failure/u);
@@ -2091,9 +1386,6 @@ void test('degrades only paper health when its bounded queue projection fails', 
       exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
       scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
     }];
-    if (call.text.includes('FROM social_enrichment_jobs')) return [{
-      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
-    }];
     if (call.text.includes('FROM paper_decision_jobs')) {
       throw new Error('postgres://private/paper-count-failure');
     }
@@ -2101,12 +1393,12 @@ void test('degrades only paper health when its bounded queue projection fails', 
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'DEGRADED',
   });
   assert.deepEqual(health.paperDecisionJobs, {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
@@ -2119,7 +1411,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
   const database = new FakeQueryable((call) =>
     call.text.includes('SELECT 1 AS available') ? [{ available: 1 }] : []);
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -2215,14 +1507,14 @@ function healthyHealthDatabase(
 function healthyRepository(database: Queryable): PostgresApiProjectionRepository {
   return new PostgresApiProjectionRepository(database, () => openedAt, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING',
   });
 }
 
 void test('scopes strict catch-up health and checkpoints to active ingestion keys', async () => {
   const launchpadOnlyPipeline: ApiProjectionPipelineState = {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE',
-    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING',
   };
   const marketOnlyFailure = new ScopeAwareHealthQueryable(new Set(['market']));
   const launchpadOnlyHealth = await new PostgresApiProjectionRepository(
@@ -3132,7 +2424,7 @@ void test('degrades stale heartbeats and reads the canonical runtime start colum
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -3154,7 +2446,7 @@ void test('degrades a heartbeat timestamped in the future', async () => {
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -3184,7 +2476,7 @@ void test('rejects invalid heartbeat runtime states and impossible runtime count
       return [];
     });
     const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING',
     }).getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.equal(health.postgresql.status, 'UNAVAILABLE');
@@ -3207,7 +2499,7 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
     () => { throw new Error('pipeline provider secret'); },
     () => ({
       httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-      paperDecision: 'RUNNING', social: 'RUNNING',
+      paperDecision: 'RUNNING',
     }),
     () => getterState,
     () => hostileProxy,
@@ -3218,14 +2510,14 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
       new FakeQueryable(() => { throw new Error('must not query after invalid pipeline'); }),
       () => openedAt,
       provider as () => {
-        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; qualification: 'RUNNING'; paperDecision: 'RUNNING'; social: 'RUNNING';
+        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; qualification: 'RUNNING'; paperDecision: 'RUNNING';
       },
     );
     const health = await repository.getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.deepEqual(health.http, { status: 'UNAVAILABLE' });
     assert.deepEqual(health.pipeline, {
-      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED',
     });
     assert.ok(Object.isFrozen(health.pipeline));
     assert.doesNotMatch(JSON.stringify(health), /secret/u);
@@ -3239,7 +2531,6 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
     httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const,
     qualification: 'RUNNING' as const,
     paperDecision: 'RUNNING' as const,
-    social: 'RUNNING' as const,
   };
   const database = new FakeQueryable((call) => {
     if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
@@ -3262,7 +2553,7 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
   original.pumpfun = 'RUNNING';
   assert.equal(providerCalls, 1);
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING',
   });
   assert.ok(Object.isFrozen(health.pipeline));
   assert.notEqual(health.pipeline, original);
