@@ -108,10 +108,8 @@ Le pipeline actif exécute, dans cet ordre strict :
 create_observation
   -> load_tracked_mints
   -> launchpad_observation
+  -> sync_tracked_mint (mints du launchpad)
   -> reload_active_events
-  -> funding_observation
-  -> participant_analytics (mints en ordre lexical)
-  -> wallet_graph (mints en ordre lexical)
   -> pumpswap_observation
   -> qualification (union des mints affectés, dédupliquée et triée)
   -> paper_decision_enqueue (même ordre lexical)
