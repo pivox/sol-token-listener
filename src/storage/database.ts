@@ -191,12 +191,20 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly domainEvents: number;
   readonly rawChainEvents: number;
   readonly tokenLaunches: number;
+  readonly entryDecisions: number;
 }> {
   const client = await pool.connect();
   let failureCleanupHandled = false;
   try {
     await client.query('BEGIN');
     await client.query(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL);
+    // entry_decisions arrives with migration 064; older schemas have nothing to purge.
+    const entryDecisionsPresent = await client.query<{ readonly present: boolean }>(
+      "SELECT to_regclass('entry_decisions') IS NOT NULL AS present",
+    );
+    const entryDecisions = entryDecisionsPresent.rows[0]?.present === true
+      ? await client.query('DELETE FROM entry_decisions WHERE purge_after <= statement_timestamp()')
+      : { rowCount: 0 };
     const executionIntentsExpiredPreSubmission =
       await expireExecutionIntentsPreSubmissionInTransaction(
         client,
@@ -1000,6 +1008,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       domainEvents: expiredDomainEvents.rowCount ?? 0,
       rawChainEvents: rawEvents.rowCount ?? 0,
       tokenLaunches: launches.rowCount ?? 0,
+      entryDecisions: entryDecisions.rowCount ?? 0,
     };
   } catch (primaryFailure) {
     const cleanupFailures: unknown[] = [];

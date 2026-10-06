@@ -144,7 +144,7 @@ const DOMAIN_EVENT_TYPES = [
   'BondingCurveCompleted', 'QualificationUpdated', 'TradingCandidateUpdated',
   'PaperStrategySessionUpdated', 'PaperExternalBuyCounted', 'PaperPositionOpened',
   'PaperPositionUpdated', 'PaperPositionClosed', 'MigrationObserved',
-  'PumpSwapPoolActivated',
+  'PumpSwapPoolActivated', 'FastEntryDecided',
 ] as const;
 
 describe('frontend-owned API V1 schemas', () => {

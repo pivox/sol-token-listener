@@ -37,6 +37,7 @@ export const domainEventTypeSchema = z.enum([
   'PaperPositionClosed',
   'MigrationObserved',
   'PumpSwapPoolActivated',
+  'FastEntryDecided',
 ]);
 
 const confirmationStatusSchema = z.enum(['processed', 'confirmed', 'finalized', 'orphaned']);

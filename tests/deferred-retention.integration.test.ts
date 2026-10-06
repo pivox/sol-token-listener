@@ -28,6 +28,23 @@ void test('retains expired deferred trades across creation commit and a restarte
   });
 });
 
+void test('purges expired entry decisions and keeps the unexpired ones', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const insert = (id: string, mintValue: string, purgeAfter: string) => pool.query(
+      `INSERT INTO entry_decisions (decision_id, mint, launch_event_id, create_slot, observed_at,
+         decided_at, entry_mode, decision, reason_code, purge_after)
+       VALUES ($1, $2, 'event', 1, NOW() - INTERVAL '3 hours', NOW() - INTERVAL '2 hours',
+         'fast', 'REJECTED', 'QUOTE_UNAVAILABLE', ${purgeAfter})`,
+      [`entry_decision_${id.repeat(64)}`, mintValue],
+    );
+    await insert('a', 'ExpiredMint', "NOW() - INTERVAL '1 hour'");
+    await insert('b', 'KeptMint', "NOW() + INTERVAL '1 hour'");
+    assert.equal((await purgeExpiredFoundationData(pool)).entryDecisions, 1);
+    const rows = await pool.query<{ mint: string }>('SELECT mint FROM entry_decisions');
+    assert.deepEqual(rows.rows.map((row) => row.mint), ['KeptMint']);
+  });
+});
+
 void test('launch proof commits before a waiting trade admission under the shared mint lock',
   async (context) => {
     await withDatabase(context, async (pool) => {

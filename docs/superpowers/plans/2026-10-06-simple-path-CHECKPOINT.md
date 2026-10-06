@@ -22,26 +22,38 @@ Plan lot 1 : `docs/superpowers/plans/2026-10-06-simple-path-lot1-deletions.md`.
   signaux sociaux (paper → WATCHLISTED) ; `docs/api/v1.md` cite encore `participant_analytics` /
   `wallet_graph`.
 
-## Lot 2 — PR ouverte (branche `feat/creates-only`)
+## Lot 2 — terminé
 
-Plan : `docs/superpowers/plans/2026-10-06-simple-path-lot2-creates-only.md`. Fait : scope
-`creates-only` (filtre `NOT_A_CREATE`, scans stricts no-op, pin strict ignoré), migration 063,
-indice `PUMPFUN_CURVE_TRADE` (ordre de claim TRADE < CURVE < POOL), poller réutilisé pour les
-bonding curves (`PostgresTrackedCurveRepository`, PDA dérivée du mint, cap 20, positions live
-d'abord). Suite complète verte (4052/4052 hors skips).
+PR #239 **mergée** (`ec8dbf2`) : scope `creates-only`, migration 063, `PUMPFUN_CURVE_TRADE`, poller
+de bonding curves.
 
-Points ouverts relevés en revue (à traiter dans les lots suivants si besoin) :
-- En `creates-only`, `market_pools` n'est pas alimenté (programme PumpSwap non ingéré) : le poller
-  de pools ne suit donc rien après migration. À régler avant le lot 4 (sortie après migration).
-- Avec l'admission bornée activée, un `create` aux logs ambigus a l'indice NONE → filtré
-  `NOT_A_CREATE` (perte acceptée par la spec).
-- Charge RPC : 2-6 `getSignaturesForAddress` par curve et par cycle (≤ 20 curves / 10 s).
+## Lot 3 — PR ouverte (branche `feat/fast-entry`)
+
+Plan : `docs/superpowers/plans/2026-10-06-simple-path-lot3-fast-entry.md` (voir ses « Deviations »).
+Fait : `ENTRY_MODE=off|fast` (fast exige `creates-only`), migration 064 (`entry_decisions`,
+`execution_entry_envelopes` avancée depuis le lot 4, `FastEntryDecided`), règles pures, repository
+(écriture BUY atomique : événement + intent `fast-entry-v1` TTL 30 s + décision), service appelé après
+le pipeline observé (hors stage, erreurs journalisées), garde de fraîcheur 15 s, rétention des
+décisions (7 j), droits listener (colonnes d'enveloppe en lecture seule) et rétention.
+
+## Points ouverts pour le lot 4
+
+- Lignage exécuteur : `EXECUTION_INTENT_CURRENT_LINEAGE_SQL` exige candidat paper +
+  `PaperStrategySessionUpdated` ; à étendre pour `fast-entry-v1`.
+- Enveloppe : CLI create/revoke/show, compteurs (`buys_armed` à l'armement, perte réalisée), colonnes
+  `scope`/`envelope_id` de la qualification (065). Tant que la lane `arm` n'existe pas, ne pas activer
+  `ENTRY_MODE=fast` avec un exécuteur live : chaque create accepté produit un intent PENDING.
+- Les événements `FastEntryDecided` n'ont pas de `purge_after` (comme les événements paper) ; si on
+  les purge un jour, garder la suppression de `domain_events` contre `execution_intents`.
+- `creates-only` n'alimente pas `market_pools` : rien n'est suivi après migration (sortie lot 4).
+- Avec l'admission bornée, un `create` aux logs ambigus est filtré `NOT_A_CREATE`.
+- Charge RPC du poller de curves : 2-6 `getSignaturesForAddress` par curve et par cycle.
 
 ## Ensuite
 
-- Lot 3 : entrée rapide, `entry_decisions`, `FastEntryDecided`, `ENTRY_MODE`, migration 064
-  (voir la spec). Plan à écrire dans `docs/superpowers/plans/2026-10-06-simple-path-lot3-fast-entry.md`.
-- Lots 4-5 : voir la spec.
+- Lot 4 : exécuteur (enveloppe + CLI, qualification `ENVELOPE`, lane `arm`, lane `exit`, clé
+  étrangère de l'échéance, CLI `report`, migration 065). Plan à écrire.
+- Lot 5 : premier run réel (K = 1, enveloppe minimale) — accord explicite de l'opérateur requis.
 
 ## Environnement
 

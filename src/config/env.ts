@@ -25,6 +25,7 @@ export type PaperStrategyId = 'validated-external-buys' | 'creation-entry-v1';
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
 export type ListenerCatchUpPolicy = 'live-edge' | 'strict';
 export type ListenerIngestionScope = 'launchpad-only' | 'launchpad-and-market' | 'creates-only';
+export type EntryMode = 'off' | 'fast' | 'dossier';
 
 export interface AppConfig {
   readonly cluster: string;
@@ -71,6 +72,7 @@ export interface AppConfig {
   readonly listenerPumpFunCatchUpPageAdmissionEnabled: boolean;
   readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
+  readonly entryMode: EntryMode;
   readonly listenerTrackedPoolPollEnabled: boolean;
   readonly listenerTrackedPoolPollIntervalMs: number;
   readonly expectedGenesisHash: string | null;
@@ -257,6 +259,11 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     'LISTENER_INGESTION_SCOPE',
     ['launchpad-only', 'launchpad-and-market', 'creates-only'],
   );
+  const entryMode = parseClosedLiteral(environment.ENTRY_MODE, 'off', 'ENTRY_MODE', ['off', 'fast', 'dossier']);
+  if (entryMode === 'dossier') throw new Error('ENTRY_MODE=dossier is not implemented yet.');
+  if (entryMode === 'fast' && listenerIngestionScope !== 'creates-only') {
+    throw new Error('ENTRY_MODE=fast requires LISTENER_INGESTION_SCOPE=creates-only.');
+  }
   if (listenerWorkerCount > 1 && (
     !blockHydration.listenerBlockHydrationEnabled
     || listenerIngestionScope !== 'launchpad-only'
@@ -354,6 +361,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerPumpFunCatchUpPageAdmissionEnabled,
     listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,
+    entryMode,
     listenerTrackedPoolPollEnabled: parseBoolean(
       environment.LISTENER_TRACKED_POOL_POLL_ENABLED, false, 'LISTENER_TRACKED_POOL_POLL_ENABLED',
     ),

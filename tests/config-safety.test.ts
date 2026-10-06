@@ -1363,3 +1363,31 @@ void test('qualification loader, evaluator, profile, and public API boundaries e
   assert.equal(policy('ROUND_TRIP_LOSS_EXCEEDED')?.mode, 'ENFORCED');
   assert.equal(policy('ROUND_TRIP_LOSS_EXCEEDED')?.maximumRoundTripLossBps, 3_000);
 });
+
+void test('ENTRY_MODE vaut off par defaut et accepte fast avec creates-only', () => {
+  assert.equal(parseConfig(base).entryMode, 'off');
+  assert.equal(
+    parseConfig({ ...base, ENTRY_MODE: 'fast', LISTENER_INGESTION_SCOPE: 'creates-only' }).entryMode,
+    'fast',
+  );
+});
+
+void test('ENTRY_MODE=fast exige le scope creates-only', () => {
+  for (const scope of ['launchpad-only', 'launchpad-and-market']) {
+    assert.throws(
+      () => parseConfig({ ...base, ENTRY_MODE: 'fast', LISTENER_INGESTION_SCOPE: scope }),
+      /ENTRY_MODE=fast requires LISTENER_INGESTION_SCOPE=creates-only\./u,
+    );
+  }
+});
+
+void test('ENTRY_MODE refuse dossier et les valeurs inconnues', () => {
+  assert.throws(
+    () => parseConfig({ ...base, ENTRY_MODE: 'dossier' }),
+    /ENTRY_MODE=dossier is not implemented yet\./u,
+  );
+  assert.throws(
+    () => parseConfig({ ...base, ENTRY_MODE: 'turbo' }),
+    /ENTRY_MODE has an unsupported value\./u,
+  );
+});

@@ -94,6 +94,7 @@ import {
   type EpochTransactionBlockRpc,
 } from '../solana/rpc/block-transaction-cache.js';
 import { getDatabasePool } from '../storage/database.js';
+import { PostgresFastEntryRepository } from '../storage/fast-entry.repository.js';
 import { PostgresLaunchpadEventRepository } from '../storage/launchpad-event.repository.js';
 import { PostgresMarketObservationRepository } from '../storage/market-observation.repository.js';
 import { PostgresPaperDecisionRepository } from '../storage/paper-decision.repository.js';
@@ -118,6 +119,7 @@ import { createFinalityReconcilerDiagnosticSink } from './finality-reconciler-di
 import { listenerIngestionPrograms } from './listener-ingestion-programs.js';
 import { LaunchpadObservationService } from './launchpad-observation.service.js';
 import { MarketObservationService } from './market-observation.service.js';
+import { DefaultFastEntryService } from './fast-entry.service.js';
 import { ObservedTransactionPipeline } from './observed-transaction-pipeline.js';
 import { PumpSwapObservationPipeline } from './pumpswap-observation-pipeline.js';
 import { SolanaListenerRuntime } from './listener-runtime.js';
@@ -562,9 +564,10 @@ export function createProductionListenerRuntime(
     qualificationRebuilder,
     config.paperQuoteMintAllowlist,
   );
+  const pumpFunQuotes = new PumpFunPaperQuoteProvider(marketRpc);
   const quoteRouter = new CanonicalPaperQuoteRouter(
     new PostgresPaperVenueReader(() => rpc.getSlot(), databasePool),
-    new PumpFunPaperQuoteProvider(marketRpc),
+    pumpFunQuotes,
     market,
     {
       maxAgeMs: config.paperQuoteMaxAgeMs,
@@ -637,6 +640,19 @@ export function createProductionListenerRuntime(
       },
     },
   );
+  const fastEntry = config.entryMode === 'fast'
+    ? new DefaultFastEntryService({
+      repository: new PostgresFastEntryRepository(databasePool),
+      quotes: pumpFunQuotes,
+      maximumRoundTripLossBps: BigInt(config.riskMaxRoundTripLossBps),
+      onDecision: (event): void => {
+        logger.info({ event: 'listener.fast_entry_decision', ...event }, 'Décision d\'entrée rapide.');
+      },
+      onError: (event): void => {
+        logger.warn({ event: 'listener.fast_entry_error', ...event }, 'Entrée rapide en erreur.');
+      },
+    })
+    : null;
   const pipeline = new ObservedTransactionPipeline(
     launchpadRepository,
     launchpad,
@@ -644,6 +660,7 @@ export function createProductionListenerRuntime(
     paperRepository,
     qualification,
     inbox,
+    fastEntry,
   );
 
   const workerPhaseRecorder = new WorkerPhaseDiagnosticRecorder();

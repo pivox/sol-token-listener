@@ -10,6 +10,7 @@ import {
   createTokenLaunchDetectedEvent,
 } from '../domain/launchpad-events.js';
 import type { LaunchpadObservationEventV1 } from '../domain/launchpad-events.js';
+import type { FastEntryService } from './fast-entry.service.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { LaunchpadEventBatchResult } from '../ports/launchpad-event-sink.js';
 import type { LaunchpadProjectionReader } from '../ports/launchpad-projection-reader.js';
@@ -108,6 +109,7 @@ export class ObservedTransactionPipeline {
     private readonly paperDecisions: PaperDecisionScheduler | null = null,
     private readonly qualification: MintProjectionRebuilder | null = null,
     private readonly trackedMintInbox: TrackedMintInboxSynchronizer | null = null,
+    private readonly fastEntry: Pick<FastEntryService, 'onObserved'> | null = null,
   ) {}
 
   public async process(
@@ -161,6 +163,12 @@ export class ObservedTransactionPipeline {
           ));
         paperDecisionEnqueueCount += 1;
       }
+    }
+    if (this.fastEntry !== null && launchpad.affectedMints.length > 0) {
+      // Never a stage: entry must not fail or retry the observation.
+      try {
+        await this.fastEntry.onObserved(observed.signature, affectedMintList([], launchpad.affectedMints));
+      } catch { /* the service logs its own errors */ }
     }
     return Object.freeze({
       launchpadEventCount: launchpad.eventCount,

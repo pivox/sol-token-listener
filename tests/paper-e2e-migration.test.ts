@@ -36,7 +36,7 @@ void test('updates the public outbox enum and replayable backfill for every doma
   assert.match(sql, /DROP CONSTRAINT[\s\S]*event_type/iu);
   assert.deepEqual(
     sqlStringListAfter(sql, 'ADD CONSTRAINT api_event_stream_event_type_check CHECK (event_type IN ('),
-    DOMAIN_EVENT_TYPES,
+    DOMAIN_EVENT_TYPES.filter((type) => type !== 'FastEntryDecided'),
   );
   for (const type of [
     'TradingCandidateUpdated', 'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
