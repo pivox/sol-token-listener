@@ -242,7 +242,7 @@ const CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, string>> = 
       OR (processing_status='PROCESSING' AND lease_expires_at<=$1
         AND attempts_in_cycle<retry_max_attempts)
     )
-    ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+    ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),(ingestion_hint='PUMPFUN_CURVE_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
 });
 
 // Keep the legacy queries stable (the only later change is the TRACKED_TRADE
@@ -281,7 +281,7 @@ const ADMITTED_CLAIM_CANDIDATE_SQL: Readonly<Record<TransactionInboxPriority, st
       OR (processing_status='PROCESSING' AND lease_expires_at<=$1
         AND attempts_in_cycle<retry_max_attempts)
     )
-    ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
+    ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),(ingestion_hint='PUMPFUN_CURVE_TRADE'),observed_slot,signature FOR UPDATE SKIP LOCKED LIMIT 1`,
 });
 
 export interface TransactionInboxRetryPolicy {
@@ -589,7 +589,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
         // All trade paths lock mint -> signature -> inbox row. The projection
         // synchronizer locks mint -> rows, so no row holder waits for a mint.
-        if (value.ingestionHint === 'PUMPFUN_TRADE' || value.ingestionHint === 'PUMPSWAP_POOL_TRADE') {
+        if (value.ingestionHint === 'PUMPFUN_TRADE' || value.ingestionHint === 'PUMPFUN_CURVE_TRADE'
+          || value.ingestionHint === 'PUMPSWAP_POOL_TRADE') {
           if (value.ingestionHintMint === null) throw new TypeError('Tracked mint is missing.');
           await lockWorkerTrackingMints(client, [value.ingestionHintMint]);
         }
@@ -1462,7 +1463,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
        JOIN tracked_preview AS preview
          ON preview.signature=inbox.signature AND preview.mint=inbox.ingestion_hint_mint
        WHERE inbox.ingestion_priority='TRACKED_TRADE'
-         AND inbox.ingestion_hint IN ('PUMPFUN_TRADE','PUMPSWAP_POOL_TRADE')
+         AND inbox.ingestion_hint IN ('PUMPFUN_TRADE','PUMPFUN_CURVE_TRADE','PUMPSWAP_POOL_TRADE')
          AND inbox.ingestion_hint_mint=ANY($3::TEXT[])
          AND inbox.worker_admitted_at IS NOT NULL AND (
            (inbox.processing_status='PENDING'
@@ -1473,7 +1474,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            OR (inbox.processing_status='PROCESSING' AND inbox.lease_expires_at<=$1
              AND inbox.attempts_in_cycle<inbox.retry_max_attempts)
          ) AND ${workerAdmissionClaimAuthoritySql('inbox')}
-       ORDER BY (inbox.ingestion_hint='PUMPSWAP_POOL_TRADE'),inbox.observed_slot,inbox.signature
+       ORDER BY (inbox.ingestion_hint='PUMPSWAP_POOL_TRADE'),(inbox.ingestion_hint='PUMPFUN_CURVE_TRADE'),inbox.observed_slot,inbox.signature
        FOR UPDATE OF inbox SKIP LOCKED LIMIT 1`,
       [now, workerAdmissionClaimPlan.trackedSignatures,
         workerAdmissionClaimPlan.trackedMints,
@@ -1561,7 +1562,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
          OR (processing_status='PROCESSING' AND lease_expires_at<=$1
            AND attempts_in_cycle<retry_max_attempts)
        )
-       ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),observed_slot,signature LIMIT $2`,
+       ORDER BY (ingestion_hint='PUMPSWAP_POOL_TRADE'),(ingestion_hint='PUMPFUN_CURVE_TRADE'),observed_slot,signature LIMIT $2`,
       [now, MAX_WORKER_ADMISSION_DEMOTIONS_PER_CLAIM],
     );
     const demotionSignatures = demotionPreview.rows.map((row) => requiredText(
@@ -1688,7 +1689,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         `SELECT EXISTS (
            SELECT 1 FROM chain_transaction_inbox
            WHERE $1 = ANY(program_ids)
-             AND ingestion_hint <> 'PUMPSWAP_POOL_TRADE'
+             AND ingestion_hint NOT IN ('PUMPFUN_CURVE_TRADE','PUMPSWAP_POOL_TRADE')
              AND NOT (
                processing_status='PROCESSED'
                AND target_confirmation_status IN ('finalized','orphaned')
@@ -4218,8 +4219,8 @@ function convergeIngestion(
     } else {
       priority = current?.priority ?? 'NORMAL';
     }
-  } else if (hint === 'PUMPSWAP_POOL_TRADE') {
-    // The pool poller only enqueues pools whose mint is already tracked.
+  } else if (hint === 'PUMPFUN_CURVE_TRADE' || hint === 'PUMPSWAP_POOL_TRADE') {
+    // The pollers only enqueue addresses whose mint is already tracked.
     priority = 'TRACKED_TRADE';
     if (status === 'DEFERRED') status = 'PENDING';
   }
@@ -4310,13 +4311,16 @@ function storedIngestionDecision(row: InboxIdentityRow): IngestionDecision {
   const hint = row.ingestion_hint;
   const mint = row.ingestion_hint_mint;
   if (hint !== 'NONE' && hint !== 'PUMPFUN_CREATE' && hint !== 'PUMPFUN_TRADE'
-    && hint !== 'PUMPSWAP_POOL_TRADE') {
+    && hint !== 'PUMPFUN_CURVE_TRADE' && hint !== 'PUMPSWAP_POOL_TRADE') {
     throw new TypeError('Stored ingestion hint is invalid.');
   }
-  if (hint === 'PUMPFUN_TRADE' || hint === 'PUMPSWAP_POOL_TRADE') assertCanonicalMint(mint);
+  if (hint === 'PUMPFUN_TRADE' || hint === 'PUMPFUN_CURVE_TRADE' || hint === 'PUMPSWAP_POOL_TRADE') {
+    assertCanonicalMint(mint);
+  }
   else if (mint !== null) throw new TypeError('Stored ingestion hint mint is invalid.');
   if ((priority === 'LAUNCH_CANDIDATE') !== (hint === 'PUMPFUN_CREATE')
-    || (priority === 'TRACKED_TRADE' && hint !== 'PUMPFUN_TRADE' && hint !== 'PUMPSWAP_POOL_TRADE')) {
+    || (priority === 'TRACKED_TRADE' && hint !== 'PUMPFUN_TRADE'
+      && hint !== 'PUMPFUN_CURVE_TRADE' && hint !== 'PUMPSWAP_POOL_TRADE')) {
     throw new TypeError('Stored ingestion priority contradicts its hint.');
   }
   if (status === 'DEFERRED' && (hint !== 'PUMPFUN_TRADE' || priority !== 'NORMAL'
