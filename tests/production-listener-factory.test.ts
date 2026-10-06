@@ -919,6 +919,7 @@ void test('production creates one bounded admission policy and injects it as the
   assert.match(source, /new PostgresTransactionInboxRepository\(databasePool, Object\.freeze\(\{[^}]*\}\), workerAdmissionPolicy\)/u);
   assert.match(source, /openWsProgramSession\(\s*endpoint,\s*observe,\s*signal,\s*\{\s*programs: ingestionPrograms,\s*workerAdmissionEnabled: workerAdmissionPolicy\.enabled,\s*createsOnly,\s*\}/u);
   assert.match(source, /if \(createsOnly \|\| config\.listenerCatchUpPolicy !== 'live-edge'\) return;/u);
+  assert.match(source, /readPinnedProviderId: \(signal\): Promise<RpcProviderId \| null> => \(createsOnly\s*\? Promise\.resolve\(null\)/u);
   assert.match(source, /runStrictScan:[^\n]*\n[^\n]*\n\s*if \(createsOnly\) \{\s*return Promise\.resolve\(Object\.freeze\(\{/u);
   assert.match(source, /inboxSnapshot:\s*\(\):\s*ReturnType<PostgresTransactionInboxRepository\['heartbeatSnapshot'\]>\s*=>\s*inbox\.heartbeatSnapshot\(\)/u);
 });

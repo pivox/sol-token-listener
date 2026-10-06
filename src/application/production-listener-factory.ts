@@ -438,7 +438,10 @@ export function createProductionListenerRuntime(
       health: websocketHealth,
       reporter: websocketReporter,
       promoted,
-      readPinnedProviderId: (signal): Promise<RpcProviderId | null> => strictAffinity.readPinnedProviderId(signal),
+      // creates-only never runs strict catch-up, so a run left by another scope must not pin it.
+      readPinnedProviderId: (signal): Promise<RpcProviderId | null> => (createsOnly
+        ? Promise.resolve(null)
+        : strictAffinity.readPinnedProviderId(signal)),
       verifyProviderGenesis: (providerId, signal): Promise<void> => {
         const source = pinnedCatchUpSources.get(providerId);
         if (source === undefined) {
