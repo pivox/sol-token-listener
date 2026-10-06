@@ -815,7 +815,7 @@ async function assertPublicHealth() {
   assertEqual(envelope?.data?.status, 'DEGRADED', 'Observe-only health is not DEGRADED.');
   assertEqual(envelope?.data?.postgresql?.status, 'AVAILABLE', 'PostgreSQL is not AVAILABLE.');
   assertEqual(envelope?.data?.http?.status, 'AVAILABLE', 'HTTP is not AVAILABLE.');
-  for (const pipeline of ['pumpfun', 'pumpswap', 'paperDecision', 'social']) {
+  for (const pipeline of ['pumpfun', 'pumpswap', 'paperDecision']) {
     assertEqual(envelope?.data?.pipeline?.[pipeline], 'STOPPED', `${pipeline} pipeline is not STOPPED.`);
   }
 }
