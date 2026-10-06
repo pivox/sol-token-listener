@@ -239,7 +239,9 @@ remplace le minimum effectif lorsqu'il est défini (de 0 à 100). En son absence
 le minimum du profil sélectionné est conservé; celui du profil initial vaut 60. Le
 profil initial porte le statut `UNVALIDATED_RULE_SET`: c'est une calibration
 initiale NONVALIDATED, pas une calibration officiellement ou
-empiriquement validée.
+empiriquement validée. Les conditions `REPORT_ONLY` sont rapportées avec leurs
+preuves mais ne peuvent ajouter aucun blocker ni modifier le verdict ou la
+décision paper.
 
 Le chargeur construit un fingerprint SHA-256 du profil canonique effectif,
 donc y compris le remplacement `QUALIFICATION_MIN_SCORE`; le fingerprint est
