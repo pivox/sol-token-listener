@@ -6,6 +6,7 @@ import type {
   UndefinedInitialDataOptions,
 } from '@tanstack/react-query';
 import type { ApiClient, ApiPage, PageInput } from './api-client.js';
+import type { OperatorClient, OperatorOverviewPage } from './operator-client.js';
 import type {
   ApiHealth,
   ApiHolders,
@@ -136,6 +137,26 @@ export function healthQuery(client: ApiClient): StandardOptions<ApiHealth, typeo
     queryKey: queryKeys.health,
     queryFn: async ({ signal }) => await client.getHealth({ signal }),
     refetchInterval: 10_000,
+    ...retryOptions,
+  });
+}
+
+export function liveOverviewInfiniteQuery(
+  client: OperatorClient,
+  limit = DEFAULT_PAGE_SIZE,
+): UndefinedInitialDataInfiniteOptions<
+  OperatorOverviewPage,
+  Error,
+  InfiniteData<OperatorOverviewPage, string | null>,
+  typeof queryKeys.liveOverview,
+  string | null
+> {
+  return infiniteQueryOptions({
+    queryKey: queryKeys.liveOverview,
+    queryFn: async ({ pageParam, signal }) => await client.getLiveOverview(pageInput(pageParam, signal, limit)),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    refetchInterval: 15_000,
     ...retryOptions,
   });
 }

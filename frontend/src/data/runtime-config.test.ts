@@ -23,6 +23,33 @@ describe('loadRuntimeConfig', () => {
     }));
   });
 
+  it('loads an optional operator API URL with the same normalization and leaves it absent otherwise', async () => {
+    const withOperator = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({
+      apiBaseUrl: 'https://api.example.test',
+      operatorApiBaseUrl: 'http://127.0.0.1:3100/',
+    })));
+    await expect(loadRuntimeConfig(withOperator)).resolves.toEqual({
+      apiBaseUrl: 'https://api.example.test',
+      operatorApiBaseUrl: 'http://127.0.0.1:3100',
+    });
+    const without = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({
+      apiBaseUrl: 'https://api.example.test',
+    })));
+    expect(await loadRuntimeConfig(without)).not.toHaveProperty('operatorApiBaseUrl');
+  });
+
+  it.each([
+    ['relative URL', '/operator'],
+    ['credentials', 'https://user:password@operator.example.test'],
+    ['query', 'https://operator.example.test?token=value'],
+    ['javascript scheme', 'javascript:alert(1)'],
+  ])('rejects an operator API URL with %s', async (_label, operatorApiBaseUrl) => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({
+      apiBaseUrl: 'https://api.example.test', operatorApiBaseUrl,
+    })));
+    await expect(loadRuntimeConfig(fetchFn)).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+  });
+
   it('uses an injected canonical origin when the public API URL is exactly root', async () => {
     const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({ apiBaseUrl: '/' })));
 

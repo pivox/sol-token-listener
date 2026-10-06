@@ -11,6 +11,7 @@ export const queryKeys = Object.freeze({
   holders: (mint: string): QueryKey => ['launches', mint, 'holders'],
   paperPositions: Object.freeze({ all: ['paper-positions'] as const }),
   health: ['health'] as const,
+  liveOverview: ['live', 'overview'] as const,
 });
 
 const HOLDER_EVENTS = new Set<ApiSseEvent['type']>([
