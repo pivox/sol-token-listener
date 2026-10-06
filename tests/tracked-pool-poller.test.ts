@@ -89,7 +89,11 @@ function harness(pools: TrackedPool[], scripts: Record<string, PoolScript>) {
       scheduled.push({ callback, delayMs, handle });
       return handle;
     },
-    cancel: (handle: unknown) => { cancelled.push(handle); },
+    cancel: (handle: unknown) => {
+      cancelled.push(handle);
+      const index = scheduled.findIndex((entry) => entry.handle === handle);
+      if (index !== -1) scheduled.splice(index, 1);
+    },
   };
   const poller = new TrackedPoolPoller({
     repository,
@@ -238,6 +242,52 @@ void test('invalid pages fail the pool while other pools continue', async () => 
     assert.deepEqual(h.enqueued.map((entry) => entry.signature), ['b1']);
     assert.equal(h.poolReports.find((entry) => entry.poolAddress === POOL_A)?.outcome, 'FAILED');
   }
+});
+
+void test('a non-finalized row fails the pool without enqueue or checkpoint change', async () => {
+  const h = harness([trackedPool(POOL_A, MINT_A)], {
+    [POOL_A]: historyScript([
+      row('a', 120), { ...row('b', 110), confirmationStatus: 'confirmed' }, row('cp', 100),
+    ]),
+  });
+  h.checkpoints.set(POOL_A, { signature: 'cp', slot: 100n });
+  await h.poller.start();
+  assert.equal(h.cycles[0]?.failed, 1);
+  assert.equal(h.enqueued.length, 0);
+  assert.equal(h.stored.length, 0);
+});
+
+void test('failed transactions are not enqueued but still advance the checkpoint', async () => {
+  const h = harness([trackedPool(POOL_A, MINT_A)], {
+    [POOL_A]: historyScript([
+      { ...row('f', 130), err: { InstructionError: [0, 'Custom'] } }, row('ok', 120), row('cp', 100),
+    ]),
+  });
+  h.checkpoints.set(POOL_A, { signature: 'cp', slot: 100n });
+  await h.poller.start();
+  assert.equal(h.cycles[0]?.succeeded, 1);
+  assert.deepEqual(h.enqueued.map((entry) => entry.signature), ['ok']);
+  assert.deepEqual(h.stored, [{ pool: POOL_A, value: { signature: 'f', slot: 130n } }]);
+});
+
+void test('a timed-out sweep makes no further rpc call for that pool', async () => {
+  let releasePage: (value: unknown[]) => void = () => undefined;
+  const pageGate = new Promise<unknown[]>((resolve) => { releasePage = resolve; });
+  const h = harness([trackedPool(POOL_A, MINT_A)], {
+    // The harness resolves the script result, so a pending promise makes the first page hang.
+    [POOL_A]: () => (h.calls.length === 1 ? pageGate as unknown as unknown[] : []),
+  });
+  h.checkpoints.set(POOL_A, { signature: 'cp', slot: 100n });
+  const starting = h.poller.start();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  const sweepTimeout = h.scheduled.find((entry) => entry.delayMs === 30_000);
+  assert.ok(sweepTimeout !== undefined, 'the sweep timeout runs on the injected scheduler');
+  sweepTimeout.callback();
+  await starting;
+  assert.equal(h.poolReports[0]?.outcome, 'FAILED');
+  releasePage([]);
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(h.calls.length, 1, 'no probe after the timeout fired');
 });
 
 void test('an rpc error isolates the pool and a selection error fails the cycle', async () => {

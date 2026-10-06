@@ -26,6 +26,12 @@ void test('validator accepts PUMPSWAP_POOL_TRADE catch-up notifications only wit
     })); },
     /catch-up/u,
   );
+  assert.throws(
+    () => { assertValidTransactionNotification(Object.freeze({
+      ...poolTrade('pool-trade-websocket', 1n), source: 'WEBSOCKET',
+    })); },
+    /ingestion hint is invalid/u,
+  );
 });
 
 void test('stores a PUMPSWAP_POOL_TRADE notification as a pending tracked trade, idempotently', async (context) => {

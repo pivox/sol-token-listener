@@ -126,7 +126,7 @@ export class TrackedPoolPoller {
     const running = this.inFlight;
     if (running !== null) {
       const settled = running.then(() => 'complete' as const, () => 'complete' as const);
-      if (await withTimeout(settled, this.options.shutdownTimeoutMs) === 'timeout') {
+      if (await withTimeout(settled, this.options.shutdownTimeoutMs, this.options.scheduler) === 'timeout') {
         this.currentState = 'DEGRADED';
         throw new Error('Tracked pool poller close timed out.');
       }
@@ -173,7 +173,11 @@ export class TrackedPoolPoller {
     const progress: PollResult = { outcome: 'FAILED', pageCount: 0, signaturesRead: 0, enqueued: 0 };
     let error: unknown = null;
     try {
-      const result = await withTimeout(this.pollPool(pool, progress, deadline), SWEEP_TIMEOUT_MS);
+      const result = await withTimeout(
+        this.pollPool(pool, progress, deadline),
+        SWEEP_TIMEOUT_MS,
+        this.options.scheduler,
+      );
       if (result === 'timeout') {
         deadline.expired = true;
         error = new Error('Tracked pool sweep timed out.');
@@ -225,6 +229,7 @@ export class TrackedPoolPoller {
     const seen = new Set<string>([checkpoint.signature]);
     let reachedEnd = false;
     while (progress.pageCount < MAX_PAGES) {
+      assertNotExpired(deadline);
       const before = rows.at(-1)?.signature;
       const page = snapshotCatchUpPage(
         await rpc.getSignaturesForAddress(
@@ -239,7 +244,8 @@ export class TrackedPoolPoller {
       for (const entry of page) {
         const previousSlot = rows.at(-1)?.slot;
         if ((previousSlot !== undefined && entry.slot > previousSlot)
-          || entry.slot < checkpoint.slot || seen.has(entry.signature)) {
+          || entry.slot < checkpoint.slot || seen.has(entry.signature)
+          || entry.confirmationStatus !== 'finalized') {
           throw new Error('Tracked pool signature page is inconsistent.');
         }
         seen.add(entry.signature);
@@ -250,6 +256,7 @@ export class TrackedPoolPoller {
         break;
       }
     }
+    assertNotExpired(deadline);
     const probe = snapshotCatchUpPage(
       await rpc.getSignaturesForAddress(
         address,
@@ -264,6 +271,7 @@ export class TrackedPoolPoller {
     if (!confirmed) return reachedEnd ? 'AWAITING_BOUNDARY' : 'WINDOW_EXCEEDED';
     for (const entry of rows) {
       if (deadline.expired) throw new Error('Tracked pool sweep timed out.');
+      if (entry.transactionFailed) continue;
       await this.options.inbox.enqueue(Object.freeze({
         signature: entry.signature,
         slot: entry.slot,
@@ -288,16 +296,24 @@ export class TrackedPoolPoller {
   }
 }
 
-async function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T | 'timeout'> {
-  let handle: ReturnType<typeof setTimeout> | undefined;
+async function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  scheduler: TrackedPoolPollerOptions['scheduler'],
+): Promise<T | 'timeout'> {
+  let handle: unknown;
   const timeout = new Promise<'timeout'>((resolve) => {
-    handle = setTimeout(() => { resolve('timeout'); }, timeoutMs);
+    handle = scheduler.schedule(() => { resolve('timeout'); }, timeoutMs);
   });
   try {
     return await Promise.race([operation, timeout]);
   } finally {
-    if (handle !== undefined) clearTimeout(handle);
+    scheduler.cancel(handle);
   }
+}
+
+function assertNotExpired(deadline: { readonly expired: boolean }): void {
+  if (deadline.expired) throw new Error('Tracked pool sweep timed out.');
 }
 
 function errorName(error: unknown): string {

@@ -782,9 +782,7 @@ export function createProductionListenerRuntime(
       void poller?.start();
     },
     async close(): Promise<void> {
-      await poller?.close();
-      attemptBudget?.close();
-      return runtime.close();
+      try { await poller?.close(); } finally { attemptBudget?.close(); await runtime.close(); }
     },
     state: () => runtime.state(),
     pipelineState: () => runtime.pipelineState(),

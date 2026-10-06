@@ -488,7 +488,8 @@ export function assertValidTransactionNotification(
   if (record.source !== 'WEBSOCKET' && record.source !== 'CATCH_UP') {
     throw new TypeError('Transaction notification source is invalid.');
   }
-  if (!isValidIngestionHintPair(record.ingestionHint, record.ingestionHintMint)) {
+  if (!isValidIngestionHintPair(record.ingestionHint, record.ingestionHintMint)
+    || (record.ingestionHint === 'PUMPSWAP_POOL_TRADE' && record.source !== 'CATCH_UP')) {
     throw new TypeError('Transaction notification ingestion hint is invalid.');
   }
   // Pool poller catch-up rows carry a tracked mint; the pair check covers it.
