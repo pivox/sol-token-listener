@@ -464,7 +464,7 @@ void test('publishes exact frozen ingestion status constants', () => {
     'DECODER_RECOVERY_NOT_ELIGIBLE',
   ]);
   assert.ok(Object.isFrozen(DECODER_RECOVERY_RESULT_CODES));
-  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE']);
+  assert.deepEqual(TRANSACTION_INGESTION_HINTS, ['NONE', 'PUMPFUN_CREATE', 'PUMPFUN_TRADE', 'PUMPSWAP_POOL_TRADE']);
   assert.ok(Object.isFrozen(TRANSACTION_INGESTION_HINTS));
 });
 

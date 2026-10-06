@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { readFile, readdir } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase as migrateAll } from '../src/storage/database.js';
 
 const migrations = new URL('../migrations/', import.meta.url);
 const previousMigrationName = '058_transaction_inbox_funding_attribution.sql';
@@ -144,6 +146,19 @@ void test('059 rejects adjacent codes, wrong stages, null bypasses and incompati
     }
   });
 });
+
+// Replay this historical migration against its own head, not later extensions.
+async function migrateDatabase({ pool }: { pool: pg.Pool }): Promise<readonly string[]> {
+  const directory = await mkdtemp(join(tmpdir(), 'qualification-migration-'));
+  try {
+    for (const name of (await readdir(migrations)).filter((name) => name <= migrationName)) {
+      await copyFile(new URL(name, migrations), join(directory, name));
+    }
+    return await migrateAll({ pool, migrationsDirectory: directory });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
 
 async function insertParent(pool: pg.Pool, signature: string): Promise<void> {
   await pool.query(`INSERT INTO chain_transaction_inbox

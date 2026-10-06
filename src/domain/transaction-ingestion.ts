@@ -95,6 +95,7 @@ export const TRANSACTION_INGESTION_HINTS = Object.freeze([
   'NONE',
   'PUMPFUN_CREATE',
   'PUMPFUN_TRADE',
+  'PUMPSWAP_POOL_TRADE',
 ] as const);
 
 export const TRANSACTION_INGESTION_ERROR_CODES = Object.freeze([
@@ -487,10 +488,12 @@ export function assertValidTransactionNotification(
   if (record.source !== 'WEBSOCKET' && record.source !== 'CATCH_UP') {
     throw new TypeError('Transaction notification source is invalid.');
   }
-  if (!isValidIngestionHintPair(record.ingestionHint, record.ingestionHintMint)) {
+  if (!isValidIngestionHintPair(record.ingestionHint, record.ingestionHintMint)
+    || (record.ingestionHint === 'PUMPSWAP_POOL_TRADE' && record.source !== 'CATCH_UP')) {
     throw new TypeError('Transaction notification ingestion hint is invalid.');
   }
-  if (record.source === 'CATCH_UP'
+  // Pool poller catch-up rows carry a tracked mint; the pair check covers it.
+  if (record.source === 'CATCH_UP' && record.ingestionHint !== 'PUMPSWAP_POOL_TRADE'
     && (record.ingestionHint !== null || record.ingestionHintMint !== null)) {
     throw new TypeError('Transaction notification ingestion hint is invalid for catch-up.');
   }
@@ -504,7 +507,7 @@ export function assertValidTransactionNotification(
 function isValidIngestionHintPair(hint: unknown, mint: unknown): boolean {
   if (hint === null && mint === null) return true;
   if (hint === 'PUMPFUN_CREATE' && mint === null) return true;
-  return hint === 'PUMPFUN_TRADE'
+  return (hint === 'PUMPFUN_TRADE' || hint === 'PUMPSWAP_POOL_TRADE')
     && typeof mint === 'string'
     && isCanonicalSolanaProgramId(mint);
 }

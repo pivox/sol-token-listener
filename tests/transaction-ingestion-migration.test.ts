@@ -392,7 +392,7 @@ void test('applies migrations 001-052 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '059_transaction_inbox_qualification_attribution.sql');
+    assert.equal(applied.at(-1), '060_listener_tracked_pool_checkpoints.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
