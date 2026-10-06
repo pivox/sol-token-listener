@@ -199,7 +199,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     await client.query('BEGIN');
     await client.query(FOUNDATION_RETENTION_EXCLUSIVE_FENCE_SQL);
     // entry_decisions arrives with migration 064; older schemas have nothing to purge.
-    const entryDecisionsPresent = await client.query(
+    const entryDecisionsPresent = await client.query<{ readonly present: boolean }>(
       "SELECT to_regclass('entry_decisions') IS NOT NULL AS present",
     );
     const entryDecisions = entryDecisionsPresent.rows[0]?.present === true

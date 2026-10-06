@@ -645,10 +645,10 @@ export function createProductionListenerRuntime(
       repository: new PostgresFastEntryRepository(databasePool),
       quotes: pumpFunQuotes,
       maximumRoundTripLossBps: BigInt(config.riskMaxRoundTripLossBps),
-      onDecision: (event) => {
+      onDecision: (event): void => {
         logger.info({ event: 'listener.fast_entry_decision', ...event }, 'Décision d\'entrée rapide.');
       },
-      onError: (event) => {
+      onError: (event): void => {
         logger.warn({ event: 'listener.fast_entry_error', ...event }, 'Entrée rapide en erreur.');
       },
     })

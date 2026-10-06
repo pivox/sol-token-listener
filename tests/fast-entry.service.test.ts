@@ -126,12 +126,10 @@ void test('loss exceeded is rejected with quotes and loss', async () => {
 void test('BUY sends the right quote requests and records the buy', async () => {
   const { service, calls } = setup();
   await service.onObserved('sig', ['M']);
-  assert.equal(calls.quotes[0]!.side, 'BUY');
-  assert.equal(calls.quotes[0]!.amountInRaw, 100n);
-  assert.equal(calls.quotes[0]!.slippageBps, 1_000n);
-  assert.equal(calls.quotes[1]!.side, 'SELL');
-  assert.equal(calls.quotes[1]!.amountInRaw, 90n);
-  assert.equal(calls.quotes[1]!.slippageBps, 1_000n);
+  assert.deepEqual(calls.quotes.map((request) => [request.side, request.amountInRaw, request.slippageBps]), [
+    ['BUY', 100n, 1_000n],
+    ['SELL', 90n, 1_000n],
+  ]);
   assert.equal(calls.rejections.length, 0);
   assert.equal(calls.buys.length, 1);
   assert.equal(calls.buys[0].roundTripLossBps, 1_100n);

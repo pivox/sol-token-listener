@@ -122,6 +122,7 @@ const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
   'bondingCurveSnapshots',
   'domainEvents',
+  'entryDecisions',
   'executionActivationArmaments',
   'executionActivationEvents',
   'executionAttempts',

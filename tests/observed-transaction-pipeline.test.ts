@@ -332,7 +332,7 @@ void test('synchronizes lexical unique launchpad mints before active events relo
 
 void test('runs the fast entry with the launchpad mints and survives its failure', async () => {
   const h = harness({ launchpadAffectedMints: ['MintB', 'MintA'] });
-  const calls: Array<{ signature: string; mints: readonly string[] }> = [];
+  const calls: { signature: string; mints: readonly string[] }[] = [];
   const d = h.dependencies;
   const make = (fail: boolean) => new ObservedTransactionPipeline(
     d.reader, d.launchpad, d.market, null, d.qualification, null,
