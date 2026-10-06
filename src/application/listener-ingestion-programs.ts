@@ -23,7 +23,7 @@ export const ALL_INGESTION_PROGRAMS: readonly ListenerIngestionProgram[] =
 export function listenerIngestionPrograms(
   scope: unknown,
 ): readonly ListenerIngestionProgram[] {
-  if (scope === 'launchpad-only') return LAUNCHPAD_ONLY_INGESTION_PROGRAMS;
+  if (scope === 'launchpad-only' || scope === 'creates-only') return LAUNCHPAD_ONLY_INGESTION_PROGRAMS;
   if (scope === 'launchpad-and-market') return ALL_INGESTION_PROGRAMS;
   throw new TypeError('Listener ingestion scope is invalid.');
 }

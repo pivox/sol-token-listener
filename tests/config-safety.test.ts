@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config/env.js';
+import {
+  LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
+  listenerIngestionPrograms,
+} from '../src/application/listener-ingestion-programs.js';
 import { loadQualificationProfile } from '../src/qualification/qualification-profile.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 import bs58 from 'bs58';
@@ -863,13 +867,20 @@ void test('le listener durable est activé avec des bornes sûres par défaut', 
   assert.equal(config.reconcileSeconds, 15);
 });
 
-void test('le scope d\'ingestion du listener accepte ses deux valeurs canoniques', () => {
-  for (const listenerIngestionScope of ['launchpad-only', 'launchpad-and-market'] as const) {
+void test('le scope d\'ingestion du listener accepte ses valeurs canoniques', () => {
+  for (const listenerIngestionScope of ['launchpad-only', 'launchpad-and-market', 'creates-only'] as const) {
     assert.equal(
       parseConfig({ ...base, LISTENER_INGESTION_SCOPE: listenerIngestionScope }).listenerIngestionScope,
       listenerIngestionScope,
     );
   }
+});
+
+void test('le scope creates-only ingere uniquement le programme launchpad', () => {
+  assert.deepEqual(
+    listenerIngestionPrograms('creates-only'),
+    LAUNCHPAD_ONLY_INGESTION_PROGRAMS,
+  );
 });
 
 void test('le scope d\'ingestion du listener refuse espaces, casse et valeurs inconnues', () => {

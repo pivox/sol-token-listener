@@ -24,7 +24,7 @@ export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
 export type PaperStrategyId = 'validated-external-buys' | 'creation-entry-v1';
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
 export type ListenerCatchUpPolicy = 'live-edge' | 'strict';
-export type ListenerIngestionScope = 'launchpad-only' | 'launchpad-and-market';
+export type ListenerIngestionScope = 'launchpad-only' | 'launchpad-and-market' | 'creates-only';
 
 export interface AppConfig {
   readonly cluster: string;
@@ -255,7 +255,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     environment.LISTENER_INGESTION_SCOPE,
     'launchpad-and-market',
     'LISTENER_INGESTION_SCOPE',
-    ['launchpad-only', 'launchpad-and-market'],
+    ['launchpad-only', 'launchpad-and-market', 'creates-only'],
   );
   if (listenerWorkerCount > 1 && (
     !blockHydration.listenerBlockHydrationEnabled
