@@ -1155,3 +1155,10 @@ dernier heartbeat (depuis le démarrage du processus) ; ceux de l'exécuteur ont
 6. Les migrations depuis un lancement `DETECTED` enregistrent maintenant le pool en `creates-only`
    (avant ce correctif, une position migrée ne pouvait jamais être vendue). `LISTENER_TRACKED_POOL_POLL_ENABLED`
    reste optionnel pour la lane de sortie.
+7. Réponses RPC Agave 4.3 (Helius, `apiVersion` 4.3.0) : `simulateTransaction` renvoie désormais
+   `fee`, `loadedAddresses`, `pre/postBalances` et `pre/postTokenBalances` ; `getSignatureStatuses`
+   renvoie l'objet `status` historique ; `getTransaction` renvoie `transactionIndex`, `costUnits` et
+   `computeUnitsConsumed`. Avant ce correctif, chaque simulation réelle échouait `RPC_RESPONSE_INVALID`
+   (stage SIMULATION) et les lanes H2a auraient échoué à la confirmation. Ces champs sont tolérés,
+   bornés et ignorés (aucune décision ne les utilise) ; les parseurs restent stricts pour toute clé
+   inconnue et `replacementBlockhash` non nul est toujours refusé.

@@ -66,6 +66,13 @@ const MAX_INNER_INSTRUCTIONS = 256;
 const MAX_INSTRUCTION_ACCOUNTS = 64;
 const MAX_INSTRUCTION_DATA_LENGTH = 2_048;
 const MAX_RETURN_DATA_BYTES = 1_048_576;
+// A transaction addresses at most 256 account keys (u8 indexes), loaded ones included.
+const MAX_TRANSACTION_ACCOUNT_KEYS = 256;
+// Agave 4.3 added these simulateTransaction fields; they are bounded and ignored.
+const AGAVE_4_3_SIMULATION_KEYS = Object.freeze([
+  'fee', 'loadedAddresses', 'preBalances', 'postBalances',
+  'preTokenBalances', 'postTokenBalances',
+] as const);
 const INTERNAL_ERRORS = new WeakSet<ExecutionProviderSessionError>();
 
 interface ValidatedConfig {
@@ -267,9 +274,11 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
       if (contextual.contextSlot < this.blockhashContextSlot) throw new Error();
       const value = plainRecord(contextual.value);
       knownKeys(value, ['err', 'logs', 'unitsConsumed', 'accounts', 'returnData',
-        'innerInstructions', 'loadedAccountsDataSize', 'replacementBlockhash'], ['err', 'logs']);
+        'innerInstructions', 'loadedAccountsDataSize', 'replacementBlockhash',
+        ...AGAVE_4_3_SIMULATION_KEYS], ['err', 'logs']);
       validateReturnData(value.returnData);
       validateSimulationSupplementaryFields(value);
+      validateSimulationBalanceEvidence(value);
       const result = Object.freeze({
         providerId: this.providerId,
         contextSlot: contextual.contextSlot,
@@ -674,6 +683,44 @@ function validateSimulationSupplementaryFields(value: Record<string, unknown>): 
   void publicKey(replacementBlockhash.blockhash);
   void safeIntegerBigint(replacementBlockhash.lastValidBlockHeight, false);
   throw new Error();
+}
+
+function validateSimulationBalanceEvidence(value: Record<string, unknown>): void {
+  if (value.fee !== undefined && value.fee !== null) void safeIntegerBigint(value.fee, false);
+  if (value.loadedAddresses !== undefined && value.loadedAddresses !== null) {
+    const addresses = plainRecord(value.loadedAddresses);
+    exactKeys(addresses, ['writable', 'readonly']);
+    if (!Array.isArray(addresses.writable) || !Array.isArray(addresses.readonly)
+      || addresses.writable.length + addresses.readonly.length > MAX_TRANSACTION_ACCOUNT_KEYS) {
+      throw new Error();
+    }
+    for (const list of [addresses.writable, addresses.readonly]) {
+      for (const address of list) void publicKey(address);
+    }
+  }
+  for (const balances of [value.preBalances, value.postBalances]) {
+    if (balances === undefined || balances === null) continue;
+    if (!Array.isArray(balances) || balances.length > MAX_TRANSACTION_ACCOUNT_KEYS) throw new Error();
+    for (const lamports of balances) void safeIntegerBigint(lamports, false);
+  }
+  for (const tokenBalances of [value.preTokenBalances, value.postTokenBalances]) {
+    if (tokenBalances === undefined || tokenBalances === null) continue;
+    if (!Array.isArray(tokenBalances) || tokenBalances.length > MAX_TRANSACTION_ACCOUNT_KEYS) {
+      throw new Error();
+    }
+    for (const rowValue of tokenBalances) {
+      const row = plainRecord(rowValue);
+      knownKeys(row, ['accountIndex', 'mint', 'uiTokenAmount', 'owner', 'programId'],
+        ['accountIndex', 'mint', 'uiTokenAmount']);
+      void boundedInteger(row.accountIndex, 0, MAX_TRANSACTION_ACCOUNT_KEYS - 1);
+      void publicKey(row.mint);
+      if (row.owner !== undefined) void publicKey(row.owner);
+      if (row.programId !== undefined) void publicKey(row.programId);
+      const amount = plainRecord(row.uiTokenAmount);
+      exactKeys(amount, ['amount', 'decimals', 'uiAmount', 'uiAmountString']);
+      boundedJson(amount, 0, { nodes: 0 });
+    }
+  }
 }
 
 function boundedJson(value: unknown, depth: number, state: { nodes: number }): void {
