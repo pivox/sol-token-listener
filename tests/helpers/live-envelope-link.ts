@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import type pg from 'pg';
 import { mutateWithTriggersDisabled } from './execution-preflight-v2-source-fixture.js';
 
@@ -16,7 +16,7 @@ export async function insertEnvelope(
   generationId: string,
   seed: EnvelopeSeed,
 ): Promise<string> {
-  const envelopeId = `envelope:${randomUUID()}`;
+  const envelopeId = `execution_entry_envelope_${randomBytes(32).toString('hex')}`;
   await pool.query(`INSERT INTO execution_entry_envelopes (
     envelope_id,generation_id,operator_id,payload_version,fingerprint,per_buy_quote_amount_raw,
     max_buys,max_open_positions,max_total_exposure_raw,max_realized_loss_raw,valid_from,

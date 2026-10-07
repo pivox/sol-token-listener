@@ -5,8 +5,6 @@ import test from 'node:test';
 import type pg from 'pg';
 import type { PoolClient } from 'pg';
 import { reExitLogicalCommandId } from '../src/domain/fast-exit.js';
-import { createExecutionSimulationArtifactDraft } from '../src/domain/execution-simulation.js';
-import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
 import { expireExecutionIntentsPreSubmissionInTransaction } from
   '../src/storage/execution-intent-expiration.js';
 import {
@@ -17,18 +15,19 @@ import { PostgresExecutionSimulationRepository } from
   '../src/storage/execution-simulation.repository.js';
 import { roleSource, withProvisionedDatabase } from './helpers/entry-envelope-fixture.js';
 import {
+  ageIntent,
   beginSellAttempt,
   claimSellReconciliation,
   createAmbiguousSellFixture,
   createExitPendingFixture,
   createSellFixture,
-  exactBuyWalletPublicKey,
-  fingerprint,
   generationId,
   landedFailedSellEvidence,
+  providerFailureDraft,
   requiredDatabaseUrl,
   sellEvidence,
   waitForDatabaseQuery,
+  withReplica,
   withTemporarySchema,
 } from './helpers/live-sell-fixture.js';
 
@@ -564,27 +563,6 @@ async function landedFailedFixture(pool: Pool, afterUnknown = false) {
   return fixture;
 }
 
-function providerFailureDraft(claim: ClaimedExecutionIntent, attemptNumber: number) {
-  return createExecutionSimulationArtifactDraft({
-    intentId: claim.intent.id, attemptNumber, intentStateRevision: claim.intent.stateRevision,
-    strategyId: claim.intent.strategyId, strategyVersion: claim.intent.strategyVersion,
-    decisionFingerprint: claim.intent.decisionFingerprint,
-    resultKind: 'PROVIDER_FAILED', effectiveVenue: null, providerId: 'primary',
-    executorPublicKey: exactBuyWalletPublicKey, expectedGenesisHash: exactBuyWalletPublicKey,
-    observedGenesisHash: null, configurationFingerprint: fingerprint,
-    quoteFingerprint: null, snapshotFingerprint: null, buildFingerprint: null,
-    messageHash: null, blockhash: null, lastValidBlockHeight: null,
-    blockhashContextSlot: null, snapshotSlot: null, feeContextSlot: null,
-    simulationSlot: null, amountInRaw: null, expectedAmountOutRaw: null,
-    protectedAmountOutRaw: null, feesRaw: null, estimatedFeeLamports: null,
-    simulatedFeePayerLamportDebit: null, unitsConsumed: null,
-    simulatedBaseDeltaRaw: null, simulatedQuoteDeltaRaw: null,
-    rpcCallsUsed: 1, rpcCallsLimit: 8, quoteStatus: 'FAILED', buildStatus: 'NOT_RUN',
-    simulationStatus: 'NOT_RUN', failureStage: 'PROVIDER', failureCode: 'RPC_UNAVAILABLE',
-    terminalReasonCode: 'EXECUTION_PROVIDER_FAILED', logsFingerprint: null, logsLineCount: null,
-  });
-}
-
 async function assertReExitCreated(
   pool: Pool,
   fixture: ExitPendingFixture,
@@ -698,39 +676,6 @@ async function retentionExpiry(pool: Pool): Promise<void> {
   } finally {
     client.release();
   }
-}
-
-async function withReplica(
-  pool: Pool,
-  operation: (client: PoolClient) => Promise<void>,
-): Promise<void> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('SET LOCAL session_replication_role=replica');
-    await operation(client);
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-/** Moves an intent's timeline back (test clock): its terminal time ages past the spacing. */
-async function ageIntent(pool: Pool, intentId: string, ageMs: number): Promise<void> {
-  await withReplica(pool, async (client) => {
-    const updated = await client.query(`UPDATE execution_intents SET
-      requested_at=requested_at-($2::BIGINT*INTERVAL '1 millisecond'),
-      expires_at=expires_at-($2::BIGINT*INTERVAL '1 millisecond'),
-      terminal_at=terminal_at-($2::BIGINT*INTERVAL '1 millisecond'),
-      reconciliation_completed_at=reconciliation_completed_at
-        -($2::BIGINT*INTERVAL '1 millisecond'),
-      purge_after=purge_after-($2::BIGINT*INTERVAL '1 millisecond')
-      WHERE id=$1`, [intentId, ageMs]);
-    assert.equal(updated.rowCount, 1);
-  });
 }
 
 /** Moves a live intent's TTL (and any lease) into the past, as 120 s of wall time would. */

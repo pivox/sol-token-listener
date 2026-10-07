@@ -1,10 +1,12 @@
-// SELL fixtures shared by the SELL reconciliation and re-exit tests: a CANARY live position
-// opened by an exact BUY, then a deadline SELL intent driven through H2b's real repository steps.
+// SELL fixtures shared by the SELL reconciliation, re-exit and fast-exit safety tests: a live
+// position opened by an exact BUY, then a deadline (or early) SELL intent driven through H2b's
+// real repository steps.
 import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import bs58 from 'bs58';
 import pg from 'pg';
+import type { PoolClient } from 'pg';
 import { Keypair, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import {
   createOperatorAuthorization,
@@ -28,6 +30,7 @@ import {
 } from
   '../../src/domain/execution-live-signed-simulation.js';
 import { createExecutionWalletSnapshot } from '../../src/domain/execution-wallet-snapshot.js';
+import type { ClaimedExecutionIntent } from '../../src/ports/execution-intent-repository.js';
 import type { ExecutionSimulationEvidenceV1 } from
   '../../src/ports/execution-simulation-gateway.js';
 import { migrateDatabase } from '../../src/storage/database.js';
@@ -37,6 +40,10 @@ import { PostgresExecutionOperationsRepository } from '../../src/storage/executi
 import { PostgresExecutionRiskRepository } from '../../src/storage/execution-risk.repository.js';
 import { PostgresExecutionSimulationRepository } from '../../src/storage/execution-simulation.repository.js';
 import { insertExecutionDecisionEvent } from './execution-decision-event.js';
+import { earlyExitPolicy } from './fast-exit-events.js';
+import { linkEnvelope } from './live-envelope-link.js';
+
+type Pool = InstanceType<typeof pg.Pool>;
 
 export const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 export const walletPublicKey = '11111111111111111111111111111111';
@@ -142,10 +149,11 @@ export async function createAmbiguousSellFixture(pool: InstanceType<typeof pg.Po
   return createSellFixture(pool, 'AMBIGUOUS');
 }
 
-/**
- * A CANARY position EXIT_PENDING behind a PENDING deadline SELL intent (no claim, no attempt).
- */
-export async function createExitPendingFixture(pool: InstanceType<typeof pg.Pool>) {
+/** How the fixture's first SELL intent is created. */
+export type SellExitKind = 'DEADLINE' | 'EARLY_REVOKED';
+
+/** A CANARY position OPEN after its exact BUY was reconciled MATCHED (no exit intent). */
+export async function createOpenPositionFixture(pool: InstanceType<typeof pg.Pool>) {
   await migrateDatabase({ pool });
   const buy = await createBuyFixture(pool);
   const live = new PostgresExecutionLiveRepository(pool);
@@ -202,16 +210,42 @@ export async function createExitPendingFixture(pool: InstanceType<typeof pg.Pool
   const entry = await live.commitReconciliation(buyReconciliationClaim, buyEvidence);
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
-  const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
-  const exit = await live.createDeadlineExitIntent({
-    positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
+  return Object.freeze({
+    live, buy, entry, positionId: entry.position.positionId,
+    exitAuthorizationId: entry.exitAuthorization.authorizationId,
+    buyReconciliationClaim, buyEvidence,
   });
+}
+
+/**
+ * A position EXIT_PENDING behind a PENDING SELL intent (no claim, no attempt). DEADLINE: a
+ * CANARY position made due, then the targeted deadline exit. EARLY_REVOKED: the position's
+ * armament is bound to a REVOKED envelope, then the early exit scan (lot 4b) sells it before
+ * its deadline. `exitDeadlineAtMs` is the SELL's observation time in both cases.
+ */
+export async function createExitPendingFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  exitKind: SellExitKind = 'DEADLINE',
+) {
+  const open = await createOpenPositionFixture(pool);
+  const { live, positionId } = open;
+  if (exitKind === 'EARLY_REVOKED') {
+    const envelopeId = await linkEnvelope(pool, generationId, {
+      state: 'REVOKED', priorLossRaw: '0', maxLossRaw: '1000000',
+    });
+    const exit = await live.createNextEarlyExitIntent(earlyExitPolicy);
+    assert.ok(exit);
+    assert.equal(exit.reason, 'ENVELOPE_REVOKED');
+    return Object.freeze({
+      ...open, exitIntent: exit.intent, exitDeadlineAtMs: exit.intent.requestedAtMs, envelopeId,
+    });
+  }
+  const exitDeadlineAtMs = await makePositionDue(pool, positionId);
+  const exit = await live.createDeadlineExitIntent({ positionId, observedAtMs: exitDeadlineAtMs });
   assert.ok(exit.intent);
   await pool.query('UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1', [exit.intent.id]);
   return Object.freeze({
-    live, buy, entry, exitIntent: exit.intent, exitDeadlineAtMs,
-    exitAuthorizationId: entry.exitAuthorization.authorizationId,
-    buyReconciliationClaim, buyEvidence,
+    ...open, exitIntent: exit.intent, exitDeadlineAtMs, envelopeId: null,
   });
 }
 
@@ -241,23 +275,48 @@ export async function beginSellAttempt(
   return intents.beginAttempt(Object.freeze({ ...exitClaim, intent: processing }));
 }
 
+type SellSubmissionState =
+  'PERSISTED' | 'SUBMISSION_STARTED' | 'AMBIGUOUS' | 'ACCEPTED' | 'CONFIRMED';
+type BeforePersistSigned = (
+  live: PostgresExecutionLiveRepository,
+  input: Parameters<PostgresExecutionLiveRepository['persistSigned']>[0],
+) => Promise<void>;
+
 export async function createSellFixture(
   pool: InstanceType<typeof pg.Pool>,
-  submissionState: 'PERSISTED' | 'SUBMISSION_STARTED' | 'AMBIGUOUS' | 'ACCEPTED' | 'CONFIRMED',
-  beforePersistSigned?: (
-    live: PostgresExecutionLiveRepository,
-    input: Parameters<PostgresExecutionLiveRepository['persistSigned']>[0],
-  ) => Promise<void>,
+  submissionState: SellSubmissionState,
+  beforePersistSigned?: BeforePersistSigned,
+  exitKind: SellExitKind = 'DEADLINE',
 ) {
-  const exitPending = await createExitPendingFixture(pool);
+  return driveSellFixture(
+    pool, await createExitPendingFixture(pool, exitKind), submissionState, beforePersistSigned,
+  );
+}
+
+/**
+ * Drives the exit intent of `exitPending` through H2b's real repository steps: SELL claim,
+ * preparation binding (position.exit_intent_id = intent, EXIT_PENDING), signed persistence,
+ * signed simulation, submission and its outcome. The RPC results are fixed values.
+ */
+export async function driveSellFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  exitPending: Awaited<ReturnType<typeof createExitPendingFixture>>,
+  submissionState: SellSubmissionState,
+  beforePersistSigned?: BeforePersistSigned,
+) {
   const { live, buy, entry, buyReconciliationClaim, buyEvidence } = exitPending;
   assert.ok(entry.exitAuthorization);
   const begun = await beginSellAttempt(pool, exitPending);
+  const binding = await live.readPreparationBinding({
+    claim: begun.claim, generationId, runtime: buy.runtime,
+  });
+  assert.equal(binding.side, 'SELL');
+  assert.equal(binding.exitAuthorizationId, entry.exitAuthorization.authorizationId);
   const sellTimelineMs = Date.now();
   const artifact = createSignedTransactionArtifact({
     payloadVersion: 1, specificationVersion: 1, intentId: begun.claim.intent.id,
     attemptNumber: begun.attempt.attemptNumber, generationId, armamentId: null,
-    reservationId: null, exitAuthorizationId: entry.exitAuthorization.authorizationId,
+    reservationId: null, exitAuthorizationId: binding.exitAuthorizationId,
     providerId: 'primary',
     walletPublicKey: buy.artifact.walletPublicKey,
     side: 'SELL', effectiveVenue: 'PUMP_FUN', messageHash: 'a'.repeat(64),
@@ -758,3 +817,58 @@ export function quoteIdentifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(value)) throw new Error('Unsafe SQL identifier.');
   return `"${value}"`;
 }
+
+export function providerFailureDraft(claim: ClaimedExecutionIntent, attemptNumber: number) {
+  return createExecutionSimulationArtifactDraft({
+    intentId: claim.intent.id, attemptNumber, intentStateRevision: claim.intent.stateRevision,
+    strategyId: claim.intent.strategyId, strategyVersion: claim.intent.strategyVersion,
+    decisionFingerprint: claim.intent.decisionFingerprint,
+    resultKind: 'PROVIDER_FAILED', effectiveVenue: null, providerId: 'primary',
+    executorPublicKey: exactBuyWalletPublicKey, expectedGenesisHash: exactBuyWalletPublicKey,
+    observedGenesisHash: null, configurationFingerprint: fingerprint,
+    quoteFingerprint: null, snapshotFingerprint: null, buildFingerprint: null,
+    messageHash: null, blockhash: null, lastValidBlockHeight: null,
+    blockhashContextSlot: null, snapshotSlot: null, feeContextSlot: null,
+    simulationSlot: null, amountInRaw: null, expectedAmountOutRaw: null,
+    protectedAmountOutRaw: null, feesRaw: null, estimatedFeeLamports: null,
+    simulatedFeePayerLamportDebit: null, unitsConsumed: null,
+    simulatedBaseDeltaRaw: null, simulatedQuoteDeltaRaw: null,
+    rpcCallsUsed: 1, rpcCallsLimit: 8, quoteStatus: 'FAILED', buildStatus: 'NOT_RUN',
+    simulationStatus: 'NOT_RUN', failureStage: 'PROVIDER', failureCode: 'RPC_UNAVAILABLE',
+    terminalReasonCode: 'EXECUTION_PROVIDER_FAILED', logsFingerprint: null, logsLineCount: null,
+  });
+}
+
+export async function withReplica(
+  pool: Pool,
+  operation: (client: PoolClient) => Promise<void>,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL session_replication_role=replica');
+    await operation(client);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/** Moves an intent's timeline back (test clock): its terminal time ages past the spacing. */
+export async function ageIntent(pool: Pool, intentId: string, ageMs: number): Promise<void> {
+  await withReplica(pool, async (client) => {
+    const updated = await client.query(`UPDATE execution_intents SET
+      requested_at=requested_at-($2::BIGINT*INTERVAL '1 millisecond'),
+      expires_at=expires_at-($2::BIGINT*INTERVAL '1 millisecond'),
+      terminal_at=terminal_at-($2::BIGINT*INTERVAL '1 millisecond'),
+      reconciliation_completed_at=reconciliation_completed_at
+        -($2::BIGINT*INTERVAL '1 millisecond'),
+      purge_after=purge_after-($2::BIGINT*INTERVAL '1 millisecond')
+      WHERE id=$1`, [intentId, ageMs]);
+    assert.equal(updated.rowCount, 1);
+  });
+}
+
