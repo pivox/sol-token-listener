@@ -115,7 +115,7 @@ export function createInitialDetectedTransition(
 }
 
 export function createMigrationPendingTransition(
-  current: 'BONDING_CURVE_COMPLETE' | 'OBSERVING',
+  current: 'BONDING_CURVE_COMPLETE' | 'DETECTED' | 'OBSERVING',
   event: MigrationObservedEventV1,
 ): StateTransition {
   return createEventTransition(

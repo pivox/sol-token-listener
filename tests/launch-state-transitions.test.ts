@@ -304,7 +304,7 @@ const activationEvent: PumpSwapPoolActivatedEventV1 = {
 };
 
 void test('migration transitions are explicit, deterministic and ordered', () => {
-  for (const current of ['OBSERVING', 'BONDING_CURVE_COMPLETE'] as const) {
+  for (const current of ['DETECTED', 'OBSERVING', 'BONDING_CURVE_COMPLETE'] as const) {
     const pending = createMigrationPendingTransition(current, migrationEvent);
     assert.equal(pending.previousStatus, current);
     assert.equal(pending.newStatus, 'MIGRATION_PENDING');

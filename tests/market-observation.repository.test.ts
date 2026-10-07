@@ -104,6 +104,31 @@ void test('market observation repository writes migration and activation atomica
   assert.equal(client.released, true);
 });
 
+void test('a creates-only launch still DETECTED migrates to MIGRATION_PENDING then PUMPSWAP_ACTIVE',
+  async () => {
+    const client = new InstrumentedClient();
+    client.launchStates.splice(0, client.launchStates.length, 'DETECTED', 'MIGRATION_PENDING');
+    const fixture = matched('confirmed');
+    const result = await repositoryWith(client).record({
+      rawEvents: fixture.rawEvents,
+      matches: [fixture.match],
+      reserveSnapshots: [],
+      trades: [],
+    });
+    assert.equal(result.migrations.length, 1);
+    assert.equal(result.activations.length, 1);
+    const transitions = client.calls.filter((call) =>
+      call.text.includes('INSERT INTO state_transitions'));
+    assert.deepEqual(transitions.map((call) => [call.values[7], call.values[8]]), [
+      ['DETECTED', 'MIGRATION_PENDING'],
+      ['MIGRATION_PENDING', 'PUMPSWAP_ACTIVE'],
+    ]);
+    const states = client.calls.filter((call) =>
+      call.text.includes('UPDATE token_launches SET current_state=$2'));
+    assert.deepEqual(states.map((call) => call.values[1]), ['MIGRATION_PENDING', 'PUMPSWAP_ACTIVE']);
+    assert.ok(client.calls.some((call) => call.text === 'COMMIT'));
+  });
+
 void test('first orphaned observation persists raw proof only', async () => {
   const client = new InstrumentedClient();
   const fixture = matched('orphaned');
