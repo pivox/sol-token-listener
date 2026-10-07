@@ -27,9 +27,8 @@ export interface ExecutionOperationsConfig {
   readonly evidencePublicKeyBase64: string;
 }
 
-export interface ExecutionCanaryArmConfig extends ExecutionOperationsConfig {
-  readonly canaryEvidencePath: string;
-  readonly preflightSourcePath: string;
+/** The armament runtime limits: they must equal H2b's (RUNNABLE_WORK_SQL and the BUY claim compare them). */
+export interface ExecutionArmRuntimeConfig {
   readonly runtimeQuoteMaxAgeMs: number;
   readonly runtimeSlippageBps: bigint;
   readonly runtimeSnapshotMaxSlotLag: number;
@@ -38,6 +37,27 @@ export interface ExecutionCanaryArmConfig extends ExecutionOperationsConfig {
   readonly runtimeMaxFeePayerLamportDebit: bigint;
   readonly runtimeMaxRpcCallsPerAttempt: number;
   readonly runtimeLeaseMs: number;
+}
+
+export interface ExecutionCanaryArmConfig extends ExecutionOperationsConfig, ExecutionArmRuntimeConfig {
+  readonly canaryEvidencePath: string;
+  readonly preflightSourcePath: string;
+}
+
+/**
+ * Mirrors FAST_ENTRY_INTENT_TTL_MS (src/domain/fast-entry.ts). Duplicated so the operations
+ * graph never imports the paper fast-entry module; a test asserts both are equal.
+ */
+export const AUTO_ARM_FAST_ENTRY_INTENT_TTL_MS = 120_000;
+
+/** `live:auto-arm`: the base configuration, the arm runtime limits, a read-only RPC and a poll. */
+export interface ExecutionAutoArmConfig extends ExecutionOperationsConfig, ExecutionArmRuntimeConfig {
+  readonly phase: 'CANARY';
+  readonly httpRpcUrl: string;
+  readonly rpcTimeoutMs: number;
+  readonly pollMs: number;
+  /** A13: a candidate intent must outlive the DB now by 2 x lease + 2 x RPC timeout + 5 s. */
+  readonly minimumRemainingMs: number;
 }
 
 export interface ExecutionEnvelopeConfig extends ExecutionOperationsConfig {
@@ -120,37 +140,60 @@ export function parseExecutionCanaryArmConfig(input: unknown): ExecutionCanaryAr
     const preflightSourcePath = absolutePath(
       environmentValue(input, 'EXECUTOR_PREFLIGHT_SOURCE_PATH'),
     );
-    const runtimeQuoteMaxAgeMs = decimalInteger(
-      environmentValue(input, 'EXECUTOR_QUOTE_MAX_AGE_MS'), 1, 60_000,
-    );
-    const runtimeSlippageBps = decimalBigint(
-      environmentValue(input, 'EXECUTOR_SLIPPAGE_BPS'), 0n, 10_000n,
-    );
-    const runtimeSnapshotMaxSlotLag = decimalInteger(
-      environmentValue(input, 'EXECUTOR_SNAPSHOT_MAX_SLOT_LAG'), 0, 128,
-    );
-    const runtimeMaxComputeUnits = decimalBigint(
-      environmentValue(input, 'EXECUTOR_MAX_COMPUTE_UNITS'), 1n, 1_400_000n,
-    );
-    const runtimeMaxFeeLamports = decimalBigint(
-      environmentValue(input, 'EXECUTOR_MAX_FEE_LAMPORTS'), 0n, 10_000_000n,
-    );
-    const runtimeMaxFeePayerLamportDebit = decimalBigint(
-      environmentValue(input, 'EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT'), 0n, 10_000_000_000n,
-    );
-    const runtimeMaxRpcCallsPerAttempt = decimalInteger(
-      environmentValue(input, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT'), 12, 16,
-    );
-    const runtimeLeaseMs = decimalInteger(
-      environmentValue(input, 'EXECUTOR_LEASE_MS'), 3_000, 120_000,
-    );
-    return Object.freeze({ ...base, canaryEvidencePath, preflightSourcePath, runtimeQuoteMaxAgeMs,
-      runtimeSlippageBps, runtimeSnapshotMaxSlotLag, runtimeMaxComputeUnits,
-      runtimeMaxFeeLamports, runtimeMaxFeePayerLamportDebit,
-      runtimeMaxRpcCallsPerAttempt, runtimeLeaseMs });
+    const runtime = parseArmRuntime(input);
+    return Object.freeze({ ...base, canaryEvidencePath, preflightSourcePath, ...runtime });
   } catch {
     throw invalid();
   }
+}
+
+/** `live:auto-arm`. The lease must leave a fast-entry intent armable within its TTL. */
+export function parseExecutionAutoArmConfig(input: unknown): ExecutionAutoArmConfig {
+  try {
+    const base = parseExecutionOperationsConfig(input);
+    if (base.phase !== 'CANARY' || !isEnvironment(input)) throw invalid();
+    const runtime = parseArmRuntime(input);
+    const httpRpcUrl = httpsUrl(environmentValue(input, 'SOLANA_HTTP_RPC_URL'));
+    const rpcTimeoutMs = decimalInteger(environmentValue(input, 'EXECUTOR_RPC_TIMEOUT_MS'), 100, 30_000);
+    const pollMs = decimalInteger(environmentValue(input, 'EXECUTOR_AUTO_ARM_POLL_MS'), 500, 60_000);
+    const minimumRemainingMs = 2 * runtime.runtimeLeaseMs + 2 * rpcTimeoutMs + 5_000;
+    if (2 * runtime.runtimeLeaseMs + 20_000 > AUTO_ARM_FAST_ENTRY_INTENT_TTL_MS
+      || minimumRemainingMs + pollMs > AUTO_ARM_FAST_ENTRY_INTENT_TTL_MS) throw invalid();
+    return Object.freeze({ ...base, phase: 'CANARY', ...runtime, httpRpcUrl, rpcTimeoutMs,
+      pollMs, minimumRemainingMs });
+  } catch {
+    throw invalid();
+  }
+}
+
+function parseArmRuntime(input: Record<string, string | undefined>): ExecutionArmRuntimeConfig {
+  const runtimeQuoteMaxAgeMs = decimalInteger(
+    environmentValue(input, 'EXECUTOR_QUOTE_MAX_AGE_MS'), 1, 60_000,
+  );
+  const runtimeSlippageBps = decimalBigint(
+    environmentValue(input, 'EXECUTOR_SLIPPAGE_BPS'), 0n, 10_000n,
+  );
+  const runtimeSnapshotMaxSlotLag = decimalInteger(
+    environmentValue(input, 'EXECUTOR_SNAPSHOT_MAX_SLOT_LAG'), 0, 128,
+  );
+  const runtimeMaxComputeUnits = decimalBigint(
+    environmentValue(input, 'EXECUTOR_MAX_COMPUTE_UNITS'), 1n, 1_400_000n,
+  );
+  const runtimeMaxFeeLamports = decimalBigint(
+    environmentValue(input, 'EXECUTOR_MAX_FEE_LAMPORTS'), 0n, 10_000_000n,
+  );
+  const runtimeMaxFeePayerLamportDebit = decimalBigint(
+    environmentValue(input, 'EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT'), 0n, 10_000_000_000n,
+  );
+  const runtimeMaxRpcCallsPerAttempt = decimalInteger(
+    environmentValue(input, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT'), 12, 16,
+  );
+  const runtimeLeaseMs = decimalInteger(
+    environmentValue(input, 'EXECUTOR_LEASE_MS'), 3_000, 120_000,
+  );
+  return Object.freeze({ runtimeQuoteMaxAgeMs, runtimeSlippageBps, runtimeSnapshotMaxSlotLag,
+    runtimeMaxComputeUnits, runtimeMaxFeeLamports, runtimeMaxFeePayerLamportDebit,
+    runtimeMaxRpcCallsPerAttempt, runtimeLeaseMs });
 }
 
 /** `envelope prepare|create`: the base configuration plus the H2g gate catalog (policy source). */
@@ -217,6 +260,14 @@ function phaseFrom(value: string | undefined): ExecutionLivePhase {
 function absolutePath(value: string | undefined): string {
   const parsed = boundedText(value, 4_096);
   if (!isAbsolute(parsed) || normalize(parsed) !== parsed || parsed.includes('\0')) throw invalid();
+  return parsed;
+}
+
+function httpsUrl(value: string | undefined): string {
+  const parsed = boundedText(value, 4_096);
+  const url = new URL(parsed);
+  if (url.protocol !== 'https:' || url.username.length > 0 || url.password.length > 0
+    || url.hash.length > 0 || url.href !== parsed) throw invalid();
   return parsed;
 }
 

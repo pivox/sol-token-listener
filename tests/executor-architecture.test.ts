@@ -40,6 +40,36 @@ void test('source and compiled operations graphs remain inert and non-signing', 
   }
 });
 
+void test('source and compiled auto-arm graphs stay non-signing and outside the live executor', async () => {
+  for (const entry of [
+    resolve(repositoryRoot, 'src/executor-operations/auto-arm-main.ts'),
+    resolve(repositoryRoot, 'dist/src/executor-operations/auto-arm-main.js'),
+  ]) {
+    await access(entry);
+    const graph = await readGraph(entry);
+    const paths = [...graph.keys()].map((path) => relative(repositoryRoot, path).replaceAll('\\', '/'));
+    assert.ok(paths.some((path) => /executor-operations\/auto-arm\.(?:ts|js)$/u.test(path)));
+    assert.ok(paths.some((path) => /executor-readiness\/rpc-gateway\.(?:ts|js)$/u.test(path)));
+    assert.deepEqual(paths.filter((path) => /\/executor-live(?:-recovery)?\//u.test(`/${path}`)), []);
+    assert.deepEqual(paths.filter((path) => path.includes('executor-readiness/')
+      && !/executor-readiness\/rpc-gateway\.(?:ts|js)$/u.test(path)), []);
+    assert.deepEqual(paths.filter((path) => /domain\/fast-entry\.(?:ts|js)$/u.test(path)), []);
+    for (const [path, source] of graph) {
+      assert.doesNotMatch(source,
+        /\b(?:Keypair|sendRawTransaction|sendTransaction|simulateTransaction|signMessage|signTransaction)\b/u,
+        `signable capability in ${relative(repositoryRoot, path)}`);
+    }
+  }
+  for (const entry of [
+    resolve(repositoryRoot, 'src/executor-operations/main.ts'),
+    resolve(repositoryRoot, 'dist/src/executor-operations/main.js'),
+  ]) {
+    const graph = await readGraph(entry);
+    assert.deepEqual([...graph.keys()].filter((path) => /auto-arm|executor-readiness/u.test(path)), [],
+      `the operations CLI graph reaches the daemon or an RPC: ${relative(repositoryRoot, entry)}`);
+  }
+});
+
 void test('source and compiled readiness graphs stay read-only and outside live paths', async () => {
   for (const entry of [
     resolve(repositoryRoot, 'src/executor-readiness/main.ts'),
@@ -654,7 +684,7 @@ void test('risk foundation source and dist graphs remain inert and closed', asyn
   );
 });
 
-void test('only the seven inert operations commands expose live-prefixed operator vocabulary', async () => {
+void test('only the operations commands and the auto-arm daemon expose live-prefixed operator vocabulary', async () => {
   const [main, packageText, environment] = await Promise.all([
     readFile(resolve(repositoryRoot, 'src/executor/main.ts'), 'utf8'),
     readFile(resolve(repositoryRoot, 'package.json'), 'utf8'),
@@ -665,11 +695,13 @@ void test('only the seven inert operations commands expose live-prefixed operato
   assert.equal(Object.keys(scripts).some((name) => /risk/iu.test(name)), false);
   const liveScripts = Object.entries(scripts).filter(([name]) => name.startsWith('live:'));
   assert.deepEqual(liveScripts.map(([name]) => name).sort(), [
-    'live:arm', 'live:envelope', 'live:kill-switch', 'live:preflight',
+    'live:arm', 'live:auto-arm', 'live:envelope', 'live:kill-switch', 'live:preflight',
     'live:report', 'live:resume', 'live:status',
   ]);
-  for (const [, command] of liveScripts) {
+  assert.equal(scripts['live:auto-arm'], 'node dist/src/executor-operations/auto-arm-main.js');
+  for (const [name, command] of liveScripts) {
     assert.equal(typeof command, 'string');
+    if (name === 'live:auto-arm') continue;
     assert.match(command as string, /dist\/src\/executor-operations\/main\.js/u);
     assert.doesNotMatch(command as string, /dist\/src\/executor\/main\.js/u);
   }
