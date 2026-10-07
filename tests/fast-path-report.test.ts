@@ -27,6 +27,9 @@ import {
 type Pool = InstanceType<typeof pg.Pool>;
 
 const NOW_MS = Date.parse('2026-10-07T12:00:00.000Z');
+const RETENTION = 'armaments and signed artifacts are purged 4 h after terminal; '
+  + 'run within 4 h of the run; failedSellFees is - when no SELL intent is left '
+  + '(reconciliation evidence is purged about 4 h after terminal)';
 const HOUR_MS = 3_600_000;
 
 // ---------------------------------------------------------------------------------------------
@@ -114,7 +117,7 @@ void test('fast-path report: table output of a fixed snapshot', () => {
       mint: 'MintA111111111111111111111111111111111111111', state: 'CLOSED',
       openedAtMs: NOW_MS - 30 * 60_000, closedAtMs: NOW_MS - 29 * 60_000, holdingMs: 60_000,
       exitReason: 'DEADLINE', reExits: 1, netLamports: '-1500', pnlBps: -15,
-      failedSellFeesLamports: '0',
+      failedSellFeesLamports: null,
     }, {
       mint: 'MintB111111111111111111111111111111111111111', state: 'OPEN',
       openedAtMs: NOW_MS - 60_000, closedAtMs: null, holdingMs: null,
@@ -125,7 +128,7 @@ void test('fast-path report: table output of a fixed snapshot', () => {
       listener: [{ providerId: 'primary', attempts: 120, http429Responses: 7, sinceMs: NOW_MS - 2 * HOUR_MS }],
       executor: { rateLimitEvents: 2, note: 'retention 4 h' },
     },
-    retentionNote: 'armaments and signed artifacts are purged 4 h after terminal; run within 4 h of the run',
+    retentionNote: RETENTION,
   };
   assert.equal(formatFastPathReport(report, 'table'), [
     'fast-path report v1  2026-10-07T11:00:00.000Z -> 2026-10-07T12:00:00.000Z',
@@ -151,7 +154,7 @@ void test('fast-path report: table output of a fixed snapshot', () => {
     '  mint                                          state         opened                    '
       + 'holdingMs exitReason        reExits  netLamports   pnlBps  failedSellFees',
     '  MintA111111111111111111111111111111111111111  CLOSED        2026-10-07T11:30:00.000Z  '
-      + '60000     DEADLINE          1        -1500         -15     0',
+      + '60000     DEADLINE          1        -1500         -15     -',
     '  MintB111111111111111111111111111111111111111  OPEN          2026-10-07T11:59:00.000Z  '
       + '-         UNKNOWN           0        -             -       5000',
     '',
@@ -159,7 +162,7 @@ void test('fast-path report: table output of a fixed snapshot', () => {
     '  listener   primary  attempts=120  http429=7  since=2026-10-07T10:00:00.000Z',
     '  executor   rateLimitEvents=2  (retention 4 h)',
     '',
-    'Note: armaments and signed artifacts are purged 4 h after terminal; run within 4 h of the run',
+    `Note: ${RETENTION}`,
     '',
   ].join('\n'));
   assert.deepEqual(JSON.parse(formatFastPathReport(report, 'json')), report);
@@ -224,12 +227,12 @@ void test('fast-path report: exact report over a seeded dataset, in a read-only 
           mint: seeded.mints.deadline, state: 'CLOSED',
           openedAtMs: seeded.deadlineOpenedAtMs, closedAtMs: seeded.deadlineOpenedAtMs + 60_000,
           holdingMs: 60_000, exitReason: 'DEADLINE', reExits: 1,
-          netLamports: '-1500', pnlBps: -15, failedSellFeesLamports: '0',
+          netLamports: '-1500', pnlBps: -15, failedSellFeesLamports: null,
         }, {
           mint: seeded.mints.unknown, state: 'CLOSED',
           openedAtMs: seeded.unknownOpenedAtMs, closedAtMs: seeded.unknownOpenedAtMs + 45_000,
           holdingMs: 45_000, exitReason: 'UNKNOWN', reExits: 0,
-          netLamports: '2000000', pnlBps: 20_000, failedSellFeesLamports: '0',
+          netLamports: '2000000', pnlBps: 20_000, failedSellFeesLamports: null,
         }, {
           mint: seeded.mints.live, state: 'EXIT_PENDING',
           openedAtMs: seeded.liveOpenedAtMs, closedAtMs: null, holdingMs: null,
@@ -243,8 +246,7 @@ void test('fast-path report: exact report over a seeded dataset, in a read-only 
           ],
           executor: { rateLimitEvents: 2, note: 'retention 4 h' },
         },
-        retentionNote: 'armaments and signed artifacts are purged 4 h after terminal; '
-          + 'run within 4 h of the run',
+        retentionNote: RETENTION,
       });
 
       const outputs = [formatFastPathReport(report, 'json'), formatFastPathReport(report, 'table')];

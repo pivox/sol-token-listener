@@ -3,7 +3,9 @@
 // back. The output never contains a signature, a wallet public key, a URL or a key.
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
-import { exitReasonOfLogicalKey, type ExitReason } from '../domain/fast-exit.js';
+import {
+  exitReasonOfLogicalKey, FAST_EXIT_REASONS, MAXIMUM_RE_EXITS, type ExitReason,
+} from '../domain/fast-exit.js';
 import { createRuntimeRpcHttpEvidence } from '../domain/rpc-http-evidence.js';
 
 const HOUR_MS = 3_600_000;
@@ -17,7 +19,8 @@ const LATENCY_KEYS = Object.freeze([
   'submittedToConfirmed',
 ] as const);
 const RETENTION_NOTE = 'armaments and signed artifacts are purged 4 h after terminal; '
-  + 'run within 4 h of the run';
+  + 'run within 4 h of the run; failedSellFees is - when no SELL intent is left '
+  + '(reconciliation evidence is purged about 4 h after terminal)';
 
 export type FastPathReportFormat = 'table' | 'json';
 type LatencyKey = typeof LATENCY_KEYS[number];
@@ -45,7 +48,7 @@ export interface FastPathPosition {
   readonly reExits: number;
   readonly netLamports: string | null;
   readonly pnlBps: number | null;
-  readonly failedSellFeesLamports: string;
+  readonly failedSellFeesLamports: string | null;
 }
 
 export interface FastPathListenerRpc429 {
@@ -206,21 +209,31 @@ export async function collectFastPathReport(
        (SELECT intent.logical_command_id FROM execution_intents intent
         WHERE intent.side='SELL' AND intent.position_id=position.position_id
         ORDER BY intent.requested_at DESC,intent.id DESC LIMIT 1) AS intent_key,
-       (SELECT tombstone.logical_order_key FROM execution_intent_tombstones tombstone
-        WHERE (tombstone.logical_order_key LIKE 'maximum-holding:%'
-            OR tombstone.logical_order_key LIKE 'fast-exit:%')
-          AND tombstone.logical_order_key LIKE '%:' || position.position_id || '%'
-        ORDER BY tombstone.retired_at DESC,tombstone.logical_order_key DESC
-        LIMIT 1) AS tombstone_key,
-       (SELECT COALESCE(SUM(evidence.fee_lamports),0)::TEXT
-        FROM execution_reconciliation_evidence evidence
-        JOIN execution_intents intent ON intent.id=evidence.intent_id
-        WHERE intent.side='SELL' AND intent.position_id=position.position_id
-          AND evidence.side='SELL' AND evidence.result='NO_EFFECT'
-          AND evidence.signature_history='PRESENT') AS failed_sell_fees
+       CASE WHEN EXISTS (SELECT 1 FROM execution_intents live_sell
+           WHERE live_sell.side='SELL' AND live_sell.position_id=position.position_id)
+         THEN (SELECT COALESCE(SUM(evidence.fee_lamports),0)::TEXT
+           FROM execution_reconciliation_evidence evidence
+           JOIN execution_intents intent ON intent.id=evidence.intent_id
+           WHERE intent.side='SELL' AND intent.position_id=position.position_id
+             AND evidence.side='SELL' AND evidence.result='NO_EFFECT'
+             AND evidence.signature_history='PRESENT')
+       END AS failed_sell_fees
      FROM position ORDER BY position.opened_at,position.position_id`,
     window,
   );
+  const tombstoneKeys: (string | null)[] = [];
+  for (const position of positions.rows) {
+    const candidates = exitKeyRoots(text(position.position_id)).flatMap((root) => [root,
+      ...Array.from({ length: MAXIMUM_RE_EXITS }, (_, index) => `${root}:retry-${index + 1}`)]);
+    const tombstone = await database.query(
+      `SELECT logical_order_key FROM execution_intent_tombstones
+       WHERE logical_order_key = ANY($1::text[])
+       ORDER BY retired_at DESC,logical_order_key DESC LIMIT 1`,
+      [candidates],
+    );
+    tombstoneKeys.push(typeof tombstone.rows[0]?.logical_order_key === 'string'
+      ? tombstone.rows[0].logical_order_key : null);
+  }
   const heartbeat = await database.query(
     `SELECT payload->'rpcHttpEvidence' AS evidence,
        ${epochMilliseconds('started_at')} AS started_at_ms
@@ -235,7 +248,8 @@ export async function collectFastPathReport(
     schemaVersion: 'fast-path-report.v1',
     window: Object.freeze({ sinceMs: options.sinceMs, untilMs: options.untilMs }),
     ...decisionSections(decisions.rows, count(creates.rows[0]?.count)),
-    positions: Object.freeze(positions.rows.map(positionFromRow)),
+    positions: Object.freeze(positions.rows.map((row, index) =>
+      positionFromRow(row, tombstoneKeys[index] ?? null))),
     rpc429: Object.freeze({
       listener: listenerRpc429(heartbeat.rows[0]),
       executor: Object.freeze({
@@ -279,7 +293,7 @@ export function formatFastPathReport(report: FastPathReport, format: FastPathRep
   for (const position of report.positions) {
     lines.push(row([`  ${position.mint}`, position.state, iso(position.openedAtMs),
       dash(position.holdingMs), position.exitReason, position.reExits,
-      dash(position.netLamports), dash(position.pnlBps), position.failedSellFeesLamports], widths));
+      dash(position.netLamports), dash(position.pnlBps), dash(position.failedSellFeesLamports)], widths));
   }
   lines.push('', 'RPC 429');
   if (report.rpc429.listener === null) {
@@ -341,11 +355,19 @@ function decisionSections(
   };
 }
 
-function positionFromRow(position: Record<string, unknown>): FastPathPosition {
+function exitKeyRoots(positionId: string): readonly string[] {
+  return [`maximum-holding:${positionId}`,
+    ...FAST_EXIT_REASONS.map((reason) => `fast-exit:${reason}:${positionId}`)];
+}
+
+function positionFromRow(
+  position: Record<string, unknown>,
+  tombstoneKey: string | null,
+): FastPathPosition {
   const positionId = text(position.position_id);
   const openedAtMs = integer(position.opened_at_ms);
   const closedAtMs = nullableInteger(position.closed_at_ms);
-  const exit = [position.intent_key, position.tombstone_key]
+  const exit = [position.intent_key, tombstoneKey]
     .map((key) => exitOfKey(key, positionId))
     .find((value) => value !== null) ?? null;
   const net = position.net_lamports === null ? null : BigInt(text(position.net_lamports));
@@ -361,7 +383,8 @@ function positionFromRow(position: Record<string, unknown>): FastPathPosition {
     reExits: exit?.reExits ?? 0,
     netLamports: net === null ? null : net.toString(),
     pnlBps: net === null || entry === null ? null : pnlBps(net, entry),
-    failedSellFeesLamports: BigInt(text(position.failed_sell_fees)).toString(),
+    failedSellFeesLamports: position.failed_sell_fees === null
+      ? null : BigInt(text(position.failed_sell_fees)).toString(),
   });
 }
 

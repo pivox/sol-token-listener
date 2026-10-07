@@ -1042,6 +1042,17 @@ l'échéance. Plan : `docs/superpowers/plans/2026-10-07-simple-path-lot4b-exit-l
 Dans chaque passe : reconciliation, confirmation, deadline, reexit, exit. L'échéance passe
 toujours en premier, dans sa propre transaction : un échec de `reexit` ou `exit` ne la retarde pas.
 
+Un `REEXIT_FAILED` qui revient en boucle termine chaque passe avant la lane `exit` : les sorties
+anticipées sont alors arrêtées. L'échéance n'est pas touchée. Si on le voit, enquêter.
+
+### Ordre de déploiement
+
+1. Migrer jusqu'à 066.
+2. Re-provisionner les rôles (`scripts/provision-executor-roles.sql`) AVANT de redémarrer H2a et H2b.
+   Sinon le validateur de démarrage refuse de lancer H2a, et les sorties à l'échéance ne tournent
+   pas non plus.
+3. Redémarrer H2a, puis H2b.
+
 ### Sorties anticipées (lane `exit`)
 
 - Elles ne concernent que les positions d'enveloppe (armement avec `envelope_id`). Les positions
@@ -1119,7 +1130,8 @@ Lecture seule (transaction `READ ONLY`), sur `DATABASE_URL` (souvent le login pr
 depuis la machine de l'opérateur). Fenêtre de 24 h par défaut, 7 j au plus. Il donne l'entonnoir, les
 latences, le résultat par position (raison de sortie, re-sorties, PnL, frais des SELL échoués) et les
 429. Les armements et artefacts signés sont purgés 4 h après leur état terminal : le lancer dans les 4 h
-d'un run. Raison de sortie et PnL restent durables. Les 429 du listener sont les compteurs cumulés du
+d'un run. Les évidences de réconciliation sont purgées environ 4 h après l'état terminal : sans intent SELL
+restant, les frais des SELL échoués s'affichent `-` (inconnus), pas `0`. Raison de sortie et PnL restent durables. Les 429 du listener sont les compteurs cumulés du
 dernier heartbeat (depuis le démarrage du processus) ; ceux de l'exécuteur ont 4 h de rétention.
 
 ### Limites connues (lot 4b)
