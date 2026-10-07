@@ -884,3 +884,13 @@ Each case is a test that must fail closed:
 
 **Tasks 6 and 8 (contract with Task 2, commit 0f4ef3a0)**
 - A23. `evaluateEnvelopeArming` takes an exact 10-key facts object `{envelope, buysArmed, realizedLossRaw, controlState, unknownBlock, activeArmament, openPosition, intentAvailable, runtimeLeaseMs, nowMs}` with a frozen envelope and policy. `readAutoArmContext` (Task 6) returns the envelope as a frozen `EntryEnvelopeV2` (policy rebuilt via `createExecutionRiskPolicy`), plus `buysArmed` / `realizedLossRaw` from the row; the daemon (Task 8) builds the facts object explicitly (`nowMs: context.databaseNowMs`). `createEnvelopeProviderSnapshot` throws over limit: Task 6 refresh and Task 8 must map it to a distinct logged code, never crash the loop.
+
+**After the Task 3 review (migration 065 at 102b7de7)**
+- A24. Lock order. Every transaction that writes envelope rows must take `pg_advisory_xact_lock(hashtextextended(generation_id, 51005))` before it touches an envelope or an armament row. This covers Task 5 `createEnvelope` / `revokeEnvelope` / `expireEnvelopes`, Task 6 `armEnvelope` and `refreshEnvelopeProviderSnapshot` if they touch envelopes, and Task 10 SELL reconciliation before the realized-loss UPDATE. Check what `lockGeneration` takes; if it is not 51005, take 51005 explicitly right after it. `armEnvelope` must not `SELECT … FOR UPDATE` the envelope before 51005 is held. Revoke under 51005 closes the "lost revoke" race against a concurrent arm.
+- A25. Exact operations grants needed by the invoker triggers (Task 5), in addition to the plan's envelope grants plus `revoked_at` in UPDATE:
+  - `execution_safety_qualifications` SELECT/INSERT (scope, envelope_id);
+  - `execution_activation_armaments` SELECT/INSERT (envelope_id);
+  - `execution_operator_authorizations` SELECT (payload_version);
+  - `execution_risk_admission_reports` SELECT (quota_state).
+  The last two are a pre-existing gap in the 039 guard: CANARY arming under the real ops role may already fail on main. The A14 role test must arm both a CANARY and an ENVELOPE armament under `SET ROLE sol_token_executor_operations`.
+- A26. Document that `intent.requested_at >= envelope.valid_from` relies on the listener clock.
