@@ -576,6 +576,10 @@ void test('rejects a parsed inner instruction of an allowlisted program absent f
   await rejectsSellWithInnerInstruction(parsedInner(TOKEN_2022_PROGRAM_ID.toBase58()));
 });
 
+void test('rejects a parsed inner instruction of an allowlisted program the RPC never parses', async () => {
+  await rejectsSellWithInnerInstruction(parsedInner(PUMP_PROGRAM_ID.toBase58()));
+});
+
 void test('rejects a parsed inner instruction that still carries accounts or data', async () => {
   await rejectsSellWithInnerInstruction({
     kind: 'PARSED', programId: TOKEN_PROGRAM_ID.toBase58(), accounts: [], data: null, stackHeight: 2,

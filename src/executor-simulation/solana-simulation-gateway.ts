@@ -79,6 +79,11 @@ const ALLOWED_INNER_PROGRAMS = new Set([
   ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(), PUMP_PROGRAM_ID.toBase58(), PUMP_FUN_FEE_PROGRAM_ID.toBase58(),
   PUMPSWAP_PROGRAM_ID, PUMP_AMM_PROGRAM_ID.toBase58(), PUMP_SWAP_FEE_PROGRAM_ID.toBase58(),
 ]);
+// Programs whose CPIs the RPC returns in jsonParsed form (no accounts, no data).
+const PARSED_INNER_PROGRAMS = new Set([
+  PublicKey.default.toBase58(), TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58(),
+  ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(),
+]);
 const INTERNAL_GATEWAY_ERRORS = new WeakSet<ExecutionSimulationGatewayError>();
 
 export class ExecutionSimulationGatewayError extends Error {
@@ -697,7 +702,8 @@ function innerInstructionsFrom(
         || (stackHeight !== null && (typeof stackHeight !== 'number' || !Number.isSafeInteger(stackHeight)
           || stackHeight < 0 || stackHeight > 16))) rejectEvidence();
       if (instruction.kind === 'PARSED') {
-        if (instruction.accounts !== null || instruction.data !== null) rejectEvidence();
+        if (!PARSED_INNER_PROGRAMS.has(programId) || instruction.accounts !== null
+          || instruction.data !== null) rejectEvidence();
         continue;
       }
       if (instruction.kind !== 'PARTIALLY_DECODED'
