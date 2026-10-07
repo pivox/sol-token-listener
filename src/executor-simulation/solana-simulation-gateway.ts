@@ -287,7 +287,10 @@ function programFailureEvidence(
   const units = result.unitsConsumed;
   if (units !== null && (!u64(units) || units > limits.maxComputeUnits)) rejectEvidence();
   const logs = result.logs === null ? null : logsFrom(result.logs);
-  if (result.accounts === null) {
+  // Agave returns no post-state for a failed transaction: either `accounts`
+  // is null or every entry is (Agave 4.3). Both are a plain program error.
+  const accounts = result.accounts === null ? null : accountResultFrom(result.accounts, requested);
+  if (accounts === null || requiredAccount(accounts, 0) === null) {
     return Object.freeze({
       simulationSlot,
       simulatedFeePayerLamportDebit: null,
@@ -299,7 +302,6 @@ function programFailureEvidence(
       logsLineCount: logs?.length ?? null,
     });
   }
-  const accounts = accountResultFrom(result.accounts, requested);
   const prePayer = lookupAccount(snapshot, requested.feePayer);
   const preBase = lookupAccount(snapshot, requested.base);
   const preQuote = lookupAccount(snapshot, requested.quote);
@@ -540,11 +542,23 @@ function accountResultFrom(value: unknown, requested: RequiredSimulationAccounts
       || typeof account.owner !== 'string' || !publicKey(account.owner)
       || typeof account.executable !== 'boolean' || (account.rentEpoch !== null && !u64(account.rentEpoch))
       || (account.space !== null && !u64(account.space)) || typeof account.dataBase64 !== 'string') rejectEvidence();
-    return Object.freeze({
+    const converted = Object.freeze({
       address, lamports: account.lamports, owner: publicKey(account.owner), executable: account.executable,
       rentEpoch: account.rentEpoch, space: account.space, dataBase64: canonicalBase64(account.dataBase64),
     });
+    return isDefaultEmptyAccount(converted) ? null : converted;
   }));
+}
+
+/**
+ * Agave 4.3 `simulateTransaction` returns a requested address that does not
+ * exist as a zero-lamport System-owned account where older nodes returned
+ * null. It is indistinguishable from an absent account and treated as one.
+ */
+function isDefaultEmptyAccount(account: ExecutionRpcAccount): boolean {
+  return account.lamports === 0n && account.owner === PublicKey.default.toBase58()
+    && !account.executable && (account.space === null || account.space === 0n)
+    && account.dataBase64 === '';
 }
 
 function tokenAmount(

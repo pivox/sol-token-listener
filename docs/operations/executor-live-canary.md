@@ -1162,3 +1162,13 @@ dernier heartbeat (depuis le démarrage du processus) ; ceux de l'exécuteur ont
    (stage SIMULATION) et les lanes H2a auraient échoué à la confirmation. Ces champs sont tolérés,
    bornés et ignorés (aucune décision ne les utilise) ; les parseurs restent stricts pour toute clé
    inconnue et `replacementBlockhash` non nul est toujours refusé.
+8. Comptes absents sous Agave 4.3 : `simulateTransaction` renvoie une adresse demandée qui n'existe
+   pas (typiquement l'ATA WSOL du payeur sur un BUY) comme un compte vide par défaut (0 lamport,
+   propriétaire System, `space` 0, données vides, `rentEpoch` u64::MAX) là où les nœuds précédents
+   renvoyaient `null` ; `getMultipleAccounts` renvoie toujours `null`. Avant ce correctif, chaque
+   BUY réel échouait `RPC_RESPONSE_INVALID` (le compte vide était refusé comme compte WSOL invalide),
+   sur la simulation non signée comme sur la simulation signée H2b. Un compte vide par défaut est
+   désormais traité comme absent ; un compte System non vide à une position de compte token reste
+   refusé. Une erreur programme dont les trois comptes reviennent `null` est classée
+   `SIMULATION_PROGRAM_ERROR` (évidence de comptes nulle, unités et logs conservés) et non plus
+   `RPC_RESPONSE_INVALID`.

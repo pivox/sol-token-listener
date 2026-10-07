@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   getAssociatedTokenAddressSync,
   NATIVE_MINT,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import {
@@ -25,6 +26,8 @@ import type {
 
 const GENESIS = SystemProgram.programId.toBase58();
 const BLOCKHASH = Keypair.generate().publicKey.toBase58();
+// Agave 4.3 reports rentEpoch as u64::MAX, which JSON.parse widens to 2^64.
+const AGAVE_RENT_EPOCH = Number((1n << 64n) - 1n);
 
 void test('uses exact JSON-RPC ids, caches the verified genesis and reports usage', async () => {
   const transport = rpcTransport(({ method }) => {
@@ -239,6 +242,66 @@ void test('supports an absent pre base account and classifies program failures',
   assert.equal(result.failureKind, 'PROGRAM_ERROR');
   assert.equal(result.baseDeltaRaw, 105n);
   assert.equal(result.quoteDeltaRaw, -100n);
+});
+
+// Agave 4.3 (Helius apiVersion 4.3.0): simulateTransaction returns a requested
+// address that does not exist as a zero-lamport System-owned account (not null)
+// and reports rentEpoch as u64::MAX, while getMultipleAccounts still returns null.
+void test('treats an Agave 4.3 default-empty quote account as absent on a Token-2022 BUY', async () => {
+  const fixture = simulationFixture();
+  const baseMint = Keypair.generate().publicKey;
+  const transport = rpcTransport(({ method }) => {
+    if (method === 'getGenesisHash') return GENESIS;
+    if (method === 'getMultipleAccounts') {
+      return { context: { slot: 123 }, value: [systemAccount(10_000_000), null, null] };
+    }
+    return {
+      context: { slot: 125, apiVersion: '4.3.0' },
+      value: {
+        err: null,
+        logs: ['Program log: Instruction: Buy', 'Program success'],
+        unitsConsumed: 102_482,
+        accounts: [
+          { ...systemAccount(8_486_065), rentEpoch: AGAVE_RENT_EPOCH },
+          { ...tokenAccount(baseMint, fixture.payer, 100n, TOKEN_2022_PROGRAM_ID), rentEpoch: AGAVE_RENT_EPOCH },
+          { ...systemAccount(0), rentEpoch: AGAVE_RENT_EPOCH },
+        ],
+      },
+    };
+  });
+  const session = new SolanaLiveRpcSession(config(), transport.fetch);
+  await session.verifyGenesis(signal());
+
+  const result = await session.simulateSignedTransaction(Object.freeze({
+    ...fixture.request, estimatedFeeLamports: 5n,
+  }), signal());
+
+  assert.equal(result.failureKind, null);
+  assert.equal(result.baseDeltaRaw, 100n);
+  assert.equal(result.quoteDeltaRaw, -90n);
+  assert.equal(result.feePayerLamportDebit, 1_513_935n);
+  assert.equal(result.unitsConsumed, 102_482n);
+});
+
+void test('still rejects a non-empty System-owned account in a signed token account position', async () => {
+  const fixture = simulationFixture();
+  const transport = rpcTransport(({ method }) => {
+    if (method === 'getGenesisHash') return GENESIS;
+    if (method === 'getMultipleAccounts') {
+      return { context: { slot: 123 }, value: [systemAccount(10_000_000), null, null] };
+    }
+    return {
+      context: { slot: 125 },
+      value: {
+        err: null, logs: ['Program success'], unitsConsumed: 20_000,
+        accounts: [systemAccount(7_954_720), fixture.post[1], systemAccount(1)],
+      },
+    };
+  });
+  const session = new SolanaLiveRpcSession(config(), transport.fetch);
+  await session.verifyGenesis(signal());
+
+  await rejectsCode(session.simulateSignedTransaction(fixture.request, signal()), 'RPC_RESPONSE_INVALID');
 });
 
 void test('rejects a signed simulation whose quote address is not the payer WSOL ATA', async () => {
@@ -669,15 +732,24 @@ function systemAccount(lamports: number): RpcAccount {
   });
 }
 
-function tokenAccount(mint: PublicKey, holder: PublicKey, amount: bigint): RpcAccount {
-  const data = Buffer.alloc(165);
-  data.set(mint.toBytes(), 0);
-  data.set(holder.toBytes(), 32);
-  data.writeBigUInt64LE(amount, 64);
-  data[108] = 1;
+function tokenAccount(
+  mint: PublicKey,
+  holder: PublicKey,
+  amount: bigint,
+  programId: PublicKey = TOKEN_PROGRAM_ID,
+): RpcAccount {
+  const legacy = Buffer.alloc(165);
+  legacy.set(mint.toBytes(), 0);
+  legacy.set(holder.toBytes(), 32);
+  legacy.writeBigUInt64LE(amount, 64);
+  legacy[108] = 1;
+  // A Token-2022 ATA appends the account-type byte and an ImmutableOwner
+  // extension header (170 bytes on mainnet, rent 1 513 840 lamports).
+  const token2022 = programId.equals(TOKEN_2022_PROGRAM_ID);
+  const data = token2022 ? Buffer.concat([legacy, Buffer.from([2, 7, 0, 0, 0])]) : legacy;
   return Object.freeze({
-    lamports: Number(2_039_280n + (mint.equals(NATIVE_MINT) ? amount : 0n)),
-    owner: TOKEN_PROGRAM_ID.toBase58(),
+    lamports: token2022 ? 1_513_840 : Number(2_039_280n + (mint.equals(NATIVE_MINT) ? amount : 0n)),
+    owner: programId.toBase58(),
     executable: false,
     rentEpoch: 0,
     space: data.byteLength,

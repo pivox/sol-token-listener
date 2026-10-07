@@ -143,6 +143,7 @@ const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const I64_MIN = -(1n << 63n);
 const I64_MAX = (1n << 63n) - 1n;
 const U64_MAX = (1n << 64n) - 1n;
+const U64_MAX_AS_NUMBER = Number(U64_MAX);
 const MAX_TRANSACTION_BYTES = 1_232;
 const MAX_ACCOUNT_DATA_BYTES = 65_536;
 const MAX_LOG_LINES = 256;
@@ -720,13 +721,19 @@ function accountFrom(value: unknown): ParsedAccount | null {
   ), 'base64');
   const space = safeIntegerBigint(record.space);
   if (space !== BigInt(data.byteLength)) throw new TypeError();
-  void safeIntegerBigint(record.rentEpoch);
-  return Object.freeze({
+  // Agave 4.3 reports rentEpoch as u64::MAX (2^64 once JSON-parsed).
+  if (record.rentEpoch !== U64_MAX_AS_NUMBER) void safeIntegerBigint(record.rentEpoch);
+  const account = Object.freeze({
     lamports: safeIntegerBigint(record.lamports),
     owner: publicKey(record.owner),
-    executable: false,
+    executable: false as const,
     data: Uint8Array.from(data),
   });
+  // Agave 4.3 returns a requested address that does not exist as a
+  // zero-lamport System-owned account where older nodes returned null.
+  if (account.lamports === 0n && account.owner === SYSTEM_PROGRAM
+    && account.data.byteLength === 0) return null;
+  return account;
 }
 
 function tokenAccountFrom(value: unknown, expectedHolder: string): ParsedTokenAccount | null {
