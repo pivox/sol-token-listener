@@ -36,7 +36,7 @@ Fait : `ENTRY_MODE=off|fast` (fast exige `creates-only`), migration 064 (`entry_
 le pipeline observé (hors stage, erreurs journalisées), garde de fraîcheur 15 s, rétention des
 décisions (7 j), droits listener (colonnes d'enveloppe en lecture seule) et rétention.
 
-## Lot 4a — terminé (PR #TBD, branche `feat/envelope-auto-arm`)
+## Lot 4a — terminé (PR #241, branche `feat/envelope-auto-arm`)
 
 Plan : `docs/superpowers/plans/2026-10-07-simple-path-lot4a-envelope-auto-arm.md` (voir « Deviations » et
 « Amendments »). Runbook : `docs/operations/executor-live-canary.md`, section « Enveloppe d'entrée et auto-arm ».
