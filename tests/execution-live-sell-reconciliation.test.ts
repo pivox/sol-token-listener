@@ -661,6 +661,33 @@ void test('SELL landed with an error after a prior UNKNOWN run resolves it and e
     });
   });
 
+void test('SELL landed with an error is refused unless the whole position is still in the wallet',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(pool, 'CONFIRMED');
+      const before = await durableState(pool, fixture);
+      const short = landedFailedSellEvidence(fixture, fixture.observedAtMs, {
+        unexpectedResidualTokenBalanceRaw: 94n,
+      });
+      assert.equal(short.result, 'NO_EFFECT');
+      await assert.rejects(
+        fixture.live.commitReconciliation(fixture.claim, short),
+        (error: unknown) => error instanceof ExecutionLiveRepositoryError
+          && error.code === 'CONFLICT',
+      );
+      assert.deepEqual(await durableState(pool, fixture), before);
+      assert.equal(before.intent_status, 'CONFIRMED');
+      const covered = landedFailedSellEvidence(fixture, fixture.observedAtMs, {
+        unexpectedResidualTokenBalanceRaw: 96n,
+      });
+      assert.equal((await fixture.live.commitReconciliation(fixture.claim, covered)).result,
+        'NO_EFFECT');
+      assert.deepEqual(await durableState(pool, fixture), expectedLandedFailedState(1));
+    });
+  });
+
 void test('SELL landed with an error and any other balance change keeps the MISMATCH block',
   async (context) => {
     const databaseUrl = requiredDatabaseUrl(context);

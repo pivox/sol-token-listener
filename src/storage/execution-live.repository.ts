@@ -4814,7 +4814,11 @@ async function commitSellReconciliation(
     || evidence.feeLamports <= 0n
     || evidence.walletLamportDelta !== -evidence.feeLamports
     || evidence.baseDeltaRaw !== 0n || evidence.quoteDeltaRaw !== 0n
-    || evidence.unexpectedResidualTokenBalanceRaw <= 0n)) throw failure('CONFLICT');
+    || evidence.unexpectedResidualTokenBalanceRaw <= 0n
+    // The whole position must still be in the wallet. The evidence is already classified and
+    // fingerprinted, so a shortfall cannot be re-labelled MISMATCH here: it is refused.
+    || evidence.unexpectedResidualTokenBalanceRaw
+      < unsignedBigint(row.remaining_base_raw))) throw failure('CONFLICT');
   const matchedAmounts = evidence.result !== 'MATCHED'
     || (evidence.observedSlot !== null && evidence.baseDeltaRaw < 0n
       && -evidence.baseDeltaRaw === unsignedBigint(row.remaining_base_raw)

@@ -260,8 +260,9 @@ void test('rejects a token-balance identity change at one account index', async 
 
 void test('reports a landed SELL with meta.err and unchanged token accounts as a failed transaction', async () => {
   for (const err of [{ InstructionError: [0, { Custom: 6_001 }] }, 'AccountInUse']) {
+    const requests: RpcRequest[] = [];
     const fixture = failedSellFixture({ err });
-    assert.deepEqual(await failedSellDeltas(fixture), {
+    assert.deepEqual(await failedSellDeltas(fixture, { requests }), {
       confirmationStatus: 'FINALIZED', observedSlot: 500n,
       feeLamports: 5_000n, walletLamportDelta: -5_000n,
       baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
@@ -269,6 +270,7 @@ void test('reports a landed SELL with meta.err and unchanged token accounts as a
       observedAtMs: 2_000, finalizedAtMs: 2_000,
       transactionFailed: true, baseTokenAccountsUnchanged: true,
     });
+    assert.deepEqual(requests.map((item) => item.method), ['getTransaction', 'getSignatureStatuses']);
   }
   const withStatus = failedSellFixture({
     err: { InstructionError: [0, { Custom: 1 }] },
@@ -284,52 +286,105 @@ void test('does not report a failed transaction when meta.err is null or contrad
     { err: null, status: { Err: 'AccountInUse' } },
     { err: 'AccountInUse', status: { Ok: null } },
   ]) {
-    const deltas = await failedSellDeltas(failedSellFixture(meta));
+    const requests: RpcRequest[] = [];
+    const deltas = await failedSellDeltas(failedSellFixture(meta), { requests });
     assert.equal(deltas.transactionFailed, false, JSON.stringify(meta));
     assert.equal(deltas.baseTokenAccountsUnchanged, true);
+    assert.deepEqual(requests.map((item) => item.method), ['getTransaction']);
   }
+});
+
+void test('requires a non-empty string or object meta.err', async () => {
+  for (const err of ['', {}, [], [0]]) {
+    const deltas = await failedSellDeltas(failedSellFixture({ err }));
+    assert.equal(deltas.transactionFailed, false, JSON.stringify(err));
+  }
+  for (const err of [0, true]) {
+    await assert.rejects(
+      failedSellDeltas(failedSellFixture({ err })),
+      (error: unknown) => error instanceof LiveRecoveryRpcError
+        && error.code === 'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
+void test('requires the on-chain failure invariant on every account before reporting a failure', async () => {
+  const err = { InstructionError: [0, { Custom: 6_001 }] };
+  for (const meta of [
+    // Another owner's token account (a pool vault) changed.
+    {
+      err,
+      preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '9')],
+      postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '3')],
+    },
+    // Another owner's token account is present on one side only.
+    {
+      err,
+      preTokenBalances: [tokenBalance(1, 'wallet', '500')],
+      postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '0')],
+    },
+    // An account other than the fee payer changed lamports.
+    { err, preBalances: [1_000_000, 0, 1], postBalances: [995_000, 1, 1] },
+    { err, preBalances: [1_000_000, 0, 1], postBalances: [995_000, 0, 2] },
+  ]) {
+    const requests: RpcRequest[] = [];
+    const deltas = await failedSellDeltas(failedSellFixture(meta), { requests });
+    assert.equal(deltas.transactionFailed, false);
+    assert.deepEqual(requests.map((item) => item.method), ['getTransaction']);
+  }
+});
+
+void test('requires getSignatureStatuses to report the same finalized failure', async () => {
+  const fixture = failedSellFixture({ err: 'AccountInUse' });
+  for (const status of [
+    null,
+    { slot: 500, confirmations: null, err: null, confirmationStatus: 'finalized' },
+    { slot: 500, confirmations: null, err: {}, confirmationStatus: 'finalized' },
+    { slot: 500, confirmations: 3, err: 'AccountInUse', confirmationStatus: 'confirmed' },
+  ]) {
+    assert.equal((await failedSellDeltas(fixture, { status })).transactionFailed, false,
+      JSON.stringify(status));
+  }
+  assert.equal((await failedSellDeltas(fixture, { status: {
+    slot: 500, confirmations: null, err: { InstructionError: [0, 'Custom'] },
+    confirmationStatus: 'finalized',
+  } })).transactionFailed, true);
 });
 
 void test('requires every wallet token account of the mint to be unchanged and present on both sides', async () => {
   const err = { InstructionError: [0, { Custom: 6_001 }] };
-  const scenarios: readonly Readonly<Record<string, unknown>>[] = [
+  const scenarios: readonly (readonly [Readonly<Record<string, unknown>>, boolean])[] = [
     // Two wallet accounts that offset each other: the sum is unchanged, an account is not.
-    {
+    [{
       err,
       preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'wallet', '0')],
       postTokenBalances: [tokenBalance(1, 'wallet', '499'), tokenBalance(2, 'wallet', '1')],
-    },
+    }, false],
     // A wallet account of the mint present in one list only, even with a zero amount.
-    {
+    [{
       err,
       preTokenBalances: [tokenBalance(1, 'wallet', '500')],
       postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'wallet', '0')],
-    },
-    {
+    }, false],
+    [{
       err,
       preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'wallet', '0')],
       postTokenBalances: [tokenBalance(1, 'wallet', '500')],
-    },
+    }, false],
     // An account of the mint whose owner is not reported cannot be attributed.
-    {
+    [{
       err,
       preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, null, '7')],
       postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, null, '7')],
-    },
+    }, true],
     // No wallet account of the mint is visible at all.
-    { err, preTokenBalances: [], postTokenBalances: [] },
+    [{ err, preTokenBalances: [], postTokenBalances: [] }, true],
   ];
-  for (const meta of scenarios) {
+  for (const [meta, failed] of scenarios) {
     const deltas = await failedSellDeltas(failedSellFixture(meta));
-    assert.equal(deltas.transactionFailed, true);
+    assert.equal(deltas.transactionFailed, failed);
     assert.equal(deltas.baseTokenAccountsUnchanged, false);
   }
-  const otherOwner = await failedSellDeltas(failedSellFixture({
-    err,
-    preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '9')],
-    postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '3')],
-  }));
-  assert.equal(otherOwner.baseTokenAccountsUnchanged, true);
 });
 
 void test('reports absent finalized history without inventing a transaction or deltas', async () => {
@@ -604,9 +659,17 @@ function failedSellFixture(meta: Readonly<Record<string, unknown>>) {
   };
 }
 
-async function failedSellDeltas(fixture: ReturnType<typeof failedSellFixture>) {
-  const session = sessionFor([], ({ method }) => {
+async function failedSellDeltas(
+  fixture: ReturnType<typeof failedSellFixture>,
+  options: Readonly<{ requests?: RpcRequest[]; status?: unknown }> = {},
+) {
+  const status = Object.hasOwn(options, 'status') ? options.status : {
+    slot: 500, confirmations: null, err: fixture.rpcTransaction.meta.err,
+    confirmationStatus: 'finalized',
+  };
+  const session = sessionFor(options.requests ?? [], ({ method }) => {
     if (method === 'getTransaction') return fixture.rpcTransaction;
+    if (method === 'getSignatureStatuses') return { context: { slot: 501 }, value: [status] };
     throw new Error('unexpected method');
   });
   return session.readFinalizedWalletDeltas(Object.freeze({
