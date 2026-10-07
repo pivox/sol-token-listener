@@ -39,6 +39,7 @@ export interface ExecutionLiveRecoveryRepository {
   ) => Promise<unknown>;
   readonly createNextDeadlineExitIntent:
     ExecutionLiveRepository['createNextDeadlineExitIntent'];
+  readonly createNextEarlyExitIntent: ExecutionLiveRepository['createNextEarlyExitIntent'];
 }
 
 export function createExecutionLiveRecoveryIntentRepository(
@@ -66,7 +67,8 @@ export function createExecutionLiveRecoveryRepository(
     | 'recordConfirmation'
     | 'readReconciliationWork'
     | 'commitReconciliation'
-    | 'createNextDeadlineExitIntent'>,
+    | 'createNextDeadlineExitIntent'
+    | 'createNextEarlyExitIntent'>,
 ): ExecutionLiveRecoveryRepository {
   return exactFacade({
     readConfirmationWork: source.readConfirmationWork.bind(source),
@@ -74,6 +76,7 @@ export function createExecutionLiveRecoveryRepository(
     readReconciliationWork: source.readReconciliationWork.bind(source),
     commitReconciliation: source.commitReconciliation.bind(source),
     createNextDeadlineExitIntent: source.createNextDeadlineExitIntent.bind(source),
+    createNextEarlyExitIntent: source.createNextEarlyExitIntent.bind(source),
   });
 }
 

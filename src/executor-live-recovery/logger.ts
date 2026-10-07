@@ -1,7 +1,8 @@
 import { isProxy } from 'node:util/types';
 import pino, { type DestinationStream } from 'pino';
+import { FAST_EXIT_REASONS, type FastExitReason } from '../domain/fast-exit.js';
 
-export type LiveRecoveryLaneName = 'RECONCILIATION' | 'CONFIRMATION' | 'DEADLINE';
+export type LiveRecoveryLaneName = 'RECONCILIATION' | 'CONFIRMATION' | 'DEADLINE' | 'EXIT';
 
 export interface LiveRecoveryLogContext {
   readonly event?: string;
@@ -11,6 +12,7 @@ export interface LiveRecoveryLogContext {
   readonly errorCode?: string;
   readonly providerPosition?: number;
   readonly durationMs?: number;
+  readonly reason?: FastExitReason;
 }
 
 export interface LiveRecoveryLogger {
@@ -21,7 +23,7 @@ export interface LiveRecoveryLogger {
 
 const CONTEXT_KEYS = Object.freeze([
   'event', 'executionMode', 'lane', 'result', 'errorCode',
-  'providerPosition', 'durationMs',
+  'providerPosition', 'durationMs', 'reason',
 ] as const);
 const SECRET_KEYS = Object.freeze([
   'EXECUTOR_PRIVATE_KEY', 'EXECUTOR_SECRET_KEY', 'EXECUTOR_KEYPAIR',
@@ -97,7 +99,8 @@ function safeValue(
         && /^executor_live_recovery\.[a-z][a-z0-9_]{0,63}$/u.test(value);
     case 'executionMode': return value === 'live-recovery';
     case 'lane':
-      return value === 'RECONCILIATION' || value === 'CONFIRMATION' || value === 'DEADLINE';
+      return value === 'RECONCILIATION' || value === 'CONFIRMATION' || value === 'DEADLINE'
+        || value === 'EXIT';
     case 'result': return value === 'DEFERRED' || value === 'WORKED';
     case 'errorCode':
       return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(value);
@@ -105,5 +108,7 @@ function safeValue(
       return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
     case 'durationMs':
       return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    case 'reason':
+      return typeof value === 'string' && (FAST_EXIT_REASONS as readonly string[]).includes(value);
   }
 }

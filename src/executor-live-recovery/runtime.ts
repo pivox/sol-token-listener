@@ -49,12 +49,14 @@ export interface LiveRecoveryRuntimeOptions {
 const ORDERED_LANES = Object.freeze([
   ['reconciliation', 'RECONCILIATION'],
   ['confirmation', 'CONFIRMATION'],
+  // The deadline always runs before the early exits: an exit failure ends the pass after it.
   ['deadline', 'DEADLINE'],
+  ['exit', 'EXIT'],
 ] as const);
 const SAFE_ERROR_CODES = new Set([
   'OPERATION_ABORTED', 'CLAIM_FAILED', 'READ_MODEL_FAILED', 'PROVIDER_MISMATCH',
   'GATEWAY_FAILED', 'LEASE_LOST', 'INVALID_EVIDENCE', 'COMMIT_FAILED',
-  'RELEASE_FAILED', 'DEADLINE_FAILED', 'INVALID_INPUT', 'INVALID_DATA',
+  'RELEASE_FAILED', 'DEADLINE_FAILED', 'EXIT_FAILED', 'INVALID_INPUT', 'INVALID_DATA',
   'DATABASE_FAILURE', 'INTENT_LEASE_LOST', 'RPC_RATE_LIMITED', 'RPC_TIMEOUT',
   'RPC_UNAVAILABLE', 'RPC_RESPONSE_TOO_LARGE', 'RPC_RESPONSE_INVALID',
   'GENESIS_MISMATCH', 'CALL_BUDGET_EXCEEDED', 'SESSION_FAILED',

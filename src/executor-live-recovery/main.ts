@@ -120,6 +120,7 @@ function productionDependencies(logger: LiveRecoveryLogger): LiveRecoveryBootstr
       intents: database.intents,
       live: database.live,
       gateway: rpcSession(config),
+      logger,
     }),
     runtime: runLiveRecoveryRuntime,
     logger,

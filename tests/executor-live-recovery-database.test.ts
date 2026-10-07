@@ -179,18 +179,19 @@ void test('exposes exact frozen null-prototype facades and fixes claim purposes'
   const liveCalls: string[] = [];
   const liveSource = (Object.fromEntries([
     'readConfirmationWork', 'recordConfirmation', 'readReconciliationWork',
-    'commitReconciliation', 'createNextDeadlineExitIntent',
+    'commitReconciliation', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
   ].map((name) => [name, async () => { liveCalls.push(name); return null; }]))) as unknown as Pick<ExecutionLiveRepository,
       | 'readConfirmationWork'
       | 'recordConfirmation'
       | 'readReconciliationWork'
       | 'commitReconciliation'
-      | 'createNextDeadlineExitIntent'>;
+      | 'createNextDeadlineExitIntent'
+      | 'createNextEarlyExitIntent'>;
   const live = createExecutionLiveRecoveryRepository(liveSource);
 
   assert.deepEqual(Object.keys(live), [
     'readConfirmationWork', 'recordConfirmation', 'readReconciliationWork',
-    'commitReconciliation', 'createNextDeadlineExitIntent',
+    'commitReconciliation', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
   ]);
   assert.equal(Object.getPrototypeOf(live), null);
   assert.equal(Object.isFrozen(live), true);
@@ -200,9 +201,10 @@ void test('exposes exact frozen null-prototype facades and fixes claim purposes'
   await live.readReconciliationWork(undefined as never);
   await live.commitReconciliation(undefined as never, undefined as never);
   await live.createNextDeadlineExitIntent();
+  await live.createNextEarlyExitIntent(undefined as never);
   assert.deepEqual(liveCalls, [
     'readConfirmationWork', 'recordConfirmation', 'readReconciliationWork',
-    'commitReconciliation', 'createNextDeadlineExitIntent',
+    'commitReconciliation', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
   ]);
 });
 

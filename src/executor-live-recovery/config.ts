@@ -1,5 +1,6 @@
 import { isProxy } from 'node:util/types';
 import { PublicKey } from '@solana/web3.js';
+import { validFastExitPolicy } from '../domain/fast-exit.js';
 
 export interface LiveRecoveryConfig {
   readonly mode: 'live';
@@ -18,6 +19,10 @@ export interface LiveRecoveryConfig {
   readonly rpcTimeoutMs: number;
   readonly maxRpcCallsPerPass: number;
   readonly ownerId: string;
+  /** Early exit policy of the `exit` lane (envelope positions only). */
+  readonly exitTakeProfitBps: bigint;
+  readonly exitExternalBuyersTarget: number;
+  readonly exitExternalMinimumBuyRaw: bigint;
 }
 
 export class LiveRecoveryConfigError extends Error {
@@ -28,6 +33,12 @@ export class LiveRecoveryConfigError extends Error {
     this.name = 'LiveRecoveryConfigError';
   }
 }
+
+// Spec «Configuration» defaults of the early exit policy.
+const DEFAULT_EXIT_TAKE_PROFIT_BPS = 20_000;
+const DEFAULT_EXIT_EXTERNAL_BUYERS_TARGET = 10;
+const DEFAULT_EXIT_EXTERNAL_MIN_BUY_RAW = 1_000_000n;
+const U64_MAX = 18_446_744_073_709_551_615n;
 
 const SECRET_KEYS = Object.freeze([
   'EXECUTOR_PRIVATE_KEY', 'EXECUTOR_SECRET_KEY', 'EXECUTOR_KEYPAIR',
@@ -57,6 +68,18 @@ export function parseLiveRecoveryConfig(value: unknown): LiveRecoveryConfig {
     if (pollMs >= leaseMs || databaseStatementTimeoutMs * 3 > leaseMs
       || databaseStatementTimeoutMs + 1_000 > shutdownGraceMs
       || rpcTimeoutMs * 4 + databaseStatementTimeoutMs * 6 + 1_000 > leaseMs) reject();
+    // Optional, but a present invalid value fails startup; the domain re-validates the policy.
+    const exitPolicy = validFastExitPolicy(Object.freeze({
+      takeProfitBps: BigInt(optionalInteger(
+        environment, 'EXIT_TAKE_PROFIT_BPS', 10_001, 100_000, DEFAULT_EXIT_TAKE_PROFIT_BPS,
+      )),
+      externalBuyersTarget: optionalInteger(
+        environment, 'EXIT_EXTERNAL_BUYERS_TARGET', 1, 1_000, DEFAULT_EXIT_EXTERNAL_BUYERS_TARGET,
+      ),
+      externalMinimumBuyRaw: optionalU64(
+        environment, 'EXIT_EXTERNAL_MIN_BUY_RAW', DEFAULT_EXIT_EXTERNAL_MIN_BUY_RAW,
+      ),
+    }));
     return Object.freeze({
       mode: 'live',
       recoveryEnabled: true,
@@ -85,6 +108,9 @@ export function parseLiveRecoveryConfig(value: unknown): LiveRecoveryConfig {
         environment, 'EXECUTOR_LIVE_RECOVERY_OWNER_ID',
         /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u, 128,
       ),
+      exitTakeProfitBps: exitPolicy.takeProfitBps,
+      exitExternalBuyersTarget: exitPolicy.externalBuyersTarget,
+      exitExternalMinimumBuyRaw: exitPolicy.externalMinimumBuyRaw,
     });
   } catch {
     throw new LiveRecoveryConfigError();
@@ -159,6 +185,32 @@ function integer(
   if (raw === undefined || !/^(?:0|[1-9][0-9]*)$/u.test(raw)) reject();
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) reject();
+  return value;
+}
+
+/** Absent: the default. Present: must be a canonical integer within bounds. */
+function optionalInteger(
+  environment: Readonly<Record<string, string | undefined>>,
+  key: string,
+  minimum: number,
+  maximum: number,
+  defaultValue: number,
+): number {
+  if (environmentValue(environment, key) === undefined) return defaultValue;
+  return integer(environment, key, minimum, maximum);
+}
+
+/** Absent: the default. Present: a canonical decimal in 1..u64::MAX. */
+function optionalU64(
+  environment: Readonly<Record<string, string | undefined>>,
+  key: string,
+  defaultValue: bigint,
+): bigint {
+  const raw = environmentValue(environment, key);
+  if (raw === undefined) return defaultValue;
+  if (!/^[1-9][0-9]{0,19}$/u.test(raw)) reject();
+  const value = BigInt(raw);
+  if (value > U64_MAX) reject();
   return value;
 }
 

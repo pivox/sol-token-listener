@@ -14,7 +14,9 @@ import type { ExecutionReconciliationGateway } from
   '../ports/execution-reconciliation-gateway.js';
 import type { ExecutionReconciliationCommitResultV1 } from
   '../ports/execution-risk-repository.js';
+import type { FastExitPolicy } from '../domain/fast-exit.js';
 import type { LiveRecoveryConfig } from './config.js';
+import type { LiveRecoveryLogger } from './logger.js';
 
 export type LiveRecoveryRetryableRpcErrorCode =
   | 'RPC_RATE_LIMITED'
@@ -42,7 +44,8 @@ export type LiveRecoveryLaneErrorCode =
   | 'INVALID_EVIDENCE'
   | 'COMMIT_FAILED'
   | 'RELEASE_FAILED'
-  | 'DEADLINE_FAILED';
+  | 'DEADLINE_FAILED'
+  | 'EXIT_FAILED';
 
 export class LiveRecoveryLaneError extends Error {
   public constructor(public readonly code: LiveRecoveryLaneErrorCode) {
@@ -60,12 +63,14 @@ export interface LiveRecoveryLaneDependencies {
   readonly intents: ExecutionLiveRecoveryIntentRepository;
   readonly live: ExecutionLiveRecoveryRepository;
   readonly gateway: RecoveryGateway;
+  readonly logger: LiveRecoveryLogger;
 }
 
 export interface LiveRecoveryLanes {
   reconciliation(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
   confirmation(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
   deadline(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
+  exit(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
 }
 
 export function createLiveRecoveryLanes(
@@ -75,6 +80,7 @@ export function createLiveRecoveryLanes(
     reconciliation: (signal: AbortSignal) => reconciliationLane(dependencies, signal),
     confirmation: (signal: AbortSignal) => confirmationLane(dependencies, signal),
     deadline: (signal: AbortSignal) => deadlineLane(dependencies, signal),
+    exit: (signal: AbortSignal) => exitLane(dependencies, signal),
   };
   return Object.freeze(lanes);
 }
@@ -200,6 +206,42 @@ async function deadlineLane(
     if (error instanceof LiveRecoveryLaneError) throw error;
     throw laneFailure('DEADLINE_FAILED');
   }
+}
+
+/**
+ * Early SELL intent of one envelope position (no signing, no RPC). Runs after the deadline lane;
+ * the repository only considers positions whose deadline is not due.
+ */
+async function exitLane(
+  dependencies: LiveRecoveryLaneDependencies,
+  signal: AbortSignal,
+): Promise<LiveRecoveryLaneResult> {
+  assertActive(signal);
+  try {
+    const result = await dependencies.live.createNextEarlyExitIntent(
+      exitPolicyFrom(dependencies.config),
+    );
+    assertActive(signal);
+    if (result === null) return 'IDLE';
+    dependencies.logger.info(Object.freeze({
+      event: 'executor_live_recovery.exit_decided',
+      executionMode: 'live-recovery',
+      lane: 'EXIT',
+      reason: result.reason,
+    }));
+    return 'WORKED';
+  } catch (error) {
+    if (error instanceof LiveRecoveryLaneError) throw error;
+    throw laneFailure('EXIT_FAILED');
+  }
+}
+
+function exitPolicyFrom(config: LiveRecoveryConfig): FastExitPolicy {
+  return Object.freeze({
+    takeProfitBps: config.exitTakeProfitBps,
+    externalBuyersTarget: config.exitExternalBuyersTarget,
+    externalMinimumBuyRaw: config.exitExternalMinimumBuyRaw,
+  });
 }
 
 async function claim(

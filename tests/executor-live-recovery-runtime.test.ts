@@ -6,6 +6,7 @@ import type {
   LiveRecoveryLogger,
 } from '../src/executor-live-recovery/logger.js';
 import { createLiveRecoveryLogger } from '../src/executor-live-recovery/logger.js';
+import { LiveRecoveryLaneError } from '../src/executor-live-recovery/lanes.js';
 import {
   runLiveRecoveryPass,
   runLiveRecoveryRuntime,
@@ -21,8 +22,10 @@ void test('a pass preserves priority while deferred finality cannot starve deadl
     },
     confirmation: async () => { calls.push('confirmation'); return 'IDLE'; },
     deadline: async () => { calls.push('deadline'); return 'WORKED'; },
+    exit: async () => { calls.push('exit'); return 'WORKED'; },
   }, new AbortController().signal);
 
+  // A WORKED deadline ends the pass before the exit lane.
   assert.deepEqual(calls, ['reconciliation', 'confirmation', 'deadline']);
   assert.deepEqual(result, {
     payloadVersion: 1,
@@ -40,6 +43,7 @@ void test('worked reconciliation stops the pass before lower-priority lanes', as
     reconciliation: async () => { calls.push('reconciliation'); return 'WORKED'; },
     confirmation: async () => { calls.push('confirmation'); return 'WORKED'; },
     deadline: async () => { calls.push('deadline'); return 'WORKED'; },
+    exit: async () => { calls.push('exit'); return 'WORKED'; },
   }, new AbortController().signal);
   assert.deepEqual(calls, ['reconciliation']);
   assert.deepEqual(result, {
@@ -47,6 +51,55 @@ void test('worked reconciliation stops the pass before lower-priority lanes', as
     workedLane: 'RECONCILIATION',
     deferredLanes: [],
   });
+});
+
+void test('an idle pass runs reconciliation, confirmation, deadline, then exit', async () => {
+  const calls: string[] = [];
+  const result = await runLiveRecoveryPass({
+    reconciliation: async () => { calls.push('reconciliation'); return 'IDLE'; },
+    confirmation: async () => { calls.push('confirmation'); return 'IDLE'; },
+    deadline: async () => { calls.push('deadline'); return 'IDLE'; },
+    exit: async () => { calls.push('exit'); return 'WORKED'; },
+  }, new AbortController().signal);
+  assert.deepEqual(calls, ['reconciliation', 'confirmation', 'deadline', 'exit']);
+  assert.deepEqual(result, { payloadVersion: 1, workedLane: 'EXIT', deferredLanes: [] });
+});
+
+void test('an exit lane failing on every pass never blocks the deadline lane', async () => {
+  const scheduler = manualScheduler();
+  const signals = new EventEmitter();
+  const events: LiveRecoveryLogContext[] = [];
+  const calls: string[] = [];
+  const runtime = runLiveRecoveryRuntime({
+    createLanes: () => ({
+      reconciliation: async () => 'IDLE',
+      confirmation: async () => 'IDLE',
+      deadline: async () => { calls.push('deadline'); return 'IDLE'; },
+      exit: async () => {
+        calls.push('exit');
+        throw new LiveRecoveryLaneError('EXIT_FAILED');
+      },
+    }),
+    logger: logger(events), closeDatabase: async () => undefined,
+    evictDatabase: () => undefined, forceExit: () => undefined,
+  }, { pollMs: 500, shutdownGraceMs: 5_000, scheduler, signalSource: signals });
+
+  await nextTurn();
+  scheduler.fire(500);
+  await nextTurn();
+  scheduler.fire(500);
+  await nextTurn();
+  signals.emit('SIGTERM');
+  await runtime;
+  assert.deepEqual(calls, ['deadline', 'exit', 'deadline', 'exit', 'deadline', 'exit']);
+  const failures = events.filter((event) => event.event === 'executor_live_recovery.lane_failed');
+  assert.equal(failures.length, 3);
+  for (const failure of failures) {
+    assert.deepEqual(failure, {
+      event: 'executor_live_recovery.lane_failed', executionMode: 'live-recovery',
+      lane: 'EXIT', errorCode: 'EXIT_FAILED',
+    });
+  }
 });
 
 void test('runtime logs bounded outcomes, waits one poll and closes after SIGTERM', async () => {
@@ -61,6 +114,7 @@ void test('runtime logs bounded outcomes, waits one poll and closes after SIGTER
       }),
       confirmation: async () => 'IDLE',
       deadline: async () => 'WORKED',
+      exit: async () => 'IDLE',
     }),
     logger: logger(events),
     closeDatabase: async () => { calls.push('close'); },
@@ -101,6 +155,7 @@ void test('runtime rejects hostile lane deferred results and logs a closed pass 
       reconciliation: async () => ({ result: 'DEFERRED', errorCode: 'RPC_TIMEOUT', secret: 'credential' }) as never,
       confirmation: async () => 'IDLE',
       deadline: async () => 'IDLE',
+      exit: async () => 'IDLE',
     }),
     logger: logger(events), closeDatabase: async () => undefined,
     evictDatabase: () => undefined, forceExit: () => undefined,
@@ -126,6 +181,7 @@ void test('shutdown deadline evicts the active database connection before exit o
       reconciliation: async () => new Promise<'IDLE'>(() => undefined),
       confirmation: async () => 'IDLE',
       deadline: async () => 'IDLE',
+      exit: async () => 'IDLE',
     }),
     logger: logger(events),
     closeDatabase: async () => { calls.push('close'); },
@@ -160,6 +216,7 @@ void test('lane factory failures are redacted and retried only after the poll in
         reconciliation: async () => 'IDLE',
         confirmation: async () => 'IDLE',
         deadline: async () => 'IDLE',
+        exit: async () => 'IDLE',
       };
     },
     logger: logger(events), closeDatabase: async () => undefined,
@@ -210,6 +267,25 @@ void test('logger emits only the closed recovery context and drops hostile paylo
   for (const forbidden of ['credential', 'private', 'signature', 'mint', 'amount']) {
     assert.equal(raw.includes(forbidden), false);
   }
+});
+
+void test('logger accepts the EXIT lane and a known exit reason only', () => {
+  const lines: string[] = [];
+  const recoveryLogger = createLiveRecoveryLogger({
+    write: (chunk: string) => { lines.push(chunk); },
+  });
+  recoveryLogger.info({
+    event: 'executor_live_recovery.exit_decided', executionMode: 'live-recovery',
+    lane: 'EXIT', reason: 'CREATOR_SOLD',
+  });
+  recoveryLogger.info({
+    event: 'executor_live_recovery.exit_decided', executionMode: 'live-recovery',
+    lane: 'EXIT', reason: 'private-mint-reason',
+  } as unknown as LiveRecoveryLogContext);
+  assert.equal(lines.length, 1);
+  const line = JSON.parse(lines[0] ?? '') as Record<string, unknown>;
+  assert.equal(line.lane, 'EXIT');
+  assert.equal(line.reason, 'CREATOR_SOLD');
 });
 
 function logger(events: LiveRecoveryLogContext[]): LiveRecoveryLogger {

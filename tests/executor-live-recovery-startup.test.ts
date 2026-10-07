@@ -294,5 +294,6 @@ function config(): LiveRecoveryConfig {
     providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
     expectedGenesisHash: PUBLIC_KEY, rpcTimeoutMs: 5_000,
     maxRpcCallsPerPass: 8, ownerId: 'recovery-a',
+    exitTakeProfitBps: 20_000n, exitExternalBuyersTarget: 10, exitExternalMinimumBuyRaw: 1_000_000n,
   });
 }

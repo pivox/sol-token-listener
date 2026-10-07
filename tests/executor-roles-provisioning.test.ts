@@ -1011,6 +1011,7 @@ function recoveryConfig(generationId: string, publicKey: string): LiveRecoveryCo
     generationId, executorPublicKey: publicKey, providerId: 'primary',
     httpRpcUrl: 'https://rpc.example.test', expectedGenesisHash: publicKey,
     rpcTimeoutMs: 5_000, maxRpcCallsPerPass: 8, ownerId: 'recovery-test',
+    exitTakeProfitBps: 20_000n, exitExternalBuyersTarget: 10, exitExternalMinimumBuyRaw: 1_000_000n,
   });
 }
 

@@ -26,6 +26,7 @@ void test('bootstrap validates database and genesis before lanes and transfers c
         reconciliation: async () => 'IDLE',
         confirmation: async () => 'IDLE',
         deadline: async () => 'IDLE',
+        exit: async () => 'IDLE',
       });
     },
     runtime: async (runtimeDependencies) => {
@@ -149,5 +150,6 @@ function config(): LiveRecoveryConfig {
     executorPublicKey: key, providerId: 'primary',
     httpRpcUrl: 'https://rpc.example.test', expectedGenesisHash: key,
     rpcTimeoutMs: 5_000, maxRpcCallsPerPass: 8, ownerId: 'recovery-a',
+    exitTakeProfitBps: 20_000n, exitExternalBuyersTarget: 10, exitExternalMinimumBuyRaw: 1_000_000n,
   });
 }
