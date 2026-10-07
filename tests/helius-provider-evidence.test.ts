@@ -64,11 +64,18 @@ void test('rejects missing and unknown current nested keys', () => {
   const requests = current.requests as Readonly<Record<string, unknown>>;
   const dataTransfer = current.dataTransfer as Readonly<Record<string, unknown>>;
   const subscription = current.subscriptionDetails as Readonly<Record<string, unknown>>;
+  // Per-service breakdowns are informational: new categories are tolerated when
+  // they are counters, `rpc` stays required, non-counters are refused.
+  assert.doesNotThrow(() => createUsage({ ...current, credits: { ...credits, futureProduct: 0 } }));
+  assert.doesNotThrow(() => createUsage({ ...current, requests: { ...requests, parsedStreams: 3 } }));
+  assert.doesNotThrow(() => createUsage({ ...current, credits: withoutKey(credits, 'other') }));
   for (const response of [
-    { ...current, credits: withoutKey(credits, 'other') },
-    { ...current, credits: { ...credits, futureProduct: 0 } },
-    { ...current, requests: withoutKey(requests, 'photon') },
-    { ...current, requests: { ...requests, futureProduct: 0 } },
+    { ...current, credits: withoutKey(credits, 'rpc') },
+    { ...current, credits: { ...credits, futureProduct: 'many' } },
+    { ...current, credits: { ...credits, futureProduct: -1 } },
+    { ...current, credits: {} },
+    { ...current, requests: withoutKey(requests, 'rpc') },
+    { ...current, requests: { ...requests, futureProduct: null } },
     { ...current, dataTransfer: withoutKey(dataTransfer, 'laserstreamGrpc') },
     { ...current, dataTransfer: { ...dataTransfer, futureTransport: 0 } },
     { ...current, subscriptionDetails: withoutKey(subscription, 'creditsLimit') },
@@ -152,6 +159,31 @@ function createUsage(response: Readonly<Record<string, unknown>>) {
     response, measuredAtMs: MEASURED_AT_MS, ttlMs: 300_000,
   }));
 }
+
+void test('accepts the Helius Admin API usage response observed on 2026-10-07 (parsedStreams category)', () => {
+  const observed = Object.freeze({
+    creditsRemaining: 999_860, creditsUsed: 140, prepaidCreditsRemaining: 0, prepaidCreditsUsed: 0,
+    creditCycle: Object.freeze({ start: '2026-10-07', end: '2026-11-07' }),
+    subscriptionDetails: Object.freeze({ billingCycle: null, creditsLimit: 1_000_000, plan: 'free' }),
+    credits: Object.freeze({
+      rpc: 140, enhancedApi: 0, walletApi: 0, das: 0, webhooks: 0, laserstreamGrpc: 0,
+      laserstreamWebsocket: 0, preConfirmations: 0, preprocessedTransactions: 0, parsedStreams: 0,
+      archival: 0, photon: 0, other: 0,
+    }),
+    requests: Object.freeze({
+      rpc: 140, enhancedApi: 0, walletApi: 0, das: 0, webhooks: 0, preConfirmations: 0,
+      preprocessedTransactions: 0, parsedStreams: 0, archival: 0, photon: 0, other: 0,
+    }),
+    dataTransfer: Object.freeze({ laserstreamGrpc: 0, laserstreamWebsocket: 0 }),
+  });
+  const result = createHeliusProviderUsage(Object.freeze({
+    providerId: 'helius', projectId: '7ab4f4e1-ee01-4122-9dae-ca0c178dd0ee',
+    response: observed, measuredAtMs: Date.parse('2026-10-08T00:00:00.000Z'), ttlMs: 300_000,
+  }));
+  assert.equal(result.snapshot.limitUnits, 1_000_000n);
+  assert.equal(result.snapshot.usedUnits, 140n);
+  assert.equal(result.snapshot.planId, 'free');
+});
 
 function validLegacyResponse(): Readonly<Record<string, unknown>> {
   return Object.freeze({

@@ -22,15 +22,11 @@ const USAGE_KEYS = Object.freeze([
   'api', 'archival', 'das', 'grpc', 'grpcGeyser', 'photon', 'rpc', 'stream',
   'webhook', 'websocket',
 ] as const);
-const CREDIT_KEYS = Object.freeze([
-  'rpc', 'enhancedApi', 'walletApi', 'das', 'webhooks', 'laserstreamGrpc',
-  'laserstreamWebsocket', 'preConfirmations', 'preprocessedTransactions',
-  'archival', 'photon', 'other',
-] as const);
-const REQUEST_KEYS = Object.freeze([
-  'rpc', 'enhancedApi', 'walletApi', 'das', 'webhooks', 'preConfirmations',
-  'preprocessedTransactions', 'archival', 'photon', 'other',
-] as const);
+// Informational per-service breakdowns. Helius adds categories over time
+// (`parsedStreams` appeared in 2026-10), so only `rpc` is required and every
+// other entry must be a counter; the quota itself comes from the top-level fields.
+const BREAKDOWN_REQUIRED_KEYS = Object.freeze(['rpc'] as const);
+const MAX_BREAKDOWN_KEYS = 64;
 const DATA_TRANSFER_KEYS = Object.freeze([
   'laserstreamGrpc', 'laserstreamWebsocket',
 ] as const);
@@ -153,14 +149,26 @@ function validateBreakdown(response: LegacyHeliusResponse | CurrentHeliusRespons
     validateCounters(response.usage, USAGE_KEYS);
     return;
   }
-  validateCounters(response.credits, CREDIT_KEYS);
-  validateCounters(response.requests, REQUEST_KEYS);
+  validateBreakdownCounters(response.credits);
+  validateBreakdownCounters(response.requests);
   validateCounters(response.dataTransfer, DATA_TRANSFER_KEYS);
 }
 
 function validateCounters(value: unknown, keys: readonly string[]): void {
   const counters = exactRecord(value, keys);
   for (const counterValue of Object.values(counters)) counter(counterValue);
+}
+
+function validateBreakdownCounters(value: unknown): void {
+  const own = exactOwnKeys(value);
+  if (own.length === 0 || own.length > MAX_BREAKDOWN_KEYS
+    || own.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 64)
+    || BREAKDOWN_REQUIRED_KEYS.some((key) => !own.includes(key))) throw invalid();
+  for (const key of own) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !('value' in descriptor)) throw invalid();
+    counter(descriptor.value);
+  }
 }
 
 export function createHeliusProviderEvidenceManifest(
