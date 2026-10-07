@@ -36,6 +36,40 @@ Fait : `ENTRY_MODE=off|fast` (fast exige `creates-only`), migration 064 (`entry_
 le pipeline observé (hors stage, erreurs journalisées), garde de fraîcheur 15 s, rétention des
 décisions (7 j), droits listener (colonnes d'enveloppe en lecture seule) et rétention.
 
+## Lot 4a — terminé (PR #TBD, branche `feat/envelope-auto-arm`)
+
+Plan : `docs/superpowers/plans/2026-10-07-simple-path-lot4a-envelope-auto-arm.md` (voir « Deviations » et
+« Amendments »). Runbook : `docs/operations/executor-live-canary.md`, section « Enveloppe d'entrée et auto-arm ».
+Écarts :
+- armement par un démon `live:auto-arm` (rôle operations), pas une lane H2b ;
+- qualification `ENVELOPE` (24 h, payload version 2) ;
+- découpage 4a / 4b ;
+- la sortie à l'échéance utilise l'événement de décision du BUY (pas de `LiveExitDecided`) ;
+- TTL des intents fast-entry 30 s -> 120 s ;
+- perte réalisée = somme des pertes par position ;
+- revoke n'est pas une sortie immédiate.
+
+Correctifs de droits trouvés sur main et corrigés ici :
+- rôle operations : `control_events`, `pair_memberships.pair_id`, `rate_limit_events.event_id`,
+  `authorizations.payload_version`, `admission_reports.quota_state` ;
+- rôle live : SELECT sur `execution_wallet_snapshots` (`snapshot_fingerprint`, `superseded_at`) et
+  `execution_safety_gate_evidence` (`qualification_id`, `gate_index`, `gate_id`, `status`,
+  `evidence_fingerprint`, `expires_at`) ; sans eux la signature BUY ne pouvait jamais tourner sous le rôle live.
+
+Reste ouvert : le chemin v3 pairé n'a pas de droit operations sur `execution_preflight_intent_pairs`.
+
+## Lot 4b — ouvert
+
+Lane de sortie (vente par le créateur / take-profit / N acheteurs), `LiveExitDecided`, CLI `report`,
+`market_pools` en creates-only.
+
+## Prérequis du lot 5
+
+- artefact gate 10, produit par le worker simulation-only avec auto-arm arrêté ;
+- provider id ou clé dédié à l'exécuteur (point de sécurité 2) ;
+- `maximum_holding_ms` <= 300 000 ;
+- accord explicite de l'opérateur.
+
 ## Points ouverts pour le lot 4
 
 - Lignage exécuteur : `EXECUTION_INTENT_CURRENT_LINEAGE_SQL` exige candidat paper +
@@ -51,8 +85,7 @@ décisions (7 j), droits listener (colonnes d'enveloppe en lecture seule) et ré
 
 ## Ensuite
 
-- Lot 4 : exécuteur (enveloppe + CLI, qualification `ENVELOPE`, lane `arm`, lane `exit`, clé
-  étrangère de l'échéance, CLI `report`, migration 065). Plan à écrire.
+- Lot 4b : lane de sortie, `LiveExitDecided`, CLI `report` (le 4a est fait, voir plus haut).
 - Lot 5 : premier run réel (K = 1, enveloppe minimale) — accord explicite de l'opérateur requis.
 
 ## Environnement

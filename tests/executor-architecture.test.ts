@@ -723,7 +723,7 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
   assert.deepEqual(executorEnvironment, {
     EXECUTOR_MODE: 'dry-run',
     EXECUTOR_POLL_MS: '1000',
-    EXECUTOR_LEASE_MS: '35000',
+    EXECUTOR_LEASE_MS: '40000',
     EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
     EXECUTOR_SHUTDOWN_GRACE_MS: '10000',
     EXECUTOR_PUBLIC_KEY: '',
