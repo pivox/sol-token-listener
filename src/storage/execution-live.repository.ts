@@ -41,6 +41,10 @@ import {
   type FastExitReason,
   type FastExitTrade,
   validFastExitPolicy,
+  exitReasonOfLogicalKey,
+  reExitLogicalCommandId,
+  REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN,
+  REEXIT_MIN_SPACING_MS,
 } from '../domain/fast-exit.js';
 import { lockLiveSellPresenceInTransaction } from './execution-intent.repository.js';
 import type {
@@ -49,6 +53,7 @@ import type {
   ExecutionBlockhashValidityEvidenceV1,
   ExecutionDeadlineExitResultV1,
   ExecutionEarlyExitResultV1,
+  ExecutionReExitResultV1,
   ExecutionLiveConfirmationV1,
   ExecutionLiveConfirmationWorkV1,
   ExecutionLiveArtifactReferenceV1,
@@ -1606,6 +1611,67 @@ export class PostgresExecutionLiveRepository {
         });
       }
       return null;
+    });
+  }
+
+  /**
+   * Replaces the dead exit intent of one EXIT_PENDING position (CANARY or envelope) by a new
+   * PENDING SELL `<root>:retry-<k>`, at most MAXIMUM_RE_EXITS times. Same scan lock and lock
+   * order as the deadline scanner (51007, mint, 51008, 51005, position row, then the dead
+   * intent row). The guard is checked in the candidate SQL, re-checked on the locked rows, and
+   * enforced again by the 066 position trigger. A SELL past its TTL whose lease lapsed is first
+   * expired in place and the transaction commits that alone: the spacing defers its re-exit.
+   */
+  public async createNextReExitIntent(): Promise<ExecutionReExitResultV1 | null> {
+    return this.transaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(
+        hashtextextended('execution-live-deadline-scan:v1', 51007))`);
+      const clock = exactRow(singleRow(await client.query(`SELECT
+        /* execution_live_deadline_clock */
+        trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+          AS deadline_clock_ms`)), ['deadline_clock_ms'] as const);
+      const observedAtMs = timestampText(clock.deadline_clock_ms);
+      const candidates = await client.query(REEXIT_CANDIDATE_SQL, [
+        observedAtMs, REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN, REEXIT_MIN_SPACING_MS,
+      ]);
+      if (candidates.rows.length === 0) return null;
+      const candidate = exactRow(singleRow(candidates), [
+        'position_id', 'generation_id', 'mint', 'exit_intent_id',
+      ] as const);
+      const positionId = text(candidate.position_id);
+      const generationId = text(candidate.generation_id);
+      const mint = solanaAddress(candidate.mint);
+      const previousIntentId = text(candidate.exit_intent_id);
+      if (!/^execution_live_position_[0-9a-f]{64}$/u.test(positionId)
+        || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)
+        || !/^execution_intent_[0-9a-f]{64}$/u.test(previousIntentId)) {
+        throw failure('INVALID_DATA');
+      }
+      await lockWorkerTrackingMints(client, [mint]);
+      await lockLiveSellPresenceInTransaction(client);
+      await lockGeneration(client, generationId);
+      return createReExitIntentLocked(client, {
+        positionId, generationId, previousIntentId, observedAtMs,
+      });
+    });
+  }
+
+  /**
+   * EXIT_PENDING positions behind a dead SELL that no re-exit will replace (cap reached, or a
+   * logical command id outside the known exit keys). Read only; left for manual action.
+   */
+  public async listCappedDeadExits(): Promise<readonly string[]> {
+    return this.transaction(async (client) => {
+      const result = await client.query(CAPPED_DEAD_EXITS_SQL, [
+        REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN,
+      ]);
+      return Object.freeze(result.rows.map((raw) => {
+        const positionId = text(exactRow(raw, ['position_id'] as const).position_id);
+        if (!/^execution_live_position_[0-9a-f]{64}$/u.test(positionId)) {
+          throw failure('INVALID_DATA');
+        }
+        return positionId;
+      }));
     });
   }
 
@@ -5308,6 +5374,29 @@ async function createDeadlineExitIntentLocked(
   if (row.state !== 'OPEN' || unsignedBigint(row.remaining_base_raw) === 0n) {
     throw failure('CONFLICT');
   }
+  await insertLiveSellIntent(client, draft);
+  const revision = unsignedBigint(row.position_revision);
+  const positioned = await client.query(`UPDATE execution_live_positions SET
+    state='EXIT_PENDING',state_revision=$2::BIGINT,exit_intent_id=$3
+    WHERE position_id=$1 AND state='OPEN' AND state_revision=$4::BIGINT
+      AND exit_intent_id IS NULL`, [
+    input.positionId, (revision + 1n).toString(), draft.id, revision.toString(),
+  ]);
+  if (positioned.rowCount !== 1) throw failure('CONFLICT');
+  return Object.freeze({
+    payloadVersion: 1,
+    kind: 'CREATED',
+    intent: await findDeadlineIntent(
+      client, draft, requestedAtLowerBoundMs, input.observedAtMs,
+    ),
+  });
+}
+
+/** The deadline SELL INSERT, shared by the deadline, early exit and re-exit bodies. */
+async function insertLiveSellIntent(
+  client: DatabaseClient,
+  draft: ExecutionIntentDraftV1,
+): Promise<void> {
   const inserted = await client.query(`INSERT INTO execution_intents (
     id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
     logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
@@ -5324,21 +5413,242 @@ async function createDeadlineExitIntentLocked(
     draft.decisionFingerprint, draft.requestedAtMs, draft.expiresAtMs,
   ]);
   if (inserted.rowCount !== 1) throw failure('CONFLICT');
+}
+
+/*
+ * Re-exit guard (lot 4b, Task 6), on the aliases `position` and `exit_intent`. The 066
+ * position trigger re-checks the same conditions when exit_intent_id is replaced.
+ * - no artifact of the dead intent outside RECONCILED / REVOKED_NO_SEND (no send in flight);
+ * - no MATCHED evidence, no unresolved UNKNOWN / MISMATCH evidence;
+ * - the position's exit authorization ACTIVE (LOCKED: signing or sending may be under way);
+ * - no unknown_block on the generation.
+ */
+const REEXIT_GUARD_SQL = `NOT EXISTS (SELECT 1 FROM execution_signed_transactions artifact
+      WHERE artifact.intent_id=exit_intent.id
+        AND artifact.state NOT IN ('RECONCILED','REVOKED_NO_SEND'))
+    AND NOT EXISTS (SELECT 1 FROM execution_reconciliation_evidence evidence
+      WHERE evidence.intent_id=exit_intent.id
+        AND (evidence.result='MATCHED' OR (evidence.result IN ('UNKNOWN','MISMATCH')
+          AND evidence.resolved_by_evidence_id IS NULL)))
+    AND EXISTS (SELECT 1 FROM execution_exit_authorizations exit_auth
+      WHERE exit_auth.position_id=position.position_id AND exit_auth.state='ACTIVE')
+    AND EXISTS (SELECT 1 FROM execution_wallet_risk_state risk
+      WHERE risk.generation_id=position.generation_id AND risk.unknown_block=FALSE)`;
+
+/*
+ * The dead intent's key still admits a re-exit (below the cap, $N is
+ * REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN), names this position, and matches its strategy.
+ * Filtered in SQL so that a capped position never starves the next one.
+ */
+function reExitEligibleKeySql(patternParameter: string): string {
+  return `(exit_intent.logical_command_id ~ ${patternParameter}
+    AND strpos(exit_intent.logical_command_id, ':' || position.position_id) > 0
+    AND ((exit_intent.strategy_id='maximum-holding-exit'
+        AND exit_intent.logical_command_id LIKE 'maximum-holding:%')
+      OR (exit_intent.strategy_id='${FAST_EXIT_STRATEGY_ID}'
+        AND exit_intent.logical_command_id LIKE 'fast-exit:%')))`;
+}
+
+const REEXIT_CANDIDATE_SQL = `SELECT
+    position.position_id,position.generation_id,position.mint,exit_intent.id AS exit_intent_id
+  FROM execution_live_positions position
+  JOIN execution_intents exit_intent ON exit_intent.id=position.exit_intent_id
+  WHERE position.state='EXIT_PENDING' AND position.remaining_base_raw > 0
+    AND exit_intent.side='SELL' AND exit_intent.position_id=position.position_id
+    AND ${reExitEligibleKeySql('$2')}
+    AND ${REEXIT_GUARD_SQL}
+    AND ((exit_intent.status IN ('FAILED','EXPIRED')
+        AND exit_intent.terminal_at IS NOT NULL
+        AND exit_intent.reconciliation_completed_at IS NOT NULL
+        AND exit_intent.terminal_at <= TIMESTAMPTZ 'epoch'
+          +(($1::BIGINT-$3::BIGINT)*INTERVAL '1 millisecond'))
+      OR (exit_intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
+        AND exit_intent.expires_at <= TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond')
+        AND (exit_intent.lease_expires_at IS NULL OR exit_intent.lease_expires_at
+          <= TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond'))))
+  ORDER BY position.opened_at,position.position_id LIMIT 1`;
+
+const CAPPED_DEAD_EXITS_SQL = `SELECT position.position_id
+  FROM execution_live_positions position
+  JOIN execution_intents exit_intent ON exit_intent.id=position.exit_intent_id
+  WHERE position.state='EXIT_PENDING' AND exit_intent.status IN ('FAILED','EXPIRED')
+    AND NOT ${reExitEligibleKeySql('$1')}
+  ORDER BY position.opened_at,position.position_id LIMIT 20`;
+
+const EXPIRABLE_INTENT_STATUSES: readonly string[] = Object.freeze([
+  'PENDING', 'RETRY_READY', 'PROCESSING', 'SIMULATED',
+]);
+
+async function createReExitIntentLocked(
+  client: DatabaseClient,
+  input: Readonly<{
+    readonly positionId: string;
+    readonly generationId: string;
+    readonly previousIntentId: string;
+    readonly observedAtMs: number;
+  }>,
+): Promise<ExecutionReExitResultV1 | null> {
+  const row = exactRow(singleRow(await client.query(`SELECT
+    position.position_id,position.generation_id,position.state,
+    position.state_revision::TEXT AS position_revision,
+    position.exit_intent_id,position.mint,position.quote_mint,
+    position.remaining_base_raw::TEXT AS remaining_base_raw,
+    trunc(EXTRACT(EPOCH FROM position.opened_at)*1000)::TEXT AS opened_at_ms,
+    position.entry_reconciliation_fingerprint,
+    buy.quote_token_program,buy.quote_decimals,
+    buy.decision_event_id AS buy_decision_event_id
+    FROM execution_live_positions position
+    JOIN execution_intents buy ON buy.id=position.buy_intent_id
+    WHERE position.position_id=$1 FOR UPDATE OF position`, [input.positionId])), [
+    'position_id', 'generation_id', 'state', 'position_revision', 'exit_intent_id', 'mint',
+    'quote_mint', 'remaining_base_raw', 'opened_at_ms', 'entry_reconciliation_fingerprint',
+    'quote_token_program', 'quote_decimals', 'buy_decision_event_id',
+  ] as const);
+  if (row.position_id !== input.positionId || row.generation_id !== input.generationId) {
+    throw failure('INVALID_DATA');
+  }
+  // The scan saw this exit intent unlocked: anything else now means another writer won.
+  const remainingBaseRaw = unsignedBigint(row.remaining_base_raw);
+  if (row.state !== 'EXIT_PENDING' || row.exit_intent_id !== input.previousIntentId
+    || remainingBaseRaw === 0n) return null;
+  const previous = exactRow(singleRow(await client.query(`SELECT
+    id,status,side,position_id,strategy_id,strategy_version,logical_command_id,
+    CASE WHEN terminal_at IS NULL THEN NULL ELSE
+      trunc(EXTRACT(EPOCH FROM terminal_at)*1000)::TEXT END AS terminal_at_ms,
+    reconciliation_completed_at IS NOT NULL AS reconciliation_completed
+    FROM execution_intents WHERE id=$1 FOR UPDATE`, [input.previousIntentId])), [
+    'id', 'status', 'side', 'position_id', 'strategy_id', 'strategy_version',
+    'logical_command_id', 'terminal_at_ms', 'reconciliation_completed',
+  ] as const);
+  if (previous.id !== input.previousIntentId || previous.side !== 'SELL'
+    || previous.position_id !== input.positionId) throw failure('INVALID_DATA');
+  if (typeof previous.status === 'string' && EXPIRABLE_INTENT_STATUSES.includes(previous.status)) {
+    // Expired here with terminal_at = now: the spacing defers the re-exit to a later pass.
+    await expireExitIntentInPlace(client, input.previousIntentId);
+    return null;
+  }
+  const terminalAtMs = nullableTimestampText(previous.terminal_at_ms);
+  if ((previous.status !== 'FAILED' && previous.status !== 'EXPIRED')
+    || terminalAtMs === null || previous.reconciliation_completed !== true
+    || terminalAtMs > input.observedAtMs - REEXIT_MIN_SPACING_MS) return null;
+  const guard = exactRow(singleRow(await client.query(`SELECT (${REEXIT_GUARD_SQL}
+    AND ${reExitEligibleKeySql('$3')}) AS admitted
+    FROM execution_live_positions position
+    JOIN execution_intents exit_intent ON exit_intent.id=position.exit_intent_id
+    WHERE position.position_id=$1 AND exit_intent.id=$2`, [
+    input.positionId, input.previousIntentId, REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN,
+  ])), ['admitted'] as const);
+  if (guard.admitted !== true) return null;
+  const previousKey = text(previous.logical_command_id);
+  const logicalCommandId = reExitLogicalCommandId(previousKey);
+  const reason = exitReasonOfLogicalKey(previousKey);
+  const strategyId = text(previous.strategy_id);
+  if (logicalCommandId === null || reason === null
+    || !logicalCommandId.includes(`:${input.positionId}:retry-`)
+    || strategyId !== (reason === 'DEADLINE' ? 'maximum-holding-exit' : FAST_EXIT_STRATEGY_ID)
+    || integer(previous.strategy_version) !== 1) throw failure('INVALID_DATA');
+  const databaseNowMs = await freshDatabaseNow(client);
+  if (input.observedAtMs > databaseNowMs) throw failure('INVALID_INPUT');
+  const draft = createExecutionIntentDraft({
+    strategyId,
+    strategyVersion: 1,
+    positionId: input.positionId,
+    logicalCommandId,
+    mint: row.mint,
+    side: 'SELL',
+    venuePolicy: 'CANONICAL_EXIT',
+    quoteMint: row.quote_mint,
+    quoteTokenProgram: row.quote_token_program,
+    quoteDecimals: integer(row.quote_decimals),
+    quoteAmountRaw: null,
+    baseAmountRaw: remainingBaseRaw,
+    minimumAmountOutRaw: 1n,
+    decisionEventId: text(row.buy_decision_event_id),
+    decisionFingerprint: row.entry_reconciliation_fingerprint,
+    requestedAtMs: input.observedAtMs,
+    expiresAtMs: input.observedAtMs + 120_000,
+  });
+  await insertLiveSellIntent(client, draft);
   const revision = unsignedBigint(row.position_revision);
   const positioned = await client.query(`UPDATE execution_live_positions SET
-    state='EXIT_PENDING',state_revision=$2::BIGINT,exit_intent_id=$3
-    WHERE position_id=$1 AND state='OPEN' AND state_revision=$4::BIGINT
-      AND exit_intent_id IS NULL`, [
-    input.positionId, (revision + 1n).toString(), draft.id, revision.toString(),
+    exit_intent_id=$2,state_revision=$3::BIGINT
+    WHERE position_id=$1 AND state='EXIT_PENDING' AND exit_intent_id=$4
+      AND state_revision=$5::BIGINT`, [
+    input.positionId, draft.id, (revision + 1n).toString(), input.previousIntentId,
+    revision.toString(),
   ]);
   if (positioned.rowCount !== 1) throw failure('CONFLICT');
   return Object.freeze({
     payloadVersion: 1,
     kind: 'CREATED',
+    positionId: input.positionId,
+    previousIntentId: input.previousIntentId,
     intent: await findDeadlineIntent(
-      client, draft, requestedAtLowerBoundMs, input.observedAtMs,
+      client, draft, timestampText(row.opened_at_ms), input.observedAtMs,
     ),
   });
+}
+
+/**
+ * The retention expiration (`execution-intent-expiration.ts`) for one locked intent, with the
+ * same predicates: past its TTL, lease lapsed, consistent attempts. Separate statements without
+ * RETURNING on the transition journal, which the recovery role may insert but not read.
+ */
+async function expireExitIntentInPlace(client: DatabaseClient, intentId: string): Promise<void> {
+  const selected = await client.query(`SELECT intent.status,intent.attempt_count,
+    intent.state_revision::TEXT AS state_revision,
+    trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+      AS at_ms
+    FROM execution_intents AS intent
+    WHERE intent.id=$1
+      AND intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
+      AND intent.expires_at <= statement_timestamp()
+      AND (intent.lease_expires_at IS NULL
+        OR intent.lease_expires_at <= statement_timestamp())
+      AND intent.state_revision < 9223372036854775807
+      AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+        WHERE attempt.intent_id=intent.id) = intent.attempt_count
+      AND COALESCE((SELECT MAX(attempt.attempt_number)
+        FROM execution_attempts AS attempt WHERE attempt.intent_id=intent.id),0)
+        = intent.attempt_count
+      AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+        WHERE attempt.intent_id=intent.id AND attempt.status='STARTED') <= 1
+      AND NOT EXISTS (SELECT 1 FROM execution_attempts AS attempt
+        WHERE attempt.intent_id=intent.id AND attempt.status='STARTED'
+          AND attempt.attempt_number<>intent.attempt_count)`, [intentId]);
+  if (selected.rows.length === 0) return;
+  const intent = exactRow(singleRow(selected), [
+    'status', 'attempt_count', 'state_revision', 'at_ms',
+  ] as const);
+  const atMs = timestampText(intent.at_ms);
+  const attemptCount = integer(intent.attempt_count);
+  const attemptNumber = attemptCount === 0 ? null : attemptCount;
+  await client.query(`UPDATE execution_attempts AS attempt
+    SET status='ABANDONED',completed_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond'),
+      reason_code='INTENT_EXPIRED'
+    WHERE attempt.intent_id=$1 AND attempt.status='STARTED'`, [intentId, atMs]);
+  const journal = await client.query(`INSERT INTO execution_intent_transitions (
+      intent_id,previous_status,next_status,reason_code,human_message,
+      activation_phase,attempt_number,evidence,occurred_at
+    ) VALUES ($1,$2,'EXPIRED','INTENT_EXPIRED','Execution intent expired before signature.',
+      'NONE',$3::INTEGER,jsonb_build_object('payloadVersion',1,'attemptNumber',$3::INTEGER,
+        'sourceEventId',NULL,'observedAtMs',$4::BIGINT),
+      TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'))`, [
+    intentId, intent.status, attemptNumber, atMs,
+  ]);
+  if (journal.rowCount !== 1) throw failure('CONFLICT');
+  const updated = await client.query(`UPDATE execution_intents AS intent
+    SET status='EXPIRED',last_reason_code='INTENT_EXPIRED',
+      terminal_at=TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'),
+      reconciliation_completed_at=TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'),
+      purge_after=TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond')+INTERVAL '4 hours',
+      lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+      updated_at=TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'),
+      state_revision=$3::BIGINT+1
+    WHERE intent.id=$1 AND intent.status=$2 AND intent.state_revision=$3::BIGINT`, [
+    intentId, intent.status, text(intent.state_revision), atMs,
+  ]);
+  if (updated.rowCount !== 1) throw failure('CONFLICT');
 }
 
 async function findDeadlineIntent(

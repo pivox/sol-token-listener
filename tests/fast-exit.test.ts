@@ -7,6 +7,8 @@ import {
   FAST_EXIT_STRATEGY_ID,
   fastExitLogicalCommandId,
   reExitLogicalCommandId,
+  REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN,
+  REEXIT_MIN_SPACING_MS,
   type FastExitFacts,
   type FastExitPolicy,
   type FastExitTrade,
@@ -239,6 +241,20 @@ void test('re-exit logical command id', () => {
   assert.equal(exitReasonOfLogicalKey(reExitLogicalCommandId(`${root}:retry-1`) ?? ''), 'TAKE_PROFIT');
   assert.equal(reExitLogicalCommandId('unknown:key'), null);
   assert.equal(reExitLogicalCommandId(`${root}:retry-4`), null);
+});
+
+void test('re-exit SQL key pattern admits exactly the keys that have a next re-exit', () => {
+  assert.equal(REEXIT_MIN_SPACING_MS, 30_000);
+  // The pattern is a PostgreSQL ARE; the subset it uses has the same meaning in JavaScript.
+  const pattern = new RegExp(REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN, 'u');
+  const keys = [
+    ...FAST_EXIT_REASONS.map((reason) => fastExitLogicalCommandId(reason, POSITION_ID)),
+    `maximum-holding:${POSITION_ID}`,
+  ].flatMap((root) => [root, `${root}:retry-1`, `${root}:retry-2`, `${root}:retry-3`,
+    `${root}:retry-4`, `${root}:retry-0`]);
+  for (const key of [...keys, `fast-exit:UNKNOWN:${POSITION_ID}`, 'maximum-holding:x', '']) {
+    assert.equal(pattern.test(key), reExitLogicalCommandId(key) !== null, key);
+  }
 });
 
 const MALFORMED_TRADE_LISTS: readonly unknown[] = [

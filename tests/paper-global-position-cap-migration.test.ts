@@ -33,7 +33,7 @@ void test('055 is replay-safe and installs the active creation-entry singleton i
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '065_entry_envelope_auto_arm.sql');
+    assert.equal(applied.at(-1), '066_live_position_reexit.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const index = await pool.query<{ readonly definition: string }>(`SELECT indexdef AS definition
       FROM pg_indexes WHERE schemaname=current_schema()

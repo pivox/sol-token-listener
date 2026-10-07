@@ -208,6 +208,7 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
     'authenticatePersistedSignedTransaction', 'recordConfirmation',
     'readConfirmationWork', 'readReconciliationWork', 'commitReconciliation',
     'createDeadlineExitIntent', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
+    'createNextReExitIntent', 'listCappedDeadExits',
     'arm', 'admit',
   ]) assert.equal(Object.hasOwn(live, absent), false);
 

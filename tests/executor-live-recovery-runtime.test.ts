@@ -22,6 +22,7 @@ void test('a pass preserves priority while deferred finality cannot starve deadl
     },
     confirmation: async () => { calls.push('confirmation'); return 'IDLE'; },
     deadline: async () => { calls.push('deadline'); return 'WORKED'; },
+    reexit: async () => { calls.push('reexit'); return 'IDLE'; },
     exit: async () => { calls.push('exit'); return 'WORKED'; },
   }, new AbortController().signal);
 
@@ -43,6 +44,7 @@ void test('worked reconciliation stops the pass before lower-priority lanes', as
     reconciliation: async () => { calls.push('reconciliation'); return 'WORKED'; },
     confirmation: async () => { calls.push('confirmation'); return 'WORKED'; },
     deadline: async () => { calls.push('deadline'); return 'WORKED'; },
+    reexit: async () => { calls.push('reexit'); return 'IDLE'; },
     exit: async () => { calls.push('exit'); return 'WORKED'; },
   }, new AbortController().signal);
   assert.deepEqual(calls, ['reconciliation']);
@@ -53,15 +55,16 @@ void test('worked reconciliation stops the pass before lower-priority lanes', as
   });
 });
 
-void test('an idle pass runs reconciliation, confirmation, deadline, then exit', async () => {
+void test('an idle pass runs reconciliation, confirmation, deadline, reexit, then exit', async () => {
   const calls: string[] = [];
   const result = await runLiveRecoveryPass({
     reconciliation: async () => { calls.push('reconciliation'); return 'IDLE'; },
     confirmation: async () => { calls.push('confirmation'); return 'IDLE'; },
     deadline: async () => { calls.push('deadline'); return 'IDLE'; },
+    reexit: async () => { calls.push('reexit'); return 'IDLE'; },
     exit: async () => { calls.push('exit'); return 'WORKED'; },
   }, new AbortController().signal);
-  assert.deepEqual(calls, ['reconciliation', 'confirmation', 'deadline', 'exit']);
+  assert.deepEqual(calls, ['reconciliation', 'confirmation', 'deadline', 'reexit', 'exit']);
   assert.deepEqual(result, { payloadVersion: 1, workedLane: 'EXIT', deferredLanes: [] });
 });
 
@@ -75,6 +78,7 @@ void test('an exit lane failing on every pass never blocks the deadline lane', a
       reconciliation: async () => 'IDLE',
       confirmation: async () => 'IDLE',
       deadline: async () => { calls.push('deadline'); return 'IDLE'; },
+      reexit: async () => { calls.push('reexit'); return 'IDLE'; },
       exit: async () => {
         calls.push('exit');
         throw new LiveRecoveryLaneError('EXIT_FAILED');
@@ -91,13 +95,64 @@ void test('an exit lane failing on every pass never blocks the deadline lane', a
   await nextTurn();
   signals.emit('SIGTERM');
   await runtime;
-  assert.deepEqual(calls, ['deadline', 'exit', 'deadline', 'exit', 'deadline', 'exit']);
+  assert.deepEqual(calls, [
+    'deadline', 'reexit', 'exit', 'deadline', 'reexit', 'exit', 'deadline', 'reexit', 'exit',
+  ]);
   const failures = events.filter((event) => event.event === 'executor_live_recovery.lane_failed');
   assert.equal(failures.length, 3);
   for (const failure of failures) {
     assert.deepEqual(failure, {
       event: 'executor_live_recovery.lane_failed', executionMode: 'live-recovery',
       lane: 'EXIT', errorCode: 'EXIT_FAILED',
+    });
+  }
+});
+
+void test('a worked re-exit ends the pass before the early exits', async () => {
+  const calls: string[] = [];
+  const result = await runLiveRecoveryPass({
+    reconciliation: async () => { calls.push('reconciliation'); return 'IDLE'; },
+    confirmation: async () => { calls.push('confirmation'); return 'IDLE'; },
+    deadline: async () => { calls.push('deadline'); return 'IDLE'; },
+    reexit: async () => { calls.push('reexit'); return 'WORKED'; },
+    exit: async () => { calls.push('exit'); return 'WORKED'; },
+  }, new AbortController().signal);
+  assert.deepEqual(calls, ['reconciliation', 'confirmation', 'deadline', 'reexit']);
+  assert.deepEqual(result, { payloadVersion: 1, workedLane: 'REEXIT', deferredLanes: [] });
+});
+
+void test('a re-exit lane failing on every pass never blocks the deadline lane', async () => {
+  const scheduler = manualScheduler();
+  const signals = new EventEmitter();
+  const events: LiveRecoveryLogContext[] = [];
+  const calls: string[] = [];
+  const runtime = runLiveRecoveryRuntime({
+    createLanes: () => ({
+      reconciliation: async () => 'IDLE',
+      confirmation: async () => 'IDLE',
+      deadline: async () => { calls.push('deadline'); return 'IDLE'; },
+      reexit: async () => {
+        calls.push('reexit');
+        throw new LiveRecoveryLaneError('REEXIT_FAILED');
+      },
+      exit: async () => { calls.push('exit'); return 'IDLE'; },
+    }),
+    logger: logger(events), closeDatabase: async () => undefined,
+    evictDatabase: () => undefined, forceExit: () => undefined,
+  }, { pollMs: 500, shutdownGraceMs: 5_000, scheduler, signalSource: signals });
+
+  await nextTurn();
+  scheduler.fire(500);
+  await nextTurn();
+  signals.emit('SIGTERM');
+  await runtime;
+  assert.deepEqual(calls, ['deadline', 'reexit', 'deadline', 'reexit']);
+  const failures = events.filter((event) => event.event === 'executor_live_recovery.lane_failed');
+  assert.equal(failures.length, 2);
+  for (const failure of failures) {
+    assert.deepEqual(failure, {
+      event: 'executor_live_recovery.lane_failed', executionMode: 'live-recovery',
+      lane: 'REEXIT', errorCode: 'REEXIT_FAILED',
     });
   }
 });
@@ -114,6 +169,7 @@ void test('runtime logs bounded outcomes, waits one poll and closes after SIGTER
       }),
       confirmation: async () => 'IDLE',
       deadline: async () => 'WORKED',
+      reexit: async () => 'IDLE',
       exit: async () => 'IDLE',
     }),
     logger: logger(events),
@@ -155,6 +211,7 @@ void test('runtime rejects hostile lane deferred results and logs a closed pass 
       reconciliation: async () => ({ result: 'DEFERRED', errorCode: 'RPC_TIMEOUT', secret: 'credential' }) as never,
       confirmation: async () => 'IDLE',
       deadline: async () => 'IDLE',
+      reexit: async () => 'IDLE',
       exit: async () => 'IDLE',
     }),
     logger: logger(events), closeDatabase: async () => undefined,
@@ -181,6 +238,7 @@ void test('shutdown deadline evicts the active database connection before exit o
       reconciliation: async () => new Promise<'IDLE'>(() => undefined),
       confirmation: async () => 'IDLE',
       deadline: async () => 'IDLE',
+      reexit: async () => 'IDLE',
       exit: async () => 'IDLE',
     }),
     logger: logger(events),
@@ -216,6 +274,7 @@ void test('lane factory failures are redacted and retried only after the poll in
         reconciliation: async () => 'IDLE',
         confirmation: async () => 'IDLE',
         deadline: async () => 'IDLE',
+        reexit: async () => 'IDLE',
         exit: async () => 'IDLE',
       };
     },
@@ -286,6 +345,26 @@ void test('logger accepts the EXIT lane and a known exit reason only', () => {
   const line = JSON.parse(lines[0] ?? '') as Record<string, unknown>;
   assert.equal(line.lane, 'EXIT');
   assert.equal(line.reason, 'CREATOR_SOLD');
+});
+
+void test('logger accepts the REEXIT lane and a well-formed position id only', () => {
+  const lines: string[] = [];
+  const recoveryLogger = createLiveRecoveryLogger({
+    write: (chunk: string) => { lines.push(chunk); },
+  });
+  const positionId = `execution_live_position_${'a'.repeat(64)}`;
+  recoveryLogger.warn({
+    event: 'executor_live_recovery.reexit_cap_reached', executionMode: 'live-recovery',
+    lane: 'REEXIT', positionId,
+  });
+  recoveryLogger.warn({
+    event: 'executor_live_recovery.reexit_cap_reached', executionMode: 'live-recovery',
+    lane: 'REEXIT', positionId: 'So11111111111111111111111111111111111111112',
+  });
+  assert.equal(lines.length, 1);
+  const line = JSON.parse(lines[0] ?? '') as Record<string, unknown>;
+  assert.equal(line.lane, 'REEXIT');
+  assert.equal(line.positionId, positionId);
 });
 
 function logger(events: LiveRecoveryLogContext[]): LiveRecoveryLogger {

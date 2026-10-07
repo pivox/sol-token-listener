@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '065_entry_envelope_auto_arm.sql';
+  readonly migrationHead: '066_live_position_reexit.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -598,7 +598,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '065_entry_envelope_auto_arm.sql',
+    migrationHead: '066_live_position_reexit.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,

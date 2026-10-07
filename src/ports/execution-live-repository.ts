@@ -282,6 +282,18 @@ export interface ExecutionEarlyExitResultV1 {
   readonly intent: ExecutionIntentV1;
 }
 
+/**
+ * A new SELL intent that replaced the dead exit intent (FAILED or EXPIRED, no send possible) of
+ * an EXIT_PENDING position. Its logical command id is the previous one with `:retry-<k>`.
+ */
+export interface ExecutionReExitResultV1 {
+  readonly payloadVersion: 1;
+  readonly kind: 'CREATED';
+  readonly positionId: string;
+  readonly previousIntentId: string;
+  readonly intent: ExecutionIntentV1;
+}
+
 export interface ExecutionPreSignatureRecoveryResultV1 {
   readonly payloadVersion: 1;
   readonly kind: 'IDLE' | 'REVOKED';
@@ -373,4 +385,6 @@ export interface ExecutionLiveRepository {
   }>): Promise<ExecutionDeadlineExitResultV1>;
   createNextDeadlineExitIntent(): Promise<ExecutionDeadlineExitResultV1 | null>;
   createNextEarlyExitIntent(policy: FastExitPolicy): Promise<ExecutionEarlyExitResultV1 | null>;
+  createNextReExitIntent(): Promise<ExecutionReExitResultV1 | null>;
+  listCappedDeadExits(): Promise<readonly string[]>;
 }

@@ -118,6 +118,7 @@ const canonicalMigrations = Object.freeze([
   '063_listener_tracked_curve_checkpoints.sql',
   '064_fast_entry_decisions.sql',
   '065_entry_envelope_auto_arm.sql',
+  '066_live_position_reexit.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',

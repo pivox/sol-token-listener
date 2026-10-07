@@ -12,6 +12,8 @@ export type ExitReason = FastExitReason | 'DEADLINE';
 
 /** A re-exit replaces a dead SELL intent at most this many times per position. */
 export const MAXIMUM_RE_EXITS = 3;
+/** A dead SELL intent is re-exited at least this long after it became terminal. */
+export const REEXIT_MIN_SPACING_MS = 30_000;
 
 export interface FastExitPolicy {
   readonly takeProfitBps: bigint;
@@ -53,6 +55,12 @@ const MAXIMUM_EVENT_ID_BYTES = 256;
 const ENVELOPE_STATES = Object.freeze(['ACTIVE', 'EXHAUSTED', 'REVOKED', 'EXPIRED'] as const);
 const POSITION_ID = 'execution_live_position_[0-9a-f]{64}';
 const POSITION_ID_PATTERN = new RegExp(`^${POSITION_ID}$`, 'u');
+/**
+ * PostgreSQL regular expression of the SELL logical command ids that still admit a re-exit:
+ * a known exit reason of one position, below the cap. Migration 066 enforces the same cap.
+ */
+export const REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN = `^(?:maximum-holding|fast-exit:(?:${
+  FAST_EXIT_REASONS.join('|')})):${POSITION_ID}(?::retry-[1-${MAXIMUM_RE_EXITS - 1}])?$`;
 const LOGICAL_KEY_PATTERN = new RegExp(
   `^(?<root>(?:maximum-holding|fast-exit:(?<reason>[A-Z_]+)):${POSITION_ID})(?::retry-(?<retry>[1-9][0-9]*))?$`,
   'u',

@@ -81,8 +81,8 @@ void test('047 remains installed beneath the clean-database head and the runner 
     await migrationSql();
     const applied = await migrateDatabase({ pool });
     assert.equal(applied.includes(migrationName), true);
-    assert.equal(applied.at(-1), '065_entry_envelope_auto_arm.sql');
-    assert.equal(applied.length, 65);
+    assert.equal(applied.at(-1), '066_live_position_reexit.sql');
+    assert.equal(applied.length, 66);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.deepEqual((await pool.query(`SELECT scheduler_key, consecutive_urgent_claims
       FROM chain_transaction_inbox_claim_scheduler`)).rows, [{ scheduler_key: 'global', consecutive_urgent_claims: 0 }]);

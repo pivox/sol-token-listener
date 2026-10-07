@@ -115,13 +115,18 @@ function productionDependencies(logger: LiveRecoveryLogger): LiveRecoveryBootstr
     createLaneFactory: ({ config, database }: Readonly<{
       readonly config: LiveRecoveryConfig;
       readonly database: LiveRecoveryBootstrapDatabase;
-    }>) => () => createLiveRecoveryLanes({
-      config,
-      intents: database.intents,
-      live: database.live,
-      gateway: rpcSession(config),
-      logger,
-    }),
+    }>) => {
+      // Once per process: lanes are rebuilt every pass.
+      const reportedCappedExits = new Set<string>();
+      return () => createLiveRecoveryLanes({
+        config,
+        intents: database.intents,
+        live: database.live,
+        gateway: rpcSession(config),
+        logger,
+        reportedCappedExits,
+      });
+    },
     runtime: runLiveRecoveryRuntime,
     logger,
     forceExit: (code: 1) => { process.exit(code); },

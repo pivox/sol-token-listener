@@ -11,7 +11,7 @@ const healthMigrationName = '030_listener_websocket_health.sql';
 const executionIntentMigrationName = '031_execution_intents.sql';
 const executionDryRunMigrationName = '032_execution_dry_run_assessments.sql';
 const executionSimulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '065_entry_envelope_auto_arm.sql';
+const latestMigrationName = '066_live_position_reexit.sql';
 const migrationUrl = new URL(`../migrations/${healthMigrationName}`, import.meta.url);
 
 void test('websocket health migration upgrades legacy state without trusting its websocket evidence', async (context) => {
@@ -76,6 +76,7 @@ void test('websocket health migration upgrades legacy state without trusting its
       '062_drop_dossier_and_legacy_tables.sql',
       '063_listener_tracked_curve_checkpoints.sql',
       '064_fast_entry_decisions.sql',
+      '065_entry_envelope_auto_arm.sql',
       latestMigrationName,
     ]);
     const beforeReplay = await canonicalRow(pool);

@@ -81,6 +81,8 @@ void test('live repository port exposes only closed durable lifecycle commands',
     'createDeadlineExitIntent',
     'createNextDeadlineExitIntent',
     'createNextEarlyExitIntent',
+    'createNextReExitIntent',
+    'listCappedDeadExits',
   ]) assert.match(source, new RegExp(`readonly ${method}:|${method}\\(`, 'u'));
   for (const contract of [
     'ExecutionLiveConfirmationWorkV1',

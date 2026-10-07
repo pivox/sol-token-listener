@@ -26,6 +26,7 @@ void test('bootstrap validates database and genesis before lanes and transfers c
         reconciliation: async () => 'IDLE',
         confirmation: async () => 'IDLE',
         deadline: async () => 'IDLE',
+        reexit: async () => 'IDLE',
         exit: async () => 'IDLE',
       });
     },
