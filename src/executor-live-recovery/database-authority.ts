@@ -273,6 +273,23 @@ export const LIVE_RECOVERY_DATABASE_AUTHORITY: LiveRecoveryDatabaseAuthority = O
       columns(),
       columns('realized_loss_raw', 'state', 'updated_at'),
     ),
+    // Lot 4b exit lane: read-only observed launch and curve trade events.
+    table(
+      'domain_events',
+      columns(
+        'event_id',
+        'type',
+        'mint',
+        'slot',
+        'transaction_index',
+        'instruction_index',
+        'inner_instruction_index',
+        'confirmation_status',
+        'payload',
+      ),
+      columns(),
+      columns(),
+    ),
     table(
       'execution_exit_authorizations',
       columns('authorization_id', 'position_id', 'state', 'state_revision'),

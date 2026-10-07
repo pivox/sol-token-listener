@@ -44,6 +44,7 @@ import { PostgresExecutionSimulationRepository } from '../src/storage/execution-
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { roleSource, withProvisionedDatabase } from './helpers/entry-envelope-fixture.js';
 import { type EnvelopeSeed, linkEnvelope } from './helpers/live-envelope-link.js';
 import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
@@ -4032,3 +4033,46 @@ async function cloneOpenPosition(
   }
   return Object.freeze({ positionId: clonePositionId, mint });
 }
+
+void test('PostgreSQL 16 recovery role creates an early exit SELL from observed creator trades',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'ACTIVE');
+      const creator = earlyExitPublicKey();
+      await insertLaunchEvent(pool, fixture.mint, creator);
+      await insertTradeEvents(pool, fixture.mint, [
+        { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      ]);
+      const recovery = new PostgresExecutionLiveRepository(
+        roleSource(pool, 'sol_token_executor_live_recovery'),
+      );
+      // The deadline is not due: the deadline scanner runs under the role and finds nothing.
+      assert.equal(await recovery.createNextDeadlineExitIntent(), null);
+      const result = await recovery.createNextEarlyExitIntent(earlyExitPolicy);
+      await assertEarlyExitCreated(pool, fixture, result, 'CREATOR_SOLD');
+      // The role reads domain_events but can never change them.
+      for (const statement of [
+        `UPDATE domain_events SET confirmation_status='orphaned'`,
+        'DELETE FROM domain_events',
+        `INSERT INTO domain_events (event_id) VALUES ('forged')`,
+        'SELECT source FROM domain_events',
+      ]) {
+        await assert.rejects(roleSource(pool, 'sol_token_executor_live_recovery').connect()
+          .then(async (client) => {
+            try { await client.query(statement); } finally { client.release(); }
+          }), (error: unknown) => databaseErrorCode(error) === '42501', statement);
+      }
+    });
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'REVOKED');
+      await makePositionDue(pool, fixture.positionId);
+      const recovery = new PostgresExecutionLiveRepository(
+        roleSource(pool, 'sol_token_executor_live_recovery'),
+      );
+      // A due position is left to the deadline, which still works under the role.
+      assert.equal(await recovery.createNextEarlyExitIntent(earlyExitPolicy), null);
+      const deadline = await recovery.createNextDeadlineExitIntent();
+      assert.equal(deadline?.kind, 'CREATED');
+      assert.equal(deadline?.intent?.logicalCommandId, `maximum-holding:${fixture.positionId}`);
+    });
+  });
