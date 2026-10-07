@@ -3987,8 +3987,8 @@ void test('early exit skips a candidate whose facts fail and exits the next one'
       const next = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
       assert.equal(next?.reason, 'CREATOR_SOLD');
       assert.equal(next?.intent.positionId, fixture.positionId);
-      const sells = await pool.query(`SELECT position_id FROM execution_intents
-        WHERE side='SELL' ORDER BY position_id`);
+      const sells = await pool.query<{ position_id: string }>(`SELECT position_id
+        FROM execution_intents WHERE side='SELL' ORDER BY position_id`);
       assert.deepEqual(sells.rows.map((row) => row.position_id).sort(),
         [fixture.positionId, second.positionId].sort());
     });

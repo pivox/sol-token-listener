@@ -141,7 +141,7 @@ export function reExitLogicalCommandId(currentLogicalCommandId: string): string 
 function parseLogicalKey(key: unknown): { root: string; reason: ExitReason; retry: number } | null {
   if (typeof key !== 'string' || key.length > 256) return null;
   const groups = LOGICAL_KEY_PATTERN.exec(key)?.groups;
-  if (groups === undefined) return null;
+  if (groups?.root === undefined) return null;
   const retry = groups.retry === undefined ? 0 : Number(groups.retry);
   if (retry > MAXIMUM_RE_EXITS) return null;
   let reason: ExitReason;
@@ -152,7 +152,7 @@ function parseLogicalKey(key: unknown): { root: string; reason: ExitReason; retr
   } else {
     return null;
   }
-  return { root: groups.root as string, reason, retry };
+  return { root: groups.root, reason, retry };
 }
 
 function compareCursor(left: FastExitTrade, right: FastExitTrade): number {
