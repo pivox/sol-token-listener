@@ -1,7 +1,20 @@
 # Lot 5 — premier run réel : inventaire, checklist et dry-run
 
-**Date :** 2026-10-07. **Base :** `main` à `d223abf2` (lots 1 à 4b mergés, head de migration 066).
+**Date :** 2026-10-07. **Base :** `main` à `d223abf2` (lots 1 à 4b mergés), plus le mini-lot 5a
+(sonde de gate 10, migration 067, branche `docs/lot5-readiness`). Head de migration : **067**.
 **Statut :** préparation seulement. Rien n'a été lancé : aucun RPC, aucun listener, aucune transaction.
+
+### Décisions de l'utilisateur (2026-10-07)
+
+1. **Gate 10 par une sonde.** Le listener écrit un intent de sonde non armable
+   (`fast-entry-probe-v1`) quand la sonde est activée et qu'aucune enveloppe n'est `ACTIVE`. Le
+   worker simulation-only le simule et produit l'artefact. Implémenté au mini-lot 5a (§A.7, point 1).
+   Le gate 10 se fait démon auto-arm arrêté, puis la sonde est désactivée avant l'enveloppe.
+2. **Base :** un conteneur PG16 dédié, publié sur `127.0.0.1:5433` (§A.4, étape B2).
+3. **Fournisseur :** l'exécuteur **partage le Helius du listener** (même projet, même clé). Risque
+   de sous-comptage et marge : voir §A.8.
+4. **Montants :** 5 achats × 0,01 SOL, exposition cumulée 0,05 SOL, perte maximale 0,03 SOL,
+   holding 180 s, wallet financé à 0,1 SOL (§B.2). La variante prudente à 3 achats est écartée.
 
 Sources lues : checkpoint `2026-10-06-simple-path-CHECKPOINT.md`, runbook
 `docs/operations/executor-live-canary.md` (sections lot 4a et lot 4b), spec
@@ -26,7 +39,7 @@ noms de variables ont été lus, avec l'indication « valeur présente » ou « 
 
 ### Bloquants : sans eux, même le dry-run est impossible
 
-1. **Amorçage du gate 10 : impasse dans le code actuel.**
+1. **Amorçage du gate 10 : impasse levée par la sonde (mini-lot 5a).** Constat d'origine :
    - `envelope prepare` exige un artefact de simulation `SUCCESS` de moins de 24 h (`prepareEnvelopeFacts`).
    - Le runbook en tire la consigne : « worker simulation-only sur un intent fast-entry ».
    - Le listener n'écrit un intent fast-entry que si une enveloppe `ACTIVE` existe. Sans elle, il
@@ -35,8 +48,8 @@ noms de variables ont été lus, avec l'indication « valeur présente » ou « 
    - Sur une base neuve, aucun intent n'existe donc, ni artefact, ni enveloppe.
    - La phrase du runbook « worker simulation-only avec `ENTRY_MODE=fast` » ne tient pas : le worker
      ne lit pas `ENTRY_MODE`, seul le listener le lit.
-   - Options : voir §A.7, point 1. Décision utilisateur requise.
-2. **Pas de base de production PG16 accessible.**
+   - Résolu : la sonde `fast-entry-probe-v1` (§A.7, point 1, étapes B11 et B12).
+2. **Pas de base de production PG16 accessible.** Décision : conteneur dédié sur `127.0.0.1:5433`.
    - `solanabot` (natif, port 5432) est bloqué à la migration 050 (PostgreSQL < 15).
    - Les validateurs H2a, H2b et opérations exigent les options d'appartenance PG16
      (`ADMIN FALSE, INHERIT FALSE, SET TRUE`).
@@ -46,7 +59,7 @@ noms de variables ont été lus, avec l'indication « valeur présente » ou « 
 3. **Preuves et clés absentes.** Aucun de ces éléments n'existe :
    - le catalogue de gates (8 gates statiques, politique de risque, empreinte de stratégie) ;
    - la clé d'attestation Ed25519 (H2e et H2f) ;
-   - un projet Helius dédié à l'exécuteur, avec sa clé API en fichier et son UUID de projet.
+   - la clé API Helius en fichier et l'UUID du projet (celui du listener, partagé : décision 3).
    H2e ne sait interroger que l'API Admin Helius.
 4. **Environnements et logins absents.**
    - `live.env` suit l'ancien schéma `LIVE_*`, qu'aucun code actuel ne lit.
@@ -65,8 +78,16 @@ Ils figurent dans la checklist.
   et par auto-arm, qui exigent 12 à 16.
   - Le worker simulation-only doit utiliser exactement la valeur de H2b moins 6.
   - Raison : H2b recalcule l'empreinte de configuration avec `maxRpcCallsPerAttempt - 6`
-    (`src/executor-live/main.ts`, `simulationConfig`).
-  - Sinon le BUY échoue fermé (`Invalid live execution identity`) ou `prepare` ne trouve aucun artefact.
+    (`src/executor-live/main.ts`, `simulationConfig`), puis exige qu'elle soit égale à
+    `EXECUTOR_CONFIGURATION_FINGERPRINT` (`src/executor-live/fresh-execution.ts`).
+  - L'empreinte couvre aussi le fournisseur, le wallet, le genesis, l'allowlist, `QUOTE_MAX_AGE`,
+    `SLIPPAGE`, `SNAPSHOT_MAX_SLOT_LAG`, `MAX_COMPUTE_UNITS`, `MAX_FEE_LAMPORTS`,
+    `MAX_FEE_PAYER_LAMPORT_DEBIT`, `MAX_PRIORITY_FEE_LAMPORTS` et `RPC_TIMEOUT_MS`
+    (`configurationFingerprint`, `src/executor-simulation/attempt-evaluator.ts`). Toutes ces
+    valeurs doivent être identiques entre `worker-sim.env` et `live.env`.
+  - Règle fragile : aucun outil ne compare les deux fichiers. Un écart n'apparaît qu'au premier
+    BUY, qui échoue fermé (`Invalid live execution identity`) mais consomme un `buys_armed`.
+    Faire le `diff` de l'étape B10.
 - **`EXECUTOR_BUILD_HASH` n'est pas un hash de build logiciel.**
   - C'est le `build_fingerprint` de l'artefact gate 10 : un hash des instructions de cette
     transaction simulée précise (fee payer, comptes, données).
@@ -78,7 +99,7 @@ Ils figurent dans la checklist.
 - **Brûlage de l'enveloppe.** Un armement jamais acheté (H2b arrêté) consomme un `buys_armed`.
   Le dry-run utilise donc sa propre enveloppe.
 
-### Enveloppe recommandée pour le premier run
+### Enveloppe du premier run (décidée le 2026-10-07)
 
 Le détail des calculs est en §B.2.
 
@@ -176,14 +197,16 @@ Fraîcheur minimale exigée de la politique : `2×40000 + 30000 = 110 000 ms`.
 
 | Variable | Format |
 |---|---|
-| `DATABASE_URL` | `postgresql://<login-listener>:<secret>@127.0.0.1:<port>/<db>?options=-c%20role%3Dsol_token_listener_writer` |
+| `DATABASE_URL` | `postgresql://<login-listener>:<secret>@127.0.0.1:5433/<db>?options=-c%20role%3Dsol_token_listener_writer` |
 | `POSTGRES_AUTO_MIGRATE` | `false` |
 | `SOLANA_CLUSTER` | `mainnet-beta` |
-| `SOLANA_HTTP_RPC_URL` / `SOLANA_WS_RPC_URL` | `https://…` / `wss://…`, fournisseur du **listener**, distinct de celui de l'exécuteur |
+| `SOLANA_HTTP_RPC_URL` / `SOLANA_WS_RPC_URL` | `https://…` / `wss://…`, le Helius partagé avec l'exécuteur (décision 3) |
 | `SOLANA_EXPECTED_GENESIS_HASH` | base58, 32 octets, vérifié indépendamment (obligatoire avec `LISTENER_ENABLED=true`) |
 | `LISTENER_ENABLED` | `true` |
 | `LISTENER_INGESTION_SCOPE` | `creates-only` |
 | `ENTRY_MODE` | `fast` |
+| `FAST_ENTRY_PROBE_ENABLED` | `true` **uniquement** pendant B11–B12, `false` ensuite (défaut `false`) |
+| `FAST_ENTRY_PROBE_INTERVAL_MS` | `600000` par défaut (60 000 à 86 400 000) ; `60000` raccourcit l'attente au gate 10 |
 | `EXECUTION_MODE` | `observe` |
 | `EXECUTION_INTENT_EMISSION_ENABLED` / `PAPER_STRATEGY_ENABLED` | `false` / `false` |
 | `RISK_MAX_ROUNDTRIP_LOSS_BPS` | `3000` (défaut) |
@@ -200,8 +223,8 @@ Le listener refuse toute variable de clé privée (`rejectPrivateKeyConfiguratio
 | `POSTGRES_AUTO_MIGRATE` | `false` |
 | `EXECUTOR_MODE` / `LIVE_TRADING_ENABLED` | `simulation-only` / `false` |
 | `EXECUTOR_PUBLIC_KEY` | adresse base58 du wallet de l'exécuteur |
-| `EXECUTOR_RPC_PROVIDER_ID` | identifiant du fournisseur **de l'exécuteur** (par exemple `helius-exec`) |
-| `SOLANA_HTTP_RPC_URL` | endpoint **de l'exécuteur** |
+| `EXECUTOR_RPC_PROVIDER_ID` | identifiant du fournisseur de l'exécuteur (par exemple `helius`), le même partout |
+| `SOLANA_HTTP_RPC_URL` | endpoint Helius (partagé avec le listener) |
 | `SOLANA_EXPECTED_GENESIS_HASH` | idem listener |
 | Valeurs runtime communes | voir le tableau, avec `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT=8` |
 
@@ -211,7 +234,7 @@ Aucun nom de keypair, même vide.
 
 | Variable | Format |
 |---|---|
-| `HELIUS_PROJECT_ID` | UUID du projet Helius **dédié à l'exécuteur** |
+| `HELIUS_PROJECT_ID` | UUID du projet Helius (partagé avec le listener) |
 | `HELIUS_API_KEY_PATH` | chemin absolu hors checkout, fichier `0600` |
 | `EXECUTOR_RPC_PROVIDER_ID` | même identifiant que l'exécuteur |
 | `EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH` | clé PEM PKCS#8 Ed25519 `0600` hors checkout |
@@ -366,19 +389,19 @@ secrets dans le checkout.
 
 ### A.4 Base de données
 
-- Il faut une **base de production PostgreSQL 16** dédiée au lot 5, avec un volume persistant.
+- **Décision :** une **base de production PostgreSQL 16** dédiée au lot 5, avec un volume persistant,
+  dans un conteneur publié sur `127.0.0.1:5433`.
   - `solanabot` (natif, 5432) est exclu : bloqué à 050, PostgreSQL < 15.
   - La base de test sur 55432 est exclue.
-- **Option recommandée** (simple, réutilise l'image épinglée de `deploy/compose.yaml`) : un
+- **Option retenue** (simple, réutilise l'image épinglée de `deploy/compose.yaml`) : un
   conteneur `postgres:16.14-alpine3.23` séparé, nommé (par exemple `sol-lot5-pg`), avec un volume
   nommé et un port publié uniquement sur `127.0.0.1:5433`. Ses identifiants viennent d'un fichier
   `--env-file` hors Git.
   - `deploy/compose.yaml` ne publie aucun port Postgres.
   - Son service `app` se connecte en propriétaire et non en `sol_token_listener_writer`.
   - Il ne convient donc pas tel quel aux processus natifs.
-- **Alternative :** mettre à niveau le Postgres natif en 16.
 - **Provisioning**, dans l'ordre (étapes B2 à B4) :
-  1. migrations jusqu'à `066_live_position_reexit.sql`, en propriétaire ;
+  1. migrations jusqu'à `067_fast_entry_probe_unarmable.sql`, en propriétaire ;
   2. `scripts/provision-executor-roles.sql` en administrateur, une ou deux fois. Ce script crée les
      **rôles de groupe** `NOLOGIN` mais aucun login ;
   3. création de 6 **logins** :
@@ -421,26 +444,38 @@ Le keypair n'a pas été lu.
     `L/keys/executor-keypair.json` en `0400`.
   - `LIVE_KEYPAIR_FILE` désigne probablement ce fichier ou un autre ; c'est à vérifier par
     l'utilisateur.
-- Recommandation : un **wallet neuf, dédié au lot 5**, qui ne détient que le financement minimal (§B.2).
+- Recommandation : un **wallet neuf, dédié au lot 5**, qui ne détient que le financement décidé
+  (0,1 SOL, §B.2).
 
 ### A.7 Ce que le code exige et qui n'existe pas encore
 
-1. **Un producteur d'intent pour le gate 10, sur base neuve.** C'est un bloquant, voir §0.
-   - Options, par ordre de simplicité :
-     - **(a) Petit changement de code (« lot 5-pré »)**, recommandé.
-       - Ajouter au listener une variable d'amorçage, par exemple
-         `FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW`. Sans enveloppe `ACTIVE`, un BUY accepté écrirait
-         quand même l'intent `fast-entry-v1` à ce montant.
-       - Cet intent n'est jamais armable : auto-arm exige une enveloppe `ACTIVE`,
-         `quote_amount_raw = per_buy` et `requested_at ≥ valid_from`.
-       - Seul le worker simulation-only le consomme.
-       - Variante : une commande one-shot qui crée un intent de sonde à partir d'un create observé.
-     - **(b) Sans code : le chemin paper.** Il passe par `EXECUTION_MODE=paper`,
-       `EXECUTION_INTENT_EMISSION_ENABLED=true` et une stratégie paper. Il n'est **pas prouvé** :
-       la spec dit que le lecteur de venue paper est cassé, et le profil
-       `pumpfun-v1-unvalidated` exige des signaux sociaux. À tester seulement en dry-run.
-     - **Exclu :** fabriquer un intent en SQL (règle du runbook).
-   - Corriger aussi la phrase du runbook, procédure lot 4a, étape 1.
+1. **Un producteur d'intent pour le gate 10, sur base neuve : la sonde (mini-lot 5a, fait).**
+   - Avec `ENTRY_MODE=fast` et `FAST_ENTRY_PROBE_ENABLED=true`, quand un create passe les
+     prechecks mais qu'aucune enveloppe n'existe (`NO_ENVELOPE_CAPACITY`), le listener garde ce
+     rejet, puis écrit un intent BUY `fast-entry-probe-v1` de 0,001 SOL (quote BUY réelle).
+   - Au plus une sonde par intervalle (`FAST_ENTRY_PROBE_INTERVAL_MS`, 10 min par défaut), et
+     seulement si aucune enveloppe n'est à l'état `ACTIVE` : vérifié en base sous verrou
+     consultatif, donc aussi entre redémarrages. La sonde ne réserve aucune exposition et
+     n'écrit aucune décision `BUY`.
+   - **Jamais armable, signée ni envoyée** :
+     - auto-arm ne sélectionne que `fast-entry-v1` ; `armEnvelope` et le trigger 065 l'exigent aussi ;
+     - CANARY v2 n'avait **aucun** contrôle de stratégie : la migration 067 ajoute
+       `CHECK (strategy_id <> 'fast-entry-probe-v1' OR live_reserved = FALSE)`. Tout armement
+       (CANARY v2, v3, enveloppe) passe `live_reserved` à `TRUE`, et tout claim H2b l'exige.
+       Le CHECK tient même triggers désactivés ;
+     - CANARY v3 (`live:arm`) exige en plus une paire preflight et une lignée paper, absentes
+       (`candidate_id` NULL : le contrôle de lignée répond `LINEAGE_INVALID`).
+     - Tests : `tests/fast-entry-probe.test.ts`, un refus par chemin (enveloppe, CANARY v2,
+       CANARY v3, claim H2b, CHECK tenu en `session_replication_role=replica`).
+   - Le worker simulation-only la prend sans changement : son claim `EXECUTE` ne filtre pas la
+     stratégie, et `prepareEnvelopeFacts` ne filtre pas non plus la stratégie de l'artefact.
+     Attention : le worker dry-run la prendrait aussi ; il reste arrêté.
+   - Une sonde simulée finit `SUCCEEDED` avec `purge_after` à +4 h ; une sonde jamais prise
+     expire (TTL 120 s) comme tout intent fast-entry. La rétention purge la sonde **et son
+     artefact** comme tout intent (testé) : avec la rétention arrêtée (§A.1), l'artefact reste
+     disponible pour `prepare` pendant ses 24 h ; sinon, `prepare` et `create` doivent passer
+     moins de 4 h après la simulation.
+   - Le runbook (procédure lot 4a, étape 1) est corrigé dans le même lot.
 2. **Le catalogue de gates** `execution-preflight-gate-catalog.v1` (JSON canonique, `0600`, hors
    Git). Il contient :
    - `strategyFingerprint` ;
@@ -460,14 +495,33 @@ Le keypair n'a pas été lu.
    - Aucun script du dépôt ne le génère : voir l'extrait de l'étape B5.
 3. **La clé d'attestation Ed25519** (PEM PKCS#8, `0600`), la **clé API Helius** en fichier et
    `HELIUS_PROJECT_ID`.
-4. **Le fournisseur RPC dédié à l'exécuteur** (point de sécurité 2) : un projet Helius distinct de
-   celui du listener. Son quota est attesté par H2e, puis reporté par les compteurs de l'exécuteur.
-5. **La base PG16**, son port local et les 6 logins (§A.4).
+4. **Le fournisseur RPC de l'exécuteur** : décision 3, il partage le Helius du listener (§A.8).
+5. **La base PG16** sur `127.0.0.1:5433` et les 6 logins (§A.4).
 6. **Les 9 fichiers d'environnement** de §A.2 et le keypair hors dépôt.
 7. **Les valeurs dérivées**, qui n'existent qu'après certaines étapes :
    - `EXECUTOR_WALLET_GENERATION_ID` (manifeste H2d) ;
    - `EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64` (manifeste H2e) ;
    - `EXECUTOR_BUILD_HASH` et `EXECUTOR_CONFIGURATION_FINGERPRINT` (artefact gate 10).
+
+### A.8 Helius partagé entre listener et exécuteur (décision 3)
+
+- H2e mesure l'usage **du projet entier** (API Admin) : la mesure de départ inclut le listener.
+- Ensuite, auto-arm reporte cet usage avec les seuls compteurs de l'exécuteur
+  (`EXECUTOR_COUNTERS`). Les crédits consommés par le listener après H2e ne sont **pas comptés** :
+  `used_units` est sous-estimé pendant toute la fenêtre de l'enveloppe (runbook, limites lot 4a, point 2).
+- Le listener est le gros consommateur : quotes BUY et SELL à chaque create, poller de curves,
+  WebSocket. Le risque réel n'est pas le compteur mais l'épuisement du plan ou des 429 au moment
+  d'un SELL.
+- Parades :
+  - `providerSafetyMarginUnits` **généreux** : au moins **deux fois** la consommation attendue du
+    listener sur toute la fenêtre de l'enveloppe (2 h), mesurée sur le tableau de bord Helius
+    pendant le dry-run, et en tout cas très inférieur à `limit − used` ;
+  - lancer H2e juste avant `create` (B14 à B18 enchaînés), pour partir d'une mesure fraîche ;
+  - surveiller les 429 (heartbeat du listener, `fast-path:report`) ; à partir de 3 réponses 429
+    récentes, les entrées sont bloquées (`ENTRY_BLOCKED`) ;
+  - en cas de doute, `entry-stop` : les sorties continuent.
+- Donnée à relever par l'utilisateur : la limite de crédits du plan Helius et l'usage du listener
+  par heure, pour fixer `providerSafetyMarginUnits` dans le catalogue (B5).
 
 ---
 
@@ -510,7 +564,7 @@ docker run -d --name sol-lot5-pg --restart unless-stopped \
 À vérifier : `SELECT current_setting('server_version_num')` ≥ 160000. Le port est publié sur
 127.0.0.1 uniquement. Ce n'est ni le 5432 ni le 55432.
 
-**B3. Migration jusqu'à 066.** NO-NETWORK.
+**B3. Migration jusqu'à 067.** NO-NETWORK.
 
 ```bash
 DOTENV_CONFIG_PATH="$L/env/migrate.env" npm run db:migrate:compiled
@@ -522,8 +576,8 @@ DOTENV_CONFIG_PATH="$L/env/migrate.env" npm run db:migrate:compiled
 SELECT max(version) FROM migration_history;
 ```
 
-Le résultat attendu est `066_live_position_reexit.sql`, et le nombre de versions doit être égal au
-nombre de fichiers dans `migrations/`.
+Le résultat attendu est `067_fast_entry_probe_unarmable.sql`, et le nombre de versions doit être
+égal au nombre de fichiers dans `migrations/`.
 
 **B4. Provisioning des rôles et logins.** NO-NETWORK.
 
@@ -589,15 +643,13 @@ tard, il faut régénérer le catalogue.
 du runbook (section « Produire la preuve Helius H2e »), avec `flag: 'wx'` et `mode: 0o600`, vers
 `$L/keys/provider-attestation-key.pem`.
 
-**B7. Fournisseur dédié à l'exécuteur.** Action web manuelle de l'utilisateur, hors du bot.
+**B7. Fournisseur (Helius partagé, décision 3).** Action web manuelle de l'utilisateur, hors du bot.
 
-- Créer un **projet Helius distinct** de celui du listener.
-- Enregistrer sa clé API dans `$L/keys/helius-api-key` (`0600`).
-- Noter son UUID de projet et son endpoint RPC mainnet.
-- Choisir l'identifiant `EXECUTOR_RPC_PROVIDER_ID`, par exemple `helius-exec`.
-
-Le listener garde son propre fournisseur. À vérifier : aucune URL ou clé partagée entre
-`listener.env` et les environnements de l'exécuteur.
+- Enregistrer la clé API Helius du listener dans `$L/keys/helius-api-key` (`0600`).
+- Noter l'UUID du projet, l'endpoint RPC mainnet, la limite de crédits du plan et l'usage horaire
+  du listener (§A.8).
+- Choisir l'identifiant `EXECUTOR_RPC_PROVIDER_ID`, par exemple `helius`, identique dans tous les
+  environnements de l'exécuteur.
 
 **B8. Wallet et keypair.** NO-NETWORK.
 
@@ -630,24 +682,26 @@ de l'utilisateur, hors du bot.
 - `grep -c KEYPAIR` vaut 0 partout sauf dans `live.env` ;
 - `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT` vaut 14 dans `operations.env` et `live.env`, et 8 dans
   `worker-sim.env` ;
+- toutes les autres valeurs de l'empreinte de configuration (voir « Pièges ») sont identiques
+  entre `worker-sim.env` et `live.env`, y compris `EXECUTOR_RPC_TIMEOUT_MS` ;
+- `listener.env` contient `FAST_ENTRY_PROBE_ENABLED=true` pour B11 ;
 - les 8 valeurs runtime sont identiques entre `operations.env` et `live.env`
   (`diff <(grep -E '^EXECUTOR_(QUOTE|SLIPPAGE|SNAPSHOT|MAX_|LEASE)' …)`).
 
-**B11. Gate 10, étape 1 : produire un intent de sonde.** READ-ONLY-RPC. **Bloqué** tant que §A.7,
-point 1 n'est pas tranché.
+**B11. Gate 10, étape 1 : sonde.** READ-ONLY-RPC.
 
-- Avec l'option (a) : lancer le listener avec `listener.env` plus la variable d'amorçage, sans
-  enveloppe, jusqu'à ce qu'**un** intent `fast-entry-v1` `PENDING` apparaisse, puis l'arrêter
-  (`SIGINT`).
-- Auto-arm, H2a et H2b restent **arrêtés**.
+Auto-arm, H2a, H2b et le worker dry-run restent **arrêtés**. Aucune enveloppe n'existe.
 
-À vérifier :
-
-```sql
-SELECT count(*) FROM execution_intents WHERE strategy_id='fast-entry-v1' AND status='PENDING';
+```bash
+DOTENV_CONFIG_PATH="$L/env/listener.env" npm start   # FAST_ENTRY_PROBE_ENABLED=true
 ```
 
-Le résultat doit être au moins 1.
+À vérifier : un log `listener.fast_entry_probe` avec `outcome: "RECORDED"`, puis
+
+```sql
+SELECT id, status, live_reserved FROM execution_intents
+WHERE strategy_id='fast-entry-probe-v1' ORDER BY requested_at DESC LIMIT 3;
+```
 
 **B12. Gate 10, étape 2 : simulation.** READ-ONLY-RPC (`simulateTransaction`, rien n'est signé ni
 envoyé).
@@ -656,13 +710,22 @@ envoyé).
 DOTENV_CONFIG_PATH="$L/env/worker-sim.env" npm run executor:start   # arrêter (Ctrl-C) après 1 artefact SUCCESS
 ```
 
-L'intent doit être consommé dans son TTL de 120 s : lancer le worker **pendant** B11, ou juste après
-l'apparition de l'intent. Auto-arm doit être arrêté (lot 4a, limite 1).
+- Lancer le worker **en même temps** que le listener de B11 : la sonde vit 120 s, et la suivante
+  attend l'intervalle (10 min par défaut).
+- Une simulation `FAILED` n'est pas bloquante : attendre la sonde suivante.
+- Après le premier `SUCCESS` : arrêter le worker, arrêter le listener (`SIGINT`), passer
+  `FAST_ENTRY_PROBE_ENABLED=false` dans `listener.env`. La sonde reste désactivée pour toute la
+  suite (dry-run compris).
+- Point non vérifié en dehors du réseau : la sonde à 0,001 SOL prouve la configuration, pas un
+  BUY de 0,01 SOL. Si un BUY débite le fee payer de plus de `EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT`
+  (2 500 000), le premier BUY réel échouera fermé. Regarder `simulated_fee_payer_lamport_debit` de
+  l'artefact en B13.
 
 **B13. Relever les empreintes du gate 10.** NO-NETWORK. Avec la connexion propriétaire :
 
 ```sql
-SELECT artifact_id, build_fingerprint, configuration_fingerprint, recorded_at
+SELECT artifact_id, strategy_id, build_fingerprint, configuration_fingerprint,
+  simulated_fee_payer_lamport_debit, recorded_at
 FROM execution_simulation_artifacts
 WHERE result_kind='SUCCESS'
 ORDER BY recorded_at DESC
@@ -672,7 +735,9 @@ LIMIT 3;
 - Recopier `build_fingerprint` dans `EXECUTOR_BUILD_HASH`, et `configuration_fingerprint` dans
   `EXECUTOR_CONFIGURATION_FINGERPRINT`, dans `operations.env` et `live.env`.
 - Ce sont des empreintes publiques.
-- À vérifier : `recorded_at` a moins de 24 h. Il faut enchaîner B14 à B17 dans cette fenêtre.
+- À vérifier : `strategy_id = 'fast-entry-probe-v1'` et `recorded_at` a moins de 24 h. Il faut
+  enchaîner B14 à B17 dans cette fenêtre.
+- Le job de rétention reste arrêté : il purge l'artefact 4 h après la fin de la sonde.
 
 **B14. H2e, preuve provider.** READ-ONLY-RPC (une lecture de l'API Admin Helius, sans retry).
 
@@ -754,7 +819,7 @@ l'enveloppe réelle. Le gate 10 reste valable s'il a moins de 24 h.
 DOTENV_CONFIG_PATH="$L/env/live-recovery.env" npm run executor:live:recovery:start
 ```
 
-À vérifier dans les logs : démarrage validé (rôle, migration 066, génération, fournisseur, genesis), puis passes à vide.
+À vérifier dans les logs : démarrage validé (rôle, migration 067, génération, fournisseur, genesis), puis passes à vide.
 
 **B23. Démarrer H2b.** **SENDS-TX** à partir de ce moment, dès qu'un armement existe.
 
@@ -780,8 +845,8 @@ Résultat attendu : ticks `IDLE NO_INTENT`. Aucun `DEFERRED CONFIG_BINDING_MISMA
 DOTENV_CONFIG_PATH="$L/env/listener.env" npm start
 ```
 
-Il tourne avec `ENTRY_MODE=fast` et `LISTENER_INGESTION_SCOPE=creates-only`, sans variable
-d'amorçage. Le worker simulation-only et le worker dry-run sont **arrêtés**.
+Il tourne avec `ENTRY_MODE=fast`, `LISTENER_INGESTION_SCOPE=creates-only` et
+`FAST_ENTRY_PROBE_ENABLED=false`. Le worker simulation-only et le worker dry-run sont **arrêtés**.
 
 À vérifier : décisions `listener.fast_entry_decision`, puis tick auto-arm `ARMED`, puis BUY H2b,
 puis position `OPEN`, puis sortie H2a.
@@ -837,7 +902,7 @@ snapshot fournisseur dont le SELL a besoin.
 8. Retirer le SOL restant vers le wallet personnel. Transaction manuelle de l'utilisateur, hors du
    bot.
 9. Laisser le job de rétention reprendre seulement après le rapport.
-10. Conserver `L/evidence`. Révoquer ou garder la clé Helius dédiée, au choix de l'utilisateur.
+10. Conserver `L/evidence`. La clé Helius est celle du listener (partagée) : ne pas la révoquer.
 
 ### B.2 Paramètres d'enveloppe et de politique : calculs
 
@@ -879,11 +944,13 @@ Valeurs :
   - Soit environ 30 + 10 + 2,5 + 10 = **52,5 M lamports (≈ 0,053 SOL)**.
 - **Financement de 0,1 SOL.** Il couvre la simulation du gate 10, la perte maximale, et garde le
   seuil d'auto-arm de 30 000 000 atteignable après environ 30 M de pertes.
-- **Coûts fournisseur.** `providerSafetyMarginUnits = 10 000` est à adapter au plan Helius : la
+- **Coûts fournisseur.** `providerSafetyMarginUnits = 10 000` n'est qu'un exemple : voir §A.8. La
   marge doit rester très inférieure à `limit − used`. Les quatre coûts par position valent 16, soit
   `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT` ou plus.
-- **Alternative plus prudente** pour un tout premier run : `--max-buys=3 --max-exposure-lamports=30000000`.
-  Elle ne change aucune autre contrainte.
+- Montants **décidés** par l'utilisateur (décision 4) : 5 × 0,01 SOL, exposition 0,05 SOL, perte
+  0,03 SOL, holding 180 s, wallet 0,1 SOL.
+- **Coûts fournisseur avec le Helius partagé** : `providerSafetyMarginUnits` suit §A.8 (au moins
+  deux fois l'usage du listener sur la fenêtre), pas la valeur d'exemple `10000`.
 
 ---
 
@@ -902,7 +969,7 @@ Valeurs :
 
 ### C.2 Procédure
 
-Prérequis : B1 à B17 réalisés, avec le bloquant gate 10 levé.
+Prérequis : B1 à B17 réalisés (gate 10 produit par la sonde, sonde désactivée).
 
 Créer une **enveloppe de dry-run** dédiée : un armement non acheté consomme un `buys_armed`
 (limite 5 du lot 4a). Pour cela, refaire B16 et B17 (nouveau `prepare`, nouvelle signature H2f),
@@ -912,7 +979,7 @@ puis :
 |---|---|---|---|
 | D1 | `live:envelope -- create --per-buy-lamports=10000000 --max-buys=2 --max-exposure-lamports=20000000 --max-loss-lamports=30000000 --holding-ms=180000` | TTY, phrase, politique, A17, âge du gate 10, liaison de la qualification | NO-NETWORK, **TTY** |
 | D2 | `live:resume` puis `live:status` | passage en `RUNNING`, qualification `ENVELOPE` la plus récente | NO-NETWORK, **TTY** |
-| D3 | Démarrer H2a (B22) | validateur de démarrage H2a : grants (dont SELECT sur `domain_events`), migration 066, génération, genesis ; passes à vide | READ-ONLY-RPC |
+| D3 | Démarrer H2a (B22) | validateur de démarrage H2a : grants (dont SELECT sur `domain_events`), migration 067, génération, genesis ; passes à vide | READ-ONLY-RPC |
 | D4 | **Ne pas démarrer H2b.** Vérifier qu'aucun processus H2b ne tourne (`pgrep -f executor-live/main.js` vide) | aucun processus ne détient la clé | NO-NETWORK |
 | D5 | Démarrer auto-arm (B24) | parse de la configuration (contraintes de bail), genesis, rôle operations, ticks `IDLE NO_INTENT`, aucun `CONFIG_BINDING_MISMATCH` | READ-ONLY-RPC |
 | D6 | Démarrer le listener (B25) | `creates-only`, quotes fast-entry à chaque create, `entry_decisions` BUY/REJECTED, intents `fast-entry-v1` | READ-ONLY-RPC |
@@ -968,12 +1035,12 @@ c'est à l'utilisateur de décider s'il la fait.
   la vraie politique.
 - Les décisions d'entrée rapide se forment sur le vrai flux, avec la latence create → décision → armement.
 - La charge RPC du listener tient avec une enveloppe active (quotes à chaque create, poller de curves),
-  ou non (429).
+  ou non (429). Avec le Helius partagé, c'est aussi la mesure de l'usage horaire pour §A.8.
 - L'armement auto-arm de bout en bout fonctionne : RPC wallet, report fournisseur, admission,
   triggers 065, compteurs d'enveloppe, `EXHAUSTED`.
 - `revoke` et `entry-stop` fonctionnent, ainsi que le rapport.
 - Avec D14 : la liaison de démarrage de H2b (génération, build, configuration, stratégie,
-  fournisseur, migration 066) et le keypair.
+  fournisseur, migration 067) et le keypair.
 
 ### C.5 Ce qu'il ne prouve pas
 
@@ -995,24 +1062,24 @@ c'est à l'utilisateur de décider s'il la fait.
 
 Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concernent le wallet) :
 
-1. [ ] Accord explicite de l'utilisateur pour le lot 5, avec les montants de §B.2 ou les siens.
-2. [ ] La base de production est en PG16, migrée à 066, avec les rôles reprovisionnés **après**
-   066 (inventaire RLS `5 | 1 | t`) et 6 logins mono-rôle.
+1. [ ] Accord explicite de l'utilisateur pour le lot 5, avec les montants décidés (§B.2).
+2. [ ] La base de production est en PG16 (`127.0.0.1:5433`), migrée à 067, avec les rôles
+   reprovisionnés **après** 067 (inventaire RLS `5 | 1 | t`) et 6 logins mono-rôle.
 3. [ ] Aucune position n'est `MISMATCH` (sur un SELL antérieur à 4b), `UNKNOWN` ou `EXIT_PENDING`,
    et `unknown_block = false` (base neuve : trivialement vrai).
 4. [ ] Le dry-run C est passé en entier : au moins un `ARMED`, `revoke` vérifié, rapport lisible.
    Aucun `CONFIG_BINDING_MISMATCH`, `POLICY_FRESHNESS` ni 429 persistant.
 5. [ ] Les 8 valeurs runtime sont identiques entre `operations.env` et `live.env`. Le worker de
    simulation utilise la valeur H2b − 6, et toutes ses autres valeurs sont identiques à H2b.
-6. [ ] Le fournisseur de l'exécuteur est dédié, distinct de celui du listener, et sa preuve H2e est
-   fraîche (B14 et B15 enchaînés).
+6. [ ] La preuve H2e du Helius partagé est fraîche (B14 et B15 enchaînés) et
+   `providerSafetyMarginUnits` couvre au moins deux fois l'usage du listener sur la fenêtre (§A.8).
 7. [ ] Le keypair est hors dépôt, en `0400`, sa clé publique est égale à `EXECUTOR_PUBLIC_KEY`, et
    le wallet est neuf et dédié.
 8. [ ] Le wallet est financé à 0,1 SOL au plus, sans autre token.
 9. [ ] L'enveloppe réelle est `ACTIVE`, avec `valid_until` à plus d'une heure, `holding ≤ 300 000`,
    `controlState = RUNNING`, et aucun armement actif.
 10. [ ] Le worker simulation-only, le worker dry-run et la rétention sont arrêtés. Le listener
-    tourne sans variable d'amorçage.
+    tourne avec `FAST_ENTRY_PROBE_ENABLED=false`.
 11. [ ] L'opérateur est présent pendant toute la durée du run, avec les commandes de kill switch
     prêtes (B27) et la procédure manuelle de vente du runbook relue.
 12. [ ] Le créneau est choisi pour pouvoir lancer `fast-path:report` dans les 4 h.
@@ -1021,24 +1088,17 @@ Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concern
 
 ## Questions ouvertes (réponses de l'utilisateur requises)
 
-1. **Amorçage du gate 10** : option (a), petit changement de code dans un lot 5-pré, ou option (b),
-   test du chemin paper ?
-2. **Base de production** : un conteneur PG16 dédié sur `127.0.0.1:5433` (recommandé), ou une mise à
-   niveau du Postgres natif ? Sur quelle machine ?
-3. **Machine du run** : le poste de l'opérateur ou un serveur ? Le run demande un TTY pour `create`
+Tranché le 2026-10-07 : sonde de gate 10, base PG16 sur `127.0.0.1:5433`, Helius partagé,
+montants (voir « Décisions de l'utilisateur » en tête). Reste :
+
+1. **Machine du run** : le poste de l'opérateur ou un serveur ? Le run demande un TTY pour `create`
    et `resume`, la présence de l'opérateur, une horloge NTP et une connexion stable.
-4. **Fournisseur dédié** : un nouveau projet Helius, et sur quel plan (limite de crédits, pour
-   `providerSafetyMarginUnits`) ? Le listener garde-t-il son fournisseur actuel, celui des 429 passés ?
-5. **Montants** : 0,01 SOL × 5 achats, perte maximale 0,03 SOL et holding de 3 min, ou la variante
-   prudente à 3 achats ? Financement de 0,1 SOL ?
-6. **`initialCapitalLamports = 240 000 000`** est fictif par rapport à un wallet de 0,1 SOL. Cela
-   convient-il, ou faut-il financer à hauteur du capital déclaré ?
-7. **Wallet** : un wallet neuf ? Le fichier `.key` du checkout est-il le keypair, et peut-on le
-   sortir du dépôt ?
-8. **`live.env` et ses deux `.bak`** à la racine du checkout : peut-on les archiver hors dépôt ou
+2. **Fichier `.key`** à la racine du checkout : est-ce le keypair du wallet (neuf et dédié) ? Où le
+   ranger hors du dépôt (`$L/keys/executor-keypair.json` en `0400` proposé) ?
+3. **`live.env` et ses deux `.bak`** à la racine du checkout : peut-on les archiver hors dépôt ou
    les supprimer une fois les nouveaux fichiers écrits ?
-9. **Politique de sortie** : garder les défauts `EXIT_*` (take-profit 2×, 10 acheteurs externes
+4. **Politique de sortie** : garder les défauts `EXIT_*` (take-profit 2×, 10 acheteurs externes
    ≥ 0,001 SOL) ?
-10. **Fumée de démarrage H2b (D14)** : la faire avant le run réel ?
-11. **Les 8 preuves statiques du catalogue** : quels artefacts concrets (identifiant de run CI, tests)
-    l'utilisateur accepte-t-il comme preuve ?
+5. **Fumée de démarrage H2b (D14)** : la faire avant le run réel ?
+6. **Les 8 preuves statiques du catalogue** : quels artefacts concrets (identifiant de run CI, tests)
+   l'utilisateur accepte-t-il comme preuve ?
