@@ -963,9 +963,16 @@ le BUY inchangé ; H2a vend à l'échéance (`maximum_holding_ms`). Plan et déc
 
 ### Procédure
 
-1. Arrêter les workers dry-run et simulation. Pour produire l'artefact de simulation
-   (gate 10), lancer une fois le worker simulation-only avec `ENTRY_MODE=fast`, puis l'arrêter.
-   L'artefact doit avoir moins de 24 h au moment de `prepare`.
+1. Arrêter le worker dry-run et le démon auto-arm. Pour produire l'artefact de simulation
+   (gate 10), utiliser la sonde (lot 5a, migration 067) :
+   - lancer le listener avec `ENTRY_MODE=fast`, `LISTENER_INGESTION_SCOPE=creates-only` et
+     `FAST_ENTRY_PROBE_ENABLED=true` (intervalle `FAST_ENTRY_PROBE_INTERVAL_MS`, 600 000 par
+     défaut). Sans enveloppe ACTIVE, il écrit au plus un intent BUY `fast-entry-probe-v1` de
+     0,001 SOL par intervalle. Cet intent n'est jamais armable (CHECK 067 : jamais `live_reserved`) ;
+   - lancer en même temps le worker simulation-only (TTL de l'intent : 120 s), jusqu'à un artefact
+     `SUCCESS` ;
+   - arrêter le worker, puis relancer le listener avec `FAST_ENTRY_PROBE_ENABLED=false`.
+   Le worker ne lit pas `ENTRY_MODE`. L'artefact doit avoir moins de 24 h au moment de `prepare`.
 2. Exécuter H2e et H2d pour un snapshot provider et un snapshot wallet autoritatifs frais.
 3. Préparer, signer, créer, reprendre :
    - `npm run live:envelope -- prepare --valid-ms=N` (N de 3 600 000 à 86 400 000) écrit un
@@ -1019,8 +1026,8 @@ au BUY bornent encore ce cas.
 
 ### Limites connues
 
-1. Gate 10 : `prepare` exige un artefact de simulation de moins de 24 h ; le seul producteur
-   prévu est le worker simulation-only sur un intent fast-entry, démon auto-arm arrêté.
+1. Gate 10 : `prepare` exige un artefact de simulation de moins de 24 h ; le producteur est le
+   worker simulation-only sur un intent de sonde `fast-entry-probe-v1` (procédure, étape 1).
 2. Les snapshots provider `EXECUTOR_COUNTERS` ne reportent que les compteurs de cet exécuteur :
    si le listener partage le même plan provider, `used_units` est sous-estimé. Prévoir un
    provider id ou une clé dédiée à l'exécuteur. Le report est conservateur (double comptage
@@ -1047,7 +1054,7 @@ anticipées sont alors arrêtées. L'échéance n'est pas touchée. Si on le voi
 
 ### Ordre de déploiement
 
-1. Migrer jusqu'à 066.
+1. Migrer jusqu'à la tête : 066 au lot 4b, 067 depuis le lot 5a (H2a et H2b exigent la tête exacte).
 2. Re-provisionner les rôles (`scripts/provision-executor-roles.sql`) AVANT de redémarrer H2a et H2b.
    Sinon le validateur de démarrage refuse de lancer H2a, et les sorties à l'échéance ne tournent
    pas non plus.

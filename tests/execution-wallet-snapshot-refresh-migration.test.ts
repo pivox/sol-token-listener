@@ -37,7 +37,7 @@ void test('migration 045 applies on an empty schema and replays through the migr
 
   await withTemporarySchema(databaseUrl, 'execution_wallet_snapshot_refresh_empty', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '066_live_position_reexit.sql');
+    assert.equal(applied.at(-1), '067_fast_entry_probe_unarmable.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     await assertSnapshotIndexes(pool);
@@ -75,6 +75,7 @@ void test('migration 045 upgrades 044 so a superseded same-revision snapshot can
       '064_fast_entry_decisions.sql',
       '065_entry_envelope_auto_arm.sql',
       '066_live_position_reexit.sql',
+      '067_fast_entry_probe_unarmable.sql',
     ]);
     await assertSnapshotIndexes(pool);
 

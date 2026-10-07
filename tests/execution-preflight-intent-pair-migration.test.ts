@@ -7,7 +7,7 @@ import { LIVE_EXECUTION_MIGRATION_CATALOG } from '../src/execution-migrations/li
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '041_execution_preflight_intent_pairs.sql';
-const migrationHeadName = '066_live_position_reexit.sql';
+const migrationHeadName = '067_fast_entry_probe_unarmable.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const wsolMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = 'a'.repeat(64);

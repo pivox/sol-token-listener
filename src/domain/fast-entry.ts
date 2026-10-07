@@ -7,6 +7,15 @@ export const FAST_ENTRY_STRATEGY_ID = 'fast-entry-v1';
 export const FAST_ENTRY_SLIPPAGE_BPS = 1_000n;
 export const FAST_ENTRY_INTENT_TTL_MS = 120_000;
 export const FAST_ENTRY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * Gate-10 bootstrap only. Without an ACTIVE envelope the listener may write, at most once per
+ * interval, a BUY intent under this distinct strategy id so the simulation-only worker can produce
+ * the SUCCESS artifact `envelope prepare` needs. It is never armable: arming requires
+ * FAST_ENTRY_STRATEGY_ID, and the 067 CHECK forbids `live_reserved` on this strategy.
+ */
+export const FAST_ENTRY_PROBE_STRATEGY_ID = 'fast-entry-probe-v1';
+/** 0.001 SOL: enough for a real pump.fun quote, never a real buy. */
+export const FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW = 1_000_000n;
 /** A create first observed longer ago than this is never decided (retries, replays, catch-up). */
 export const FAST_ENTRY_MAX_CREATE_AGE_MS = 15_000;
 

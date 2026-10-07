@@ -73,6 +73,8 @@ export interface AppConfig {
   readonly listenerPumpFunCatchUpCoverageFastPathEnabled: boolean;
   readonly listenerIngestionScope: ListenerIngestionScope;
   readonly entryMode: EntryMode;
+  readonly fastEntryProbeEnabled: boolean;
+  readonly fastEntryProbeIntervalMs: number;
   readonly listenerTrackedPoolPollEnabled: boolean;
   readonly listenerTrackedPoolPollIntervalMs: number;
   readonly expectedGenesisHash: string | null;
@@ -264,6 +266,15 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   if (entryMode === 'fast' && listenerIngestionScope !== 'creates-only') {
     throw new Error('ENTRY_MODE=fast requires LISTENER_INGESTION_SCOPE=creates-only.');
   }
+  const fastEntryProbeEnabled = parseStrictBoolean(
+    environment.FAST_ENTRY_PROBE_ENABLED, false, 'FAST_ENTRY_PROBE_ENABLED',
+  );
+  if (fastEntryProbeEnabled && entryMode !== 'fast') {
+    throw new Error('FAST_ENTRY_PROBE_ENABLED requires ENTRY_MODE=fast.');
+  }
+  const fastEntryProbeIntervalMs = parseCanonicalBoundedInteger(
+    environment.FAST_ENTRY_PROBE_INTERVAL_MS, 600_000, 'FAST_ENTRY_PROBE_INTERVAL_MS', 60_000, 86_400_000,
+  );
   if (listenerWorkerCount > 1 && (
     !blockHydration.listenerBlockHydrationEnabled
     || listenerIngestionScope !== 'launchpad-only'
@@ -362,6 +373,8 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerPumpFunCatchUpCoverageFastPathEnabled,
     listenerIngestionScope,
     entryMode,
+    fastEntryProbeEnabled,
+    fastEntryProbeIntervalMs,
     listenerTrackedPoolPollEnabled: parseBoolean(
       environment.LISTENER_TRACKED_POOL_POLL_ENABLED, false, 'LISTENER_TRACKED_POOL_POLL_ENABLED',
     ),
