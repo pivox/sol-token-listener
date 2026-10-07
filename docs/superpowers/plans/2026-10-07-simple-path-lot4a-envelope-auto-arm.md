@@ -840,3 +840,44 @@ Each case is a test that must fail closed:
 - /Users/haythem.mabrouk/workspace/perso/sol-token-listener/src/domain/execution-safety-qualification.ts and /Users/haythem.mabrouk/workspace/perso/sol-token-listener/src/domain/execution-canary.ts
 - /Users/haythem.mabrouk/workspace/perso/sol-token-listener/src/storage/execution-live.repository.ts (RUNNABLE_WORK_SQL 149-226, signing checks 2472-2477/2513-2518, commitSellReconciliation 4520/4965, deadline 5008-5102)
 - /Users/haythem.mabrouk/workspace/perso/sol-token-listener/scripts/provision-executor-roles.sql (with /Users/haythem.mabrouk/workspace/perso/sol-token-listener/src/executor-live/startup-validator.ts and /Users/haythem.mabrouk/workspace/perso/sol-token-listener/src/executor-live-recovery/database-authority.ts)
+---
+
+## Amendments after the safety review (2026-10-07) — binding, they override the tasks above
+
+**Task 1**
+- A1. `src/preflight-source/repository.ts:568-570` (`providerProvenance`) must accept `EXECUTOR_COUNTERS` when reading a current snapshot, otherwise the CANARY preflight-source path breaks while an executor-counter snapshot is current. Add a test.
+
+**Task 3 (migration 065)**
+- A2. Identity CHECK: copy 035:23-32 (NOT 035:22, which is `payload_version = 1 AND evaluator_version = 1`).
+- A3. Temporal CHECK: copy 035:35-38 only (035:39 is the 5-minute equality, replaced by the scope disjunction).
+- A4. Provider provenance: drop/re-add `execution_provider_usage_snapshots_identity_check` with its full body (034:337-345), changing only the provenance list.
+- A5. Armament trigger: copy 039:789 up to the last predicate (835 is `) INTO armament_valid;`). Trigger binding is 039:841-844.
+- A6. Armament trigger, ENVELOPE branch: add `AND qualification.expires_at = envelope.valid_until` (the DB must tie the qualification to the cut-off; the SELL at execution-live.repository.ts:2776 and BUY submission at :3883 need the qualification unexpired).
+- A7. Envelope BEFORE INSERT guard: also require `operator_auth.authorization_id = NEW.authorization_id AND operator_auth.action = 'ENVELOPE' AND operator_auth.payload_version = 1`.
+- A8. Re-create `guard_execution_activation_armament_update` (039:686-760) identically, plus `NEW.envelope_id IS DISTINCT FROM OLD.envelope_id` in its immutable identity list.
+- A9. Over 30 tests reference 064: check all of them (`grep -rl 064_fast_entry_decisions tests src scripts`); edit only those that pin the migration head/list.
+
+**Task 5**
+- A10. `revokeEnvelope` revokes only an ARMED armament whose `envelope_id = $envelopeId` (never a CANARY armament). Add a test: an ARMED CANARY armament survives an envelope revoke.
+
+**Task 6**
+- A11. The carry-forward SUM filters `billing_period_id` exactly like admission (execution-risk.repository.ts:906-915).
+- A12. `providerRefreshDue` uses `expires_at < now + providerUsageMaxAgeMs / 2` (not 5 min), so refresh does not fire every tick. `readAutoArmContext` takes `providerRefreshThresholdMs` as input.
+- A13. Candidate intent filter margin: `expires_at >= now + 2×lease + 2×rpcTimeout + 5 000` ms (`readAutoArmContext` takes `minimumRemainingMs`).
+- A14. At least one arm-path PG test runs under `SET ROLE sol_token_executor_operations` with roles provisioned (reuse how existing role tests do it).
+
+**Task 7**
+- A15. `validFromMs` = DB now (from the repository), not the local clock.
+- A16. Confirmation phrase uses the first 8 hex chars of the envelope fingerprint (like the wallet prefix at terminal.ts:85), not the full 64.
+- A17. `envelope create` precondition: the policy's reconciled capital must be ≥ 20 × per_buy (BUY submission requires `reserved_exposure × 10 000 ≤ reconciled_capital × 500`, execution-live.repository.ts:3825-3884). Reject otherwise.
+
+**Task 8**
+- A18. Exclude an intent only on a non-transient rejection (admission refused / intent-specific CONFLICT such as wrong strategy or quote). Provider carry-forward mismatch and 23505 are transient: no exclusion, retry next tick. Make the repository surface a distinct code (e.g. `PROVIDER_CARRY_FORWARD_STALE`) for the carry-forward case.
+
+**Task 10**
+- A19. Recovery SELECT grant on `execution_entry_envelopes` includes `updated_at` (read by `GREATEST(envelope.updated_at, …)`); mirror in the authority constant. At least one Task 10 PG test runs the SELL reconciliation under `SET ROLE sol_token_executor_live_recovery`.
+
+**Task 12**
+- A20. Fix `.env.example`: `EXECUTOR_LEASE_MS=35000` is already below the minimum for RPC 5 000 / DB 3 000 (≥ 39 000); use 40 000.
+- A21. Safety point 3 is restated: the ops role can itself mint and consume a v1 ENVELOPE authorization and insert an envelope + qualification, so a compromised auto-arm daemon (same role) can arm without the human limits; a separate login does not change this. Accepted per the user decision (daemon = ops role); bounded only by wallet balance and the risk policy checks at BUY. Document it in the runbook and the PR.
+- A22. Safety point 2 addendum: carry-forward is conservative (it can double-count counters recorded between context read and arm), so a later authoritative H2e probe reporting less may be refused `STALE_MEASUREMENT` until the period rolls over.
