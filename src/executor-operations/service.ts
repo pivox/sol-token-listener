@@ -11,18 +11,31 @@ import {
   type ExecutionPreflightDraftSourceV2,
 } from '../domain/execution-preflight-draft.js';
 import type { ExecutionCanaryEvidenceV1 } from '../domain/execution-canary.js';
+import {
+  createEntryEnvelope,
+  type EntryEnvelopeV2,
+} from '../domain/execution-entry-envelope.js';
+import type { ExecutionRiskPolicyV1 } from '../domain/execution-risk-policy.js';
 import type {
   ExecutionSafetyQualification,
   ExecutionSafetyQualificationV1,
+  ExecutionSafetyQualificationV2,
 } from '../domain/execution-safety-qualification.js';
 import type {
   ExecutionControlCommandV1,
   ExecutionCanaryArmamentRepository,
+  ExecutionEntryEnvelopeRepository,
+  ExecutionEntryEnvelopeSummaryV1,
+  ExecutionEnvelopeFactsQueryV1,
+  ExecutionEnvelopeFactsV1,
+  ExecutionEnvelopeRevocationV1,
+  ExecutionEnvelopeRevokeCommandV1,
   ExecutionCanaryTargetIntentV1,
   ExecutionOperationsRepository,
   ExecutionOperationsStatusV1,
 } from '../ports/execution-operations-repository.js';
 import {
+  authorizeEnvelopeCreation,
   authorizeOperatorAction,
   authorizeCanaryArmament,
   type OperatorTerminal,
@@ -31,7 +44,38 @@ import {
 interface ServiceDependencies {
   readonly repository: ExecutionOperationsRepository;
   readonly canaryRepository?: ExecutionCanaryArmamentRepository;
+  readonly envelopeRepository?: ExecutionEntryEnvelopeRepository;
   readonly nonceSource: () => string;
+}
+
+export interface CreateEnvelopeCommandV1 {
+  readonly payloadVersion: 1;
+  readonly qualification: ExecutionSafetyQualificationV2;
+  readonly policy: ExecutionRiskPolicyV1;
+  readonly operatorId: string;
+  readonly perBuyQuoteAmountRaw: bigint;
+  readonly maxBuys: number;
+  readonly maxTotalExposureRaw: bigint;
+  readonly maxRealizedLossRaw: bigint;
+  readonly maximumHoldingMs: number;
+  readonly terminal: OperatorTerminal;
+}
+
+export type ExecutionEnvelopeCommandErrorCode =
+  | 'ENVELOPE_LIMITS_REJECTED'
+  | 'ENVELOPE_FACTS_UNAVAILABLE';
+
+/** An envelope refusal the operator must be able to tell apart from a generic failure. */
+export class ExecutionEnvelopeCommandError extends Error {
+  public readonly code: ExecutionEnvelopeCommandErrorCode;
+
+  public constructor(code: ExecutionEnvelopeCommandErrorCode) {
+    super(code === 'ENVELOPE_LIMITS_REJECTED'
+      ? 'Envelope limits rejected: window, caps or risk policy (capital >= 20 x per-buy after the loss cap).'
+      : 'No matching SUCCESS mainnet simulation artifact in the last 24 hours.');
+    this.name = 'ExecutionEnvelopeCommandError';
+    this.code = code;
+  }
 }
 
 interface ArmCommandV1 {
@@ -92,11 +136,28 @@ export interface ExecutionOperationsService {
     ExecutionActivationArmamentV1 | ExecutionActivationArmamentV2
   >;
   readonly resume: (command: ResumeCommandV1) => Promise<ExecutionOperationsStatusV1>;
+  readonly prepareEnvelopeFacts: (
+    generationId: string,
+    query: ExecutionEnvelopeFactsQueryV1,
+  ) => Promise<ExecutionEnvelopeFactsV1 | null>;
+  readonly createEnvelope: (command: CreateEnvelopeCommandV1) => Promise<EntryEnvelopeV2>;
+  readonly revokeEnvelope: (
+    command: ExecutionEnvelopeRevokeCommandV1,
+  ) => Promise<ExecutionEnvelopeRevocationV1>;
+  readonly readEnvelopes: (
+    generationId: string,
+  ) => Promise<readonly ExecutionEntryEnvelopeSummaryV1[]>;
 }
 
 export function createExecutionOperationsService(
   dependencies: ServiceDependencies,
 ): ExecutionOperationsService {
+  const envelopeRepository = (): ExecutionEntryEnvelopeRepository => {
+    if (dependencies.envelopeRepository === undefined) {
+      throw new Error('ENVELOPE_REPOSITORY_UNAVAILABLE');
+    }
+    return dependencies.envelopeRepository;
+  };
   return Object.freeze({
     preflight: (qualification: ExecutionSafetyQualification) =>
       dependencies.repository.persistQualification(qualification),
@@ -250,6 +311,37 @@ export function createExecutionOperationsService(
         occurredAtMs: command.nowMs,
       });
     },
+    prepareEnvelopeFacts: (generationId: string, query: ExecutionEnvelopeFactsQueryV1) =>
+      envelopeRepository().prepareEnvelopeFacts(generationId, query),
+    createEnvelope: async (command: CreateEnvelopeCommandV1) => {
+      const repository = envelopeRepository();
+      const qualification = command.qualification;
+      // A15: the envelope starts at the DB now, never at the operator's clock.
+      const { databaseNowMs } = await repository.expireEnvelopes(qualification.generationId);
+      let envelope: EntryEnvelopeV2;
+      try {
+        envelope = createEntryEnvelope(Object.freeze({
+          payloadVersion: 2, qualification, operatorId: command.operatorId,
+          perBuyQuoteAmountRaw: command.perBuyQuoteAmountRaw, maxBuys: command.maxBuys,
+          maxTotalExposureRaw: command.maxTotalExposureRaw,
+          maxRealizedLossRaw: command.maxRealizedLossRaw,
+          maximumHoldingMs: command.maximumHoldingMs,
+          validFromMs: databaseNowMs, validUntilMs: qualification.expiresAtMs,
+          policy: command.policy,
+        }));
+      } catch {
+        throw new ExecutionEnvelopeCommandError('ENVELOPE_LIMITS_REJECTED');
+      }
+      const authorization = await authorizeEnvelopeCreation({
+        terminal: command.terminal, nonceSource: dependencies.nonceSource,
+        walletPublicKey: qualification.walletPublicKey, envelope, nowMs: databaseNowMs,
+      });
+      await dependencies.repository.recordAuthorization(authorization);
+      return repository.createEnvelope(Object.freeze({ envelope, qualification, authorization }));
+    },
+    revokeEnvelope: (command: ExecutionEnvelopeRevokeCommandV1) =>
+      envelopeRepository().revokeEnvelope(command),
+    readEnvelopes: (generationId: string) => envelopeRepository().readEnvelopes(generationId),
   });
 }
 

@@ -6,6 +6,7 @@ import {
 import { createExecutionPreflightBundle } from '../domain/execution-preflight-bundle.js';
 import { verifySignedExecutionCanaryEvidence } from '../domain/execution-canary-attestation.js';
 import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
+import { createSafetyQualification } from '../domain/execution-safety-qualification.js';
 import { canonicalStringifyJson, parseJson } from '../utils/json.js';
 
 export interface ExecutionPreflightBundleManifestV1 {
@@ -36,6 +37,31 @@ export interface ExecutionPreflightBundlePackageV1 {
   readonly canaryEnvelope: string;
   readonly manifest: ExecutionPreflightBundleManifestV1;
 }
+
+export interface ExecutionEnvelopeQualificationManifestV1 {
+  readonly schemaVersion: 'execution-envelope-qualification-package.v1';
+  readonly state: 'ENVELOPE_QUALIFICATION_PACKAGED';
+  readonly scope: 'ENVELOPE';
+  readonly qualificationId: string;
+  readonly qualificationFingerprint: string;
+  readonly generationId: string;
+  readonly walletPublicKey: string;
+  readonly providerId: string;
+  readonly qualifiedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly evidencePublicKeyBase64: string;
+  readonly paperMainnet49Status: 'NON_EXECUTED_NON_VALIDATED';
+  readonly liveCapabilityPresent: false;
+}
+
+export interface ExecutionEnvelopeQualificationPackageV1 {
+  readonly qualificationEnvelope: string;
+  readonly manifest: ExecutionEnvelopeQualificationManifestV1;
+}
+
+export const ENVELOPE_QUALIFICATION_DRAFT_SCHEMA = 'execution-envelope-qualification-draft.v1';
+/** An ENVELOPE qualification is packaged only with at least one hour left. */
+const ENVELOPE_PACKAGING_MINIMUM_REMAINING_MS = 3_600_000;
 
 export class ExecutionPreflightBundleServiceError extends Error {
   public readonly code = 'EXECUTION_PREFLIGHT_BUNDLE_FAILED' as const;
@@ -112,6 +138,74 @@ export function createExecutionPreflightBundlePackage(
         expiresAtMs: bundle.canary.expiresAtMs,
         evidencePublicKeyBase64,
         canaryStatus: 'CANARY_NOT_STARTED',
+        paperMainnet49Status: 'NON_EXECUTED_NON_VALIDATED',
+        liveCapabilityPresent: false,
+      }),
+    });
+  } catch {
+    throw invalid();
+  }
+}
+
+/** Signs an `envelope prepare` draft: one v2 ENVELOPE qualification, no canary evidence. */
+export function createEnvelopeQualificationPackage(
+  encodedDraft: string,
+  privateKeyText: string,
+  nowMs = Date.now(),
+): ExecutionEnvelopeQualificationPackageV1 {
+  try {
+    if (encodedDraft.length === 0
+      || Buffer.byteLength(encodedDraft, 'utf8') > 1_048_576) throw invalid();
+    if (privateKeyText.length === 0
+      || Buffer.byteLength(privateKeyText, 'utf8') > 8_192
+      || !Number.isSafeInteger(nowMs) || nowMs < 0) throw invalid();
+    const decodedDraft = parseJson(encodedDraft);
+    if (canonicalStringifyJson(decodedDraft) !== encodedDraft) throw invalid();
+    const draft = deepFreeze(decodedDraft);
+    if (typeof draft !== 'object' || draft === null || Array.isArray(draft)) throw invalid();
+    const keys = Object.keys(draft).sort();
+    if (keys.length !== 2 || keys[0] !== 'qualification' || keys[1] !== 'schemaVersion'
+      || (draft as Readonly<Record<string, unknown>>).schemaVersion
+        !== ENVELOPE_QUALIFICATION_DRAFT_SCHEMA) throw invalid();
+    const qualification = createSafetyQualification(
+      (draft as Readonly<Record<string, unknown>>).qualification,
+    );
+    if (qualification.payloadVersion !== 2
+      || qualification.qualifiedAtMs > nowMs
+      || qualification.expiresAtMs < nowMs + ENVELOPE_PACKAGING_MINIMUM_REMAINING_MS) {
+      throw invalid();
+    }
+    const privateKey = createPrivateKey(privateKeyText);
+    if (privateKey.asymmetricKeyType !== 'ed25519') throw invalid();
+    const evidencePublicKeyBase64 = createPublicKey(privateKey)
+      .export({ format: 'der', type: 'spki' }).toString('base64');
+    const qualificationEnvelope = signedEnvelope(
+      without(qualification, ['qualificationId', 'qualificationFingerprint']),
+      privateKey,
+    );
+    const verified = verifySignedSafetyQualificationEvidence(
+      deepFreeze(parseJson(qualificationEnvelope)),
+      evidencePublicKeyBase64,
+    );
+    if (verified.payloadVersion !== 2
+      || verified.qualificationId !== qualification.qualificationId
+      || verified.qualificationFingerprint !== qualification.qualificationFingerprint) {
+      throw invalid();
+    }
+    return Object.freeze({
+      qualificationEnvelope,
+      manifest: Object.freeze({
+        schemaVersion: 'execution-envelope-qualification-package.v1',
+        state: 'ENVELOPE_QUALIFICATION_PACKAGED',
+        scope: 'ENVELOPE',
+        qualificationId: qualification.qualificationId,
+        qualificationFingerprint: qualification.qualificationFingerprint,
+        generationId: qualification.generationId,
+        walletPublicKey: qualification.walletPublicKey,
+        providerId: qualification.providerId,
+        qualifiedAtMs: qualification.qualifiedAtMs,
+        expiresAtMs: qualification.expiresAtMs,
+        evidencePublicKeyBase64,
         paperMainnet49Status: 'NON_EXECUTED_NON_VALIDATED',
         liveCapabilityPresent: false,
       }),

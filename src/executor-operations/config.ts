@@ -40,6 +40,11 @@ export interface ExecutionCanaryArmConfig extends ExecutionOperationsConfig {
   readonly runtimeLeaseMs: number;
 }
 
+export interface ExecutionEnvelopeConfig extends ExecutionOperationsConfig {
+  readonly phase: 'CANARY';
+  readonly gateCatalogPath: string;
+}
+
 export class ExecutionOperationsConfigError extends Error {
   public readonly code = 'INVALID_EXECUTION_OPERATIONS_CONFIG' as const;
 
@@ -143,6 +148,20 @@ export function parseExecutionCanaryArmConfig(input: unknown): ExecutionCanaryAr
       runtimeSlippageBps, runtimeSnapshotMaxSlotLag, runtimeMaxComputeUnits,
       runtimeMaxFeeLamports, runtimeMaxFeePayerLamportDebit,
       runtimeMaxRpcCallsPerAttempt, runtimeLeaseMs });
+  } catch {
+    throw invalid();
+  }
+}
+
+/** `envelope prepare|create`: the base configuration plus the H2g gate catalog (policy source). */
+export function parseExecutionEnvelopeConfig(input: unknown): ExecutionEnvelopeConfig {
+  try {
+    const base = parseExecutionOperationsConfig(input);
+    if (base.phase !== 'CANARY' || !isEnvironment(input)) throw invalid();
+    const gateCatalogPath = absolutePath(
+      environmentValue(input, 'EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH'),
+    );
+    return Object.freeze({ ...base, phase: 'CANARY', gateCatalogPath });
   } catch {
     throw invalid();
   }

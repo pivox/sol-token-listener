@@ -654,7 +654,7 @@ void test('risk foundation source and dist graphs remain inert and closed', asyn
   );
 });
 
-void test('only the six inert operations commands expose live-prefixed operator vocabulary', async () => {
+void test('only the seven inert operations commands expose live-prefixed operator vocabulary', async () => {
   const [main, packageText, environment] = await Promise.all([
     readFile(resolve(repositoryRoot, 'src/executor/main.ts'), 'utf8'),
     readFile(resolve(repositoryRoot, 'package.json'), 'utf8'),
@@ -665,7 +665,7 @@ void test('only the six inert operations commands expose live-prefixed operator 
   assert.equal(Object.keys(scripts).some((name) => /risk/iu.test(name)), false);
   const liveScripts = Object.entries(scripts).filter(([name]) => name.startsWith('live:'));
   assert.deepEqual(liveScripts.map(([name]) => name).sort(), [
-    'live:arm', 'live:kill-switch', 'live:preflight',
+    'live:arm', 'live:envelope', 'live:kill-switch', 'live:preflight',
     'live:report', 'live:resume', 'live:status',
   ]);
   for (const [, command] of liveScripts) {

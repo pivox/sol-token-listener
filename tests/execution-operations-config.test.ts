@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   ExecutionOperationsConfigError,
   parseExecutionCanaryArmConfig,
+  parseExecutionEnvelopeConfig,
   parseExecutionOperationsConfig,
 } from '../src/executor-operations/config.js';
 
@@ -80,6 +81,23 @@ void test('rejects every secret key even when empty and every non-canonical arm 
   ]) assert.throws(() => parseExecutionCanaryArmConfig(environment(changed)), ExecutionOperationsConfigError);
 });
 
+void test('envelope config requires an absolute gate catalog path and the CANARY phase', () => {
+  const config = parseExecutionEnvelopeConfig(environment());
+  assert.equal(config.gateCatalogPath, '/tmp/gate-catalog.json');
+  assert.equal(config.phase, 'CANARY');
+  assert.equal(Object.isFrozen(config), true);
+  const missing: Record<string, string | undefined> = { ...environment() };
+  delete missing.EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH;
+  assert.equal(parseExecutionOperationsConfig(missing).phase, 'CANARY');
+  for (const changed of [
+    missing,
+    environment({ EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH: 'relative.json' }),
+    environment({ EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH: '/tmp/../gate-catalog.json' }),
+    environment({ EXECUTOR_ACTIVATION_PHASE: 'MICRO_LIVE' }),
+    environment({ EXECUTOR_ACTIVATION_PHASE: 'PILOT' }),
+  ]) assert.throws(() => parseExecutionEnvelopeConfig(changed), ExecutionOperationsConfigError);
+});
+
 function environment(overrides: Readonly<Record<string, string>> = {}) {
   return {
     DATABASE_URL: 'postgresql://localhost/solanabot',
@@ -95,6 +113,7 @@ function environment(overrides: Readonly<Record<string, string>> = {}) {
     EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '/tmp/preflight-evidence.json',
     EXECUTOR_CANARY_EVIDENCE_PATH: '/tmp/canary-evidence.json',
     EXECUTOR_PREFLIGHT_SOURCE_PATH: '/tmp/preflight-source.json',
+    EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH: '/tmp/gate-catalog.json',
     EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: 'MCowBQYDK2VwAyEA7Q2ZB8C8QzL4vVfJdGz4g0yP5wVqgYvZx4h7gM9rGgM=',
     EXECUTOR_LEASE_MS: '120000',
     EXECUTOR_QUOTE_MAX_AGE_MS: '3000',
