@@ -2,10 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createExecutionPreflightBundle } from '../src/domain/execution-preflight-bundle.js';
 import {
+  createEnvelopeQualificationDraft,
   createExecutionPreflightDraft,
   createExecutionPreflightDraftSource,
   createExecutionPreflightDraftSourceProofFingerprint,
 } from '../src/domain/execution-preflight-draft.js';
+import {
+  createEnvelopeBindingGates,
+  createMainnetSimulationEvidenceFingerprint,
+  createSafetyQualification,
+} from '../src/domain/execution-safety-qualification.js';
 import { NOW_MS } from './helpers/execution-canary-fixture.js';
 import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
 
@@ -115,4 +121,85 @@ void test('refuses to fabricate provider exit capacity when quota blocks a new e
     ...input.catalog,
     policy: entryBlockedPolicy,
   })), /Invalid execution preflight draft/u);
+});
+
+function envelopeDraftInput(overrides: Readonly<Record<string, unknown>> = {}) {
+  const input = preflightDraftInputs();
+  const simulation = input.source.simulation;
+  if (simulation.buildFingerprint === null) throw new TypeError();
+  return {
+    catalog: input.catalog,
+    generation: {
+      generationId: input.source.generation.generationId,
+      walletPublicKey: input.source.generation.walletPublicKey,
+      genesisHash: input.source.generation.genesisHash,
+    },
+    providerId: simulation.providerId,
+    simulation: {
+      artifactId: simulation.artifactId, resultFingerprint: simulation.resultFingerprint,
+      recordedAtMs: simulation.recordedAtMs, buildFingerprint: simulation.buildFingerprint as string,
+      configurationFingerprint: simulation.configurationFingerprint,
+    },
+    qualifiedAtMs: NOW_MS,
+    expiresAtMs: NOW_MS + 300_000,
+    ...overrides,
+  };
+}
+
+void test('drafts an ENVELOPE qualification accepted by the v2 qualification', () => {
+  const input = envelopeDraftInput();
+  const draft = createEnvelopeQualificationDraft(input);
+  assert.equal(draft.schemaVersion, 'execution-envelope-qualification-draft.v1');
+  assert.ok(Object.isFrozen(draft));
+  assert.equal('qualificationId' in draft.qualification, false);
+  assert.equal('qualificationFingerprint' in draft.qualification, false);
+  const qualification = createSafetyQualification(draft.qualification);
+  assert.equal(qualification.payloadVersion, 2);
+  assert.equal(qualification.expiresAtMs, NOW_MS + 300_000);
+  assert.equal(qualification.strategyFingerprint, input.catalog.strategyFingerprint);
+  const binding = createEnvelopeBindingGates({
+    generationId: input.generation.generationId, walletPublicKey: input.generation.walletPublicKey,
+    providerId: input.providerId, observedAtMs: NOW_MS, expiresAtMs: NOW_MS + 300_000,
+  });
+  assert.deepEqual(qualification.gates[7], binding.provider);
+  assert.deepEqual(qualification.gates[9], binding.wallet);
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 8].map((index) => qualification.gates[index]),
+    input.catalog.gates);
+  const simulationGate = qualification.gates[10];
+  assert.equal(simulationGate?.evidenceId, input.simulation.artifactId);
+  assert.equal(simulationGate?.observedAtMs, input.simulation.recordedAtMs);
+  assert.equal(simulationGate?.expiresAtMs, NOW_MS + 300_000);
+  assert.equal(simulationGate?.evidenceFingerprint, createMainnetSimulationEvidenceFingerprint({
+    artifactId: input.simulation.artifactId, resultFingerprint: input.simulation.resultFingerprint,
+    buildHash: input.simulation.buildFingerprint,
+    configurationFingerprint: input.simulation.configurationFingerprint,
+    strategyFingerprint: input.catalog.strategyFingerprint,
+    walletPublicKey: input.generation.walletPublicKey, genesisHash: input.generation.genesisHash,
+    providerId: input.providerId,
+  }));
+});
+
+void test('rejects an envelope draft with a stale catalog gate', () => {
+  const input = envelopeDraftInput();
+  const gates = input.catalog.gates.map((gate, index) => index === 3
+    ? Object.freeze({ ...gate, expiresAtMs: NOW_MS + 299_999 }) : gate);
+  assert.throws(() => createEnvelopeQualificationDraft({ ...input,
+    catalog: Object.freeze({ ...input.catalog, gates: Object.freeze(gates) }) }),
+  /Invalid execution preflight draft/u);
+});
+
+void test('rejects an envelope draft beyond 24 hours, from the future or with a wrong catalog', () => {
+  assert.throws(() => createEnvelopeQualificationDraft(envelopeDraftInput({
+    expiresAtMs: NOW_MS + 86_400_001 })), /Invalid execution preflight draft/u);
+  assert.throws(() => createEnvelopeQualificationDraft(envelopeDraftInput({
+    expiresAtMs: NOW_MS })), /Invalid execution preflight draft/u);
+  const input = envelopeDraftInput();
+  assert.throws(() => createEnvelopeQualificationDraft({ ...input,
+    simulation: { ...input.simulation, recordedAtMs: NOW_MS + 1 } }),
+  /Invalid execution preflight draft/u);
+  assert.throws(() => createEnvelopeQualificationDraft({ ...input,
+    catalog: Object.freeze({ ...input.catalog, schemaVersion: 'other' }) }),
+  /Invalid execution preflight draft/u);
+  assert.throws(() => createEnvelopeQualificationDraft({ ...input, extra: true } as typeof input),
+    /Invalid execution preflight draft/u);
 });
