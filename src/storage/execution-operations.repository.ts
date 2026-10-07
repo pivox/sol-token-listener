@@ -23,6 +23,7 @@ import { ExecutionAdmissionService } from '../executor-risk/admission-service.js
 import {
   createMainnetSimulationEvidenceFingerprint,
   createSafetyQualification,
+  type ExecutionSafetyQualification,
   type ExecutionSafetyQualificationV1,
 } from '../domain/execution-safety-qualification.js';
 import type {
@@ -92,7 +93,7 @@ export class PostgresExecutionOperationsRepository implements
   }
 
   public async persistQualification(
-    input: ExecutionSafetyQualificationV1,
+    input: ExecutionSafetyQualification,
   ): Promise<ExecutionSafetyQualificationV1> {
     const qualification = qualificationFrom(input);
     return this.transaction(async (client) => {
@@ -1465,7 +1466,8 @@ async function qualificationForArm(
     }),
   });
   if (canonical.qualificationId !== row.qualification_id
-    || canonical.qualificationFingerprint !== row.qualification_fingerprint) {
+    || canonical.qualificationFingerprint !== row.qualification_fingerprint
+    || canonical.payloadVersion !== 1) {
     throw failure('INVALID_DATA');
   }
   return canonical;
@@ -1508,7 +1510,8 @@ function authorizationForArm(
   });
 }
 
-function qualificationFrom(input: ExecutionSafetyQualificationV1): ExecutionSafetyQualificationV1 {
+function qualificationFrom(input: ExecutionSafetyQualification): ExecutionSafetyQualificationV1 {
+  if (input.payloadVersion !== 1) throw failure('CONFLICT');
   const canonical = createSafetyQualification({
     payloadVersion: input.payloadVersion, evaluatorVersion: input.evaluatorVersion,
     phase: input.phase, buildHash: input.buildHash,
@@ -1519,7 +1522,8 @@ function qualificationFrom(input: ExecutionSafetyQualificationV1): ExecutionSafe
     expiresAtMs: input.expiresAtMs, gates: input.gates,
   });
   if (canonical.qualificationId !== input.qualificationId
-    || canonical.qualificationFingerprint !== input.qualificationFingerprint) throw failure('CONFLICT');
+    || canonical.qualificationFingerprint !== input.qualificationFingerprint
+    || canonical.payloadVersion !== 1) throw failure('CONFLICT');
   return canonical;
 }
 

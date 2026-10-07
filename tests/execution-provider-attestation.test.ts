@@ -57,3 +57,12 @@ void test('enforces provider binding, time bounds, provenance and signed canonic
   );
 });
 
+
+void test('never accepts a signed EXECUTOR_COUNTERS snapshot', () => {
+  for (const expiresAtMs of [NOW + 30_000, NOW + 300_000]) assert.throws(
+    () => verifySignedProviderUsageEvidence(
+      envelope(payload({ provenance: 'EXECUTOR_COUNTERS', expiresAtMs })), publicKey, 'primary', NOW,
+    ),
+    ExecutionProviderAttestationValidationError,
+  );
+});

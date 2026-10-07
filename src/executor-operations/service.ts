@@ -11,7 +11,10 @@ import {
   type ExecutionPreflightDraftSourceV2,
 } from '../domain/execution-preflight-draft.js';
 import type { ExecutionCanaryEvidenceV1 } from '../domain/execution-canary.js';
-import type { ExecutionSafetyQualificationV1 } from '../domain/execution-safety-qualification.js';
+import type {
+  ExecutionSafetyQualification,
+  ExecutionSafetyQualificationV1,
+} from '../domain/execution-safety-qualification.js';
 import type {
   ExecutionControlCommandV1,
   ExecutionCanaryArmamentRepository,
@@ -78,8 +81,8 @@ interface ArmCanaryCommandV3 extends Omit<ArmCanaryCommandV2, 'payloadVersion'> 
 
 export interface ExecutionOperationsService {
   readonly preflight: (
-    qualification: ExecutionSafetyQualificationV1,
-  ) => Promise<ExecutionSafetyQualificationV1>;
+    qualification: ExecutionSafetyQualification,
+  ) => Promise<ExecutionSafetyQualification>;
   readonly status: (generationId: string) => Promise<ExecutionOperationsStatusV1>;
   readonly stop: (
     command: ExecutionControlCommandV1,
@@ -95,7 +98,7 @@ export function createExecutionOperationsService(
   dependencies: ServiceDependencies,
 ): ExecutionOperationsService {
   return Object.freeze({
-    preflight: (qualification: ExecutionSafetyQualificationV1) =>
+    preflight: (qualification: ExecutionSafetyQualification) =>
       dependencies.repository.persistQualification(qualification),
     status: (generationId: string) => dependencies.repository.readStatus(generationId),
     stop: (command: ExecutionControlCommandV1, mode: 'ENTRY_STOP' | 'HARD_STOP') =>

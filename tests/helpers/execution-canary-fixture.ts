@@ -1,6 +1,6 @@
 import { createExecutionRiskPolicy } from '../../src/domain/execution-risk-policy.js';
 import { createProviderUsageSnapshot } from '../../src/domain/execution-provider-quota.js';
-import { createSafetyQualification, EXECUTION_SAFETY_GATE_IDS } from '../../src/domain/execution-safety-qualification.js';
+import { createEnvelopeBindingGates, createSafetyQualification, EXECUTION_SAFETY_GATE_IDS } from '../../src/domain/execution-safety-qualification.js';
 import { createExecutionWalletSnapshot } from '../../src/domain/execution-wallet-snapshot.js';
 
 export const NOW_MS = 1_788_134_400_000;
@@ -52,4 +52,26 @@ export function canaryEvidenceInput(overrides: Readonly<Record<string, unknown>>
     }), walletSnapshot, providerSnapshot, allEndpointsUnavailable: false,
     capturedAtMs: overrides.capturedAtMs ?? NOW_MS, expiresAtMs: overrides.expiresAtMs ?? NOW_MS + 300_000,
   };
+}
+
+export const ENVELOPE_QUALIFICATION_TTL_MS = 3_600_000;
+
+/** Same evidence as canaryEvidenceInput, but carried by an ENVELOPE-scoped v2 qualification. */
+export function envelopeCanaryEvidenceInput(overrides: Readonly<Record<string, unknown>> = {}) {
+  const base = canaryEvidenceInput(overrides);
+  const v1 = base.qualification;
+  const expiresAtMs = v1.qualifiedAtMs + ENVELOPE_QUALIFICATION_TTL_MS;
+  const binding = createEnvelopeBindingGates({
+    generationId: v1.generationId, walletPublicKey: v1.walletPublicKey, providerId: v1.providerId,
+    observedAtMs: v1.qualifiedAtMs - 1_000, expiresAtMs,
+  });
+  const qualification = createSafetyQualification({
+    payloadVersion: 2, scope: 'ENVELOPE', evaluatorVersion: 1, phase: 'CANARY', buildHash: v1.buildHash,
+    configurationFingerprint: v1.configurationFingerprint, strategyFingerprint: v1.strategyFingerprint,
+    generationId: v1.generationId, walletPublicKey: v1.walletPublicKey, cluster: v1.cluster,
+    genesisHash: v1.genesisHash, providerId: v1.providerId, qualifiedAtMs: v1.qualifiedAtMs, expiresAtMs,
+    gates: v1.gates.map((gate) => gate.gateId === 'PROVIDER_EXIT_CAPACITY_VERIFIED' ? binding.provider
+      : gate.gateId === 'WALLET_CHAIN_LIMITS_VERIFIED' ? binding.wallet : { ...gate, expiresAtMs }),
+  });
+  return { ...base, qualification };
 }

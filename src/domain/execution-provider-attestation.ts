@@ -57,6 +57,7 @@ export function verifySignedProviderUsageEvidence(
       expiresAtMs: row.expiresAtMs,
       provenance: row.provenance,
     }));
+    if (snapshot.provenance === 'EXECUTOR_COUNTERS') throw invalid();
     if (snapshot.providerId !== expectedProviderId
       || !Number.isSafeInteger(nowMs) || nowMs < 0
       || snapshot.measuredAtMs > nowMs || snapshot.expiresAtMs < nowMs) throw invalid();

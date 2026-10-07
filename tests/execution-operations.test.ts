@@ -14,7 +14,11 @@ import {
   createSafetyQualification,
   EXECUTION_SAFETY_GATE_IDS,
 } from '../src/domain/execution-safety-qualification.js';
-import { canaryEvidenceInput, NOW_MS as CANARY_NOW_MS } from './helpers/execution-canary-fixture.js';
+import {
+  canaryEvidenceInput,
+  envelopeCanaryEvidenceInput,
+  NOW_MS as CANARY_NOW_MS,
+} from './helpers/execution-canary-fixture.js';
 
 const NOW_MS = 1_788_134_400_000;
 
@@ -286,6 +290,54 @@ void test('creates a frozen V3 request whose fingerprint binds the complete H2h 
   assert.throws(() => createExecutionArmamentRequestV3({ ...input,
     lineageProof: { ...lineageProof, proofFingerprint: 'x'.repeat(64) },
   }), ExecutionOperationsValidationError);
+});
+
+void test('creates a v1 ENVELOPE authorization without a phase and keeps ARM/RESUME identities', () => {
+  const base = {
+    payloadVersion: 1, generationId: `execution_wallet_generation_${'d'.repeat(64)}`,
+    contextFingerprint: 'a'.repeat(64), nonceHash: 'b'.repeat(64), operatorId: 'operator-primary',
+    issuedAtMs: NOW_MS, expiresAtMs: NOW_MS + 60_000,
+  };
+  assert.equal(createOperatorAuthorization({ ...base, action: 'ARM', phase: 'CANARY' }).authorizationFingerprint,
+    '70199f6e78eff01c3ef3e8bfc12d655371d4117a0f2429152bf7afd8e73bd274');
+  assert.equal(createOperatorAuthorization({ ...base, action: 'RESUME', phase: null }).authorizationFingerprint,
+    'e8b3815915ffcc92584b7499d9844e2363f226f0fd3198cef940102703954809');
+  const envelope = createOperatorAuthorization({ ...base, action: 'ENVELOPE', phase: null });
+  assert.equal(envelope.action, 'ENVELOPE');
+  assert.equal(envelope.phase, null);
+  assert.equal(envelope.payloadVersion, 1);
+  assert.equal(Object.isFrozen(envelope), true);
+  assert.match(envelope.authorizationId, /^execution_operator_authorization_[0-9a-f]{64}$/u);
+  for (const phase of ['CANARY', 'MICRO_LIVE', 'PILOT', undefined]) {
+    assert.throws(() => createOperatorAuthorization({ ...base, action: 'ENVELOPE', phase }),
+      ExecutionOperationsValidationError);
+  }
+  assert.throws(() => createOperatorAuthorization({ ...base, action: 'STOP', phase: null }),
+    ExecutionOperationsValidationError);
+  assert.throws(() => createOperatorAuthorizationV2({ ...base, payloadVersion: 2, action: 'ENVELOPE', phase: null }),
+    ExecutionOperationsValidationError);
+});
+
+void test('builds a V2 armament request from an ENVELOPE-scoped v2 qualification', () => {
+  const evidence = envelopeCanaryEvidenceInput();
+  const request = createExecutionArmamentRequestV2({
+    ...evidence, payloadVersion: 2, target: {
+      intentId: evidence.targetIntentId, stateRevision: 7n, strategyId: 'fast-entry-v1',
+      strategyVersion: 1, decisionFingerprint: '8'.repeat(64), mint: '11111111111111111111111111111111',
+      quoteMint: 'So11111111111111111111111111111111111111112', quoteAmountRaw: 500_000n,
+    }, maximumBuys: 1, maximumCapitalLamports: 500_000n, maximumExposureBps: 500n,
+    maximumOpenPositions: 1, maximumHoldingMs: 300_000,
+    runtimeQuoteMaxAgeMs: 30_000, runtimeSlippageBps: 500n, runtimeSnapshotMaxSlotLag: 50,
+    runtimeMaxComputeUnits: 1_400_000n, runtimeMaxFeeLamports: 10_000n,
+    runtimeMaxFeePayerLamportDebit: 20_000n, runtimeMaxRpcCallsPerAttempt: 12,
+    runtimeLeaseMs: 120_000, armedAtMs: CANARY_NOW_MS + 1, armamentExpiresAtMs: CANARY_NOW_MS + 299_999,
+    operatorId: 'operator-primary', operatorReason: 'Envelope auto-arm.',
+  });
+  assert.equal(request.qualification.payloadVersion, 2);
+  assert.equal(request.payloadVersion, 2);
+  assert.equal(Object.isFrozen(request), true);
+  assert.throws(() => createExecutionArmament(armamentInput({ qualification: evidence.qualification })),
+    ExecutionOperationsValidationError);
 });
 
 function armamentInput(overrides: Readonly<Record<string, unknown>> = {}) {

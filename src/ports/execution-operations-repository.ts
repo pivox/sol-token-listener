@@ -7,7 +7,7 @@ import type {
   ExecutionOperatorAuthorizationV1,
   ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
-import type { ExecutionSafetyQualificationV1 } from '../domain/execution-safety-qualification.js';
+import type { ExecutionSafetyQualification } from '../domain/execution-safety-qualification.js';
 import type { ExecutionIntentSide, ExecutionIntentStatus } from '../domain/execution-intent.js';
 import type { ExecutionPreflightDraftSourceV2 } from '../domain/execution-preflight-draft.js';
 
@@ -38,9 +38,9 @@ export interface ExecutionOperationsStatusV1 {
 
 export interface ExecutionOperationsRepository {
   persistQualification(
-    qualification: ExecutionSafetyQualificationV1,
-  ): Promise<ExecutionSafetyQualificationV1>;
-  readQualification(qualificationId: string): Promise<ExecutionSafetyQualificationV1>;
+    qualification: ExecutionSafetyQualification,
+  ): Promise<ExecutionSafetyQualification>;
+  readQualification(qualificationId: string): Promise<ExecutionSafetyQualification>;
   recordAuthorization(
     authorization: ExecutionOperatorAuthorizationV1,
   ): Promise<'RECORDED' | 'REPLAYED'>;

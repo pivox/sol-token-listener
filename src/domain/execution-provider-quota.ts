@@ -41,8 +41,9 @@ const POLICY_INPUT_KEYS = Object.freeze(POLICY_KEYS.slice(2));
 const CATEGORIES = Object.freeze([
   'ENTRY', 'EXIT', 'CONFIRMATION', 'RECONCILIATION', 'TELEMETRY',
 ] as const);
+/** EXECUTOR_COUNTERS is derived by the executor from its own counters and is never signed. */
 const PROVENANCES = Object.freeze([
-  'AUTHORITATIVE_PROBE', 'OPERATOR_REPORT',
+  'AUTHORITATIVE_PROBE', 'OPERATOR_REPORT', 'EXECUTOR_COUNTERS',
 ] as const);
 
 export type ExecutionProviderQuotaState =

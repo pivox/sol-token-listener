@@ -2,7 +2,7 @@ import { createPublicKey, verify } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
   createSafetyQualification,
-  type ExecutionSafetyQualificationV1,
+  type ExecutionSafetyQualification,
 } from './execution-safety-qualification.js';
 
 const ENVELOPE_KEYS = Object.freeze([
@@ -20,7 +20,7 @@ export class ExecutionSafetyAttestationValidationError extends TypeError {
 export function verifySignedSafetyQualificationEvidence(
   input: unknown,
   trustedPublicKeyBase64: unknown,
-): ExecutionSafetyQualificationV1 {
+): ExecutionSafetyQualification {
   try {
     const envelope = exactRecord(input, ENVELOPE_KEYS);
     if (envelope.payloadVersion !== 1 || envelope.algorithm !== 'Ed25519') throw invalid();
