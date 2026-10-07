@@ -60,8 +60,8 @@ export interface ExecutionEnvelopeQualificationPackageV1 {
 }
 
 export const ENVELOPE_QUALIFICATION_DRAFT_SCHEMA = 'execution-envelope-qualification-draft.v1';
-/** An ENVELOPE qualification is packaged only with at least one hour left. */
-const ENVELOPE_PACKAGING_MINIMUM_REMAINING_MS = 3_600_000;
+/** An ENVELOPE qualification is packaged only with at least 30 minutes left. */
+const ENVELOPE_PACKAGING_MINIMUM_REMAINING_MS = 1_800_000;
 
 export class ExecutionPreflightBundleServiceError extends Error {
   public readonly code = 'EXECUTION_PREFLIGHT_BUNDLE_FAILED' as const;

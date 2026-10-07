@@ -171,7 +171,7 @@ void test('refuses an envelope draft that is v1, stale, future, extended or not 
   const privateKeyText = keys.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
   for (const [draft, nowMs] of [
     [encodedEnvelopeDraft(canaryEvidenceInput().qualification), NOW_MS],
-    [encodedEnvelopeDraft(), NOW_MS + 1],
+    [encodedEnvelopeDraft(), NOW_MS + 1_800_001],
     [encodedEnvelopeDraft(), NOW_MS - 1],
     [encodedEnvelopeDraft(undefined, { extra: true }), NOW_MS],
     [` ${encodedEnvelopeDraft()}`, NOW_MS],
@@ -182,4 +182,15 @@ void test('refuses an envelope draft that is v1, stale, future, extended or not 
     rsa.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(), NOW_MS));
   assert.throws(() => createExecutionPreflightBundlePackage(encodedEnvelopeDraft(), privateKeyText,
     NOW_MS));
+});
+
+void test('signs a one-hour envelope draft a few seconds after its qualification', () => {
+  const keys = generateKeyPairSync('ed25519');
+  const privateKeyText = keys.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+  const expected = envelopeCanaryEvidenceInput().qualification;
+  assert.equal(expected.expiresAtMs - expected.qualifiedAtMs, 3_600_000);
+  const result = createEnvelopeQualificationPackage(encodedEnvelopeDraft(), privateKeyText,
+    expected.qualifiedAtMs + 5_000);
+  assert.equal(result.manifest.qualificationId, expected.qualificationId);
+  assert.equal(result.manifest.expiresAtMs, expected.qualifiedAtMs + 3_600_000);
 });

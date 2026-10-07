@@ -16,7 +16,6 @@ import type { ExecutionOperatorAuthorizationV1 } from '../src/domain/execution-o
 import type {
   ExecutionEntryEnvelopeRepository,
   ExecutionEnvelopeCreationV1,
-
   ExecutionCanaryArmamentRepository,
   ExecutionCanaryTargetIntentV1,
   ExecutionOperationsRepository,
