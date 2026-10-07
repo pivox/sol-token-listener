@@ -1,16 +1,31 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
+import { Keypair } from '@solana/web3.js';
 import pg from 'pg';
 import {
   createExecutionArmamentRequestV2,
   createOperatorAuthorization,
   createOperatorAuthorizationV2,
+  type ExecutionActivationArmamentV2,
+  type ExecutionArmamentRequestV2,
   type ExecutionOperatorAuthorizationV1,
+  type ExecutionOperatorAuthorizationV2,
 } from '../src/domain/execution-operations.js';
-import { createEntryEnvelope, type EntryEnvelopeV2 } from '../src/domain/execution-entry-envelope.js';
-import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
+import {
+  createEntryEnvelope,
+  createEnvelopeArmAuthorization,
+  createEnvelopeProviderSnapshot,
+  ENVELOPE_ARMAMENT_MAXIMUM_TTL_MS,
+  type EntryEnvelopeV2,
+} from '../src/domain/execution-entry-envelope.js';
+import {
+  createProviderUsageOperationId,
+  createProviderUsageSnapshot,
+  type ProviderUsageSnapshotV1,
+} from '../src/domain/execution-provider-quota.js';
+import { FAST_ENTRY_STRATEGY_ID } from '../src/domain/fast-entry.js';
 import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
 import { parseJson } from '../src/utils/json.js';
 import {
@@ -32,6 +47,7 @@ import {
 } from '../src/storage/execution-operations.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
+import { PostgresFastEntryRepository } from '../src/storage/fast-entry.repository.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 import { mutateWithTriggersDisabled } from './helpers/execution-preflight-v2-source-fixture.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
@@ -44,6 +60,8 @@ const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const hash = '1'.repeat(64);
 const WSOL = 'So11111111111111111111111111111111111111112';
 const HOUR = 3_600_000;
+const PER_BUY = 10_000_000n;
+const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const SOL_TOKEN_ROLES = [
   'sol_token_listener_writer', 'sol_token_executor_worker', 'sol_token_executor_live',
@@ -314,14 +332,15 @@ for (const initialState of ['ACTIVE', 'EXHAUSTED', 'EXPIRED'] as const) {
       await withSchema(context, async (pool) => {
         const simulation = await seedEnvelopeBase(pool);
         const repository = new PostgresExecutionOperationsRepository(pool);
-        const prepared = await prepareEnvelope(pool, repository, simulation);
-        await repository.createEnvelope(prepared);
-        const armament = await armCanary(pool, repository, simulation);
-        await bindArmamentToEnvelope(pool, armament.armamentId, prepared.envelope.envelopeId);
-        if (initialState === 'EXHAUSTED') {
-          await mutateWithTriggersDisabled(pool, `UPDATE execution_entry_envelopes
-            SET state='EXHAUSTED',buys_armed=1 WHERE envelope_id=$1`, [prepared.envelope.envelopeId]);
-        } else if (initialState === 'EXPIRED') {
+        // max_buys=1: the real arm itself exhausts the envelope.
+        const prepared = await openEnvelope(pool, repository, simulation,
+          { maxBuys: initialState === 'EXHAUSTED' ? 1 : 3 });
+        await seedProviderSnapshot(pool);
+        const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+        const armament = await armEnvelope(repository, prepared, intentId);
+        assert.equal((await repository.readEnvelopes(generationId))[0]?.state,
+          initialState === 'EXHAUSTED' ? 'EXHAUSTED' : 'ACTIVE');
+        if (initialState === 'EXPIRED') {
           await moveEnvelopeIntoThePast(pool, prepared.envelope.envelopeId);
           assert.equal((await repository.expireEnvelopes(generationId)).expiredCount, 1);
         }
@@ -364,7 +383,7 @@ void test('expireEnvelopes expires only ACTIVE envelopes past valid_until', asyn
   });
 });
 
-void test('PostgreSQL 16 operations role creates, revokes and expires envelopes and arms a CANARY (A14, A25)',
+void test('PostgreSQL 16 operations role arms a CANARY and an ENVELOPE, reads the context, refreshes, revokes and expires (A14, A25)',
   async (context) => {
     await withProvisionedDatabase(context, async (pool) => {
       const operations = new PostgresExecutionOperationsRepository(roleSource(pool,
@@ -375,26 +394,53 @@ void test('PostgreSQL 16 operations role creates, revokes and expires envelopes 
         walletPublicKey: publicKey, providerId: 'primary', genesisHash: publicKey,
       });
       assert.equal(facts?.simulation.artifactId, simulation.artifactId);
+      // A25: the CANARY path under the real operations role.
       const first = await prepareEnvelope(pool, operations, simulation, { nonce: '1' });
       await operations.createEnvelope(first);
-      const armament = await armCanary(pool, operations, simulation);
-      assert.equal(armament.state, 'ARMED');
-      const revokeCommand = Object.freeze({
+      const canary = await armCanary(pool, operations, simulation);
+      assert.equal(canary.state, 'ARMED');
+      const revokeFirst = Object.freeze({
         generationId, envelopeId: first.envelope.envelopeId,
         operatorId: 'operator-primary', occurredAtMs: Date.now(),
       });
-      assert.equal((await operations.revokeEnvelope(revokeCommand)).armamentRevoked, false);
-      await bindArmamentToEnvelope(pool, armament.armamentId, first.envelope.envelopeId);
-      const replay = await operations.revokeEnvelope(revokeCommand);
-      assert.equal(replay.replayed, true);
-      assert.equal(replay.armamentRevoked, true);
+      assert.equal((await operations.revokeEnvelope(revokeFirst)).armamentRevoked, false);
+      // A14: a real ENVELOPE arm under the same role (the CANARY armament is revoked by the stop).
       const second = await prepareEnvelope(pool, operations, simulation,
         { nonce: '2', expiresInMs: 3 * HOUR });
       await operations.createEnvelope(second);
-      await moveEnvelopeIntoThePast(pool, second.envelope.envelopeId);
+      await stopAndResume(operations, second.qualification, 'role-second');
+      const intentId = await fastEntryIntent(pool, second.envelope, await currentDatabaseTimeMs(pool));
+      const armed = await operations.readAutoArmContext(contextQuery());
+      assert.equal(armed.envelope?.envelopeId, second.envelope.envelopeId);
+      assert.equal(armed.candidateIntent?.intentId, intentId);
+      const armament = await armEnvelope(operations, second, intentId);
+      assert.equal(armament.state, 'ARMED');
+      assert.equal((await operations.readAutoArmContext(contextQuery())).activeArmament, 'ARMED');
+      const revoked = await operations.revokeEnvelope(Object.freeze({
+        generationId, envelopeId: second.envelope.envelopeId,
+        operatorId: 'operator-primary', occurredAtMs: Date.now(),
+      }));
+      assert.equal(revoked.replayed, false);
+      assert.equal(revoked.armamentRevoked, true);
+      // Refresh needs a LOCKED envelope armament whose BUY SUCCEEDED (H2b state, forged here);
+      // it reads and writes only what the role holds, and needs no ACTIVE envelope.
+      await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUCCEEDED');
+      const due = await operations.readAutoArmContext(contextQuery({ providerRefreshThresholdMs: 3_600_000 }));
+      assert.equal(due.envelope, null);
+      assert.equal(due.activeArmament, 'LOCKED');
+      assert.equal(due.providerRefreshDue, true);
+      const refreshed = await operations.refreshEnvelopeProviderSnapshot({
+        generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 3_600_000,
+      });
+      assert.equal(refreshed.refreshed, true);
+      assert.equal(refreshed.snapshot?.provenance, 'EXECUTOR_COUNTERS');
+      const third = await prepareEnvelope(pool, operations, simulation,
+        { nonce: '3', expiresInMs: 4 * HOUR });
+      await operations.createEnvelope(third);
+      await moveEnvelopeIntoThePast(pool, third.envelope.envelopeId);
       assert.equal((await operations.expireEnvelopes(generationId)).expiredCount, 1);
       assert.deepEqual((await operations.readEnvelopes(generationId)).map((row) => row.state).sort(),
-        ['EXPIRED', 'REVOKED']);
+        ['EXPIRED', 'REVOKED', 'REVOKED']);
       const updateEnvelopeId = await pool.query<{ readonly role: string; readonly table: string }>(`
         SELECT role.rolname AS role,target.relname AS table
         FROM pg_roles role CROSS JOIN (VALUES ('execution_activation_armaments'),
@@ -403,6 +449,392 @@ void test('PostgreSQL 16 operations role creates, revokes and expires envelopes 
           AND has_column_privilege(role.oid,target.relname,'envelope_id','UPDATE')`,
       [[...SOL_TOKEN_ROLES]]);
       assert.deepEqual(updateEnvelopeId.rows, []);
+    });
+  });
+
+void test('armEnvelope arms a real fast-entry intent bound to its envelope (safety point 6)', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    await seedProviderSnapshot(pool);
+    const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+    const armament = await armEnvelope(repository, prepared, intentId);
+    assert.equal(armament.state, 'ARMED');
+    assert.equal(armament.qualification.phase, 'CANARY');
+    assert.equal(armament.operatorId, 'operator-primary');
+    assert.deepEqual((await pool.query(`SELECT armament.payload_version,armament.phase,armament.state,
+      armament.envelope_id,armament.target_strategy_id,armament.qualification_id,
+      intent.live_reserved,report.decision,reservation.state AS reservation_state,
+      envelope.buys_armed,envelope.state AS envelope_state,
+      operator_auth.consumed_at IS NOT NULL AS consumed,operator_auth.operator_id,
+      operator_auth.payload_version AS authorization_version,
+      (SELECT array_agg(event.reason_code) FROM execution_activation_events event
+        WHERE event.armament_id=armament.armament_id) AS events
+      FROM execution_activation_armaments armament
+      JOIN execution_intents intent ON intent.id=armament.target_intent_id
+      JOIN execution_risk_admission_reports report ON report.report_id=armament.target_admission_report_id
+      JOIN execution_exposure_reservations reservation
+        ON reservation.reservation_id=armament.target_reservation_id
+      JOIN execution_entry_envelopes envelope ON envelope.envelope_id=armament.envelope_id
+      JOIN execution_operator_authorizations operator_auth
+        ON operator_auth.authorization_id=armament.authorization_id`)).rows, [{
+      payload_version: 2, phase: 'CANARY', state: 'ARMED', envelope_id: prepared.envelope.envelopeId,
+      target_strategy_id: FAST_ENTRY_STRATEGY_ID, qualification_id: prepared.qualification.qualificationId,
+      live_reserved: true, decision: 'ADMITTED', reservation_state: 'RESERVED', buys_armed: 1,
+      envelope_state: 'ACTIVE', consumed: true, operator_id: 'operator-primary',
+      authorization_version: 2, events: ['OPERATOR_ARMED'],
+    }]);
+    assert.deepEqual((await pool.query(`SELECT provenance FROM execution_provider_usage_snapshots
+      WHERE superseded_at IS NULL`)).rows, [{ provenance: 'EXECUTOR_COUNTERS' }]);
+    const status = await repository.readStatus(generationId);
+    assert.equal(status.activeArmamentId, armament.armamentId);
+  });
+});
+
+void test('armEnvelope refuses while control is ENTRY_STOP', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    await seedProviderSnapshot(pool);
+    const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+    await repository.setStop({ payloadVersion: 1, commandId: 'command:stop:control', generationId,
+      operatorId: 'operator-primary', occurredAtMs: Date.now() }, 'ENTRY_STOP');
+    await assert.rejects(armEnvelope(repository, prepared, intentId),
+      isRepositoryError('CONTROL_STOPPED'));
+    await assertNothingArmed(pool);
+  });
+});
+
+for (const ending of ['REVOKED', 'EXPIRED', 'CUT_OFF'] as const) {
+  void test(`armEnvelope refuses an envelope that is ${ending}`, async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await openEnvelope(pool, repository, simulation);
+      await seedProviderSnapshot(pool);
+      const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      const request = await envelopeArmRequest(repository, prepared, intentId);
+      if (ending === 'REVOKED') {
+        await repository.revokeEnvelope({ generationId, envelopeId: prepared.envelope.envelopeId,
+          operatorId: 'operator-primary', occurredAtMs: Date.now() });
+      } else if (ending === 'EXPIRED') {
+        await moveEnvelopeIntoThePast(pool, prepared.envelope.envelopeId);
+        assert.equal((await repository.expireEnvelopes(generationId)).expiredCount, 1);
+      } else {
+        // valid_until < now + holding (60 s) + 15 min.
+        await mutateWithTriggersDisabled(pool, `UPDATE execution_entry_envelopes
+          SET valid_until=date_trunc('milliseconds',statement_timestamp())+INTERVAL '15 minutes'
+          WHERE envelope_id=$1`, [prepared.envelope.envelopeId]);
+      }
+      await assert.rejects(repository.armEnvelope(request), isRepositoryError('CONFLICT'));
+      await assertNothingArmed(pool);
+    });
+  });
+}
+
+void test('armEnvelope keeps K=1: a second arm while one is ARMED is a conflict', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    await seedProviderSnapshot(pool);
+    const nowMs = await currentDatabaseTimeMs(pool);
+    const first = await fastEntryIntent(pool, prepared.envelope, nowMs);
+    const second = await fastEntryIntent(pool, prepared.envelope, nowMs);
+    await armEnvelope(repository, prepared, first);
+    await assert.rejects(armEnvelope(repository, prepared, second), isRepositoryError('CONFLICT'));
+    assert.deepEqual((await pool.query(`SELECT buys_armed FROM execution_entry_envelopes`)).rows,
+      [{ buys_armed: 1 }]);
+  });
+});
+
+for (const cap of [
+  { name: 'max_buys=2', maxBuys: 2, maxTotalExposureRaw: 30_000_000n },
+  { name: 'max_total_exposure=2 x per_buy with max_buys=5', maxBuys: 5, maxTotalExposureRaw: 20_000_000n },
+] as const) {
+  void test(`armEnvelope exhausts the envelope at ${cap.name} and refuses a third arm`, async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await openEnvelope(pool, repository, simulation,
+        { maxBuys: cap.maxBuys, maxTotalExposureRaw: cap.maxTotalExposureRaw });
+      await seedProviderSnapshot(pool);
+      const nowMs = await currentDatabaseTimeMs(pool);
+      const intents = [
+        await fastEntryIntent(pool, prepared.envelope, nowMs),
+        await fastEntryIntent(pool, prepared.envelope, nowMs),
+        await fastEntryIntent(pool, prepared.envelope, nowMs),
+      ];
+      await armEnvelope(repository, prepared, intents[0] ?? '');
+      await stopAndResume(repository, prepared.qualification, 'cap-1');
+      assert.equal((await repository.readEnvelopes(generationId))[0]?.state, 'ACTIVE');
+      const second = await armEnvelope(repository, prepared, intents[1] ?? '');
+      const [exhausted] = await repository.readEnvelopes(generationId);
+      assert.equal(exhausted?.state, 'EXHAUSTED');
+      assert.equal(exhausted?.buysArmed, 2);
+      await stopAndResume(repository, prepared.qualification, 'cap-2');
+      // No ACTIVE envelope any more: the daemon would not even try; the repository refuses.
+      await assert.rejects(repository.armEnvelope(await envelopeArmRequest(repository, prepared,
+        intents[2] ?? '', { provider: { snapshot: second.providerSnapshot, localUsedUnits: 0n } })),
+      isRepositoryError('CONFLICT'));
+      assert.equal((await repository.readAutoArmContext(contextQuery())).envelope, null);
+    });
+  });
+}
+
+void test('armEnvelope refuses once the realized loss reaches the cap', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    await seedProviderSnapshot(pool);
+    const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+    await pool.query(`UPDATE execution_entry_envelopes SET realized_loss_raw=max_realized_loss_raw`);
+    const armingContext = await repository.readAutoArmContext(contextQuery());
+    assert.equal(armingContext.realizedLossRaw, 30_000_000n);
+    await assert.rejects(armEnvelope(repository, prepared, intentId), isRepositoryError('CONFLICT'));
+    await assertNothingArmed(pool);
+  });
+});
+
+void test('armEnvelope refuses a non fast-entry intent and a quote other than per_buy', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    await seedProviderSnapshot(pool);
+    const nowMs = await currentDatabaseTimeMs(pool);
+    await insertExecutionDecisionEvent(pool, 'decision:other-strategy', publicKey);
+    const other = await new PostgresExecutionIntentRepository(pool).create(createExecutionIntentDraft({
+      strategyId: 'canary-target', strategyVersion: 1,
+      positionId: 'position:other-strategy', logicalCommandId: 'command:other-strategy',
+      mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint: WSOL,
+      quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+      quoteAmountRaw: PER_BUY, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+      decisionEventId: 'decision:other-strategy', decisionFingerprint: 'd'.repeat(64),
+      requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+    }));
+    await assert.rejects(armEnvelope(repository, prepared, other.intent.id),
+      isRepositoryError('CONFLICT'));
+    const smaller = await fastEntryIntent(pool, prepared.envelope, nowMs, PER_BUY / 2n);
+    await assert.rejects(armEnvelope(repository, prepared, smaller), isRepositoryError('CONFLICT'));
+    await assertNothingArmed(pool);
+  });
+});
+
+void test('armEnvelope surfaces a provider carry-forward mismatch as PROVIDER_CARRY_FORWARD_STALE and writes nothing',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await openEnvelope(pool, repository, simulation);
+      const base = await seedProviderSnapshot(pool);
+      const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      // The daemon read the context, then a counter was recorded before the arm.
+      const request = await envelopeArmRequest(repository, prepared, intentId);
+      await recordProviderUnits(pool, base, 'late', 2n);
+      await assert.rejects(repository.armEnvelope(request), isRepositoryError('PROVIDER_CARRY_FORWARD_STALE'));
+      await assertNothingArmed(pool);
+      assert.deepEqual((await pool.query(`SELECT snapshot_id FROM execution_provider_usage_snapshots
+        WHERE superseded_at IS NULL`)).rows, [{ snapshot_id: base.snapshotId }]);
+      // Overstated usage is just as stale.
+      const overstated = await envelopeArmRequest(repository, prepared, intentId, { extraUnits: 1n });
+      await assert.rejects(repository.armEnvelope(overstated),
+        isRepositoryError('PROVIDER_CARRY_FORWARD_STALE'));
+      // An operator-reported snapshot is not a carry-forward at all.
+      const reported = await envelopeArmRequest(repository, prepared, intentId,
+        { provenance: 'OPERATOR_REPORT' });
+      await assert.rejects(repository.armEnvelope(reported), isRepositoryError('CONFLICT'));
+      await assertNothingArmed(pool);
+      // A fresh context carries the late counter forward and arms.
+      const armament = await armEnvelope(repository, prepared, intentId);
+      assert.equal(armament.providerSnapshot.usedUnits, base.usedUnits + 2n);
+    });
+  });
+
+void test('the carry-forward sums only the counters of the current billing period (A11)', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    const nowMs = await currentDatabaseTimeMs(pool);
+    const risk = new PostgresExecutionRiskRepository(pool);
+    const previous = createProviderUsageSnapshot({
+      providerId: 'primary', planId: 'plan-1', billingPeriodId: 'period-0',
+      billingPeriodStartedAtMs: nowMs - 3 * HOUR, billingPeriodEndsAtMs: nowMs - 2_000,
+      limitUnits: 1_000n, usedUnits: 5n, measuredAtMs: nowMs - 40_000, expiresAtMs: nowMs - 5_000,
+      provenance: 'OPERATOR_REPORT',
+    });
+    await risk.appendProviderUsage(previous);
+    const current = createProviderUsageSnapshot({
+      providerId: 'primary', planId: 'plan-1', billingPeriodId: 'period-1',
+      billingPeriodStartedAtMs: nowMs - 2_000, billingPeriodEndsAtMs: nowMs + 3 * HOUR,
+      limitUnits: 1_000n, usedUnits: 1n, measuredAtMs: nowMs - 1_000, expiresAtMs: nowMs + 300_000,
+      provenance: 'OPERATOR_REPORT',
+    });
+    // Recorded now, after the current measurement, but billed to the previous period.
+    await mutateWithTriggersDisabled(pool, `INSERT INTO execution_provider_usage_counters (
+      operation_id,payload_version,snapshot_id,provider_id,billing_period_id,category,
+      logical_operation_id,units) VALUES ($1,1,$2,'primary','period-0','ENTRY','old-period',7)`,
+    [`execution_provider_operation_${'7'.repeat(64)}`, previous.snapshotId]);
+    await risk.appendProviderUsage(current);
+    await recordProviderUnits(pool, current, 'same-period', 3n);
+    const view = await repository.readAutoArmContext(contextQuery());
+    assert.equal(view.provider?.snapshot.snapshotId, current.snapshotId);
+    assert.equal(view.provider?.localUsedUnits, 3n);
+    const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+    const armament = await armEnvelope(repository, prepared, intentId);
+    assert.equal(armament.providerSnapshot.usedUnits, 4n);
+  });
+});
+
+void test('armEnvelope refuses a CANARY qualification and the trigger refuses an envelope link on a CANARY armament',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await prepareEnvelope(pool, repository, simulation);
+      await repository.createEnvelope(prepared);
+      const canary = await armCanary(pool, repository, simulation, { returnRequest: true });
+      await assert.rejects(repository.armEnvelope({
+        request: canary.request, authorization: canary.authorization,
+        envelopeId: prepared.envelope.envelopeId,
+      }), isRepositoryError('CONFLICT'));
+      // The real CANARY armament, copied under a new identity: without an envelope link the
+      // guard passes and the active unique index refuses it; with one, the guard refuses it.
+      const copy = async (envelopeId: string | null) => {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(`INSERT INTO execution_activation_armaments
+            SELECT (jsonb_populate_record(NULL::execution_activation_armaments,
+              to_jsonb(armament) || jsonb_build_object('armament_id',$2::TEXT,'envelope_id',$3::TEXT))).*
+            FROM execution_activation_armaments armament WHERE armament_id=$1`, [
+            canary.armament.armamentId, `execution_activation_armament_${'0'.repeat(64)}`, envelopeId,
+          ]);
+          return null;
+        } catch (error) {
+          return (error as { readonly code?: string }).code ?? 'unknown';
+        } finally {
+          await client.query('ROLLBACK');
+          client.release();
+        }
+      };
+      assert.equal(await copy(null), '23505');
+      assert.equal(await copy(prepared.envelope.envelopeId), '55000');
+    });
+  });
+
+void test('readAutoArmContext returns the envelope and picks the oldest eligible fast-entry intent', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const empty = await repository.readAutoArmContext(contextQuery());
+    assert.equal(empty.envelope, null);
+    assert.equal(empty.qualification, null);
+    assert.equal(empty.controlState, 'ENTRY_STOP');
+    assert.equal(empty.candidateIntent, null);
+    assert.equal(empty.provider, null);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    const base = await seedProviderSnapshot(pool);
+    await recordProviderUnits(pool, base, 'context', 4n);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const from = prepared.envelope.validFromMs;
+    const excluded = await fastEntryIntent(pool, prepared.envelope, from + 1);
+    const leased = await fastEntryIntent(pool, prepared.envelope, from + 2);
+    const shortLived = await fastEntryIntent(pool, prepared.envelope, from + 3);
+    const preEnvelope = await fastEntryIntent(pool, prepared.envelope, from + 4);
+    const smaller = await fastEntryIntent(pool, prepared.envelope, from + 5, PER_BUY / 2n);
+    const oldest = await fastEntryIntent(pool, prepared.envelope, from + 6);
+    const next = await fastEntryIntent(pool, prepared.envelope, from + 7);
+    await mutateWithTriggersDisabled(pool, `UPDATE execution_intents SET lease_owner='worker',
+      lease_token=gen_random_uuid(),
+      lease_expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute'
+      WHERE id=$1`, [leased]);
+    await mutateWithTriggersDisabled(pool, `UPDATE execution_intents
+      SET expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '30 seconds' WHERE id=$1`,
+    [shortLived]);
+    await mutateWithTriggersDisabled(pool, `UPDATE execution_intents
+      SET requested_at=requested_at-INTERVAL '1 second' WHERE id=$1`, [preEnvelope]);
+    const view = await repository.readAutoArmContext(contextQuery({ excludedIntentIds: [excluded] }));
+    assert.ok(Object.isFrozen(view));
+    assert.ok(view.databaseNowMs >= from);
+    assert.deepEqual(view.envelope, prepared.envelope);
+    assert.ok(view.envelope !== null && Object.isFrozen(view.envelope) && Object.isFrozen(view.envelope.policy));
+    assert.deepEqual(view.qualification, prepared.qualification);
+    assert.equal(view.buysArmed, 0);
+    assert.equal(view.realizedLossRaw, 0n);
+    assert.equal(view.controlState, 'RUNNING');
+    assert.equal(view.riskStateRevision, 0n);
+    assert.equal(view.openPositions, 0);
+    assert.equal(view.unknownBlock, false);
+    assert.equal(view.activeArmament, null);
+    assert.deepEqual(view.provider, { snapshot: base, localUsedUnits: 4n });
+    assert.equal(view.providerRefreshDue, false);
+    assert.equal(view.candidateIntent?.intentId, oldest);
+    assert.equal(view.candidateIntent?.strategyId, FAST_ENTRY_STRATEGY_ID);
+    assert.equal(view.candidateIntent?.quoteAmountRaw, PER_BUY);
+    assert.notEqual(smaller, oldest);
+    const skipped = await repository.readAutoArmContext(contextQuery({ excludedIntentIds: [excluded, oldest] }));
+    assert.equal(skipped.candidateIntent?.intentId, next);
+    // Without the exclusion the oldest eligible one wins, whatever the margin allows.
+    const all = await repository.readAutoArmContext(contextQuery({ minimumRemainingMs: 0 }));
+    assert.equal(all.candidateIntent?.intentId, excluded);
+    const tooShort = await repository.readAutoArmContext(contextQuery({ minimumRemainingMs: 3_600_000 }));
+    assert.equal(tooShort.candidateIntent, null);
+    await assert.rejects(repository.readAutoArmContext(contextQuery({ excludedIntentIds: ['nope'] })),
+      isRepositoryError('INVALID_DATA'));
+  });
+});
+
+void test('providerRefreshDue follows the armament and the BUY, and refresh carries the counters forward',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await openEnvelope(pool, repository, simulation);
+      await seedProviderSnapshot(pool);
+      const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      const armament = await armEnvelope(repository, prepared, intentId);
+      const wide = contextQuery({ providerRefreshThresholdMs: 3_600_000 });
+      const command = { generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 3_600_000 };
+      const armed = await repository.readAutoArmContext(wide);
+      assert.equal(armed.activeArmament, 'ARMED');
+      assert.equal(armed.providerRefreshDue, false);
+      assert.equal((await repository.refreshEnvelopeProviderSnapshot(command)).refreshed, false);
+      await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUBMITTED');
+      const inFlight = await repository.readAutoArmContext(wide);
+      assert.equal(inFlight.activeArmament, 'LOCKED');
+      assert.equal(inFlight.providerRefreshDue, false);
+      assert.equal((await repository.refreshEnvelopeProviderSnapshot(command)).refreshed, false);
+      await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUCCEEDED');
+      const succeeded = await repository.readAutoArmContext(wide);
+      assert.equal(succeeded.providerRefreshDue, true);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).providerRefreshDue, false);
+      assert.equal((await repository.refreshEnvelopeProviderSnapshot({ ...command,
+        providerRefreshThresholdMs: 1 })).refreshed, false);
+      const latest = succeeded.provider?.snapshot;
+      assert.ok(latest !== undefined);
+      // The admission of the arm itself recorded the entry cost (8 units) after the measurement.
+      assert.equal(succeeded.provider?.localUsedUnits, 8n);
+      await recordProviderUnits(pool, latest, 'sell-quote', 5n);
+      const refreshed = await repository.refreshEnvelopeProviderSnapshot(command);
+      assert.equal(refreshed.refreshed, true);
+      assert.ok(refreshed.snapshot !== null);
+      assert.equal(refreshed.snapshot.provenance, 'EXECUTOR_COUNTERS');
+      assert.equal(refreshed.snapshot.usedUnits, latest.usedUnits + 8n + 5n);
+      assert.equal(refreshed.snapshot.measuredAtMs, refreshed.databaseNowMs);
+      assert.equal(refreshed.snapshot.expiresAtMs, refreshed.databaseNowMs + 300_000);
+      assert.deepEqual((await repository.readAutoArmContext(wide)).provider,
+        { snapshot: refreshed.snapshot, localUsedUnits: 0n });
+      // Over the limit: a distinct code, nothing written.
+      await recordProviderUnits(pool, refreshed.snapshot, 'flood', 5_000n);
+      await assert.rejects(repository.refreshEnvelopeProviderSnapshot(command),
+        isRepositoryError('PROVIDER_CARRY_FORWARD_REJECTED'));
+      assert.equal((await repository.readAutoArmContext(wide)).provider?.snapshot.snapshotId,
+        refreshed.snapshot.snapshotId);
     });
   });
 
@@ -416,14 +848,18 @@ async function prepareEnvelope(
   pool: Pool,
   repository: PostgresExecutionOperationsRepository,
   simulation: SeededSimulation,
-  options: Readonly<{ nonce?: string; expiresInMs?: number }> = {},
+  options: Readonly<{
+    nonce?: string; expiresInMs?: number; maxBuys?: number;
+    maxTotalExposureRaw?: bigint; maxRealizedLossRaw?: bigint;
+  }> = {},
 ): Promise<PreparedEnvelope> {
   const nowMs = await currentDatabaseTimeMs(pool);
   const qualification = envelopeQualification(nowMs, simulation, options.expiresInMs);
   const envelope = createEntryEnvelope(Object.freeze({
     payloadVersion: 2, qualification, operatorId: 'operator-primary',
-    perBuyQuoteAmountRaw: 10_000_000n, maxBuys: 3, maxTotalExposureRaw: 30_000_000n,
-    maxRealizedLossRaw: 30_000_000n, maximumHoldingMs: 60_000,
+    perBuyQuoteAmountRaw: PER_BUY, maxBuys: options.maxBuys ?? 3,
+    maxTotalExposureRaw: options.maxTotalExposureRaw ?? 30_000_000n,
+    maxRealizedLossRaw: options.maxRealizedLossRaw ?? 30_000_000n, maximumHoldingMs: 60_000,
     validFromMs: nowMs, validUntilMs: qualification.expiresAtMs, policy: envelopePolicy(),
   }));
   const authorization = envelopeAuthorization(envelope, nowMs,
@@ -565,6 +1001,22 @@ async function armCanary(
   pool: Pool,
   repository: PostgresExecutionOperationsRepository,
   simulation: SeededSimulation,
+): Promise<ExecutionActivationArmamentV2>;
+async function armCanary(
+  pool: Pool,
+  repository: PostgresExecutionOperationsRepository,
+  simulation: SeededSimulation,
+  options: Readonly<{ returnRequest: true }>,
+): Promise<Readonly<{
+  armament: ExecutionActivationArmamentV2;
+  request: ExecutionArmamentRequestV2;
+  authorization: ExecutionOperatorAuthorizationV2;
+}>>;
+async function armCanary(
+  pool: Pool,
+  repository: PostgresExecutionOperationsRepository,
+  simulation: SeededSimulation,
+  options: Readonly<{ returnRequest?: true }> = {},
 ) {
   const snapshotNowMs = await currentDatabaseTimeMs(pool);
   const walletSnapshot = createExecutionWalletSnapshot({
@@ -626,13 +1078,235 @@ async function armCanary(
     contextFingerprint: request.armamentRequestFingerprint, nonceHash: 'e'.repeat(64),
     operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
   });
-  return repository.armCanary(Object.freeze({ request, authorization }));
+  const armament = await repository.armCanary(Object.freeze({ request, authorization }));
+  return options.returnRequest === true
+    ? Object.freeze({ armament, request, authorization }) : armament;
 }
 
-/** Seeds what a real envelope armament (Task 6) would carry: the armament's envelope link. */
-async function bindArmamentToEnvelope(pool: Pool, armamentId: string, envelopeId: string) {
-  await mutateWithTriggersDisabled(pool, `UPDATE execution_activation_armaments
-    SET envelope_id=$2 WHERE armament_id=$1`, [armamentId, envelopeId]);
+/** Creates the envelope and resumes control with its ENVELOPE qualification. */
+async function openEnvelope(
+  pool: Pool,
+  repository: PostgresExecutionOperationsRepository,
+  simulation: SeededSimulation,
+  options: Parameters<typeof prepareEnvelope>[3] = {},
+): Promise<PreparedEnvelope> {
+  const prepared = await prepareEnvelope(pool, repository, simulation, options);
+  await repository.createEnvelope(prepared);
+  await resumeWith(repository, prepared.qualification, 'open');
+  return prepared;
+}
+
+async function resumeWith(
+  repository: PostgresExecutionOperationsRepository,
+  qualification: ExecutionSafetyQualificationV2,
+  tag: string,
+): Promise<void> {
+  const nowMs = Date.now();
+  const authorization = createOperatorAuthorization({
+    payloadVersion: 1, generationId, action: 'RESUME', phase: null,
+    contextFingerprint: qualification.qualificationFingerprint,
+    nonceHash: createHash('sha256').update(`resume:${tag}`).digest('hex'),
+    operatorId: 'operator-primary', issuedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
+  });
+  await repository.recordAuthorization(authorization);
+  await repository.resume({
+    payloadVersion: 1, commandId: `command:resume:${tag}`, generationId,
+    qualificationId: qualification.qualificationId, authorization,
+    operatorId: 'operator-primary', occurredAtMs: nowMs,
+  });
+}
+
+/** ENTRY_STOP then RESUME: revokes the ARMED armament and releases its reservation. */
+async function stopAndResume(
+  repository: PostgresExecutionOperationsRepository,
+  qualification: ExecutionSafetyQualificationV2,
+  tag: string,
+): Promise<void> {
+  await repository.setStop({ payloadVersion: 1, commandId: `command:stop:${tag}`, generationId,
+    operatorId: 'operator-primary', occurredAtMs: Date.now() }, 'ENTRY_STOP');
+  await resumeWith(repository, qualification, tag);
+}
+
+async function seedProviderSnapshot(pool: Pool): Promise<ProviderUsageSnapshotV1> {
+  const nowMs = await currentDatabaseTimeMs(pool);
+  const snapshot = createProviderUsageSnapshot({
+    providerId: 'primary', planId: 'plan-1', billingPeriodId: 'period-1',
+    billingPeriodStartedAtMs: nowMs - 60_000, billingPeriodEndsAtMs: nowMs + 3 * HOUR,
+    limitUnits: 1_000n, usedUnits: 1n, measuredAtMs: nowMs - 1_000,
+    expiresAtMs: nowMs + 300_000, provenance: 'OPERATOR_REPORT',
+  });
+  return new PostgresExecutionRiskRepository(pool).appendProviderUsage(snapshot);
+}
+
+async function recordProviderUnits(
+  pool: Pool,
+  snapshot: ProviderUsageSnapshotV1,
+  logicalOperationId: string,
+  units: bigint,
+): Promise<void> {
+  const identity = {
+    providerId: snapshot.providerId, billingPeriodId: snapshot.billingPeriodId,
+    category: 'ENTRY' as const, logicalOperationId,
+  };
+  assert.equal(await new PostgresExecutionRiskRepository(pool).recordProviderOperation({
+    operationId: createProviderUsageOperationId(identity), payloadVersion: 1,
+    snapshotId: snapshot.snapshotId, ...identity, units,
+  }), 'RECORDED');
+}
+
+/** A BUY intent produced by the real lot-3 fast-entry path (safety point 6). */
+async function fastEntryIntent(
+  pool: Pool,
+  envelope: EntryEnvelopeV2,
+  decidedAtMs: number,
+  amountInRaw: bigint = envelope.perBuyQuoteAmountRaw,
+): Promise<string> {
+  const mint = Keypair.generate().publicKey.toBase58();
+  const creator = Keypair.generate().publicKey.toBase58();
+  const signature = `create-${mint}`;
+  const at = new Date(decidedAtMs - 500);
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+    created_signature,created_slot,created_transaction_index,created_instruction_index,
+    created_inner_instruction_index,detected_at,updated_at
+  ) VALUES ($1,'pumpfun',$2,$3,'SPL_TOKEN',$4,'DETECTED',$5,100,2,3,NULL,$6,$6)`, [
+    mint, PUMP_PROGRAM, creator,
+    JSON.stringify([{ mint: WSOL, decimals: 9, tokenProgram: 'SPL_TOKEN' }]), signature, at,
+  ]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,instruction_index,
+    inner_instruction_index,confirmation_status,blockchain_time,observed_at,payload_version,payload
+  ) VALUES ($1,'TokenLaunchDetected',$2,'pumpfun',$3,$4,100,2,3,NULL,'confirmed',$5,$5,1,$6)`, [
+    `launch-${mint}`, mint, PUMP_PROGRAM, signature, at, JSON.stringify({ launch: { mint, creator } }),
+  ]);
+  const fastEntry = new PostgresFastEntryRepository(pool);
+  const launch = await fastEntry.readLaunchForSignature(mint, signature);
+  assert.ok(launch !== null);
+  const quote = (inputMint: string, outputMint: string, amountIn: bigint, minimumOut: bigint) => (
+    Object.freeze({
+      id: `quote-${randomUUID()}`, inputMint, outputMint, amountInRaw: amountIn,
+      amountOutRaw: minimumOut + 1n, minimumAmountOutRaw: minimumOut, feesRaw: 10n,
+      slippageBps: 1_000n, priceImpactBps: 5n, observedAtMs: decidedAtMs, observedSlot: 100n,
+    }));
+  const result = await fastEntry.recordBuy({
+    launch, decidedAtMs,
+    envelope: { envelopeId: envelope.envelopeId, perBuyQuoteAmountRaw: envelope.perBuyQuoteAmountRaw },
+    buyQuote: quote(WSOL, mint, amountInRaw, 1_000_000n),
+    reverseQuote: quote(mint, WSOL, 1_000_000n, (amountInRaw * 9n) / 10n),
+    roundTripLossBps: 500n,
+  });
+  assert.equal(result.kind, 'RECORDED');
+  if (result.kind !== 'RECORDED') throw new Error('unreachable');
+  return result.intentId;
+}
+
+function contextQuery(overrides: Partial<{
+  minimumRemainingMs: number; providerRefreshThresholdMs: number; excludedIntentIds: readonly string[];
+}> = {}) {
+  return Object.freeze({
+    generationId, minimumRemainingMs: 60_000, providerRefreshThresholdMs: 150_000,
+    excludedIntentIds: [], ...overrides,
+  });
+}
+
+/** What the auto-arm daemon builds from one context: snapshots, request and authorization. */
+async function envelopeArmRequest(
+  repository: PostgresExecutionOperationsRepository,
+  prepared: PreparedEnvelope,
+  intentId: string,
+  options: Readonly<{
+    extraUnits?: bigint;
+    provenance?: 'OPERATOR_REPORT';
+    provider?: Readonly<{ snapshot: ProviderUsageSnapshotV1; localUsedUnits: bigint }>;
+  }> = {},
+) {
+  const view = await repository.readAutoArmContext(contextQuery({ minimumRemainingMs: 0 }));
+  const provider = options.provider ?? view.provider;
+  assert.ok(provider !== null);
+  const nowMs = view.databaseNowMs;
+  const policy = prepared.envelope.policy;
+  const carried = createEnvelopeProviderSnapshot({
+    latest: provider.snapshot,
+    localUsedUnits: provider.localUsedUnits + (options.extraUnits ?? 0n),
+    measuredAtMs: nowMs, maximumAgeMs: policy.providerUsageMaxAgeMs,
+  });
+  const { snapshotId: _id, payloadVersion: _version, snapshotFingerprint: _fingerprint,
+    ...carriedFields } = carried;
+  const providerSnapshot = options.provenance === undefined ? carried
+    : createProviderUsageSnapshot({ ...carriedFields, provenance: options.provenance });
+  const walletSnapshot = createExecutionWalletSnapshot({
+    generationId, providerId: 'primary', stateRevision: view.riskStateRevision, slot: 10n,
+    blockTimeMs: nowMs - 100, observedAtMs: nowMs - 50, commitment: 'finalized',
+    walletLamports: 230_000_000n, tokenBalanceCount: 0, openPositions: [], realizedNetPnlRaw: 0n,
+  });
+  const target = await repository.readTargetIntent(intentId);
+  const expiresAtMs = Math.min(target.expiresAtMs, providerSnapshot.expiresAtMs,
+    nowMs + ENVELOPE_ARMAMENT_MAXIMUM_TTL_MS);
+  const request = createExecutionArmamentRequestV2({
+    payloadVersion: 2, qualification: prepared.qualification, targetIntentId: intentId, policy,
+    walletSnapshot, providerSnapshot, allEndpointsUnavailable: false,
+    capturedAtMs: nowMs, expiresAtMs,
+    target: {
+      intentId, stateRevision: target.stateRevision, strategyId: target.strategyId,
+      strategyVersion: target.strategyVersion, decisionFingerprint: target.decisionFingerprint,
+      mint: target.mint, quoteMint: target.quoteMint, quoteAmountRaw: target.quoteAmountRaw,
+    },
+    maximumBuys: 1, maximumCapitalLamports: prepared.envelope.perBuyQuoteAmountRaw,
+    maximumExposureBps: 500n, maximumOpenPositions: 1,
+    maximumHoldingMs: prepared.envelope.maximumHoldingMs, runtimeQuoteMaxAgeMs: 60_000,
+    runtimeSlippageBps: 1_000n, runtimeSnapshotMaxSlotLag: 8,
+    runtimeMaxComputeUnits: 200_000n, runtimeMaxFeeLamports: 5_000n,
+    runtimeMaxFeePayerLamportDebit: 100_000n, runtimeMaxRpcCallsPerAttempt: 12,
+    runtimeLeaseMs: 3_000, armedAtMs: nowMs, armamentExpiresAtMs: expiresAtMs,
+    operatorId: prepared.envelope.operatorId, operatorReason: 'Entry envelope auto-arm.',
+  });
+  const authorization = createEnvelopeArmAuthorization({
+    generationId, operatorId: prepared.envelope.operatorId,
+    envelopeId: prepared.envelope.envelopeId, intentId,
+    contextFingerprint: request.armamentRequestFingerprint, nowMs,
+  });
+  return Object.freeze({ request, authorization, envelopeId: prepared.envelope.envelopeId });
+}
+
+async function armEnvelope(
+  repository: PostgresExecutionOperationsRepository,
+  prepared: PreparedEnvelope,
+  intentId: string,
+): Promise<ExecutionActivationArmamentV2> {
+  return repository.armEnvelope(await envelopeArmRequest(repository, prepared, intentId));
+}
+
+async function assertNothingArmed(pool: Pool): Promise<void> {
+  assert.deepEqual((await pool.query(`SELECT
+    (SELECT COUNT(*)::INTEGER FROM execution_activation_armaments
+      WHERE envelope_id IS NOT NULL) AS armaments,
+    (SELECT COUNT(*)::INTEGER FROM execution_intents WHERE live_reserved) AS reserved,
+    (SELECT COUNT(*)::INTEGER FROM execution_exposure_reservations WHERE state='RESERVED') AS reservations,
+    (SELECT COALESCE(SUM(buys_armed),0)::INTEGER FROM execution_entry_envelopes) AS buys_armed,
+    (SELECT COUNT(*)::INTEGER FROM execution_operator_authorizations
+      WHERE payload_version=2) AS arm_authorizations`)).rows,
+  [{ armaments: 0, reserved: 0, reservations: 0, buys_armed: 0, arm_authorizations: 0 }]);
+}
+
+/** Forges what H2b leaves behind: the armament LOCKED on its BUY, the BUY at `status`. */
+async function lockArmamentAfterBuy(
+  pool: Pool,
+  armamentId: string,
+  intentId: string,
+  status: 'SUBMITTED' | 'SUCCEEDED',
+): Promise<void> {
+  await mutateWithTriggersDisabled(pool, `UPDATE execution_activation_armaments SET
+    state='LOCKED',state_revision=1,consumed_buys=1,locked_intent_id=target_intent_id,
+    locked_attempt_number=1,locked_reservation_id=target_reservation_id,
+    locked_lease_token=gen_random_uuid(),locked_at=date_trunc('milliseconds',statement_timestamp()),
+    terminal_at=NULL,purge_after=NULL WHERE armament_id=$1`, [armamentId]);
+  await mutateWithTriggersDisabled(pool, status === 'SUBMITTED'
+    ? `UPDATE execution_intents SET status='SUBMITTED',last_reason_code='SUBMISSION_ACCEPTED',
+      attempt_count=1 WHERE id=$1`
+    : `UPDATE execution_intents SET status='SUCCEEDED',last_reason_code='INTENT_SUCCEEDED',
+      attempt_count=1,
+      terminal_at=GREATEST(date_trunc('milliseconds',statement_timestamp()),requested_at) WHERE id=$1`,
+  [intentId]);
 }
 
 async function moveEnvelopeIntoThePast(pool: Pool, envelopeId: string) {

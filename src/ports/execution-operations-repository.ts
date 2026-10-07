@@ -12,6 +12,7 @@ import type {
   ExecutionSafetyQualificationV2,
 } from '../domain/execution-safety-qualification.js';
 import type { EntryEnvelopeV2 } from '../domain/execution-entry-envelope.js';
+import type { ProviderUsageSnapshotV1 } from '../domain/execution-provider-quota.js';
 import type { ExecutionIntentSide, ExecutionIntentStatus } from '../domain/execution-intent.js';
 import type { ExecutionPreflightDraftSourceV2 } from '../domain/execution-preflight-draft.js';
 
@@ -152,6 +153,73 @@ export interface ExecutionEntryEnvelopeRepository {
   revokeEnvelope(command: ExecutionEnvelopeRevokeCommandV1): Promise<ExecutionEnvelopeRevocationV1>;
   expireEnvelopes(generationId: string): Promise<ExecutionEnvelopeExpiryV1>;
   readEnvelopes(generationId: string): Promise<readonly ExecutionEntryEnvelopeSummaryV1[]>;
+}
+
+/** What `readAutoArmContext` reads; every margin is the daemon's (A12, A13). */
+export interface ExecutionAutoArmContextQueryV1 {
+  readonly generationId: string;
+  /** A candidate intent must expire at least this long after the DB now (A13). */
+  readonly minimumRemainingMs: number;
+  /** The provider snapshot is due for refresh when it expires within this (A12). */
+  readonly providerRefreshThresholdMs: number;
+  /** Intents the daemon already refused for a non-transient reason. */
+  readonly excludedIntentIds: readonly string[];
+}
+
+/** One REPEATABLE READ READ ONLY view of everything the auto-arm daemon decides on. */
+export interface ExecutionAutoArmContextV1 {
+  readonly payloadVersion: 1;
+  readonly databaseNowMs: number;
+  /** The ACTIVE v2 envelope, rebuilt and verified (policy via createExecutionRiskPolicy). */
+  readonly envelope: EntryEnvelopeV2 | null;
+  readonly qualification: ExecutionSafetyQualificationV2 | null;
+  /** The envelope row counters; 0 without an envelope. */
+  readonly buysArmed: number;
+  readonly realizedLossRaw: bigint;
+  readonly controlState: ExecutionControlState;
+  readonly riskStateRevision: bigint;
+  readonly openPositions: number;
+  readonly unknownBlock: boolean;
+  /** An ARMED armament not yet expired, or a LOCKED one (whatever its expiry). */
+  readonly activeArmament: 'ARMED' | 'LOCKED' | null;
+  /** The current snapshot of the envelope (or locked armament) provider and the local
+   * counter units recorded in its billing period since its measurement. */
+  readonly provider: Readonly<{
+    snapshot: ProviderUsageSnapshotV1;
+    localUsedUnits: bigint;
+  }> | null;
+  /** The oldest eligible fast-entry BUY intent of the envelope, if any. */
+  readonly candidateIntent: ExecutionCanaryTargetIntentV1 | null;
+  /** No ARMED armament, a LOCKED envelope armament whose BUY SUCCEEDED, and the current
+   * provider snapshot expires within the threshold. */
+  readonly providerRefreshDue: boolean;
+}
+
+export interface ExecutionEnvelopeProviderRefreshCommandV1 {
+  readonly generationId: string;
+  /** The carried-forward snapshot expires this long after the DB now (bounded by the period). */
+  readonly maximumAgeMs: number;
+  readonly providerRefreshThresholdMs: number;
+}
+
+export interface ExecutionEnvelopeProviderRefreshV1 {
+  readonly payloadVersion: 1;
+  /** False when the refresh was not due any more inside the transaction. */
+  readonly refreshed: boolean;
+  readonly snapshot: ProviderUsageSnapshotV1 | null;
+  readonly databaseNowMs: number;
+}
+
+export interface ExecutionEnvelopeArmamentRepository {
+  armEnvelope(input: Readonly<{
+    request: ExecutionArmamentRequestV2;
+    authorization: ExecutionOperatorAuthorizationV2;
+    envelopeId: string;
+  }>): Promise<ExecutionActivationArmamentV2>;
+  readAutoArmContext(query: ExecutionAutoArmContextQueryV1): Promise<ExecutionAutoArmContextV1>;
+  refreshEnvelopeProviderSnapshot(
+    command: ExecutionEnvelopeProviderRefreshCommandV1,
+  ): Promise<ExecutionEnvelopeProviderRefreshV1>;
 }
 
 export interface ExecutionCanaryTargetIntentV1 {

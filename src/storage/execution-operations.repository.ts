@@ -12,6 +12,7 @@ import {
   type ExecutionActivationArmamentV2,
   type ExecutionArmamentRequestV2,
   type ExecutionArmamentRequestV3,
+  type ExecutionControlState,
   type ExecutionOperatorAuthorizationV1,
   type ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
@@ -28,25 +29,44 @@ import {
   type ExecutionSafetyQualificationV1,
   type ExecutionSafetyQualificationV2,
 } from '../domain/execution-safety-qualification.js';
-import { createEntryEnvelope, type EntryEnvelopeV2 } from '../domain/execution-entry-envelope.js';
+import {
+  createEntryEnvelope,
+  createEnvelopeProviderSnapshot,
+  ENVELOPE_ARMAMENT_MAXIMUM_TTL_MS,
+  ENVELOPE_EXIT_MARGIN_MS,
+  type EntryEnvelopeV2,
+} from '../domain/execution-entry-envelope.js';
+import {
+  createProviderUsageSnapshot,
+  type ProviderUsageSnapshotV1,
+} from '../domain/execution-provider-quota.js';
+import {
+  createExecutionRiskPolicy,
+  type ExecutionRiskPolicyV1,
+} from '../domain/execution-risk-policy.js';
 import type {
+  ExecutionAutoArmContextQueryV1,
+  ExecutionAutoArmContextV1,
   ExecutionCanaryArmamentRepository,
   ExecutionCanaryTargetIntentV1,
   ExecutionControlCommandV1,
   ExecutionEntryEnvelopeRepository,
   ExecutionEntryEnvelopeState,
   ExecutionEntryEnvelopeSummaryV1,
+  ExecutionEnvelopeArmamentRepository,
   ExecutionEnvelopeCreationV1,
   ExecutionEnvelopeExpiryV1,
   ExecutionEnvelopeFactsQueryV1,
   ExecutionEnvelopeFactsV1,
+  ExecutionEnvelopeProviderRefreshCommandV1,
+  ExecutionEnvelopeProviderRefreshV1,
   ExecutionEnvelopeRevocationV1,
   ExecutionEnvelopeRevokeCommandV1,
   ExecutionOperationsRepository,
   ExecutionOperationsStatusV1,
   ExecutionResumeCommandV1,
 } from '../ports/execution-operations-repository.js';
-import { canonicalStringifyJson } from '../utils/json.js';
+import { canonicalStringifyJson, parseJson } from '../utils/json.js';
 import type {
   ExecutionBuyAdmissionInputV1,
   ExecutionBuyAdmissionResultV1,
@@ -81,9 +101,17 @@ interface DatabaseSource {
   connect(): Promise<DatabaseClient>;
 }
 
-type RepositoryErrorCode =
+/**
+ * PROVIDER_CARRY_FORWARD_STALE (the executor counters moved since the context was read) and
+ * ARMAMENT_CONTENDED (a unique violation while arming an envelope) are transient: the daemon
+ * retries next tick. PROVIDER_CARRY_FORWARD_REJECTED: the carried-forward provider snapshot
+ * cannot be built (over the limit, or outside the billing period).
+ */
+export type ExecutionOperationsRepositoryErrorCode =
   | 'CONFLICT' | 'INVALID_DATA' | 'DATABASE_FAILURE'
-  | 'CONTROL_STOPPED' | 'PREFLIGHT_EXPIRED';
+  | 'CONTROL_STOPPED' | 'PREFLIGHT_EXPIRED'
+  | 'PROVIDER_CARRY_FORWARD_STALE' | 'PROVIDER_CARRY_FORWARD_REJECTED' | 'ARMAMENT_CONTENDED';
+type RepositoryErrorCode = ExecutionOperationsRepositoryErrorCode;
 
 const INTERNAL_ERRORS = new WeakSet();
 
@@ -99,7 +127,7 @@ export class ExecutionOperationsRepositoryError extends Error {
 
 export class PostgresExecutionOperationsRepository implements
   ExecutionOperationsRepository, ExecutionCanaryArmamentRepository,
-  ExecutionEntryEnvelopeRepository {
+  ExecutionEntryEnvelopeRepository, ExecutionEnvelopeArmamentRepository {
   readonly #source: DatabaseSource;
 
   public constructor(source: DatabaseSource | Pick<InstanceType<typeof pg.Pool>, 'connect'>) {
@@ -403,41 +431,9 @@ export class PostgresExecutionOperationsRepository implements
 
   public async readTargetIntent(intentId: string): Promise<ExecutionCanaryTargetIntentV1> {
     const parsed = patterned(intentId, /^execution_intent_[0-9a-f]{64}$/u);
-    return this.transaction(async (client) => {
-      const row = exactRow(singleRow(await client.query(`SELECT id,side,status,lease_owner,
-        CASE WHEN lease_expires_at IS NULL THEN NULL
-          ELSE trunc(EXTRACT(EPOCH FROM lease_expires_at)*1000)::TEXT END AS lease_expires_at_ms,
-        state_revision::TEXT AS state_revision,strategy_id,strategy_version,decision_fingerprint,
-        mint,quote_mint,quote_amount_raw::TEXT AS quote_amount_raw,
-        trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms
-        FROM execution_intents WHERE id=$1`, [parsed])), [
-        'id', 'side', 'status', 'lease_owner', 'lease_expires_at_ms', 'state_revision',
-        'strategy_id', 'strategy_version', 'decision_fingerprint', 'mint', 'quote_mint',
-        'quote_amount_raw', 'expires_at_ms',
-      ] as const);
-      if (row.side !== 'BUY' || row.status !== 'PENDING'
-        || (row.lease_owner !== null && typeof row.lease_owner !== 'string')
-        || (row.lease_expires_at_ms !== null && typeof row.lease_expires_at_ms !== 'string')
-        || typeof row.strategy_id !== 'string' || typeof row.strategy_version !== 'number'
-        || !Number.isSafeInteger(row.strategy_version) || row.strategy_version < 1
-        || typeof row.decision_fingerprint !== 'string' || typeof row.mint !== 'string'
-        || typeof row.quote_mint !== 'string' || typeof row.quote_amount_raw !== 'string') {
-        throw failure('CONFLICT');
-      }
-      return Object.freeze({
-        intentId: patterned(row.id, /^execution_intent_[0-9a-f]{64}$/u),
-        side: 'BUY', status: 'PENDING', leaseOwner: row.lease_owner,
-        leaseExpiresAtMs: row.lease_expires_at_ms === null ? null : timestampText(row.lease_expires_at_ms),
-        stateRevision: unsignedBigint(row.state_revision),
-        strategyId: patterned(row.strategy_id, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u),
-        strategyVersion: row.strategy_version,
-        decisionFingerprint: patterned(row.decision_fingerprint, /^[0-9a-f]{64}$/u),
-        mint: patterned(row.mint, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u),
-        quoteMint: patterned(row.quote_mint, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u),
-        quoteAmountRaw: unsignedBigint(row.quote_amount_raw),
-        expiresAtMs: timestampText(row.expires_at_ms),
-      });
-    });
+    return this.transaction(async (client) => targetIntentFrom(singleRow(await client.query(
+      `SELECT ${TARGET_INTENT_PROJECTION} FROM execution_intents WHERE id=$1`, [parsed],
+    ))));
   }
 
   public async armCanary(input: Readonly<{
@@ -457,101 +453,133 @@ export class PostgresExecutionOperationsRepository implements
       || authorization.action !== 'ARM' || authorization.phase !== 'CANARY'
       || authorization.contextFingerprint !== request.armamentRequestFingerprint
       || authorization.operatorId !== request.operatorId) throw failure('CONFLICT');
-    const outcome = await this.transaction(async (client) => {
-      await lockWorkerTrackingMints(client, [request.target.mint]);
-      await client.query(`SELECT pg_advisory_xact_lock(
-        hashtextextended('execution-live-sell-presence:v1', 51008))`);
-      await lockGeneration(client, request.qualification.generationId);
-      const nowMs = await databaseNowMs(client);
-      let target: LockedCanaryTarget | null = null;
-      if (request.payloadVersion === 3) {
-        const pair = await lockAndAssertPairedPreflightPair(
-          client, request, preflightSource, nowMs,
-        );
-        target = await lockedCanaryTarget(client, request.target.intentId, pair.pairId, null);
-        await lockAndAssertPairedPreflightEvidence(client, request, pair, nowMs);
-      }
-      const replay = await findCanaryReplay(client, request, authorization);
-      if (replay?.kind === 'REPLAY') {
-        if (target !== null) {
-          if (!target.liveReserved) throw failure('CONFLICT');
-          await assertCurrentCanaryLineage(client, request.target.intentId);
-        }
-        return replay;
-      }
-      if (replay?.kind === 'STALE') {
-        await terminalizeActiveArmament(client, request.qualification.generationId, 'EXPIRED', true);
-        return replay;
-      }
-      target ??= await lockedCanaryTarget(client, request.target.intentId, null, false);
-      if (target.liveReserved) throw failure('CONFLICT');
-      assertCanaryRequestTarget(request, target, nowMs);
-      if (request.payloadVersion === 3) {
-        await assertCurrentCanaryLineage(client, request.target.intentId);
-      }
-      await promoteCanaryTarget(client, target.intent.id);
-      await ensureControlState(client, request.qualification.generationId);
-      const control = await lockedControlState(client, request.qualification.generationId);
-      if (control.state !== 'RUNNING') throw failure('CONTROL_STOPPED');
-      const qualification = (await qualificationForArm(
-        client, request.qualification.qualificationId,
-      )).qualification;
-      assertCanaryQualification(request, qualification, nowMs, null);
-      await terminalizeActiveArmament(client, request.qualification.generationId, 'EXPIRED', true);
-      const active = await client.query(`SELECT armament_id FROM execution_activation_armaments
-        WHERE generation_id=$1 AND state IN ('ARMED','LOCKED')
-          AND expires_at > statement_timestamp() FOR UPDATE`, [request.qualification.generationId]);
-      if (active.rows.length !== 0) throw failure('CONFLICT');
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))', [
-        request.providerSnapshot.providerId,
-      ]);
-      const walletSnapshot = await appendWalletSnapshotInTransaction(
-        client,
-        request.walletSnapshot,
-      );
-      const providerSnapshot = await appendProviderUsageInTransaction(
-        client,
-        request.providerSnapshot,
-      );
-      await assertCanarySnapshotsCurrent(client, request, walletSnapshot, providerSnapshot, nowMs);
-      let admission: ExecutionBuyAdmissionResultV1;
-      try {
-        admission = await new ExecutionAdmissionService({
-          admitBuy: (value: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1> => (
-            admitBuyInTransaction(client, value)
-          ),
-        }).admit(Object.freeze({
-          payloadVersion: 1,
-          intent: target.intent,
-          policy: request.policy,
-          generationId: request.qualification.generationId,
-          walletSnapshot,
-          providerSnapshot,
-          allEndpointsUnavailable: request.allEndpointsUnavailable,
-          nowMs,
-        }));
-      } catch (error) {
-        if (error instanceof ExecutionRiskRepositoryError) throw failure('CONFLICT');
-        throw error;
-      }
-      if (admission.decision !== 'ADMITTED' || admission.reservationId === null) {
-        throw failure('CONFLICT');
-      }
-      await consumeCanaryAuthorization(client, authorization, nowMs);
-      const armament = createExecutionArmamentV2({
-        payloadVersion: 2,
-        request,
-        authorizationId: authorization.authorizationId,
-        authorizationFingerprint: authorization.authorizationFingerprint,
-        admissionReportId: admission.reportId,
-        reservationId: admission.reservationId,
-      });
-      await insertCanaryArmament(client, armament);
-      await insertCanaryArmamentEvent(client, armament, nowMs);
-      return Object.freeze({ kind: 'REPLAY' as const, armament });
-    });
+    const outcome = await this.transaction((client) => armV2InTransaction(
+      client, request, authorization, { preflightSource, envelopeId: null },
+    ));
     if (outcome.kind === 'STALE') throw failure('CONFLICT');
     return outcome.armament;
+  }
+
+  /**
+   * Arms one fast-entry BUY inside the ACTIVE envelope: the v2 CANARY path with the envelope
+   * bound. The ENVELOPE qualification, the envelope caps and the executor-counter provider
+   * carry-forward are checked under the envelope row lock; the 065 trigger counts the buy.
+   */
+  public async armEnvelope(input: Readonly<{
+    request: ExecutionArmamentRequestV2;
+    authorization: ExecutionOperatorAuthorizationV2;
+    envelopeId: string;
+  }>): Promise<ExecutionActivationArmamentV2> {
+    const request = canaryRequestFrom(input.request);
+    const envelopeId = patterned(input.envelopeId, ENVELOPE_ID_PATTERN);
+    const authorization = canaryAuthorizationFrom(input.authorization);
+    if (request.payloadVersion !== 2 || request.qualification.payloadVersion !== 2
+      || authorization.generationId !== request.qualification.generationId
+      || authorization.action !== 'ARM' || authorization.phase !== 'CANARY'
+      || authorization.contextFingerprint !== request.armamentRequestFingerprint
+      || authorization.operatorId !== request.operatorId) throw failure('CONFLICT');
+    const outcome = await this.transaction((client) => armV2InTransaction(
+      client, request, authorization, { preflightSource: null, envelopeId },
+    ), { uniqueViolation: 'ARMAMENT_CONTENDED' });
+    if (outcome.kind === 'STALE') throw failure('CONFLICT');
+    return outcome.armament;
+  }
+
+  public async readAutoArmContext(
+    input: ExecutionAutoArmContextQueryV1,
+  ): Promise<ExecutionAutoArmContextV1> {
+    const query = autoArmContextQueryFrom(input);
+    return this.transaction(async (client) => {
+      const nowMs = await databaseNowMs(client);
+      const generation = await client.query(`SELECT generation_id FROM execution_wallet_generations
+        WHERE generation_id=$1 AND retired_at IS NULL`, [query.generationId]);
+      if (generation.rows.length !== 1) throw failure('CONFLICT');
+      const control = await client.query(`SELECT state FROM execution_control_state
+        WHERE generation_id=$1`, [query.generationId]);
+      if (control.rows.length > 1) throw failure('INVALID_DATA');
+      const controlState = control.rows.length === 0 ? 'ENTRY_STOP'
+        : controlStateFrom(exactRow(control.rows[0], ['state'] as const).state);
+      const risk = exactRow(singleRowOr(await client.query(`SELECT
+        state_revision::TEXT AS state_revision,open_positions,unknown_block
+        FROM execution_wallet_risk_state WHERE generation_id=$1`, [query.generationId]), 'CONFLICT'),
+      ['state_revision', 'open_positions', 'unknown_block'] as const);
+      if (typeof risk.unknown_block !== 'boolean') throw failure('INVALID_DATA');
+      const active = await activeEnvelopeOf(client, query.generationId);
+      const armament = await activeArmamentOf(client, query.generationId, nowMs);
+      const providerId = armament?.envelopeBound === true && armament.state === 'LOCKED'
+        ? armament.providerId : active?.qualification.providerId ?? null;
+      const provider = providerId === null ? null : await currentProviderOf(client, providerId, false);
+      const candidate = active === null ? null : await client.query(`SELECT ${TARGET_INTENT_PROJECTION}
+        FROM execution_intents
+        WHERE strategy_id=$1 AND side='BUY' AND status='PENDING' AND live_reserved=FALSE
+          AND lease_owner IS NULL AND attempt_count=0 AND base_amount_raw IS NULL
+          AND quote_mint=$2 AND quote_token_program='SPL_TOKEN' AND quote_decimals=9
+          AND quote_amount_raw=$3::NUMERIC
+          AND requested_at >= TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond')
+          AND requested_at <= TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')
+          AND expires_at >= TIMESTAMPTZ 'epoch'+(($5::BIGINT+$6::BIGINT)*INTERVAL '1 millisecond')
+          AND id <> ALL($7::TEXT[])
+        ORDER BY requested_at,id LIMIT 1`, [
+        FAST_ENTRY_STRATEGY_ID, WSOL_MINT, active.envelope.perBuyQuoteAmountRaw.toString(),
+        active.envelope.validFromMs, nowMs, query.minimumRemainingMs, [...query.excludedIntentIds],
+      ]);
+      const [candidateRow] = candidate?.rows ?? [];
+      return Object.freeze({
+        payloadVersion: 1,
+        databaseNowMs: nowMs,
+        envelope: active?.envelope ?? null,
+        qualification: active?.qualification ?? null,
+        buysArmed: active?.buysArmed ?? 0,
+        realizedLossRaw: active?.realizedLossRaw ?? 0n,
+        controlState,
+        riskStateRevision: unsignedBigint(risk.state_revision),
+        openPositions: safeInteger(risk.open_positions),
+        unknownBlock: risk.unknown_block,
+        activeArmament: armament?.state ?? null,
+        provider,
+        candidateIntent: candidateRow === undefined ? null : targetIntentFrom(candidateRow),
+        providerRefreshDue: refreshDue(armament, provider, nowMs, query.providerRefreshThresholdMs),
+      });
+    }, { begin: 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' });
+  }
+
+  /**
+   * Carries the provider snapshot forward with the executor counters while the envelope BUY
+   * is reconciled and its position open (SELL submission needs an unexpired snapshot). It
+   * never supersedes while a BUY is in flight: the refresh must still be due under the locks.
+   */
+  public async refreshEnvelopeProviderSnapshot(
+    input: ExecutionEnvelopeProviderRefreshCommandV1,
+  ): Promise<ExecutionEnvelopeProviderRefreshV1> {
+    const generationId = generationIdFrom(input.generationId);
+    const maximumAgeMs = boundedInteger(input.maximumAgeMs, 30_000, 900_000);
+    const thresholdMs = boundedInteger(input.providerRefreshThresholdMs, 1, 86_400_000);
+    return this.transaction(async (client) => {
+      await lockGeneration(client, generationId);
+      const nowMs = await databaseNowMs(client);
+      const notRefreshed = Object.freeze({
+        payloadVersion: 1, refreshed: false, snapshot: null, databaseNowMs: nowMs,
+      } as const);
+      const armament = await activeArmamentOf(client, generationId, nowMs);
+      if (armament?.state !== 'LOCKED' || !armament.envelopeBound
+        || !armament.buySucceeded) return notRefreshed;
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))', [
+        armament.providerId,
+      ]);
+      const provider = await currentProviderOf(client, armament.providerId, true);
+      if (!refreshDue(armament, provider, nowMs, thresholdMs) || provider === null) return notRefreshed;
+      let carried: ProviderUsageSnapshotV1;
+      try {
+        carried = createEnvelopeProviderSnapshot(Object.freeze({
+          latest: provider.snapshot, localUsedUnits: provider.localUsedUnits,
+          measuredAtMs: nowMs, maximumAgeMs,
+        }));
+      } catch {
+        throw failure('PROVIDER_CARRY_FORWARD_REJECTED');
+      }
+      const snapshot = await appendProviderUsageInTransaction(client, carried);
+      return Object.freeze({ payloadVersion: 1, refreshed: true, snapshot, databaseNowMs: nowMs });
+    });
   }
 
   public async prepareEnvelopeFacts(
@@ -717,11 +745,14 @@ export class PostgresExecutionOperationsRepository implements
     return this.transaction((client) => readStatus(client, parsed));
   }
 
-  private async transaction<T>(operation: (client: DatabaseClient) => Promise<T>): Promise<T> {
+  private async transaction<T>(
+    operation: (client: DatabaseClient) => Promise<T>,
+    options: Readonly<{ begin?: string; uniqueViolation?: RepositoryErrorCode }> = {},
+  ): Promise<T> {
     let client: DatabaseClient | null = null;
     try {
       client = await this.#source.connect();
-      await client.query('BEGIN');
+      await client.query(options.begin ?? 'BEGIN');
       const result = await operation(client);
       await client.query('COMMIT');
       client.release();
@@ -732,6 +763,9 @@ export class PostgresExecutionOperationsRepository implements
         client.release(true);
       }
       if (error instanceof ExecutionOperationsRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
+      if (databaseCode(error) === '23505' && options.uniqueViolation !== undefined) {
+        throw failure(options.uniqueViolation);
+      }
       if (databaseCode(error) === '23505' || databaseCode(error) === '23503'
         || databaseCode(error) === '55000') {
         throw failure('CONFLICT');
@@ -739,6 +773,482 @@ export class PostgresExecutionOperationsRepository implements
       throw failure('DATABASE_FAILURE');
     }
   }
+}
+
+/**
+ * The v2/v3 arming transaction body. CANARY passes `envelopeId` null and keeps its exact
+ * statement order; every envelope step is guarded by `envelopeId !== null`.
+ */
+async function armV2InTransaction(
+  client: DatabaseClient,
+  request: CanaryArmamentRequest,
+  authorization: ExecutionOperatorAuthorizationV2,
+  options: Readonly<{
+    preflightSource: ExecutionPreflightDraftSourceV2 | null;
+    envelopeId: string | null;
+  }>,
+): Promise<ArmV2Outcome> {
+  const { preflightSource, envelopeId } = options;
+  await lockWorkerTrackingMints(client, [request.target.mint]);
+  await client.query(`SELECT pg_advisory_xact_lock(
+    hashtextextended('execution-live-sell-presence:v1', 51008))`);
+  await lockGeneration(client, request.qualification.generationId);
+  const nowMs = await databaseNowMs(client);
+  // A24: the envelope row is locked only once the generation lock (51005) is held.
+  let envelope: LockedEnvelope | null = null;
+  if (envelopeId !== null) {
+    envelope = await lockedEnvelope(client, envelopeId, request.qualification.generationId);
+    assertEnvelopeRequest(request, envelope, nowMs);
+  }
+  let target: LockedCanaryTarget | null = null;
+  if (request.payloadVersion === 3) {
+    const pair = await lockAndAssertPairedPreflightPair(
+      client, request, preflightSource, nowMs,
+    );
+    target = await lockedCanaryTarget(client, request.target.intentId, pair.pairId, null);
+    await lockAndAssertPairedPreflightEvidence(client, request, pair, nowMs);
+  }
+  const replay = await findCanaryReplay(client, request, authorization);
+  if (replay?.kind === 'REPLAY') {
+    if (target !== null) {
+      if (!target.liveReserved) throw failure('CONFLICT');
+      await assertCurrentCanaryLineage(client, request.target.intentId);
+    }
+    return replay;
+  }
+  if (replay?.kind === 'STALE') {
+    await terminalizeActiveArmament(client, request.qualification.generationId, 'EXPIRED', true);
+    return replay;
+  }
+  target ??= await lockedCanaryTarget(client, request.target.intentId, null, false);
+  if (envelope !== null && (target.intent.strategyId !== FAST_ENTRY_STRATEGY_ID
+    || target.intent.requestedAtMs < envelope.validFromMs)) throw failure('CONFLICT');
+  if (target.liveReserved) throw failure('CONFLICT');
+  assertCanaryRequestTarget(request, target, nowMs);
+  if (request.payloadVersion === 3) {
+    await assertCurrentCanaryLineage(client, request.target.intentId);
+  }
+  await promoteCanaryTarget(client, target.intent.id);
+  await ensureControlState(client, request.qualification.generationId);
+  const control = await lockedControlState(client, request.qualification.generationId);
+  if (control.state !== 'RUNNING') throw failure('CONTROL_STOPPED');
+  const stored = await qualificationForArm(client, request.qualification.qualificationId);
+  if (envelopeId !== null && stored.envelopeId !== envelopeId) throw failure('CONFLICT');
+  assertCanaryQualification(request, stored.qualification, nowMs, envelopeId);
+  await terminalizeActiveArmament(client, request.qualification.generationId, 'EXPIRED', true);
+  const active = await client.query(`SELECT armament_id FROM execution_activation_armaments
+    WHERE generation_id=$1 AND state IN ('ARMED','LOCKED')
+      AND expires_at > statement_timestamp() FOR UPDATE`, [request.qualification.generationId]);
+  if (active.rows.length !== 0) throw failure('CONFLICT');
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))', [
+    request.providerSnapshot.providerId,
+  ]);
+  const walletSnapshot = await appendWalletSnapshotInTransaction(
+    client,
+    request.walletSnapshot,
+  );
+  if (envelope !== null) await assertEnvelopeProviderCarryForward(client, request, envelope, nowMs);
+  const providerSnapshot = await appendProviderUsageInTransaction(
+    client,
+    request.providerSnapshot,
+  );
+  await assertCanarySnapshotsCurrent(client, request, walletSnapshot, providerSnapshot, nowMs);
+  let admission: ExecutionBuyAdmissionResultV1;
+  try {
+    admission = await new ExecutionAdmissionService({
+      admitBuy: (value: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1> => (
+        admitBuyInTransaction(client, value)
+      ),
+    }).admit(Object.freeze({
+      payloadVersion: 1,
+      intent: target.intent,
+      policy: request.policy,
+      generationId: request.qualification.generationId,
+      walletSnapshot,
+      providerSnapshot,
+      allEndpointsUnavailable: request.allEndpointsUnavailable,
+      nowMs,
+    }));
+  } catch (error) {
+    if (error instanceof ExecutionRiskRepositoryError) throw failure('CONFLICT');
+    throw error;
+  }
+  if (admission.decision !== 'ADMITTED' || admission.reservationId === null) {
+    throw failure('CONFLICT');
+  }
+  await consumeCanaryAuthorization(client, authorization, nowMs);
+  const armament = createExecutionArmamentV2({
+    payloadVersion: 2,
+    request,
+    authorizationId: authorization.authorizationId,
+    authorizationFingerprint: authorization.authorizationFingerprint,
+    admissionReportId: admission.reportId,
+    reservationId: admission.reservationId,
+  });
+  await insertCanaryArmament(client, armament, envelopeId);
+  await insertCanaryArmamentEvent(client, armament, nowMs);
+  return Object.freeze({ kind: 'REPLAY' as const, armament });
+}
+
+type ArmV2Outcome =
+  | Readonly<{ kind: 'REPLAY'; armament: ExecutionActivationArmamentV2 }>
+  | Readonly<{ kind: 'STALE' }>;
+
+const ENVELOPE_ID_PATTERN = /^execution_entry_envelope_[0-9a-f]{64}$/u;
+/**
+ * FAST_ENTRY_STRATEGY_ID of src/domain/fast-entry.ts, also hard-coded in the 065 trigger. It is
+ * not imported: the operations graph must not reach the paper/quote modules fast-entry pulls in.
+ */
+const FAST_ENTRY_STRATEGY_ID = 'fast-entry-v1';
+const INTENT_ID_PATTERN = /^execution_intent_[0-9a-f]{64}$/u;
+
+const TARGET_INTENT_PROJECTION = `id,side,status,lease_owner,
+  CASE WHEN lease_expires_at IS NULL THEN NULL
+    ELSE trunc(EXTRACT(EPOCH FROM lease_expires_at)*1000)::TEXT END AS lease_expires_at_ms,
+  state_revision::TEXT AS state_revision,strategy_id,strategy_version,decision_fingerprint,
+  mint,quote_mint,quote_amount_raw::TEXT AS quote_amount_raw,
+  trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms`;
+
+function targetIntentFrom(value: Readonly<Record<string, unknown>>): ExecutionCanaryTargetIntentV1 {
+  const row = exactRow(value, [
+    'id', 'side', 'status', 'lease_owner', 'lease_expires_at_ms', 'state_revision',
+    'strategy_id', 'strategy_version', 'decision_fingerprint', 'mint', 'quote_mint',
+    'quote_amount_raw', 'expires_at_ms',
+  ] as const);
+  if (row.side !== 'BUY' || row.status !== 'PENDING'
+    || (row.lease_owner !== null && typeof row.lease_owner !== 'string')
+    || (row.lease_expires_at_ms !== null && typeof row.lease_expires_at_ms !== 'string')
+    || typeof row.strategy_id !== 'string' || typeof row.strategy_version !== 'number'
+    || !Number.isSafeInteger(row.strategy_version) || row.strategy_version < 1
+    || typeof row.decision_fingerprint !== 'string' || typeof row.mint !== 'string'
+    || typeof row.quote_mint !== 'string' || typeof row.quote_amount_raw !== 'string') {
+    throw failure('CONFLICT');
+  }
+  return Object.freeze({
+    intentId: patterned(row.id, INTENT_ID_PATTERN),
+    side: 'BUY', status: 'PENDING', leaseOwner: row.lease_owner,
+    leaseExpiresAtMs: row.lease_expires_at_ms === null ? null : timestampText(row.lease_expires_at_ms),
+    stateRevision: unsignedBigint(row.state_revision),
+    strategyId: patterned(row.strategy_id, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u),
+    strategyVersion: row.strategy_version,
+    decisionFingerprint: patterned(row.decision_fingerprint, /^[0-9a-f]{64}$/u),
+    mint: patterned(row.mint, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u),
+    quoteMint: patterned(row.quote_mint, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u),
+    quoteAmountRaw: unsignedBigint(row.quote_amount_raw),
+    expiresAtMs: timestampText(row.expires_at_ms),
+  });
+}
+
+/** An envelope row as arming reads it; the policy is rebuilt and matches its fingerprint. */
+interface StoredEnvelope {
+  readonly envelopeId: string;
+  readonly payloadVersion: number;
+  readonly fingerprint: string;
+  readonly generationId: string;
+  readonly operatorId: string;
+  readonly state: ExecutionEntryEnvelopeState;
+  readonly perBuyQuoteAmountRaw: bigint;
+  readonly maxBuys: number;
+  readonly maxTotalExposureRaw: bigint;
+  readonly maxRealizedLossRaw: bigint;
+  readonly buysArmed: number;
+  readonly realizedLossRaw: bigint;
+  readonly validFromMs: number;
+  readonly validUntilMs: number;
+  readonly maximumHoldingMs: number;
+  readonly policy: ExecutionRiskPolicyV1;
+}
+
+type LockedEnvelope = StoredEnvelope;
+
+const ENVELOPE_ROW_PROJECTION = `envelope_id,payload_version,fingerprint,generation_id,
+  operator_id,state,per_buy_quote_amount_raw::TEXT AS per_buy_quote_amount_raw,max_buys,
+  max_total_exposure_raw::TEXT AS max_total_exposure_raw,
+  max_realized_loss_raw::TEXT AS max_realized_loss_raw,buys_armed,
+  realized_loss_raw::TEXT AS realized_loss_raw,
+  trunc(EXTRACT(EPOCH FROM valid_from)*1000)::TEXT AS valid_from_ms,
+  trunc(EXTRACT(EPOCH FROM valid_until)*1000)::TEXT AS valid_until_ms,
+  maximum_holding_ms,policy_fingerprint,risk_policy::TEXT AS risk_policy`;
+
+function storedEnvelopeFrom(value: Readonly<Record<string, unknown>> | undefined): StoredEnvelope {
+  const row = exactRow(value, [
+    'envelope_id', 'payload_version', 'fingerprint', 'generation_id', 'operator_id', 'state',
+    'per_buy_quote_amount_raw', 'max_buys', 'max_total_exposure_raw', 'max_realized_loss_raw',
+    'buys_armed', 'realized_loss_raw', 'valid_from_ms', 'valid_until_ms', 'maximum_holding_ms',
+    'policy_fingerprint', 'risk_policy',
+  ] as const);
+  if (row.payload_version !== 2) throw failure('CONFLICT');
+  return Object.freeze({
+    envelopeId: patterned(row.envelope_id, ENVELOPE_ID_PATTERN),
+    payloadVersion: 2,
+    fingerprint: patterned(row.fingerprint, /^[0-9a-f]{64}$/u),
+    generationId: generationIdFrom(String(row.generation_id)),
+    operatorId: patterned(row.operator_id, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u),
+    state: envelopeState(row.state),
+    perBuyQuoteAmountRaw: unsignedBigint(row.per_buy_quote_amount_raw),
+    maxBuys: safeInteger(row.max_buys),
+    maxTotalExposureRaw: unsignedBigint(row.max_total_exposure_raw),
+    maxRealizedLossRaw: unsignedBigint(row.max_realized_loss_raw),
+    buysArmed: safeInteger(row.buys_armed),
+    realizedLossRaw: unsignedBigint(row.realized_loss_raw),
+    validFromMs: timestampText(row.valid_from_ms),
+    validUntilMs: timestampText(row.valid_until_ms),
+    maximumHoldingMs: safeInteger(row.maximum_holding_ms),
+    policy: storedPolicyFrom(row.risk_policy, row.policy_fingerprint),
+  });
+}
+
+/** The risk policy is stored with canonicalStringifyJson: parseJson restores its bigints. */
+function storedPolicyFrom(text: unknown, fingerprint: unknown): ExecutionRiskPolicyV1 {
+  const expected = patterned(fingerprint, /^[0-9a-f]{64}$/u);
+  let policy: ExecutionRiskPolicyV1;
+  try {
+    if (typeof text !== 'string') throw new TypeError();
+    const parsed = parseJson(text);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new TypeError();
+    const { payloadVersion, policyFingerprint, ...fields } = parsed as Record<string, unknown>;
+    policy = createExecutionRiskPolicy(fields);
+    if (payloadVersion !== 1 || policyFingerprint !== policy.policyFingerprint) throw new TypeError();
+  } catch {
+    throw failure('INVALID_DATA');
+  }
+  if (policy.policyFingerprint !== expected) throw failure('INVALID_DATA');
+  return policy;
+}
+
+/** Callers hold the generation lock (51005): A24. */
+async function lockedEnvelope(
+  client: DatabaseClient,
+  envelopeId: string,
+  generationId: string,
+): Promise<LockedEnvelope> {
+  const envelope = storedEnvelopeFrom(singleRowOr(await client.query(`SELECT
+    ${ENVELOPE_ROW_PROJECTION} FROM execution_entry_envelopes
+    WHERE envelope_id=$1 AND generation_id=$2 FOR UPDATE`, [envelopeId, generationId]), 'CONFLICT'));
+  if (envelope.state !== 'ACTIVE') throw failure('CONFLICT');
+  return envelope;
+}
+
+/** The request must be exactly what the envelope allows, now (mirrors the 065 trigger). */
+function assertEnvelopeRequest(
+  request: CanaryArmamentRequest,
+  envelope: LockedEnvelope,
+  nowMs: number,
+): void {
+  if (request.payloadVersion !== 2 || request.operatorId !== envelope.operatorId
+    || request.target.quoteAmountRaw !== envelope.perBuyQuoteAmountRaw
+    || request.maximumCapitalLamports !== envelope.perBuyQuoteAmountRaw
+    || request.maximumHoldingMs !== envelope.maximumHoldingMs
+    || request.policy.policyFingerprint !== envelope.policy.policyFingerprint
+    || nowMs < envelope.validFromMs
+    || envelope.validUntilMs < nowMs + envelope.maximumHoldingMs + ENVELOPE_EXIT_MARGIN_MS
+    || request.armamentExpiresAtMs > envelope.validUntilMs
+    || request.armamentExpiresAtMs - request.armedAtMs > ENVELOPE_ARMAMENT_MAXIMUM_TTL_MS
+    || envelope.buysArmed >= envelope.maxBuys
+    || BigInt(envelope.buysArmed + 1) * envelope.perBuyQuoteAmountRaw > envelope.maxTotalExposureRaw
+    || envelope.realizedLossRaw >= envelope.maxRealizedLossRaw) throw failure('CONFLICT');
+}
+
+/**
+ * The request carries the current snapshot forward with the executor counters of its billing
+ * period (A11, like admission). Anything else is stale: the daemon reads a new context.
+ */
+async function assertEnvelopeProviderCarryForward(
+  client: DatabaseClient,
+  request: CanaryArmamentRequest,
+  envelope: LockedEnvelope,
+  nowMs: number,
+): Promise<void> {
+  const snapshot = request.providerSnapshot;
+  if (snapshot.provenance !== 'EXECUTOR_COUNTERS'
+    || snapshot.expiresAtMs > snapshot.measuredAtMs + envelope.policy.providerUsageMaxAgeMs) {
+    throw failure('CONFLICT');
+  }
+  const current = await currentProviderOf(client, snapshot.providerId, true);
+  if (current === null) throw failure('PROVIDER_CARRY_FORWARD_STALE');
+  const latest = current.snapshot;
+  if (snapshot.planId !== latest.planId || snapshot.billingPeriodId !== latest.billingPeriodId
+    || snapshot.billingPeriodStartedAtMs !== latest.billingPeriodStartedAtMs
+    || snapshot.billingPeriodEndsAtMs !== latest.billingPeriodEndsAtMs
+    || snapshot.limitUnits !== latest.limitUnits
+    || snapshot.measuredAtMs <= latest.measuredAtMs || snapshot.measuredAtMs > nowMs
+    || snapshot.usedUnits !== latest.usedUnits + current.localUsedUnits) {
+    throw failure('PROVIDER_CARRY_FORWARD_STALE');
+  }
+}
+
+const PROVIDER_ROW_PROJECTION = `snapshot_id,payload_version,snapshot_fingerprint,provider_id,
+  plan_id,billing_period_id,
+  trunc(EXTRACT(EPOCH FROM billing_period_started_at)*1000)::TEXT AS billing_period_started_at_ms,
+  trunc(EXTRACT(EPOCH FROM billing_period_ends_at)*1000)::TEXT AS billing_period_ends_at_ms,
+  limit_units::TEXT AS limit_units,used_units::TEXT AS used_units,
+  trunc(EXTRACT(EPOCH FROM measured_at)*1000)::TEXT AS measured_at_ms,
+  trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms,provenance`;
+
+interface CurrentProvider {
+  readonly snapshot: ProviderUsageSnapshotV1;
+  readonly localUsedUnits: bigint;
+}
+
+/** The provider's current snapshot (row-locked when `lock`) and its local counter units. */
+async function currentProviderOf(
+  client: DatabaseClient,
+  providerId: string,
+  lock: boolean,
+): Promise<CurrentProvider | null> {
+  const result = await client.query(`SELECT ${PROVIDER_ROW_PROJECTION}
+    FROM execution_provider_usage_snapshots WHERE provider_id=$1 AND superseded_at IS NULL
+    ${lock ? 'FOR UPDATE' : ''}`, [providerId]);
+  if (result.rows.length > 1) throw failure('INVALID_DATA');
+  if (result.rows.length === 0) return null;
+  const row = exactRow(result.rows[0], [
+    'snapshot_id', 'payload_version', 'snapshot_fingerprint', 'provider_id', 'plan_id',
+    'billing_period_id', 'billing_period_started_at_ms', 'billing_period_ends_at_ms',
+    'limit_units', 'used_units', 'measured_at_ms', 'expires_at_ms', 'provenance',
+  ] as const);
+  let snapshot: ProviderUsageSnapshotV1;
+  try {
+    snapshot = createProviderUsageSnapshot({
+      providerId: row.provider_id, planId: row.plan_id, billingPeriodId: row.billing_period_id,
+      billingPeriodStartedAtMs: timestampText(row.billing_period_started_at_ms),
+      billingPeriodEndsAtMs: timestampText(row.billing_period_ends_at_ms),
+      limitUnits: unsignedBigint(row.limit_units), usedUnits: unsignedBigint(row.used_units),
+      measuredAtMs: timestampText(row.measured_at_ms),
+      expiresAtMs: timestampText(row.expires_at_ms), provenance: row.provenance,
+    });
+  } catch {
+    throw failure('INVALID_DATA');
+  }
+  if (row.payload_version !== 1 || row.snapshot_id !== snapshot.snapshotId
+    || row.snapshot_fingerprint !== snapshot.snapshotFingerprint) throw failure('INVALID_DATA');
+  const local = exactRow(singleRow(await client.query(`SELECT COALESCE(SUM(units),0)::TEXT AS local_units
+    FROM execution_provider_usage_counters
+    WHERE provider_id=$1 AND billing_period_id=$2
+      AND recorded_at >= TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')`, [
+    snapshot.providerId, snapshot.billingPeriodId, snapshot.measuredAtMs,
+  ])), ['local_units'] as const);
+  return Object.freeze({ snapshot, localUsedUnits: unsignedBigint(local.local_units) });
+}
+
+interface ActiveEnvelope {
+  readonly envelope: EntryEnvelopeV2;
+  readonly qualification: ExecutionSafetyQualificationV2;
+  readonly buysArmed: number;
+  readonly realizedLossRaw: bigint;
+}
+
+/** The ACTIVE v2 envelope, rebuilt from its row and its ENVELOPE qualification (A23). */
+async function activeEnvelopeOf(
+  client: DatabaseClient,
+  generationId: string,
+): Promise<ActiveEnvelope | null> {
+  const result = await client.query(`SELECT ${ENVELOPE_ROW_PROJECTION}
+    FROM execution_entry_envelopes WHERE generation_id=$1 AND state='ACTIVE' AND payload_version=2`,
+  [generationId]);
+  if (result.rows.length > 1) throw failure('INVALID_DATA');
+  if (result.rows.length === 0) return null;
+  const row = storedEnvelopeFrom(result.rows[0]);
+  const qualifications = await client.query(`SELECT qualification_id
+    FROM execution_safety_qualifications WHERE envelope_id=$1`, [row.envelopeId]);
+  if (qualifications.rows.length !== 1) throw failure('INVALID_DATA');
+  const stored = await qualificationForArm(client, patterned(
+    exactRow(qualifications.rows[0], ['qualification_id'] as const).qualification_id,
+    /^execution_safety_qualification_[0-9a-f]{64}$/u,
+  ));
+  const qualification = stored.qualification;
+  if (qualification.payloadVersion !== 2 || stored.envelopeId !== row.envelopeId) {
+    throw failure('INVALID_DATA');
+  }
+  let envelope: EntryEnvelopeV2;
+  try {
+    envelope = createEntryEnvelope(Object.freeze({
+      payloadVersion: 2, qualification, operatorId: row.operatorId,
+      perBuyQuoteAmountRaw: row.perBuyQuoteAmountRaw, maxBuys: row.maxBuys,
+      maxTotalExposureRaw: row.maxTotalExposureRaw, maxRealizedLossRaw: row.maxRealizedLossRaw,
+      maximumHoldingMs: row.maximumHoldingMs, validFromMs: row.validFromMs,
+      validUntilMs: row.validUntilMs, policy: row.policy,
+    }));
+  } catch {
+    throw failure('INVALID_DATA');
+  }
+  if (envelope.envelopeId !== row.envelopeId || envelope.fingerprint !== row.fingerprint
+    || envelope.generationId !== row.generationId) throw failure('INVALID_DATA');
+  return Object.freeze({
+    envelope, qualification, buysArmed: row.buysArmed, realizedLossRaw: row.realizedLossRaw,
+  });
+}
+
+interface ActiveArmament {
+  readonly state: 'ARMED' | 'LOCKED';
+  readonly providerId: string;
+  readonly envelopeBound: boolean;
+  readonly buySucceeded: boolean;
+}
+
+/** An ARMED armament not yet expired, or a LOCKED one whatever its expiry (K=1). */
+async function activeArmamentOf(
+  client: DatabaseClient,
+  generationId: string,
+  nowMs: number,
+): Promise<ActiveArmament | null> {
+  const result = await client.query(`SELECT armament.state,armament.provider_id,
+    armament.envelope_id IS NOT NULL AS envelope_bound,intent.status='SUCCEEDED' AS buy_succeeded
+    FROM execution_activation_armaments armament
+    JOIN execution_intents intent ON intent.id=armament.target_intent_id
+    WHERE armament.generation_id=$1 AND (armament.state='LOCKED' OR (armament.state='ARMED'
+      AND armament.expires_at > TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')))`,
+  [generationId, nowMs]);
+  if (result.rows.length > 1) throw failure('INVALID_DATA');
+  if (result.rows.length === 0) return null;
+  const row = exactRow(result.rows[0], [
+    'state', 'provider_id', 'envelope_bound', 'buy_succeeded',
+  ] as const);
+  if ((row.state !== 'ARMED' && row.state !== 'LOCKED') || typeof row.provider_id !== 'string'
+    || typeof row.envelope_bound !== 'boolean' || typeof row.buy_succeeded !== 'boolean') {
+    throw failure('INVALID_DATA');
+  }
+  return Object.freeze({
+    state: row.state, providerId: row.provider_id,
+    envelopeBound: row.envelope_bound, buySucceeded: row.buy_succeeded,
+  });
+}
+
+/** No ARMED armament, a LOCKED envelope armament whose BUY SUCCEEDED, a snapshot near expiry. */
+function refreshDue(
+  armament: ActiveArmament | null,
+  provider: CurrentProvider | null,
+  nowMs: number,
+  thresholdMs: number,
+): boolean {
+  return armament !== null && armament.state === 'LOCKED' && armament.envelopeBound
+    && armament.buySucceeded && provider !== null
+    && provider.snapshot.providerId === armament.providerId
+    && provider.snapshot.expiresAtMs < nowMs + thresholdMs;
+}
+
+function autoArmContextQueryFrom(input: ExecutionAutoArmContextQueryV1): ExecutionAutoArmContextQueryV1 {
+  const excluded = input.excludedIntentIds;
+  if (!Array.isArray(excluded) || excluded.length > 10_000) throw failure('INVALID_DATA');
+  return Object.freeze({
+    generationId: generationIdFrom(input.generationId),
+    minimumRemainingMs: boundedInteger(input.minimumRemainingMs, 0, 3_600_000),
+    providerRefreshThresholdMs: boundedInteger(input.providerRefreshThresholdMs, 1, 86_400_000),
+    excludedIntentIds: Object.freeze(excluded.map((id: unknown) => patterned(id, INTENT_ID_PATTERN))),
+  });
+}
+
+function controlStateFrom(value: unknown): ExecutionControlState {
+  if (value !== 'RUNNING' && value !== 'ENTRY_STOP' && value !== 'HARD_STOP') {
+    throw failure('INVALID_DATA');
+  }
+  return value;
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw failure('INVALID_DATA');
+  }
+  return value as number;
 }
 
 function preflightSourceForRequest(
@@ -1289,6 +1799,7 @@ async function consumeCanaryAuthorization(
 async function insertCanaryArmament(
   client: DatabaseClient,
   armament: ExecutionActivationArmamentV2,
+  envelopeId: string | null,
 ): Promise<void> {
   const inserted = await client.query(`INSERT INTO execution_activation_armaments (
     armament_id,payload_version,armament_fingerprint,qualification_id,
@@ -1303,13 +1814,13 @@ async function insertCanaryArmament(
     target_wallet_snapshot_fingerprint,target_provider_snapshot_fingerprint,
     runtime_quote_max_age_ms,runtime_slippage_bps,runtime_snapshot_max_slot_lag,
     runtime_max_compute_units,runtime_max_fee_lamports,runtime_max_fee_payer_lamport_debit,
-    runtime_max_rpc_calls_per_attempt,runtime_lease_ms
+    runtime_max_rpc_calls_per_attempt,runtime_lease_ms,envelope_id
   ) VALUES ($1,2,$2,$3,$4,$5,$6,'ARMED',0,'CANARY',$7,$8,$9,$10,'mainnet-beta',$11,
     $12,1,0,$13::NUMERIC,500,1,$14,$15,$16,
     TIMESTAMPTZ 'epoch'+($17::BIGINT*INTERVAL '1 millisecond'),
     TIMESTAMPTZ 'epoch'+($18::BIGINT*INTERVAL '1 millisecond'),
     $19,$20,$21,$22::BIGINT,$23,$24,$25,$26,$27,$28::NUMERIC,$29,$30,$31,$32,$33,
-    $34,$35::BIGINT,$36::BIGINT,$37::BIGINT,$38::NUMERIC,$39::NUMERIC,$40,$41)`, [
+    $34,$35::BIGINT,$36::BIGINT,$37::BIGINT,$38::NUMERIC,$39::NUMERIC,$40,$41,$42)`, [
     armament.armamentId, armament.armamentFingerprint, armament.qualification.qualificationId,
     armament.qualification.qualificationFingerprint, armament.qualification.generationId,
     armament.authorizationId, armament.qualification.buildHash,
@@ -1326,7 +1837,7 @@ async function insertCanaryArmament(
     armament.runtimeQuoteMaxAgeMs, armament.runtimeSlippageBps.toString(),
     armament.runtimeSnapshotMaxSlotLag, armament.runtimeMaxComputeUnits.toString(),
     armament.runtimeMaxFeeLamports.toString(), armament.runtimeMaxFeePayerLamportDebit.toString(),
-    armament.runtimeMaxRpcCallsPerAttempt, armament.runtimeLeaseMs,
+    armament.runtimeMaxRpcCallsPerAttempt, armament.runtimeLeaseMs, envelopeId,
   ]);
   if (inserted.rowCount !== 1) throw failure('CONFLICT');
 }
