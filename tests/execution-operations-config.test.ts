@@ -123,6 +123,9 @@ void test('auto-arm config: arm runtime, https RPC, poll and the TTL / lease gua
   assert.equal(parseExecutionAutoArmConfig(autoArmEnvironment({
     EXECUTOR_LEASE_MS: '50000', EXECUTOR_RPC_TIMEOUT_MS: '100', EXECUTOR_AUTO_ARM_POLL_MS: '500',
   })).runtimeLeaseMs, 50_000);
+  assert.equal(parseExecutionAutoArmConfig(autoArmEnvironment({
+    EXECUTOR_LEASE_MS: '3000', EXECUTOR_RPC_TIMEOUT_MS: '20000',
+  })).rpcTimeoutMs, 20_000);
   for (const changed of [
     // 2 x lease + 20 s > 120 s.
     { EXECUTOR_LEASE_MS: '50001', EXECUTOR_RPC_TIMEOUT_MS: '100', EXECUTOR_AUTO_ARM_POLL_MS: '500' },
@@ -134,6 +137,8 @@ void test('auto-arm config: arm runtime, https RPC, poll and the TTL / lease gua
     { SOLANA_HTTP_RPC_URL: 'wss://rpc.example.com/' },
     { SOLANA_HTTP_RPC_URL: '' },
     { EXECUTOR_RPC_TIMEOUT_MS: '99' }, { EXECUTOR_RPC_TIMEOUT_MS: '30001' },
+    // Capped at 20 s even when the lease leaves room in the TTL.
+    { EXECUTOR_LEASE_MS: '3000', EXECUTOR_RPC_TIMEOUT_MS: '20001' },
     { EXECUTOR_AUTO_ARM_POLL_MS: '499' }, { EXECUTOR_AUTO_ARM_POLL_MS: '60001' },
     { EXECUTOR_ACTIVATION_PHASE: 'MICRO_LIVE' }, { EXECUTOR_ACTIVATION_PHASE: 'PILOT' },
     { LIVE_TRADING_ENABLED: 'true' },

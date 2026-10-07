@@ -275,6 +275,29 @@ void test('happy path arms the candidate with the envelope limits and operator',
   });
 });
 
+void test('the armament expires within 15 minutes even when the intent and qualification outlive it',
+  async () => {
+    const longPolicy = createExecutionRiskPolicy({
+      ...policyFields(), walletSnapshotMaxAgeMs: 900_000, providerUsageMaxAgeMs: 900_000,
+    });
+    const longEnvelope = createEntryEnvelope({
+      payloadVersion: 2, qualification, operatorId: ENVELOPE_OPERATOR,
+      perBuyQuoteAmountRaw: PER_BUY, maxBuys: 5, maxTotalExposureRaw: 50_000_000n,
+      maxRealizedLossRaw: 30_000_000n, maximumHoldingMs: 120_000,
+      validFromMs: NOW_MS, validUntilMs: qualification.expiresAtMs, policy: longPolicy,
+    });
+    const longIntent = intent({ expiresAtMs: DB_NOW_MS + 2_000_000 });
+    assert.ok(qualification.expiresAtMs > DB_NOW_MS + 900_000);
+    const { calls, tick } = harness({ context: context({
+      envelope: longEnvelope, candidateIntent: longIntent,
+    }) });
+    assert.equal((await tick()).kind, 'ARMED');
+    const [armed] = calls.arm;
+    if (armed === undefined) throw new Error('not armed');
+    assert.ok(armed.request.armamentExpiresAtMs <= armed.request.armedAtMs + 900_000);
+    assert.equal(armed.request.armamentExpiresAtMs, DB_NOW_MS + 900_000);
+  });
+
 void test('CONFLICT and INVALID_DATA reject and exclude the intent until it expires', async () => {
   for (const code of ['CONFLICT', 'INVALID_DATA'] as const) {
     const { state, tick, calls } = harness({ armError: code });

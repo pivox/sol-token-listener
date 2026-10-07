@@ -154,7 +154,8 @@ export function parseExecutionAutoArmConfig(input: unknown): ExecutionAutoArmCon
     if (base.phase !== 'CANARY' || !isEnvironment(input)) throw invalid();
     const runtime = parseArmRuntime(input);
     const httpRpcUrl = httpsUrl(environmentValue(input, 'SOLANA_HTTP_RPC_URL'));
-    const rpcTimeoutMs = decimalInteger(environmentValue(input, 'EXECUTOR_RPC_TIMEOUT_MS'), 100, 30_000);
+    // A tick (2 x RPC timeout) stays well inside the 60 s arm authorization life.
+    const rpcTimeoutMs = decimalInteger(environmentValue(input, 'EXECUTOR_RPC_TIMEOUT_MS'), 100, 20_000);
     const pollMs = decimalInteger(environmentValue(input, 'EXECUTOR_AUTO_ARM_POLL_MS'), 500, 60_000);
     const minimumRemainingMs = 2 * runtime.runtimeLeaseMs + 2 * rpcTimeoutMs + 5_000;
     if (2 * runtime.runtimeLeaseMs + 20_000 > AUTO_ARM_FAST_ENTRY_INTENT_TTL_MS
