@@ -3,9 +3,10 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **User decisions (2026-10-07, binding):**
-1. A stuck SELL gets a **guarded re-exit in this lot** (Task 5).
+1. A stuck SELL gets a **guarded re-exit in this lot** (Task 6).
 2. Take-profit stays a **market trigger**: last observed curve trade, SELL `minimumAmountOutRaw = 1` (deviation 4).
 3. **After a migration, only the deadline or a revoked envelope exits** (deviation 5).
+4. A SELL that **landed with an error and changed nothing but the fee** is a terminal no-effect failure, and the re-exit may retry it. Every other mismatch still blocks (Task 5, deviation 11).
 
 **Goal:**
 1. Recovery (H2a) sells an OPEN **envelope** position before its deadline when the first of these is true:
@@ -13,7 +14,7 @@
    2. the creator sold after our entry;
    3. take-profit: the value of the remaining tokens at the latest observed curve price reaches `EXIT_TAKE_PROFIT_BPS` of the quote cost;
    4. at least `EXIT_EXTERNAL_BUYERS_TARGET` distinct external buyers bought at least `EXIT_EXTERNAL_MIN_BUY_RAW` after our entry.
-2. The deadline exit (`maximum-holding-exit`) is unchanged. It always runs first in a pass and stays the only exit reason of CANARY positions (the Task 5 re-exit only re-issues a dead SELL).
+2. The deadline exit (`maximum-holding-exit`) is unchanged. It always runs first in a pass and stays the only exit reason of CANARY positions (the Task 6 re-exit only re-issues a dead SELL).
 3. A read-only `fast-path:report` CLI shows the funnel, the latencies, the result per position and the 429 counts (spec «Mesure»).
 4. A position stuck `EXIT_PENDING` behind a SELL intent that ended `FAILED` or `EXPIRED` with no possible send in flight gets a new SELL intent, at most 3 times per position (CANARY and envelope positions alike).
 5. It is proven, by tests, that `creates-only` already records `migrations` + `market_pools` for a tracked mint that migrates, so the live SELL can route to PumpSwap after a migration.
@@ -25,7 +26,7 @@ Nothing is signed or sent by the code added here. Signing stays in H2b.
 - **Pure decision** in a new `src/domain/fast-exit.ts` (`decideFastExit`). The repository reads the facts with SQL and passes them in. A fact that cannot be read or decoded makes its conditions undecidable: they are skipped, never an error that reaches the deadline.
 - **SELL intent creation** reuses the deadline transaction body. `createDeadlineExitIntentLocked` (`execution-live.repository.ts:5058-5154`) and `findDeadlineIntent` (`:5156-5239`) are parameterised by an exit spec: strategy id, logical command id, whether the deadline must be due, and the lower bound of `requested_at`. The deadline spec reproduces today's values exactly.
 - **Same lock order as the deadline scanner** (`:1471-1510`): `pg_advisory_xact_lock(hashtextextended('execution-live-deadline-scan:v1', 51007))`, then `lockWorkerTrackingMints`, then `lockLiveSellPresenceInTransaction`, then `lockGeneration` (51005), then `FOR UPDATE OF position`. No envelope or armament row is written.
-- **One live SELL per position** stays structural: a first exit needs the position `OPEN` with `exit_intent_id IS NULL` (`:5141-5146`). The only other write of `exit_intent_id` is the Task 5 re-exit. It replaces a dead intent (`FAILED`/`EXPIRED`, no send possible) under the same locks, and the 066 trigger enforces that guard.
+- **One live SELL per position** stays structural: a first exit needs the position `OPEN` with `exit_intent_id IS NULL` (`:5141-5146`). The only other write of `exit_intent_id` is the Task 6 re-exit. It replaces a dead intent (`FAILED`/`EXPIRED`, no send possible) under the same locks, and the 066 trigger enforces that guard.
 - **No RPC in H2a for exits.** Take-profit uses the latest observed curve trade in `domain_events`. H2b re-quotes at SELL time and protects the amount with its own slippage (`src/executor-simulation/attempt-evaluator.ts:407-413`: `protected = max(intent.minimumAmountOutRaw, computed.minimumAmountOutRaw)`).
 
 **Tech Stack:** TypeScript (tsx, node:test), PostgreSQL 16 (pg).
@@ -68,7 +69,7 @@ Spec: `docs/superpowers/specs/2026-10-06-simple-path-design.md` («Lane `exit` (
    - The `pumpswap_observation` stage runs on every observed transaction (`src/application/observed-transaction-pipeline.ts:142-143` → `src/application/pumpswap-observation-pipeline.ts:61-110`), and writes `migrations` and `market_pools`.
    - `selectTrackedCurves` then stops polling that curve (`src/storage/tracked-curve.repository.ts:55-80`).
    - The live SELL router needs exactly that row (`src/executor-simulation/venue-router.ts:62-75`, `src/storage/execution-venue.repository.ts:101-117`).
-   - Task 6 proves this with tests. The checkpoint line «creates-only n'alimente pas market_pools» is corrected once the tests pass. If they fail, stop and report: do not build a feed without a new decision.
+   - Task 8 proves this with tests. The checkpoint line «creates-only n'alimente pas market_pools» is corrected once the tests pass. If they fail, stop and report: do not build a feed without a new decision.
    - `LISTENER_TRACKED_POOL_POLL_ENABLED` stays optional. It only adds post-migration pool trades, which this lot does not read.
 8. **The report is a separate CLI, `fast-path:report`, and it runs on `DATABASE_URL` in a `READ ONLY` transaction.**
    - It does not extend `live:report`, which is an alias of `status` (`src/executor-operations/main.ts:89-92`), and it does not use the operations role: that role would need SELECT on `entry_decisions`, `domain_events`, the ledger and the heartbeats.
@@ -79,8 +80,10 @@ Spec: `docs/superpowers/specs/2026-10-06-simple-path-design.md` («Lane `exit` (
 9. **No feature flag.** `EXIT_*` are optional H2a variables with the spec defaults. Early exits only touch envelope positions, which only exist with `live:auto-arm` (lot 4a).
 10. **Migration 066 for the re-exit** (the spec plans no re-exit at all).
     - The position update guard only allows the state pairs of `execution_live_state_transition_allowed` (`migrations/036_execution_live_canary.sql:865-903`). `EXIT_PENDING → EXIT_PENDING` is not one of them, and `EXIT_PENDING → OPEN` is not either. So `exit_intent_id` cannot be replaced without a migration.
-    - 066 replaces `guard_execution_live_position_update` (`036:1090-1118`) with a body that is identical except for one extra branch. That branch accepts `EXIT_PENDING → EXIT_PENDING` only when it replaces a dead exit intent with no possible send (Task 5).
+    - 066 replaces `guard_execution_live_position_update` (`036:1090-1118`) with a body that is identical except for one extra branch. That branch accepts `EXIT_PENDING → EXIT_PENDING` only when it replaces a dead exit intent with no possible send (Task 6).
     - No other constraint, table or grant changes.
+
+11. **Narrow on-chain SELL failure (user decision 4).** It reuses `NO_EFFECT`/`RECONCILIATION_PROVED_NO_EFFECT`, and the intent ends `FAILED`: no new result, reason code or CHECK. `meta.err` is read but not persisted. Today such a SELL is `MISMATCH`/`RESIDUAL_TOKEN_BALANCE` (`src/domain/execution-reconciliation.ts:192-194`), not `BALANCE_MISMATCH` as first assumed. BUY reconciliation is unchanged.
 
 **Environment:**
 - Worktree `/Users/haythem.mabrouk/workspace/perso/sol-token-listener/.worktrees/reconcile`, branch `feat/exit-lane` (= `origin/main` `3bb355cc`, lot 4a merged).
@@ -103,7 +106,7 @@ Spec: `docs/superpowers/specs/2026-10-06-simple-path-design.md` («Lane `exit` (
 | `.env.example`, `docs/operations/executor-live-canary.md`, checkpoint | docs |
 | Tests | listed per task |
 
-One migration (066, the position update guard, Task 5). No frontend change. No new event type.
+One migration (066, the position update guard, Task 6). No frontend change. No new event type.
 
 ---
 
@@ -134,7 +137,7 @@ export function decideFastExit(facts: FastExitFacts, policy: FastExitPolicy): Fa
 export function fastExitLogicalCommandId(reason: FastExitReason, positionId: string): string; // `fast-exit:${reason}:${positionId}`
 export function exitReasonOfLogicalKey(key: string): ExitReason | null;
 // 'maximum-holding:<pos>' -> DEADLINE; 'fast-exit:<R>:<pos>' -> R; an optional ':retry-<1..3>'
-// suffix (Task 5) is stripped first; else null
+// suffix (Task 6) is stripped first; else null
 export function reExitLogicalCommandId(currentLogicalCommandId: string): string | null;
 // root = current without ':retry-<k>'; returns `${root}:retry-${k+1}` (k = 0 without suffix), null when k+1 > 3
 ```
@@ -229,6 +232,7 @@ LIMIT 10001
        - an amount that is not a canonical decimal;
        - a quote mint that is not WSOL;
        - a trader that is not null and is not a canonical public key.
+  Steps 2-3 read the facts **before** the mint / SELL-presence / 51005 locks, holding only the 51007 scan lock, and the envelope SELECT is not locked (`FOR UPDATE` would break the 4a lock order, A24). This is harmless: each fact only changes one way while a position is `OPEN` (envelopes leave `ACTIVE` but never return to it; trades are append-only after entry), so a stale read can only delay a reason by one pass. Step 6 re-locks the position and re-checks `OPEN` and `exit_intent_id IS NULL`.
   4. `decideFastExit` runs inside `try/catch`, and an error counts as `null`. The first candidate with a reason continues. If none has one, return `null`.
   5. Take `lockWorkerTrackingMints([mint])`, `lockLiveSellPresenceInTransaction`, then `lockGeneration(generationId)`: the same order as `:1500-1502`.
   6. Call `createDeadlineExitIntentLocked(client, { positionId, observedAtMs, generationId }, { FAST_EXIT_STRATEGY_ID, fastExitLogicalCommandId(reason, positionId), false, 'OPENED' })`. It re-reads the position `FOR UPDATE` and requires `OPEN` and `exit_intent_id IS NULL`. Map `REPLAYED` to `CONFLICT`: the scan only picks positions without an exit intent, so a replay here is a bug.
@@ -300,8 +304,9 @@ The SELL insert columns are the deadline's. Check that `domain_events` has no RL
   - `tests/executor-live-recovery-config.test.ts`;
   - `tests/executor-live-recovery-lanes.test.ts`;
   - `tests/executor-live-recovery-runtime.test.ts`, whose lane order assertions are at `:15-26`;
-  - `tests/executor-live-recovery-database.test.ts:153` (exact facade keys);
-  - `tests/execution-live-repository-contract.test.ts:182-205` (facade key lists).
+  - `tests/executor-live-recovery-database.test.ts:182-205` (facade key lists);
+  - `tests/execution-live-repository-contract.test.ts:70-81` (contract method list);
+  - `tests/executor-live-database.test.ts:207-211` (H2b "absent" list: add `createNextEarlyExitIntent`).
 
 Changes:
 - **Config:** `exitTakeProfitBps: bigint` (`EXIT_TAKE_PROFIT_BPS`, 10 001..100 000, default 20 000), `exitExternalBuyersTarget: number` (`EXIT_EXTERNAL_BUYERS_TARGET`, 1..1000, default 10) and `exitExternalMinimumBuyRaw: bigint` (`EXIT_EXTERNAL_MIN_BUY_RAW`, a canonical decimal > 0 that fits u64, default 1 000 000).
@@ -334,7 +339,99 @@ async function exitLane(dependencies, signal): Promise<LiveRecoveryLaneResult> {
 - [ ] **Step 2:** Implement. Run the recovery test files and the build.
 - [ ] **Step 3: Commit.** `feat(live-recovery): exit lane after the deadline lane, EXIT_* configuration`
 
-### Task 5: Guarded re-exit of a dead SELL (user decision 1)
+### Task 5: Narrow classification of a SELL that landed but failed on chain (user decision 4)
+
+**Today.** A SELL that lands with a program error (slippage exceeded, etc.) is finalized with `meta.err` set, its fee is charged and every other state change is reverted. Recovery reads it with `readFinalizedWalletDeltas` (`src/executor-live-recovery/rpc-gateway.ts:157-192`). For a SELL that call sets `unexpectedResidualTokenBalanceRaw = base.post` (`:187`), which is the full unsold balance. `classify` (`src/domain/execution-reconciliation.ts:185-219`) therefore returns `MISMATCH`/`RESIDUAL_TOKEN_BALANCE` at its first check (`:192-194`); `BALANCE_MISMATCH` (`:206-210`) is not reached. `commitSellReconciliation` then takes the `!terminal` branch (`src/storage/execution-live.repository.ts:4724-4800`): artifact `AMBIGUOUS`, intent `UNKNOWN_REQUIRES_RECONCILIATION`, position `UNKNOWN`, `unknown_block = TRUE`. MISMATCH evidence can never be resolved (`migrations/034_execution_risk_reconciliation.sql:720-728`), so the position is stuck for good.
+
+**Evidence available to the reconciler.**
+- `getTransaction` (`rpc-gateway.ts:242-306`) already requires `meta.err` (`:265-268`) but does not return it.
+- It returns `fee`, `preBalances`/`postBalances` (lamports) and `preTokenBalances`/`postTokenBalances`.
+- `tokenAmounts` (`:375-398`) sums, over every token account in those maps owned by the wallet for the mint, `pre` and `post`, and `delta = post − pre`.
+- `baseDeltaRaw` is that delta. For a WSOL quote, `quoteDeltaRaw = walletLamportDelta + fee` (`:180-182`).
+
+**"Token balance unchanged", exactly:**
+- `baseDeltaRaw === 0n`, i.e. the sum of the wallet's token amounts for the mint is the same before and after, across all of its token accounts in the transaction's token-balance maps;
+- `quoteDeltaRaw === 0n` and `walletLamportDelta === −feeLamports`, i.e. the only lamport change is the fee;
+- `0n < feeLamports ≤ expected.maximumFeeLamports`.
+
+**The new rule** is SELL only and placed **before** the residual check:
+
+```ts
+// classify(), first statement
+if (expected.side === 'SELL'
+  && observed.transactionFailed === true
+  && observed.signatureHistory === 'PRESENT' && observed.confirmationStatus === 'FINALIZED'
+  && observed.finalizedAtMs !== null && observed.observedSlot !== null
+  && observed.transaction !== null && sameTransaction(expected, observed.transaction)
+  && observed.baseDeltaRaw === 0n && observed.quoteDeltaRaw === 0n
+  && observed.walletLamportDelta === -observed.feeLamports
+  && observed.feeLamports > 0n && observed.feeLamports <= expected.maximumFeeLamports) {
+  return outcome('NO_EFFECT', 'RECONCILIATION_PROVED_NO_EFFECT');
+}
+```
+
+Every other combination falls through to today's rules unchanged:
+- `meta.err` with any token or lamport change → `MISMATCH`;
+- a successful transaction → `MATCHED` or `MISMATCH`;
+- BUY → as today.
+
+**Plumbing.** Add `transactionFailed: boolean` (`meta.err !== null`) to:
+- the gateway's finalized observation;
+- `FinalizedWalletDeltasV1` (`src/ports/execution-reconciliation-gateway.ts:16-26`; `false` when `NOT_FOUND`);
+- `OBSERVED_KEYS` (`src/domain/execution-reconciliation.ts:17-22`) and `observedFrom`. `transactionFailed === true` requires `FINALIZED`.
+- `src/executor-risk/reconciliation-service.ts:85-98`.
+
+It is **not persisted**:
+- The evidence identity and fingerprint are computed from the persisted fields (`assertExecutionReconciliationEvidenceIdentity`), and `classify` is not replayed from the database.
+- The persisted row stays distinguishable from a classic NO_EFFECT: `signature_history='PRESENT'`, `confirmation_status='FINALIZED'`, an `observed_transaction_fingerprint`, and `fee_lamports > 0`.
+
+No CHECK changes, because the evidence CHECK accepts `NO_EFFECT`/`RECONCILIATION_PROVED_NO_EFFECT` with `finalized_at` set (`034:713-719`). Update every constructor of the observed object (`grep -rln "unexpectedResidualTokenBalanceRaw:" src tests`). `src/storage/execution-risk.repository.ts` keeps its behaviour: the variant can only come from a SELL, and that path is left as is (verify it does not receive SELL evidence; if it can, it rejects a `PRESENT` NO_EFFECT with CONFLICT).
+
+**Commit path** (`commitSellReconciliation`, `execution-live.repository.ts:4564`). Define `landedNoEffect = evidence.result === 'NO_EFFECT' && evidence.signatureHistory === 'PRESENT'`. When it holds, in the same transaction:
+1. **Artifact:** if it is not already `AMBIGUOUS`, move it `ACCEPTED|CONFIRMED → AMBIGUOUS` with `RECONCILIATION_REQUIRED`, reusing the statements at `:4725-4738`. The submission-event CHECK only allows `AMBIGUOUS → RECONCILED` with `RECONCILIATION_PROVED_NO_EFFECT` (`036:1197-1200`); `CONFIRMED → RECONCILED` is reserved for `INTENT_SUCCEEDED`.
+2. **Intent:** if it is not already `UNKNOWN_REQUIRES_RECONCILIATION`, move it `SUBMITTED|CONFIRMED|RECONCILING → UNKNOWN_REQUIRES_RECONCILIATION` (`:4739-4755`).
+3. **Skip** the position `UNKNOWN` update, `unknown_block = TRUE` and `stopEntriesForSystemEvidence` (`:4767-4800`).
+4. **Run the existing NO_EFFECT branch** (`:4803-4880`), with one change: the intent goes `UNKNOWN_REQUIRES_RECONCILIATION → FAILED` (not `RETRY_READY`), with `last_reason_code='RECONCILIATION_PROVED_NO_EFFECT'` and `terminal_at = reconciliation_completed_at = finalized`. That branch already:
+   - moves the artifact `AMBIGUOUS → RECONCILED`;
+   - moves the position `UNKNOWN → EXIT_PENDING` if a prior UNKNOWN run set it;
+   - moves the exit authorization `LOCKED → ACTIVE` with `locked_intent_id=NULL` (`:4823-4829`);
+   - recomputes `unknown_block` from unresolved UNKNOWN/MISMATCH evidence;
+   - abandons the attempt;
+   - resolves prior UNKNOWN evidence (`:4710-4721`).
+
+`purge_after = terminal + 4 h`. Every constraint already allows this:
+- `UNKNOWN_REQUIRES_RECONCILIATION → FAILED` with `RECONCILIATION_PROVED_NO_EFFECT` is required by `execution_intent_transitions_reconciliation_proof_check` (`031:385-389`) and allowed by the status/reason CHECKs (`036:146-149`, `:168-171`);
+- `FAILED` is terminal, so the H2b claim never takes it again;
+- the Task 6 re-exit guard accepts it.
+
+**Why FAILED and not RETRY_READY.** `RETRY_READY` would let H2b re-sign the same intent, with no cap, until its 120 s TTL. `FAILED` is terminal, and the next SELL goes through the guarded, capped, spaced re-exit.
+
+**Grants:** none. Recovery already updates every column used (`database-authority.ts:46-121` intents, `:122-171` artifacts, `:172-191` attempts, exit authorizations, risk state).
+
+**Not counted.** The fee of a failed SELL is in no PnL: neither `execution_live_position_ledger` nor the envelope realized loss counts it. The report adds it (Task 9).
+
+- [ ] **Step 1: Write failing tests.**
+  - Domain (`tests/execution-reconciliation.test.ts`):
+    - **landed + err, unchanged balance → NO_EFFECT**: SELL, `transactionFailed`, base 0, quote 0, wallet −fee, residual > 0;
+    - **landed + err with any token change → MISMATCH**: base −1, or base +1, or wallet −fee−1;
+    - **landed + err with a fee above the maximum → MISMATCH**;
+    - **landed OK → MATCHED, unchanged**;
+    - **a BUY with err → unchanged** (MISMATCH);
+    - **`transactionFailed: true` with `NOT_FOUND` → invalid**;
+    - every existing case unchanged.
+  - Gateway (`tests/executor-live-recovery-rpc.test.ts`): `meta.err` non-null → `transactionFailed: true`; null → false.
+  - PG (`tests/execution-live-sell-reconciliation.test.ts`), for a landed-failed SELL whose artifact is `CONFIRMED` (and a second case where it is `ACCEPTED`):
+    - after reconciliation the artifact is `RECONCILED`, the intent `FAILED` (terminal), the exit authorization `ACTIVE`, the position `EXIT_PENDING`, `unknown_block = FALSE`, and the evidence is `NO_EFFECT` with `signature_history='PRESENT'`;
+    - the submission events are `CONFIRMED→AMBIGUOUS` then `AMBIGUOUS→RECONCILED`;
+    - the intent transitions are `CONFIRMED→UNKNOWN_REQUIRES_RECONCILIATION→FAILED`;
+    - a prior UNKNOWN run (position UNKNOWN) is resolved the same way;
+    - a token change keeps today's MISMATCH effects, including `unknown_block = TRUE`;
+    - a landed-OK SELL is MATCHED, unchanged;
+    - one case runs under `SET ROLE sol_token_executor_live_recovery`.
+- [ ] **Step 2:** Implement. Run the reconciliation, recovery and sell-reconciliation tests and the build.
+- [ ] **Step 3: Commit.** `feat(live-recovery): a SELL that landed with an error and moved nothing but the fee is a terminal no-effect failure`
+
+### Task 6: Guarded re-exit of a dead SELL (user decision 1)
 
 **Why it is needed.** `exit_intent_id` is set once (`execution-live.repository.ts:5141-5146`) and nothing in `src/` clears or replaces it. If that SELL intent ends `FAILED` or `EXPIRED`, the position stays `EXIT_PENDING`. The deadline scanner (`:1483`) and the exit lane only pick `OPEN` positions, so no lane sells it again.
 
@@ -362,18 +459,25 @@ So an "expired but possibly landed" SELL cannot occur. A possibly landed send ke
 4. No `execution_reconciliation_evidence` row of that intent is `MATCHED`, and none is `UNKNOWN`/`MISMATCH` with `resolved_by_evidence_id IS NULL`.
 5. The position's `execution_exit_authorizations.state = 'ACTIVE'`. A `LOCKED` authorization means signing or sending may be under way, so the re-exit waits.
 6. Repository only: `execution_wallet_risk_state.unknown_block = FALSE` for the generation.
-7. Repository only: the cap, `reExitLogicalCommandId(current) !== null` (at most `:retry-3`, so at most 4 SELL intents per position). When the cap is reached, log `executor_live_recovery.reexit_cap_reached` with the `positionId` once per pass, write nothing, and leave the position for manual action (runbook, Task 9).
+7. Repository only: the cap, `reExitLogicalCommandId(current) !== null` (at most `:retry-3`, so at most 4 SELL intents per position). Capped positions are filtered out of the candidate SQL. A separate read-only query (`listCappedDeadExits`) returns them, and the lane logs `executor_live_recovery.reexit_cap_reached` **once per position per process**: the set of logged ids is created once in `createLaneFactory` (`src/executor-live-recovery/main.ts:115-123`) and passed in, since lanes are rebuilt every pass. Nothing is written; the position is left for manual action (runbook, Task 10).
+8. Repository only: the spacing, `old.terminal_at <= now − REEXIT_MIN_SPACING_MS` (30 s).
 
 **Mechanism: replace `exit_intent_id` under the same lock order.**
 - The new intent keeps the dead intent's `strategy_id` and reason. Its `logical_command_id` is `reExitLogicalCommandId(current)`, so `<root>:retry-<k>`. The intent id is derived from `strategyId`, `strategyVersion`, `positionId`, `side` and `logicalCommandId` (`src/domain/execution-intent.ts:229-241`), so the new key gives a new id, and the logical order key stays unique (also against `execution_intent_tombstones.logical_order_key UNIQUE`, `migrations/031_execution_intents.sql:224-229`).
 - Its other fields are copied from the deadline draft: `CANONICAL_EXIT`, `minimumAmountOutRaw = 1`, `baseAmountRaw = remaining_base_raw`, the BUY's `decision_event_id`, `decision_fingerprint` = the entry fingerprint, `requested_at` = the DB clock, TTL 120 s, `live_reserved = TRUE`.
 - New repository method `createNextReExitIntent(): Promise<ExecutionReExitResultV1 | null>`. In one transaction:
   1. take the 51007 scan lock and read the clock (`:1473-1479`);
-  2. pick the oldest guard candidate (`ORDER BY opened_at, position_id LIMIT 1`, with conditions 1-6 in SQL);
+  2. pick the oldest candidate (`ORDER BY opened_at, position_id LIMIT 1`) with conditions 1 and 3-6 in SQL, and either:
+     - **(a)** the exit intent already `FAILED`/`EXPIRED` with `terminal_at <= now − REEXIT_MIN_SPACING_MS` (30 000 ms, a domain constant in `fast-exit.ts`; repository only, the trigger does not need it); or
+     - **(b)** the exit intent **expirable now**: status `PENDING`/`RETRY_READY`/`PROCESSING`/`SIMULATED`, `expires_at <= now`, lease lapsed. These are the predicates of `src/storage/execution-intent-expiration.ts:50-56`.
+
+     **Cap filter in the same SQL:** `exit_intent.logical_command_id !~ ':retry-3$'`, so one capped position cannot starve the others.
   3. take `lockWorkerTrackingMints`, `lockLiveSellPresenceInTransaction`, `lockGeneration` (51005);
-  4. `SELECT … FOR UPDATE OF position`, then re-check the guard on the locked row;
-  5. insert the new intent (the deadline INSERT, `:5125-5139`);
-  6. `UPDATE execution_live_positions SET exit_intent_id=$new, state_revision=$rev+1 WHERE position_id=$1 AND state='EXIT_PENDING' AND exit_intent_id=$old AND state_revision=$rev`, which must return rowCount 1.
+  4. `SELECT … FOR UPDATE OF position`;
+  5. **expire that one intent in place.** `expireExecutionIntentsPreSubmissionInTransaction` only runs from retention (every 60-900 s), so run its expiration statement (`execution-intent-expiration.ts:46-104`) with the extra predicate `AND intent.id=$old`. It moves the intent to `EXPIRED`, writes the transition and abandons the attempt. Recovery already has the grants: intents UPDATE (`database-authority.ts:46-121`), attempts UPDATE `status,completed_at,reason_code` (`:172-191`), transitions INSERT. An intent expired here has `terminal_at = now`, so the spacing rule defers its re-exit to a pass ≥ 30 s later: the transaction **commits the expiry and returns `null`** (expiry happening when nothing else does is the purpose of this step);
+  6. re-check the full guard on the locked row, including the spacing;
+  7. insert the new intent (the deadline INSERT, `:5125-5139`), read back with `findDeadlineIntent` using `requestedAtLowerBound='OPENED'`;
+  8. `UPDATE execution_live_positions SET exit_intent_id=$new, state_revision=$rev+1 WHERE position_id=$1 AND state='EXIT_PENDING' AND exit_intent_id=$old AND state_revision=$rev`, which must return rowCount 1.
 - **Scope:** every position, CANARY or envelope. It is the same code path and the same guard, and a CANARY position stuck behind a dead SELL needs it as much.
 - **Lane:** a new H2a lane `reexit` (log name `REEXIT`, error `REEXIT_FAILED`). `ORDERED_LANES` becomes `reconciliation, confirmation, deadline, reexit, exit` (`runtime.ts:49-53`). A pass stops at the first lane that throws, so this order keeps the deadline first and the stuck-position repair ahead of the optional early exits.
 
@@ -389,17 +493,21 @@ All statements must be replayable. `CREATE OR REPLACE FUNCTION guard_execution_l
   IF OLD.state='EXIT_PENDING' AND NEW.state='EXIT_PENDING' THEN
     -- Lot 4b re-exit: replace a dead exit intent, nothing else.
     IF OLD.exit_intent_id IS NULL OR NEW.exit_intent_id IS NULL
+      OR NOT (OLD.remaining_base_raw > 0)
       OR NEW.exit_intent_id IS NOT DISTINCT FROM OLD.exit_intent_id
       OR NEW.remaining_base_raw IS DISTINCT FROM OLD.remaining_base_raw
       OR NEW.exit_reconciliation_fingerprint IS NOT NULL
       OR NEW.closed_at IS NOT NULL OR NEW.purge_after IS NOT NULL
       OR NOT EXISTS (SELECT 1 FROM execution_intents old_exit
         WHERE old_exit.id=OLD.exit_intent_id AND old_exit.status IN ('FAILED','EXPIRED')
+          AND old_exit.side='SELL' AND old_exit.position_id=OLD.position_id
           AND old_exit.terminal_at IS NOT NULL AND old_exit.reconciliation_completed_at IS NOT NULL)
       OR NOT EXISTS (SELECT 1 FROM execution_intents new_exit
         WHERE new_exit.id=NEW.exit_intent_id AND new_exit.side='SELL'
           AND new_exit.position_id=NEW.position_id AND new_exit.status='PENDING'
-          AND new_exit.live_reserved=TRUE)
+          AND new_exit.live_reserved=TRUE
+          AND new_exit.base_amount_raw=NEW.remaining_base_raw
+          AND new_exit.minimum_amount_out_raw=1)
       OR EXISTS (SELECT 1 FROM execution_signed_transactions artifact
         WHERE artifact.intent_id=OLD.exit_intent_id
           AND artifact.state NOT IN ('RECONCILED','REVOKED_NO_SEND'))
@@ -420,7 +528,7 @@ All statements must be replayable. `CREATE OR REPLACE FUNCTION guard_execution_l
 Each condition is written as `IS NULL` / `IS DISTINCT FROM` / `EXISTS`, never as a bare comparison that a NULL would let through (the 4a lesson). The trigger binding (`036:1120-1123`) is re-created identically. `execution_live_state_transition_allowed` is not changed, because other entities use it.
 
 **Grants.** The function is SECURITY INVOKER, so the updating role needs column SELECT on everything it reads. For recovery, which is the only role that takes the new branch, all of these are already granted:
-- `execution_intents`: `id`, `status`, `side`, `position_id`, `live_reserved`, `terminal_at`, `reconciliation_completed_at`. Verify each in `database-authority.ts:46-121` and add any that is missing, both there and in the provisioning;
+- `execution_intents`: `id`, `status`, `side`, `position_id`, `live_reserved`, `terminal_at`, `reconciliation_completed_at`, `base_amount_raw`, `minimum_amount_out_raw`. Verify each in `database-authority.ts:46-121` and add any that is missing, both there and in the provisioning;
 - `execution_signed_transactions`: `intent_id`, `state` (`:122-171`);
 - `execution_reconciliation_evidence`: all columns (`:351-424`);
 - `execution_exit_authorizations`: `position_id`, `state` (`:276-300`);
@@ -429,10 +537,11 @@ Each condition is written as `IS NULL` / `IS DISTINCT FROM` / `EXISTS`, never as
 The live role's position updates never take the branch, but the function body is shared: run the existing live-role tests unchanged. No new UPDATE grant: recovery already updates `exit_intent_id` and `state_revision` (`database-authority.ts:245-256`).
 
 - [ ] **Step 1: Write failing tests** (PG, `tests/execution-live-reexit.test.ts`; the fixtures of Task 2 plus `createSellFixture`).
-  1. **Failed SELL → re-exit.** The exit intent is set `FAILED` by the real `simulations.complete` path (or its SQL equivalent with the triggers on), with no artifact. `createNextReExitIntent` creates `…:retry-1`; the position stays `EXIT_PENDING` with the new `exit_intent_id`; strategy and reason are kept.
+  1. **Failed SELL → re-exit** (with `terminal_at` at least 30 s in the past; a younger one returns `null`). The exit intent is set `FAILED` by the real `simulations.complete` path (or its SQL equivalent with the triggers on), with no artifact. `createNextReExitIntent` creates `…:retry-1`; the position stays `EXIT_PENDING` with the new `exit_intent_id`; strategy and reason are kept.
   2. **Expired SELL with no fill → re-exit.** Two cases:
      - expired before any attempt;
-     - expired after a proven `NO_EFFECT` (artifact `RECONCILED`, intent `RETRY_READY` then expired by `expireExecutionIntentsPreSubmissionInTransaction`, `src/storage/execution-intent-expiration.ts:13`).
+     - after a proven `NO_EFFECT` the intent is `RETRY_READY`, which is not terminal: `createNextReExitIntent` returns `null`. Once its `expires_at` passes, the in-place expiry (step 5) expires it **with no retention worker running**. The next call ≥ 30 s later creates `:retry-1`; a call earlier than that returns `null` (spacing);
+     - a landed-with-error SELL classified by Task 5 (`FAILED`, artifact `RECONCILED`) gives a re-exit ≥ 30 s after its `terminal_at`.
   3. **In flight or unknown → no re-exit.** Each of these returns `null` and writes nothing:
      - the intent in `PENDING`, `PROCESSING` (with a live lease), `RETRY_READY`, `SIGNED_NOT_SUBMITTED`, `SUBMITTED`, `CONFIRMED` or `UNKNOWN_REQUIRES_RECONCILIATION`;
      - the position `UNKNOWN`;
@@ -441,11 +550,11 @@ The live role's position updates never take the branch, but the function body is
      - a `LOCKED` exit authorization;
      - `unknown_block = TRUE`.
      The same states forced through a direct `UPDATE` of `exit_intent_id` are rejected `55000` by the 066 trigger.
-  4. **Cap reached → no re-exit.** After `:retry-3` fails, the call returns `null`, writes nothing and logs `reexit_cap_reached`.
+  4. **Cap reached → no re-exit.** After `:retry-3` fails, the call returns `null` and writes nothing. `reexit_cap_reached` is logged once for that position across several passes. A second, uncapped dead-exit position is still re-exited: no starvation.
   5. **Exactly one SELL fills.**
      - Two concurrent `createNextReExitIntent` create one intent.
      - A re-exit racing the reconciliation that turns the old intent's `UNKNOWN` into `NO_EFFECT` creates at most one new intent, and only after that commit.
-     - End to end (in Task 6): one MATCHED SELL and one ledger row.
+     - End to end (in Task 7): one MATCHED SELL and one ledger row.
   6. **Lapsed-lease fencing.** A `PROCESSING` SELL whose lease lapsed is expired. A later `persistSigned` with the old claim is rejected (lease lost), so no signed artifact can appear for a dead intent.
   7. **Role test.** Under `SET ROLE sol_token_executor_live_recovery`, with the roles provisioned, `createNextReExitIntent` succeeds for case 1. A direct invalid update is rejected `55000`, not `42501`.
   8. **066 migration test** (`tests/live-position-reexit-migration.test.ts`, modelled on `tests/entry-envelope-migration.test.ts`):
@@ -454,10 +563,15 @@ The live role's position updates never take the branch, but the function body is
      - `EXIT_PENDING→OPEN` is still rejected;
      - the migration replays.
   9. **Lanes and runtime.** The order is `…, deadline, reexit, exit`; `REEXIT_FAILED` is logged, and the next pass still runs the deadline first.
+  10. **Facades.**
+      - Add `createNextReExitIntent`, `listCappedDeadExits` and `createNextEarlyExitIntent` to:
+        - the recovery facade key lists, `tests/executor-live-recovery-database.test.ts:182-205`;
+        - the contract method list, `tests/execution-live-repository-contract.test.ts:70-81`.
+      - Add all three to the H2b "absent" list in `tests/executor-live-database.test.ts:207-211`, so the H2b facade cannot reach them.
 - [ ] **Step 2:** Implement: the migration and its registration, `createNextReExitIntent` (port and facade), `reExitLogicalCommandId` (Task 1 file), and the lane, logger and runtime changes. Run the new tests, `tests/execution-live.repository.test.ts`, `tests/execution-live-sell-reconciliation.test.ts`, the recovery test files and the build.
 - [ ] **Step 3: Commit.** `feat(live-recovery): guarded re-exit of a dead SELL intent, at most 3 per position (066)`
 
-### Task 6: The H2b SELL path accepts an early exit (safety checklist)
+### Task 7: The H2b SELL path accepts an early exit (safety checklist)
 
 **Files:** `tests/fast-exit-safety.test.ts` (new, PG). Reuse the SELL fixtures of `tests/execution-live-sell-reconciliation.test.ts` (`createSellFixture` `:788`), with the SELL intent produced by `createNextEarlyExitIntent` instead of the deadline.
 
@@ -470,10 +584,10 @@ Each case is a test that must hold:
 6. The deadline still sells when every fact is unreadable: malformed launch payload, malformed trades, creator ambiguous.
 7. Re-exit end to end: a first SELL fails before signature, the re-exit SELL (`:retry-1`) goes through H2b preparation (the binding at `execution-live.repository.ts:2770-2805` follows the new `exit_intent_id`), is reconciled MATCHED and closes the position. Exactly one ledger row and one MATCHED SELL evidence exist for the position.
 
-- [ ] **Step 1:** Write the tests. They should pass with Tasks 1-5; if one fails, fix the defect, not the test.
+- [ ] **Step 1:** Write the tests. They should pass with Tasks 1-6; if one fails, fix the defect, not the test.
 - [ ] **Step 2: Commit.** `test(safety): early exit fail-closed checklist`
 
-### Task 7: creates-only records the post-migration venue (proof, no feed)
+### Task 8: creates-only records the post-migration venue (proof, no feed)
 
 **Files:**
 - `tests/creates-only-migration-venue.test.ts` (new).
@@ -488,7 +602,7 @@ Each case is a test that must hold:
 - [ ] **Step 2:** If any test fails, stop and report the gap with its evidence. Do not add a feed in this lot.
 - [ ] **Step 3: Commit.** `test(listener): creates-only records migrations and market_pools for a migrating tracked mint`
 
-### Task 8: `fast-path:report` CLI
+### Task 9: `fast-path:report` CLI
 
 **Files:** create `src/cli/fast-path-report.ts`, `tests/fast-path-report.test.ts`; `package.json` `"fast-path:report": "node dist/src/cli/fast-path-report.js"`.
 
@@ -498,7 +612,7 @@ Options: `--since=<ISO-8601>` (default now − 24 h), `--until=<ISO-8601>` (defa
 
 Output `schemaVersion: 'fast-path-report.v1'`:
 - **`funnel`:**
-  - `createsObserved`: `domain_events` with `type='TokenLaunchDetected'`, `observed_at` in the window, not orphaned.
+  - `createsObserved`: `domain_events` with `type='TokenLaunchDetected'`, `created_at` in the window (uses `domain_events_resume_idx (created_at, event_id)`, `migrations/002_pumpfun_foundation.sql:95-96`), not orphaned.
   - `decisions`, `rejectedByReason{…}`, `buyIntents` (`entry_decisions` in the window by `observed_at`; `decision='BUY' AND intent_id IS NOT NULL`).
   - `armed`: `execution_activation_armaments.target_intent_id` in those intents.
   - `submitted`: BUY `execution_signed_transactions` with `submitted_at IS NOT NULL`.
@@ -506,7 +620,8 @@ Output `schemaVersion: 'fast-path-report.v1'`:
 - **`latenciesMs`:** for each of `blockToObserved` (`create_block_time→observed_at`), `observedToDecided`, `decidedToArmed` (`armed_at`), `armedToSubmitted` (`submitted_at`) and `submittedToConfirmed` (`confirmed_at`), give `{ count, p50, p90, max }`.
 - **`positions`:** positions opened in the window. Closed ones come from `execution_live_position_ledger` (never purged), open ones from `execution_live_positions`. Each gives `{ mint, state, openedAtMs, closedAtMs, holdingMs, exitReason, netLamports, pnlBps }`.
   - `pnlBps = net_lamports × 10 000 / −entry_wallet_lamport_delta`.
-  - `exitReason = exitReasonOfLogicalKey(...)`, read from the SELL intent's `logical_command_id` (`execution_intents` with `side='SELL' AND position_id = <position>`, latest `requested_at`), otherwise from `execution_intent_tombstones.logical_order_key LIKE '%:' || position_id || '%'` (latest `retired_at`), otherwise `UNKNOWN`. Also report `reExits` = the `:retry-k` suffix of that key (0 when absent).
+  - `failedSellFeesLamports`: the sum of `fee_lamports` of the position's SELL evidence with `result='NO_EFFECT' AND signature_history='PRESENT'` (Task 5). The ledger does not include these fees.
+  - `exitReason = exitReasonOfLogicalKey(...)`, read from the SELL intent's `logical_command_id` (`execution_intents` with `side='SELL' AND position_id = <position>`, latest `requested_at`), otherwise from `execution_intent_tombstones` with `(logical_order_key LIKE 'maximum-holding:%' OR logical_order_key LIKE 'fast-exit:%') AND logical_order_key LIKE '%:' || position_id || '%'` (latest `retired_at`), otherwise `UNKNOWN`. Also report `reExits` = the `:retry-k` suffix of that key (0 when absent).
 - **`rpc429`:**
   - `listener`: per provider, `{ providerId, attempts, http429Responses, sinceMs: started_at }` from the latest `listener_heartbeats` row's `payload.rpcHttpEvidence`;
   - `executor`: the count of `execution_provider_rate_limit_events` in the window, with the note `retention 4 h`.
@@ -529,7 +644,7 @@ The output never contains a signature, a wallet public key, a URL or a key.
 - [ ] **Step 2:** Implement. Run the tests and the build.
 - [ ] **Step 3: Commit.** `feat(cli): read-only fast-path report (funnel, latencies, exits, PnL, 429)`
 
-### Task 9: Docs, checkpoint, full suite, PR
+### Task 10: Docs, checkpoint, full suite, PR
 
 - [ ] **`.env.example`:**
   - add `EXIT_TAKE_PROFIT_BPS=20000`, `EXIT_EXTERNAL_BUYERS_TARGET=10` and `EXIT_EXTERNAL_MIN_BUY_RAW=1000000` in the H2a block, with a comment: envelope positions only; the deadline always applies; there is no RPC;
@@ -539,7 +654,7 @@ The output never contains a signature, a wallet public key, a URL or a key.
   - the order of the exit conditions;
   - the exit reasons in `logical_command_id`;
   - `npm run fast-path:report -- --since=…`, to be run within 4 h of a run;
-  - the re-exit (Task 5): when it fires, its cap, and the log `executor_live_recovery.reexit_cap_reached`;
+  - the re-exit (Task 6): when it fires, its cap, and the log `executor_live_recovery.reexit_cap_reached`;
   - **manual procedure when the cap is reached or a position stays `UNKNOWN`/`EXIT_PENDING`:**
     1. `live:kill-switch --mode=entry-stop` (auto-arm is already blocked by K=1);
     2. read the position, its SELL intents and artifacts with `live:status` and SQL (`execution_live_positions`, `execution_intents WHERE position_id=…`, `execution_signed_transactions WHERE intent_id IN (…)`);
@@ -551,7 +666,7 @@ The output never contains a signature, a wallet public key, a URL or a key.
   - add the stranded-exit and pre-pool window points below.
 - [ ] **Checkpoint** `docs/superpowers/plans/2026-10-06-simple-path-CHECKPOINT.md`:
   - lot 4b done (PR), with its deviations;
-  - correct the «`creates-only` n'alimente pas `market_pools`» open point (Task 6);
+  - correct the «`creates-only` n'alimente pas `market_pools`» open point (Task 8);
   - lot 5 prerequisites: the open questions below.
 - [ ] **Full suite green.**
 - [ ] **Commit, push, open the PR** (attribution per the session reminder). Wait for CI, merge, update local `main`.
@@ -560,10 +675,10 @@ The output never contains a signature, a wallet public key, a URL or a key.
 
 ## Points where safety is not certain (with recommendation)
 
-1. **Stranded exit (pre-existing; reduced by Task 5).**
+1. **Stranded exit (pre-existing; reduced by Task 6).**
    - **Risk:** `exit_intent_id` is set once and never cleared. If the SELL intent then goes `FAILED` or `EXPIRED` (TTL 120 s, `src/storage/execution-intent-expiration.ts:50-54`), the position stays `EXIT_PENDING` and no lane sells it.
    - **Bound:** with K=1 the stuck LOCKED armament also blocks every new buy, so this fails closed for spending, but the tokens stay unsold.
-   - **Now:** Task 5 re-issues the SELL for a dead intent with no possible send, at most 3 times. After the cap, and for anything ambiguous, the runbook procedure is manual.
+   - **Now:** Task 6 re-issues the SELL for a dead intent with no possible send, at most 3 times. After the cap, and for anything ambiguous, the runbook procedure is manual.
 2. **The window between curve completion and the pool row.**
    - **Risk:** once the curve is `complete`, the router requires the canonical pool (`venue-router.ts:62-75`). Until the migrate transaction has been ingested (finalized, curve poller), every SELL fails `VENUE_UNAVAILABLE`, which can strand the position (point 1). This applies to the deadline too.
    - **Bound:** take-profit 2× normally fires long before completion.
@@ -576,10 +691,18 @@ The output never contains a signature, a wallet public key, a URL or a key.
 6. **Payload format dependency.** The SQL reads the bigint marker `$solTokenListenerBigInt`. If the writer format changes, the trades list becomes null, and only REVOKED and the deadline still exit. Task 2 seeds rows with `toJsonValue` so the tests break with the writer.
 7. **The `TradeEvent` 24-byte suffix (#232)** feeds `quoteAmountRaw` / `baseAmountRaw`. If those octets change the meaning of the amounts, take-profit and the buyer threshold are wrong. The impact is bounded as in point 3.
 8. **The report uses `DATABASE_URL`**, usually the owner login, in a `READ ONLY` transaction. It is not a dedicated role. Run it only from the operator's machine.
-9. **Re-exit and double sell.** The guard accepts only `FAILED`/`EXPIRED` intents whose artifacts are all `RECONCILED` (proven no effect) or `REVOKED_NO_SEND`, with no unresolved evidence, an `ACTIVE` exit authorization and no `unknown_block`. An ambiguous send stays `UNKNOWN_REQUIRES_RECONCILIATION`, which is neither terminal nor expirable (`src/storage/execution-intent-expiration.ts:52`), so no re-exit can start.
-   - **Remaining assumption:** a signature produced but not yet persisted is never sent. Submission only reads persisted artifacts (`src/executor-live/execution-worker.ts:100-118`), and persisting requires the live lease, which expiration only takes once it has lapsed (`execution-intent-expiration.ts:55-56`). The pre-signature lock table is not read by the guard: the recovery role has no grant on it, and the lease fencing makes it redundant. Task 5 has a test for the lapsed-lease case.
-   - **Remaining risk:** a stranded pre-signature lock can leave the exit authorization `LOCKED`. The guard then waits, which fails closed (`recoverStrandedPreSignatureLock`, `execution-live.repository.ts:234`).
-10. **The relaxed position trigger (066)** is SECURITY INVOKER and reads intents, artifacts, evidence and the exit authorization. PL/pgSQL only runs those reads inside the new `EXIT_PENDING → EXIT_PENDING` branch, and only recovery takes it; Task 5 tests it under `SET ROLE`, and the existing live-role tests must pass unchanged.
+9. **Re-exit and double sell.**
+   - **Guard:** the re-exit accepts only `FAILED`/`EXPIRED` intents whose artifacts are all `RECONCILED` (proven no effect) or `REVOKED_NO_SEND`, with no unresolved evidence, an `ACTIVE` exit authorization and no `unknown_block`. An ambiguous send stays `UNKNOWN_REQUIRES_RECONCILIATION`, which is neither terminal nor expirable (`src/storage/execution-intent-expiration.ts:52`), so no re-exit can start.
+   - **Facts:** a SELL never takes a pre-signature lock (`src/executor-live/fresh-execution.ts:84-100`: only the BUY calls `authorizeExactSigning`; the SELL calls `readPreparationBinding`). Its exit authorization only becomes `LOCKED` in `persistSellSigned` (`execution-live.repository.ts:2858`, the UPDATE at `:2920-2925`), in the same transaction that persists the signed bytes and moves the intent to `SIGNED_NOT_SUBMITTED`. A SELL that dies before that has no signed artifact and an `ACTIVE` authorization; after it, the intent can no longer be expired.
+   - **Remaining assumptions:**
+     - signed SELL bytes produced before persistence, and the bytes passed to the signed `simulateTransaction`, are never broadcast. Only `submission-gateway.ts` calls `sendRawTransaction` (`tests/executor-architecture.test.ts:837-840`), and it reads persisted artifacts;
+     - a signer that lost its lease cannot persist late (Task 6 test 6).
+10. **The relaxed position trigger (066)** is SECURITY INVOKER and reads intents, artifacts, evidence and the exit authorization. PL/pgSQL only runs those reads inside the new `EXIT_PENDING → EXIT_PENDING` branch, and only recovery takes it; Task 6 tests it under `SET ROLE`, and the existing live-role tests must pass unchanged.
+11. **Landed-failed SELL classification (Task 5).**
+    - **Risk:** a transaction with `meta.err` whose token and lamport deltas are wrong would be classified NO_EFFECT, and then re-sold.
+    - **Bound:** the rule requires all of `meta.err`, base delta 0 summed over every wallet token account of the mint in the transaction's balance maps, a quote delta of 0, a wallet lamport delta of exactly −fee, and a fee within the maximum. A failed Solana transaction reverts every account except the fee payer's fee, so a real change cannot coexist with `meta.err`.
+    - **Residual:** a token account of the mint that is absent from the RPC's `pre/postTokenBalances` is invisible. That is the same visibility the MATCHED rule already relies on.
+    - **Fees:** each failed SELL costs a fee that is in no PnL. It is bounded by the cap (at most 4 intents) and shown by the report.
 
 ## Open questions for the user
 
