@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { Keypair } from '@solana/web3.js';
 import pg from 'pg';
-import { createEntryDecisionId, FAST_ENTRY_STRATEGY_ID } from '../src/domain/fast-entry.js';
+import {
+  createEntryDecisionId,
+  FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW,
+  FAST_ENTRY_PROBE_STRATEGY_ID,
+  FAST_ENTRY_STRATEGY_ID,
+} from '../src/domain/fast-entry.js';
 import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import {
@@ -201,6 +206,85 @@ void test('recordBuy after a rejection returns ALREADY_DECIDED and writes nothin
       reverseQuote: quote(mint, SOL, 1_000_000n, 95_000_000n), roundTripLossBps: 500n,
     }), { kind: 'ALREADY_DECIDED' });
     assert.deepEqual(await counts(pool), before);
+  });
+});
+
+void test('recordProbe writes the event and a PENDING probe intent, never a BUY decision', async (context) => {
+  await withRepository(context, async (pool, repository) => {
+    const { mint } = await seedLaunch(pool);
+    const launch = required(await repository.readLaunchForSignature(mint, CREATE_SIGNATURE));
+    await repository.recordRejection({
+      launch, decidedAtMs: OBSERVED_AT_MS + 1, reason: 'NO_ENVELOPE_CAPACITY',
+      roundTripLossBps: null, buyQuote: null, reverseQuote: null, envelopeId: null,
+    });
+    const decidedAtMs = OBSERVED_AT_MS + 60;
+    const result = await repository.recordProbe({
+      launch, decidedAtMs, intervalMs: 600_000,
+      buyQuote: quote(SOL, mint, FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW, 1_000n),
+    });
+    assert.equal(result.kind, 'RECORDED');
+    if (result.kind !== 'RECORDED') return;
+    const intent = (await pool.query(`SELECT strategy_id,strategy_version,status,side,live_reserved,
+      quote_amount_raw::TEXT AS quote_amount_raw,minimum_amount_out_raw::TEXT AS minimum_amount_out_raw,
+      decision_event_id,candidate_id,logical_command_id,position_id,
+      (EXTRACT(EPOCH FROM expires_at - requested_at) * 1000)::BIGINT::TEXT AS ttl_ms
+      FROM execution_intents WHERE id=$1`, [result.intentId])).rows[0] as Record<string, unknown>;
+    assert.equal(intent.strategy_id, FAST_ENTRY_PROBE_STRATEGY_ID);
+    assert.equal(intent.strategy_version, 1);
+    assert.equal(intent.status, 'PENDING');
+    assert.equal(intent.side, 'BUY');
+    assert.equal(intent.live_reserved, false);
+    assert.equal(intent.quote_amount_raw, FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW.toString());
+    assert.equal(intent.minimum_amount_out_raw, '1000');
+    assert.equal(intent.candidate_id, null);
+    assert.equal(intent.ttl_ms, '120000');
+    const suffix = createEntryDecisionId(mint).slice('entry_decision_'.length);
+    assert.equal(intent.logical_command_id, `entry_probe_${suffix}`);
+    assert.equal(intent.position_id, `fast_probe_position_${suffix}`);
+    const event = (await pool.query(`SELECT type,payload FROM domain_events WHERE event_id=$1`,
+      [intent.decision_event_id])).rows[0] as Record<string, unknown>;
+    assert.equal(event.type, 'FastEntryDecided');
+    assert.equal((event.payload as Record<string, unknown>).probe, true);
+    assert.equal((event.payload as Record<string, unknown>).envelopeId, null);
+    const decision = (await pool.query(`SELECT decision,reason_code,intent_id FROM entry_decisions
+      WHERE mint=$1`, [mint])).rows[0] as Record<string, unknown>;
+    assert.deepEqual({ ...decision }, { decision: 'REJECTED', reason_code: 'NO_ENVELOPE_CAPACITY', intent_id: null });
+  });
+});
+
+void test('recordProbe skips inside the interval', async (context) => {
+  await withRepository(context, async (pool, repository) => {
+    const probe = async (decidedAtMs: number) => {
+      const { mint } = await seedLaunch(pool);
+      const launch = required(await repository.readLaunchForSignature(mint, CREATE_SIGNATURE));
+      return (await repository.recordProbe({
+        launch, decidedAtMs, intervalMs: 600_000,
+        buyQuote: quote(SOL, mint, FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW, 1_000n),
+      })).kind;
+    };
+    const probes = async () => (await pool.query(`SELECT COUNT(*)::INTEGER AS n FROM execution_intents
+      WHERE strategy_id=$1`, [FAST_ENTRY_PROBE_STRATEGY_ID])).rows[0]?.n as number;
+    assert.equal(await probe(OBSERVED_AT_MS), 'RECORDED');
+    assert.equal(await probe(OBSERVED_AT_MS + 599_999), 'SKIPPED');
+    assert.equal(await probes(), 1);
+    assert.equal(await probe(OBSERVED_AT_MS + 600_000), 'RECORDED');
+
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS n FROM domain_events
+      WHERE type='FastEntryDecided'`)).rows[0]?.n, 2);
+  });
+});
+
+void test('recordProbe skips while any envelope is ACTIVE, lot 3 (v1) included', async (context) => {
+  await withRepository(context, async (pool, repository) => {
+    await seedEnvelope(pool, { envelopeId: 'active-v1', generationId: 'g1', now: OBSERVED_AT_MS,
+      validFromMs: OBSERVED_AT_MS + 5_000_000, validUntilMs: OBSERVED_AT_MS + 6_000_000 });
+    const { mint } = await seedLaunch(pool);
+    const launch = required(await repository.readLaunchForSignature(mint, CREATE_SIGNATURE));
+    assert.equal((await repository.recordProbe({
+      launch, decidedAtMs: OBSERVED_AT_MS, intervalMs: 600_000,
+      buyQuote: quote(SOL, mint, FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW, 1_000n),
+    })).kind, 'SKIPPED');
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS n FROM execution_intents`)).rows[0]?.n, 0);
   });
 });
 

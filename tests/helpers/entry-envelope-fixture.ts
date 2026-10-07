@@ -548,12 +548,13 @@ export async function armCanary(
   pool: Pool,
   repository: PostgresExecutionOperationsRepository,
   simulation: SeededSimulation,
+  options?: Readonly<{ strategyId?: string }>,
 ): Promise<ExecutionActivationArmamentV2>;
 export async function armCanary(
   pool: Pool,
   repository: PostgresExecutionOperationsRepository,
   simulation: SeededSimulation,
-  options: Readonly<{ returnRequest: true }>,
+  options: Readonly<{ returnRequest: true; strategyId?: string }>,
 ): Promise<Readonly<{
   armament: ExecutionActivationArmamentV2;
   request: ExecutionArmamentRequestV2;
@@ -563,7 +564,7 @@ export async function armCanary(
   pool: Pool,
   repository: PostgresExecutionOperationsRepository,
   simulation: SeededSimulation,
-  options: Readonly<{ returnRequest?: true }> = {},
+  options: Readonly<{ returnRequest?: true; strategyId?: string }> = {},
 ) {
   const snapshotNowMs = await currentDatabaseTimeMs(pool);
   const walletSnapshot = createExecutionWalletSnapshot({
@@ -594,7 +595,7 @@ export async function armCanary(
   });
   await insertExecutionDecisionEvent(pool, 'decision:canary-target', publicKey);
   const target = await new PostgresExecutionIntentRepository(pool).create(createExecutionIntentDraft({
-    strategyId: 'canary-target', strategyVersion: 1,
+    strategyId: options.strategyId ?? 'canary-target', strategyVersion: 1,
     positionId: 'position:canary-target', logicalCommandId: 'command:canary-target',
     mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint: WSOL,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,

@@ -1391,3 +1391,19 @@ void test('ENTRY_MODE refuse dossier et les valeurs inconnues', () => {
     /ENTRY_MODE has an unsupported value\./u,
   );
 });
+
+void test('FAST_ENTRY_PROBE est desactive par defaut et exige ENTRY_MODE=fast', () => {
+  const fast = { ...base, ENTRY_MODE: 'fast', LISTENER_INGESTION_SCOPE: 'creates-only' };
+  assert.equal(parseConfig(fast).fastEntryProbeEnabled, false);
+  assert.equal(parseConfig(fast).fastEntryProbeIntervalMs, 600_000);
+  const enabled = parseConfig({ ...fast, FAST_ENTRY_PROBE_ENABLED: 'true', FAST_ENTRY_PROBE_INTERVAL_MS: '60000' });
+  assert.equal(enabled.fastEntryProbeEnabled, true);
+  assert.equal(enabled.fastEntryProbeIntervalMs, 60_000);
+  assert.throws(
+    () => parseConfig({ ...base, FAST_ENTRY_PROBE_ENABLED: 'true' }),
+    /FAST_ENTRY_PROBE_ENABLED requires ENTRY_MODE=fast\./u,
+  );
+  for (const interval of ['59999', '86400001', '1e6']) {
+    assert.throws(() => parseConfig({ ...fast, FAST_ENTRY_PROBE_INTERVAL_MS: interval }));
+  }
+});

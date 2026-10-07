@@ -68,7 +68,8 @@ void test('066 applies on an empty schema and replays cleanly', async (context) 
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.ok(applied.includes(migrationName));
+    assert.equal(applied.at(-1), '067_fast_entry_probe_unarmable.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

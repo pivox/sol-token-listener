@@ -1,12 +1,16 @@
 import {
   FAST_ENTRY_MAX_CREATE_AGE_MS,
+  FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW,
   decideFastEntryQuotes,
   FAST_ENTRY_SLIPPAGE_BPS,
   precheckFastEntry,
 } from '../domain/fast-entry.js';
 import type { PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { PaperQuoteRequest } from '../ports/paper-quote-router.js';
-import type { PostgresFastEntryRepository } from '../storage/fast-entry.repository.js';
+import type {
+  FastEntryLaunchContext,
+  PostgresFastEntryRepository,
+} from '../storage/fast-entry.repository.js';
 
 export interface FastEntryService {
   onObserved(signature: string, mints: readonly string[]): Promise<void>;
@@ -20,20 +24,29 @@ export interface FastEntryDecisionEvent {
   readonly durationMs: number;
 }
 
+export interface FastEntryProbeEvent {
+  readonly mint: string;
+  readonly outcome: 'RECORDED' | 'SKIPPED' | 'QUOTE_UNAVAILABLE';
+}
+
 export interface FastEntryServiceDependencies {
   readonly repository: Pick<
     PostgresFastEntryRepository,
-    'readLaunchForSignature' | 'readActiveEnvelope' | 'recordRejection' | 'recordBuy'
+    'readLaunchForSignature' | 'readActiveEnvelope' | 'recordRejection' | 'recordBuy' | 'recordProbe'
   >;
   readonly quotes: { quote(request: PaperQuoteRequest): Promise<PaperExecutionQuote> };
   readonly maximumRoundTripLossBps: bigint;
+  /** Gate-10 bootstrap probe (FAST_ENTRY_PROBE_ENABLED); absent means disabled. */
+  readonly probe?: Readonly<{ intervalMs: number }>;
   readonly now?: () => number;
   readonly onDecision?: (event: Readonly<FastEntryDecisionEvent>) => void;
+  readonly onProbe?: (event: Readonly<FastEntryProbeEvent>) => void;
   readonly onError?: (event: Readonly<{ mint: string; errorName: string }>) => void;
 }
 
 export class DefaultFastEntryService implements FastEntryService {
   private readonly now: () => number;
+  private lastProbeAttemptAtMs: number | null = null;
 
   public constructor(private readonly deps: FastEntryServiceDependencies) {
     this.now = deps.now ?? Date.now;
@@ -72,6 +85,7 @@ export class DefaultFastEntryService implements FastEntryService {
         buyQuote: null, reverseQuote: null, envelopeId: envelope?.envelopeId ?? null,
       });
       if (recorded === 'RECORDED') this.emit(mint, 'REJECTED', reason, null, startedAtMs);
+      if (recorded === 'RECORDED' && precheck === 'NO_ENVELOPE_CAPACITY') await this.probe(launch);
       return;
     }
 
@@ -124,6 +138,36 @@ export class DefaultFastEntryService implements FastEntryService {
       launch, decidedAtMs, envelope, buyQuote, reverseQuote, roundTripLossBps: decision.lossBps,
     });
     if (bought.kind === 'RECORDED') this.emit(mint, 'BUY', null, decision.lossBps, startedAtMs);
+  }
+
+  /** At most one attempt per interval in this process; the repository enforces it durably. */
+  private async probe(launch: FastEntryLaunchContext): Promise<void> {
+    const { probe, repository, quotes } = this.deps;
+    if (probe === undefined) return;
+    const attemptAtMs = this.now();
+    if (this.lastProbeAttemptAtMs !== null && attemptAtMs - this.lastProbeAttemptAtMs < probe.intervalMs) return;
+    this.lastProbeAttemptAtMs = attemptAtMs;
+    let buyQuote: PaperExecutionQuote;
+    try {
+      buyQuote = await quotes.quote({
+        mint: launch.mint,
+        quoteAsset: {
+          mint: launch.quoteMint,
+          decimals: launch.quoteDecimals,
+          tokenProgram: launch.quoteTokenProgram,
+        },
+        side: 'BUY',
+        amountInRaw: FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW,
+        slippageBps: FAST_ENTRY_SLIPPAGE_BPS,
+      });
+    } catch {
+      this.deps.onProbe?.({ mint: launch.mint, outcome: 'QUOTE_UNAVAILABLE' });
+      return;
+    }
+    const result = await repository.recordProbe({
+      launch, decidedAtMs: this.now(), buyQuote, intervalMs: probe.intervalMs,
+    });
+    this.deps.onProbe?.({ mint: launch.mint, outcome: result.kind });
   }
 
   private emit(

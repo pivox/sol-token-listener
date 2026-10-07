@@ -24,7 +24,7 @@ void test('056 defines only the three bounded-tracking indexes and restricted li
     .filter((name) => /^\d+_[a-z0-9_-]+\.sql$/u.test(name))
     .sort((left, right) => left.localeCompare(right));
 
-  assert.equal(migrationNames.at(-1), '066_live_position_reexit.sql');
+  assert.equal(migrationNames.at(-1), '067_fast_entry_probe_unarmable.sql');
   assert.equal((sql.match(/\bCREATE INDEX\b/gu) ?? []).length, 3);
   assert.equal((sql.match(/\bCREATE VIEW\b/gu) ?? []).length, 1);
   assert.equal((sql.match(/\bLOCK TABLE\b/gu) ?? []).length, 1);
@@ -49,8 +49,8 @@ void test('056 installs from empty, upgrades from 055 and replays without replac
   async (context) => {
     await withSchema(context, async (pool) => {
       const applied = await migrateDatabase({ pool });
-      assert.equal(applied.length, 66);
-      assert.equal(applied.at(-1), '066_live_position_reexit.sql');
+      assert.equal(applied.length, 67);
+      assert.equal(applied.at(-1), '067_fast_entry_probe_unarmable.sql');
       assert.deepEqual(await migrateDatabase({ pool }), []);
       const identities = await objectIdentities(pool);
       const sql = await readFile(migrationUrl, 'utf8');

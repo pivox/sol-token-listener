@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DefaultFastEntryService } from '../src/application/fast-entry.service.js';
+import { FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW } from '../src/domain/fast-entry.js';
 import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
 import type { PaperQuoteRequest } from '../src/ports/paper-quote-router.js';
 
@@ -170,4 +171,109 @@ void test('a decision lost to a concurrent writer is not reported', async () => 
   await bought.service.onObserved('sig', ['M']);
   assert.equal(bought.calls.buys.length, 1);
   assert.equal(bought.calls.decisions.length, 0);
+});
+
+function probeSetup(opts: {
+  launches?: Record<string, unknown>;
+  env?: typeof envelope | null;
+  quoteFn?: (r: PaperQuoteRequest) => Promise<PaperExecutionQuote>;
+  probe?: 'RECORDED' | 'SKIPPED';
+} = {}) {
+  const clock = { now: NOW };
+  const calls = { rejections: [] as any[], buys: [] as any[], probes: [] as any[],
+    quotes: [] as PaperQuoteRequest[], probeEvents: [] as any[], errors: [] as any[] };
+  const service = new DefaultFastEntryService({
+    repository: {
+      readLaunchForSignature: async (mint: string) => (opts.launches ?? {
+        M: launchOf('M'), N: launchOf('N', { launchEvent: { observedAtMs: NOW + 599_000 } }),
+        O: launchOf('O', { launchEvent: { observedAtMs: NOW + 599_000 } }),
+      })[mint] as never ?? null,
+      readActiveEnvelope: async () => (opts.env === undefined ? null : opts.env),
+      recordRejection: async (i: unknown) => { calls.rejections.push(i); return 'RECORDED'; },
+      recordBuy: async (i: unknown) => { calls.buys.push(i); return { kind: 'RECORDED', intentId: 'i' }; },
+      recordProbe: async (i: unknown) => {
+        calls.probes.push(i);
+        return opts.probe === 'SKIPPED' ? { kind: 'SKIPPED' } : { kind: 'RECORDED', intentId: 'p' };
+      },
+    } as never,
+    quotes: {
+      quote: async (r) => {
+        calls.quotes.push(r);
+        if (opts.quoteFn) return opts.quoteFn(r);
+        return quote(SOL, r.mint, r.amountInRaw, 95n, 90n);
+      },
+    },
+    maximumRoundTripLossBps: 1_100n,
+    probe: { intervalMs: 600_000 },
+    now: () => clock.now,
+    onProbe: (e) => calls.probeEvents.push(e),
+    onError: (e) => calls.errors.push(e),
+  });
+  return { service, calls, clock };
+}
+
+void test('probe disabled by default: no envelope means no quote and no probe', async () => {
+  const { service, calls } = setup({ env: null });
+  await service.onObserved('sig', ['M']);
+  assert.equal(calls.quotes.length, 0);
+  assert.equal(calls.rejections[0].reason, 'NO_ENVELOPE_CAPACITY');
+});
+
+void test('probe enabled without an envelope: rejection kept, one minimal BUY quote, one probe', async () => {
+  const { service, calls } = probeSetup();
+  await service.onObserved('sig', ['M']);
+  assert.equal(calls.rejections.length, 1);
+  assert.equal(calls.rejections[0].reason, 'NO_ENVELOPE_CAPACITY');
+  assert.deepEqual(calls.quotes.map((r) => [r.mint, r.side, r.amountInRaw, r.slippageBps]), [
+    ['M', 'BUY', FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW, 1_000n],
+  ]);
+  assert.equal(calls.probes.length, 1);
+  assert.equal(calls.probes[0].launch.mint, 'M');
+  assert.equal(calls.probes[0].decidedAtMs, NOW);
+  assert.equal(calls.probes[0].intervalMs, 600_000);
+  assert.equal(calls.probes[0].buyQuote.amountInRaw, FAST_ENTRY_PROBE_QUOTE_AMOUNT_RAW);
+  assert.deepEqual(calls.probeEvents, [{ mint: 'M', outcome: 'RECORDED' }]);
+  assert.equal(calls.buys.length, 0);
+});
+
+void test('probe is rate limited to one attempt per interval, quote failures included', async () => {
+  const { service, calls, clock } = probeSetup({
+    quoteFn: async (r) => {
+      if (r.mint === 'M') throw new Error('rpc');
+      return quote(SOL, r.mint, r.amountInRaw, 95n, 90n);
+    },
+  });
+  await service.onObserved('sig', ['M']);
+  assert.equal(calls.quotes.length, 1);
+  assert.equal(calls.probes.length, 0);
+  assert.deepEqual(calls.probeEvents, [{ mint: 'M', outcome: 'QUOTE_UNAVAILABLE' }]);
+  clock.now = NOW + 599_999;
+  await service.onObserved('sig', ['N']);
+  assert.equal(calls.quotes.length, 1);
+  clock.now = NOW + 600_000;
+  await service.onObserved('sig', ['O']);
+  assert.equal(calls.quotes.length, 2);
+  assert.equal(calls.probes.length, 1);
+  assert.equal(calls.probes[0].launch.mint, 'O');
+  assert.equal(calls.rejections.length, 3);
+  assert.equal(calls.errors.length, 0);
+});
+
+void test('probe never runs with an envelope or for another precheck rejection', async () => {
+  const withEnvelope = probeSetup({ env: envelope });
+  await withEnvelope.service.onObserved('sig', ['M']);
+  assert.equal(withEnvelope.calls.probes.length, 0);
+  assert.deepEqual(withEnvelope.calls.quotes.map((r) => r.amountInRaw), [100n, 90n]);
+
+  const sold = probeSetup({ launches: { M: launchOf('M', { creatorSoldInCreate: true }) } });
+  await sold.service.onObserved('sig', ['M']);
+  assert.equal(sold.calls.quotes.length + sold.calls.probes.length, 0);
+  assert.equal(sold.calls.rejections[0].reason, 'CREATOR_ALREADY_SOLD');
+});
+
+void test('a probe skipped by the database is reported as SKIPPED', async () => {
+  const { service, calls } = probeSetup({ probe: 'SKIPPED' });
+  await service.onObserved('sig', ['M']);
+  assert.equal(calls.probes.length, 1);
+  assert.deepEqual(calls.probeEvents, [{ mint: 'M', outcome: 'SKIPPED' }]);
 });

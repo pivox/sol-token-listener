@@ -4,6 +4,7 @@ import { createExecutionIntentDraft, type ExecutionQuoteTokenProgram } from '../
 import {
   createEntryDecisionId,
   FAST_ENTRY_INTENT_TTL_MS,
+  FAST_ENTRY_PROBE_STRATEGY_ID,
   FAST_ENTRY_RETENTION_MS,
   FAST_ENTRY_STRATEGY_ID,
   type FastEntryEnvelope,
@@ -62,6 +63,17 @@ export interface FastEntryBuyInput {
   readonly roundTripLossBps: bigint;
 }
 
+export interface FastEntryProbeInput {
+  readonly launch: FastEntryLaunchContext;
+  readonly decidedAtMs: number;
+  readonly buyQuote: PaperExecutionQuote;
+  readonly intervalMs: number;
+}
+
+export type FastEntryProbeResult =
+  | { readonly kind: 'RECORDED'; readonly intentId: string }
+  | { readonly kind: 'SKIPPED' };
+
 export type FastEntryBuyResult =
   | { readonly kind: 'RECORDED'; readonly intentId: string }
   | { readonly kind: 'ALREADY_DECIDED' };
@@ -101,6 +113,14 @@ const ENVELOPE_SQL = `SELECT envelope_id,per_buy_quote_amount_raw::TEXT AS per_b
   WHERE state='ACTIVE' AND valid_from <= $1 AND valid_until > $1 AND buys_armed < max_buys
   ORDER BY created_at,envelope_id
   LIMIT 1`;
+
+// Serializes probes across listener processes; checked again under the lock. Any ACTIVE envelope
+// stops probing (stricter than "no ACTIVE v2"; the listener role cannot read payload_version).
+const PROBE_LOCK_SQL = `SELECT pg_advisory_xact_lock(hashtextextended('fast-entry-probe:v1', 0))`;
+const PROBE_DUE_SQL = `SELECT
+    NOT EXISTS (SELECT 1 FROM execution_entry_envelopes WHERE state='ACTIVE')
+    AND NOT EXISTS (SELECT 1 FROM execution_intents
+      WHERE strategy_id=$1 AND requested_at > $2) AS due`;
 
 const INSERT_DECISION_SQL = `INSERT INTO entry_decisions (
     decision_id,mint,launch_event_id,create_slot,create_block_time,observed_at,decided_at,
@@ -174,7 +194,12 @@ export class PostgresFastEntryRepository {
         await client.query('ROLLBACK');
         return Object.freeze({ kind: 'ALREADY_DECIDED' });
       }
-      const event = fastEntryDecidedEvent(input, decisionId);
+      const event = fastEntryDecidedEvent(launch, decisionId, {
+        envelopeId: input.envelope.envelopeId,
+        buyQuote: serializeQuote(input.buyQuote),
+        reverseQuote: serializeQuote(input.reverseQuote),
+        roundTripLossBps: input.roundTripLossBps.toString(),
+      });
       await insertDomainEventWithRaw(client, null, event);
       const draft = createExecutionIntentDraft({
         strategyId: FAST_ENTRY_STRATEGY_ID,
@@ -216,16 +241,75 @@ export class PostgresFastEntryRepository {
       client.release();
     }
   }
+
+  /**
+   * Writes one unarmable probe BUY intent for the simulation-only worker (gate 10), unless an
+   * envelope is ACTIVE or a probe was requested within the interval. No entry decision is
+   * written: the mint keeps its NO_ENVELOPE_CAPACITY rejection, so the funnel is unchanged.
+   */
+  public async recordProbe(input: FastEntryProbeInput): Promise<FastEntryProbeResult> {
+    const { launch, decidedAtMs } = input;
+    const suffix = createEntryDecisionId(launch.mint).slice('entry_decision_'.length);
+    const client = await this.pool.connect();
+    try {
+      // READ COMMITTED: the check below must see a probe committed while waiting for the lock.
+      await client.query('BEGIN');
+      await client.query(FOUNDATION_RETENTION_SHARED_FENCE_SQL);
+      await client.query(PROBE_LOCK_SQL);
+      const due = await client.query(PROBE_DUE_SQL, [
+        FAST_ENTRY_PROBE_STRATEGY_ID, new Date(decidedAtMs - input.intervalMs),
+      ]);
+      if (due.rows[0]?.due !== true) {
+        await client.query('ROLLBACK');
+        return Object.freeze({ kind: 'SKIPPED' });
+      }
+      const event = fastEntryDecidedEvent(launch, `entry_probe_${suffix}`, {
+        probe: true, envelopeId: null, buyQuote: serializeQuote(input.buyQuote),
+      });
+      await insertDomainEventWithRaw(client, null, event);
+      const created = await createExecutionIntentInTransaction(client, createExecutionIntentDraft({
+        strategyId: FAST_ENTRY_PROBE_STRATEGY_ID,
+        strategyVersion: 1,
+        positionId: `fast_probe_position_${suffix}`,
+        candidateId: null,
+        logicalCommandId: `entry_probe_${suffix}`,
+        mint: launch.mint,
+        side: 'BUY',
+        venuePolicy: 'PUMP_FUN_ONLY',
+        quoteMint: launch.quoteMint,
+        quoteTokenProgram: launch.quoteTokenProgram,
+        quoteDecimals: launch.quoteDecimals,
+        quoteAmountRaw: input.buyQuote.amountInRaw,
+        baseAmountRaw: null,
+        minimumAmountOutRaw: input.buyQuote.minimumAmountOutRaw,
+        decisionEventId: event.id,
+        decisionFingerprint: createExecutionDecisionFingerprint(event),
+        requestedAtMs: decidedAtMs,
+        expiresAtMs: decidedAtMs + FAST_ENTRY_INTENT_TTL_MS,
+      }));
+      await client.query('COMMIT');
+      return Object.freeze({ kind: 'RECORDED', intentId: created.intent.id });
+    } catch (error: unknown) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 }
 
-function fastEntryDecidedEvent(input: FastEntryBuyInput, decisionId: string): DomainEvent {
-  const launchEvent = input.launch.launchEvent;
+function fastEntryDecidedEvent(
+  launch: FastEntryLaunchContext,
+  decisionId: string,
+  payload: Readonly<Record<string, unknown>>,
+): DomainEvent {
+  const launchEvent = launch.launchEvent;
   const type = 'FastEntryDecided';
   const source = 'fast-entry';
   return Object.freeze({
     id: createDeterministicDerivedEventId({
       type,
-      mint: input.launch.mint,
+      mint: launch.mint,
       source,
       program: launchEvent.program,
       signature: launchEvent.signature,
@@ -233,7 +317,7 @@ function fastEntryDecidedEvent(input: FastEntryBuyInput, decisionId: string): Do
       qualifier: decisionId,
     }),
     type,
-    mint: input.launch.mint,
+    mint: launch.mint,
     source,
     program: launchEvent.program,
     signature: launchEvent.signature,
@@ -242,13 +326,7 @@ function fastEntryDecidedEvent(input: FastEntryBuyInput, decisionId: string): Do
     blockchainTimeMs: launchEvent.blockchainTimeMs,
     observedAtMs: launchEvent.observedAtMs,
     payloadVersion: 1,
-    payload: Object.freeze({
-      decisionId,
-      envelopeId: input.envelope.envelopeId,
-      buyQuote: serializeQuote(input.buyQuote),
-      reverseQuote: serializeQuote(input.reverseQuote),
-      roundTripLossBps: input.roundTripLossBps.toString(),
-    }),
+    payload: Object.freeze({ decisionId, ...payload }),
   });
 }
 

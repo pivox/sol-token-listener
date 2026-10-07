@@ -1734,9 +1734,19 @@ async function promoteCanaryTarget(
   client: DatabaseClient,
   intentId: string,
 ): Promise<void> {
-  const promoted = await client.query(`UPDATE execution_intents
-    SET live_reserved=TRUE
-    WHERE id=$1 AND live_reserved=FALSE`, [intentId]);
+  let promoted;
+  try {
+    promoted = await client.query(`UPDATE execution_intents
+      SET live_reserved=TRUE
+      WHERE id=$1 AND live_reserved=FALSE`, [intentId]);
+  } catch (error) {
+    // 067: a fast-entry probe target is never armable (CANARY v2 has no strategy check).
+    if (databaseCode(error) === '23514'
+      && (error as { constraint?: unknown }).constraint === 'execution_intents_probe_unarmable_check') {
+      throw failure('CONFLICT');
+    }
+    throw error;
+  }
   if (promoted.rowCount !== 1 || promoted.rows.length !== 0) throw failure('CONFLICT');
 }
 
