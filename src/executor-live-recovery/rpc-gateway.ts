@@ -232,7 +232,9 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
       const value: unknown = values[0];
       if (value === null) return null;
       const status = record(value);
-      exactKeys(status, ['slot', 'confirmations', 'err', 'confirmationStatus']);
+      // Agave 4.3 adds the legacy `status` object; it is bounded and ignored (err decides).
+      knownKeys(status, ['slot', 'confirmations', 'err', 'confirmationStatus'], ['status']);
+      if (Object.hasOwn(status, 'status') && !isTransactionStatus(status.status)) invalidResponse();
       const confirmationStatus = status.confirmationStatus;
       if (confirmationStatus !== 'processed' && confirmationStatus !== 'confirmed'
         && confirmationStatus !== 'finalized') invalidResponse();
@@ -273,7 +275,9 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
     if (raw === null) return null;
     try {
       const root = record(raw);
-      exactKeys(root, ['slot', 'blockTime', 'transaction', 'meta', 'version']);
+      // Agave 4.3 adds `transactionIndex`; it is bounded and ignored.
+      knownKeys(root, ['slot', 'blockTime', 'transaction', 'meta', 'version'], ['transactionIndex']);
+      if (Object.hasOwn(root, 'transactionIndex')) safeInteger(root.transactionIndex);
       const slot = unsignedInteger(root.slot);
       blockTime(root.blockTime);
       const tuple = root.transaction;

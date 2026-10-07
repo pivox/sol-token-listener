@@ -63,6 +63,62 @@ void test('rejects malformed or unknown signature-status context fields', async 
   }
 });
 
+void test('tolerates the Agave 4.3 signature-status object and still rejects unknown keys', async () => {
+  const agaveStatus = Object.freeze({
+    slot: 500, confirmations: null, status: { Ok: null }, err: null, confirmationStatus: 'finalized',
+  });
+  const session = sessionFor([], () => ({
+    context: { slot: 501, apiVersion: '4.3.0' }, value: [agaveStatus],
+  }));
+  assert.deepEqual(await session.observeSignature('1'.repeat(64), signal()), {
+    confirmationStatus: 'FINALIZED', observedSlot: 500n, observedAtMs: 2_000,
+  });
+
+  for (const status of [
+    { ...agaveStatus, zzzUnexpected: 1 },
+    { ...agaveStatus, status: { Ok: null, Err: null } },
+    { ...agaveStatus, status: 'Ok' },
+  ]) {
+    const hostile = sessionFor([], () => ({ context: { slot: 501 }, value: [status] }));
+    await assert.rejects(
+      hostile.observeSignature('1'.repeat(64), signal()),
+      (error: unknown) => error instanceof LiveRecoveryRpcError
+        && error.code === 'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
+void test('tolerates the Agave 4.3 getTransaction root fields and still rejects unknown keys', async () => {
+  const fixture = fullV0TransactionFixture();
+  const agaveTransaction = Object.freeze({ ...fixture.rpcTransaction, transactionIndex: 3 });
+  const session = sessionFor([], ({ method }) => {
+    if (method === 'getTransaction') return agaveTransaction;
+    throw new Error('unexpected method');
+  });
+  assert.deepEqual(await session.readNormalizedTransaction(fixture.signature, signal()), {
+    signature: fixture.signature,
+    blockhash: GENESIS,
+    messageHash: fixture.messageHash,
+  });
+
+  for (const response of [
+    { ...agaveTransaction, zzzUnexpected: 1 },
+    { ...agaveTransaction, transactionIndex: -1 },
+    { ...agaveTransaction, transactionIndex: '3' },
+    { ...agaveTransaction, meta: { ...fixture.rpcTransaction.meta, zzzUnexpected: 1 } },
+  ]) {
+    const hostile = sessionFor([], ({ method }) => {
+      if (method === 'getTransaction') return response;
+      throw new Error('unexpected method');
+    });
+    await assert.rejects(
+      hostile.readNormalizedTransaction(fixture.signature, signal()),
+      (error: unknown) => error instanceof LiveRecoveryRpcError
+        && error.code === 'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
 void test('shares one finalized transaction read and derives exact wallet deltas as bigint', async () => {
   const fixture = transactionFixture();
   const requests: RpcRequest[] = [];

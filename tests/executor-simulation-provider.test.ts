@@ -594,6 +594,53 @@ void test('validates current simulation loaded data size and forbids replacement
   }
 });
 
+void test('tolerates the Agave 4.3 simulateTransaction fields and still rejects unknown keys', async () => {
+  const agaveValue = Object.freeze({
+    accounts: [], err: null, fee: 5_000, innerInstructions: [], loadedAccountsDataSize: 149,
+    loadedAddresses: { readonly: [], writable: [] }, logs: [],
+    postBalances: [402_934_765, 1], preBalances: [402_939_765, 1],
+    postTokenBalances: [{
+      accountIndex: 1, mint: OTHER_KEY, owner: PUBLIC_KEY, programId: OTHER_KEY,
+      uiTokenAmount: { amount: '500', decimals: 6, uiAmount: 0.0005, uiAmountString: '0.0005' },
+    }],
+    preTokenBalances: [],
+    replacementBlockhash: null, returnData: null, unitsConsumed: 150,
+  });
+  const valid = await preparedSimulationSession(agaveValue);
+  const result = await valid.session.simulateUnsignedTransaction(simulationRequest(), activeSignal());
+  assert.equal(result.failureKind, null);
+  assert.equal(result.unitsConsumed, 150n);
+  assert.deepEqual(Object.keys(result).sort(), [
+    'accounts', 'contextSlot', 'failureKind', 'innerInstructions', 'logs', 'providerId',
+    'unitsConsumed',
+  ]);
+
+  for (const simulationValue of [
+    { ...agaveValue, zzzUnexpected: 1 },
+    { ...agaveValue, fee: -1 },
+    { ...agaveValue, fee: '5000' },
+    { ...agaveValue, loadedAddresses: { readonly: [], writable: [], zzzUnexpected: [] } },
+    { ...agaveValue, loadedAddresses: { readonly: ['not-a-key'], writable: [] } },
+    { ...agaveValue, preBalances: [-1, 1] },
+    { ...agaveValue, postBalances: 'many' },
+    { ...agaveValue, postTokenBalances: [{ ...agaveValue.postTokenBalances[0], zzzUnexpected: 1 }] },
+    { ...agaveValue, postTokenBalances: [{ ...agaveValue.postTokenBalances[0], accountIndex: 256 }] },
+    {
+      ...agaveValue,
+      postTokenBalances: [{
+        ...agaveValue.postTokenBalances[0],
+        uiTokenAmount: { amount: '500', decimals: 6, uiAmount: 0.0005 },
+      }],
+    },
+  ]) {
+    const hostile = await preparedSimulationSession(simulationValue);
+    await expectCode(
+      hostile.session.simulateUnsignedTransaction(simulationRequest(), activeSignal()),
+      'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
 void test('accepts bounded fractional parsed evidence but rejects non-finite JSON numbers', async () => {
   const finite = await preparedSimulationSession({
     err: null,

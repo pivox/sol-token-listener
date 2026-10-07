@@ -157,6 +157,61 @@ void test('simulates signed bytes and derives payer, SPL base and SPL quote delt
   ]);
 });
 
+void test('tolerates the Agave 4.3 signed simulation fields and still rejects unknown keys', async () => {
+  const fixture = simulationFixture();
+  const agaveValue = Object.freeze({
+    accounts: fixture.post,
+    err: null,
+    fee: 5_000,
+    innerInstructions: [],
+    loadedAccountsDataSize: 149,
+    loadedAddresses: { readonly: [], writable: [] },
+    logs: ['Program log: signed', 'Program success'],
+    postBalances: [9_994_000, 2_039_280, 2_039_280],
+    postTokenBalances: [{
+      accountIndex: 1, mint: BLOCKHASH, owner: fixture.payer.toBase58(), programId: GENESIS,
+      uiTokenAmount: { amount: '105', decimals: 6, uiAmount: 0.000_105, uiAmountString: '0.000105' },
+    }],
+    preBalances: [10_000_000, 2_039_280, 2_039_280],
+    preTokenBalances: [],
+    replacementBlockhash: null,
+    returnData: null,
+    unitsConsumed: 26_000,
+  });
+  const sessionFor = (value: unknown): SolanaLiveRpcSession => new SolanaLiveRpcSession(
+    config(),
+    rpcTransport(({ method }) => {
+      if (method === 'getGenesisHash') return GENESIS;
+      if (method === 'getMultipleAccounts') return { context: { slot: 123 }, value: fixture.pre };
+      return { context: { slot: 125 }, value };
+    }).fetch,
+  );
+
+  const valid = sessionFor(agaveValue);
+  await valid.verifyGenesis(signal());
+  const result = await valid.simulateSignedTransaction(fixture.request, signal());
+  assert.equal(result.failureKind, null);
+  assert.equal(result.unitsConsumed, 26_000n);
+  assert.equal(result.baseDeltaRaw, 95n);
+  assert.equal(result.quoteDeltaRaw, -100n);
+
+  for (const hostileValue of [
+    { ...agaveValue, zzzUnexpected: 1 },
+    { ...agaveValue, fee: -1 },
+    { ...agaveValue, loadedAddresses: { readonly: [], writable: [], zzzUnexpected: [] } },
+    { ...agaveValue, preBalances: [-1] },
+    { ...agaveValue, postTokenBalances: [{ ...agaveValue.postTokenBalances[0], zzzUnexpected: 1 }] },
+    { ...agaveValue, replacementBlockhash: { blockhash: BLOCKHASH, lastValidBlockHeight: 1 } },
+  ]) {
+    const hostile = sessionFor(hostileValue);
+    await hostile.verifyGenesis(signal());
+    await rejectsCode(
+      hostile.simulateSignedTransaction(fixture.request, signal()),
+      'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
 void test('supports an absent pre base account and classifies program failures', async () => {
   const fixture = simulationFixture();
   const transport = rpcTransport(({ method }) => {

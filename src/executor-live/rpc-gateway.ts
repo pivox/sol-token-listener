@@ -125,7 +125,15 @@ const ACCOUNT_KEYS = Object.freeze([
 const SIMULATION_VALUE_KEYS = Object.freeze([
   'err', 'logs', 'unitsConsumed', 'accounts', 'returnData',
   'innerInstructions', 'loadedAccountsDataSize', 'replacementBlockhash',
+  // Agave 4.3 additions: bounded and ignored, never used for a decision.
+  'fee', 'loadedAddresses', 'preBalances', 'postBalances',
+  'preTokenBalances', 'postTokenBalances',
 ] as const);
+const TOKEN_BALANCE_KEYS = Object.freeze([
+  'accountIndex', 'mint', 'uiTokenAmount', 'owner', 'programId',
+] as const);
+// A transaction addresses at most 256 account keys (u8 indexes), loaded ones included.
+const MAX_TRANSACTION_ACCOUNT_KEYS = 256;
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const SYSTEM_PROGRAM = SystemProgram.programId.toBase58();
 const SPL_TOKEN_PROGRAMS = new Set([
@@ -783,6 +791,46 @@ function validateSupplementarySimulationFields(value: Record<string, unknown>): 
   }
   if (value.replacementBlockhash !== undefined && value.replacementBlockhash !== null) {
     throw new TypeError();
+  }
+  validateSimulationBalanceEvidence(value);
+}
+
+function validateSimulationBalanceEvidence(value: Record<string, unknown>): void {
+  if (value.fee !== undefined && value.fee !== null) void safeIntegerBigint(value.fee);
+  if (value.loadedAddresses !== undefined && value.loadedAddresses !== null) {
+    const addresses = plainRecord(value.loadedAddresses);
+    exactKeys(addresses, ['writable', 'readonly']);
+    if (!Array.isArray(addresses.writable) || !Array.isArray(addresses.readonly)
+      || addresses.writable.length + addresses.readonly.length > MAX_TRANSACTION_ACCOUNT_KEYS) {
+      throw new TypeError();
+    }
+    for (const list of [addresses.writable, addresses.readonly]) {
+      for (const address of list) void publicKey(address);
+    }
+  }
+  for (const balances of [value.preBalances, value.postBalances]) {
+    if (balances === undefined || balances === null) continue;
+    if (!Array.isArray(balances) || balances.length > MAX_TRANSACTION_ACCOUNT_KEYS) {
+      throw new TypeError();
+    }
+    for (const lamports of balances) void safeIntegerBigint(lamports);
+  }
+  for (const tokenBalances of [value.preTokenBalances, value.postTokenBalances]) {
+    if (tokenBalances === undefined || tokenBalances === null) continue;
+    if (!Array.isArray(tokenBalances) || tokenBalances.length > MAX_TRANSACTION_ACCOUNT_KEYS) {
+      throw new TypeError();
+    }
+    for (const rowValue of tokenBalances) {
+      const row = plainRecord(rowValue);
+      knownKeys(row, TOKEN_BALANCE_KEYS, ['accountIndex', 'mint', 'uiTokenAmount']);
+      void boundedInteger(row.accountIndex, 0, MAX_TRANSACTION_ACCOUNT_KEYS - 1);
+      void publicKey(row.mint);
+      if (row.owner !== undefined) void publicKey(row.owner);
+      if (row.programId !== undefined) void publicKey(row.programId);
+      const amount = plainRecord(row.uiTokenAmount);
+      exactKeys(amount, ['amount', 'decimals', 'uiAmount', 'uiAmountString']);
+      boundedJson(amount, 0, { nodes: 0 });
+    }
   }
 }
 
