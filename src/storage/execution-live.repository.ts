@@ -2492,9 +2492,12 @@ function exactSigningInputFrom(value: ExecutionExactSigningInputV1): ExecutionEx
       throw new TypeError();
     }
     const material = unsignedSigningMaterialFrom(value.material);
+    // The material's build fingerprint hashes this transaction's exact instructions (mint, curve
+    // accounts, amount), so it is never compared to the static gate-10 hash in runtime.buildHash:
+    // the static hash binds qualification, armament and lock; the per-transaction consistency is
+    // enforced by unsignedSigningMaterialFrom (material vs its simulation) and fresh-execution.
     if (material.walletPublicKey !== value.runtime.walletPublicKey
-      || material.providerId !== value.runtime.providerId
-      || material.buildFingerprint !== value.runtime.buildHash) throw new TypeError();
+      || material.providerId !== value.runtime.providerId) throw new TypeError();
     return Object.freeze({
       claim, attempt: Object.freeze({ ...value.attempt }), generationId: value.generationId,
       runtime: Object.freeze({ ...value.runtime }), material,

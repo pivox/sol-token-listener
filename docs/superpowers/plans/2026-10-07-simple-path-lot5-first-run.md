@@ -64,32 +64,23 @@ noms de variables ont été lus, avec l'indication « valeur présente » ou « 
 4. **Environnements et logins absents.**
    - `live.env` suit l'ancien schéma `LIVE_*`, qu'aucun code actuel ne lit.
    - Il faut 9 fichiers d'environnement hors Git (§A.2) et 6 logins PostgreSQL mono-rôle (§A.5).
-5. **`EXECUTOR_BUILD_HASH` est comparé à l'empreinte de build de chaque transaction (revue du
-   mini-lot 5a, 2026-10-07). Décision de l'utilisateur requise avant tout BUY réel.**
-   - `buildFingerprint` (`src/executor-simulation/solana-simulation-gateway.ts`, `buildFingerprint`)
-     hache le fee payer, les programmes, tous les comptes (mint, bonding curve) et les données
-     (montant) de la transaction : il est propre à **une** transaction.
-   - `authorizeExactSigning` (`src/storage/execution-live.repository.ts`, `exactSigningInputFrom`)
-     exige `material.buildFingerprint === runtime.buildHash`, c'est-à-dire `EXECUTOR_BUILD_HASH`,
-     une valeur statique. `prepareEnvelopeFacts` n'accepte que l'artefact gate 10 dont le
-     `build_fingerprint` vaut cette même valeur.
-   - Conséquence : avec l'enveloppe (mint inconnu à l'avance), le premier BUY `fast-entry-v1`
-     construit une transaction d'un autre mint, l'égalité échoue, H2b refuse de signer
-     (`INVALID_INPUT`), et chaque BUY de l'enveloppe échoue fermé en consommant un `buys_armed`.
-     Seul CANARY v3 (simulation appariée sur le même mint et le même montant) satisfait l'égalité.
-     Tous les tests du dépôt partagent une constante entre les deux valeurs, d'où l'angle mort.
-   - Le correctif n'est **pas** dans le mini-lot 5a. Options :
-     - (a) **recommandée, la plus simple** : retirer cette seule égalité dans `exactSigningInputFrom`.
-       La cohérence par transaction reste garantie deux fois : `unsignedSigningMaterialFrom` lie le
-       matériel à sa simulation non signée, et `fresh-execution.ts` lie l'artefact de simulation
-       signée de la tentative au matériel avant soumission. `EXECUTOR_BUILD_HASH` reste l'ancre de
-       la qualification, de l'armement et du verrou (égalités `armament_build_hash` et `build_hash`,
-       toutes statiques). Un test : matériel dont l'empreinte diffère de `runtime.buildHash` mais
-       égale à sa simulation → autorisation accordée ;
-     - (b) redéfinir l'empreinte de build comme un hash logiciel indépendant de la transaction,
-       côté simulation et côté live : plus large, touche l'artefact, le catalogue live et H2b.
-   - Tant que ce n'est pas tranché, le dry-run (partie C) reste valable jusqu'à l'armement, mais
-     B23 (H2b) ne doit pas être lancé.
+5. **Résolu dans la branche `fix/build-hash-per-transaction` (option a) : `EXECUTOR_BUILD_HASH`
+   n'est plus comparé à l'empreinte de build de chaque transaction** (revue du mini-lot 5a,
+   2026-10-07).
+   - `buildFingerprint` (`src/executor-simulation/solana-simulation-gateway.ts`) hache le fee payer,
+     les programmes, tous les comptes (mint, bonding curve) et les données (montant) : il est propre
+     à **une** transaction. `exactSigningInputFrom` (`src/storage/execution-live.repository.ts`)
+     exigeait `material.buildFingerprint === runtime.buildHash` (statique) : avec l'enveloppe
+     (mint inconnu à l'avance), chaque BUY `fast-entry-v1` échouait fermé (`INVALID_INPUT`) en
+     consommant un `buys_armed`. Seul CANARY v3 satisfaisait l'égalité ; tous les tests partageaient
+     une constante entre les deux valeurs, d'où l'angle mort.
+   - Correctif : cette seule égalité est retirée. La cohérence par transaction reste garantie deux
+     fois (`unsignedSigningMaterialFrom` lie le matériel à sa simulation non signée,
+     `fresh-execution.ts` lie l'artefact de simulation signée au matériel). `EXECUTOR_BUILD_HASH`
+     reste l'ancre statique de la qualification, de l'armement et du verrou. Test :
+     `tests/execution-live-envelope.repository.test.ts`, « ENVELOPE signing accepts a per-mint
+     build fingerprint different from EXECUTOR_BUILD_HASH ».
+   - À merger avant B23 (H2b).
 
 ### Pièges sans être bloquants
 
@@ -116,9 +107,9 @@ Ils figurent dans la checklist.
     Faire le `diff` de l'étape B10.
 - **`EXECUTOR_BUILD_HASH` n'est pas un hash de build logiciel.**
   - C'est le `build_fingerprint` de l'artefact gate 10 : un hash des instructions de cette
-    transaction simulée précise (fee payer, comptes, données). Voir le bloquant 5 : H2b exige
-    aujourd'hui cette même valeur pour chaque transaction signée, ce qui est impossible sur un
-    autre mint.
+    transaction simulée précise (fee payer, comptes, données). H2b ne la compare plus à chaque
+    transaction signée (bloquant 5 résolu) : elle n'ancre que la qualification, l'armement et le
+    verrou.
   - `EXECUTOR_CONFIGURATION_FINGERPRINT` est de même le `configuration_fingerprint` de cet artefact.
   - On les lit en SQL après la simulation (étape B13).
 - **`fast-path:report` ne charge pas `dotenv`.** Utiliser `node --env-file=…`.
@@ -1093,8 +1084,8 @@ c'est à l'utilisateur de décider s'il la fait.
 Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concernent le wallet) :
 
 1. [ ] Accord explicite de l'utilisateur pour le lot 5, avec les montants décidés (§B.2).
-0. [ ] Le bloquant 5 (`EXECUTOR_BUILD_HASH` comparé à chaque transaction) est corrigé, testé et
-   mergé ; sinon H2b refuse chaque BUY fast-entry en consommant un `buys_armed`.
+0. [ ] Le correctif du bloquant 5 (branche `fix/build-hash-per-transaction`, testé) est mergé
+   dans `main` et déployé ; sinon H2b refuse chaque BUY fast-entry en consommant un `buys_armed`.
 2. [ ] La base de production est en PG16 (`127.0.0.1:5433`), migrée à 067, avec les rôles
    reprovisionnés **après** 067 (inventaire RLS `5 | 1 | t`) et 6 logins mono-rôle.
 3. [ ] Aucune position n'est `MISMATCH` (sur un SELL antérieur à 4b), `UNKNOWN` ou `EXIT_PENDING`,
