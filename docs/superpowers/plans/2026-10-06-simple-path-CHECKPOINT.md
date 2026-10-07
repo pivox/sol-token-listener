@@ -58,7 +58,7 @@ Correctifs de droits trouvés sur main et corrigés ici :
 
 Reste ouvert : le chemin v3 pairé n'a pas de droit operations sur `execution_preflight_intent_pairs`.
 
-## Lot 4b — terminé (PR #TBD, branche `feat/exit-lane`)
+## Lot 4b — terminé (PR #242, branche `feat/exit-lane`)
 
 Plan : `docs/superpowers/plans/2026-10-07-simple-path-lot4b-exit-lane.md`. Runbook :
 `docs/operations/executor-live-canary.md`, section « Sorties rapides, re-sortie et rapport (lot 4b) ».
