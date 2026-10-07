@@ -1201,9 +1201,15 @@ GRANT SELECT (
 )
 ON TABLE execution_live_positions TO sol_token_executor_live_recovery;
 
-GRANT SELECT (armament_id,provider_id,state,state_revision,maximum_holding_ms),
+GRANT SELECT (armament_id,provider_id,state,state_revision,maximum_holding_ms,envelope_id),
   UPDATE (state,state_revision,terminal_at,purge_after)
 ON TABLE execution_activation_armaments TO sol_token_executor_live_recovery;
+
+-- SELL reconciliation adds the closed position's realized loss to its entry envelope and
+-- may move an ACTIVE envelope to EXHAUSTED (lot 4a). It never inserts or deletes envelopes.
+GRANT SELECT (envelope_id,state,realized_loss_raw,max_realized_loss_raw,updated_at),
+  UPDATE (realized_loss_raw,state,updated_at)
+ON TABLE execution_entry_envelopes TO sol_token_executor_live_recovery;
 
 GRANT SELECT (authorization_id,position_id,state,state_revision), INSERT (
   authorization_id,payload_version,position_id,generation_id,wallet_public_key,

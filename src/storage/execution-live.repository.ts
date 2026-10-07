@@ -4539,6 +4539,28 @@ export const LIVE_POSITION_LEDGER_INSERT_SQL = `INSERT INTO execution_live_posit
   WHERE position.position_id=$4::TEXT
   ON CONFLICT DO NOTHING`;
 
+// Adds the closed position's realized loss to its entry envelope (lot 4a, deviation 8): the
+// loss is max(0, -net_lamports), computed exactly like execution_live_position_ledger.net_lamports
+// (BUY wallet lamport delta + SELL wallet lamport delta); gains never offset losses. An ACTIVE
+// envelope that reaches its maximum becomes EXHAUSTED; any other state is kept, so a REVOKED,
+// EXHAUSTED or EXPIRED envelope still accumulates. A CANARY armament has no envelope and updates
+// nothing. The caller holds the generation lock (51005) and the armament row lock. $1 closed-at
+// epoch ms, $2 exit wallet lamport delta, $3 position id.
+export const ENVELOPE_REALIZED_LOSS_SQL = `UPDATE execution_entry_envelopes envelope SET
+  realized_loss_raw=envelope.realized_loss_raw+loss.amount,
+  state=CASE WHEN envelope.state='ACTIVE'
+      AND envelope.realized_loss_raw+loss.amount>=envelope.max_realized_loss_raw
+    THEN 'EXHAUSTED' ELSE envelope.state END,
+  updated_at=GREATEST(envelope.updated_at,TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond'))
+FROM (SELECT armament.envelope_id,
+    GREATEST(0::NUMERIC,-(buy.wallet_lamport_delta+$2::NUMERIC)) AS amount
+  FROM execution_live_positions position
+  JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+  JOIN execution_reconciliation_evidence buy
+    ON buy.evidence_fingerprint=position.entry_reconciliation_fingerprint AND buy.side='BUY'
+  WHERE position.position_id=$3::TEXT AND armament.envelope_id IS NOT NULL) loss
+WHERE envelope.envelope_id=loss.envelope_id`;
+
 async function commitSellReconciliation(
   client: DatabaseClient,
   claim: ClaimedExecutionIntent,
@@ -4987,6 +5009,12 @@ async function commitSellReconciliation(
   await client.query(LIVE_POSITION_LEDGER_INSERT_SQL, [
     finalizedAtMs, evidence.walletLamportDelta.toString(), evidence.signature, row.position_id,
   ]);
+  // Runs once per close: a replayed SELL evidence returned above. lockGeneration already holds
+  // 51005 for this generation, the same order as arming (51005, then the envelope row).
+  const envelopeLoss = await client.query(ENVELOPE_REALIZED_LOSS_SQL, [
+    finalizedAtMs, evidence.walletLamportDelta.toString(), row.position_id,
+  ]);
+  if (envelopeLoss.rowCount !== 0 && envelopeLoss.rowCount !== 1) throw failure('CONFLICT');
   await insertLiveStateEvent(
     client, artifact, 'CONFIRMED', 'RECONCILED', 'INTENT_SUCCEEDED', finalizedAtMs,
   );

@@ -286,6 +286,41 @@ void test('read-only recovery provisioning matches its closed authority policy',
   assert.deepEqual(submissionEvents.select, [
     'artifact_id', 'generation_id', 'previous_state', 'next_state', 'reason_code',
   ]);
+
+  // Task 10: SELL reconciliation accumulates the envelope realized loss.
+  const recoveryGrant = (table: string): string => {
+    const statements = executable.split(';').filter((statement) => (
+      new RegExp(`ON TABLE ${table} TO sol_token_executor_live_recovery\\s*$`, 'u').test(statement)));
+    assert.equal(statements.length, 1, `one recovery grant on ${table}`);
+    return statements[0] ?? '';
+  };
+  const grantColumns = (grant: string, privilege: 'SELECT' | 'INSERT' | 'UPDATE') => (
+    new RegExp(`${privilege} \\(([^)]*)\\)`, 'u').exec(grant)?.[1]
+      ?.split(',').map((column) => column.trim()) ?? []);
+  const expectedRecovery = {
+    execution_activation_armaments: {
+      select: ['armament_id', 'provider_id', 'state', 'state_revision', 'maximum_holding_ms',
+        'envelope_id'],
+      insert: [],
+      update: ['state', 'state_revision', 'terminal_at', 'purge_after'],
+    },
+    execution_entry_envelopes: {
+      select: ['envelope_id', 'state', 'realized_loss_raw', 'max_realized_loss_raw', 'updated_at'],
+      insert: [],
+      update: ['realized_loss_raw', 'state', 'updated_at'],
+    },
+  } as const;
+  for (const [name, expected] of Object.entries(expectedRecovery)) {
+    const entry = authority.tables.find((table) => table.name === name);
+    assert.ok(entry !== undefined, `recovery authority for ${name}`);
+    assert.deepEqual(entry.select, expected.select, `${name} authority SELECT`);
+    assert.deepEqual(entry.insert, expected.insert, `${name} authority INSERT`);
+    assert.deepEqual(entry.update, expected.update, `${name} authority UPDATE`);
+    const grant = recoveryGrant(name);
+    assert.deepEqual(grantColumns(grant, 'SELECT'), expected.select, `${name} grant SELECT`);
+    assert.deepEqual(grantColumns(grant, 'INSERT'), expected.insert, `${name} grant INSERT`);
+    assert.deepEqual(grantColumns(grant, 'UPDATE'), expected.update, `${name} grant UPDATE`);
+  }
 });
 
 void test('signed live capability is visible only to the dedicated executor role', async () => {

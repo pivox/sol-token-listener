@@ -256,9 +256,22 @@ export const LIVE_RECOVERY_DATABASE_AUTHORITY: LiveRecoveryDatabaseAuthority = O
     ),
     table(
       'execution_activation_armaments',
-      columns('armament_id', 'provider_id', 'state', 'state_revision', 'maximum_holding_ms'),
+      columns(
+        'armament_id',
+        'provider_id',
+        'state',
+        'state_revision',
+        'maximum_holding_ms',
+        'envelope_id',
+      ),
       columns(),
       columns('state', 'state_revision', 'terminal_at', 'purge_after'),
+    ),
+    table(
+      'execution_entry_envelopes',
+      columns('envelope_id', 'state', 'realized_loss_raw', 'max_realized_loss_raw', 'updated_at'),
+      columns(),
+      columns('realized_loss_raw', 'state', 'updated_at'),
     ),
     table(
       'execution_exit_authorizations',

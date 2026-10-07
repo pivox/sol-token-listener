@@ -38,6 +38,8 @@ import { PostgresExecutionOperationsRepository } from '../src/storage/execution-
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { roleSource, withProvisionedDatabase } from './helpers/entry-envelope-fixture.js';
+import { mutateWithTriggersDisabled } from './helpers/execution-preflight-v2-source-fixture.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
@@ -191,6 +193,97 @@ void test('SELL MATCHED appends one immutable ledger row and a replay appends no
         { code: '55000' });
       await assert.rejects(pool.query('DELETE FROM execution_live_position_ledger'),
         { code: '55000' });
+    });
+  });
+
+for (const scenario of [
+  {
+    name: 'a net loss adds max(0,-net_lamports) and a replay adds nothing',
+    state: 'ACTIVE', priorLossRaw: '1000', maxLossRaw: '1000000', exitDeltaLamports: 795n,
+    expected: { state: 'ACTIVE', realized_loss_raw: '5205' },
+  },
+  {
+    name: 'a net gain adds nothing',
+    state: 'ACTIVE', priorLossRaw: '1000', maxLossRaw: '1000000', exitDeltaLamports: 6_000n,
+    expected: { state: 'ACTIVE', realized_loss_raw: '1000' },
+  },
+  {
+    name: 'reaching the maximum realized loss sets EXHAUSTED',
+    state: 'ACTIVE', priorLossRaw: '0', maxLossRaw: '4205', exitDeltaLamports: 795n,
+    expected: { state: 'EXHAUSTED', realized_loss_raw: '4205' },
+  },
+  {
+    name: 'a REVOKED envelope accumulates the loss and stays REVOKED',
+    state: 'REVOKED', priorLossRaw: '0', maxLossRaw: '4205', exitDeltaLamports: 795n,
+    expected: { state: 'REVOKED', realized_loss_raw: '4205' },
+  },
+  {
+    name: 'an EXPIRED envelope accumulates the loss and stays EXPIRED',
+    state: 'EXPIRED', priorLossRaw: '10', maxLossRaw: '1000000', exitDeltaLamports: 795n,
+    expected: { state: 'EXPIRED', realized_loss_raw: '4215' },
+  },
+] as const) {
+  void test(`SELL MATCHED on an envelope armament: ${scenario.name}`, async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(pool, 'ACCEPTED');
+      const envelopeId = await linkEnvelope(pool, scenario);
+      const matched = sellEvidence(
+        fixture, 'MATCHED', fixture.observedAtMs, scenario.exitDeltaLamports,
+      );
+      await fixture.live.commitReconciliation(fixture.claim, matched);
+      await fixture.live.commitReconciliation(fixture.claim, matched);
+      const envelope = await envelopeRow(pool, envelopeId);
+      assert.deepEqual({ state: envelope.state, realized_loss_raw: envelope.realized_loss_raw },
+        scenario.expected);
+      assert.equal(envelope.updated_at_ms, String(matched.finalizedAtMs));
+      const ledger = await pool.query(`SELECT net_lamports::TEXT AS net_lamports
+        FROM execution_live_position_ledger`);
+      const net = BigInt(String(ledger.rows[0]?.net_lamports));
+      assert.equal(BigInt(envelope.realized_loss_raw) - BigInt(scenario.priorLossRaw),
+        net < 0n ? -net : 0n);
+    });
+  });
+}
+
+void test('SELL MATCHED on a CANARY armament without an envelope updates no envelope',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(pool, 'ACCEPTED');
+      // An unrelated envelope of the same generation must stay untouched.
+      const envelopeId = await insertEnvelope(pool, {
+        state: 'ACTIVE', priorLossRaw: '0', maxLossRaw: '1000000',
+      });
+      const before = await envelopeRow(pool, envelopeId);
+      await fixture.live.commitReconciliation(
+        fixture.claim, sellEvidence(fixture, 'MATCHED', fixture.observedAtMs),
+      );
+      assert.deepEqual(await envelopeRow(pool, envelopeId), before);
+      assert.deepEqual((await pool.query(`SELECT state FROM execution_live_positions`)).rows,
+        [{ state: 'CLOSED' }]);
+    });
+  });
+
+void test('PostgreSQL 16 recovery role reconciles an envelope SELL and accumulates its loss',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await createSellFixture(pool, 'ACCEPTED');
+      const envelopeId = await linkEnvelope(pool, {
+        state: 'ACTIVE', priorLossRaw: '0', maxLossRaw: '4205',
+      });
+      const recovery = new PostgresExecutionLiveRepository(
+        roleSource(pool, 'sol_token_executor_live_recovery'),
+      );
+      const matched = sellEvidence(fixture, 'MATCHED', fixture.observedAtMs);
+      const result = await recovery.commitReconciliation(fixture.claim, matched);
+      assert.equal(result.result, 'MATCHED');
+      await recovery.commitReconciliation(fixture.claim, matched);
+      const envelope = await envelopeRow(pool, envelopeId);
+      assert.deepEqual({ state: envelope.state, realized_loss_raw: envelope.realized_loss_raw },
+        { state: 'EXHAUSTED', realized_loss_raw: '4205' });
     });
   });
 
@@ -591,6 +684,7 @@ function sellEvidence(
   fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>,
   outcome: 'MATCHED' | 'NO_EFFECT' | 'MISMATCH' | 'UNKNOWN',
   observedAtMs: number,
+  matchedWalletLamportDelta = 795n,
 ) {
   const common = {
     feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
@@ -605,7 +699,7 @@ function sellEvidence(
       buildFingerprint: fixture.artifact.buildFingerprint,
       snapshotFingerprint: fixture.artifact.snapshotFingerprint,
     }),
-    feeLamports: 5_000n, walletLamportDelta: 795n,
+    feeLamports: 5_000n, walletLamportDelta: matchedWalletLamportDelta,
     baseDeltaRaw: -95n, quoteDeltaRaw: 800n,
     unexpectedResidualTokenBalanceRaw: 0n, observedAtMs, finalizedAtMs: observedAtMs + 1,
   } : outcome === 'NO_EFFECT' ? {
@@ -635,6 +729,56 @@ function sellEvidence(
     }),
     observed: Object.freeze(observed),
   });
+}
+
+type EnvelopeSeed = Readonly<{
+  state: 'ACTIVE' | 'REVOKED' | 'EXPIRED'; priorLossRaw: string; maxLossRaw: string;
+}>;
+
+/**
+ * A lot-3 shaped (payload v1) envelope row of the fixture generation. The realized-loss update
+ * does not depend on the envelope payload version, and a v2 envelope cannot be created for the
+ * fixture's exact-signing wallet, so the row is inserted directly.
+ */
+async function insertEnvelope(
+  pool: InstanceType<typeof pg.Pool>,
+  seed: EnvelopeSeed,
+): Promise<string> {
+  const envelopeId = `envelope:${randomUUID()}`;
+  await pool.query(`INSERT INTO execution_entry_envelopes (
+    envelope_id,generation_id,operator_id,payload_version,fingerprint,per_buy_quote_amount_raw,
+    max_buys,max_open_positions,max_total_exposure_raw,max_realized_loss_raw,valid_from,
+    valid_until,state,realized_loss_raw,revoked_at,created_at,updated_at
+  ) VALUES ($1,$2,'operator-primary',1,$3,1000,3,1,3000,$4::NUMERIC,
+    date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 minute',
+    date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 hour',$5,$6::NUMERIC,
+    CASE WHEN $5='REVOKED' THEN date_trunc('milliseconds',statement_timestamp()) END,
+    date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 minute',
+    date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 minute')`, [
+    envelopeId, generationId, 'e'.repeat(64), seed.maxLossRaw, seed.state, seed.priorLossRaw,
+  ]);
+  return envelopeId;
+}
+
+/** Binds the fixture position's armament to a new envelope (envelope_id is immutable). */
+async function linkEnvelope(
+  pool: InstanceType<typeof pg.Pool>,
+  seed: EnvelopeSeed,
+): Promise<string> {
+  const envelopeId = await insertEnvelope(pool, seed);
+  await mutateWithTriggersDisabled(pool, `UPDATE execution_activation_armaments SET envelope_id=$1
+    WHERE armament_id=(SELECT armament_id FROM execution_live_positions)`, [envelopeId]);
+  return envelopeId;
+}
+
+async function envelopeRow(pool: InstanceType<typeof pg.Pool>, envelopeId: string) {
+  const row = (await pool.query(`SELECT state,realized_loss_raw::TEXT AS realized_loss_raw,
+    buys_armed,trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS updated_at_ms
+    FROM execution_entry_envelopes WHERE envelope_id=$1`, [envelopeId])).rows[0];
+  assert.ok(row !== undefined);
+  return row as Readonly<{
+    state: string; realized_loss_raw: string; buys_armed: number; updated_at_ms: string;
+  }>;
 }
 
 async function createAmbiguousSellFixture(pool: InstanceType<typeof pg.Pool>) {
