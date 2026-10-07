@@ -413,7 +413,7 @@ void test('PostgreSQL 16 operations role arms a CANARY and an ENVELOPE, reads th
       const armed = await operations.readAutoArmContext(contextQuery());
       assert.equal(armed.envelope?.envelopeId, second.envelope.envelopeId);
       assert.equal(armed.candidateIntent?.intentId, intentId);
-      const armament = await armEnvelope(operations, second, intentId);
+      const armament = await armEnvelope(operations, second, intentId, SHORT_PROVIDER);
       assert.equal(armament.state, 'ARMED');
       assert.equal((await operations.readAutoArmContext(contextQuery())).activeArmament, 'ARMED');
       const revoked = await operations.revokeEnvelope(Object.freeze({
@@ -425,9 +425,11 @@ void test('PostgreSQL 16 operations role arms a CANARY and an ENVELOPE, reads th
       // Refresh needs a LOCKED envelope armament whose BUY SUCCEEDED (H2b state, forged here);
       // it reads and writes only what the role holds, and needs no ACTIVE envelope.
       await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUCCEEDED');
-      const due = await operations.readAutoArmContext(contextQuery({ providerRefreshThresholdMs: 3_600_000 }));
+      const due = await operations.readAutoArmContext(contextQuery());
       assert.equal(due.envelope, null);
       assert.equal(due.activeArmament, 'LOCKED');
+      // The REVOKED envelope's policy, read under the operations role.
+      assert.equal(due.refreshProviderUsageMaxAgeMs, 300_000);
       assert.equal(due.providerRefreshDue, true);
       const refreshed = await operations.refreshEnvelopeProviderSnapshot({
         generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 300_000,
@@ -853,8 +855,8 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
       const prepared = await openEnvelope(pool, repository, simulation);
       await seedProviderSnapshot(pool);
       const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
-      const armament = await armEnvelope(repository, prepared, intentId);
-      const wide = contextQuery({ providerRefreshThresholdMs: 3_600_000 });
+      const armament = await armEnvelope(repository, prepared, intentId, SHORT_PROVIDER);
+      const wide = contextQuery();
       const command = { generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 300_000 };
       const armed = await repository.readAutoArmContext(wide);
       assert.equal(armed.activeArmament, 'ARMED');
@@ -868,7 +870,7 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
       await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUCCEEDED');
       const succeeded = await repository.readAutoArmContext(wide);
       assert.equal(succeeded.providerRefreshDue, true);
-      assert.equal((await repository.readAutoArmContext(contextQuery())).providerRefreshDue, false);
+      assert.equal(succeeded.refreshProviderUsageMaxAgeMs, 300_000);
       assert.equal((await repository.refreshEnvelopeProviderSnapshot({ ...command,
         providerRefreshThresholdMs: 1 })).refreshed, false);
       // The threshold may not exceed the carried-forward snapshot's own age.
@@ -886,14 +888,50 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
       assert.equal(refreshed.snapshot.usedUnits, latest.usedUnits + 8n + 5n);
       assert.equal(refreshed.snapshot.measuredAtMs, refreshed.databaseNowMs);
       assert.equal(refreshed.snapshot.expiresAtMs, refreshed.databaseNowMs + 300_000);
-      assert.deepEqual((await repository.readAutoArmContext(wide)).provider,
-        { snapshot: refreshed.snapshot, localUsedUnits: 0n });
+      const after = await repository.readAutoArmContext(wide);
+      assert.deepEqual(after.provider, { snapshot: refreshed.snapshot, localUsedUnits: 0n });
+      // A12: 300 s left is not within half the 300 s policy max age.
+      assert.equal(after.providerRefreshDue, false);
       // Over the limit: a distinct code, nothing written.
       await recordProviderUnits(pool, refreshed.snapshot, 'flood', 5_000n);
       await assert.rejects(repository.refreshEnvelopeProviderSnapshot(command),
         isRepositoryError('PROVIDER_CARRY_FORWARD_REJECTED'));
       assert.equal((await repository.readAutoArmContext(wide)).provider?.snapshot.snapshotId,
         refreshed.snapshot.snapshotId);
+    });
+  });
+
+void test('after the last arm EXHAUSTS the envelope, a fresh context still has the refresh policy',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await openEnvelope(pool, repository, simulation, { maxBuys: 1 });
+      await seedProviderSnapshot(pool);
+      const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      const armament = await armEnvelope(repository, prepared, intentId, SHORT_PROVIDER);
+      assert.equal((await repository.readEnvelopes(generationId))[0]?.state, 'EXHAUSTED');
+      await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUCCEEDED');
+      // A new repository: nothing carried over from the arm.
+      const view = await new PostgresExecutionOperationsRepository(pool).readAutoArmContext(contextQuery());
+      assert.equal(view.envelope, null);
+      assert.equal(view.activeArmament, 'LOCKED');
+      assert.equal(view.refreshProviderUsageMaxAgeMs, prepared.envelope.policy.providerUsageMaxAgeMs);
+      assert.equal(view.providerRefreshDue, true);
+      const refreshed = await repository.refreshEnvelopeProviderSnapshot({
+        generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 150_000,
+      });
+      assert.equal(refreshed.refreshed, true);
+    });
+  });
+
+void test('readAutoArmContext has no refresh policy without an envelope or envelope armament',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      await seedEnvelopeBase(pool);
+      const view = await new PostgresExecutionOperationsRepository(pool).readAutoArmContext(contextQuery());
+      assert.equal(view.refreshProviderUsageMaxAgeMs, null);
+      assert.equal(view.providerRefreshDue, false);
     });
   });
 
@@ -1260,11 +1298,10 @@ async function fastEntryIntent(
 }
 
 function contextQuery(overrides: Partial<{
-  minimumRemainingMs: number; providerRefreshThresholdMs: number; excludedIntentIds: readonly string[];
+  minimumRemainingMs: number; excludedIntentIds: readonly string[];
 }> = {}) {
   return Object.freeze({
-    generationId, minimumRemainingMs: 60_000, providerRefreshThresholdMs: 150_000,
-    excludedIntentIds: [], ...overrides,
+    generationId, minimumRemainingMs: 60_000, excludedIntentIds: [], ...overrides,
   });
 }
 
@@ -1278,6 +1315,8 @@ async function envelopeArmRequest(
     provenance?: 'OPERATOR_REPORT';
     operatorId?: string;
     provider?: Readonly<{ snapshot: ProviderUsageSnapshotV1; localUsedUnits: bigint }>;
+    /** A shorter carried-forward snapshot, so its refresh is due right after the arm. */
+    providerMaxAgeMs?: number;
   }> = {},
 ) {
   const view = await repository.readAutoArmContext(contextQuery({ minimumRemainingMs: 0 }));
@@ -1288,7 +1327,7 @@ async function envelopeArmRequest(
   const carried = createEnvelopeProviderSnapshot({
     latest: provider.snapshot,
     localUsedUnits: provider.localUsedUnits + (options.extraUnits ?? 0n),
-    measuredAtMs: nowMs, maximumAgeMs: policy.providerUsageMaxAgeMs,
+    measuredAtMs: nowMs, maximumAgeMs: options.providerMaxAgeMs ?? policy.providerUsageMaxAgeMs,
   });
   const { snapshotId: _id, payloadVersion: _version, snapshotFingerprint: _fingerprint,
     ...carriedFields } = carried;
@@ -1333,9 +1372,13 @@ async function armEnvelope(
   repository: PostgresExecutionOperationsRepository,
   prepared: PreparedEnvelope,
   intentId: string,
+  options: Parameters<typeof envelopeArmRequest>[3] = {},
 ): Promise<ExecutionActivationArmamentV2> {
-  return repository.armEnvelope(await envelopeArmRequest(repository, prepared, intentId));
+  return repository.armEnvelope(await envelopeArmRequest(repository, prepared, intentId, options));
 }
+
+/** Carried-forward snapshots expire 30 s after the arm: within half the 300 s policy max age. */
+const SHORT_PROVIDER = Object.freeze({ providerMaxAgeMs: 30_000 });
 
 async function assertNothingArmed(pool: Pool): Promise<void> {
   assert.deepEqual((await pool.query(`SELECT

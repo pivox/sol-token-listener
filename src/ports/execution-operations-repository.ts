@@ -155,13 +155,11 @@ export interface ExecutionEntryEnvelopeRepository {
   readEnvelopes(generationId: string): Promise<readonly ExecutionEntryEnvelopeSummaryV1[]>;
 }
 
-/** What `readAutoArmContext` reads; every margin is the daemon's (A12, A13). */
+/** What `readAutoArmContext` reads. The refresh threshold (A12) comes from the DB policy. */
 export interface ExecutionAutoArmContextQueryV1 {
   readonly generationId: string;
   /** A candidate intent must expire at least this long after the DB now (A13). */
   readonly minimumRemainingMs: number;
-  /** The provider snapshot is due for refresh when it expires within this (A12). */
-  readonly providerRefreshThresholdMs: number;
   /** Intents the daemon already refused for a non-transient reason. */
   readonly excludedIntentIds: readonly string[];
 }
@@ -190,8 +188,11 @@ export interface ExecutionAutoArmContextV1 {
   }> | null;
   /** The oldest eligible fast-entry BUY intent of the envelope, if any. */
   readonly candidateIntent: ExecutionCanaryTargetIntentV1 | null;
+  /** The provider max age of the refresh policy: the risk policy of the envelope the LOCKED
+   * envelope-bound armament points to (whatever its state), else of the ACTIVE envelope. */
+  readonly refreshProviderUsageMaxAgeMs: number | null;
   /** No ARMED armament, a LOCKED envelope armament whose BUY SUCCEEDED, and the current
-   * provider snapshot expires within the threshold. */
+   * provider snapshot expires within half the refresh policy max age (A12). */
   readonly providerRefreshDue: boolean;
 }
 

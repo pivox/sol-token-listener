@@ -103,7 +103,7 @@ function context(overrides: Partial<ExecutionAutoArmContextV1> = {}): ExecutionA
     buysArmed: 1, realizedLossRaw: 2_000_000n, controlState: 'RUNNING', riskStateRevision: 7n,
     openPositions: 0, unknownBlock: false, activeArmament: null,
     provider: Object.freeze({ snapshot: latestProvider, localUsedUnits: 3n }),
-    candidateIntent: intent(), providerRefreshDue: false,
+    candidateIntent: intent(), refreshProviderUsageMaxAgeMs: 300_000, providerRefreshDue: false,
     ...overrides,
   });
 }
@@ -235,8 +235,7 @@ void test('happy path arms the candidate with the envelope limits and operator',
   assert.equal(result.kind, 'ARMED');
   assert.equal(calls.expire, 1);
   assert.deepEqual(calls.read, [{
-    generationId: config.generationId, minimumRemainingMs: 95_000,
-    providerRefreshThresholdMs: 1, excludedIntentIds: [],
+    generationId: config.generationId, minimumRemainingMs: 95_000, excludedIntentIds: [],
   }]);
   assert.deepEqual(calls.rpc, [{ wallet: config.walletPublicKey, lag: 8, now: DB_NOW_MS }]);
   assert.equal(calls.arm.length, 1);
@@ -314,18 +313,15 @@ void test('excluded intents are pruned once their expiry has passed', async () =
 });
 
 void test('expireEnvelopes runs every tick; refresh only when providerRefreshDue', async () => {
-  const state = createAutoArmState();
-  const idle = harness({ context: context({ activeArmament: 'LOCKED' }) }, state);
+  const idle = harness({ context: context({ activeArmament: 'LOCKED' }) });
   await idle.tick();
   await idle.tick();
   assert.equal(idle.calls.expire, 2);
   assert.equal(idle.calls.refresh.length, 0);
-  // A12: once the envelope policy is known, the threshold is half its provider max age.
-  assert.equal(idle.calls.read[0]?.providerRefreshThresholdMs, 1);
-  assert.equal(idle.calls.read[1]?.providerRefreshThresholdMs, 150_000);
-  const due = harness({ context: context({ activeArmament: 'LOCKED', providerRefreshDue: true }) }, state);
+  const due = harness({ context: context({ activeArmament: 'LOCKED', providerRefreshDue: true }) });
   assert.deepEqual(await due.tick(), { kind: 'REFRESHED', reason: 'PROVIDER_CARRIED_FORWARD' });
   assert.equal(due.calls.expire, 1);
+  // A12: the max age and half of it, both from the context policy.
   assert.deepEqual(due.calls.refresh, [{
     generationId: config.generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 150_000,
   }]);
@@ -333,18 +329,19 @@ void test('expireEnvelopes runs every tick; refresh only when providerRefreshDue
   assert.equal(due.calls.arm.length, 0);
 });
 
-void test('the refresh still runs after the envelope left ACTIVE, from the remembered policy', async () => {
-  const state = createAutoArmState();
-  await harness({ context: context({ activeArmament: 'LOCKED' }) }, state).tick();
+void test('a fresh daemon refreshes for an EXHAUSTED envelope from the context policy', async () => {
+  // No memory: the policy comes from the armament's envelope, read in the context.
   const exhausted = harness({ context: context({
     envelope: null, qualification: null, candidateIntent: null, buysArmed: 0, realizedLossRaw: 0n,
-    activeArmament: 'LOCKED', providerRefreshDue: true,
-  }) }, state);
-  assert.equal((await exhausted.tick()).kind, 'REFRESHED');
-  assert.equal(exhausted.calls.refresh[0]?.maximumAgeMs, 300_000);
+    activeArmament: 'LOCKED', refreshProviderUsageMaxAgeMs: 240_000, providerRefreshDue: true,
+  }) });
+  assert.deepEqual(await exhausted.tick(), { kind: 'REFRESHED', reason: 'PROVIDER_CARRIED_FORWARD' });
+  assert.deepEqual(exhausted.calls.refresh, [{
+    generationId: config.generationId, maximumAgeMs: 240_000, providerRefreshThresholdMs: 120_000,
+  }]);
   const unknown = harness({ context: context({
     envelope: null, qualification: null, candidateIntent: null,
-    activeArmament: 'LOCKED', providerRefreshDue: true,
+    activeArmament: 'LOCKED', refreshProviderUsageMaxAgeMs: null, providerRefreshDue: true,
   }) });
   assert.deepEqual(await unknown.tick(), { kind: 'DEFERRED', reason: 'PROVIDER_REFRESH_POLICY_UNKNOWN' });
   assert.equal(unknown.calls.refresh.length, 0);
@@ -352,7 +349,6 @@ void test('the refresh still runs after the envelope left ACTIVE, from the remem
 
 void test('a refresh error is reported and the next tick runs normally', async () => {
   const state = createAutoArmState();
-  state.providerUsageMaxAgeMs = 300_000;
   for (const code of ['PROVIDER_CARRY_FORWARD_REJECTED', 'DATABASE_FAILURE'] as const) {
     const failing = harness({
       context: context({ activeArmament: 'LOCKED', providerRefreshDue: true }), refreshError: code,

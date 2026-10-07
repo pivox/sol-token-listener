@@ -515,6 +515,11 @@ export class PostgresExecutionOperationsRepository implements
       const providerId = armament?.envelopeBound === true && armament.state === 'LOCKED'
         ? armament.providerId : active?.qualification.providerId ?? null;
       const provider = providerId === null ? null : await currentProviderOf(client, providerId, false);
+      // The refresh policy outlives the ACTIVE state: the last buy makes its envelope EXHAUSTED.
+      const refreshPolicy = armament?.state === 'LOCKED' && armament.envelopeId !== null
+        ? await envelopePolicyOf(client, armament.envelopeId, query.generationId)
+        : active?.envelope.policy ?? null;
+      const refreshProviderUsageMaxAgeMs = refreshPolicy?.providerUsageMaxAgeMs ?? null;
       const candidate = active === null ? null : await client.query(`SELECT ${TARGET_INTENT_PROJECTION}
         FROM execution_intents
         WHERE strategy_id=$1 AND side='BUY' AND status='PENDING' AND live_reserved=FALSE
@@ -547,7 +552,10 @@ export class PostgresExecutionOperationsRepository implements
         activeArmament: armament?.state ?? null,
         provider,
         candidateIntent: candidateRow === undefined ? null : targetIntentFrom(candidateRow),
-        providerRefreshDue: refreshDue(armament, provider, nowMs, query.providerRefreshThresholdMs),
+        refreshProviderUsageMaxAgeMs,
+        // A12: half the policy max age; without a policy, only an expired snapshot is due.
+        providerRefreshDue: refreshDue(armament, provider, nowMs, refreshProviderUsageMaxAgeMs === null
+          ? 1 : Math.floor(refreshProviderUsageMaxAgeMs / 2)),
       });
     }, { begin: 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' });
   }
@@ -1221,6 +1229,7 @@ interface ActiveArmament {
   readonly state: 'ARMED' | 'LOCKED';
   readonly providerId: string;
   readonly envelopeBound: boolean;
+  readonly envelopeId: string | null;
   readonly buySucceeded: boolean;
 }
 
@@ -1231,7 +1240,7 @@ async function activeArmamentOf(
   nowMs: number,
 ): Promise<ActiveArmament | null> {
   const result = await client.query(`SELECT armament.state,armament.provider_id,
-    armament.envelope_id IS NOT NULL AS envelope_bound,intent.status='SUCCEEDED' AS buy_succeeded
+    armament.envelope_id,armament.envelope_id IS NOT NULL AS envelope_bound,intent.status='SUCCEEDED' AS buy_succeeded
     FROM execution_activation_armaments armament
     JOIN execution_intents intent ON intent.id=armament.target_intent_id
     WHERE armament.generation_id=$1 AND (armament.state='LOCKED' OR (armament.state='ARMED'
@@ -1240,16 +1249,31 @@ async function activeArmamentOf(
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   if (result.rows.length === 0) return null;
   const row = exactRow(result.rows[0], [
-    'state', 'provider_id', 'envelope_bound', 'buy_succeeded',
+    'state', 'provider_id', 'envelope_id', 'envelope_bound', 'buy_succeeded',
   ] as const);
   if ((row.state !== 'ARMED' && row.state !== 'LOCKED') || typeof row.provider_id !== 'string'
-    || typeof row.envelope_bound !== 'boolean' || typeof row.buy_succeeded !== 'boolean') {
+    || typeof row.envelope_bound !== 'boolean' || typeof row.buy_succeeded !== 'boolean'
+    || row.envelope_bound !== (row.envelope_id !== null)) {
     throw failure('INVALID_DATA');
   }
   return Object.freeze({
     state: row.state, providerId: row.provider_id,
+    envelopeId: row.envelope_id === null ? null : patterned(row.envelope_id, ENVELOPE_ID_PATTERN),
     envelopeBound: row.envelope_bound, buySucceeded: row.buy_succeeded,
   });
+}
+
+/** The stored risk policy of one envelope of the generation, whatever its state. */
+async function envelopePolicyOf(
+  client: DatabaseClient,
+  envelopeId: string,
+  generationId: string,
+): Promise<ExecutionRiskPolicyV1> {
+  const row = exactRow(singleRowOr(await client.query(`SELECT policy_fingerprint,
+    risk_policy::TEXT AS risk_policy FROM execution_entry_envelopes
+    WHERE envelope_id=$1 AND generation_id=$2 AND payload_version=2`, [envelopeId, generationId]),
+  'INVALID_DATA'), ['policy_fingerprint', 'risk_policy'] as const);
+  return storedPolicyFrom(row.risk_policy, row.policy_fingerprint);
 }
 
 /** No ARMED armament, a LOCKED envelope armament whose BUY SUCCEEDED, a snapshot near expiry. */
@@ -1271,7 +1295,6 @@ function autoArmContextQueryFrom(input: ExecutionAutoArmContextQueryV1): Executi
   return Object.freeze({
     generationId: generationIdFrom(input.generationId),
     minimumRemainingMs: boundedInteger(input.minimumRemainingMs, 0, 3_600_000),
-    providerRefreshThresholdMs: boundedInteger(input.providerRefreshThresholdMs, 1, 86_400_000),
     excludedIntentIds: Object.freeze(excluded.map((id: unknown) => patterned(id, INTENT_ID_PATTERN))),
   });
 }

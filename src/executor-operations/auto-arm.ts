@@ -57,10 +57,9 @@ export type AutoArmConfig = Pick<ExecutionAutoArmConfig,
   | 'runtimeMaxComputeUnits' | 'runtimeMaxFeeLamports' | 'runtimeMaxFeePayerLamportDebit'
   | 'runtimeMaxRpcCallsPerAttempt' | 'runtimeLeaseMs'>;
 
-/** Daemon memory: refused intents (id -> expiresAtMs) and the last seen provider max age. */
+/** Daemon memory: refused intents (id -> expiresAtMs) only. */
 export interface AutoArmState {
   readonly excluded: Map<string, number>;
-  providerUsageMaxAgeMs: number | null;
 }
 
 export interface AutoArmDependencies {
@@ -79,7 +78,7 @@ export type AutoArmTickResult =
   | Readonly<{ kind: 'ERROR'; reason: string }>;
 
 export function createAutoArmState(): AutoArmState {
-  return { excluded: new Map(), providerUsageMaxAgeMs: null };
+  return { excluded: new Map() };
 }
 
 /**
@@ -99,19 +98,14 @@ export async function runAutoArmTick(
     context = await repository.readAutoArmContext(Object.freeze({
       generationId: config.generationId,
       minimumRemainingMs: config.minimumRemainingMs,
-      // A12: refresh when the snapshot expires within half the policy max age. Before any
-      // envelope was seen, only an already expired snapshot is due.
-      providerRefreshThresholdMs: state.providerUsageMaxAgeMs === null
-        ? 1 : Math.floor(state.providerUsageMaxAgeMs / 2),
       excludedIntentIds: Object.freeze([...state.excluded.keys()]),
     }));
   } catch (error) {
     return Object.freeze({ kind: 'ERROR', reason: errorCode(error) });
   }
-  if (context.envelope !== null) {
-    state.providerUsageMaxAgeMs = context.envelope.policy.providerUsageMaxAgeMs;
+  if (context.providerRefreshDue) {
+    return refreshProvider(dependencies, context.refreshProviderUsageMaxAgeMs);
   }
-  if (context.providerRefreshDue) return refreshProvider(dependencies);
 
   let decision: ReturnType<typeof evaluateEnvelopeArming>;
   try {
@@ -240,8 +234,11 @@ export function formatAutoArmTickLog(result: AutoArmTickResult): string {
   });
 }
 
-async function refreshProvider(dependencies: AutoArmDependencies): Promise<AutoArmTickResult> {
-  const maximumAgeMs = dependencies.state.providerUsageMaxAgeMs;
+/** The max age and the A12 threshold come from the DB refresh policy, never from memory. */
+async function refreshProvider(
+  dependencies: AutoArmDependencies,
+  maximumAgeMs: number | null,
+): Promise<AutoArmTickResult> {
   if (maximumAgeMs === null) {
     return Object.freeze({ kind: 'DEFERRED', reason: 'PROVIDER_REFRESH_POLICY_UNKNOWN' });
   }
