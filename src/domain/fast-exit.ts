@@ -69,12 +69,19 @@ const TRADE_KEYS = Object.freeze([
 
 /**
  * Early exit of an envelope position, first true rule wins; null = no early exit. Throws
- * TypeError on malformed input: the caller treats that as "no early exit" (the deadline stays).
+ * TypeError on a malformed policy, wallet, amount or envelope state: the caller treats that as
+ * "no early exit" (the deadline stays). REVOKED never depends on trade data.
  */
 export function decideFastExit(facts: FastExitFacts, policy: FastExitPolicy): FastExitReason | null {
-  const input = factsFrom(facts);
   const rules = policyFrom(policy);
-  if (input.envelopeState === 'REVOKED') return 'ENVELOPE_REVOKED';
+  const record = exactFrozenRecord(facts, FACT_KEYS);
+  const envelopeState = record.envelopeState;
+  if (typeof envelopeState !== 'string' || !(ENVELOPE_STATES as readonly string[]).includes(envelopeState)) {
+    throw invalid();
+  }
+  // A revoked envelope exits whatever the trade data looks like.
+  if (envelopeState === 'REVOKED') return 'ENVELOPE_REVOKED';
+  const input = factsFrom(record);
   const trades = input.trades;
   if (trades === null) return null;
   if (input.creator !== null
@@ -150,33 +157,45 @@ function compareCursor(left: FastExitTrade, right: FastExitTrade): number {
   const leftInner = left.innerInstructionIndex ?? -1;
   const rightInner = right.innerInstructionIndex ?? -1;
   if (leftInner !== rightInner) return leftInner - rightInner;
+  // Deterministic last resort only: two trades at the same on-chain position should not exist.
   if (left.eventId === right.eventId) return 0;
   return left.eventId > right.eventId ? 1 : -1;
 }
 
-function factsFrom(value: unknown): FastExitFacts {
-  const record = exactFrozenRecord(value, FACT_KEYS);
-  const envelopeState = record.envelopeState;
-  if (typeof envelopeState !== 'string' || !(ENVELOPE_STATES as readonly string[]).includes(envelopeState)) {
-    throw invalid();
-  }
-  const creator = record.creator === null ? null : publicKey(record.creator);
+/**
+ * Wallet and amounts must be valid (throws). A malformed creator becomes null, and a malformed
+ * trade list, or any malformed trade in it, drops the whole list (null): never a single trade.
+ */
+function factsFrom(record: Readonly<Record<(typeof FACT_KEYS)[number], unknown>>): FastExitFacts {
   const walletPublicKey = publicKey(record.walletPublicKey);
+  const remainingBaseRaw = amount(record.remainingBaseRaw);
+  const quoteCostRaw = amount(record.quoteCostRaw);
+  let creator: string | null = null;
+  try {
+    creator = record.creator === null ? null : publicKey(record.creator);
+  } catch {
+    creator = null;
+  }
   let trades: readonly FastExitTrade[] | null = null;
-  if (record.trades !== null) {
-    const list = record.trades;
-    if (!Array.isArray(list) || isProxy(list) || !Object.isFrozen(list)
-      || list.length > MAXIMUM_TRADES) throw invalid();
-    trades = Object.freeze(Array.from(list, tradeFrom));
+  try {
+    trades = record.trades === null ? null : tradesFrom(record.trades);
+  } catch {
+    trades = null;
   }
   return Object.freeze({
-    envelopeState,
+    envelopeState: record.envelopeState as string,
     creator,
     walletPublicKey,
-    remainingBaseRaw: amount(record.remainingBaseRaw),
-    quoteCostRaw: amount(record.quoteCostRaw),
+    remainingBaseRaw,
+    quoteCostRaw,
     trades,
   });
+}
+
+function tradesFrom(list: unknown): readonly FastExitTrade[] {
+  if (!Array.isArray(list) || isProxy(list) || !Object.isFrozen(list)
+    || list.length > MAXIMUM_TRADES) throw invalid();
+  return Object.freeze(Array.from(list, tradeFrom));
 }
 
 function tradeFrom(value: unknown): FastExitTrade {

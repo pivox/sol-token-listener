@@ -187,19 +187,14 @@ test('malformed input throws TypeError', () => {
     () => decideFastExit({ ...facts() }, policy()),
     () => decideFastExit(facts({ extra: 1 } as never), policy()),
     () => decideFastExit(facts({ envelopeState: 'UNKNOWN' }), policy()),
-    () => decideFastExit(facts({ creator: 'not-a-key' }), policy()),
     () => decideFastExit(facts({ walletPublicKey: null }), policy()),
     () => decideFastExit(facts({ remainingBaseRaw: -1n }), policy()),
     () => decideFastExit(facts({ quoteCostRaw: 1 }), policy()),
-    () => decideFastExit(facts({ trades: [trade()] }), policy()),
-    () => decideFastExit(facts({ trades: trades({ ...trade() }) }), policy()),
-    () => decideFastExit(facts({ trades: trades(trade({ kind: 'SWAP' as never })) }), policy()),
-    () => decideFastExit(facts({ trades: trades(trade({ baseAmountRaw: -1n })) }), policy()),
-    () => decideFastExit(facts({ trades: trades(trade({ slot: -1n })) }), policy()),
-    () => decideFastExit(facts({ trades: trades(trade({ transactionIndex: 1.5 })) }), policy()),
-    () => decideFastExit(facts({ trades: trades(trade({ innerInstructionIndex: -1 })) }), policy()),
-    () => decideFastExit(facts({ trades: trades(trade({ eventId: '' })) }), policy()),
     () => decideFastExit(facts(), { ...policy() }),
+    () => decideFastExit(facts({ envelopeState: 'REVOKED' }), policy({ takeProfitBps: 1n })),
+    () => decideFastExit(facts({ envelopeState: 'REVOKED', extra: 1 } as never), policy()),
+    () => decideFastExit(facts({ quoteCostRaw: -1n }), policy()),
+    () => decideFastExit(facts({ walletPublicKey: 'not-a-key' }), policy()),
     () => decideFastExit(facts(), policy({ takeProfitBps: 10_000n })),
     () => decideFastExit(facts(), policy({ takeProfitBps: 100_001n })),
     () => decideFastExit(facts(), policy({ externalBuyersTarget: 0 })),
@@ -244,4 +239,62 @@ test('re-exit logical command id', () => {
   assert.equal(exitReasonOfLogicalKey(reExitLogicalCommandId(`${root}:retry-1`) ?? ''), 'TAKE_PROFIT');
   assert.equal(reExitLogicalCommandId('unknown:key'), null);
   assert.equal(reExitLogicalCommandId(`${root}:retry-4`), null);
+});
+
+const MALFORMED_TRADE_LISTS: ReadonlyArray<unknown> = [
+  [trade()],
+  Object.freeze([{ ...trade() }]),
+  Object.freeze([trade(), trade({ kind: 'SWAP' as never })]),
+  Object.freeze([trade(), trade({ baseAmountRaw: -1n })]),
+  Object.freeze([trade(), trade({ slot: -1n })]),
+  Object.freeze([trade(), trade({ transactionIndex: 1.5 })]),
+  Object.freeze([trade(), trade({ innerInstructionIndex: -1 })]),
+  Object.freeze([trade(), trade({ eventId: '' })]),
+  Object.freeze([trade(), trade({ trader: 'not-a-key' })]),
+  'not-a-list',
+];
+
+test('a revoked envelope exits regardless of trade data', () => {
+  for (const list of MALFORMED_TRADE_LISTS) {
+    assert.equal(decideFastExit(facts({ envelopeState: 'REVOKED', trades: list }), policy()), 'ENVELOPE_REVOKED');
+  }
+  assert.equal(decideFastExit(facts({ envelopeState: 'REVOKED', trades: Object.freeze([]) }), policy()),
+    'ENVELOPE_REVOKED');
+  assert.equal(decideFastExit(facts({ envelopeState: 'REVOKED', creator: 'not-a-key' }), policy()),
+    'ENVELOPE_REVOKED');
+});
+
+test('a malformed trade drops the whole list without throwing', () => {
+  const pump = trade({ trader: BUYER_A, baseAmountRaw: 1n, quoteAmountRaw: 1_000_000n, slot: 300n });
+  const creatorSell = trade({ kind: 'SELL', trader: CREATOR, slot: 301n });
+  const buyerB = trade({ trader: BUYER_B, slot: 302n });
+  assert.equal(decideFastExit(facts({ trades: trades(pump, creatorSell, buyerB) }), policy()), 'CREATOR_SOLD');
+  for (const list of MALFORMED_TRADE_LISTS) {
+    assert.equal(decideFastExit(facts({ trades: list }), policy()), null);
+  }
+  const withBad = Object.freeze([pump, creatorSell, buyerB, trade({ slot: -1n })]);
+  assert.equal(decideFastExit(facts({ trades: withBad }), policy()), null);
+});
+
+test('a malformed creator becomes unknown: no CREATOR_SOLD, buyers still counted', () => {
+  const sell = trade({ kind: 'SELL', trader: CREATOR, quoteAmountRaw: 1n, baseAmountRaw: 1_000_000n, slot: 300n });
+  assert.equal(decideFastExit(facts({ creator: 'not-a-key', trades: trades(sell) }), policy()), null);
+  const buys = trades(trade({ trader: BUYER_A, slot: 101n }), trade({ trader: BUYER_B, slot: 102n }), sell);
+  assert.equal(decideFastExit(facts({ creator: 'not-a-key', trades: buys }), policy()), 'EXTERNAL_BUYERS');
+});
+
+test('zero remaining base never takes profit', () => {
+  const pump = trade({ trader: BUYER_A, baseAmountRaw: 1n, quoteAmountRaw: 1_000_000n });
+  assert.equal(decideFastExit(facts({ remainingBaseRaw: 0n, trades: trades(pump) }),
+    policy({ externalBuyersTarget: 5 })), null);
+});
+
+test('a SELL can be the last trade for take-profit', () => {
+  const p = policy({ externalBuyersTarget: 5 });
+  const lowBuy = trade({ trader: BUYER_A, baseAmountRaw: 1_000n, quoteAmountRaw: 1_000n, slot: 100n });
+  const highSell = trade({ kind: 'SELL', trader: BUYER_B, baseAmountRaw: 1n, quoteAmountRaw: 1_000_000n, slot: 200n });
+  assert.equal(decideFastExit(facts({ trades: trades(lowBuy, highSell) }), p), 'TAKE_PROFIT');
+  const highBuy = trade({ trader: BUYER_A, baseAmountRaw: 1n, quoteAmountRaw: 1_000_000n, slot: 100n });
+  const lowSell = trade({ kind: 'SELL', trader: BUYER_B, baseAmountRaw: 1_000n, quoteAmountRaw: 1_000n, slot: 200n });
+  assert.equal(decideFastExit(facts({ trades: trades(highBuy, lowSell) }), p), null);
 });
