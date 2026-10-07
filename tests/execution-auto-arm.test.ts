@@ -117,7 +117,10 @@ interface FakeOptions {
   readonly rpcFails?: boolean;
 }
 
-function harness(options: FakeOptions = {}, state: AutoArmState = createAutoArmState()) {
+function harness(
+  options: FakeOptions = {}, state: AutoArmState = createAutoArmState(),
+  configOverrides: Partial<AutoArmConfig> = {},
+) {
   const calls = {
     expire: 0, read: [] as ExecutionAutoArmContextQueryV1[],
     refresh: [] as ExecutionEnvelopeProviderRefreshCommandV1[],
@@ -170,7 +173,7 @@ function harness(options: FakeOptions = {}, state: AutoArmState = createAutoArmS
       });
     },
   };
-  const tick = () => runAutoArmTick({ config, repository, rpc, state }, new AbortController().signal);
+  const tick = () => runAutoArmTick({ config: { ...config, ...configOverrides }, repository, rpc, state }, new AbortController().signal);
   return { calls, state, tick };
 }
 
@@ -438,3 +441,19 @@ function policyFields() {
   const { payloadVersion: _version, policyFingerprint: _fingerprint, ...fields } = policy;
   return fields;
 }
+
+void test('a config that does not match the envelope qualification defers without RPC, arming or exclusion', async () => {
+  const cases: readonly [string, Partial<AutoArmConfig>][] = [
+    ['wallet', { walletPublicKey: `${qualification.walletPublicKey}x` }],
+    ['provider', { providerId: `${qualification.providerId}-other` }],
+  ];
+  for (const [label, overrides] of cases) {
+    const state = createAutoArmState();
+    const { calls, tick } = harness({}, state, overrides);
+    const result = await tick();
+    assert.deepEqual(result, { kind: 'DEFERRED', reason: 'CONFIG_BINDING_MISMATCH' }, label);
+    assert.equal(calls.rpc.length, 0, label);
+    assert.equal(calls.arm.length, 0, label);
+    assert.equal(state.excluded.size, 0, label);
+  }
+});

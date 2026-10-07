@@ -10,6 +10,7 @@ import {
   type ExecutionArmamentRequestV2,
   type ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
+import type { ExecutionSafetyQualificationV2 } from '../domain/execution-safety-qualification.js';
 import type { ProviderUsageSnapshotV1 } from '../domain/execution-provider-quota.js';
 import { createExecutionWalletSnapshot } from '../domain/execution-wallet-snapshot.js';
 import type {
@@ -55,7 +56,9 @@ export type AutoArmConfig = Pick<ExecutionAutoArmConfig,
   | 'generationId' | 'walletPublicKey' | 'providerId' | 'minimumRemainingMs'
   | 'runtimeQuoteMaxAgeMs' | 'runtimeSlippageBps' | 'runtimeSnapshotMaxSlotLag'
   | 'runtimeMaxComputeUnits' | 'runtimeMaxFeeLamports' | 'runtimeMaxFeePayerLamportDebit'
-  | 'runtimeMaxRpcCallsPerAttempt' | 'runtimeLeaseMs'>;
+  | 'runtimeMaxRpcCallsPerAttempt' | 'runtimeLeaseMs'>
+  & Partial<Pick<ExecutionAutoArmConfig,
+    'genesisHash' | 'buildHash' | 'configurationFingerprint' | 'strategyFingerprint'>>;
 
 /** Daemon memory: refused intents (id -> expiresAtMs) only. */
 export interface AutoArmState {
@@ -105,6 +108,11 @@ export async function runAutoArmTick(
   }
   if (context.providerRefreshDue) {
     return refreshProvider(dependencies, context.refreshProviderUsageMaxAgeMs);
+  }
+
+  if (context.envelope !== null && context.qualification !== null
+    && !configMatchesQualification(config, context.qualification)) {
+    return Object.freeze({ kind: 'DEFERRED', reason: 'CONFIG_BINDING_MISMATCH' });
   }
 
   let decision: ReturnType<typeof evaluateEnvelopeArming>;
@@ -223,6 +231,22 @@ export async function runAutoArmTick(
 }
 
 /** One JSON line per tick. Never the RPC URL, a key or the wallet balance. */
+/** Fields absent from the config (undefined) are not compared. */
+function configMatchesQualification(
+  config: AutoArmConfig,
+  qualification: ExecutionSafetyQualificationV2,
+): boolean {
+  const pairs: readonly (readonly [string | undefined, string])[] = [
+    [config.walletPublicKey, qualification.walletPublicKey],
+    [config.providerId, qualification.providerId],
+    [config.genesisHash, qualification.genesisHash],
+    [config.buildHash, qualification.buildHash],
+    [config.configurationFingerprint, qualification.configurationFingerprint],
+    [config.strategyFingerprint, qualification.strategyFingerprint],
+  ];
+  return pairs.every(([configured, qualified]) => configured === undefined || configured === qualified);
+}
+
 export function formatAutoArmTickLog(result: AutoArmTickResult): string {
   return JSON.stringify({
     service: AUTO_ARM_SERVICE,
