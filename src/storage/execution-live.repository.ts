@@ -32,12 +32,23 @@ import {
   type ExecutionIntentDraftV1,
   type ExecutionIntentV1,
 } from '../domain/execution-intent.js';
+import {
+  decideFastExit,
+  FAST_EXIT_STRATEGY_ID,
+  fastExitLogicalCommandId,
+  type FastExitFacts,
+  type FastExitPolicy,
+  type FastExitReason,
+  type FastExitTrade,
+  validFastExitPolicy,
+} from '../domain/fast-exit.js';
 import { lockLiveSellPresenceInTransaction } from './execution-intent.repository.js';
 import type {
   AuthenticatedPersistedSignedTransactionV1,
   AuthenticatedSubmissionStartedTransactionV1,
   ExecutionBlockhashValidityEvidenceV1,
   ExecutionDeadlineExitResultV1,
+  ExecutionEarlyExitResultV1,
   ExecutionLiveConfirmationV1,
   ExecutionLiveConfirmationWorkV1,
   ExecutionLiveArtifactReferenceV1,
@@ -1464,7 +1475,7 @@ export class PostgresExecutionLiveRepository {
       await lockGeneration(client, identity.generationId);
       return createDeadlineExitIntentLocked(client, {
         ...input, generationId: identity.generationId,
-      });
+      }, deadlineSpec(input.positionId));
     });
   }
 
@@ -1502,9 +1513,89 @@ export class PostgresExecutionLiveRepository {
       await lockGeneration(client, generationId);
       const result = await createDeadlineExitIntentLocked(client, {
         positionId, observedAtMs, generationId,
-      });
+      }, deadlineSpec(positionId));
       if (result.kind === 'NOT_DUE') throw failure('CONFLICT');
       return result;
+    });
+  }
+
+  /**
+   * Early SELL of an OPEN envelope position whose deadline is not due. Same scan lock and lock
+   * order as the deadline scanner (51007, mint, 51008, 51005, position row). The facts are read
+   * before the mint/SELL-presence/generation locks, without locking the envelope: each one only
+   * moves one way while the position is OPEN, so a stale read can only delay a reason by one
+   * pass. The position row is re-locked and re-checked (OPEN, no exit intent) before the write.
+   */
+  public async createNextEarlyExitIntent(
+    policy: FastExitPolicy,
+  ): Promise<ExecutionEarlyExitResultV1 | null> {
+    let rules: FastExitPolicy;
+    try {
+      rules = validFastExitPolicy(policy);
+    } catch {
+      throw failure('INVALID_INPUT');
+    }
+    return this.transaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(
+        hashtextextended('execution-live-deadline-scan:v1', 51007))`);
+      const clock = exactRow(singleRow(await client.query(`SELECT
+        /* execution_live_deadline_clock */
+        trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+          AS deadline_clock_ms`)), ['deadline_clock_ms'] as const);
+      const observedAtMs = timestampText(clock.deadline_clock_ms);
+      const candidates = await client.query(`SELECT
+          position.position_id,position.generation_id,position.mint,position.wallet_public_key,
+          position.remaining_base_raw::TEXT AS remaining_base_raw,
+          position.quote_cost_raw::TEXT AS quote_cost_raw,
+          buy.observed_slot::TEXT AS entry_slot,envelope.state AS envelope_state
+        FROM execution_live_positions position
+        JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+        JOIN execution_entry_envelopes envelope ON envelope.envelope_id=armament.envelope_id
+        JOIN execution_reconciliation_evidence buy
+          ON buy.evidence_fingerprint=position.entry_reconciliation_fingerprint AND buy.side='BUY'
+        WHERE position.state='OPEN' AND position.exit_intent_id IS NULL
+          AND position.exit_deadline_at > TIMESTAMPTZ 'epoch'
+            +($1::BIGINT*INTERVAL '1 millisecond')
+          AND buy.observed_slot IS NOT NULL
+        ORDER BY position.opened_at,position.position_id LIMIT 20`, [observedAtMs]);
+      for (const raw of candidates.rows) {
+        const candidate = exactRow(raw, [
+          'position_id', 'generation_id', 'mint', 'wallet_public_key', 'remaining_base_raw',
+          'quote_cost_raw', 'entry_slot', 'envelope_state',
+        ] as const);
+        const positionId = text(candidate.position_id);
+        const generationId = text(candidate.generation_id);
+        const mint = solanaAddress(candidate.mint);
+        if (!/^execution_live_position_[0-9a-f]{64}$/u.test(positionId)
+          || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
+          throw failure('INVALID_DATA');
+        }
+        const facts = await readFastExitFacts(client, mint, candidate);
+        let reason: FastExitReason | null = null;
+        try {
+          reason = facts === null ? null : decideFastExit(facts, rules);
+        } catch {
+          reason = null;
+        }
+        if (reason === null) continue;
+        await lockWorkerTrackingMints(client, [mint]);
+        await lockLiveSellPresenceInTransaction(client);
+        await lockGeneration(client, generationId);
+        const result = await createDeadlineExitIntentLocked(client, {
+          positionId, observedAtMs, generationId,
+        }, Object.freeze({
+          strategyId: FAST_EXIT_STRATEGY_ID,
+          logicalCommandId: fastExitLogicalCommandId(reason, positionId),
+          requireDue: false,
+          requestedAtLowerBound: 'OPENED',
+        }));
+        // The scan only picks positions without an exit intent: a replay here is a bug.
+        if (result.kind !== 'CREATED' || result.intent === null) throw failure('CONFLICT');
+        return Object.freeze({
+          payloadVersion: 1, kind: 'CREATED', reason, intent: result.intent,
+        });
+      }
+      return null;
     });
   }
 
@@ -5055,6 +5146,25 @@ async function deadlinePositionIdentity(
   return Object.freeze({ generationId, mint: solanaAddress(identity.mint) });
 }
 
+/** Identity and bounds of a position SELL intent built by the deadline body. */
+interface ExitIntentSpec {
+  readonly strategyId: string;
+  readonly logicalCommandId: string;
+  /** true: return NOT_DUE before the deadline. */
+  readonly requireDue: boolean;
+  /** Lower bound of requested_at: the exit deadline, or the position opening. */
+  readonly requestedAtLowerBound: 'DEADLINE' | 'OPENED';
+}
+
+function deadlineSpec(positionId: string): ExitIntentSpec {
+  return Object.freeze({
+    strategyId: 'maximum-holding-exit',
+    logicalCommandId: `maximum-holding:${positionId}`,
+    requireDue: true,
+    requestedAtLowerBound: 'DEADLINE',
+  });
+}
+
 async function createDeadlineExitIntentLocked(
   client: DatabaseClient,
   input: Readonly<{
@@ -5062,6 +5172,7 @@ async function createDeadlineExitIntentLocked(
     readonly observedAtMs: number;
     readonly generationId: string;
   }>,
+  spec: ExitIntentSpec,
 ): Promise<ExecutionDeadlineExitResultV1> {
   const row = exactRow(singleRow(await client.query(`SELECT
     position.position_id,position.generation_id,position.state,
@@ -5069,6 +5180,7 @@ async function createDeadlineExitIntentLocked(
     position.exit_intent_id,position.mint,position.quote_mint,
     position.remaining_base_raw::TEXT AS remaining_base_raw,
     trunc(EXTRACT(EPOCH FROM position.exit_deadline_at)*1000)::TEXT AS exit_deadline_at_ms,
+    trunc(EXTRACT(EPOCH FROM position.opened_at)*1000)::TEXT AS opened_at_ms,
     position.entry_reconciliation_fingerprint,
     buy.quote_token_program,buy.quote_decimals,
     buy.decision_event_id AS buy_decision_event_id
@@ -5076,7 +5188,7 @@ async function createDeadlineExitIntentLocked(
     JOIN execution_intents buy ON buy.id=position.buy_intent_id
     WHERE position.position_id=$1 FOR UPDATE OF position`, [input.positionId])), [
     'position_id', 'generation_id', 'state', 'position_revision', 'exit_intent_id', 'mint',
-    'quote_mint', 'remaining_base_raw', 'exit_deadline_at_ms',
+    'quote_mint', 'remaining_base_raw', 'exit_deadline_at_ms', 'opened_at_ms',
     'entry_reconciliation_fingerprint', 'quote_token_program', 'quote_decimals',
     'buy_decision_event_id',
   ] as const);
@@ -5086,15 +5198,17 @@ async function createDeadlineExitIntentLocked(
   const databaseNowMs = await freshDatabaseNow(client);
   if (input.observedAtMs > databaseNowMs) throw failure('INVALID_INPUT');
   const exitDeadlineAtMs = timestampText(row.exit_deadline_at_ms);
-  if (input.observedAtMs < exitDeadlineAtMs) {
+  const requestedAtLowerBoundMs = spec.requestedAtLowerBound === 'DEADLINE'
+    ? exitDeadlineAtMs
+    : timestampText(row.opened_at_ms);
+  if (spec.requireDue && input.observedAtMs < exitDeadlineAtMs) {
     return Object.freeze({ payloadVersion: 1, kind: 'NOT_DUE', intent: null });
   }
-  const logicalCommandId = `maximum-holding:${input.positionId}`;
   const draft = createExecutionIntentDraft({
-    strategyId: 'maximum-holding-exit',
+    strategyId: spec.strategyId,
     strategyVersion: 1,
     positionId: input.positionId,
-    logicalCommandId,
+    logicalCommandId: spec.logicalCommandId,
     mint: row.mint,
     side: 'SELL',
     venuePolicy: 'CANONICAL_EXIT',
@@ -5115,7 +5229,7 @@ async function createDeadlineExitIntentLocked(
       payloadVersion: 1,
       kind: 'REPLAYED',
       intent: await findDeadlineIntent(
-        client, draft, exitDeadlineAtMs, input.observedAtMs,
+        client, draft, requestedAtLowerBoundMs, input.observedAtMs,
       ),
     });
   }
@@ -5149,14 +5263,16 @@ async function createDeadlineExitIntentLocked(
   return Object.freeze({
     payloadVersion: 1,
     kind: 'CREATED',
-    intent: await findDeadlineIntent(client, draft, exitDeadlineAtMs, input.observedAtMs),
+    intent: await findDeadlineIntent(
+      client, draft, requestedAtLowerBoundMs, input.observedAtMs,
+    ),
   });
 }
 
 async function findDeadlineIntent(
   client: DatabaseClient,
   draft: ExecutionIntentDraftV1,
-  exitDeadlineAtMs: number,
+  requestedAtLowerBoundMs: number,
   requestedAtUpperBoundMs: number,
 ): Promise<ExecutionIntentV1> {
   const row = exactRow(singleRow(await client.query(`SELECT
@@ -5230,12 +5346,106 @@ async function findDeadlineIntent(
   }
   if (!sameDeadlineIntentContext(candidate, draft)
     || row.live_reserved !== true
-    || candidate.requestedAtMs < exitDeadlineAtMs
+    || candidate.requestedAtMs < requestedAtLowerBoundMs
     || candidate.requestedAtMs > requestedAtUpperBoundMs
     || candidate.expiresAtMs - candidate.requestedAtMs !== 120_000) {
     throw failure('INVALID_DATA');
   }
   return candidate;
+}
+
+const FAST_EXIT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
+const FAST_EXIT_MAXIMUM_TRADES = 10_000;
+const CANONICAL_DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
+
+/**
+ * Facts of one early exit candidate. Position fields that do not decode skip the candidate
+ * (null). Creator or trades that do not decode become null: only their own rules are skipped.
+ */
+async function readFastExitFacts(
+  client: DatabaseClient,
+  mint: string,
+  candidate: Readonly<Record<
+    'wallet_public_key' | 'remaining_base_raw' | 'quote_cost_raw' | 'entry_slot'
+    | 'envelope_state', unknown>>,
+): Promise<FastExitFacts | null> {
+  const entrySlot = candidate.entry_slot;
+  if (typeof entrySlot !== 'string' || !CANONICAL_DECIMAL.test(entrySlot)) return null;
+  const creators = await client.query(`SELECT DISTINCT payload #>> '{launch,creator}' AS creator
+    FROM domain_events
+    WHERE type='TokenLaunchDetected' AND mint=$1 AND confirmation_status<>'orphaned'`, [mint]);
+  const trades = await client.query(`SELECT event_id,slot::TEXT AS slot,transaction_index,
+      instruction_index,inner_instruction_index,
+      payload #>> '{trade,kind}' AS kind,payload #>> '{trade,trader}' AS trader,
+      payload #>> '{trade,baseAmountRaw,$solTokenListenerBigInt}' AS base_amount_raw,
+      payload #>> '{trade,quoteAmountRaw,$solTokenListenerBigInt}' AS quote_amount_raw,
+      payload #>> '{trade,quoteAsset,mint}' AS quote_mint
+    FROM domain_events
+    WHERE type='BondingCurveTradeObserved' AND mint=$1
+      AND confirmation_status IN ('confirmed','finalized') AND slot > $2::NUMERIC
+    ORDER BY slot,transaction_index,instruction_index,COALESCE(inner_instruction_index,-1),event_id
+    LIMIT ${FAST_EXIT_MAXIMUM_TRADES + 1}`, [mint, entrySlot]);
+  const remaining = candidate.remaining_base_raw;
+  const quoteCost = candidate.quote_cost_raw;
+  if (typeof candidate.wallet_public_key !== 'string' || typeof candidate.envelope_state !== 'string'
+    || typeof remaining !== 'string' || !CANONICAL_DECIMAL.test(remaining)
+    || typeof quoteCost !== 'string' || !CANONICAL_DECIMAL.test(quoteCost)) return null;
+  const creator = creators.rows.length === 1 && typeof creators.rows[0]?.creator === 'string'
+    ? creators.rows[0].creator
+    : null;
+  return Object.freeze({
+    envelopeState: candidate.envelope_state,
+    creator,
+    walletPublicKey: candidate.wallet_public_key,
+    remainingBaseRaw: BigInt(remaining),
+    quoteCostRaw: BigInt(quoteCost),
+    trades: fastExitTrades(trades.rows),
+  });
+}
+
+/** The trade list, or null when it is truncated or any row does not decode. */
+function fastExitTrades(
+  rows: readonly Readonly<Record<string, unknown>>[],
+): readonly FastExitTrade[] | null {
+  if (rows.length > FAST_EXIT_MAXIMUM_TRADES) return null;
+  const trades: FastExitTrade[] = [];
+  for (const row of rows) {
+    const {
+      event_id: eventId, slot, transaction_index: transactionIndex,
+      instruction_index: instructionIndex, inner_instruction_index: innerInstructionIndex,
+      kind, trader, base_amount_raw: base, quote_amount_raw: quote, quote_mint: quoteMint,
+    } = row;
+    if (typeof eventId !== 'string'
+      || typeof slot !== 'string' || !CANONICAL_DECIMAL.test(slot)
+      || !Number.isSafeInteger(transactionIndex) || !Number.isSafeInteger(instructionIndex)
+      || (innerInstructionIndex !== null && !Number.isSafeInteger(innerInstructionIndex))
+      || (kind !== 'BUY' && kind !== 'SELL')
+      || (trader !== null && (typeof trader !== 'string' || !isCanonicalPublicKey(trader)))
+      || typeof base !== 'string' || !CANONICAL_DECIMAL.test(base)
+      || typeof quote !== 'string' || !CANONICAL_DECIMAL.test(quote)
+      || quoteMint !== FAST_EXIT_WSOL_MINT) return null;
+    trades.push(Object.freeze({
+      eventId,
+      kind,
+      trader,
+      baseAmountRaw: BigInt(base),
+      quoteAmountRaw: BigInt(quote),
+      slot: BigInt(slot),
+      transactionIndex: transactionIndex as number,
+      instructionIndex: instructionIndex as number,
+      innerInstructionIndex: innerInstructionIndex as number | null,
+    }));
+  }
+  return Object.freeze(trades);
+}
+
+function isCanonicalPublicKey(value: string): boolean {
+  try {
+    solanaAddress(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sameDeadlineIntentContext(

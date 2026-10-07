@@ -111,6 +111,11 @@ export function decideFastExit(facts: FastExitFacts, policy: FastExitPolicy): Fa
   return null;
 }
 
+/** Validated, frozen copy of a fast exit policy; throws TypeError when it is malformed. */
+export function validFastExitPolicy(policy: FastExitPolicy): FastExitPolicy {
+  return policyFrom(policy);
+}
+
 export function fastExitLogicalCommandId(reason: FastExitReason, positionId: string): string {
   if (typeof reason !== 'string' || !(FAST_EXIT_REASONS as readonly string[]).includes(reason)) {
     throw new TypeError('Invalid fast exit reason.');

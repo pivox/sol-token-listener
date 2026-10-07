@@ -22,6 +22,7 @@ const h1ProductionModules = Object.freeze([
       '../domain/execution-live-signed-simulation.js',
       '../domain/execution-intent.js',
       '../domain/execution-reconciliation.js',
+      '../domain/fast-exit.js',
       '../executor-risk/reconciliation-service.js',
       './execution-intent-repository.js',
       './execution-simulation-gateway.js',
@@ -51,6 +52,7 @@ const h1ProductionModules = Object.freeze([
       '../domain/execution-live-signed-simulation.js',
       '../domain/execution-intent.js',
       '../domain/execution-reconciliation.js',
+      '../domain/fast-exit.js',
       '../ports/execution-intent-repository.js',
       '../ports/execution-live-repository.js',
       '../ports/execution-simulation-gateway.js',
@@ -78,6 +80,7 @@ void test('live repository port exposes only closed durable lifecycle commands',
     'readReconciliationWork',
     'createDeadlineExitIntent',
     'createNextDeadlineExitIntent',
+    'createNextEarlyExitIntent',
   ]) assert.match(source, new RegExp(`readonly ${method}:|${method}\\(`, 'u'));
   for (const contract of [
     'ExecutionLiveConfirmationWorkV1',
