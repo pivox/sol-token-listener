@@ -1,25 +1,16 @@
-import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
   ExecutionLiveRepositoryError,
   PostgresExecutionLiveRepository,
 } from '../src/storage/execution-live.repository.js';
 import { PostgresExecutionOperationsRepository } from '../src/storage/execution-operations.repository.js';
 import {
-  armCanary, armEnvelope, currentDatabaseTimeMs, fastEntryIntent, generationId, hash, openEnvelope,
-  type Pool, prepareEnvelope, publicKey, roleSource, type SeededSimulation, seedEnvelopeBase,
-  seedProviderSnapshot, withProvisionedDatabase, withSchema,
+  canaryBuyFixture, envelopeBuyFixture, generationId, hash, liveRuntimeLimits as runtimeLimits,
+  prepareEnvelope, publicKey, roleSource, type SeededSimulation, seedEnvelopeBase, withProvisionedDatabase,
+  withSchema,
 } from './helpers/entry-envelope-fixture.js';
 import { mutateWithTriggersDisabled } from './helpers/execution-preflight-v2-source-fixture.js';
-
-const runtimeLimits = Object.freeze({
-  quoteMaxAgeMs: 60_000, slippageBps: 1_000n, snapshotMaxSlotLag: 8,
-  maxComputeUnits: 200_000n, maxFeeLamports: 5_000n,
-  maxFeePayerLamportDebit: 100_000n, maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
-});
 
 void test('H2b runnable work starts on an ACTIVE v2 envelope alone and on nothing else', async (context) => {
   await withSchema(context, async (pool) => {
@@ -187,91 +178,6 @@ function runnableBinding(simulation: SeededSimulation) {
     strategyFingerprint: '3'.repeat(64), walletPublicKey: publicKey,
     cluster: 'mainnet-beta' as const, genesisHash: publicKey, providerId: 'primary',
     ...runtimeLimits,
-  });
-}
-
-/** A fast-entry BUY armed by `armEnvelope`, claimed and begun as H2b does before signing. */
-async function envelopeBuyFixture(pool: Pool, seeded?: SeededSimulation) {
-  const simulation = seeded ?? await seedEnvelopeBase(pool);
-  const operations = new PostgresExecutionOperationsRepository(pool);
-  const prepared = await openEnvelope(pool, operations, simulation);
-  await seedProviderSnapshot(pool);
-  const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
-  const armament = await armEnvelope(operations, prepared, intentId);
-  return beginArmedBuy(pool, simulation, armament.armamentId, runtimeLimits.slippageBps);
-}
-
-/** A CANARY v2 armament (operator ARM), claimed and begun as H2b does before signing. */
-async function canaryBuyFixture(pool: Pool, simulation: SeededSimulation) {
-  const armament = await armCanary(pool, new PostgresExecutionOperationsRepository(pool), simulation);
-  return beginArmedBuy(pool, simulation, armament.armamentId, 100n);
-}
-
-async function beginArmedBuy(
-  pool: Pool,
-  simulation: SeededSimulation,
-  armamentId: string,
-  slippageBps: bigint,
-) {
-  const intentId = (await pool.query<{ readonly target_intent_id: string }>(`SELECT target_intent_id
-    FROM execution_activation_armaments WHERE armament_id=$1`, [armamentId])).rows[0]?.target_intent_id;
-  assert.ok(intentId !== undefined);
-  const intents = new PostgresExecutionIntentRepository(pool);
-  const claimed = await intents.claim({
-    ownerId: 'envelope-live-test', leaseMs: 60_000, purpose: 'LIVE_EXECUTE',
-    side: 'BUY', generationId,
-  });
-  assert.ok(claimed);
-  assert.equal(claimed.intent.id, intentId);
-  const nowMs = await currentDatabaseTimeMs(pool);
-  const processing = await intents.transition(claimed, {
-    intentId, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
-    leaseToken: claimed.leaseToken, reasonCode: 'EXECUTION_STARTED',
-    humanMessage: 'Prepare an envelope BUY.', activationPhase: 'CANARY',
-    evidence: Object.freeze({
-      payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: nowMs,
-    }),
-  });
-  const begun = await intents.beginAttempt(Object.freeze({ ...claimed, intent: processing }));
-  const payer = new PublicKey(publicKey);
-  const unsigned = new VersionedTransaction(new TransactionMessage({
-    payerKey: payer, recentBlockhash: publicKey, instructions: [],
-  }).compileToV0Message());
-  const messageBytes = Object.freeze([...unsigned.message.serialize()]);
-  const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
-  const messageHash = createHash('sha256').update(Uint8Array.from(messageBytes)).digest('hex');
-  const quoteObservedAtMs = await currentDatabaseTimeMs(pool);
-  const unsignedSimulation = Object.freeze({
-    outcome: 'SUCCESS' as const, snapshotFingerprint: '6'.repeat(64),
-    buildFingerprint: hash, messageHash, blockhash: publicKey, lastValidBlockHeight: 1_000n,
-    blockhashContextSlot: 124n, feeContextSlot: 124n, estimatedFeeLamports: 5_000n,
-    simulationSlot: 125n, simulatedFeePayerLamportDebit: 5_000n, unitsConsumed: 25_000n,
-    simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
-    logsFingerprint: '8'.repeat(64), logsLineCount: 1,
-  });
-  const material = Object.freeze({
-    payloadVersion: 1 as const, walletPublicKey: publicKey, providerId: 'primary',
-    side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const, snapshotSlot: 124n,
-    quoteFingerprint: '7'.repeat(64), quoteObservedAtMs,
-    quoteExpiresAtMs: quoteObservedAtMs + 60_000, buildFingerprint: hash,
-    snapshotFingerprint: '6'.repeat(64), messageHash, messageBytes,
-    unsignedTransactionHash: createHash('sha256')
-      .update(Uint8Array.from(unsignedTransactionBytes)).digest('hex'),
-    unsignedTransactionBytes, blockhash: publicKey, lastValidBlockHeight: 1_000n,
-    unsignedSimulation,
-  });
-  const runtime = Object.freeze({
-    payloadVersion: 1 as const, phase: 'CANARY' as const, buildHash: hash,
-    configurationFingerprint: simulation.configurationFingerprint,
-    strategyFingerprint: '3'.repeat(64), walletPublicKey: publicKey,
-    cluster: 'mainnet-beta' as const, expectedGenesisHash: publicKey,
-    observedGenesisHash: publicKey, providerId: 'primary', ...runtimeLimits, slippageBps,
-  });
-  return Object.freeze({
-    armamentId,
-    input: Object.freeze({
-      claim: begun.claim, attempt: begun.attempt, generationId, runtime, material,
-    }),
   });
 }
 

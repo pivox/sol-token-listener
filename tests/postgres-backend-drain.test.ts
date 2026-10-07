@@ -151,7 +151,7 @@ void test('inventories every destructive database cleanup and guards forced term
     }
   }
   assert.deepEqual(cleanupCounts, {
-    'execution-entry-envelope.repository.test.ts': 1,
+    'helpers/entry-envelope-fixture.ts': 1,
     'execution-live.repository.test.ts': 1,
     'execution-preflight-source-database.test.ts': 1,
     'execution-worker-live-partition-migration.test.ts': 3,
@@ -176,7 +176,7 @@ const FORCED_DATABASE_CLEANUPS = Object.freeze({
 });
 
 const GRACEFUL_DATABASE_CLEANUPS = Object.freeze({
-  'execution-entry-envelope.repository.test.ts': 1,
+  'helpers/entry-envelope-fixture.ts': 1,
   'execution-preflight-source-database.test.ts': 1,
   'executor-readiness-database.test.ts': 1,
 });
