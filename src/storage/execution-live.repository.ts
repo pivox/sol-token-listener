@@ -2493,9 +2493,11 @@ function exactSigningInputFrom(value: ExecutionExactSigningInputV1): ExecutionEx
     }
     const material = unsignedSigningMaterialFrom(value.material);
     // The material's build fingerprint hashes this transaction's exact instructions (mint, curve
-    // accounts, amount), so it is never compared to the static gate-10 hash in runtime.buildHash:
-    // the static hash binds qualification, armament and lock; the per-transaction consistency is
-    // enforced by unsignedSigningMaterialFrom (material vs its simulation) and fresh-execution.
+    // accounts, amount), so it is never compared to the static gate-10 hash in runtime.buildHash.
+    // The static hash binds qualification, armament and lock to the configured identity; the
+    // per-transaction fingerprint is bound to the unsigned simulation (unsignedSigningMaterialFrom),
+    // to this attempt's signed-simulation artifact (fresh-execution, persistInputFrom) and to the
+    // lock's unsigned_simulation_fingerprint (persistSigned).
     if (material.walletPublicKey !== value.runtime.walletPublicKey
       || material.providerId !== value.runtime.providerId) throw new TypeError();
     return Object.freeze({
@@ -3268,6 +3270,7 @@ async function readAuthorizedBuyPreSignatureLock(
     armament.state AS armament_state,armament.state_revision::TEXT AS armament_state_revision,
     armament.consumed_buys,armament.qualification_id AS armament_qualification_id,
     armament.generation_id AS armament_generation_id,
+    armament.build_hash AS armament_build_hash,
     armament.target_intent_id,armament.target_intent_state_revision::TEXT,
     armament.target_reservation_id,armament.target_decision_fingerprint,
     armament.target_policy_fingerprint,armament.target_wallet_snapshot_fingerprint,
@@ -3318,7 +3321,9 @@ async function readAuthorizedBuyPreSignatureLock(
     || row.provider_id !== artifact.providerId || row.lease_token !== input.claim.leaseToken
     || row.message_hash !== artifact.messageHash
     || row.unsigned_transaction_hash !== unsigned.transactionHash
-    || row.build_hash !== artifact.buildFingerprint
+    // The lock's build_hash is the static EXECUTOR_BUILD_HASH shared with its armament, never this
+    // transaction's build fingerprint (bound through unsigned_simulation_fingerprint below).
+    || row.build_hash !== row.armament_build_hash
     || row.market_snapshot_fingerprint !== artifact.snapshotFingerprint
     || row.quote_fingerprint !== artifact.quoteFingerprint
     || timestampText(row.lock_quote_observed_at_ms) !== artifact.quoteObservedAtMs
@@ -3391,8 +3396,11 @@ async function validatePersistedPreSignatureLockReplay(
     lock.intent_state_revision::TEXT AS lock_intent_state_revision,
     lock.last_valid_block_height::TEXT AS lock_last_valid_block_height,
     trunc(EXTRACT(EPOCH FROM lock.quote_observed_at)*1000)::TEXT AS lock_quote_observed_at_ms,
-    trunc(EXTRACT(EPOCH FROM lock.quote_expires_at)*1000)::TEXT AS lock_quote_expires_at_ms
-    FROM execution_pre_signature_locks lock WHERE lock.lock_id=$1 FOR UPDATE`, [
+    trunc(EXTRACT(EPOCH FROM lock.quote_expires_at)*1000)::TEXT AS lock_quote_expires_at_ms,
+    armament.build_hash AS armament_build_hash
+    FROM execution_pre_signature_locks lock
+    JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+    WHERE lock.lock_id=$1 FOR UPDATE OF lock`, [
     input.preSignatureLockId,
   ]));
   const artifact = input.artifact;
@@ -3407,7 +3415,7 @@ async function validatePersistedPreSignatureLockReplay(
     || row.unsigned_transaction_hash !== unsigned.transactionHash
     || !databaseBytesEqual(row.unsigned_message_bytes, unsigned.messageBytes)
     || !databaseBytesEqual(row.unsigned_transaction_bytes, unsigned.transactionBytes)
-    || row.build_hash !== artifact.buildFingerprint
+    || row.build_hash !== row.armament_build_hash
     || row.market_snapshot_fingerprint !== artifact.snapshotFingerprint
     || row.quote_fingerprint !== artifact.quoteFingerprint
     || timestampText(row.lock_quote_observed_at_ms) !== artifact.quoteObservedAtMs

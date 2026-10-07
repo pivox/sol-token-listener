@@ -33,7 +33,7 @@ void test('055 is replay-safe and installs the active creation-entry singleton i
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied = await migrateDatabase({ pool });
     assert.ok(applied.includes(migrationName));
-    assert.equal(applied.at(-1), '067_fast_entry_probe_unarmable.sql');
+    assert.equal(applied.at(-1), '068_live_build_fingerprint_per_transaction.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const index = await pool.query<{ readonly definition: string }>(`SELECT indexdef AS definition
       FROM pg_indexes WHERE schemaname=current_schema()

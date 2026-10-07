@@ -75,6 +75,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       '065_entry_envelope_auto_arm.sql',
       '066_live_position_reexit.sql',
       '067_fast_entry_probe_unarmable.sql',
+      '068_live_build_fingerprint_per_transaction.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

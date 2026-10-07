@@ -1,7 +1,8 @@
 # Lot 5 — premier run réel : inventaire, checklist et dry-run
 
 **Date :** 2026-10-07. **Base :** `main` à `d223abf2` (lots 1 à 4b mergés), plus le mini-lot 5a
-(sonde de gate 10, migration 067, branche `docs/lot5-readiness`). Head de migration : **067**.
+(sonde de gate 10, migration 067, branche `docs/lot5-readiness`) et le correctif du bloquant 5
+(migration 068, branche `fix/build-hash-per-transaction`). Head de migration : **068**.
 **Statut :** préparation seulement. Rien n'a été lancé : aucun RPC, aucun listener, aucune transaction.
 
 ### Décisions de l'utilisateur (2026-10-07)
@@ -74,13 +75,27 @@ noms de variables ont été lus, avec l'indication « valeur présente » ou « 
      (mint inconnu à l'avance), chaque BUY `fast-entry-v1` échouait fermé (`INVALID_INPUT`) en
      consommant un `buys_armed`. Seul CANARY v3 satisfaisait l'égalité ; tous les tests partageaient
      une constante entre les deux valeurs, d'où l'angle mort.
-   - Correctif : cette seule égalité est retirée. La cohérence par transaction reste garantie deux
-     fois (`unsignedSigningMaterialFrom` lie le matériel à sa simulation non signée,
-     `fresh-execution.ts` lie l'artefact de simulation signée au matériel). `EXECUTOR_BUILD_HASH`
-     reste l'ancre statique de la qualification, de l'armement et du verrou. Test :
-     `tests/execution-live-envelope.repository.test.ts`, « ENVELOPE signing accepts a per-mint
-     build fingerprint different from EXECUTOR_BUILD_HASH ».
-   - À merger avant B23 (H2b).
+   - La même égalité existait plus loin sur le chemin BUY : `persistSigned` (lecture du verrou
+     autorisé et rejeu) comparait `lock.build_hash` (statique) au `build_fingerprint` de l'artefact
+     signé, et deux triggers de la migration 039 l'imposaient aussi (insertion de l'artefact signé,
+     passage du verrou à `SIGNED_PERSISTED`). Sans ce second correctif, l'autorisation passait
+     (armement `LOCKED`, `buys_armed` consommé), la transaction était signée, puis la persistance
+     échouait fermée : le `buys_armed` était perdu quand même.
+   - Correctif : ces égalités sont retirées, et seulement elles. En TypeScript, `exactSigningInputFrom`
+     ne compare plus le matériel à `runtime.buildHash`, et `persistSigned` compare le `build_hash`
+     du verrou à celui de son armement (statique contre statique). La migration **068**
+     (`068_live_build_fingerprint_per_transaction.sql`) redéfinit les deux fonctions trigger de 039
+     sans la clause `build_fingerprint = build_hash` ; tout le reste est conservé mot pour mot. La
+     cohérence par transaction reste garantie trois fois (`unsignedSigningMaterialFrom` lie le
+     matériel à sa simulation non signée, `fresh-execution.ts` et `persistInputFrom` lient l'artefact
+     signé à cette simulation, et le verrou porte `unsigned_simulation_fingerprint`).
+     `EXECUTOR_BUILD_HASH` reste l'ancre statique de la qualification, de l'armement et du verrou.
+     Tests : `tests/execution-live-envelope.repository.test.ts`, « ENVELOPE signing accepts a
+     per-mint build fingerprint different from EXECUTOR_BUILD_HASH » (autorisation) et
+     `tests/execution-live.repository.test.ts`, « BUY persistence and submission accept a
+     per-transaction build fingerprint that differs from the static build hash » (autorisation →
+     persistance → rejeu → soumission).
+   - À merger avant B3 (la base doit être migrée à 068) et donc avant B23 (H2b).
 
 ### Pièges sans être bloquants
 
@@ -420,7 +435,7 @@ secrets dans le checkout.
   - Son service `app` se connecte en propriétaire et non en `sol_token_listener_writer`.
   - Il ne convient donc pas tel quel aux processus natifs.
 - **Provisioning**, dans l'ordre (étapes B2 à B4) :
-  1. migrations jusqu'à `067_fast_entry_probe_unarmable.sql`, en propriétaire ;
+  1. migrations jusqu'à `068_live_build_fingerprint_per_transaction.sql`, en propriétaire ;
   2. `scripts/provision-executor-roles.sql` en administrateur, une ou deux fois. Ce script crée les
      **rôles de groupe** `NOLOGIN` mais aucun login ;
   3. création de 6 **logins** :
@@ -585,7 +600,7 @@ docker run -d --name sol-lot5-pg --restart unless-stopped \
 À vérifier : `SELECT current_setting('server_version_num')` ≥ 160000. Le port est publié sur
 127.0.0.1 uniquement. Ce n'est ni le 5432 ni le 55432.
 
-**B3. Migration jusqu'à 067.** NO-NETWORK.
+**B3. Migration jusqu'à 068.** NO-NETWORK.
 
 ```bash
 DOTENV_CONFIG_PATH="$L/env/migrate.env" npm run db:migrate:compiled
@@ -597,8 +612,8 @@ DOTENV_CONFIG_PATH="$L/env/migrate.env" npm run db:migrate:compiled
 SELECT max(version) FROM migration_history;
 ```
 
-Le résultat attendu est `067_fast_entry_probe_unarmable.sql`, et le nombre de versions doit être
-égal au nombre de fichiers dans `migrations/`.
+Le résultat attendu est `068_live_build_fingerprint_per_transaction.sql`, et le nombre de versions
+doit être égal au nombre de fichiers dans `migrations/`.
 
 **B4. Provisioning des rôles et logins.** NO-NETWORK.
 
@@ -1086,8 +1101,8 @@ Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concern
 1. [ ] Accord explicite de l'utilisateur pour le lot 5, avec les montants décidés (§B.2).
 0. [ ] Le correctif du bloquant 5 (branche `fix/build-hash-per-transaction`, testé) est mergé
    dans `main` et déployé ; sinon H2b refuse chaque BUY fast-entry en consommant un `buys_armed`.
-2. [ ] La base de production est en PG16 (`127.0.0.1:5433`), migrée à 067, avec les rôles
-   reprovisionnés **après** 067 (inventaire RLS `5 | 1 | t`) et 6 logins mono-rôle.
+2. [ ] La base de production est en PG16 (`127.0.0.1:5433`), migrée à 068, avec les rôles
+   reprovisionnés **après** 068 (inventaire RLS `5 | 1 | t`) et 6 logins mono-rôle.
 3. [ ] Aucune position n'est `MISMATCH` (sur un SELL antérieur à 4b), `UNKNOWN` ou `EXIT_PENDING`,
    et `unknown_block = false` (base neuve : trivialement vrai).
 4. [ ] Le dry-run C est passé en entier : au moins un `ARMED`, `revoke` vérifié, rapport lisible.

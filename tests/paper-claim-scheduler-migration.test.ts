@@ -72,6 +72,7 @@ void test('adds a replay-safe monotone paper finality claim scheduler',async(con
       '065_entry_envelope_auto_arm.sql',
       '066_live_position_reexit.sql',
       '067_fast_entry_probe_unarmable.sql',
+      '068_live_build_fingerprint_per_transaction.sql',
     ]);
     assert.deepEqual((await pool.query(`SELECT mint,finality_checked_at,
       claim_scan_generation::text AS claim_scan_generation

@@ -1054,7 +1054,9 @@ anticipées sont alors arrêtées. L'échéance n'est pas touchée. Si on le voi
 
 ### Ordre de déploiement
 
-1. Migrer jusqu'à la tête : 066 au lot 4b, 067 depuis le lot 5a (H2a et H2b exigent la tête exacte).
+1. Migrer jusqu'à la tête : 066 au lot 4b, 067 depuis le lot 5a, 068 depuis le correctif du
+   bloquant 5 (H2a et H2b exigent la tête exacte ; sans 068, chaque BUY fast-entry échoue fermé à
+   la persistance en consommant un `buys_armed`).
 2. Re-provisionner les rôles (`scripts/provision-executor-roles.sql`) AVANT de redémarrer H2a et H2b.
    Sinon le validateur de démarrage refuse de lancer H2a, et les sorties à l'échéance ne tournent
    pas non plus.

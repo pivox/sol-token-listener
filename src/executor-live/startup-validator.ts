@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '067_fast_entry_probe_unarmable.sql';
+  readonly migrationHead: '068_live_build_fingerprint_per_transaction.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -598,7 +598,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '067_fast_entry_probe_unarmable.sql',
+    migrationHead: '068_live_build_fingerprint_per_transaction.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,
