@@ -5020,13 +5020,15 @@ async function createDeadlineExitIntentLocked(
     position.remaining_base_raw::TEXT AS remaining_base_raw,
     trunc(EXTRACT(EPOCH FROM position.exit_deadline_at)*1000)::TEXT AS exit_deadline_at_ms,
     position.entry_reconciliation_fingerprint,
-    buy.quote_token_program,buy.quote_decimals
+    buy.quote_token_program,buy.quote_decimals,
+    buy.decision_event_id AS buy_decision_event_id
     FROM execution_live_positions position
     JOIN execution_intents buy ON buy.id=position.buy_intent_id
     WHERE position.position_id=$1 FOR UPDATE OF position`, [input.positionId])), [
     'position_id', 'generation_id', 'state', 'position_revision', 'exit_intent_id', 'mint',
     'quote_mint', 'remaining_base_raw', 'exit_deadline_at_ms',
     'entry_reconciliation_fingerprint', 'quote_token_program', 'quote_decimals',
+    'buy_decision_event_id',
   ] as const);
   if (row.position_id !== input.positionId || row.generation_id !== input.generationId) {
     throw failure('INVALID_DATA');
@@ -5052,7 +5054,7 @@ async function createDeadlineExitIntentLocked(
     quoteAmountRaw: null,
     baseAmountRaw: unsignedBigint(row.remaining_base_raw),
     minimumAmountOutRaw: 1n,
-    decisionEventId: logicalCommandId,
+    decisionEventId: text(row.buy_decision_event_id),
     decisionFingerprint: row.entry_reconciliation_fingerprint,
     requestedAtMs: input.observedAtMs,
     expiresAtMs: input.observedAtMs + 120_000,

@@ -621,11 +621,6 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
   const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
-  await insertExecutionDecisionEvent(
-    pool,
-    `maximum-holding:${entry.position.positionId}`,
-    entry.position.mint,
-  );
   const exit = await live.createDeadlineExitIntent({
     positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });
