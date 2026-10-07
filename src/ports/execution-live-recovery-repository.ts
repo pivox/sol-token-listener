@@ -39,6 +39,9 @@ export interface ExecutionLiveRecoveryRepository {
   ) => Promise<unknown>;
   readonly createNextDeadlineExitIntent:
     ExecutionLiveRepository['createNextDeadlineExitIntent'];
+  readonly createNextEarlyExitIntent: ExecutionLiveRepository['createNextEarlyExitIntent'];
+  readonly createNextReExitIntent: ExecutionLiveRepository['createNextReExitIntent'];
+  readonly listCappedDeadExits: ExecutionLiveRepository['listCappedDeadExits'];
 }
 
 export function createExecutionLiveRecoveryIntentRepository(
@@ -66,7 +69,10 @@ export function createExecutionLiveRecoveryRepository(
     | 'recordConfirmation'
     | 'readReconciliationWork'
     | 'commitReconciliation'
-    | 'createNextDeadlineExitIntent'>,
+    | 'createNextDeadlineExitIntent'
+    | 'createNextEarlyExitIntent'
+    | 'createNextReExitIntent'
+    | 'listCappedDeadExits'>,
 ): ExecutionLiveRecoveryRepository {
   return exactFacade({
     readConfirmationWork: source.readConfirmationWork.bind(source),
@@ -74,6 +80,9 @@ export function createExecutionLiveRecoveryRepository(
     readReconciliationWork: source.readReconciliationWork.bind(source),
     commitReconciliation: source.commitReconciliation.bind(source),
     createNextDeadlineExitIntent: source.createNextDeadlineExitIntent.bind(source),
+    createNextEarlyExitIntent: source.createNextEarlyExitIntent.bind(source),
+    createNextReExitIntent: source.createNextReExitIntent.bind(source),
+    listCappedDeadExits: source.listCappedDeadExits.bind(source),
   });
 }
 

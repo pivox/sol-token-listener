@@ -15,10 +15,10 @@ const GENERATION_ID = `execution_wallet_generation_${'a'.repeat(64)}`;
 const PUBLIC_KEY = '11111111111111111111111111111111';
 
 void test('pins every migration through 060 to a non-placeholder sha256', async () => {
-  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 65);
+  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 66);
   assert.equal(
     LIVE_RECOVERY_MIGRATION_CATALOG.at(-1)?.name,
-    '065_entry_envelope_auto_arm.sql',
+    '066_live_position_reexit.sql',
   );
   for (const entry of LIVE_RECOVERY_MIGRATION_CATALOG) {
     assert.match(entry.name, /^\d{3}_[a-z0-9_-]+\.sql$/u);
@@ -38,7 +38,7 @@ void test('validates role, exact migration history, generation and open-work aff
   assert.deepEqual(evidence, {
     payloadVersion: 1,
     role: 'sol_token_executor_live_recovery',
-    migrationHead: '065_entry_envelope_auto_arm.sql',
+    migrationHead: '066_live_position_reexit.sql',
     generationId: GENERATION_ID,
     providerId: 'primary',
   });
@@ -294,5 +294,6 @@ function config(): LiveRecoveryConfig {
     providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
     expectedGenesisHash: PUBLIC_KEY, rpcTimeoutMs: 5_000,
     maxRpcCallsPerPass: 8, ownerId: 'recovery-a',
+    exitTakeProfitBps: 20_000n, exitExternalBuyersTarget: 10, exitExternalMinimumBuyRaw: 1_000_000n,
   });
 }

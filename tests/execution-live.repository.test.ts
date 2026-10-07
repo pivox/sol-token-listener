@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import bs58 from 'bs58';
 import pg from 'pg';
 import {
@@ -43,6 +43,12 @@ import { PostgresExecutionSimulationRepository } from '../src/storage/execution-
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
 import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
+import { roleSource, withProvisionedDatabase } from './helpers/entry-envelope-fixture.js';
+import { type EnvelopeSeed, linkEnvelope } from './helpers/live-envelope-link.js';
+import {
+  earlyExitPolicy, earlyExitPublicKey, entrySlot, everyRuleTrades, insertLaunchEvent,
+  insertTradeEvents,
+} from './helpers/fast-exit-events.js';
 import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
@@ -3410,3 +3416,606 @@ function databaseErrorCode(error: unknown): string | null {
 function isLiveRepositoryError(code: string): (error: unknown) => boolean {
   return (error) => error instanceof ExecutionLiveRepositoryError && error.code === code;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Lot 4b: early exit intents of envelope positions (createNextEarlyExitIntent).
+// ---------------------------------------------------------------------------------------------
+
+type EarlyExitFixture = Awaited<ReturnType<typeof earlyExitFixture>>;
+
+/** An OPEN position, deadline in the future, opened in the past, optionally envelope-linked. */
+async function earlyExitFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  envelopeState: EnvelopeSeed['state'] | null,
+) {
+  const fixture = await openPositionFixture(pool);
+  const positionId = fixture.position.positionId;
+  const row = (await pool.query<{
+    readonly mint: string; readonly wallet_public_key: string;
+    readonly maximum_holding_ms: number; readonly remaining_base_raw: string;
+    readonly quote_cost_raw: string; readonly buy_decision_event_id: string;
+  }>(`SELECT position.mint,position.wallet_public_key,position.maximum_holding_ms,
+    position.remaining_base_raw::TEXT AS remaining_base_raw,
+    position.quote_cost_raw::TEXT AS quote_cost_raw,
+    buy.decision_event_id AS buy_decision_event_id
+    FROM execution_live_positions position
+    JOIN execution_intents buy ON buy.id=position.buy_intent_id
+    WHERE position.position_id=$1`, [positionId])).rows[0];
+  assert.ok(row);
+  assert.ok(row.maximum_holding_ms > 20_000);
+  const deadlineAtMs = (await databaseNowMs(pool)) + row.maximum_holding_ms - 10_000;
+  await setPositionDeadline(pool, positionId, deadlineAtMs);
+  const evidence = await pool.query(`SELECT observed_slot::TEXT AS observed_slot
+    FROM execution_reconciliation_evidence WHERE side='BUY'`);
+  assert.deepEqual(evidence.rows, [{ observed_slot: entrySlot.toString() }]);
+  if (envelopeState !== null) {
+    await linkEnvelope(pool, generationId, {
+      state: envelopeState, priorLossRaw: '0', maxLossRaw: '1000',
+    });
+  }
+  return Object.freeze({
+    live: fixture.live,
+    positionId,
+    deadlineAtMs,
+    mint: row.mint,
+    wallet: row.wallet_public_key,
+    remainingBaseRaw: BigInt(row.remaining_base_raw),
+    quoteCostRaw: BigInt(row.quote_cost_raw),
+    buyDecisionEventId: row.buy_decision_event_id,
+  });
+}
+
+async function assertEarlyExitCreated(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: EarlyExitFixture,
+  result: Awaited<ReturnType<PostgresExecutionLiveRepository['createNextEarlyExitIntent']>>,
+  reason: string,
+): Promise<void> {
+  assert.ok(result);
+  assert.equal(result.kind, 'CREATED');
+  assert.equal(result.reason, reason);
+  const logicalCommandId = `fast-exit:${reason}:${fixture.positionId}`;
+  assert.equal(result.intent.logicalCommandId, logicalCommandId);
+  const rows = await pool.query(`SELECT intent.id,intent.strategy_id,intent.logical_command_id,
+    intent.side,intent.venue_policy,intent.minimum_amount_out_raw::TEXT AS minimum,
+    intent.base_amount_raw::TEXT AS base,intent.decision_event_id,intent.live_reserved,
+    trunc(EXTRACT(EPOCH FROM intent.expires_at-intent.requested_at)*1000)::INTEGER AS ttl_ms,
+    intent.requested_at >= position.opened_at AS after_open,
+    intent.requested_at < position.exit_deadline_at AS before_deadline,
+    position.state,position.exit_intent_id
+    FROM execution_intents intent
+    JOIN execution_live_positions position ON position.position_id=intent.position_id
+    WHERE intent.side='SELL' AND intent.position_id=$1`, [fixture.positionId]);
+  assert.deepEqual(rows.rows, [{
+    id: result.intent.id,
+    strategy_id: 'fast-entry-exit-v1',
+    logical_command_id: logicalCommandId,
+    side: 'SELL',
+    venue_policy: 'CANONICAL_EXIT',
+    minimum: '1',
+    base: fixture.remainingBaseRaw.toString(),
+    decision_event_id: fixture.buyDecisionEventId,
+    live_reserved: true,
+    ttl_ms: 120_000,
+    after_open: true,
+    before_deadline: true,
+    state: 'EXIT_PENDING',
+    exit_intent_id: result.intent.id,
+  }]);
+}
+
+async function assertNoEarlyExit(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: EarlyExitFixture,
+): Promise<void> {
+  assert.equal(await fixture.live.createNextEarlyExitIntent(earlyExitPolicy), null);
+  const durable = await pool.query(`SELECT
+    (SELECT COUNT(*)::INTEGER FROM execution_intents WHERE side='SELL') AS sells,
+    (SELECT state FROM execution_live_positions WHERE position_id=$1) AS state,
+    (SELECT exit_intent_id FROM execution_live_positions WHERE position_id=$1) AS exit_intent_id`, [
+    fixture.positionId,
+  ]);
+  assert.deepEqual(durable.rows, [{ sells: 0, state: 'OPEN', exit_intent_id: null }]);
+}
+
+function earlyExitDatabaseUrl(context: TestContext): string | null {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: early exit test skipped');
+    return null;
+  }
+  return databaseUrl;
+}
+
+void test('early exit: a revoked envelope sells before the deadline, with the deadline lock order',
+  async (context) => {
+    const databaseUrl = earlyExitDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'REVOKED');
+      const clockMs = await databaseNowMs(pool);
+      const queries: string[] = [];
+      const repository = deadlineClockRepository(pool, clockMs, Object.freeze({ queries }));
+      const result = await repository.createNextEarlyExitIntent(earlyExitPolicy);
+      await assertEarlyExitCreated(pool, fixture, result, 'ENVELOPE_REVOKED');
+      assert.equal(result?.intent.requestedAtMs, clockMs);
+
+      const normalized = queries.map((query) => query.replaceAll(/\s+/gu, ' ').trim());
+      const scanLock = normalized.findIndex((query) =>
+        query.includes("hashtextextended('execution-live-deadline-scan:v1', 51007)"));
+      const clock = normalized.findIndex((query) => query.includes('execution_live_deadline_clock'));
+      const candidates = normalized.findIndex((query) =>
+        query.includes('execution_entry_envelopes') && query.includes('LIMIT 20'));
+      const trades = normalized.findIndex((query) =>
+        query.includes("type='BondingCurveTradeObserved'"));
+      const mintLock = normalized.findIndex((query) =>
+        query.includes("hashtextextended('transaction-inbox-mint:' || $1, 0)"));
+      const sellPresenceLock = normalized.findIndex((query) =>
+        query.includes("hashtextextended('execution-live-sell-presence:v1', 51008)"));
+      const generationLock = normalized.findIndex((query) =>
+        query.includes('hashtextextended($1, 51005)'));
+      const rowLock = normalized.findIndex((query) => query.includes('FOR UPDATE OF position'));
+      assert.ok(scanLock >= 0 && scanLock < clock && clock < candidates);
+      assert.ok(candidates < trades && trades < mintLock);
+      assert.ok(mintLock < sellPresenceLock && sellPresenceLock < generationLock);
+      assert.ok(generationLock < rowLock);
+      assert.equal(normalized.filter((query) =>
+        query.includes('execution_entry_envelopes') && /FOR (UPDATE|SHARE)/u.test(query)).length, 0);
+    });
+  });
+
+void test('early exit: the creator sold after entry', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    const creator = earlyExitPublicKey();
+    await insertLaunchEvent(pool, fixture.mint, creator);
+    await insertTradeEvents(pool, fixture.mint, [
+      { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+    ]);
+    const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+    await assertEarlyExitCreated(pool, fixture, result, 'CREATOR_SOLD');
+  });
+});
+
+void test('early exit: take-profit at the last observed curve price', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    await insertLaunchEvent(pool, fixture.mint, earlyExitPublicKey());
+    // remaining * quote * 10 000 >= cost * 20 000 * base, with base = remaining.
+    await insertTradeEvents(pool, fixture.mint, [{
+      kind: 'BUY', trader: earlyExitPublicKey(), baseAmountRaw: fixture.remainingBaseRaw,
+      quoteAmountRaw: 2n * fixture.quoteCostRaw,
+    }]);
+    const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+    await assertEarlyExitCreated(pool, fixture, result, 'TAKE_PROFIT');
+  });
+});
+
+void test('early exit: enough distinct external buyers', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    await insertLaunchEvent(pool, fixture.mint, earlyExitPublicKey());
+    const cheap = { baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n } as const;
+    await insertTradeEvents(pool, fixture.mint, [
+      { kind: 'BUY', trader: earlyExitPublicKey(), ...cheap },
+      { kind: 'BUY', trader: earlyExitPublicKey(), ...cheap },
+    ]);
+    await assertNoEarlyExit(pool, fixture);
+    await insertTradeEvents(pool, fixture.mint, [
+      { kind: 'BUY', trader: earlyExitPublicKey(), ...cheap, transactionIndex: 10 },
+    ]);
+    const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+    await assertEarlyExitCreated(pool, fixture, result, 'EXTERNAL_BUYERS');
+  });
+});
+
+void test('early exit: a CANARY position keeps the deadline as its only exit', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, null);
+    const creator = earlyExitPublicKey();
+    await insertLaunchEvent(pool, fixture.mint, creator);
+    await insertTradeEvents(pool, fixture.mint, everyRuleTrades(fixture, creator));
+    await assertNoEarlyExit(pool, fixture);
+  });
+});
+
+void test('early exit ignores trades at or before the entry slot', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    const creator = earlyExitPublicKey();
+    await insertLaunchEvent(pool, fixture.mint, creator);
+    await insertTradeEvents(pool, fixture.mint, everyRuleTrades(fixture, creator, { slot: entrySlot }));
+    await insertTradeEvents(pool, fixture.mint,
+      everyRuleTrades(fixture, creator, { slot: entrySlot - 1n }));
+    await assertNoEarlyExit(pool, fixture);
+    // Control: the same trades one slot after entry fire.
+    await insertTradeEvents(pool, fixture.mint, everyRuleTrades(fixture, creator));
+    await assertEarlyExitCreated(pool, fixture,
+      await fixture.live.createNextEarlyExitIntent(earlyExitPolicy), 'CREATOR_SOLD');
+  });
+});
+
+void test('early exit ignores orphaned and processed trades', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    const creator = earlyExitPublicKey();
+    await insertLaunchEvent(pool, fixture.mint, creator);
+    await insertTradeEvents(pool, fixture.mint,
+      everyRuleTrades(fixture, creator, { confirmationStatus: 'orphaned' }));
+    await insertTradeEvents(pool, fixture.mint,
+      everyRuleTrades(fixture, creator, { confirmationStatus: 'processed' }));
+    await assertNoEarlyExit(pool, fixture);
+    // Control: confirmed trades fire.
+    await insertTradeEvents(pool, fixture.mint,
+      everyRuleTrades(fixture, creator, { confirmationStatus: 'confirmed' }));
+    await assertEarlyExitCreated(pool, fixture,
+      await fixture.live.createNextEarlyExitIntent(earlyExitPolicy), 'CREATOR_SOLD');
+  });
+});
+
+void test('early exit ignores trades of our own wallet', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    await insertLaunchEvent(pool, fixture.mint, earlyExitPublicKey());
+    await insertTradeEvents(pool, fixture.mint, [
+      { kind: 'BUY', trader: fixture.wallet, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      { kind: 'BUY', trader: fixture.wallet, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      { kind: 'BUY', trader: fixture.wallet, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      {
+        kind: 'BUY', trader: fixture.wallet, baseAmountRaw: 1n,
+        quoteAmountRaw: 2n * fixture.quoteCostRaw,
+      },
+    ]);
+    await assertNoEarlyExit(pool, fixture);
+    // Control: the same take-profit price from another wallet fires.
+    await insertTradeEvents(pool, fixture.mint, [{
+      kind: 'BUY', trader: earlyExitPublicKey(), baseAmountRaw: 1n,
+      quoteAmountRaw: 2n * fixture.quoteCostRaw, transactionIndex: 10,
+    }]);
+    await assertEarlyExitCreated(pool, fixture,
+      await fixture.live.createNextEarlyExitIntent(earlyExitPolicy), 'TAKE_PROFIT');
+  });
+});
+
+void test('early exit: a malformed amount disables trade rules, a revoked envelope still exits',
+  async (context) => {
+    const databaseUrl = earlyExitDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    for (const envelopeState of ['ACTIVE', 'REVOKED'] as const) {
+      await withTemporarySchema(databaseUrl, async (pool) => {
+        const fixture = await earlyExitFixture(pool, envelopeState);
+        const creator = earlyExitPublicKey();
+        await insertLaunchEvent(pool, fixture.mint, creator);
+        await insertTradeEvents(pool, fixture.mint, everyRuleTrades(fixture, creator));
+        await insertTradeEvents(pool, fixture.mint, [{
+          kind: 'BUY', trader: earlyExitPublicKey(), baseAmountRaw: 1n, quoteAmountRaw: 1n,
+          transactionIndex: 99,
+          mutate: (payload) => {
+            payload.trade.baseAmountRaw = { $solTokenListenerBigInt: '01' };
+          },
+        }]);
+        if (envelopeState === 'ACTIVE') {
+          await assertNoEarlyExit(pool, fixture);
+        } else {
+          const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+          await assertEarlyExitCreated(pool, fixture, result, 'ENVELOPE_REVOKED');
+        }
+      });
+    }
+  });
+
+void test('early exit leaves a due position to the deadline scanner', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'REVOKED');
+    await makePositionDue(pool, fixture.positionId);
+    await assertNoEarlyExit(pool, fixture);
+    const deadline = await fixture.live.createNextDeadlineExitIntent();
+    assert.equal(deadline?.kind, 'CREATED');
+    assert.equal(deadline?.intent?.logicalCommandId, `maximum-holding:${fixture.positionId}`);
+    assert.equal(deadline?.intent?.strategyId, 'maximum-holding-exit');
+  });
+});
+
+void test('after an early exit the deadline scanner finds nothing to sell', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'REVOKED');
+    const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+    await assertEarlyExitCreated(pool, fixture, result, 'ENVELOPE_REVOKED');
+    assert.equal(await fixture.live.createNextEarlyExitIntent(earlyExitPolicy), null);
+    await makePositionDue(pool, fixture.positionId);
+    assert.equal(await fixture.live.createNextDeadlineExitIntent(), null);
+    const sells = await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM execution_intents
+      WHERE side='SELL'`);
+    assert.deepEqual(sells.rows, [{ count: 1 }]);
+  });
+});
+
+void test('two concurrent early exit scans create exactly one SELL intent', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'REVOKED');
+    const results = await Promise.all([
+      fixture.live.createNextEarlyExitIntent(earlyExitPolicy),
+      fixture.live.createNextEarlyExitIntent(earlyExitPolicy),
+    ]);
+    assert.equal(results.filter((result) => result?.kind === 'CREATED').length, 1);
+    assert.equal(results.filter((result) => result === null).length, 1);
+    const sells = await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM execution_intents
+      WHERE side='SELL'`);
+    assert.deepEqual(sells.rows, [{ count: 1 }]);
+  });
+});
+
+void test('an early exit racing a due deadline gives exactly one SELL intent', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'REVOKED');
+    const dueAtMs = await makePositionDue(pool, fixture.positionId);
+    // The early scan observes a clock just before the deadline, the deadline scan the real one.
+    const early = deadlineClockRepository(pool, dueAtMs - 1);
+    const results = await Promise.all([
+      early.createNextEarlyExitIntent(earlyExitPolicy),
+      fixture.live.createNextDeadlineExitIntent(),
+    ]);
+    assert.equal(results.filter((result) => result !== null).length, 1);
+    const sells = await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM execution_intents
+      WHERE side='SELL'`);
+    assert.deepEqual(sells.rows, [{ count: 1 }]);
+    const position = await pool.query(`SELECT state FROM execution_live_positions`);
+    assert.deepEqual(position.rows, [{ state: 'EXIT_PENDING' }]);
+  });
+});
+
+void test('early exit: one malformed trade disables trade rules, a revoked envelope still exits',
+  async (context) => {
+    const databaseUrl = earlyExitDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    const malformations: readonly Readonly<{
+      name: string; mutate: (payload: { trade: Record<string, unknown> }) => void;
+    }>[] = [
+      {
+        name: 'non-WSOL quote mint',
+        mutate: (payload) => {
+          payload.trade.quoteAsset = {
+            mint: earlyExitPublicKey(), decimals: 9, tokenProgram: 'SPL_TOKEN',
+          };
+        },
+      },
+      { name: 'invalid kind', mutate: (payload) => { payload.trade.kind = 'SWAP'; } },
+      { name: 'non-canonical trader', mutate: (payload) => { payload.trade.trader = '0OIl'; } },
+    ];
+    for (const malformation of malformations) {
+      for (const envelopeState of ['ACTIVE', 'REVOKED'] as const) {
+        await withTemporarySchema(databaseUrl, async (pool) => {
+          const fixture = await earlyExitFixture(pool, envelopeState);
+          const creator = earlyExitPublicKey();
+          await insertLaunchEvent(pool, fixture.mint, creator);
+          await insertTradeEvents(pool, fixture.mint, everyRuleTrades(fixture, creator));
+          await insertTradeEvents(pool, fixture.mint, [{
+            kind: 'BUY', trader: earlyExitPublicKey(), baseAmountRaw: 1n, quoteAmountRaw: 1n,
+            transactionIndex: 99, mutate: malformation.mutate,
+          }]);
+          if (envelopeState === 'ACTIVE') {
+            await assertNoEarlyExit(pool, fixture);
+          } else {
+            const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+            await assertEarlyExitCreated(pool, fixture, result, 'ENVELOPE_REVOKED');
+          }
+        });
+      }
+    }
+  });
+
+void test('early exit: an ambiguous creator gives no CREATOR_SOLD', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    const creator = earlyExitPublicKey();
+    await insertLaunchEvent(pool, fixture.mint, creator);
+    await insertLaunchEvent(pool, fixture.mint, earlyExitPublicKey());
+    await insertTradeEvents(pool, fixture.mint, [
+      { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+    ]);
+    await assertNoEarlyExit(pool, fixture);
+  });
+});
+
+void test('early exit rejects an invalid policy before any database access', async () => {
+  const repository = new PostgresExecutionLiveRepository({
+    connect: async () => { throw new Error('the policy must be rejected before connecting'); },
+  });
+  for (const policy of [
+    Object.freeze({ ...earlyExitPolicy, takeProfitBps: 10_000n }),
+    Object.freeze({ ...earlyExitPolicy, externalBuyersTarget: 0 }),
+    Object.freeze({ ...earlyExitPolicy, externalMinimumBuyRaw: 0n }),
+    { ...earlyExitPolicy },
+  ]) {
+    await assert.rejects(repository.createNextEarlyExitIntent(policy),
+      isLiveRepositoryError('INVALID_INPUT'));
+  }
+});
+
+void test('early exit skips a candidate whose facts raise a data exception and exits the next one',
+  async (context) => {
+    const databaseUrl = earlyExitDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'ACTIVE');
+      const second = await cloneOpenPosition(pool, fixture.positionId);
+      for (const mint of [fixture.mint, second.mint]) {
+        const creator = earlyExitPublicKey();
+        await insertLaunchEvent(pool, mint, creator);
+        await insertTradeEvents(pool, mint, [
+          { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+        ]);
+      }
+      // The first (oldest) candidate's trade read fails with a data exception (22012).
+      const failing = failingTradeReadRepository(pool, fixture.mint, 'SELECT 1/0');
+      const skipped = await failing.createNextEarlyExitIntent(earlyExitPolicy);
+      assert.equal(skipped?.reason, 'CREATOR_SOLD');
+      assert.equal(skipped?.intent.positionId, second.positionId);
+      // Without the failure, the first candidate exits on the next pass.
+      const next = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+      assert.equal(next?.reason, 'CREATOR_SOLD');
+      assert.equal(next?.intent.positionId, fixture.positionId);
+      const sells = await pool.query<{ position_id: string }>(`SELECT position_id
+        FROM execution_intents WHERE side='SELL' ORDER BY position_id`);
+      assert.deepEqual(sells.rows.map((row) => row.position_id).sort(),
+        [fixture.positionId, second.positionId].sort());
+    });
+  });
+
+void test('early exit fails instead of skipping on a non-data facts error', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  for (const sqlState of ['42501', '57014', '08006', '42601']) {
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'ACTIVE');
+      const creator = earlyExitPublicKey();
+      await insertLaunchEvent(pool, fixture.mint, creator);
+      await insertTradeEvents(pool, fixture.mint, [
+        { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      ]);
+      const failing = failingTradeReadRepository(pool, fixture.mint,
+        `DO $raise$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE='${sqlState}'; END $raise$`);
+      await assert.rejects(failing.createNextEarlyExitIntent(earlyExitPolicy),
+        isLiveRepositoryError('DATABASE_FAILURE'), sqlState);
+      const durable = await pool.query(`SELECT
+        (SELECT COUNT(*)::INTEGER FROM execution_intents WHERE side='SELL') AS sells,
+        (SELECT state FROM execution_live_positions WHERE position_id=$1) AS state`, [
+        fixture.positionId,
+      ]);
+      assert.deepEqual(durable.rows, [{ sells: 0, state: 'OPEN' }], sqlState);
+    });
+  }
+});
+
+/** A repository whose trade read for `mint` first runs `failure` on the same connection. */
+function failingTradeReadRepository(
+  pool: InstanceType<typeof pg.Pool>,
+  mint: string,
+  failure: string,
+): PostgresExecutionLiveRepository {
+  return new PostgresExecutionLiveRepository({
+    connect: async () => {
+      const client = await pool.connect();
+      return {
+        query: async (text: string, values?: readonly unknown[]) => {
+          if (text.includes("type='BondingCurveTradeObserved'") && values?.[0] === mint) {
+            await client.query(failure);
+          }
+          const result = await client.query(text, values as unknown[] | undefined);
+          return {
+            rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+            rowCount: result.rowCount,
+          };
+        },
+        release: (error?: boolean) => { client.release(error); },
+      };
+    },
+  });
+}
+
+/**
+ * A second OPEN position of the same armament (envelope), opened 5 s after the first, on a new
+ * mint. The one-active-position-per-generation index is dropped in this temporary schema only.
+ */
+async function cloneOpenPosition(
+  pool: InstanceType<typeof pg.Pool>,
+  positionId: string,
+): Promise<Readonly<{ positionId: string; mint: string }>> {
+  const clonePositionId = `execution_live_position_${randomUUID().replaceAll('-', '').repeat(2)}`;
+  const cloneIntentId = `execution_intent_${randomUUID().replaceAll('-', '').repeat(2)}`;
+  const mint = earlyExitPublicKey();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DROP INDEX execution_live_positions_one_active_per_generation');
+    await client.query('SET LOCAL session_replication_role=replica');
+    await client.query(`CREATE TEMP TABLE clone_intent ON COMMIT DROP AS
+      SELECT intent.* FROM execution_intents intent
+      JOIN execution_live_positions position ON position.buy_intent_id=intent.id
+      WHERE position.position_id=$1`, [positionId]);
+    await client.query(`UPDATE clone_intent SET id=$1,logical_order_key=$2`, [
+      cloneIntentId, `clone:${cloneIntentId}`,
+    ]);
+    await client.query('INSERT INTO execution_intents SELECT * FROM clone_intent');
+    await client.query(`CREATE TEMP TABLE clone_position ON COMMIT DROP AS
+      SELECT * FROM execution_live_positions WHERE position_id=$1`, [positionId]);
+    await client.query(`UPDATE clone_position SET position_id=$1,buy_intent_id=$2,mint=$3,
+      opened_at=opened_at+INTERVAL '5 seconds',exit_deadline_at=exit_deadline_at+INTERVAL '5 seconds'`,
+    [clonePositionId, cloneIntentId, mint]);
+    await client.query('INSERT INTO execution_live_positions SELECT * FROM clone_position');
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+  return Object.freeze({ positionId: clonePositionId, mint });
+}
+
+void test('PostgreSQL 16 recovery role creates an early exit SELL from observed creator trades',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'ACTIVE');
+      const creator = earlyExitPublicKey();
+      await insertLaunchEvent(pool, fixture.mint, creator);
+      await insertTradeEvents(pool, fixture.mint, [
+        { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      ]);
+      const recovery = new PostgresExecutionLiveRepository(
+        roleSource(pool, 'sol_token_executor_live_recovery'),
+      );
+      // The deadline is not due: the deadline scanner runs under the role and finds nothing.
+      assert.equal(await recovery.createNextDeadlineExitIntent(), null);
+      const result = await recovery.createNextEarlyExitIntent(earlyExitPolicy);
+      await assertEarlyExitCreated(pool, fixture, result, 'CREATOR_SOLD');
+      // The role reads domain_events but can never change them.
+      for (const statement of [
+        `UPDATE domain_events SET confirmation_status='orphaned'`,
+        'DELETE FROM domain_events',
+        `INSERT INTO domain_events (event_id) VALUES ('forged')`,
+        'SELECT source FROM domain_events',
+      ]) {
+        await assert.rejects(roleSource(pool, 'sol_token_executor_live_recovery').connect()
+          .then(async (client) => {
+            try { await client.query(statement); } finally { client.release(); }
+          }), (error: unknown) => databaseErrorCode(error) === '42501', statement);
+      }
+    });
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'REVOKED');
+      await makePositionDue(pool, fixture.positionId);
+      const recovery = new PostgresExecutionLiveRepository(
+        roleSource(pool, 'sol_token_executor_live_recovery'),
+      );
+      // A due position is left to the deadline, which still works under the role.
+      assert.equal(await recovery.createNextEarlyExitIntent(earlyExitPolicy), null);
+      const deadline = await recovery.createNextDeadlineExitIntent();
+      assert.equal(deadline?.kind, 'CREATED');
+      assert.equal(deadline?.intent?.logicalCommandId, `maximum-holding:${fixture.positionId}`);
+    });
+  });

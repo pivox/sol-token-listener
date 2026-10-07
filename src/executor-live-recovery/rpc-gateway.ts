@@ -55,6 +55,12 @@ interface FinalizedTransactionObservation {
   readonly postBalances: readonly bigint[];
   readonly preTokenBalances: ReadonlyMap<number, TokenBalance>;
   readonly postTokenBalances: ReadonlyMap<number, TokenBalance>;
+  /**
+   * `meta.err` is a non-empty string or object, an optional `meta.status` does not say `Ok`,
+   * and the response shows the on-chain failure invariant: every token balance entry and
+   * every lamport balance except the fee payer's is unchanged. Any doubt gives `false`.
+   */
+  readonly transactionFailed: boolean;
 }
 
 interface TokenBalance {
@@ -167,6 +173,7 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
         quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
         observedAtMs, finalizedAtMs: observedAtMs,
+        transactionFailed: false, baseTokenAccountsUnchanged: false,
       });
     }
     const walletIndex = observed.accountKeys.indexOf(request.walletPublicKey);
@@ -188,13 +195,29 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
       unexpectedResidualTokenBalanceRaw: request.side === 'SELL' ? base.post : 0n,
       observedAtMs,
       finalizedAtMs: observedAtMs,
+      transactionFailed: observed.transactionFailed
+        && await this.signatureStatusReportsFailure(request.signature, signal),
+      baseTokenAccountsUnchanged: base.everyAccountUnchanged,
     });
+  }
+
+  /** Cross-check of `meta.err` through an independent `getSignatureStatuses` read. */
+  private async signatureStatusReportsFailure(
+    signature: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const status = await this.signatureStatus(signature, signal);
+    return status !== null && status.confirmationStatus === 'finalized' && status.failed;
   }
 
   async signatureStatus(
     signatureValue: string,
     signal: AbortSignal,
-  ): Promise<Readonly<{ readonly slot: bigint; readonly confirmationStatus: string }> | null> {
+  ): Promise<Readonly<{
+    readonly slot: bigint;
+    readonly confirmationStatus: string;
+    readonly failed: boolean;
+  }> | null> {
     const signature = signatureValueOf(signatureValue);
     this.requireReady(signal);
     const raw = await this.dispatch('getSignatureStatuses', [
@@ -216,6 +239,7 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
       return Object.freeze({
         slot: unsignedInteger(status.slot),
         confirmationStatus,
+        failed: isTransactionError(status.err),
       });
     } catch (error) {
       if (isInternal(error)) throw error;
@@ -285,6 +309,8 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
       if (preBalances.length !== postBalances.length || preBalances.length !== accountKeys.length) {
         invalidResponse();
       }
+      const preTokenBalances = tokenBalanceMap(meta.preTokenBalances, accountKeys.length);
+      const postTokenBalances = tokenBalanceMap(meta.postTokenBalances, accountKeys.length);
       return Object.freeze({
         slot,
         observedAtMs: timestamp(this.#clock()),
@@ -295,8 +321,12 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         feeLamports: unsignedInteger(meta.fee),
         preBalances,
         postBalances,
-        preTokenBalances: tokenBalanceMap(meta.preTokenBalances, accountKeys.length),
-        postTokenBalances: tokenBalanceMap(meta.postTokenBalances, accountKeys.length),
+        preTokenBalances,
+        postTokenBalances,
+        transactionFailed: isTransactionError(meta.err)
+          && !(Object.hasOwn(meta, 'status') && Object.hasOwn(record(meta.status), 'Ok'))
+          && onlyFeePayerLamportsChanged(preBalances, postBalances)
+          && tokenBalancesUnchanged(preTokenBalances, postTokenBalances),
       });
     } catch (error) {
       if (isInternal(error)) throw error;
@@ -376,9 +406,18 @@ function tokenAmounts(
   observed: FinalizedTransactionObservation,
   wallet: string,
   mint: string,
-): Readonly<{ readonly pre: bigint; readonly post: bigint; readonly delta: bigint }> {
+): Readonly<{
+  readonly pre: bigint;
+  readonly post: bigint;
+  readonly delta: bigint;
+  readonly everyAccountUnchanged: boolean;
+}> {
   let pre = 0n;
   let post = 0n;
+  // True only when at least one wallet account of the mint is visible, every such account is
+  // in both maps with the same amount, and no account of the mint has an unreported owner.
+  let visible = false;
+  let everyAccountUnchanged = true;
   const indexes = new Set([
     ...observed.preTokenBalances.keys(), ...observed.postTokenBalances.keys(),
   ]);
@@ -388,13 +427,51 @@ function tokenAmounts(
     if (before !== undefined && after !== undefined
       && (before.owner !== after.owner || before.mint !== after.mint)) invalidResponse();
     const identity = after ?? before;
+    if (identity?.mint === mint && identity.owner === null) everyAccountUnchanged = false;
     if (identity?.owner !== wallet || identity.mint !== mint) continue;
+    visible = true;
+    // Present in one map only counts as a change, whatever the amount.
+    if (before === undefined || after === undefined) everyAccountUnchanged = false;
+    else if (before.amountRaw !== after.amountRaw) everyAccountUnchanged = false;
     if (before !== undefined && (before.owner !== wallet || before.mint !== mint)) invalidResponse();
     if (after !== undefined && (after.owner !== wallet || after.mint !== mint)) invalidResponse();
     pre += before?.amountRaw ?? 0n;
     post += after?.amountRaw ?? 0n;
   }
-  return Object.freeze({ pre, post, delta: post - pre });
+  return Object.freeze({
+    pre, post, delta: post - pre, everyAccountUnchanged: visible && everyAccountUnchanged,
+  });
+}
+
+/** A Solana transaction error: a non-empty string or a plain object with at least one key. */
+function isTransactionError(value: unknown): boolean {
+  if (typeof value === 'string') return value.length > 0;
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype && Object.keys(value).length > 0;
+}
+
+/** A failed transaction only debits the fee payer (index 0); every other account is reverted. */
+function onlyFeePayerLamportsChanged(
+  preBalances: readonly bigint[],
+  postBalances: readonly bigint[],
+): boolean {
+  return preBalances.length === postBalances.length
+    && preBalances.every((balance, index) => index === 0 || balance === postBalances[index]);
+}
+
+/** A failed transaction reverts every token account, whatever its owner (pool vaults too). */
+function tokenBalancesUnchanged(
+  pre: ReadonlyMap<number, TokenBalance>,
+  post: ReadonlyMap<number, TokenBalance>,
+): boolean {
+  if (pre.size !== post.size) return false;
+  for (const [index, before] of pre) {
+    const after = post.get(index);
+    if (after === undefined) return false;
+    if (after.mint !== before.mint || after.owner !== before.owner
+      || after.amountRaw !== before.amountRaw) return false;
+  }
+  return true;
 }
 
 function tokenBalanceMap(value: unknown, accountKeyCount: number): ReadonlyMap<number, TokenBalance> {

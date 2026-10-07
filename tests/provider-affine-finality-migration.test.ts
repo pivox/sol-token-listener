@@ -73,6 +73,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       '063_listener_tracked_curve_checkpoints.sql',
       '064_fast_entry_decisions.sql',
       '065_entry_envelope_auto_arm.sql',
+      '066_live_position_reexit.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

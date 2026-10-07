@@ -14,7 +14,9 @@ import type { ExecutionReconciliationGateway } from
   '../ports/execution-reconciliation-gateway.js';
 import type { ExecutionReconciliationCommitResultV1 } from
   '../ports/execution-risk-repository.js';
+import type { FastExitPolicy } from '../domain/fast-exit.js';
 import type { LiveRecoveryConfig } from './config.js';
+import type { LiveRecoveryLogger } from './logger.js';
 
 export type LiveRecoveryRetryableRpcErrorCode =
   | 'RPC_RATE_LIMITED'
@@ -42,7 +44,9 @@ export type LiveRecoveryLaneErrorCode =
   | 'INVALID_EVIDENCE'
   | 'COMMIT_FAILED'
   | 'RELEASE_FAILED'
-  | 'DEADLINE_FAILED';
+  | 'DEADLINE_FAILED'
+  | 'REEXIT_FAILED'
+  | 'EXIT_FAILED';
 
 export class LiveRecoveryLaneError extends Error {
   public constructor(public readonly code: LiveRecoveryLaneErrorCode) {
@@ -60,12 +64,20 @@ export interface LiveRecoveryLaneDependencies {
   readonly intents: ExecutionLiveRecoveryIntentRepository;
   readonly live: ExecutionLiveRecoveryRepository;
   readonly gateway: RecoveryGateway;
+  readonly logger: LiveRecoveryLogger;
+  /**
+   * Positions whose capped dead exit was already logged by this process. Created once per
+   * process (lanes are rebuilt every pass) so that each one is logged once.
+   */
+  readonly reportedCappedExits: Set<string>;
 }
 
 export interface LiveRecoveryLanes {
   reconciliation(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
   confirmation(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
   deadline(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
+  reexit(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
+  exit(signal: AbortSignal): Promise<LiveRecoveryLaneResult>;
 }
 
 export function createLiveRecoveryLanes(
@@ -75,6 +87,8 @@ export function createLiveRecoveryLanes(
     reconciliation: (signal: AbortSignal) => reconciliationLane(dependencies, signal),
     confirmation: (signal: AbortSignal) => confirmationLane(dependencies, signal),
     deadline: (signal: AbortSignal) => deadlineLane(dependencies, signal),
+    reexit: (signal: AbortSignal) => reExitLane(dependencies, signal),
+    exit: (signal: AbortSignal) => exitLane(dependencies, signal),
   };
   return Object.freeze(lanes);
 }
@@ -200,6 +214,81 @@ async function deadlineLane(
     if (error instanceof LiveRecoveryLaneError) throw error;
     throw laneFailure('DEADLINE_FAILED');
   }
+}
+
+/**
+ * New SELL intent for one EXIT_PENDING position whose SELL intent died with no possible send
+ * (no signing, no RPC). Positions past the re-exit cap are only logged, once per process.
+ */
+async function reExitLane(
+  dependencies: LiveRecoveryLaneDependencies,
+  signal: AbortSignal,
+): Promise<LiveRecoveryLaneResult> {
+  assertActive(signal);
+  try {
+    const result = await dependencies.live.createNextReExitIntent();
+    assertActive(signal);
+    if (result !== null) {
+      dependencies.logger.info(Object.freeze({
+        event: 'executor_live_recovery.reexit_created',
+        executionMode: 'live-recovery',
+        lane: 'REEXIT',
+        positionId: result.positionId,
+      }));
+    }
+    const capped = await dependencies.live.listCappedDeadExits();
+    assertActive(signal);
+    for (const positionId of capped) {
+      if (dependencies.reportedCappedExits.has(positionId)) continue;
+      dependencies.reportedCappedExits.add(positionId);
+      dependencies.logger.warn(Object.freeze({
+        event: 'executor_live_recovery.reexit_cap_reached',
+        executionMode: 'live-recovery',
+        lane: 'REEXIT',
+        positionId,
+      }));
+    }
+    return result === null ? 'IDLE' : 'WORKED';
+  } catch (error) {
+    if (error instanceof LiveRecoveryLaneError) throw error;
+    throw laneFailure('REEXIT_FAILED');
+  }
+}
+
+/**
+ * Early SELL intent of one envelope position (no signing, no RPC). Runs after the deadline lane;
+ * the repository only considers positions whose deadline is not due.
+ */
+async function exitLane(
+  dependencies: LiveRecoveryLaneDependencies,
+  signal: AbortSignal,
+): Promise<LiveRecoveryLaneResult> {
+  assertActive(signal);
+  try {
+    const result = await dependencies.live.createNextEarlyExitIntent(
+      exitPolicyFrom(dependencies.config),
+    );
+    assertActive(signal);
+    if (result === null) return 'IDLE';
+    dependencies.logger.info(Object.freeze({
+      event: 'executor_live_recovery.exit_decided',
+      executionMode: 'live-recovery',
+      lane: 'EXIT',
+      reason: result.reason,
+    }));
+    return 'WORKED';
+  } catch (error) {
+    if (error instanceof LiveRecoveryLaneError) throw error;
+    throw laneFailure('EXIT_FAILED');
+  }
+}
+
+function exitPolicyFrom(config: LiveRecoveryConfig): FastExitPolicy {
+  return Object.freeze({
+    takeProfitBps: config.exitTakeProfitBps,
+    externalBuyersTarget: config.exitExternalBuyersTarget,
+    externalMinimumBuyRaw: config.exitExternalMinimumBuyRaw,
+  });
 }
 
 async function claim(

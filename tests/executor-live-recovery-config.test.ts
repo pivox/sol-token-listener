@@ -18,8 +18,51 @@ void test('parses and freezes the exact read-only finality runtime configuration
     expectedGenesisHash: '11111111111111111111111111111111',
     rpcTimeoutMs: 5_000,
     maxRpcCallsPerPass: 8, ownerId: 'live-recovery-a',
+    exitTakeProfitBps: 20_000n, exitExternalBuyersTarget: 10,
+    exitExternalMinimumBuyRaw: 1_000_000n,
   });
   assert.equal(Object.isFrozen(config), true);
+});
+
+void test('EXIT_* are optional, default to the spec values and accept their exact bounds', () => {
+  const absent = parseLiveRecoveryConfig(environment({
+    EXIT_TAKE_PROFIT_BPS: undefined, EXIT_EXTERNAL_BUYERS_TARGET: undefined,
+    EXIT_EXTERNAL_MIN_BUY_RAW: undefined,
+  }));
+  assert.equal(absent.exitTakeProfitBps, 20_000n);
+  assert.equal(absent.exitExternalBuyersTarget, 10);
+  assert.equal(absent.exitExternalMinimumBuyRaw, 1_000_000n);
+  for (const [overrides, field, expected] of [
+    [{ EXIT_TAKE_PROFIT_BPS: '10001' }, 'exitTakeProfitBps', 10_001n],
+    [{ EXIT_TAKE_PROFIT_BPS: '100000' }, 'exitTakeProfitBps', 100_000n],
+    [{ EXIT_EXTERNAL_BUYERS_TARGET: '1' }, 'exitExternalBuyersTarget', 1],
+    [{ EXIT_EXTERNAL_BUYERS_TARGET: '1000' }, 'exitExternalBuyersTarget', 1_000],
+    [{ EXIT_EXTERNAL_MIN_BUY_RAW: '1' }, 'exitExternalMinimumBuyRaw', 1n],
+    [{ EXIT_EXTERNAL_MIN_BUY_RAW: '18446744073709551615' }, 'exitExternalMinimumBuyRaw',
+      18_446_744_073_709_551_615n],
+  ] as const) {
+    const config = parseLiveRecoveryConfig(environment(overrides));
+    assert.equal(config[field], expected, JSON.stringify(overrides));
+  }
+});
+
+void test('a present but invalid EXIT_* value fails startup', () => {
+  for (const overrides of [
+    { EXIT_TAKE_PROFIT_BPS: '10000' },
+    { EXIT_TAKE_PROFIT_BPS: '100001' },
+    { EXIT_TAKE_PROFIT_BPS: '' },
+    { EXIT_TAKE_PROFIT_BPS: '020000' },
+    { EXIT_TAKE_PROFIT_BPS: '2e4' },
+    { EXIT_EXTERNAL_BUYERS_TARGET: '0' },
+    { EXIT_EXTERNAL_BUYERS_TARGET: '1001' },
+    { EXIT_EXTERNAL_BUYERS_TARGET: '-1' },
+    { EXIT_EXTERNAL_BUYERS_TARGET: '10.5' },
+    { EXIT_EXTERNAL_MIN_BUY_RAW: '0' },
+    { EXIT_EXTERNAL_MIN_BUY_RAW: '18446744073709551616' },
+    { EXIT_EXTERNAL_MIN_BUY_RAW: '0x10' },
+    { EXIT_EXTERNAL_MIN_BUY_RAW: ' 1000' },
+    { EXIT_EXTERNAL_MIN_BUY_RAW: 'abc' },
+  ]) assertFailure(environment(overrides));
 });
 
 void test('fails closed unless recovery, live mode and mainnet are explicit', () => {

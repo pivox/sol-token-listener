@@ -11,6 +11,8 @@ import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js
 import type { ExecutionReconciliationEvidenceV1 } from '../src/domain/execution-reconciliation.js';
 import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
 import type { ExecutionLiveConfirmationV1 } from '../src/ports/execution-live-repository.js';
+import type { FastExitPolicy } from '../src/domain/fast-exit.js';
+import type { LiveRecoveryLogContext } from '../src/executor-live-recovery/logger.js';
 
 const signature = '3'.repeat(88);
 const key = '11111111111111111111111111111111';
@@ -266,7 +268,143 @@ void test('empty claims and non-due deadlines remain idle', async () => {
   assert.equal(await lanes.reconciliation(signal()), 'IDLE');
   assert.equal(await lanes.confirmation(signal()), 'IDLE');
   assert.equal(await lanes.deadline(signal()), 'IDLE');
-  assert.deepEqual(calls, ['claim:RECONCILE', 'claim:CONFIRM', 'deadline']);
+  assert.equal(await lanes.reexit(signal()), 'IDLE');
+  assert.equal(await lanes.exit(signal()), 'IDLE');
+  assert.deepEqual(calls, [
+    'claim:RECONCILE', 'claim:CONFIRM', 'deadline', 'reexit', 'capped', 'exit',
+  ]);
+  assert.deepEqual(fixture.logs, []);
+});
+
+void test('reexit lane logs a created re-exit and works', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'NONE');
+  const positionId = `execution_live_position_${'c'.repeat(64)}`;
+  fixture.live.createNextReExitIntent = () => {
+    calls.push('reexit');
+    return Promise.resolve(Object.freeze({
+      payloadVersion: 1 as const, kind: 'CREATED' as const, positionId,
+      previousIntentId: `execution_intent_${'d'.repeat(64)}`, intent: claim('CONFIRMED').intent,
+    }));
+  };
+  assert.equal(await createLiveRecoveryLanes(fixture).reexit(signal()), 'WORKED');
+  assert.deepEqual(calls, ['reexit', 'capped']);
+  assert.deepEqual(fixture.logs, [{
+    level: 'info', event: 'executor_live_recovery.reexit_created',
+    executionMode: 'live-recovery', lane: 'REEXIT', positionId,
+  }]);
+});
+
+void test('reexit lane logs a capped position once per process across passes', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'NONE');
+  const first = `execution_live_position_${'1'.repeat(64)}`;
+  const second = `execution_live_position_${'2'.repeat(64)}`;
+  const capped: string[][] = [[first], [first], [first, second], [second, first]];
+  fixture.live.listCappedDeadExits = () => {
+    calls.push('capped');
+    return Promise.resolve(Object.freeze(capped.shift() ?? []));
+  };
+  // Lanes are rebuilt every pass; the reported set is shared through the dependencies.
+  for (let pass = 0; pass < 4; pass += 1) {
+    assert.equal(await createLiveRecoveryLanes(fixture).reexit(signal()), 'IDLE');
+  }
+  assert.deepEqual(fixture.logs, [first, second].map((positionId) => ({
+    level: 'warn', event: 'executor_live_recovery.reexit_cap_reached',
+    executionMode: 'live-recovery', lane: 'REEXIT', positionId,
+  })));
+});
+
+void test('reexit lane maps any repository failure to REEXIT_FAILED without leaking it',
+  async () => {
+    for (const failing of ['createNextReExitIntent', 'listCappedDeadExits'] as const) {
+      const fixture = dependencies([], 'NONE');
+      const rejection = () => Promise.reject(
+        new Error('postgresql://credential@db.private.test'));
+      if (failing === 'createNextReExitIntent') fixture.live.createNextReExitIntent = rejection;
+      else fixture.live.listCappedDeadExits = rejection;
+      await assert.rejects(createLiveRecoveryLanes(fixture).reexit(signal()),
+        (error: unknown) => error instanceof LiveRecoveryLaneError
+          && error.code === 'REEXIT_FAILED' && !error.message.includes('credential'));
+      assert.deepEqual(fixture.logs, []);
+    }
+  });
+
+void test('reexit lane honours cancellation before and after the repository call', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'NONE');
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(createLiveRecoveryLanes(fixture).reexit(aborted.signal),
+    (error: unknown) => error instanceof LiveRecoveryLaneError
+      && error.code === 'OPERATION_ABORTED');
+  assert.equal(calls.length, 0);
+  const during = new AbortController();
+  fixture.live.createNextReExitIntent = () => {
+    calls.push('reexit');
+    during.abort();
+    return Promise.resolve(null);
+  };
+  await assert.rejects(createLiveRecoveryLanes(fixture).reexit(during.signal),
+    (error: unknown) => error instanceof LiveRecoveryLaneError
+      && error.code === 'OPERATION_ABORTED');
+  assert.deepEqual(calls, ['reexit']);
+});
+
+void test('exit lane passes the configured policy and logs the reason of a created exit',
+  async () => {
+    const calls: string[] = [];
+    const fixture = dependencies(calls, 'NONE');
+    const policies: FastExitPolicy[] = [];
+    fixture.live.createNextEarlyExitIntent = (policy: FastExitPolicy) => {
+      calls.push('exit');
+      policies.push(policy);
+      return Promise.resolve(Object.freeze({
+        payloadVersion: 1 as const, kind: 'CREATED' as const, reason: 'TAKE_PROFIT' as const,
+        intent: claim('CONFIRMED').intent,
+      }));
+    };
+    assert.equal(await createLiveRecoveryLanes(fixture).exit(signal()), 'WORKED');
+    assert.deepEqual(policies, [{
+      takeProfitBps: 30_000n, externalBuyersTarget: 7, externalMinimumBuyRaw: 5_000n,
+    }]);
+    assert.equal(Object.isFrozen(policies[0]), true);
+    assert.deepEqual(fixture.logs, [{
+      level: 'info', event: 'executor_live_recovery.exit_decided', executionMode: 'live-recovery',
+      lane: 'EXIT', reason: 'TAKE_PROFIT',
+    }]);
+    assert.deepEqual(calls, ['exit']);
+  });
+
+void test('exit lane maps a repository failure to EXIT_FAILED without leaking it', async () => {
+  const fixture = dependencies([], 'NONE');
+  fixture.live.createNextEarlyExitIntent = () => Promise.reject(
+    new Error('postgresql://credential@db.private.test'));
+  await assert.rejects(createLiveRecoveryLanes(fixture).exit(signal()),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'EXIT_FAILED'
+      && !error.message.includes('credential'));
+  assert.deepEqual(fixture.logs, []);
+});
+
+void test('exit lane honours cancellation before and after the repository call', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'NONE');
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(createLiveRecoveryLanes(fixture).exit(aborted.signal),
+    (error: unknown) => error instanceof LiveRecoveryLaneError
+      && error.code === 'OPERATION_ABORTED');
+  assert.equal(calls.length, 0);
+  const during = new AbortController();
+  fixture.live.createNextEarlyExitIntent = () => {
+    calls.push('exit');
+    during.abort();
+    return Promise.resolve(null);
+  };
+  await assert.rejects(createLiveRecoveryLanes(fixture).exit(during.signal),
+    (error: unknown) => error instanceof LiveRecoveryLaneError
+      && error.code === 'OPERATION_ABORTED');
+  assert.deepEqual(calls, ['exit']);
 });
 
 type IntentStatus = 'CONFIRMED' | 'SUBMITTED' | 'NONE';
@@ -298,6 +436,22 @@ function dependencies(
       calls.push('deadline');
       return Promise.resolve(null);
     },
+    createNextEarlyExitIntent: () => {
+      calls.push('exit');
+      return Promise.resolve(null);
+    },
+    createNextReExitIntent: () => {
+      calls.push('reexit');
+      return Promise.resolve(null);
+    },
+    listCappedDeadExits: () => {
+      calls.push('capped');
+      return Promise.resolve(Object.freeze([]));
+    },
+  };
+  const logs: (LiveRecoveryLogContext & { level: string })[] = [];
+  const record = (level: string) => (context: LiveRecoveryLogContext) => {
+    logs.push({ level, ...context });
   };
   const gateway: MutableGateway = {
     providerId: 'primary',
@@ -356,6 +510,9 @@ function dependencies(
     },
     live,
     gateway,
+    logger: Object.freeze({ info: record('info'), warn: record('warn'), error: record('error') }),
+    reportedCappedExits: new Set<string>(),
+    logs,
   };
 }
 
@@ -410,6 +567,7 @@ function config(): LiveRecoveryConfig {
     executorPublicKey: key, providerId: 'primary',
     httpRpcUrl: 'https://rpc.example.test', expectedGenesisHash: key,
     rpcTimeoutMs: 5_000, maxRpcCallsPerPass: 8, ownerId: 'recovery-a',
+    exitTakeProfitBps: 30_000n, exitExternalBuyersTarget: 7, exitExternalMinimumBuyRaw: 5_000n,
   });
 }
 

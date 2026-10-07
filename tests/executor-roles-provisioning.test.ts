@@ -309,6 +309,13 @@ void test('read-only recovery provisioning matches its closed authority policy',
       insert: [],
       update: ['realized_loss_raw', 'state', 'updated_at'],
     },
+    // Lot 4b exit lane: read-only observed launch and curve trade events.
+    domain_events: {
+      select: ['event_id', 'type', 'mint', 'slot', 'transaction_index', 'instruction_index',
+        'inner_instruction_index', 'confirmation_status', 'payload'],
+      insert: [],
+      update: [],
+    },
   } as const;
   for (const [name, expected] of Object.entries(expectedRecovery)) {
     const entry = authority.tables.find((table) => table.name === name);
@@ -1004,6 +1011,7 @@ function recoveryConfig(generationId: string, publicKey: string): LiveRecoveryCo
     generationId, executorPublicKey: publicKey, providerId: 'primary',
     httpRpcUrl: 'https://rpc.example.test', expectedGenesisHash: publicKey,
     rpcTimeoutMs: 5_000, maxRpcCallsPerPass: 8, ownerId: 'recovery-test',
+    exitTakeProfitBps: 20_000n, exitExternalBuyersTarget: 10, exitExternalMinimumBuyRaw: 1_000_000n,
   });
 }
 

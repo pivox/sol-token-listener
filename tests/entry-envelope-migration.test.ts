@@ -46,7 +46,8 @@ void test('065 declares the envelope scope, the ENVELOPE action and the envelope
 void test('065 applies on an empty schema and replays cleanly', async (context) => {
   await withTemporarySchema(context, async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.ok(applied.includes(migrationName));
+    assert.equal(applied.at(-1), '066_live_position_reexit.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(new URL(`../migrations/${migrationName}`, import.meta.url), 'utf8');
     await pool.query(sql);

@@ -23,6 +23,16 @@ export interface FinalizedWalletDeltasV1 {
   readonly unexpectedResidualTokenBalanceRaw: bigint;
   readonly observedAtMs: number;
   readonly finalizedAtMs: number | null;
+  /**
+   * Classification only, never persisted. Absent means false. `true` requires
+   * `FINALIZED`: the transaction landed with a non-null `meta.err`.
+   */
+  readonly transactionFailed?: boolean;
+  /**
+   * Classification only, never persisted. Absent means false. Every wallet-owned token
+   * account of the base mint is in both token-balance maps with the same amount.
+   */
+  readonly baseTokenAccountsUnchanged?: boolean;
 }
 
 export interface ExecutionReconciliationGateway {

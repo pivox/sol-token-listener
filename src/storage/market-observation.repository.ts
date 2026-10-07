@@ -306,7 +306,8 @@ implements MarketObservationRepository {
         event.payloadVersion, toJsonValue(event.payload),
       ],
     );
-    if (current === 'OBSERVING' || current === 'BONDING_CURVE_COMPLETE') {
+    // A creates-only tracked mint never leaves DETECTED before it migrates.
+    if (current === 'DETECTED' || current === 'OBSERVING' || current === 'BONDING_CURVE_COMPLETE') {
       const transition = createMigrationPendingTransition(current, event);
       await writeTransition(client, transition);
       await updateLaunchState(client, event.mint, 'MIGRATION_PENDING', transition.occurredAtMs);

@@ -1211,6 +1211,12 @@ GRANT SELECT (envelope_id,state,realized_loss_raw,max_realized_loss_raw,updated_
   UPDATE (realized_loss_raw,state,updated_at)
 ON TABLE execution_entry_envelopes TO sol_token_executor_live_recovery;
 
+-- Lot 4b exit lane: read-only access to observed launch and curve trade events of the
+-- position's mint. Public chain data; no INSERT/UPDATE/DELETE.
+GRANT SELECT (event_id,type,mint,slot,transaction_index,instruction_index,inner_instruction_index,
+  confirmation_status,payload)
+ON TABLE domain_events TO sol_token_executor_live_recovery;
+
 GRANT SELECT (authorization_id,position_id,state,state_revision), INSERT (
   authorization_id,payload_version,position_id,generation_id,wallet_public_key,
   mint,quote_mint,maximum_base_amount_raw,state,state_revision,created_at

@@ -5,6 +5,7 @@ import type {
   SignedTransactionState,
 } from '../domain/execution-live.js';
 import type { ExecutionIntentV1 } from '../domain/execution-intent.js';
+import type { FastExitPolicy, FastExitReason } from '../domain/fast-exit.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
 import type { ExecutionReconciliationRequestV1 } from
   '../executor-risk/reconciliation-service.js';
@@ -273,6 +274,26 @@ export interface ExecutionDeadlineExitResultV1 {
   readonly intent: ExecutionIntentV1 | null;
 }
 
+/** An early (non-deadline) SELL intent of an envelope position; the reason is in the intent. */
+export interface ExecutionEarlyExitResultV1 {
+  readonly payloadVersion: 1;
+  readonly kind: 'CREATED';
+  readonly reason: FastExitReason;
+  readonly intent: ExecutionIntentV1;
+}
+
+/**
+ * A new SELL intent that replaced the dead exit intent (FAILED or EXPIRED, no send possible) of
+ * an EXIT_PENDING position. Its logical command id is the previous one with `:retry-<k>`.
+ */
+export interface ExecutionReExitResultV1 {
+  readonly payloadVersion: 1;
+  readonly kind: 'CREATED';
+  readonly positionId: string;
+  readonly previousIntentId: string;
+  readonly intent: ExecutionIntentV1;
+}
+
 export interface ExecutionPreSignatureRecoveryResultV1 {
   readonly payloadVersion: 1;
   readonly kind: 'IDLE' | 'REVOKED';
@@ -363,4 +384,7 @@ export interface ExecutionLiveRepository {
     readonly observedAtMs: number;
   }>): Promise<ExecutionDeadlineExitResultV1>;
   createNextDeadlineExitIntent(): Promise<ExecutionDeadlineExitResultV1 | null>;
+  createNextEarlyExitIntent(policy: FastExitPolicy): Promise<ExecutionEarlyExitResultV1 | null>;
+  createNextReExitIntent(): Promise<ExecutionReExitResultV1 | null>;
+  listCappedDeadExits(): Promise<readonly string[]>;
 }
