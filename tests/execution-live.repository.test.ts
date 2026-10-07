@@ -3875,3 +3875,160 @@ void test('an early exit racing a due deadline gives exactly one SELL intent', a
     assert.deepEqual(position.rows, [{ state: 'EXIT_PENDING' }]);
   });
 });
+
+void test('early exit: one malformed trade disables trade rules, a revoked envelope still exits',
+  async (context) => {
+    const databaseUrl = earlyExitDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    const malformations: readonly Readonly<{
+      name: string; mutate: (payload: { trade: Record<string, unknown> }) => void;
+    }>[] = [
+      {
+        name: 'non-WSOL quote mint',
+        mutate: (payload) => {
+          payload.trade.quoteAsset = {
+            mint: earlyExitPublicKey(), decimals: 9, tokenProgram: 'SPL_TOKEN',
+          };
+        },
+      },
+      { name: 'invalid kind', mutate: (payload) => { payload.trade.kind = 'SWAP'; } },
+      { name: 'non-canonical trader', mutate: (payload) => { payload.trade.trader = '0OIl'; } },
+    ];
+    for (const malformation of malformations) {
+      for (const envelopeState of ['ACTIVE', 'REVOKED'] as const) {
+        await withTemporarySchema(databaseUrl, async (pool) => {
+          const fixture = await earlyExitFixture(pool, envelopeState);
+          const creator = earlyExitPublicKey();
+          await insertLaunchEvent(pool, fixture.mint, creator);
+          await insertTradeEvents(pool, fixture.mint, everyRuleTrades(fixture, creator));
+          await insertTradeEvents(pool, fixture.mint, [{
+            kind: 'BUY', trader: earlyExitPublicKey(), baseAmountRaw: 1n, quoteAmountRaw: 1n,
+            transactionIndex: 99, mutate: malformation.mutate,
+          }]);
+          if (envelopeState === 'ACTIVE') {
+            await assertNoEarlyExit(pool, fixture);
+          } else {
+            const result = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+            await assertEarlyExitCreated(pool, fixture, result, 'ENVELOPE_REVOKED');
+          }
+        });
+      }
+    }
+  });
+
+void test('early exit: an ambiguous creator gives no CREATOR_SOLD', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await earlyExitFixture(pool, 'ACTIVE');
+    const creator = earlyExitPublicKey();
+    await insertLaunchEvent(pool, fixture.mint, creator);
+    await insertLaunchEvent(pool, fixture.mint, earlyExitPublicKey());
+    await insertTradeEvents(pool, fixture.mint, [
+      { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+    ]);
+    await assertNoEarlyExit(pool, fixture);
+  });
+});
+
+void test('early exit rejects an invalid policy before any database access', async () => {
+  const repository = new PostgresExecutionLiveRepository({
+    connect: async () => { throw new Error('the policy must be rejected before connecting'); },
+  });
+  for (const policy of [
+    Object.freeze({ ...earlyExitPolicy, takeProfitBps: 10_000n }),
+    Object.freeze({ ...earlyExitPolicy, externalBuyersTarget: 0 }),
+    Object.freeze({ ...earlyExitPolicy, externalMinimumBuyRaw: 0n }),
+    { ...earlyExitPolicy },
+  ]) {
+    await assert.rejects(repository.createNextEarlyExitIntent(policy),
+      isLiveRepositoryError('INVALID_INPUT'));
+  }
+});
+
+void test('early exit skips a candidate whose facts fail and exits the next one',
+  async (context) => {
+    const databaseUrl = earlyExitDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'ACTIVE');
+      const second = await cloneOpenPosition(pool, fixture.positionId);
+      for (const mint of [fixture.mint, second.mint]) {
+        const creator = earlyExitPublicKey();
+        await insertLaunchEvent(pool, mint, creator);
+        await insertTradeEvents(pool, mint, [
+          { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+        ]);
+      }
+      // The first (oldest) candidate's trade read fails with a real PostgreSQL error.
+      const failing = new PostgresExecutionLiveRepository({
+        connect: async () => {
+          const client = await pool.connect();
+          return {
+            query: async (text: string, values?: readonly unknown[]) => {
+              if (text.includes("type='BondingCurveTradeObserved'") && values?.[0] === fixture.mint) {
+                await client.query('SELECT 1/0');
+              }
+              const result = await client.query(text, values as unknown[] | undefined);
+              return {
+                rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+                rowCount: result.rowCount,
+              };
+            },
+            release: (error?: boolean) => { client.release(error); },
+          };
+        },
+      });
+      const skipped = await failing.createNextEarlyExitIntent(earlyExitPolicy);
+      assert.equal(skipped?.reason, 'CREATOR_SOLD');
+      assert.equal(skipped?.intent.positionId, second.positionId);
+      // Without the failure, the first candidate exits on the next pass.
+      const next = await fixture.live.createNextEarlyExitIntent(earlyExitPolicy);
+      assert.equal(next?.reason, 'CREATOR_SOLD');
+      assert.equal(next?.intent.positionId, fixture.positionId);
+      const sells = await pool.query(`SELECT position_id FROM execution_intents
+        WHERE side='SELL' ORDER BY position_id`);
+      assert.deepEqual(sells.rows.map((row) => row.position_id).sort(),
+        [fixture.positionId, second.positionId].sort());
+    });
+  });
+
+/**
+ * A second OPEN position of the same armament (envelope), opened 5 s after the first, on a new
+ * mint. The one-active-position-per-generation index is dropped in this temporary schema only.
+ */
+async function cloneOpenPosition(
+  pool: InstanceType<typeof pg.Pool>,
+  positionId: string,
+): Promise<Readonly<{ positionId: string; mint: string }>> {
+  const clonePositionId = `execution_live_position_${randomUUID().replaceAll('-', '').repeat(2)}`;
+  const cloneIntentId = `execution_intent_${randomUUID().replaceAll('-', '').repeat(2)}`;
+  const mint = earlyExitPublicKey();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DROP INDEX execution_live_positions_one_active_per_generation');
+    await client.query('SET LOCAL session_replication_role=replica');
+    await client.query(`CREATE TEMP TABLE clone_intent ON COMMIT DROP AS
+      SELECT intent.* FROM execution_intents intent
+      JOIN execution_live_positions position ON position.buy_intent_id=intent.id
+      WHERE position.position_id=$1`, [positionId]);
+    await client.query(`UPDATE clone_intent SET id=$1,logical_order_key=$2`, [
+      cloneIntentId, `clone:${cloneIntentId}`,
+    ]);
+    await client.query('INSERT INTO execution_intents SELECT * FROM clone_intent');
+    await client.query(`CREATE TEMP TABLE clone_position ON COMMIT DROP AS
+      SELECT * FROM execution_live_positions WHERE position_id=$1`, [positionId]);
+    await client.query(`UPDATE clone_position SET position_id=$1,buy_intent_id=$2,mint=$3,
+      opened_at=opened_at+INTERVAL '5 seconds',exit_deadline_at=exit_deadline_at+INTERVAL '5 seconds'`,
+    [clonePositionId, cloneIntentId, mint]);
+    await client.query('INSERT INTO execution_live_positions SELECT * FROM clone_position');
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+  return Object.freeze({ positionId: clonePositionId, mint });
+}

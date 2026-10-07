@@ -688,17 +688,18 @@ The output never contains a signature, a wallet public key, a URL or a key.
    - **Bound:** a wrong take-profit only exits early, at H2b's fresh quote minus `EXECUTOR_SLIPPAGE_BPS`. It never delays the deadline.
 4. **Ingestion lag and stalls** delay conditions 2-4. The deadline bounds the holding time in every case.
 5. **Wider read surface for H2a.** The recovery role gains SELECT on 9 columns of `domain_events`: public chain data, with no write access. A compromised H2a could read observed events. It cannot change them.
-6. **Payload format dependency.** The SQL reads the bigint marker `$solTokenListenerBigInt`. If the writer format changes, the trades list becomes null, and only REVOKED and the deadline still exit. Task 2 seeds rows with `toJsonValue` so the tests break with the writer.
-7. **The `TradeEvent` 24-byte suffix (#232)** feeds `quoteAmountRaw` / `baseAmountRaw`. If those octets change the meaning of the amounts, take-profit and the buyer threshold are wrong. The impact is bounded as in point 3.
-8. **The report uses `DATABASE_URL`**, usually the owner login, in a `READ ONLY` transaction. It is not a dedicated role. Run it only from the operator's machine.
-9. **Re-exit and double sell.**
+6. **Trade volume cap.** On a mint with more than 10 000 trades since entry, the trades list is null, so only REVOKED or the deadline exits.
+7. **Payload format dependency.** The SQL reads the bigint marker `$solTokenListenerBigInt`. If the writer format changes, the trades list becomes null, and only REVOKED and the deadline still exit. Task 2 seeds rows with `toJsonValue` so the tests break with the writer.
+8. **The `TradeEvent` 24-byte suffix (#232)** feeds `quoteAmountRaw` / `baseAmountRaw`. If those octets change the meaning of the amounts, take-profit and the buyer threshold are wrong. The impact is bounded as in point 3.
+9. **The report uses `DATABASE_URL`**, usually the owner login, in a `READ ONLY` transaction. It is not a dedicated role. Run it only from the operator's machine.
+10. **Re-exit and double sell.**
    - **Guard:** the re-exit accepts only `FAILED`/`EXPIRED` intents whose artifacts are all `RECONCILED` (proven no effect) or `REVOKED_NO_SEND`, with no unresolved evidence, an `ACTIVE` exit authorization and no `unknown_block`. An ambiguous send stays `UNKNOWN_REQUIRES_RECONCILIATION`, which is neither terminal nor expirable (`src/storage/execution-intent-expiration.ts:52`), so no re-exit can start.
    - **Facts:** a SELL never takes a pre-signature lock (`src/executor-live/fresh-execution.ts:84-100`: only the BUY calls `authorizeExactSigning`; the SELL calls `readPreparationBinding`). Its exit authorization only becomes `LOCKED` in `persistSellSigned` (`execution-live.repository.ts:2858`, the UPDATE at `:2920-2925`), in the same transaction that persists the signed bytes and moves the intent to `SIGNED_NOT_SUBMITTED`. A SELL that dies before that has no signed artifact and an `ACTIVE` authorization; after it, the intent can no longer be expired.
    - **Remaining assumptions:**
      - signed SELL bytes produced before persistence, and the bytes passed to the signed `simulateTransaction`, are never broadcast. Only `submission-gateway.ts` calls `sendRawTransaction` (`tests/executor-architecture.test.ts:837-840`), and it reads persisted artifacts;
      - a signer that lost its lease cannot persist late (Task 6 test 6).
-10. **The relaxed position trigger (066)** is SECURITY INVOKER and reads intents, artifacts, evidence and the exit authorization. PL/pgSQL only runs those reads inside the new `EXIT_PENDING → EXIT_PENDING` branch, and only recovery takes it; Task 6 tests it under `SET ROLE`, and the existing live-role tests must pass unchanged.
-11. **Landed-failed SELL classification (Task 5).**
+11. **The relaxed position trigger (066)** is SECURITY INVOKER and reads intents, artifacts, evidence and the exit authorization. PL/pgSQL only runs those reads inside the new `EXIT_PENDING → EXIT_PENDING` branch, and only recovery takes it; Task 6 tests it under `SET ROLE`, and the existing live-role tests must pass unchanged.
+12. **Landed-failed SELL classification (Task 5).**
     - **Risk:** a transaction with `meta.err` whose token and lamport deltas are wrong would be classified NO_EFFECT, and then re-sold.
     - **Bound:** the rule requires all of `meta.err`, base delta 0 summed over every wallet token account of the mint in the transaction's balance maps, a quote delta of 0, a wallet lamport delta of exactly −fee, and a fee within the maximum. A failed Solana transaction reverts every account except the fee payer's fee, so a real change cannot coexist with `meta.err`.
     - **Residual:** a token account of the mint that is absent from the RPC's `pre/postTokenBalances` is invisible. That is the same visibility the MATCHED rule already relies on.

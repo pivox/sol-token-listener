@@ -207,7 +207,8 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
   for (const absent of [
     'authenticatePersistedSignedTransaction', 'recordConfirmation',
     'readConfirmationWork', 'readReconciliationWork', 'commitReconciliation',
-    'createDeadlineExitIntent', 'createNextDeadlineExitIntent', 'arm', 'admit',
+    'createDeadlineExitIntent', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
+    'arm', 'admit',
   ]) assert.equal(Object.hasOwn(live, absent), false);
 
   await live.recoverStrandedPreSignatureLock(undefined as never);

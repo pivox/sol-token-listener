@@ -1570,11 +1570,17 @@ export class PostgresExecutionLiveRepository {
           || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
           throw failure('INVALID_DATA');
         }
-        const facts = await readFastExitFacts(client, mint, candidate);
+        // One candidate whose facts cannot be read is skipped for this pass: the savepoint keeps
+        // the scan transaction (and its 51007 lock) usable for the next candidates.
         let reason: FastExitReason | null = null;
+        await client.query('SAVEPOINT execution_live_early_exit_facts');
         try {
+          const facts = await readFastExitFacts(client, mint, candidate);
           reason = facts === null ? null : decideFastExit(facts, rules);
+          await client.query('RELEASE SAVEPOINT execution_live_early_exit_facts');
         } catch {
+          await client.query('ROLLBACK TO SAVEPOINT execution_live_early_exit_facts');
+          await client.query('RELEASE SAVEPOINT execution_live_early_exit_facts');
           reason = null;
         }
         if (reason === null) continue;
@@ -5373,7 +5379,8 @@ async function readFastExitFacts(
   if (typeof entrySlot !== 'string' || !CANONICAL_DECIMAL.test(entrySlot)) return null;
   const creators = await client.query(`SELECT DISTINCT payload #>> '{launch,creator}' AS creator
     FROM domain_events
-    WHERE type='TokenLaunchDetected' AND mint=$1 AND confirmation_status<>'orphaned'`, [mint]);
+    WHERE type='TokenLaunchDetected' AND mint=$1 AND confirmation_status<>'orphaned'
+      AND payload #>> '{launch,creator}' IS NOT NULL`, [mint]);
   const trades = await client.query(`SELECT event_id,slot::TEXT AS slot,transaction_index,
       instruction_index,inner_instruction_index,
       payload #>> '{trade,kind}' AS kind,payload #>> '{trade,trader}' AS trader,
