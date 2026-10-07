@@ -665,6 +665,11 @@ function validateSimulationEnvelope(
   if (result.unitsConsumed !== null && !u64(result.unitsConsumed)) rejectEvidence();
 }
 
+// The RPC returns the CPIs of programs it knows (System, SPL Token, Token-2022)
+// in jsonParsed form, which the provider session maps to PARSED entries without
+// accounts or data: the node already resolved them, so they are accepted when
+// the program is allowed and part of the compiled message. Every other CPI must
+// arrive partially decoded and touch only static accounts.
 function innerInstructionsFrom(
   value: unknown,
   staticAccounts: ReadonlySet<string> = new Set(),
@@ -688,11 +693,15 @@ function innerInstructionsFrom(
       const instruction = record(item, ['kind', 'programId', 'accounts', 'data', 'stackHeight']);
       const stackHeight = instruction.stackHeight;
       const programId = typeof instruction.programId === 'string' ? publicKey(instruction.programId) : null;
-      if (instruction.kind !== 'PARTIALLY_DECODED'
-        || programId === null || !ALLOWED_INNER_PROGRAMS.has(programId) || !staticAccounts.has(programId)
-        || instruction.accounts === null || !canonicalBase58(instruction.data)
+      if (programId === null || !ALLOWED_INNER_PROGRAMS.has(programId) || !staticAccounts.has(programId)
         || (stackHeight !== null && (typeof stackHeight !== 'number' || !Number.isSafeInteger(stackHeight)
           || stackHeight < 0 || stackHeight > 16))) rejectEvidence();
+      if (instruction.kind === 'PARSED') {
+        if (instruction.accounts !== null || instruction.data !== null) rejectEvidence();
+        continue;
+      }
+      if (instruction.kind !== 'PARTIALLY_DECODED'
+        || instruction.accounts === null || !canonicalBase58(instruction.data)) rejectEvidence();
       const addresses = frozenArray(instruction.accounts, 0, 64);
       for (const address of addresses) {
         const account = publicKey(address);

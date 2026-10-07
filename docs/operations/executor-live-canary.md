@@ -1171,4 +1171,7 @@ dernier heartbeat (depuis le démarrage du processus) ; ceux de l'exécuteur ont
    désormais traité comme absent ; un compte System non vide à une position de compte token reste
    refusé. Une erreur programme dont les trois comptes reviennent `null` est classée
    `SIMULATION_PROGRAM_ERROR` (évidence de comptes nulle, unités et logs conservés) et non plus
-   `RPC_RESPONSE_INVALID`.
+   `RPC_RESPONSE_INVALID`. Les CPI internes des programmes connus du nœud (System, SPL Token,
+   Token-2022) arrivent sous forme `parsed` (sans comptes ni données bruts) ; elles sont acceptées
+   lorsque le programme est dans l'allowlist et fait partie des comptes statiques de la transaction,
+   les autres CPI restant exigées en forme partiellement décodée sur comptes statiques uniquement.
