@@ -82,6 +82,23 @@ void test('ENVELOPE armament signs although its gate bindings are not the target
   });
 });
 
+void test('ENVELOPE signing accepts a per-mint build fingerprint different from EXECUTOR_BUILD_HASH', async (context) => {
+  await withSchema(context, async (pool) => {
+    const fixture = await envelopeBuyFixture(pool);
+    const perMintFingerprint = 'e'.repeat(64);
+    assert.notEqual(perMintFingerprint, fixture.input.runtime.buildHash);
+    const live = new PostgresExecutionLiveRepository(pool);
+    // The material's own unsigned simulation must still carry the same fingerprint as the material.
+    await assert.rejects(live.authorizeExactSigning(withMaterialFingerprint(fixture.input, {
+      material: perMintFingerprint, simulation: fixture.input.runtime.buildHash,
+    })), isLiveError('INVALID_INPUT'));
+    const authorization = await live.authorizeExactSigning(withMaterialFingerprint(fixture.input, {
+      material: perMintFingerprint, simulation: perMintFingerprint,
+    }));
+    assert.equal(authorization.binding.armamentId, fixture.armamentId);
+  });
+});
+
 void test('ENVELOPE signing keeps every other check: a superseded wallet snapshot is refused', async (context) => {
   await withSchema(context, async (pool) => {
     const fixture = await envelopeBuyFixture(pool);
@@ -178,6 +195,25 @@ function runnableBinding(simulation: SeededSimulation) {
     strategyFingerprint: '3'.repeat(64), walletPublicKey: publicKey,
     cluster: 'mainnet-beta' as const, genesisHash: publicKey, providerId: 'primary',
     ...runtimeLimits,
+  });
+}
+
+type SigningInput = Awaited<ReturnType<typeof envelopeBuyFixture>>['input'];
+
+/** The fixture input with the material's build fingerprint and its unsigned simulation's replaced. */
+function withMaterialFingerprint(
+  input: SigningInput,
+  fingerprints: { readonly material: string; readonly simulation: string },
+): SigningInput {
+  return Object.freeze({
+    ...input,
+    material: Object.freeze({
+      ...input.material,
+      buildFingerprint: fingerprints.material,
+      unsignedSimulation: Object.freeze({
+        ...input.material.unsignedSimulation, buildFingerprint: fingerprints.simulation,
+      }),
+    }),
   });
 }
 

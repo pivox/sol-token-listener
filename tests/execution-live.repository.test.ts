@@ -60,11 +60,14 @@ const exactBuyWallet = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 17
 const exactBuyWalletPublicKey = exactBuyWallet.publicKey.toBase58();
 const roleProvisioningUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 
-function submissionPreflight(artifact: ReturnType<typeof createSignedTransactionArtifact>) {
+function submissionPreflight(
+  artifact: ReturnType<typeof createSignedTransactionArtifact>,
+  buildHash = artifact.buildFingerprint,
+) {
   return Object.freeze({
     runtime: Object.freeze({
       payloadVersion: 1 as const, phase: 'CANARY' as const,
-      buildHash: artifact.buildFingerprint, configurationFingerprint: fingerprint,
+      buildHash, configurationFingerprint: fingerprint,
       strategyFingerprint: '3'.repeat(64), walletPublicKey: artifact.walletPublicKey,
       cluster: 'mainnet-beta' as const, expectedGenesisHash: artifact.walletPublicKey,
       observedGenesisHash: artifact.walletPublicKey, providerId: artifact.providerId,
@@ -1615,6 +1618,65 @@ void test('BUY persistence commits only the exact authorized V2 pre-signature lo
     });
   });
 
+void test('BUY persistence and submission accept a per-transaction build fingerprint that differs from the static build hash',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: per-transaction build fingerprint test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      // The build fingerprint hashes this transaction's exact instructions (mint, curve accounts,
+      // amount); the lock, armament and qualification carry the static EXECUTOR_BUILD_HASH.
+      const perTransactionFingerprint = 'e'.repeat(64);
+      const fixture = await exactBuyPersistenceFixture(pool, {
+        buildFingerprint: perTransactionFingerprint,
+      });
+      assert.notEqual(fixture.buildHash, perTransactionFingerprint);
+      assert.equal(fixture.input.artifact.buildFingerprint, perTransactionFingerprint);
+      assert.equal(fixture.input.unsignedSimulation.buildFingerprint, perTransactionFingerprint);
+      assert.deepEqual((await pool.query(`SELECT lock.build_hash,armament.build_hash AS armament_build_hash
+        FROM execution_pre_signature_locks lock
+        JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+        WHERE lock.lock_id=$1`, [fixture.preSignatureLockId])).rows,
+      [{ build_hash: fixture.buildHash, armament_build_hash: fixture.buildHash }]);
+
+      const persisted = await fixture.live.persistSigned(fixture.input);
+      assert.deepEqual(persisted.artifact, fixture.input.artifact);
+      assert.deepEqual(await fixture.live.persistSigned(fixture.input), persisted);
+      assert.deepEqual(await exactBuyLockState(pool, fixture), {
+        lockState: 'SIGNED_PERSISTED', lockRevision: '1', armamentState: 'LOCKED',
+        armamentRevision: '1', consumedBuys: 1, artifacts: 1,
+      });
+      assert.deepEqual((await pool.query(`SELECT build_fingerprint FROM execution_signed_transactions
+        WHERE artifact_id=$1`, [fixture.artifact.artifactId])).rows,
+      [{ build_fingerprint: perTransactionFingerprint }]);
+
+      const signed = await fixture.live.recordSignedSimulation(
+        fixture.claim,
+        signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+          simulationSlot: 126n, unitsConsumed: 26_000n, feePayerLamportDebit: 5_500n,
+          baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n, observedAtMs: fixture.artifact.signedAtMs + 1,
+        }),
+      );
+      // Submission still binds the static hash: the per-transaction fingerprint is not accepted there.
+      await assert.rejects(fixture.live.beginSubmission({
+        claim: fixture.claim, artifactId: fixture.artifact.artifactId,
+        expectedRevision: signed.stateRevision,
+        ...submissionPreflight(fixture.artifact, perTransactionFingerprint),
+      }), (error: unknown) => error instanceof ExecutionLiveRepositoryError);
+      const started = await fixture.live.beginSubmission({
+        claim: fixture.claim, artifactId: fixture.artifact.artifactId,
+        expectedRevision: signed.stateRevision,
+        ...submissionPreflight(fixture.artifact, fixture.buildHash),
+      });
+      assert.equal(started.artifact.artifactId, fixture.artifact.artifactId);
+      assert.deepEqual((await pool.query(`SELECT build_hash FROM execution_submission_preflight_evidence
+        WHERE artifact_id=$1`, [fixture.artifact.artifactId])).rows,
+      [{ build_hash: fixture.buildHash }]);
+    });
+  });
+
 void test('BUY persistence rejects a missing or mismatched exact pre-signature lock without side effects',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -2809,6 +2871,8 @@ async function exactBuyPersistenceFixture(
     readonly quoteLifetimeMs?: number;
     readonly maximumCanaryCapitalLamports?: bigint;
     readonly lastValidBlockHeight?: bigint;
+    /** The transaction's own build fingerprint; defaults to the static qualification build hash. */
+    readonly buildFingerprint?: string;
   }> = {},
 ) {
   const quoteLifetimeMs = options.quoteLifetimeMs ?? 60_000;
@@ -2918,14 +2982,15 @@ async function exactBuyPersistenceFixture(
     side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const, snapshotSlot: 125n,
     quoteFingerprint: '7'.repeat(64), quoteObservedAtMs,
     quoteExpiresAtMs: quoteObservedAtMs + quoteLifetimeMs,
-    buildFingerprint: qualification.buildHash,
+    buildFingerprint: options.buildFingerprint ?? qualification.buildHash,
     snapshotFingerprint: walletSnapshot.snapshotFingerprint,
     messageHash: sha256(messageBytes), messageBytes,
     unsignedTransactionHash: sha256(unsignedTransactionBytes), unsignedTransactionBytes,
     blockhash: exactBuyWalletPublicKey, lastValidBlockHeight,
     unsignedSimulation: Object.freeze({
       outcome: 'SUCCESS' as const, snapshotFingerprint: walletSnapshot.snapshotFingerprint,
-      buildFingerprint: qualification.buildHash, messageHash: sha256(messageBytes),
+      buildFingerprint: options.buildFingerprint ?? qualification.buildHash,
+      messageHash: sha256(messageBytes),
       blockhash: exactBuyWalletPublicKey, lastValidBlockHeight,
       blockhashContextSlot: 125n, feeContextSlot: 125n, estimatedFeeLamports: 5_000n,
       simulationSlot: 125n, simulatedFeePayerLamportDebit: 5_000n, unitsConsumed: 25_000n,
@@ -2983,6 +3048,7 @@ async function exactBuyPersistenceFixture(
   });
   return Object.freeze({
     live, input, authorization, claim: begun.claim, artifact,
+    buildHash: qualification.buildHash,
     unsignedSimulation: authorization.material.unsignedSimulation,
     rpcBudget: input.rpcBudget, providerSnapshot,
     armamentId: authorization.binding.armamentId,

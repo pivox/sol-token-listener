@@ -37,7 +37,7 @@ void test('applies migrations 001-052 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '067_fast_entry_probe_unarmable.sql');
+    assert.equal(applied.at(-1), '068_live_build_fingerprint_per_transaction.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const versions = await pool.query(
       `SELECT payload_version FROM paper_strategy_sessions
