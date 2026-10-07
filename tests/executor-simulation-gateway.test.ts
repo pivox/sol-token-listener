@@ -55,6 +55,9 @@ const MINT = key(20);
 const BASE_ATA = getAssociatedTokenAddressSync(
   new PublicKey(MINT), new PublicKey(PAYER), true, TOKEN_PROGRAM_ID,
 ).toBase58();
+const BASE_ATA_2022 = getAssociatedTokenAddressSync(
+  new PublicKey(MINT), new PublicKey(PAYER), true, TOKEN_2022_PROGRAM_ID,
+).toBase58();
 const QUOTE_ATA = getAssociatedTokenAddressSync(
   NATIVE_MINT, new PublicKey(PAYER), true, TOKEN_PROGRAM_ID,
 ).toBase58();
@@ -260,6 +263,81 @@ void test('simulates a Pump.fun BUY when the causal base ATA is absent and then 
   );
   assert.equal(result.simulatedBaseDeltaRaw, 100n);
   assert.equal(result.simulatedQuoteDeltaRaw, -90n);
+  assert.deepEqual(provider.calls, ['blockhash', 'fee', 'simulate']);
+});
+
+// Agave 4.3 (Helius apiVersion 4.3.0) returns a requested address that does not
+// exist as a zero-lamport System-owned account instead of null. The payer WSOL ATA
+// of a Pump.fun BUY is such an address; the causal snapshot still has it as null.
+void test('treats an Agave 4.3 default-empty quote account as absent on a Token-2022 BUY', async () => {
+  const pre = pumpFunSnapshot([systemAccount(PAYER, 10_000_000n), null, null], BASE_ATA_2022);
+  const plan = await buildPumpFunPlan(pumpFunRequest('BUY', fingerprint(pre), 'TOKEN_2022'));
+  const provider = new ScriptedGateway(pre, Object.freeze({
+    providerId: 'primary', contextSlot: 125n, failureKind: null,
+    logs: Object.freeze(['Program log: success']), unitsConsumed: 102_482n,
+    accounts: Object.freeze([
+      systemAccount(PAYER, 8_486_065n),
+      tokenAccount(BASE_ATA_2022, MINT, PAYER, 100n, 1_513_840n, false, TOKEN_2022_PROGRAM_ID),
+      defaultEmptyAccount(QUOTE_ATA),
+    ]),
+    innerInstructions: Object.freeze([]),
+  }));
+  const result = await new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+    gatewayInput(provider, plan, pre), activeSignal(),
+  );
+  assert.equal(result.outcome, 'SUCCESS');
+  assert.equal(result.simulatedBaseDeltaRaw, 100n);
+  assert.equal(result.simulatedQuoteDeltaRaw, -90n);
+  assert.equal(result.simulatedFeePayerLamportDebit, 1_513_935n);
+  assert.equal(result.unitsConsumed, 102_482n);
+  assert.deepEqual(provider.simulationRequest?.accountAddresses, [PAYER, BASE_ATA_2022, QUOTE_ATA]);
+});
+
+void test('still rejects a non-empty System-owned account returned in a token account position', async () => {
+  const pre = pumpFunSnapshot([systemAccount(PAYER, 10_000_000n), null, null]);
+  const plan = await buildPumpFunPlan(pumpFunRequest('BUY', fingerprint(pre)));
+  const provider = new ScriptedGateway(pre, Object.freeze({
+    providerId: 'primary', contextSlot: 125n, failureKind: null,
+    logs: Object.freeze(['Program log: success']), unitsConsumed: 25_000n,
+    accounts: Object.freeze([
+      systemAccount(PAYER, 7_960_625n),
+      tokenAccount(BASE_ATA, MINT, PAYER, 100n, 2_039_280n, false),
+      Object.freeze({ ...defaultEmptyAccount(QUOTE_ATA), lamports: 1n }),
+    ]),
+    innerInstructions: Object.freeze([]),
+  }));
+  await rejectsGateway(
+    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, pre), activeSignal(),
+    ),
+    'SIMULATION',
+    'RPC_RESPONSE_INVALID',
+  );
+});
+
+void test('classifies a program failure whose three post accounts are null as SIMULATION_PROGRAM_ERROR', async () => {
+  const pre = pumpFunSnapshot([systemAccount(PAYER, 10_000_000n), null, null]);
+  const plan = await buildPumpFunPlan(pumpFunRequest('BUY', fingerprint(pre)));
+  const provider = new ScriptedGateway(pre, Object.freeze({
+    providerId: 'primary', contextSlot: 125n, failureKind: 'PROGRAM_ERROR' as const,
+    logs: Object.freeze(['Program log: Error: TooMuchSolRequired', 'Program failed']), unitsConsumed: 77_094n,
+    accounts: Object.freeze([null, null, null]),
+    innerInstructions: Object.freeze([]),
+  }));
+  const error = await rejectsGateway(
+    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, pre), activeSignal(),
+    ),
+    'SIMULATION',
+    'SIMULATION_PROGRAM_ERROR',
+  );
+  assert.equal(error.evidence.simulationSlot, 125n);
+  assert.equal(error.evidence.unitsConsumed, 77_094n);
+  assert.equal(error.evidence.simulatedFeePayerLamportDebit, null);
+  assert.equal(error.evidence.simulatedBaseDeltaRaw, null);
+  assert.equal(error.evidence.simulatedQuoteDeltaRaw, null);
+  assert.match(error.evidence.logsFingerprint ?? '', /^[0-9a-f]{64}$/u);
+  assert.equal(error.evidence.logsLineCount, 2);
   assert.deepEqual(provider.calls, ['blockhash', 'fee', 'simulate']);
 });
 
@@ -557,11 +635,13 @@ void test('requires a one-shot authority-scoped receipt before any RPC', async (
 function pumpFunRequest(
   side: 'BUY' | 'SELL',
   snapshotFingerprint: string,
+  baseTokenProgram: 'SPL_TOKEN' | 'TOKEN_2022' = 'SPL_TOKEN',
 ): PumpFunBuildRequestV1 {
+  const baseAta = baseTokenProgram === 'SPL_TOKEN' ? BASE_ATA : BASE_ATA_2022;
   return Object.freeze({
     quote: Object.freeze({
       payloadVersion: 1, venue: 'PUMP_FUN', side, mint: MINT,
-      quoteMint: NATIVE_MINT.toBase58(), baseTokenProgram: 'SPL_TOKEN',
+      quoteMint: NATIVE_MINT.toBase58(), baseTokenProgram,
       quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
       amountInRaw: 100n, expectedAmountOutRaw: 100n, protectedAmountOutRaw: 90n,
       snapshotSlot: SLOT, quoteFingerprint: '0'.repeat(64), snapshotFingerprint,
@@ -572,7 +652,7 @@ function pumpFunRequest(
       ownerProgramId: PUMP_PROGRAM_ID.toBase58(), exists: true, complete: false,
       creator: key(30), isMayhemMode: false,
     }),
-    userBaseTokenAccount: Object.freeze({ address: BASE_ATA, exists: side === 'SELL' }),
+    userBaseTokenAccount: Object.freeze({ address: baseAta, exists: side === 'SELL' }),
     recipients: Object.freeze({
       feeRecipient: key(100), feeRecipients: frozenKeys(101, 7),
       reservedFeeRecipient: key(110), reservedFeeRecipients: frozenKeys(111, 7),
@@ -583,11 +663,12 @@ function pumpFunRequest(
 
 function pumpFunSnapshot(
   balanceAccounts: readonly [ExecutionRpcAccount, ExecutionRpcAccount | null, ExecutionRpcAccount | null],
+  baseAta: string = BASE_ATA,
 ): ExecutionAccountSnapshot {
   const curve = bondingCurvePda(new PublicKey(MINT)).toBase58();
   const addresses = Object.freeze([
     GLOBAL_PDA.toBase58(), PUMP_FEE_CONFIG_PDA.toBase58(), MINT, curve,
-    PAYER, BASE_ATA, QUOTE_ATA,
+    PAYER, baseAta, QUOTE_ATA,
   ]);
   const accounts = Object.freeze([
     opaqueAccount(GLOBAL_PDA.toBase58(), PUMP_PROGRAM_ID.toBase58()),
@@ -681,6 +762,11 @@ function systemAccount(address: string, lamports: bigint): ExecutionRpcAccount {
   });
 }
 
+/** The shape Agave 4.3 returns for a requested address that does not exist. */
+function defaultEmptyAccount(address: string): ExecutionRpcAccount {
+  return systemAccount(address, 0n);
+}
+
 function tokenAccount(
   address: string,
   mint: string,
@@ -690,13 +776,17 @@ function tokenAccount(
   isNative: boolean,
   programId: PublicKey = TOKEN_PROGRAM_ID,
 ): ExecutionRpcAccount {
-  const data = Buffer.alloc(AccountLayout.span);
+  const base = Buffer.alloc(AccountLayout.span);
   AccountLayout.encode({
     mint: new PublicKey(mint), owner: new PublicKey(owner), amount: amountRaw,
     delegateOption: 0, delegate: PublicKey.default, state: AccountState.Initialized,
     isNativeOption: isNative ? 1 : 0, isNative: isNative ? 2_039_280n : 0n,
     delegatedAmount: 0n, closeAuthorityOption: 0, closeAuthority: PublicKey.default,
-  }, data);
+  }, base);
+  // A Token-2022 ATA carries the account-type byte and an ImmutableOwner
+  // extension header after the 165-byte legacy layout (170 bytes on mainnet).
+  const data = programId.equals(TOKEN_2022_PROGRAM_ID)
+    ? Buffer.concat([base, Buffer.from([2, 7, 0, 0, 0])]) : base;
   return Object.freeze({
     address, lamports, owner: programId.toBase58(), executable: false,
     rentEpoch: null, space: BigInt(data.length), dataBase64: data.toString('base64'),
