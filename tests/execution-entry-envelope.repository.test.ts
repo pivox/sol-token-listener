@@ -430,7 +430,7 @@ void test('PostgreSQL 16 operations role arms a CANARY and an ENVELOPE, reads th
       assert.equal(due.activeArmament, 'LOCKED');
       assert.equal(due.providerRefreshDue, true);
       const refreshed = await operations.refreshEnvelopeProviderSnapshot({
-        generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 3_600_000,
+        generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 300_000,
       });
       assert.equal(refreshed.refreshed, true);
       assert.equal(refreshed.snapshot?.provenance, 'EXECUTOR_COUNTERS');
@@ -528,7 +528,7 @@ for (const ending of ['REVOKED', 'EXPIRED', 'CUT_OFF'] as const) {
           SET valid_until=date_trunc('milliseconds',statement_timestamp())+INTERVAL '15 minutes'
           WHERE envelope_id=$1`, [prepared.envelope.envelopeId]);
       }
-      await assert.rejects(repository.armEnvelope(request), isRepositoryError('CONFLICT'));
+      await assert.rejects(repository.armEnvelope(request), isRepositoryError('ENVELOPE_NOT_ARMABLE'));
       await assertNothingArmed(pool);
     });
   });
@@ -544,7 +544,7 @@ void test('armEnvelope keeps K=1: a second arm while one is ARMED is a conflict'
     const first = await fastEntryIntent(pool, prepared.envelope, nowMs);
     const second = await fastEntryIntent(pool, prepared.envelope, nowMs);
     await armEnvelope(repository, prepared, first);
-    await assert.rejects(armEnvelope(repository, prepared, second), isRepositoryError('CONFLICT'));
+    await assert.rejects(armEnvelope(repository, prepared, second), isRepositoryError('ARMAMENT_CONTENDED'));
     assert.deepEqual((await pool.query(`SELECT buys_armed FROM execution_entry_envelopes`)).rows,
       [{ buys_armed: 1 }]);
   });
@@ -578,7 +578,7 @@ for (const cap of [
       // No ACTIVE envelope any more: the daemon would not even try; the repository refuses.
       await assert.rejects(repository.armEnvelope(await envelopeArmRequest(repository, prepared,
         intents[2] ?? '', { provider: { snapshot: second.providerSnapshot, localUsedUnits: 0n } })),
-      isRepositoryError('CONFLICT'));
+      isRepositoryError('ENVELOPE_NOT_ARMABLE'));
       assert.equal((await repository.readAutoArmContext(contextQuery())).envelope, null);
     });
   });
@@ -594,7 +594,7 @@ void test('armEnvelope refuses once the realized loss reaches the cap', async (c
     await pool.query(`UPDATE execution_entry_envelopes SET realized_loss_raw=max_realized_loss_raw`);
     const armingContext = await repository.readAutoArmContext(contextQuery());
     assert.equal(armingContext.realizedLossRaw, 30_000_000n);
-    await assert.rejects(armEnvelope(repository, prepared, intentId), isRepositoryError('CONFLICT'));
+    await assert.rejects(armEnvelope(repository, prepared, intentId), isRepositoryError('ENVELOPE_NOT_ARMABLE'));
     await assertNothingArmed(pool);
   });
 });
@@ -727,6 +727,55 @@ void test('armEnvelope refuses a CANARY qualification and the trigger refuses an
     });
   });
 
+void test('armEnvelope refuses an operator mismatch and a qualification of another envelope with ENVELOPE_NOT_ARMABLE',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const first = await openEnvelope(pool, repository, simulation);
+      await seedProviderSnapshot(pool);
+      const intentId = await fastEntryIntent(pool, first.envelope, await currentDatabaseTimeMs(pool));
+      const otherOperator = await envelopeArmRequest(repository, first, intentId,
+        { operatorId: 'operator-other' });
+      await assert.rejects(repository.armEnvelope(otherOperator),
+        isRepositoryError('ENVELOPE_NOT_ARMABLE'));
+      // The first envelope is revoked and a second one opened: a request carrying the first
+      // envelope's qualification is refused against the second envelope.
+      await repository.revokeEnvelope({ generationId, envelopeId: first.envelope.envelopeId,
+        operatorId: 'operator-primary', occurredAtMs: Date.now() });
+      const second = await prepareEnvelope(pool, repository, simulation,
+        { nonce: '2', expiresInMs: 3 * HOUR });
+      await repository.createEnvelope(second);
+      const later = await fastEntryIntent(pool, second.envelope, await currentDatabaseTimeMs(pool));
+      const stale = await envelopeArmRequest(repository, first, later);
+      await assert.rejects(repository.armEnvelope({ ...stale, envelopeId: second.envelope.envelopeId }),
+        isRepositoryError('ENVELOPE_NOT_ARMABLE'));
+      await assertNothingArmed(pool);
+    });
+  });
+
+void test('armEnvelope surfaces a wallet snapshot superseded concurrently as ARMAMENT_CONTENDED', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const prepared = await openEnvelope(pool, repository, simulation);
+    await seedProviderSnapshot(pool);
+    const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+    const armed = await envelopeArmRequest(repository, prepared, intentId);
+    const risk = new PostgresExecutionRiskRepository(pool);
+    const wallet = armed.request.walletSnapshot;
+    await risk.appendWalletSnapshot(wallet);
+    await risk.appendWalletSnapshot(createExecutionWalletSnapshot({
+      generationId, providerId: 'primary', stateRevision: wallet.stateRevision, slot: 11n,
+      blockTimeMs: wallet.observedAtMs, observedAtMs: wallet.observedAtMs + 20,
+      commitment: 'finalized', walletLamports: 230_000_000n, tokenBalanceCount: 0,
+      openPositions: [], realizedNetPnlRaw: 0n,
+    }));
+    await assert.rejects(repository.armEnvelope(armed), isRepositoryError('ARMAMENT_CONTENDED'));
+    await assertNothingArmed(pool);
+  });
+});
+
 void test('readAutoArmContext returns the envelope and picks the oldest eligible fast-entry intent', async (context) => {
   await withSchema(context, async (pool) => {
     const simulation = await seedEnvelopeBase(pool);
@@ -747,8 +796,9 @@ void test('readAutoArmContext returns the envelope and picks the oldest eligible
     const shortLived = await fastEntryIntent(pool, prepared.envelope, from + 3);
     const preEnvelope = await fastEntryIntent(pool, prepared.envelope, from + 4);
     const smaller = await fastEntryIntent(pool, prepared.envelope, from + 5, PER_BUY / 2n);
-    const oldest = await fastEntryIntent(pool, prepared.envelope, from + 6);
-    const next = await fastEntryIntent(pool, prepared.envelope, from + 7);
+    const reasoned = await fastEntryIntent(pool, prepared.envelope, from + 6);
+    const oldest = await fastEntryIntent(pool, prepared.envelope, from + 7);
+    const next = await fastEntryIntent(pool, prepared.envelope, from + 8);
     await mutateWithTriggersDisabled(pool, `UPDATE execution_intents SET lease_owner='worker',
       lease_token=gen_random_uuid(),
       lease_expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute'
@@ -758,6 +808,12 @@ void test('readAutoArmContext returns the envelope and picks the oldest eligible
     [shortLived]);
     await mutateWithTriggersDisabled(pool, `UPDATE execution_intents
       SET requested_at=requested_at-INTERVAL '1 second' WHERE id=$1`, [preEnvelope]);
+    // A row lockedCanaryTarget would refuse (a reason code while PENDING) is never offered.
+    await pool.query(`ALTER TABLE execution_intents
+      DROP CONSTRAINT execution_intents_pending_check,
+      DROP CONSTRAINT execution_intents_status_reason_check`);
+    await mutateWithTriggersDisabled(pool, `UPDATE execution_intents
+      SET last_reason_code='EXECUTION_STARTED' WHERE id=$1`, [reasoned]);
     const view = await repository.readAutoArmContext(contextQuery({ excludedIntentIds: [excluded] }));
     assert.ok(Object.isFrozen(view));
     assert.ok(view.databaseNowMs >= from);
@@ -799,7 +855,7 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
       const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
       const armament = await armEnvelope(repository, prepared, intentId);
       const wide = contextQuery({ providerRefreshThresholdMs: 3_600_000 });
-      const command = { generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 3_600_000 };
+      const command = { generationId, maximumAgeMs: 300_000, providerRefreshThresholdMs: 300_000 };
       const armed = await repository.readAutoArmContext(wide);
       assert.equal(armed.activeArmament, 'ARMED');
       assert.equal(armed.providerRefreshDue, false);
@@ -815,6 +871,9 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
       assert.equal((await repository.readAutoArmContext(contextQuery())).providerRefreshDue, false);
       assert.equal((await repository.refreshEnvelopeProviderSnapshot({ ...command,
         providerRefreshThresholdMs: 1 })).refreshed, false);
+      // The threshold may not exceed the carried-forward snapshot's own age.
+      await assert.rejects(repository.refreshEnvelopeProviderSnapshot({ ...command,
+        providerRefreshThresholdMs: command.maximumAgeMs + 1 }), isRepositoryError('INVALID_DATA'));
       const latest = succeeded.provider?.snapshot;
       assert.ok(latest !== undefined);
       // The admission of the arm itself recorded the entry cost (8 units) after the measurement.
@@ -1217,6 +1276,7 @@ async function envelopeArmRequest(
   options: Readonly<{
     extraUnits?: bigint;
     provenance?: 'OPERATOR_REPORT';
+    operatorId?: string;
     provider?: Readonly<{ snapshot: ProviderUsageSnapshotV1; localUsedUnits: bigint }>;
   }> = {},
 ) {
@@ -1258,10 +1318,11 @@ async function envelopeArmRequest(
     runtimeMaxComputeUnits: 200_000n, runtimeMaxFeeLamports: 5_000n,
     runtimeMaxFeePayerLamportDebit: 100_000n, runtimeMaxRpcCallsPerAttempt: 12,
     runtimeLeaseMs: 3_000, armedAtMs: nowMs, armamentExpiresAtMs: expiresAtMs,
-    operatorId: prepared.envelope.operatorId, operatorReason: 'Entry envelope auto-arm.',
+    operatorId: options.operatorId ?? prepared.envelope.operatorId,
+    operatorReason: 'Entry envelope auto-arm.',
   });
   const authorization = createEnvelopeArmAuthorization({
-    generationId, operatorId: prepared.envelope.operatorId,
+    generationId, operatorId: options.operatorId ?? prepared.envelope.operatorId,
     envelopeId: prepared.envelope.envelopeId, intentId,
     contextFingerprint: request.armamentRequestFingerprint, nowMs,
   });
