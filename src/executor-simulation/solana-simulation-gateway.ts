@@ -79,6 +79,11 @@ const ALLOWED_INNER_PROGRAMS = new Set([
   ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(), PUMP_PROGRAM_ID.toBase58(), PUMP_FUN_FEE_PROGRAM_ID.toBase58(),
   PUMPSWAP_PROGRAM_ID, PUMP_AMM_PROGRAM_ID.toBase58(), PUMP_SWAP_FEE_PROGRAM_ID.toBase58(),
 ]);
+// Programs whose CPIs the RPC returns in jsonParsed form (no accounts, no data).
+const PARSED_INNER_PROGRAMS = new Set([
+  PublicKey.default.toBase58(), TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58(),
+  ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(),
+]);
 const INTERNAL_GATEWAY_ERRORS = new WeakSet<ExecutionSimulationGatewayError>();
 
 export class ExecutionSimulationGatewayError extends Error {
@@ -665,6 +670,11 @@ function validateSimulationEnvelope(
   if (result.unitsConsumed !== null && !u64(result.unitsConsumed)) rejectEvidence();
 }
 
+// The RPC returns the CPIs of programs it knows (System, SPL Token, Token-2022)
+// in jsonParsed form, which the provider session maps to PARSED entries without
+// accounts or data: the node already resolved them, so they are accepted when
+// the program is allowed and part of the compiled message. Every other CPI must
+// arrive partially decoded and touch only static accounts.
 function innerInstructionsFrom(
   value: unknown,
   staticAccounts: ReadonlySet<string> = new Set(),
@@ -688,11 +698,16 @@ function innerInstructionsFrom(
       const instruction = record(item, ['kind', 'programId', 'accounts', 'data', 'stackHeight']);
       const stackHeight = instruction.stackHeight;
       const programId = typeof instruction.programId === 'string' ? publicKey(instruction.programId) : null;
-      if (instruction.kind !== 'PARTIALLY_DECODED'
-        || programId === null || !ALLOWED_INNER_PROGRAMS.has(programId) || !staticAccounts.has(programId)
-        || instruction.accounts === null || !canonicalBase58(instruction.data)
+      if (programId === null || !ALLOWED_INNER_PROGRAMS.has(programId) || !staticAccounts.has(programId)
         || (stackHeight !== null && (typeof stackHeight !== 'number' || !Number.isSafeInteger(stackHeight)
           || stackHeight < 0 || stackHeight > 16))) rejectEvidence();
+      if (instruction.kind === 'PARSED') {
+        if (!PARSED_INNER_PROGRAMS.has(programId) || instruction.accounts !== null
+          || instruction.data !== null) rejectEvidence();
+        continue;
+      }
+      if (instruction.kind !== 'PARTIALLY_DECODED'
+        || instruction.accounts === null || !canonicalBase58(instruction.data)) rejectEvidence();
       const addresses = frozenArray(instruction.accounts, 0, 64);
       for (const address of addresses) {
         const account = publicKey(address);

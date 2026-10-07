@@ -40,6 +40,7 @@ import {
 import type { UnsignedBuildPlanV1 } from '../src/executor-simulation/build-plan.js';
 import type {
   ExecutionAccountSnapshot,
+  ExecutionInnerInstruction,
   ExecutionLatestBlockhash,
   ExecutionMarketGateway,
   ExecutionMessageFee,
@@ -63,6 +64,9 @@ const QUOTE_ATA = getAssociatedTokenAddressSync(
 ).toBase58();
 const BLOCKHASH = key(210);
 const SLOT = 123n;
+const PUMP_EVENT_AUTHORITY = PublicKey.findProgramAddressSync(
+  [Buffer.from('__event_authority')], PUMP_PROGRAM_ID,
+)[0].toBase58();
 
 void test('simulates the strict PumpSwap SELL golden plan against its canonical 14-account snapshot', async () => {
   const fixturePlan = await loadPumpSwapSellGoldenPlan();
@@ -509,38 +513,97 @@ void test('validates the complete simulation envelope before classifying a progr
   );
 });
 
-void test('rejects parsed inner instructions whose accounts and data cannot be inspected', async () => {
-  const pre = pumpFunSnapshot([
-    systemAccount(PAYER, 10_000_000n),
-    tokenAccount(BASE_ATA, MINT, PAYER, 1_000n, 2_039_280n, false),
-    tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
-  ]);
-  const plan = await buildPumpFunPlan(pumpFunRequest('SELL', fingerprint(pre)));
+// Agave 4.3 (Helius apiVersion 4.3.0) returns the CPIs of programs it knows
+// (System, SPL Token, Token-2022) in jsonParsed form, which the provider session
+// maps to PARSED entries without accounts or data. Mirrors a captured Token-2022
+// BUY: group 0 = ATA creation (4 parsed CPIs), group 1 = BuyV2 (fee program CPI,
+// parsed TransferChecked, 4 parsed System transfers, pump self-CPI).
+void test('accepts the parsed inner CPIs of allowed static programs on a Token-2022 BUY', async () => {
+  const pre = pumpFunSnapshot([systemAccount(PAYER, 10_000_000n), null, null], BASE_ATA_2022);
+  const plan = await buildPumpFunPlan(pumpFunRequest('BUY', fingerprint(pre), 'TOKEN_2022'));
+  const system = PublicKey.default.toBase58();
+  const token2022 = TOKEN_2022_PROGRAM_ID.toBase58();
   const provider = new ScriptedGateway(pre, deepFreeze({
     providerId: 'primary', contextSlot: 125n, failureKind: null,
-    logs: ['Program log: success'], unitsConsumed: 25_000n,
+    logs: ['Program log: success'], unitsConsumed: 102_482n,
     accounts: [
-      systemAccount(PAYER, 10_000_095n),
-      tokenAccount(BASE_ATA, MINT, PAYER, 900n, 2_039_280n, false),
-      tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+      systemAccount(PAYER, 8_486_065n),
+      tokenAccount(BASE_ATA_2022, MINT, PAYER, 100n, 1_513_840n, false, TOKEN_2022_PROGRAM_ID),
+      defaultEmptyAccount(QUOTE_ATA),
     ],
-    innerInstructions: [{
-      index: 0,
-      instructions: [{
-        kind: 'PARSED', programId: TOKEN_PROGRAM_ID.toBase58(),
-        accounts: null, data: null, stackHeight: 2,
-      }],
-    }],
+    innerInstructions: [
+      {
+        index: 0,
+        instructions: [
+          parsedInner(token2022), parsedInner(system), parsedInner(token2022), parsedInner(token2022),
+        ],
+      },
+      {
+        index: 1,
+        instructions: [
+          {
+            kind: 'PARTIALLY_DECODED', programId: PUMP_FEE_PROGRAM_ID.toBase58(),
+            accounts: [PUMP_FEE_CONFIG_PDA.toBase58(), PUMP_PROGRAM_ID.toBase58()],
+            data: 'KX69VKtJ7u4EBBUge6ccdz6MFdzZSGr9LuKYsmdyg4vxaZ17yLHFCbpu48h28vRbgp74p6smHpha6B',
+            stackHeight: 2,
+          },
+          parsedInner(token2022),
+          parsedInner(system), parsedInner(system), parsedInner(system), parsedInner(system),
+          {
+            kind: 'PARTIALLY_DECODED', programId: PUMP_PROGRAM_ID.toBase58(),
+            accounts: [PUMP_EVENT_AUTHORITY], data: 'BUV4LqTLWqEhXptXmSCkvVEiVZTGhZ5DEKXrvZTbS2di8Dfrrork',
+            stackHeight: 2,
+          },
+        ],
+      },
+    ],
   } satisfies ExecutionUnsignedSimulationResult));
 
-  await rejectsGateway(
-    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
-      gatewayInput(provider, plan, pre), activeSignal(),
-    ),
-    'SIMULATION',
-    'RPC_RESPONSE_INVALID',
+  const result = await new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+    gatewayInput(provider, plan, pre), activeSignal(),
   );
+
+  assert.equal(result.outcome, 'SUCCESS');
+  assert.equal(result.simulatedBaseDeltaRaw, 100n);
   assert.deepEqual(provider.calls, ['blockhash', 'fee', 'simulate']);
+});
+
+void test('rejects a parsed inner instruction of a program outside the allowlist', async () => {
+  await rejectsSellWithInnerInstruction(parsedInner(key(40)));
+});
+
+void test('rejects a parsed inner instruction of an allowlisted program absent from the compiled message', async () => {
+  await rejectsSellWithInnerInstruction(parsedInner(TOKEN_2022_PROGRAM_ID.toBase58()));
+});
+
+void test('rejects a parsed inner instruction of an allowlisted program the RPC never parses', async () => {
+  await rejectsSellWithInnerInstruction(parsedInner(PUMP_PROGRAM_ID.toBase58()));
+});
+
+void test('rejects a parsed inner instruction that still carries accounts or data', async () => {
+  await rejectsSellWithInnerInstruction({
+    kind: 'PARSED', programId: TOKEN_PROGRAM_ID.toBase58(), accounts: [], data: null, stackHeight: 2,
+  });
+  await rejectsSellWithInnerInstruction({
+    kind: 'PARSED', programId: TOKEN_PROGRAM_ID.toBase58(), accounts: null, data: '1', stackHeight: 2,
+  });
+});
+
+void test('rejects a parsed inner instruction whose stack height is out of bounds', async () => {
+  await rejectsSellWithInnerInstruction({ ...parsedInner(TOKEN_PROGRAM_ID.toBase58()), stackHeight: 17 });
+});
+
+void test('rejects an inner instruction of an unknown kind', async () => {
+  await rejectsSellWithInnerInstruction({
+    ...parsedInner(TOKEN_PROGRAM_ID.toBase58()), kind: 'COMPILED' as 'PARSED',
+  });
+});
+
+void test('rejects a partially decoded inner instruction touching a non-static account', async () => {
+  await rejectsSellWithInnerInstruction({
+    kind: 'PARTIALLY_DECODED', programId: PUMP_PROGRAM_ID.toBase58(),
+    accounts: [key(99)], data: '1', stackHeight: 2,
+  });
 });
 
 void test('rejects an allowlisted inner program absent from the compiled message', async () => {
@@ -814,6 +877,37 @@ function lengthPrefixedUtf8(values: readonly string[]): Buffer {
     const length = Buffer.alloc(4); length.writeUInt32BE(bytes.length);
     return [length, bytes];
   }));
+}
+
+function parsedInner(programId: string): ExecutionInnerInstruction {
+  return Object.freeze({ kind: 'PARSED', programId, accounts: null, data: null, stackHeight: 2 });
+}
+
+async function rejectsSellWithInnerInstruction(instruction: ExecutionInnerInstruction): Promise<void> {
+  const pre = pumpFunSnapshot([
+    systemAccount(PAYER, 10_000_000n),
+    tokenAccount(BASE_ATA, MINT, PAYER, 1_000n, 2_039_280n, false),
+    tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+  ]);
+  const plan = await buildPumpFunPlan(pumpFunRequest('SELL', fingerprint(pre)));
+  const provider = new ScriptedGateway(pre, deepFreeze({
+    providerId: 'primary', contextSlot: 125n, failureKind: null,
+    logs: ['Program log: success'], unitsConsumed: 25_000n,
+    accounts: [
+      systemAccount(PAYER, 10_000_095n),
+      tokenAccount(BASE_ATA, MINT, PAYER, 900n, 2_039_280n, false),
+      tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+    ],
+    innerInstructions: [{ index: 0, instructions: [instruction] }],
+  } satisfies ExecutionUnsignedSimulationResult));
+  await rejectsGateway(
+    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, pre), activeSignal(),
+    ),
+    'SIMULATION',
+    'RPC_RESPONSE_INVALID',
+  );
+  assert.deepEqual(provider.calls, ['blockhash', 'fee', 'simulate']);
 }
 
 function successfulSimulation(snapshotValue: ExecutionAccountSnapshot): ExecutionUnsignedSimulationResult {
