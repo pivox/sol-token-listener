@@ -580,6 +580,245 @@ void test('late exact SELL replays cannot create a second exit or a second concu
     });
   });
 
+for (const submissionState of ['CONFIRMED', 'ACCEPTED'] as const) {
+  void test(`SELL landed with an error from ${submissionState} ends FAILED and re-enables the exit`,
+    async (context) => {
+      const databaseUrl = requiredDatabaseUrl(context);
+      if (databaseUrl === null) return;
+      await withTemporarySchema(databaseUrl, async (pool) => {
+        const fixture = await createSellFixture(pool, submissionState);
+        const controlBefore = await controlState(pool);
+        const evidence = landedFailedSellEvidence(fixture, fixture.observedAtMs);
+        assert.equal(evidence.result, 'NO_EFFECT');
+
+        const result = await fixture.live.commitReconciliation(fixture.claim, evidence);
+
+        assert.equal(result.result, 'NO_EFFECT');
+        assert.deepEqual(await durableState(pool, fixture), expectedLandedFailedState(1));
+        assert.deepEqual(await landedFailedJournal(pool, fixture), {
+          artifact: [
+            { previous_state: submissionState, next_state: 'AMBIGUOUS',
+              reason_code: 'RECONCILIATION_REQUIRED' },
+            { previous_state: 'AMBIGUOUS', next_state: 'RECONCILED',
+              reason_code: 'RECONCILIATION_PROVED_NO_EFFECT' },
+          ],
+          intent: [
+            { previous_status: submissionState === 'CONFIRMED' ? 'CONFIRMED' : 'SUBMITTED',
+              next_status: 'UNKNOWN_REQUIRES_RECONCILIATION',
+              reason_code: 'RECONCILIATION_REQUIRED' },
+            { previous_status: 'UNKNOWN_REQUIRES_RECONCILIATION', next_status: 'FAILED',
+              reason_code: 'RECONCILIATION_PROVED_NO_EFFECT' },
+          ],
+        });
+        assert.deepEqual(await terminalIntentColumns(pool, fixture, evidence), {
+          status: 'FAILED', last_reason_code: 'RECONCILIATION_PROVED_NO_EFFECT',
+          lease_owner: null, terminal: true, completed: true, purge: true,
+        });
+        assert.deepEqual(await persistedEvidence(pool, fixture), [{
+          result: 'NO_EFFECT', reason_code: 'RECONCILIATION_PROVED_NO_EFFECT',
+          signature_history: 'PRESENT', confirmation_status: 'FINALIZED',
+          has_transaction_fingerprint: true, fee_lamports: '5000',
+          wallet_lamport_delta: '-5000', base_delta_raw: '0', quote_delta_raw: '0',
+          unexpected_residual_token_balance_raw: '95',
+        }]);
+        assert.deepEqual(await controlState(pool), controlBefore);
+        assert.equal((await fixture.live.commitReconciliation(fixture.claim, evidence)).result,
+          'NO_EFFECT');
+        assert.deepEqual(await durableState(pool, fixture), expectedLandedFailedState(1));
+      });
+    });
+}
+
+void test('SELL landed with an error after a prior UNKNOWN run resolves it and ends FAILED',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(pool, 'CONFIRMED');
+      const unknown = sellEvidence(fixture, 'UNKNOWN', fixture.observedAtMs);
+      await fixture.live.commitReconciliation(fixture.claim, unknown);
+      assert.deepEqual(await durableState(pool, fixture),
+        expectedUnknownState(fixture.claim.intent.id, 1));
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-landed-failed-after-unknown');
+      const evidence = landedFailedSellEvidence(fixture, fixture.observedAtMs + 2_000);
+
+      assert.equal((await fixture.live.commitReconciliation(terminalClaim, evidence)).result,
+        'NO_EFFECT');
+
+      assert.deepEqual(await durableState(pool, fixture), expectedLandedFailedState(2));
+      const journal = await landedFailedJournal(pool, fixture);
+      assert.equal(journal.artifact.length, 2);
+      assert.deepEqual(journal.intent.map((row) => row.next_status),
+        ['UNKNOWN_REQUIRES_RECONCILIATION', 'FAILED']);
+      const resolved = await pool.query(`SELECT result,resolved_by_evidence_id
+        FROM execution_reconciliation_evidence WHERE intent_id=$1 ORDER BY observed_at`, [
+        fixture.claim.intent.id,
+      ]);
+      assert.deepEqual(resolved.rows, [
+        { result: 'UNKNOWN', resolved_by_evidence_id: evidence.evidenceId },
+        { result: 'NO_EFFECT', resolved_by_evidence_id: null },
+      ]);
+    });
+  });
+
+void test('SELL landed with an error and any other balance change keeps the MISMATCH block',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    for (const overrides of [
+      { baseDeltaRaw: -1n },
+      { baseDeltaRaw: 1n },
+      { baseTokenAccountsUnchanged: false },
+      { walletLamportDelta: -5_001n },
+      { walletLamportDelta: -4_999n },
+      { feeLamports: 5_001n, walletLamportDelta: -5_001n },
+    ]) {
+      await withTemporarySchema(databaseUrl, async (pool) => {
+        const fixture = await createSellFixture(pool, 'CONFIRMED');
+        const evidence = landedFailedSellEvidence(fixture, fixture.observedAtMs, overrides);
+        assert.equal(evidence.result, 'MISMATCH');
+        assert.equal((await fixture.live.commitReconciliation(fixture.claim, evidence)).result,
+          'MISMATCH');
+        assert.deepEqual(await durableState(pool, fixture),
+          expectedUnknownState(fixture.claim.intent.id, 1));
+      });
+    }
+  });
+
+void test('SELL landed without an error stays MATCHED with the failure facts present',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(pool, 'CONFIRMED');
+      const legacy = sellEvidence(fixture, 'MATCHED', fixture.observedAtMs);
+      const explicit = landedFailedSellEvidence(fixture, fixture.observedAtMs, {
+        transactionFailed: false, baseTokenAccountsUnchanged: false,
+        feeLamports: 5_000n, walletLamportDelta: 795n, baseDeltaRaw: -95n, quoteDeltaRaw: 800n,
+        unexpectedResidualTokenBalanceRaw: 0n,
+      });
+      assert.deepEqual(explicit, legacy);
+      assert.equal((await fixture.live.commitReconciliation(fixture.claim, explicit)).result,
+        'MATCHED');
+      assert.deepEqual((await pool.query(`SELECT state FROM execution_live_positions`)).rows,
+        [{ state: 'CLOSED' }]);
+    });
+  });
+
+void test('PostgreSQL 16 recovery role ends a landed-with-error SELL FAILED',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await createSellFixture(pool, 'CONFIRMED');
+      const recovery = new PostgresExecutionLiveRepository(
+        roleSource(pool, 'sol_token_executor_live_recovery'),
+      );
+      const evidence = landedFailedSellEvidence(fixture, fixture.observedAtMs);
+      assert.equal((await recovery.commitReconciliation(fixture.claim, evidence)).result,
+        'NO_EFFECT');
+      assert.deepEqual(await durableState(pool, fixture), expectedLandedFailedState(1));
+      assert.equal((await recovery.commitReconciliation(fixture.claim, evidence)).result,
+        'NO_EFFECT');
+    });
+  });
+
+function expectedLandedFailedState(evidenceCount: number) {
+  return {
+    artifact_state: 'RECONCILED', intent_status: 'FAILED', attempt_status: 'ABANDONED',
+    attempt_reason: 'RECONCILIATION_PROVED_NO_EFFECT', position_state: 'EXIT_PENDING',
+    remaining_base_raw: '95', authorization_state: 'ACTIVE', locked_intent_id: null,
+    locked_attempt_number: null, armament_state: 'LOCKED', unknown_block: false,
+    reserved_exposure_raw: '1000', open_positions: 1, evidence_count: evidenceCount,
+    unresolved_evidence_count: 0, sell_artifact_count: 1,
+  };
+}
+
+function landedFailedSellEvidence(
+  fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>,
+  observedAtMs: number,
+  overrides: Readonly<Record<string, unknown>> = {},
+) {
+  return evaluateExecutionReconciliation({
+    expected: sellExpected(fixture),
+    observed: Object.freeze({
+      signatureHistory: 'PRESENT' as const, confirmationStatus: 'FINALIZED' as const,
+      finalizedBlockHeight: fixture.artifact.lastValidBlockHeight + 1n, observedSlot: 777n,
+      transaction: Object.freeze({
+        signature: fixture.artifact.signature, blockhash: fixture.artifact.blockhash,
+        messageHash: fixture.artifact.messageHash,
+        buildFingerprint: fixture.artifact.buildFingerprint,
+        snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+      }),
+      feeLamports: 5_000n, walletLamportDelta: -5_000n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+      unexpectedResidualTokenBalanceRaw: 95n, observedAtMs, finalizedAtMs: observedAtMs + 1,
+      transactionFailed: true, baseTokenAccountsUnchanged: true,
+      ...overrides,
+    }),
+  });
+}
+
+function sellExpected(fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>) {
+  return Object.freeze({
+    intentId: fixture.artifact.intentId, attemptNumber: fixture.artifact.attemptNumber,
+    walletGeneration: 1, providerId: fixture.artifact.providerId, side: 'SELL' as const,
+    signature: fixture.artifact.signature, blockhash: fixture.artifact.blockhash,
+    lastValidBlockHeight: fixture.artifact.lastValidBlockHeight,
+    messageHash: fixture.artifact.messageHash,
+    buildFingerprint: fixture.artifact.buildFingerprint,
+    snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+    maximumFeeLamports: fixture.unsignedSimulation.estimatedFeeLamports,
+    maximumFeePayerLamportDebit: fixture.unsignedSimulation.simulatedFeePayerLamportDebit,
+  });
+}
+
+async function landedFailedJournal(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>,
+) {
+  const artifact = await pool.query<{
+    previous_state: string; next_state: string; reason_code: string;
+  }>(`SELECT previous_state,next_state,reason_code FROM execution_submission_events
+    WHERE artifact_id=$1 AND next_state IN ('AMBIGUOUS','RECONCILED')
+    ORDER BY occurred_at,event_id`, [fixture.artifact.artifactId]);
+  const intent = await pool.query<{
+    previous_status: string; next_status: string; reason_code: string;
+  }>(`SELECT previous_status,next_status,reason_code FROM execution_intent_transitions
+    WHERE intent_id=$1 AND next_status IN ('UNKNOWN_REQUIRES_RECONCILIATION','FAILED')
+    ORDER BY sequence`, [fixture.claim.intent.id]);
+  return { artifact: artifact.rows, intent: intent.rows };
+}
+
+async function terminalIntentColumns(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>,
+  evidence: Readonly<{ finalizedAtMs: number | null }>,
+) {
+  assert.ok(evidence.finalizedAtMs !== null);
+  const row = (await pool.query(`SELECT status,last_reason_code,lease_owner,
+    terminal_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond') AS terminal,
+    reconciliation_completed_at=terminal_at AS completed,
+    purge_after=terminal_at+INTERVAL '4 hours' AS purge
+    FROM execution_intents WHERE id=$1`, [fixture.claim.intent.id, evidence.finalizedAtMs]))
+    .rows[0] as unknown;
+  return row;
+}
+
+async function persistedEvidence(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>,
+) {
+  return (await pool.query<Record<string, unknown>>(`SELECT result,reason_code,signature_history,confirmation_status,
+    observed_transaction_fingerprint IS NOT NULL AS has_transaction_fingerprint,
+    fee_lamports::TEXT AS fee_lamports,wallet_lamport_delta::TEXT AS wallet_lamport_delta,
+    base_delta_raw::TEXT AS base_delta_raw,quote_delta_raw::TEXT AS quote_delta_raw,
+    unexpected_residual_token_balance_raw::TEXT AS unexpected_residual_token_balance_raw
+    FROM execution_reconciliation_evidence WHERE intent_id=$1`, [fixture.claim.intent.id])).rows;
+}
+
+async function controlState(pool: InstanceType<typeof pg.Pool>) {
+  return (await pool.query<Record<string, unknown>>(`SELECT state,state_revision::TEXT AS state_revision
+    FROM execution_control_state WHERE generation_id=$1`, [generationId])).rows;
+}
+
 function expectedUnknownState(intentId: string, evidenceCount: number) {
   return {
     artifact_state: 'AMBIGUOUS', intent_status: 'UNKNOWN_REQUIRES_RECONCILIATION',

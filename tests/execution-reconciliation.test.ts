@@ -136,6 +136,121 @@ void test('requires conservative BUY and SELL delta directions and configured fe
   assert.equal(sell.result, 'MATCHED');
 });
 
+void test('classifies a finalized SELL that landed with an error and moved only the fee as NO_EFFECT', () => {
+  const evidence = evaluateExecutionReconciliation(landedFailedSell());
+  assert.equal(evidence.result, 'NO_EFFECT');
+  assert.equal(evidence.reasonCode, 'RECONCILIATION_PROVED_NO_EFFECT');
+  assert.equal(evidence.signatureHistory, 'PRESENT');
+  assert.equal(evidence.confirmationStatus, 'FINALIZED');
+  assert.notEqual(evidence.observedTransactionFingerprint, null);
+  assert.equal(Object.hasOwn(evidence, 'transactionFailed'), false);
+  assert.equal(Object.hasOwn(evidence, 'baseTokenAccountsUnchanged'), false);
+});
+
+void test('keeps every other landed-with-error SELL on the previous MISMATCH rules', () => {
+  for (const overrides of [
+    { baseDeltaRaw: -1n },
+    { baseDeltaRaw: 1n },
+    { walletLamportDelta: -6n },
+    { walletLamportDelta: -4n },
+    { quoteDeltaRaw: 1n },
+    { baseTokenAccountsUnchanged: false },
+    { feeLamports: 11n, walletLamportDelta: -11n },
+  ]) {
+    const evidence = evaluateExecutionReconciliation(landedFailedSell(overrides));
+    assert.equal(evidence.result, 'MISMATCH', JSON.stringify(overrides, (_, value: unknown) =>
+      typeof value === 'bigint' ? value.toString() : value));
+    assert.equal(evidence.reasonCode, 'RESIDUAL_TOKEN_BALANCE');
+  }
+  const fullyVisible = (overrides: Readonly<Record<string, unknown>>) => landedFailedSell({
+    unexpectedResidualTokenBalanceRaw: 0n, ...overrides,
+  });
+  for (const [overrides, reasonCode] of [
+    [{}, 'BALANCE_MISMATCH'],
+    [{ transaction: transactionInput({ messageHash: 'e'.repeat(64) }) }, 'DOUBLE_ORDER_SUSPECTED'],
+    [{ feeLamports: 0n, walletLamportDelta: 0n }, 'BALANCE_MISMATCH'],
+  ] as const) {
+    const evidence = evaluateExecutionReconciliation(fullyVisible(overrides));
+    assert.equal(evidence.result, 'MISMATCH');
+    assert.equal(evidence.reasonCode, reasonCode);
+  }
+});
+
+void test('requires the explicit failure and per-account facts for a landed SELL NO_EFFECT', () => {
+  for (const overrides of [
+    { transactionFailed: false },
+    { baseTokenAccountsUnchanged: false },
+  ]) {
+    assert.equal(evaluateExecutionReconciliation(landedFailedSell(overrides)).result, 'MISMATCH');
+  }
+  const { transactionFailed: _failed, ...withoutFailure } = landedFailedSell().observed as
+    Readonly<Record<string, unknown>>;
+  assert.equal(evaluateExecutionReconciliation(reconciliationInput({
+    expected: expectedInput({ side: 'SELL' }), observed: Object.freeze(withoutFailure),
+  })).result, 'MISMATCH');
+});
+
+void test('keeps a landed SELL without error and a BUY with error on the previous rules', () => {
+  const sell = evaluateExecutionReconciliation(reconciliationInput({
+    expected: expectedInput({ side: 'SELL' }),
+    observed: observedInput({
+      walletLamportDelta: 95n, baseDeltaRaw: -500n, quoteDeltaRaw: 100n,
+      transactionFailed: false, baseTokenAccountsUnchanged: false,
+    }),
+  }));
+  assert.equal(sell.result, 'MATCHED');
+  assert.equal(sell.reasonCode, 'INTENT_SUCCEEDED');
+  const legacy = evaluateExecutionReconciliation(reconciliationInput({
+    expected: expectedInput({ side: 'SELL' }),
+    observed: observedInput({ walletLamportDelta: 95n, baseDeltaRaw: -500n, quoteDeltaRaw: 100n }),
+  }));
+  assert.deepEqual(sell, legacy);
+
+  const buy = evaluateExecutionReconciliation(reconciliationInput({
+    observed: landedFailedSell().observed,
+  }));
+  assert.equal(buy.result, 'MISMATCH');
+  assert.equal(buy.reasonCode, 'RESIDUAL_TOKEN_BALANCE');
+  const buyResidualFree = evaluateExecutionReconciliation(reconciliationInput({
+    observed: observedInput({
+      walletLamportDelta: -5n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+      transactionFailed: true, baseTokenAccountsUnchanged: true,
+    }),
+  }));
+  assert.equal(buyResidualFree.result, 'MISMATCH');
+  assert.equal(buyResidualFree.reasonCode, 'BALANCE_MISMATCH');
+});
+
+void test('does not classify a landed-with-error SELL before finalization', () => {
+  const evidence = evaluateExecutionReconciliation(landedFailedSell({
+    confirmationStatus: 'CONFIRMED', finalizedAtMs: null, transactionFailed: false,
+    baseTokenAccountsUnchanged: false,
+  }));
+  assert.notEqual(evidence.result, 'NO_EFFECT');
+  assertInvalid(() => evaluateExecutionReconciliation(landedFailedSell({
+    confirmationStatus: 'CONFIRMED', finalizedAtMs: null,
+  })));
+});
+
+void test('rejects failure facts on an observation that is not finalized', () => {
+  for (const flag of ['transactionFailed', 'baseTokenAccountsUnchanged']) {
+    assertInvalid(() => evaluateExecutionReconciliation(reconciliationInput({
+      expected: expectedInput({ side: 'SELL' }),
+      observed: observedInput({
+        signatureHistory: 'ABSENT', confirmationStatus: 'NOT_FOUND',
+        finalizedBlockHeight: 1_001n, observedSlot: null, transaction: null,
+        feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
+        quoteDeltaRaw: 0n, finalizedAtMs: 2_000, [flag]: true,
+      }),
+    })));
+  }
+  for (const value of [1, 'true', null, undefined]) {
+    assertInvalid(() => evaluateExecutionReconciliation(landedFailedSell({
+      transactionFailed: value,
+    })));
+  }
+});
+
 void test('rejects malformed causal identities, numbers, extra fields, accessors and proxies', () => {
   assertInvalid(() => evaluateExecutionReconciliation(reconciliationInput({
     expected: expectedInput({ lastValidBlockHeight: 1_000 }),
@@ -162,6 +277,20 @@ void test('rejects malformed causal identities, numbers, extra fields, accessors
   assertInvalid(() => evaluateExecutionReconciliation(proxy));
   assert.equal(traps, 0);
 });
+
+function landedFailedSell(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  return reconciliationInput({
+    expected: expectedInput({ side: 'SELL' }),
+    observed: observedInput({
+      feeLamports: 5n, walletLamportDelta: -5n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+      unexpectedResidualTokenBalanceRaw: 500n,
+      transactionFailed: true, baseTokenAccountsUnchanged: true,
+      ...overrides,
+    }),
+  });
+}
 
 function reconciliationInput(
   overrides: Readonly<Record<string, unknown>> = {},

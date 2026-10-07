@@ -141,6 +141,46 @@ void test('reconciliation service does not retain a hostile gateway code accesso
   );
 });
 
+void test('reconciliation service carries the landed-failure facts to classification only', async () => {
+  const outcomes: string[] = [];
+  for (const facts of [
+    { transactionFailed: true, baseTokenAccountsUnchanged: true },
+    { transactionFailed: true },
+    {},
+  ]) {
+    const gateway: ExecutionReconciliationGateway = {
+      async readFinalizedBlockHeight() { return 1_001n; },
+      async readSignatureHistory() { return 'PRESENT'; },
+      async readNormalizedTransaction() {
+        return Object.freeze({ signature, blockhash, messageHash: hash });
+      },
+      async readFinalizedWalletDeltas() {
+        return Object.freeze({
+          confirmationStatus: 'FINALIZED', observedSlot: 500n, feeLamports: 5n,
+          walletLamportDelta: -5n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+          unexpectedResidualTokenBalanceRaw: 500n, observedAtMs: 1_900, finalizedAtMs: 2_000,
+          ...facts,
+        });
+      },
+    };
+    const repository = repositoryStub(async (input) => {
+      assert.equal(Object.hasOwn(input.evidence, 'transactionFailed'), false);
+      assert.equal(Object.hasOwn(input.evidence, 'baseTokenAccountsUnchanged'), false);
+      outcomes.push(input.evidence.result);
+      return Object.freeze({
+        payloadVersion: 1, result: input.evidence.result, evidenceId: input.evidence.evidenceId,
+      });
+    });
+    const sell = request();
+    await new ExecutionReconciliationService(gateway, repository).reconcile(Object.freeze({
+      ...sell,
+      expected: Object.freeze({ ...sell.expected, side: 'SELL' as const }),
+      walletDeltaRequest: Object.freeze({ ...sell.walletDeltaRequest, side: 'SELL' as const }),
+    }), new AbortController().signal);
+  }
+  assert.deepEqual(outcomes, ['NO_EFFECT', 'MISMATCH', 'MISMATCH']);
+});
+
 function request() {
   return Object.freeze({
     payloadVersion: 1,

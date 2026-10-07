@@ -102,6 +102,7 @@ void test('shares one finalized transaction read and derives exact wallet deltas
     baseDeltaRaw: 500n, quoteDeltaRaw: -100_000n,
     unexpectedResidualTokenBalanceRaw: 0n,
     observedAtMs: 2_000, finalizedAtMs: 2_000,
+    transactionFailed: false, baseTokenAccountsUnchanged: false,
   });
   assert.equal(requests.filter((item) => item.method === 'getTransaction').length, 1);
   assert.deepEqual(
@@ -137,6 +138,7 @@ void test('accepts the complete v0 getTransaction response and resolves loaded t
     baseDeltaRaw: 500n, quoteDeltaRaw: -100_000n,
     unexpectedResidualTokenBalanceRaw: 0n,
     observedAtMs: 2_000, finalizedAtMs: 2_000,
+    transactionFailed: false, baseTokenAccountsUnchanged: false,
   });
 });
 
@@ -256,6 +258,80 @@ void test('rejects a token-balance identity change at one account index', async 
   );
 });
 
+void test('reports a landed SELL with meta.err and unchanged token accounts as a failed transaction', async () => {
+  for (const err of [{ InstructionError: [0, { Custom: 6_001 }] }, 'AccountInUse']) {
+    const fixture = failedSellFixture({ err });
+    assert.deepEqual(await failedSellDeltas(fixture), {
+      confirmationStatus: 'FINALIZED', observedSlot: 500n,
+      feeLamports: 5_000n, walletLamportDelta: -5_000n,
+      baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+      unexpectedResidualTokenBalanceRaw: 500n,
+      observedAtMs: 2_000, finalizedAtMs: 2_000,
+      transactionFailed: true, baseTokenAccountsUnchanged: true,
+    });
+  }
+  const withStatus = failedSellFixture({
+    err: { InstructionError: [0, { Custom: 1 }] },
+    status: { Err: { InstructionError: [0, { Custom: 1 }] } },
+  });
+  assert.equal((await failedSellDeltas(withStatus)).transactionFailed, true);
+});
+
+void test('does not report a failed transaction when meta.err is null or contradicts status', async () => {
+  for (const meta of [
+    { err: null },
+    { err: null, status: { Ok: null } },
+    { err: null, status: { Err: 'AccountInUse' } },
+    { err: 'AccountInUse', status: { Ok: null } },
+  ]) {
+    const deltas = await failedSellDeltas(failedSellFixture(meta));
+    assert.equal(deltas.transactionFailed, false, JSON.stringify(meta));
+    assert.equal(deltas.baseTokenAccountsUnchanged, true);
+  }
+});
+
+void test('requires every wallet token account of the mint to be unchanged and present on both sides', async () => {
+  const err = { InstructionError: [0, { Custom: 6_001 }] };
+  const scenarios: readonly Readonly<Record<string, unknown>>[] = [
+    // Two wallet accounts that offset each other: the sum is unchanged, an account is not.
+    {
+      err,
+      preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'wallet', '0')],
+      postTokenBalances: [tokenBalance(1, 'wallet', '499'), tokenBalance(2, 'wallet', '1')],
+    },
+    // A wallet account of the mint present in one list only, even with a zero amount.
+    {
+      err,
+      preTokenBalances: [tokenBalance(1, 'wallet', '500')],
+      postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'wallet', '0')],
+    },
+    {
+      err,
+      preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'wallet', '0')],
+      postTokenBalances: [tokenBalance(1, 'wallet', '500')],
+    },
+    // An account of the mint whose owner is not reported cannot be attributed.
+    {
+      err,
+      preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, null, '7')],
+      postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, null, '7')],
+    },
+    // No wallet account of the mint is visible at all.
+    { err, preTokenBalances: [], postTokenBalances: [] },
+  ];
+  for (const meta of scenarios) {
+    const deltas = await failedSellDeltas(failedSellFixture(meta));
+    assert.equal(deltas.transactionFailed, true);
+    assert.equal(deltas.baseTokenAccountsUnchanged, false);
+  }
+  const otherOwner = await failedSellDeltas(failedSellFixture({
+    err,
+    preTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '9')],
+    postTokenBalances: [tokenBalance(1, 'wallet', '500'), tokenBalance(2, 'other', '3')],
+  }));
+  assert.equal(otherOwner.baseTokenAccountsUnchanged, true);
+});
+
 void test('reports absent finalized history without inventing a transaction or deltas', async () => {
   const session = sessionFor([], ({ method }) => {
     if (method === 'getBlockHeight') return 1_001;
@@ -273,6 +349,7 @@ void test('reports absent finalized history without inventing a transaction or d
     confirmationStatus: 'NOT_FOUND', observedSlot: null, feeLamports: 0n,
     walletLamportDelta: 0n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
     unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: 2_000, finalizedAtMs: 2_000,
+    transactionFailed: false, baseTokenAccountsUnchanged: false,
   });
 });
 
@@ -483,6 +560,59 @@ function rpcFetch(
       jsonrpc: '2.0', id: request.id, result: result(request),
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
+}
+
+const FAILED_SELL_OTHER_OWNER = Keypair.fromSeed(
+  Uint8Array.from({ length: 32 }, () => 4),
+).publicKey.toBase58();
+
+function tokenBalance(accountIndex: number, owner: 'wallet' | 'other' | null, amount: string) {
+  return { accountIndex, owner, amount };
+}
+
+function failedSellFixture(meta: Readonly<Record<string, unknown>>) {
+  const fixture = transactionFixture();
+  const balance = (
+    item: Readonly<{ accountIndex: number; owner: 'wallet' | 'other' | null; amount: string }>,
+  ) => ({
+    accountIndex: item.accountIndex, mint: fixture.mint,
+    ...(item.owner === null ? {} : {
+      owner: item.owner === 'wallet' ? fixture.wallet : FAILED_SELL_OTHER_OWNER,
+    }),
+    uiTokenAmount: {
+      amount: item.amount, decimals: 6, uiAmount: Number(item.amount) / 1e6,
+      uiAmountString: String(Number(item.amount) / 1e6),
+    },
+  });
+  type Balance = ReturnType<typeof tokenBalance>;
+  const { preTokenBalances, postTokenBalances, ...rest } = meta as Readonly<{
+    preTokenBalances?: readonly Balance[]; postTokenBalances?: readonly Balance[];
+  } & Record<string, unknown>>;
+  return {
+    ...fixture,
+    rpcTransaction: {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        preBalances: [1_000_000, 0, 1],
+        postBalances: [995_000, 0, 1],
+        preTokenBalances: (preTokenBalances ?? [tokenBalance(1, 'wallet', '500')]).map(balance),
+        postTokenBalances: (postTokenBalances ?? [tokenBalance(1, 'wallet', '500')]).map(balance),
+        ...rest,
+      },
+    },
+  };
+}
+
+async function failedSellDeltas(fixture: ReturnType<typeof failedSellFixture>) {
+  const session = sessionFor([], ({ method }) => {
+    if (method === 'getTransaction') return fixture.rpcTransaction;
+    throw new Error('unexpected method');
+  });
+  return session.readFinalizedWalletDeltas(Object.freeze({
+    signature: fixture.signature, walletPublicKey: fixture.wallet, mint: fixture.mint,
+    quoteMint: WSOL, side: 'SELL' as const,
+  }), signal());
 }
 
 function transactionFixture() {

@@ -20,6 +20,13 @@ const OBSERVED_KEYS = Object.freeze([
   'baseDeltaRaw', 'quoteDeltaRaw', 'unexpectedResidualTokenBalanceRaw',
   'observedAtMs', 'finalizedAtMs',
 ] as const);
+/**
+ * Classification-only facts of a finalized transaction. They are optional (absent means
+ * false), never persisted and never part of the evidence identity.
+ */
+const OPTIONAL_OBSERVED_KEYS = Object.freeze([
+  'transactionFailed', 'baseTokenAccountsUnchanged',
+] as const);
 const TRANSACTION_KEYS = Object.freeze([
   'signature', 'blockhash', 'messageHash', 'buildFingerprint',
   'snapshotFingerprint',
@@ -114,6 +121,13 @@ interface ObservedEvidence {
   readonly unexpectedResidualTokenBalanceRaw: bigint;
   readonly observedAtMs: number;
   readonly finalizedAtMs: number | null;
+  /** The finalized transaction carries a non-null `meta.err`. */
+  readonly transactionFailed: boolean;
+  /**
+   * Every wallet-owned token account of the base mint in the transaction's token-balance
+   * maps is present before and after with the same amount.
+   */
+  readonly baseTokenAccountsUnchanged: boolean;
 }
 
 export class ExecutionReconciliationValidationError extends TypeError {
@@ -190,6 +204,9 @@ function classify(
   result: ExecutionReconciliationResult;
   reasonCode: ExecutionReconciliationReasonCode;
 }> {
+  if (isLandedSellFailureWithoutEffect(expected, observed)) {
+    return outcome('NO_EFFECT', 'RECONCILIATION_PROVED_NO_EFFECT');
+  }
   if (observed.unexpectedResidualTokenBalanceRaw > 0n) {
     return outcome('MISMATCH', 'RESIDUAL_TOKEN_BALANCE');
   }
@@ -217,6 +234,31 @@ function classify(
     return outcome('NO_EFFECT', 'RECONCILIATION_PROVED_NO_EFFECT');
   }
   return outcome('UNKNOWN', 'RECONCILIATION_REQUIRED');
+}
+
+/**
+ * A SELL that landed finalized with an error: the runtime reverted everything except the
+ * fee. Every fact must hold; anything else keeps the previous rules.
+ */
+function isLandedSellFailureWithoutEffect(
+  expected: ExpectedEvidence,
+  observed: ObservedEvidence,
+): boolean {
+  return expected.side === 'SELL'
+    && observed.transactionFailed
+    && observed.baseTokenAccountsUnchanged
+    && observed.signatureHistory === 'PRESENT'
+    && observed.confirmationStatus === 'FINALIZED'
+    && observed.finalizedAtMs !== null
+    && observed.observedSlot !== null
+    && observed.transaction !== null
+    && sameTransaction(expected, observed.transaction)
+    && observed.baseDeltaRaw === 0n
+    && observed.quoteDeltaRaw === 0n
+    && observed.unexpectedResidualTokenBalanceRaw > 0n
+    && observed.feeLamports > 0n
+    && observed.feeLamports <= expected.maximumFeeLamports
+    && observed.walletLamportDelta === -observed.feeLamports;
 }
 
 function isMatched(expected: ExpectedEvidence, observed: ObservedEvidence): boolean {
@@ -267,7 +309,7 @@ function expectedFrom(value: unknown): ExpectedEvidence {
 
 function observedFrom(value: unknown): ObservedEvidence {
   if (!isFrozenPlainObject(value)) throw invalid();
-  const record = exactRecord(value, OBSERVED_KEYS);
+  const record = exactRecord(value, OBSERVED_KEYS, OPTIONAL_OBSERVED_KEYS);
   const result: ObservedEvidence = Object.freeze({
     signatureHistory: enumValue(record.signatureHistory, SIGNATURE_HISTORY),
     confirmationStatus: enumValue(record.confirmationStatus, CONFIRMATION_STATUSES),
@@ -283,8 +325,12 @@ function observedFrom(value: unknown): ObservedEvidence {
     ),
     observedAtMs: timestamp(record.observedAtMs),
     finalizedAtMs: nullableTimestamp(record.finalizedAtMs),
+    transactionFailed: optionalBoolean(record, 'transactionFailed'),
+    baseTokenAccountsUnchanged: optionalBoolean(record, 'baseTokenAccountsUnchanged'),
   });
   if (result.finalizedAtMs !== null && result.finalizedAtMs < result.observedAtMs) throw invalid();
+  if ((result.transactionFailed || result.baseTokenAccountsUnchanged)
+    && result.confirmationStatus !== 'FINALIZED') throw invalid();
   if (result.confirmationStatus === 'FINALIZED'
     && (result.finalizedAtMs === null || result.observedSlot === null
       || result.signatureHistory !== 'PRESENT' || result.transaction === null)) throw invalid();
@@ -360,18 +406,28 @@ function outcome(
 function exactRecord<const Keys extends readonly string[]>(
   value: unknown,
   keys: Keys,
+  optionalKeys: readonly string[] = [],
 ): Readonly<Record<Keys[number], unknown>> {
   if (!isPlainObject(value)) throw invalid();
   const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== 'string'
-    || !keys.includes(key))) throw invalid();
+  if (ownKeys.some((key) => typeof key !== 'string'
+    || (!keys.includes(key) && !optionalKeys.includes(key)))) throw invalid();
+  const present = [...keys, ...optionalKeys.filter((key) => ownKeys.includes(key))];
+  if (ownKeys.length !== present.length) throw invalid();
   const result = Object.create(null) as Record<string, unknown>;
-  for (const key of keys) {
+  for (const key of present) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalid();
     result[key] = descriptor.value;
   }
   return Object.freeze(result);
+}
+
+function optionalBoolean(record: Readonly<Record<string, unknown>>, key: string): boolean {
+  if (!Object.hasOwn(record, key)) return false;
+  const value = record[key];
+  if (typeof value !== 'boolean') throw invalid();
+  return value;
 }
 
 function enumValue<const Values extends readonly string[]>(

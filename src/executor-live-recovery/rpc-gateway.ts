@@ -55,6 +55,8 @@ interface FinalizedTransactionObservation {
   readonly postBalances: readonly bigint[];
   readonly preTokenBalances: ReadonlyMap<number, TokenBalance>;
   readonly postTokenBalances: ReadonlyMap<number, TokenBalance>;
+  /** `meta.err` is non-null and an optional `meta.status` does not say `Ok`. */
+  readonly transactionFailed: boolean;
 }
 
 interface TokenBalance {
@@ -167,6 +169,7 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
         quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
         observedAtMs, finalizedAtMs: observedAtMs,
+        transactionFailed: false, baseTokenAccountsUnchanged: false,
       });
     }
     const walletIndex = observed.accountKeys.indexOf(request.walletPublicKey);
@@ -188,6 +191,8 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
       unexpectedResidualTokenBalanceRaw: request.side === 'SELL' ? base.post : 0n,
       observedAtMs,
       finalizedAtMs: observedAtMs,
+      transactionFailed: observed.transactionFailed,
+      baseTokenAccountsUnchanged: base.everyAccountUnchanged,
     });
   }
 
@@ -297,6 +302,8 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         postBalances,
         preTokenBalances: tokenBalanceMap(meta.preTokenBalances, accountKeys.length),
         postTokenBalances: tokenBalanceMap(meta.postTokenBalances, accountKeys.length),
+        transactionFailed: meta.err !== null && !(Object.hasOwn(meta, 'status')
+          && Object.hasOwn(record(meta.status), 'Ok')),
       });
     } catch (error) {
       if (isInternal(error)) throw error;
@@ -376,9 +383,18 @@ function tokenAmounts(
   observed: FinalizedTransactionObservation,
   wallet: string,
   mint: string,
-): Readonly<{ readonly pre: bigint; readonly post: bigint; readonly delta: bigint }> {
+): Readonly<{
+  readonly pre: bigint;
+  readonly post: bigint;
+  readonly delta: bigint;
+  readonly everyAccountUnchanged: boolean;
+}> {
   let pre = 0n;
   let post = 0n;
+  // True only when at least one wallet account of the mint is visible, every such account is
+  // in both maps with the same amount, and no account of the mint has an unreported owner.
+  let visible = false;
+  let everyAccountUnchanged = true;
   const indexes = new Set([
     ...observed.preTokenBalances.keys(), ...observed.postTokenBalances.keys(),
   ]);
@@ -388,13 +404,20 @@ function tokenAmounts(
     if (before !== undefined && after !== undefined
       && (before.owner !== after.owner || before.mint !== after.mint)) invalidResponse();
     const identity = after ?? before;
+    if (identity?.mint === mint && identity.owner === null) everyAccountUnchanged = false;
     if (identity?.owner !== wallet || identity.mint !== mint) continue;
+    visible = true;
+    // Present in one map only counts as a change, whatever the amount.
+    if (before === undefined || after === undefined) everyAccountUnchanged = false;
+    else if (before.amountRaw !== after.amountRaw) everyAccountUnchanged = false;
     if (before !== undefined && (before.owner !== wallet || before.mint !== mint)) invalidResponse();
     if (after !== undefined && (after.owner !== wallet || after.mint !== mint)) invalidResponse();
     pre += before?.amountRaw ?? 0n;
     post += after?.amountRaw ?? 0n;
   }
-  return Object.freeze({ pre, post, delta: post - pre });
+  return Object.freeze({
+    pre, post, delta: post - pre, everyAccountUnchanged: visible && everyAccountUnchanged,
+  });
 }
 
 function tokenBalanceMap(value: unknown, accountKeyCount: number): ReadonlyMap<number, TokenBalance> {

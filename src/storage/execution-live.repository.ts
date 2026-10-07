@@ -4662,6 +4662,56 @@ FROM (SELECT armament.envelope_id,
   WHERE position.position_id=$3::TEXT AND armament.envelope_id IS NOT NULL) loss
 WHERE envelope.envelope_id=loss.envelope_id`;
 
+/**
+ * Journals a SELL as ambiguous: the artifact `ACCEPTED|CONFIRMED -> AMBIGUOUS` and the intent
+ * `SUBMITTED|CONFIRMED -> UNKNOWN_REQUIRES_RECONCILIATION`, each only when not already there.
+ * Returns the revisions after the moves.
+ */
+async function journalSellAmbiguity(
+  client: DatabaseClient,
+  artifact: ExecutionLiveArtifactReferenceV1,
+  row: Row,
+  initialArtifactState: string,
+  initialIntentStatus: string,
+  observedAtMs: number,
+): Promise<Readonly<{ artifactRevision: bigint; intentRevision: bigint }>> {
+  let artifactRevision = unsignedBigint(row.state_revision);
+  let intentRevision = unsignedBigint(row.intent_revision);
+  if (initialArtifactState !== 'AMBIGUOUS') {
+    const ambiguousArtifact = await client.query(`UPDATE execution_signed_transactions SET
+      state='AMBIGUOUS',state_revision=$2::BIGINT
+      WHERE artifact_id=$1 AND state=$3 AND state_revision=$4::BIGINT`, [
+      artifact.artifactId, (artifactRevision + 1n).toString(), initialArtifactState,
+      artifactRevision.toString(),
+    ]);
+    if (ambiguousArtifact.rowCount !== 1) throw failure('CONFLICT');
+    await insertLiveStateEvent(
+      client, artifact, initialArtifactState as 'ACCEPTED' | 'CONFIRMED', 'AMBIGUOUS',
+      'RECONCILIATION_REQUIRED', observedAtMs,
+    );
+    artifactRevision += 1n;
+  }
+  if (initialIntentStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION') {
+    const unknownIntent = await client.query(`UPDATE execution_intents SET
+      status='UNKNOWN_REQUIRES_RECONCILIATION',state_revision=$2::BIGINT,
+      last_reason_code='RECONCILIATION_REQUIRED',
+      lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+      updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+      WHERE id=$1 AND status=$4 AND state_revision=$5::BIGINT`, [
+      artifact.intentId, (intentRevision + 1n).toString(), observedAtMs,
+      initialIntentStatus, intentRevision.toString(),
+    ]);
+    if (unknownIntent.rowCount !== 1) throw failure('CONFLICT');
+    await insertStandardIntentTransition(
+      client, artifact, initialIntentStatus as 'SUBMITTED' | 'CONFIRMED',
+      'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
+      observedAtMs,
+    );
+    intentRevision += 1n;
+  }
+  return Object.freeze({ artifactRevision, intentRevision });
+}
+
 async function commitSellReconciliation(
   client: DatabaseClient,
   claim: ClaimedExecutionIntent,
@@ -4755,6 +4805,16 @@ async function commitSellReconciliation(
   const initialArtifactState = String(row.state);
   const initialIntentStatus = String(row.intent_status);
   const terminal = evidence.result === 'MATCHED' || evidence.result === 'NO_EFFECT';
+  // A SELL that landed finalized with an error and moved nothing but the fee. The classic
+  // NO_EFFECT proof is always ABSENT/NOT_FOUND, so PRESENT identifies this variant exactly.
+  const landedNoEffect = evidence.result === 'NO_EFFECT'
+    && evidence.signatureHistory === 'PRESENT';
+  if (landedNoEffect && (evidence.confirmationStatus !== 'FINALIZED'
+    || evidence.observedTransactionFingerprint === null || evidence.observedSlot === null
+    || evidence.feeLamports <= 0n
+    || evidence.walletLamportDelta !== -evidence.feeLamports
+    || evidence.baseDeltaRaw !== 0n || evidence.quoteDeltaRaw !== 0n
+    || evidence.unexpectedResidualTokenBalanceRaw <= 0n)) throw failure('CONFLICT');
   const matchedAmounts = evidence.result !== 'MATCHED'
     || (evidence.observedSlot !== null && evidence.baseDeltaRaw < 0n
       && -evidence.baseDeltaRaw === unsignedBigint(row.remaining_base_raw)
@@ -4823,38 +4883,10 @@ async function commitSellReconciliation(
     if (resolved.rowCount !== priorEvidence.length) throw failure('CONFLICT');
   }
   if (!terminal) {
-    if (initialArtifactState !== 'AMBIGUOUS') {
-      const artifactRevision = unsignedBigint(row.state_revision);
-      const ambiguousArtifact = await client.query(`UPDATE execution_signed_transactions SET
-        state='AMBIGUOUS',state_revision=$2::BIGINT
-        WHERE artifact_id=$1 AND state=$3 AND state_revision=$4::BIGINT`, [
-        artifact.artifactId, (artifactRevision + 1n).toString(), initialArtifactState,
-        artifactRevision.toString(),
-      ]);
-      if (ambiguousArtifact.rowCount !== 1) throw failure('CONFLICT');
-      await insertLiveStateEvent(
-        client, artifact, initialArtifactState as 'ACCEPTED' | 'CONFIRMED', 'AMBIGUOUS',
-        'RECONCILIATION_REQUIRED', evidence.observedAtMs,
-      );
-    }
-    if (initialIntentStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION') {
-      const intentRevision = unsignedBigint(row.intent_revision);
-      const unknownIntent = await client.query(`UPDATE execution_intents SET
-        status='UNKNOWN_REQUIRES_RECONCILIATION',state_revision=$2::BIGINT,
-        last_reason_code='RECONCILIATION_REQUIRED',
-        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
-        updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
-        WHERE id=$1 AND status=$4 AND state_revision=$5::BIGINT`, [
-        artifact.intentId, (intentRevision + 1n).toString(), evidence.observedAtMs,
-        initialIntentStatus, intentRevision.toString(),
-      ]);
-      if (unknownIntent.rowCount !== 1) throw failure('CONFLICT');
-      await insertStandardIntentTransition(
-        client, artifact, initialIntentStatus as 'SUBMITTED' | 'CONFIRMED',
-        'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
-        evidence.observedAtMs,
-      );
-    } else {
+    await journalSellAmbiguity(
+      client, artifact, row, initialArtifactState, initialIntentStatus, evidence.observedAtMs,
+    );
+    if (initialIntentStatus === 'UNKNOWN_REQUIRES_RECONCILIATION') {
       const releasedIntent = await client.query(`UPDATE execution_intents SET
         lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
         updated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
@@ -4902,10 +4934,17 @@ async function commitSellReconciliation(
     });
   }
   if (evidence.result === 'NO_EFFECT') {
-    if (initialArtifactState !== 'AMBIGUOUS'
-      || initialIntentStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION'
-      || finalizedAtMs === null) throw failure('CONFLICT');
-    const artifactRevision = unsignedBigint(row.state_revision);
+    if (finalizedAtMs === null) throw failure('CONFLICT');
+    let artifactRevision = unsignedBigint(row.state_revision);
+    let intentRevision = unsignedBigint(row.intent_revision);
+    if (landedNoEffect) {
+      // The submission-event CHECK only accepts AMBIGUOUS -> RECONCILED with this proof, and
+      // the transition CHECK only accepts UNKNOWN_REQUIRES_RECONCILIATION -> FAILED with it.
+      ({ artifactRevision, intentRevision } = await journalSellAmbiguity(
+        client, artifact, row, initialArtifactState, initialIntentStatus, evidence.observedAtMs,
+      ));
+    } else if (initialArtifactState !== 'AMBIGUOUS'
+      || initialIntentStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION') throw failure('CONFLICT');
     const artifactUpdate = await client.query(`UPDATE execution_signed_transactions SET
       state='RECONCILED',state_revision=$2::BIGINT,
       reconciled_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
@@ -4944,24 +4983,43 @@ async function commitSellReconciliation(
     const transition = await client.query(`INSERT INTO execution_intent_transitions (
       intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
       attempt_number,evidence,occurred_at
-    ) VALUES ($1,'UNKNOWN_REQUIRES_RECONCILIATION','RETRY_READY',
-      'RECONCILIATION_PROVED_NO_EFFECT','Finalized canary exit had no effect; retry enabled.',
+    ) VALUES ($1,'UNKNOWN_REQUIRES_RECONCILIATION',$4,
+      'RECONCILIATION_PROVED_NO_EFFECT',$5,
       'CANARY',$2,jsonb_build_object('payloadVersion',1,'attemptNumber',$2::INTEGER,
         'sourceEventId',NULL,'observedAtMs',$3::BIGINT),
       TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'))`, [
       artifact.intentId, artifact.attemptNumber, finalizedAtMs,
+      landedNoEffect ? 'FAILED' : 'RETRY_READY',
+      landedNoEffect
+        ? 'Finalized canary exit failed on chain with no effect; intent closed.'
+        : 'Finalized canary exit had no effect; retry enabled.',
     ]);
-    const intentRevision = unsignedBigint(row.intent_revision);
-    const intentUpdate = await client.query(`UPDATE execution_intents SET
+    // A landed failure ends the intent (terminal): a new SELL only comes from the guarded
+    // re-exit, never from H2b re-signing this intent.
+    const intentUpdate = landedNoEffect
+      ? await client.query(`UPDATE execution_intents SET
+        status='FAILED',state_revision=$2::BIGINT,
+        last_reason_code='RECONCILIATION_PROVED_NO_EFFECT',
+        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+        terminal_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+        reconciliation_completed_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+        purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond'),
+        updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+        WHERE id=$1 AND status='UNKNOWN_REQUIRES_RECONCILIATION'
+          AND state_revision=$4::BIGINT`, [
+        artifact.intentId, (intentRevision + 1n).toString(), finalizedAtMs,
+        intentRevision.toString(),
+      ])
+      : await client.query(`UPDATE execution_intents SET
       status='RETRY_READY',state_revision=$2::BIGINT,
       last_reason_code='RECONCILIATION_PROVED_NO_EFFECT',
       lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
       updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
       WHERE id=$1 AND status='UNKNOWN_REQUIRES_RECONCILIATION'
         AND state_revision=$4::BIGINT`, [
-      artifact.intentId, (intentRevision + 1n).toString(), finalizedAtMs,
-      intentRevision.toString(),
-    ]);
+        artifact.intentId, (intentRevision + 1n).toString(), finalizedAtMs,
+        intentRevision.toString(),
+      ]);
     const attemptUpdate = await client.query(`UPDATE execution_attempts SET
       status='ABANDONED',completed_at=TIMESTAMPTZ 'epoch'
         +($3::BIGINT*INTERVAL '1 millisecond'),

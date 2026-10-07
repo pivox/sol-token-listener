@@ -98,6 +98,8 @@ export class ExecutionReconciliationService {
           unexpectedResidualTokenBalanceRaw: deltas.unexpectedResidualTokenBalanceRaw,
           observedAtMs: deltas.observedAtMs,
           finalizedAtMs: deltas.finalizedAtMs,
+          transactionFailed: deltas.transactionFailed === true,
+          baseTokenAccountsUnchanged: deltas.baseTokenAccountsUnchanged === true,
         }),
       });
     } catch {
