@@ -24,7 +24,7 @@ void test('056 defines only the three bounded-tracking indexes and restricted li
     .filter((name) => /^\d+_[a-z0-9_-]+\.sql$/u.test(name))
     .sort((left, right) => left.localeCompare(right));
 
-  assert.equal(migrationNames.at(-1), '064_fast_entry_decisions.sql');
+  assert.equal(migrationNames.at(-1), '065_entry_envelope_auto_arm.sql');
   assert.equal((sql.match(/\bCREATE INDEX\b/gu) ?? []).length, 3);
   assert.equal((sql.match(/\bCREATE VIEW\b/gu) ?? []).length, 1);
   assert.equal((sql.match(/\bLOCK TABLE\b/gu) ?? []).length, 1);
@@ -49,8 +49,8 @@ void test('056 installs from empty, upgrades from 055 and replays without replac
   async (context) => {
     await withSchema(context, async (pool) => {
       const applied = await migrateDatabase({ pool });
-      assert.equal(applied.length, 64);
-      assert.equal(applied.at(-1), '064_fast_entry_decisions.sql');
+      assert.equal(applied.length, 65);
+      assert.equal(applied.at(-1), '065_entry_envelope_auto_arm.sql');
       assert.deepEqual(await migrateDatabase({ pool }), []);
       const identities = await objectIdentities(pool);
       const sql = await readFile(migrationUrl, 'utf8');

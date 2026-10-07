@@ -13,7 +13,7 @@ import {
 } from '../src/storage/execution-live.repository.js';
 
 const migrationName = '039_execution_canary_operator_binding.sql';
-const latestMigrationName = '064_fast_entry_decisions.sql';
+const latestMigrationName = '065_entry_envelope_auto_arm.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 039 defines V2 armament bindings and pre-signature locks', async () => {
