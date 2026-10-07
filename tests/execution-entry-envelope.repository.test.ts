@@ -12,6 +12,7 @@ import {
 import { createEntryEnvelope, type EntryEnvelopeV2 } from '../src/domain/execution-entry-envelope.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
 import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
+import { parseJson } from '../src/utils/json.js';
 import {
   createEnvelopeBindingGates,
   createMainnetSimulationEvidenceFingerprint,
@@ -115,6 +116,11 @@ void test('createEnvelope binds an ACTIVE v2 envelope, its ENVELOPE qualificatio
       valid_until_ms: String(prepared.envelope.validUntilMs), stamped: true,
       stored_policy_fingerprint: prepared.envelope.policy.policyFingerprint,
     }]);
+    const storedPolicy = await pool.query<{ readonly risk_policy: string }>(`SELECT
+      risk_policy::TEXT AS risk_policy FROM execution_entry_envelopes`);
+    const parsedPolicy = parseJson(storedPolicy.rows[0]?.risk_policy ?? '') as Record<string, unknown>;
+    const { payloadVersion: _version, policyFingerprint: _fingerprint, ...policyInput } = parsedPolicy;
+    assert.deepEqual(createExecutionRiskPolicy(policyInput), prepared.envelope.policy);
     const qualification = await pool.query(`SELECT qualification_id,payload_version,scope,envelope_id,
       (SELECT COUNT(*)::INTEGER FROM execution_safety_gate_evidence gate
         WHERE gate.qualification_id=qualification.qualification_id) AS gates
@@ -173,6 +179,17 @@ void test('createEnvelope refuses a v1 qualification, a mismatched or unconsumab
     });
     await assert.rejects(repository.createEnvelope({ ...prepared, authorization: resume }),
       isRepositoryError('CONFLICT'));
+    // The envelope must be exactly the one its own qualification and fields produce.
+    const otherWindow = await prepareEnvelope(pool, repository, simulation,
+      { nonce: '3', expiresInMs: 3 * HOUR });
+    assert.notEqual(otherWindow.envelope.validUntilMs, prepared.envelope.validUntilMs);
+    await assert.rejects(repository.createEnvelope({ ...prepared, envelope: otherWindow.envelope }),
+      isRepositoryError('CONFLICT'));
+    await assert.rejects(repository.createEnvelope({ ...prepared,
+      envelope: Object.freeze({ ...prepared.envelope, maxBuys: 4 }) }), isRepositoryError('CONFLICT'));
+    await assert.rejects(repository.createEnvelope({ ...prepared,
+      envelope: Object.freeze({ ...prepared.envelope, validUntilMs: prepared.envelope.validUntilMs - 1 }) }),
+    isRepositoryError('CONFLICT'));
     const unrecorded = envelopeAuthorization(prepared.envelope, nowMs, '4'.repeat(64));
     await assert.rejects(repository.createEnvelope({ ...prepared, authorization: unrecorded }),
       isRepositoryError('CONFLICT'));
@@ -188,6 +205,35 @@ void test('createEnvelope refuses a v1 qualification, a mismatched or unconsumab
       (SELECT COUNT(*)::INTEGER FROM execution_operator_authorizations
         WHERE consumed_at IS NOT NULL) AS consumed`)).rows,
     [{ envelopes: 0, qualifications: 0, consumed: 0 }]);
+  });
+});
+
+void test('createEnvelope refuses gate 10 evidence older than 24 hours before the DB now', async (context) => {
+  await withSchema(context, async (pool) => {
+    const simulation = await seedEnvelopeBase(pool);
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    await mutateWithTriggersDisabled(pool, `UPDATE execution_simulation_artifacts
+      SET recorded_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '25 hours'
+      WHERE artifact_id=$1`, [simulation.artifactId]);
+    const stale = await pool.query<{ readonly recorded_at_ms: string }>(`SELECT
+      trunc(EXTRACT(EPOCH FROM recorded_at)*1000)::TEXT AS recorded_at_ms
+      FROM execution_simulation_artifacts WHERE artifact_id=$1`, [simulation.artifactId]);
+    // Qualified 23 hours ago: the artifact is within 24 hours of qualifiedAt but not of the DB now.
+    const nowMs = await currentDatabaseTimeMs(pool);
+    const qualification = envelopeQualification(nowMs - 23 * HOUR,
+      { ...simulation, recordedAtMs: Number(stale.rows[0]?.recorded_at_ms) }, 24 * HOUR);
+    const envelope = createEntryEnvelope(Object.freeze({
+      payloadVersion: 2, qualification, operatorId: 'operator-primary',
+      perBuyQuoteAmountRaw: 10_000_000n, maxBuys: 3, maxTotalExposureRaw: 30_000_000n,
+      maxRealizedLossRaw: 30_000_000n, maximumHoldingMs: 60_000,
+      validFromMs: nowMs, validUntilMs: qualification.expiresAtMs, policy: envelopePolicy(),
+    }));
+    const authorization = envelopeAuthorization(envelope, nowMs, '7'.repeat(64));
+    await repository.recordAuthorization(authorization);
+    await assert.rejects(repository.createEnvelope({ envelope, qualification, authorization }),
+      isRepositoryError('CONFLICT'));
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_entry_envelopes`)).rows[0]?.count, 0);
   });
 });
 
@@ -262,7 +308,7 @@ void test('revokeEnvelope never touches an ARMED CANARY armament and replays (A1
   });
 });
 
-for (const initialState of ['ACTIVE', 'EXHAUSTED'] as const) {
+for (const initialState of ['ACTIVE', 'EXHAUSTED', 'EXPIRED'] as const) {
   void test(`revokeEnvelope revokes the ARMED armament of a ${initialState} envelope and releases its reservation`,
     async (context) => {
       await withSchema(context, async (pool) => {
@@ -275,13 +321,17 @@ for (const initialState of ['ACTIVE', 'EXHAUSTED'] as const) {
         if (initialState === 'EXHAUSTED') {
           await mutateWithTriggersDisabled(pool, `UPDATE execution_entry_envelopes
             SET state='EXHAUSTED',buys_armed=1 WHERE envelope_id=$1`, [prepared.envelope.envelopeId]);
+        } else if (initialState === 'EXPIRED') {
+          await moveEnvelopeIntoThePast(pool, prepared.envelope.envelopeId);
+          assert.equal((await repository.expireEnvelopes(generationId)).expiredCount, 1);
         }
         const revoked = await repository.revokeEnvelope({
           generationId, envelopeId: prepared.envelope.envelopeId,
           operatorId: 'operator-primary', occurredAtMs: Date.now(),
         });
         assert.equal(revoked.armamentRevoked, true);
-        assert.equal(revoked.state, initialState === 'ACTIVE' ? 'REVOKED' : 'EXHAUSTED');
+        assert.equal(revoked.state, initialState === 'ACTIVE' ? 'REVOKED' : initialState);
+        assert.equal(revoked.replayed, false);
         assert.deepEqual((await pool.query(`SELECT armament.state,reservation.state AS reservation_state,
           risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,risk.open_positions
           FROM execution_activation_armaments armament

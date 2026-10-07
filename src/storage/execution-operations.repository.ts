@@ -626,8 +626,9 @@ export class PostgresExecutionOperationsRepository implements
       if (qualification.qualifiedAtMs > nowMs
         || qualification.expiresAtMs <= nowMs) throw failure('PREFLIGHT_EXPIRED');
       if (envelope.validFromMs > nowMs) throw failure('CONFLICT');
+      // Safety point 1, anchored on the DB now: an old qualification cannot carry older evidence.
       await verifyMainnetSimulationEvidence(client, qualification,
-        qualification.qualifiedAtMs - ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS);
+        nowMs - ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS);
       await expireActiveEnvelopes(client, envelope.generationId);
       await consumeAuthorization(client, authorization, 'ENVELOPE', null, nowMs);
       await insertEntryEnvelope(client, envelope, authorization.authorizationId);
