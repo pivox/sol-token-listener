@@ -121,7 +121,9 @@ void test('rejects a window that does not end with the qualification or that is 
   assert.doesNotThrow(() => envelope({ validFromMs: tooShortFrom - 1 }));
 });
 
-void test('rejects a window longer than 24 hours', () => {
+void test('rejects a window starting before the qualification, which also bounds it to 24 hours', () => {
+  // The explicit 24 h branch cannot be reached on its own: validFrom >= qualifiedAt and a
+  // qualification TTL <= 24 h already bound the window. This input is refused by validFrom.
   const qualification = envelopeCanaryEvidenceInput().qualification;
   assert.throws(() => envelope({
     validFromMs: qualification.expiresAtMs - 86_400_001,
@@ -135,12 +137,23 @@ void test('rejects policies that could block a buy before the envelope loss cap'
   assert.throws(() => envelope({ policy: policy({ positionSizeBps: 500n }) }), INVALID);
 });
 
-void test('rejects reconciled capital below 20 times the per-buy amount', () => {
+void test('rejects loss-capped reconciled capital below 20 times the per-buy amount (A17)', () => {
   // 0.01 SOL example: 230M initial - 30M loss = 200M = 20 x 10M, exactly admissible.
+  // The A17 guard is redundant with evaluateBuyRisk at <= 500 bps; either rejects these inputs.
   assert.doesNotThrow(() => envelope());
   assert.throws(() => envelope({ perBuyQuoteAmountRaw: 10_000_001n }), INVALID);
   assert.throws(() => envelope({
     policy: policy({ initialCapitalLamports: 229_999_999n }),
+  }), INVALID);
+});
+
+void test('rejects a policy whose quote mint allowlist is not WSOL', () => {
+  const usdc = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  assert.throws(() => envelope({
+    policy: Object.freeze({ ...policy(), quoteMintAllowlist: Object.freeze([usdc]) }),
+  }), INVALID);
+  assert.throws(() => envelope({
+    policy: Object.freeze({ ...policy(), quoteMintAllowlist: Object.freeze([WSOL_MINT, usdc]) }),
   }), INVALID);
 });
 

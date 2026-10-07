@@ -160,6 +160,9 @@ export function createEntryEnvelope(input: unknown): EntryEnvelopeV2 {
     const validFromMs = timestamp(record.validFromMs);
     const validUntilMs = timestamp(record.validUntilMs);
     const windowMs = validUntilMs - validFromMs;
+    // The 24 h bound cannot fire on its own: validUntil equals the qualification expiry,
+    // validFrom is not before qualifiedAt, and the qualification TTL is at most 24 h.
+    // It is kept as defence in depth.
     if (maxTotalExposureRaw < perBuyQuoteAmountRaw
       || validUntilMs !== qualification.expiresAtMs
       || validFromMs < qualification.qualifiedAtMs
@@ -302,7 +305,9 @@ function assertPolicyAdmitsEnvelope(
   if (policy.quoteMintAllowlist[0] !== WSOL_MINT
     || policy.maximumOpenPositions !== 1
     || policy.maximumTotalExposureBps > MAXIMUM_TOTAL_EXPOSURE_BPS) throw invalid();
-  // Reconciled capital once the whole loss cap is realized, computed like evaluateBuyRisk.
+  // A17: reconciled capital once the whole loss cap is realized (computed like evaluateBuyRisk)
+  // must be at least 20 x per_buy. This is a redundant explicit guard: with
+  // maximumTotalExposureBps <= 500, the evaluateBuyRisk check below already implies it.
   const lossCappedCapital = minimum(
     maximum(0n, policy.initialCapitalLamports - maxRealizedLossRaw),
     policy.maximumCapitalLamports,
