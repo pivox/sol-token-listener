@@ -217,6 +217,10 @@ const RUNNABLE_WORK_SQL = `SELECT (
       AND armament.runtime_max_fee_payer_lamport_debit=$15::NUMERIC
       AND armament.runtime_max_rpc_calls_per_attempt=$16
       AND armament.runtime_lease_ms=$17)
+  -- An open envelope is work: the operations auto-arm daemon arms its intents while H2b idles.
+  OR EXISTS (SELECT 1 FROM execution_entry_envelopes envelope
+    WHERE envelope.generation_id=$1 AND envelope.payload_version=2
+      AND envelope.state='ACTIVE' AND envelope.valid_until>statement_timestamp())
 ) AS runnable_work`;
 export class PostgresExecutionLiveRepository {
   readonly #source: DatabaseSource;
@@ -325,6 +329,7 @@ export class PostgresExecutionLiveRepository {
         qualification.genesis_hash AS qualification_genesis_hash,
         qualification.provider_id AS qualification_provider_id,
         trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT AS qualification_expires_at_ms,
+        qualification.scope AS qualification_scope,
         control.state AS control_state,risk.unknown_block,
         wallet.superseded_at AS wallet_superseded_at,
         provider.superseded_at AS provider_superseded_at,
@@ -391,6 +396,7 @@ export class PostgresExecutionLiveRepository {
         qualification.genesis_hash AS qualification_genesis_hash,
         qualification.provider_id AS qualification_provider_id,
         trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT AS qualification_expires_at_ms,
+        qualification.scope AS qualification_scope,
         armament.armament_id,armament.payload_version AS armament_payload_version,
         armament.state AS armament_state,armament.state_revision::TEXT AS armament_state_revision,
         armament.phase AS armament_phase,armament.build_hash AS armament_build_hash,
@@ -2408,6 +2414,20 @@ function unsignedSimulationFingerprint(value: ExecutionSimulationEvidenceV1): st
   ]);
 }
 
+/** Signing accepts only the two qualification scopes; anything else fails closed. */
+function knownQualificationScope(row: Row): boolean {
+  return row.qualification_scope === 'CANARY' || row.qualification_scope === 'ENVELOPE';
+}
+
+/**
+ * CANARY gates 7 and 9 carry the armament's exact snapshot fingerprints. ENVELOPE gates carry
+ * deterministic generation/provider bindings instead (checked at arming by migration 065), so
+ * only their status and expiry are re-checked here.
+ */
+function canaryScoped(row: Row): boolean {
+  return row.qualification_scope === 'CANARY';
+}
+
 function validateExactSigningBinding(
   row: Row,
   input: ExecutionExactSigningInputV1,
@@ -2469,11 +2489,13 @@ function validateExactSigningBinding(
     || row.admission_provider_snapshot_fingerprint !== row.target_provider_snapshot_fingerprint
     || row.unknown_block !== false || row.wallet_superseded_at !== null
     || row.provider_superseded_at !== null
+    || !knownQualificationScope(row)
     || row.wallet_gate_status !== 'PASSED'
-    || row.wallet_gate_fingerprint !== row.target_wallet_snapshot_fingerprint
+    || (canaryScoped(row) && row.wallet_gate_fingerprint !== row.target_wallet_snapshot_fingerprint)
     || timestampText(row.wallet_gate_expires_at_ms) < deadlineMs
     || row.provider_gate_status !== 'PASSED'
-    || row.provider_gate_fingerprint !== row.target_provider_snapshot_fingerprint
+    || (canaryScoped(row)
+      && row.provider_gate_fingerprint !== row.target_provider_snapshot_fingerprint)
     || timestampText(row.provider_gate_expires_at_ms) < deadlineMs
     || timestampText(row.provider_expires_at_ms) < deadlineMs
     || material.quoteObservedAtMs > nowMs
@@ -2510,11 +2532,12 @@ function exactSigningReplay(
     || timestampText(row.qualification_expires_at_ms) < deadlineMs
     || row.control_state !== 'RUNNING' || row.unknown_block !== false
     || row.wallet_superseded_at !== null || row.provider_superseded_at !== null
+    || !knownQualificationScope(row)
     || row.wallet_gate_status !== 'PASSED'
-    || row.wallet_gate_fingerprint !== row.wallet_snapshot_fingerprint
+    || (canaryScoped(row) && row.wallet_gate_fingerprint !== row.wallet_snapshot_fingerprint)
     || timestampText(row.wallet_gate_expires_at_ms) < deadlineMs
     || row.provider_gate_status !== 'PASSED'
-    || row.provider_gate_fingerprint !== row.provider_snapshot_fingerprint
+    || (canaryScoped(row) && row.provider_gate_fingerprint !== row.provider_snapshot_fingerprint)
     || timestampText(row.provider_gate_expires_at_ms) < deadlineMs
     || timestampText(row.provider_expires_at_ms) < deadlineMs
     || row.armament_phase !== input.runtime.phase

@@ -267,6 +267,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_attempts',
     'execution_control_events',
     'execution_control_state',
+    'execution_entry_envelopes',
     'execution_exit_authorizations',
     'execution_exposure_reservations',
     'execution_intent_transitions',
@@ -317,6 +318,15 @@ void test('authority allowlist is restricted to H2b signing and submission primi
   assert.equal(byName.get('execution_signed_transactions')?.update.includes('confirmed_at'), false);
   assert.equal(byName.get('execution_signed_transactions')?.update.includes('confirmed_slot'), false);
   assert.equal(byName.get('execution_signed_transactions')?.update.includes('reconciled_at'), false);
+  // Lot 4a: H2b starts on an ACTIVE v2 envelope and tells ENVELOPE from CANARY gate bindings.
+  assert.deepEqual(byName.get('execution_entry_envelopes'), {
+    name: 'execution_entry_envelopes',
+    select: ['generation_id', 'payload_version', 'state', 'valid_until'],
+    insert: [], update: [],
+  });
+  assert.equal(byName.get('execution_safety_qualifications')?.select.includes('scope'), true);
+  assert.deepEqual(byName.get('execution_safety_qualifications')?.insert, []);
+  assert.deepEqual(byName.get('execution_safety_qualifications')?.update, []);
   assert.equal(byName.get('execution_intents')?.select.includes('live_reserved'), true);
   assert.equal(byName.get('execution_intents')?.insert.includes('live_reserved'), false);
   assert.equal(byName.get('execution_intents')?.update.includes('live_reserved'), false);

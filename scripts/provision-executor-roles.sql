@@ -1809,9 +1809,13 @@ ON TABLE execution_simulation_artifacts TO sol_token_executor_live;
 GRANT SELECT (
   qualification_id,qualification_fingerprint,generation_id,phase,build_hash,
   configuration_fingerprint,strategy_fingerprint,wallet_public_key,cluster,
-  genesis_hash,provider_id,expires_at
+  genesis_hash,provider_id,expires_at,scope
 )
 ON TABLE execution_safety_qualifications TO sol_token_executor_live;
+
+-- Lot 4a: H2b starts idle while an ACTIVE v2 entry envelope is open (read-only).
+GRANT SELECT (generation_id,payload_version,state,valid_until)
+ON TABLE execution_entry_envelopes TO sol_token_executor_live;
 
 GRANT SELECT (generation_id,state,state_revision,last_event_id),
   UPDATE (state,state_revision,last_event_id,updated_at)

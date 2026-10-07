@@ -199,7 +199,10 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
       table('execution_safety_qualifications', names(
         'qualification_id', 'qualification_fingerprint', 'generation_id', 'phase',
         'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
-        'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'expires_at',
+        'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'expires_at', 'scope',
+      )),
+      table('execution_entry_envelopes', names(
+        'generation_id', 'payload_version', 'state', 'valid_until',
       )),
       table('execution_control_state', names(
         'generation_id', 'state', 'state_revision', 'last_event_id',
