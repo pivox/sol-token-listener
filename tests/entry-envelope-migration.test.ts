@@ -141,6 +141,11 @@ void test('065 guards the v2 envelope insert with a consumed v1 ENVELOPE authori
       await assert.rejects(insertV2Envelope(pool, { nowMs, authorizationId: authorizationId('1'),
         nullColumn: column }), { code: '23514' }, column);
     }
+    const microsecondUntil = (await pool.query<{ readonly value: string }>(`SELECT
+      to_char(to_timestamp($1::DOUBLE PRECISION/1000) AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS') || '123+00' AS value`, [nowMs + 2 * HOUR])).rows[0]?.value ?? '';
+    await assert.rejects(insertV2Envelope(pool, { nowMs, authorizationId: authorizationId('1'),
+      validUntilText: microsecondUntil }), { code: '23514' });
     await insertV2Envelope(pool, { nowMs, authorizationId: authorizationId('1') });
     await pool.query(`INSERT INTO execution_entry_envelopes (
       envelope_id,generation_id,operator_id,payload_version,fingerprint,per_buy_quote_amount_raw,
@@ -150,6 +155,79 @@ void test('065 guards the v2 envelope insert with a consumed v1 ENVELOPE authori
       $2,$3,'ACTIVE',0,NULL,$2,$2)`, ['a'.repeat(64), new Date(nowMs - MINUTE), new Date(nowMs + HOUR)]);
   });
 });
+
+void test('065 envelope insert guard rejects stale, retired, pre-counted, revoked or closed envelopes', async (context) => {
+  await withTemporarySchema(context, async (pool) => {
+    await migrateDatabase({ pool });
+    const nowMs = await seedGeneration(pool);
+    await insertEnvelopeAuthorization(pool, { nowMs, id: '1', issuedOffsetMs: -10 * MINUTE });
+    await assert.rejects(insertV2Envelope(pool, { nowMs, authorizationId: authorizationId('1') }),
+      { code: '55000' }, 'expired authorization');
+    await insertEnvelopeAuthorization(pool, { nowMs });
+    await assert.rejects(insertV2Envelope(pool, { nowMs, buysArmed: 1 }), { code: '55000' }, 'buys_armed');
+    await assert.rejects(insertV2Envelope(pool, { nowMs, revokedAt: new Date(nowMs) }),
+      { code: '55000' }, 'revoked_at');
+    await assert.rejects(insertV2Envelope(pool, { nowMs, validUntilMs: nowMs - 1_000 }),
+      { code: '55000' }, 'valid_until');
+    await withReplicaRole(pool, () => pool.query(`UPDATE execution_wallet_generations
+      SET retired_at=created_at WHERE generation_id=$1`, [GENERATION_ID]));
+    await assert.rejects(insertV2Envelope(pool, { nowMs }), { code: '55000' }, 'retired generation');
+  });
+});
+
+void test('065 refuses arming a closed, exhausted or not-yet-open envelope', async (context) => {
+  for (const scenario of [
+    { maxBuys: 1, maxTotalExposure: '1' },
+    { maxBuys: 3, maxTotalExposure: '1' },
+  ] as const) {
+    await withTemporarySchema(context, async (pool) => {
+      await migrateDatabase({ pool });
+      await seedEnvelopeArmament(pool, scenario);
+      await insertEnvelopeArmament(pool);
+      await assert.rejects(insertEnvelopeArmament(pool),
+        { code: '55000', message: /guarded V2 armament insert required/u }, 'second arm');
+      assert.deepEqual(await envelopeCounters(pool), { buys_armed: 1, state: 'EXHAUSTED' });
+    });
+  }
+  const forced: readonly Readonly<{ name: string; seed?: EnvelopeArmamentSeed; assignments: string; buys: number }>[] = [
+    { name: 'revoked', assignments: "state='REVOKED',revoked_at=updated_at", buys: 0 },
+    { name: 'expired', assignments: "state='EXPIRED'", buys: 0 },
+    { name: 'max_buys', seed: { maxBuys: 3, maxTotalExposure: '3' }, assignments: 'buys_armed=3', buys: 3 },
+    { name: 'total_exposure', seed: { maxBuys: 3, maxTotalExposure: '2' }, assignments: 'buys_armed=2', buys: 2 },
+    { name: 'valid_from_future', assignments: "valid_from=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute'", buys: 0 },
+  ];
+  for (const variant of forced) {
+    await withTemporarySchema(context, async (pool) => {
+      await migrateDatabase({ pool });
+      await seedEnvelopeArmament(pool, {
+        ...variant.seed,
+        ...(variant.name === 'valid_from_future' ? { intentRequestedOffsetMs: 3 * MINUTE } : {}),
+      });
+      await withReplicaRole(pool, () => pool.query(
+        `UPDATE execution_entry_envelopes SET ${variant.assignments} WHERE envelope_id=$1`, [ENVELOPE_ID]));
+      await assert.rejects(insertEnvelopeArmament(pool),
+        { code: '55000', message: /guarded V2 armament insert required/u }, variant.name);
+      assert.equal((await envelopeCounters(pool)).buys_armed, variant.buys, variant.name);
+    });
+  }
+});
+
+async function envelopeCounters(pool: pg.Pool): Promise<Readonly<{ buys_armed: number; state: string }>> {
+  const result = await pool.query<{ readonly buys_armed: number; readonly state: string }>(
+    'SELECT buys_armed,state FROM execution_entry_envelopes WHERE envelope_id=$1', [ENVELOPE_ID]);
+  const row = result.rows[0];
+  if (row === undefined) throw new Error('envelope row missing');
+  return { buys_armed: row.buys_armed, state: row.state };
+}
+
+async function withReplicaRole(pool: pg.Pool, run: () => Promise<unknown>): Promise<void> {
+  await pool.query('SET session_replication_role = replica');
+  try {
+    await run();
+  } finally {
+    await pool.query('SET session_replication_role = origin');
+  }
+}
 
 void test('065 keeps envelope identity immutable and its counters monotonic', async (context) => {
   await withTemporarySchema(context, async (pool) => {
@@ -424,10 +502,11 @@ async function insertEnvelopeAuthorization(pool: pg.Pool, input: Readonly<{
   action?: string;
   phase?: string | null;
   payloadVersion?: number;
+  issuedOffsetMs?: number;
 }>): Promise<unknown> {
-  const issuedAt = new Date(input.nowMs - 1_000);
+  const issuedAt = new Date(input.nowMs + (input.issuedOffsetMs ?? -1_000));
   const consumedAt = input.consumed === false ? null : issuedAt;
-  const expiresAt = new Date(input.nowMs + 4 * MINUTE);
+  const expiresAt = new Date(issuedAt.getTime() + 4 * MINUTE + 1_000);
   return pool.query(`INSERT INTO execution_operator_authorizations (
     authorization_id,payload_version,authorization_fingerprint,generation_id,action,phase,
     context_fingerprint,nonce_hash,operator_id,issued_at,expires_at,consumed_at,purge_after
@@ -451,20 +530,25 @@ async function insertV2Envelope(pool: pg.Pool, input: Readonly<{
   maxBuys?: number;
   maxTotalExposure?: string;
   nullColumn?: string;
+  validUntilText?: string;
+  buysArmed?: number;
+  revokedAt?: Date;
 }>): Promise<unknown> {
   const createdAt = new Date(input.nowMs);
   return pool.query(`INSERT INTO execution_entry_envelopes (
     envelope_id,generation_id,operator_id,payload_version,fingerprint,per_buy_quote_amount_raw,
     max_buys,max_open_positions,max_total_exposure_raw,max_realized_loss_raw,valid_from,valid_until,
-    state,created_at,updated_at,authorization_id,risk_policy,policy_fingerprint,maximum_holding_ms
-  ) VALUES ($1,$2,$3,2,$4,$5,$6,1,$7,5,$8,$9,$10,$11,$11,$12,$14::JSONB,$13,$15)`, [
+    state,created_at,updated_at,authorization_id,risk_policy,policy_fingerprint,maximum_holding_ms,
+    buys_armed,revoked_at
+  ) VALUES ($1,$2,$3,2,$4,$5,$6,1,$7,5,$8,$9,$10,$11,$11,$12,$14::JSONB,$13,$15,$16,$17)`, [
     input.envelopeId ?? ENVELOPE_ID, GENERATION_ID, input.operatorId ?? 'operator', ENVELOPE_FINGERPRINT,
     input.perBuy ?? '1', input.maxBuys ?? 3, input.maxTotalExposure ?? '3',
-    new Date(input.validFromMs ?? input.nowMs - MINUTE), new Date(input.validUntilMs ?? input.nowMs + 2 * HOUR),
+    new Date(input.validFromMs ?? input.nowMs - MINUTE), input.validUntilText ?? new Date(input.validUntilMs ?? input.nowMs + 2 * HOUR),
     input.state ?? 'ACTIVE', createdAt, input.authorizationId ?? ENVELOPE_AUTHORIZATION_ID,
     input.nullColumn === 'policy_fingerprint' ? null : POLICY_FINGERPRINT,
     input.nullColumn === 'risk_policy' ? null : '{"payloadVersion":1}',
     input.nullColumn === 'maximum_holding_ms' ? null : 30_000,
+    input.buysArmed ?? 0, input.revokedAt ?? null,
   ]);
 }
 

@@ -96,6 +96,8 @@ ALTER TABLE execution_entry_envelopes
       -- A NULL operand would make the CHECK pass: every v2 column is required explicitly.
       AND authorization_id IS NOT NULL AND risk_policy IS NOT NULL
       AND policy_fingerprint IS NOT NULL AND maximum_holding_ms IS NOT NULL
+      AND date_trunc('milliseconds', valid_from) = valid_from
+      AND date_trunc('milliseconds', valid_until) = valid_until
       AND authorization_id ~ '^execution_operator_authorization_[0-9a-f]{64}$'
       AND policy_fingerprint ~ '^[0-9a-f]{64}$' AND jsonb_typeof(risk_policy) = 'object'
       AND maximum_holding_ms BETWEEN 30000 AND 900000
