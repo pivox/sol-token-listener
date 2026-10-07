@@ -433,7 +433,6 @@ export class PostgresExecutionLiveRepository {
         admission.decision AS admission_decision,admission.quota_state,
         admission.quote_amount_raw::TEXT AS admission_quote_amount_raw,
         risk.unknown_block,wallet.superseded_at AS wallet_superseded_at,
-        trunc(EXTRACT(EPOCH FROM wallet.observed_at)*1000)::TEXT AS wallet_observed_at_ms,
         provider.superseded_at AS provider_superseded_at,
         trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms,
         provider_gate.status AS provider_gate_status,

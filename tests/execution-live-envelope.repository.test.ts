@@ -104,6 +104,40 @@ void test('ENVELOPE signing keeps every other check: a superseded wallet snapsho
   });
 });
 
+for (const refusal of [
+  {
+    name: 'gate 7 expires before the signing deadline',
+    sql: `UPDATE execution_safety_gate_evidence SET
+      expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 second'
+      WHERE gate_index=7 AND qualification_id=(SELECT qualification_id
+        FROM execution_activation_armaments WHERE armament_id=$1)`,
+  },
+  {
+    name: 'gate 9 expires before the signing deadline',
+    sql: `UPDATE execution_safety_gate_evidence SET
+      expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 second'
+      WHERE gate_index=9 AND qualification_id=(SELECT qualification_id
+        FROM execution_activation_armaments WHERE armament_id=$1)`,
+  },
+  {
+    name: 'the provider snapshot is superseded',
+    sql: `UPDATE execution_provider_usage_snapshots SET
+      superseded_at=date_trunc('milliseconds',statement_timestamp()),
+      purge_after=date_trunc('milliseconds',statement_timestamp())+INTERVAL '4 hours'
+      WHERE snapshot_fingerprint=(SELECT target_provider_snapshot_fingerprint
+        FROM execution_activation_armaments WHERE armament_id=$1)`,
+  },
+] as const) {
+  void test(`ENVELOPE signing is refused when ${refusal.name}`, async (context) => {
+    await withSchema(context, async (pool) => {
+      const fixture = await envelopeBuyFixture(pool);
+      await mutateWithTriggersDisabled(pool, refusal.sql, [fixture.armamentId]);
+      await assert.rejects(new PostgresExecutionLiveRepository(pool).authorizeExactSigning(fixture.input),
+        isLiveError('PREFLIGHT_EXPIRED'));
+    });
+  });
+}
+
 void test('PostgreSQL 16 live role starts on an ACTIVE envelope and reads the qualification scope',
   async (context) => {
     await withProvisionedDatabase(context, async (pool) => {

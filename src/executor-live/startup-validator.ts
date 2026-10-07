@@ -205,7 +205,7 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'generation_id', 'payload_version', 'state', 'valid_until',
       )),
       table('execution_wallet_snapshots', names(
-        'snapshot_fingerprint', 'observed_at', 'superseded_at',
+        'snapshot_fingerprint', 'superseded_at',
       )),
       table('execution_safety_gate_evidence', names(
         'qualification_id', 'gate_index', 'gate_id', 'status', 'evidence_fingerprint', 'expires_at',

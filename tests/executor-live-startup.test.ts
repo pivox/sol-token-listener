@@ -302,7 +302,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
   // The BUY signing binding re-checks the wallet snapshot and gates 7/9: read-only columns.
   assert.deepEqual(byName.get('execution_wallet_snapshots'), {
     name: 'execution_wallet_snapshots',
-    select: ['snapshot_fingerprint', 'observed_at', 'superseded_at'],
+    select: ['snapshot_fingerprint', 'superseded_at'],
     insert: [], update: [],
   });
   assert.deepEqual(byName.get('execution_safety_gate_evidence'), {
