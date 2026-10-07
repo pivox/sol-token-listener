@@ -1007,7 +1007,7 @@ le BUY inchangé ; H2a vend à l'échéance (`maximum_holding_ms`). Plan et déc
 - Un intent refusé avec CONFLICT ou INVALID_DATA est exclu jusqu'à son expiration ; les codes
   transitoires sont réessayés au tick suivant.
 - `revoke` met l'enveloppe en REVOKED et révoque un armement ARMED. Un BUY déjà LOCKED se
-  termine et sa position est vendue à l'échéance (pas de sortie immédiate en 4a).
+  termine et sa position est vendue sans attendre l'échéance depuis le lot 4b (lane `exit`).
 - `intent.requested_at >= valid_from` repose sur l'horloge du listener.
 
 ### Risque accepté (A21)
@@ -1028,6 +1028,109 @@ au BUY bornent encore ce cas.
    jusqu'au changement de période (A22).
 3. Qualification ENVELOPE valable jusqu'à 24 h : un SELL qui échoue au-delà de `valid_until`
    ne peut plus être préparé ; intervention manuelle. Garder `maximum_holding_ms` <= 300 000.
-4. Revoke n'est pas une sortie immédiate (voir ci-dessus) ; la sortie immédiate est prévue au lot 4b.
+4. ~~Revoke n'est pas une sortie immédiate~~ : résolu par le lot 4b (la lane `exit` vend une position dont l'enveloppe est REVOKED, voir la section suivante).
 5. Un armement ARMED jamais acheté (lane BUY arrêtée) a déjà consommé un `buys_armed` : cela peut
    épuiser l'enveloppe sans trade ; les logs du démon le montrent.
+
+## Sorties rapides, re-sortie et rapport (lot 4b)
+
+H2a (récupération, sans signature ni RPC pour ces sorties) crée des intents SELL en plus de
+l'échéance. Plan : `docs/superpowers/plans/2026-10-07-simple-path-lot4b-exit-lane.md`.
+
+### Ordre des lanes de H2a
+
+Dans chaque passe : reconciliation, confirmation, deadline, reexit, exit. L'échéance passe
+toujours en premier, dans sa propre transaction : un échec de `reexit` ou `exit` ne la retarde pas.
+
+### Sorties anticipées (lane `exit`)
+
+- Elles ne concernent que les positions d'enveloppe (armement avec `envelope_id`). Les positions
+  CANARY ne sortent qu'à l'échéance. Une position dont l'échéance est due sort avec la raison `DEADLINE`.
+- La première condition vraie décide, dans cet ordre :
+  1. enveloppe `REVOKED` ;
+  2. le créateur a vendu après notre entrée ;
+  3. take-profit : la valeur des tokens restants au dernier trade de courbe observé atteint
+     `EXIT_TAKE_PROFIT_BPS` du coût en quote. La vente est au marché (`minimumAmountOutRaw = 1`),
+     H2b protège le prix avec `EXECUTOR_SLIPPAGE_BPS` contre sa cotation fraîche ;
+  4. au moins `EXIT_EXTERNAL_BUYERS_TARGET` acheteurs externes distincts, chacun ayant acheté au
+     moins `EXIT_EXTERNAL_MIN_BUY_RAW`.
+- Variables de H2a, toutes optionnelles (une valeur invalide fait échouer le démarrage) :
+
+  | Variable | Défaut | Plage |
+  |---|---|---|
+  | `EXIT_TAKE_PROFIT_BPS` | 20000 | 10001 à 100000 |
+  | `EXIT_EXTERNAL_BUYERS_TARGET` | 10 | 1 à 1000 |
+  | `EXIT_EXTERNAL_MIN_BUY_RAW` | 1000000 | entier u64 positif |
+
+- La raison est dans `execution_intents.logical_command_id` : `fast-exit:<RAISON>:<position_id>`
+  (`maximum-holding:<position_id>` pour l'échéance), suffixé `:retry-<k>` pour une re-sortie. Il n'y a
+  pas d'événement `LiveExitDecided`. La raison survit à la purge dans `execution_intent_tombstones`.
+- Le rôle de récupération a SELECT sur 9 colonnes de `domain_events` (données de chaîne publiques,
+  aucune écriture) : provisionner les rôles à nouveau (`scripts/provision-executor-roles.sql`).
+
+### SELL échoué on-chain
+
+Un SELL qui a atterri avec une erreur, sans changer le solde du token et en ne payant que les frais,
+termine l'intent en `FAILED` sans `unknown_block` (prouvé sans effet). Toute autre divergence reste
+bloquante (`MISMATCH`, position `UNKNOWN`, `unknown_block`).
+
+Un SELL déjà enregistré `MISMATCH` avant ce déploiement reste bloqué : son évidence ne peut pas être
+résolue et le code n'a aucun chemin pour le débloquer. Procédure manuelle :
+1. `npm run live:kill-switch -- --mode=entry-stop --reason=OPERATOR_ENTRY_STOP` ;
+2. lire la position, ses intents et ses artefacts (`live:status`, SQL sur `execution_live_positions`,
+   `execution_intents WHERE position_id=…`, `execution_signed_transactions`,
+   `execution_reconciliation_evidence`) ;
+3. vérifier le solde du token du wallet on-chain ; s'il reste des tokens, les vendre à la main depuis
+   le wallet, hors du bot ;
+4. consigner l'incident. Ne pas reprendre l'enveloppe tant que la position n'est pas comprise.
+
+### Re-sortie gardée (migration 066)
+
+Une position `EXIT_PENDING` dont l'intent SELL est `FAILED` ou `EXPIRED` reçoit un nouvel intent SELL
+(`logical_command_id` suffixé `:retry-1` à `:retry-3`), pour les positions CANARY comme d'enveloppe. Conditions :
+- l'intent mort est terminal et réconcilié, sans fill, sans artefact signé non résolu, sans évidence
+  `MATCHED` ni `UNKNOWN`/`MISMATCH` non résolue, autorisation de sortie `ACTIVE`, pas de `unknown_block` ;
+- au moins 30 s depuis la fin de l'intent mort ;
+- au plus 3 re-sorties par position (4 intents SELL au total). Un intent expirable est expiré d'abord,
+  la re-sortie suit à une passe ultérieure.
+
+La migration 066 relâche aussi le trigger de position pour ce seul cas et fixe `exit_intent_id`
+hors de la branche de re-sortie (un trou déjà présent dans 036).
+
+Au plafond, H2a journalise `executor_live_recovery.reexit_cap_reached` (une fois par position et par
+processus) et n'écrit rien : la position reste `EXIT_PENDING` et, avec K=1, l'armement verrouillé
+bloque tout nouveau BUY. Procédure manuelle (même procédure pour une position qui reste
+`UNKNOWN`/`EXIT_PENDING` sans issue) :
+1. `npm run live:kill-switch -- --mode=entry-stop --reason=OPERATOR_ENTRY_STOP` (l'auto-arm est déjà bloqué par K=1) ;
+2. lire la position, ses intents SELL et leurs artefacts avec `live:status` et SQL
+   (`execution_live_positions`, `execution_intents WHERE position_id=…`,
+   `execution_signed_transactions WHERE intent_id IN (…)`) ;
+3. vérifier le solde du token du wallet on-chain ; s'il reste des tokens, les vendre à la main depuis le wallet, hors du bot ;
+4. consigner l'incident et ne pas reprendre l'enveloppe tant que la position n'est pas comprise.
+   Le bot n'a aucun chemin qui clôt une position sans SELL réconcilié.
+
+### Rapport
+
+```bash
+DATABASE_URL=… npm run fast-path:report -- [--since=ISO] [--until=ISO] [--format=table|json]
+```
+
+Lecture seule (transaction `READ ONLY`), sur `DATABASE_URL` (souvent le login propriétaire : à lancer
+depuis la machine de l'opérateur). Fenêtre de 24 h par défaut, 7 j au plus. Il donne l'entonnoir, les
+latences, le résultat par position (raison de sortie, re-sorties, PnL, frais des SELL échoués) et les
+429. Les armements et artefacts signés sont purgés 4 h après leur état terminal : le lancer dans les 4 h
+d'un run. Raison de sortie et PnL restent durables. Les 429 du listener sont les compteurs cumulés du
+dernier heartbeat (depuis le démarrage du processus) ; ceux de l'exécuteur ont 4 h de rétention.
+
+### Limites connues (lot 4b)
+
+1. Après une migration, aucun trade de courbe n'est produit : seuls l'échéance ou REVOKED sortent.
+2. Sur un mint de plus de 10 000 trades depuis l'entrée, seuls REVOKED ou l'échéance sortent.
+3. Entre la complétion de la courbe et l'enregistrement de la ligne de pool, un SELL échoue en
+   `VENUE_UNAVAILABLE` ; la re-sortie l'absorbe (dans la limite de 3). Garder `maximum_holding_ms` <= 300 000.
+4. L'estimation du take-profit (prix moyen du dernier trade observé, latence d'ingestion) peut être
+   périmée ou surestimée de quelques pour cent ; une erreur ne fait que sortir plus tôt.
+5. Les frais des SELL échoués ne sont pas dans le PnL du ledger ; le rapport les montre à part.
+6. Les migrations depuis un lancement `DETECTED` enregistrent maintenant le pool en `creates-only`
+   (avant ce correctif, une position migrée ne pouvait jamais être vendue). `LISTENER_TRACKED_POOL_POLL_ENABLED`
+   reste optionnel pour la lane de sortie.
