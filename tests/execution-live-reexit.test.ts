@@ -284,6 +284,10 @@ void test('066 trigger: a direct replacement must be the exact next retry of a d
         ['other amount', { baseAmountRaw: '94' }],
         ['protective minimum', { minimumAmountOutRaw: '2' }],
         ['not live reserved', { liveReserved: false }],
+        ['other mint', { mint: 'So11111111111111111111111111111111111111112' }],
+        ['other quote mint', { quoteMint: '11111111111111111111111111111111' }],
+        // venue_policy: execution_intents_side_venue_amount_check already pins every SELL to
+        // CANONICAL_EXIT, so a different SELL venue cannot even be inserted.
       ] as const) {
         assert.equal(await directReExit(pool, positionId, override), '55000', name);
       }
@@ -355,6 +359,31 @@ void test('re-exit: three re-exits at most, then the position is listed and the 
       assert.equal(served?.positionId, clone.positionId);
       assert.equal(served?.intent.logicalCommandId, `maximum-holding:${clone.positionId}:retry-1`);
       assert.deepEqual(await live.listCappedDeadExits(), [positionId]);
+    });
+  });
+
+void test('re-exit: an intent the expiry would refuse is never picked and starves nobody',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createExitPendingFixture(pool);
+      const positionId = fixture.entry.position?.positionId;
+      assert.ok(positionId !== undefined);
+      await makeExpirable(pool, fixture.exitIntent.id);
+      // Past its TTL, but outside the expiry's attempt-ledger predicates.
+      await withReplica(pool, async (client) => {
+        await client.query(`UPDATE execution_intents SET state_revision=9223372036854775807
+          WHERE id=$1`, [fixture.exitIntent.id]);
+      });
+      const live = new PostgresExecutionLiveRepository(pool);
+      const before = await writeState(pool);
+      assert.equal(await live.createNextReExitIntent(), null);
+      assert.deepEqual(await writeState(pool), before);
+      const clone = await cloneDeadExitPosition(pool, positionId);
+      const served = await live.createNextReExitIntent();
+      assert.equal(served?.positionId, clone.positionId);
+      assert.equal(await intentStatus(pool, fixture.exitIntent.id), 'PENDING');
     });
   });
 
@@ -723,6 +752,9 @@ interface DirectReExitOverride {
   readonly baseAmountRaw?: string;
   readonly minimumAmountOutRaw?: string;
   readonly liveReserved?: boolean;
+  readonly mint?: string;
+  readonly quoteMint?: string;
+  readonly venuePolicy?: string;
   readonly sameIntent?: boolean;
   readonly keepIntent?: boolean;
   readonly positionMutation?: string;
@@ -767,9 +799,12 @@ async function directReExit(
         requested_at=date_trunc('milliseconds',statement_timestamp()),
         expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '120 seconds',
         created_at=date_trunc('milliseconds',statement_timestamp()),
-        updated_at=date_trunc('milliseconds',statement_timestamp())`, [
+        updated_at=date_trunc('milliseconds',statement_timestamp()),
+        mint=COALESCE($7,mint),quote_mint=COALESCE($8,quote_mint),
+        venue_policy=COALESCE($9,venue_policy)`, [
         newIntentId, nextKey, override.strategyId ?? null, override.baseAmountRaw ?? null,
         override.minimumAmountOutRaw ?? null, override.liveReserved ?? true,
+        override.mint ?? null, override.quoteMint ?? null, override.venuePolicy ?? null,
       ]);
       await client.query('INSERT INTO execution_intents SELECT * FROM direct_reexit');
     }

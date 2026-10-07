@@ -9,6 +9,7 @@ import {
   reExitLogicalCommandId,
   REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN,
   REEXIT_MIN_SPACING_MS,
+  MAXIMUM_RE_EXITS,
   type FastExitFacts,
   type FastExitPolicy,
   type FastExitTrade,
@@ -245,6 +246,9 @@ void test('re-exit logical command id', () => {
 
 void test('re-exit SQL key pattern admits exactly the keys that have a next re-exit', () => {
   assert.equal(REEXIT_MIN_SPACING_MS, 30_000);
+  // Migration 066 hardcodes this cap as `:retry-[12]` (the dead key admits one more retry):
+  // changing MAXIMUM_RE_EXITS requires a new migration.
+  assert.equal(MAXIMUM_RE_EXITS, 3);
   // The pattern is a PostgreSQL ARE; the subset it uses has the same meaning in JavaScript.
   const pattern = new RegExp(REEXIT_ELIGIBLE_LOGICAL_KEY_SQL_PATTERN, 'u');
   const keys = [

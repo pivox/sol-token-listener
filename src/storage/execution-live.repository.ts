@@ -5442,12 +5442,30 @@ const REEXIT_GUARD_SQL = `NOT EXISTS (SELECT 1 FROM execution_signed_transaction
  */
 function reExitEligibleKeySql(patternParameter: string): string {
   return `(exit_intent.logical_command_id ~ ${patternParameter}
+    AND exit_intent.strategy_version=1
     AND strpos(exit_intent.logical_command_id, ':' || position.position_id) > 0
     AND ((exit_intent.strategy_id='maximum-holding-exit'
         AND exit_intent.logical_command_id LIKE 'maximum-holding:%')
       OR (exit_intent.strategy_id='${FAST_EXIT_STRATEGY_ID}'
         AND exit_intent.logical_command_id LIKE 'fast-exit:%')))`;
 }
+
+/*
+ * The attempt-ledger predicates of the retention expiration, on the alias `exit_intent`:
+ * shared by the re-exit candidate SQL and expireExitIntentInPlace, so that an intent that
+ * cannot be expired is never picked (it would starve every other position).
+ */
+const EXPIRABLE_ATTEMPT_LEDGER_SQL = `exit_intent.state_revision < 9223372036854775807
+        AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+          WHERE attempt.intent_id=exit_intent.id) = exit_intent.attempt_count
+        AND COALESCE((SELECT MAX(attempt.attempt_number)
+          FROM execution_attempts AS attempt WHERE attempt.intent_id=exit_intent.id),0)
+          = exit_intent.attempt_count
+        AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+          WHERE attempt.intent_id=exit_intent.id AND attempt.status='STARTED') <= 1
+        AND NOT EXISTS (SELECT 1 FROM execution_attempts AS attempt
+          WHERE attempt.intent_id=exit_intent.id AND attempt.status='STARTED'
+            AND attempt.attempt_number<>exit_intent.attempt_count)`;
 
 const REEXIT_CANDIDATE_SQL = `SELECT
     position.position_id,position.generation_id,position.mint,exit_intent.id AS exit_intent_id
@@ -5465,7 +5483,8 @@ const REEXIT_CANDIDATE_SQL = `SELECT
       OR (exit_intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
         AND exit_intent.expires_at <= TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond')
         AND (exit_intent.lease_expires_at IS NULL OR exit_intent.lease_expires_at
-          <= TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond'))))
+          <= TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond'))
+        AND ${EXPIRABLE_ATTEMPT_LEDGER_SQL}))
   ORDER BY position.opened_at,position.position_id LIMIT 1`;
 
 const CAPPED_DEAD_EXITS_SQL = `SELECT position.position_id
@@ -5595,27 +5614,17 @@ async function createReExitIntentLocked(
  * RETURNING on the transition journal, which the recovery role may insert but not read.
  */
 async function expireExitIntentInPlace(client: DatabaseClient, intentId: string): Promise<void> {
-  const selected = await client.query(`SELECT intent.status,intent.attempt_count,
-    intent.state_revision::TEXT AS state_revision,
+  const selected = await client.query(`SELECT exit_intent.status,exit_intent.attempt_count,
+    exit_intent.state_revision::TEXT AS state_revision,
     trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
       AS at_ms
-    FROM execution_intents AS intent
-    WHERE intent.id=$1
-      AND intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
-      AND intent.expires_at <= statement_timestamp()
-      AND (intent.lease_expires_at IS NULL
-        OR intent.lease_expires_at <= statement_timestamp())
-      AND intent.state_revision < 9223372036854775807
-      AND (SELECT COUNT(*) FROM execution_attempts AS attempt
-        WHERE attempt.intent_id=intent.id) = intent.attempt_count
-      AND COALESCE((SELECT MAX(attempt.attempt_number)
-        FROM execution_attempts AS attempt WHERE attempt.intent_id=intent.id),0)
-        = intent.attempt_count
-      AND (SELECT COUNT(*) FROM execution_attempts AS attempt
-        WHERE attempt.intent_id=intent.id AND attempt.status='STARTED') <= 1
-      AND NOT EXISTS (SELECT 1 FROM execution_attempts AS attempt
-        WHERE attempt.intent_id=intent.id AND attempt.status='STARTED'
-          AND attempt.attempt_number<>intent.attempt_count)`, [intentId]);
+    FROM execution_intents AS exit_intent
+    WHERE exit_intent.id=$1
+      AND exit_intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
+      AND exit_intent.expires_at <= statement_timestamp()
+      AND (exit_intent.lease_expires_at IS NULL
+        OR exit_intent.lease_expires_at <= statement_timestamp())
+      AND ${EXPIRABLE_ATTEMPT_LEDGER_SQL}`, [intentId]);
   if (selected.rows.length === 0) return;
   const intent = exactRow(singleRow(selected), [
     'status', 'attempt_count', 'state_revision', 'at_ms',

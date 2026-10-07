@@ -53,6 +53,10 @@ void test('066 is the 036 position guard verbatim plus one EXIT_PENDING re-exit 
       'OLD.exit_reconciliation_fingerprint IS NOT NULL',
       'NEW.exit_reconciliation_fingerprint IS NOT NULL',
       "'execution live position re-exit is not permitted' USING ERRCODE='55000'",
+      'NEW.exit_intent_id IS DISTINCT FROM OLD.exit_intent_id',
+      "NOT (OLD.state='OPEN' AND OLD.exit_intent_id IS NULL AND NEW.state='EXIT_PENDING')",
+      'new_exit.mint=old_exit.mint AND new_exit.quote_mint=old_exit.quote_mint',
+      'new_exit.venue_policy=old_exit.venue_policy',
     ]) assert.ok(sql.includes(fragment), `missing migration contract: ${fragment}`);
     assert.doesNotMatch(sql, /execution_live_state_transition_allowed\(\s*entity_type/u);
     assert.doesNotMatch(sql, /\b(?:DELETE FROM|TRUNCATE|DROP TABLE|GRANT|REVOKE)\b/u);
@@ -116,5 +120,17 @@ void test('066 keeps every other live position transition of 036', async (contex
     assert.equal(await attempt(["state='UNKNOWN'", "state='UNKNOWN'"]), '55000',
       'UNKNOWN -> UNKNOWN');
     assert.equal(await attempt([`mint='${'1'.repeat(32)}'`]), '55000', 'identity');
+    // Outside the re-exit branch, exit_intent_id never changes (the buy intent stands in for
+    // any other existing intent).
+    const swap = 'exit_intent_id=buy_intent_id';
+    assert.equal(await attempt(["state='UNKNOWN'", `state='EXIT_PENDING',${swap}`]), '55000',
+      'UNKNOWN -> EXIT_PENDING with a swap');
+    assert.equal(await attempt([`state='UNKNOWN',${swap}`, "state='EXIT_PENDING'"]), '55000',
+      'EXIT_PENDING -> UNKNOWN with a swap');
+    assert.equal(await attempt(["state='UNKNOWN'", `state='UNKNOWN',${swap}`]), '55000',
+      'UNKNOWN -> UNKNOWN with a swap');
+    assert.equal(await attempt(["state='UNKNOWN'", 'exit_intent_id=NULL']), '55000',
+      'UNKNOWN clearing its exit intent');
+    assert.equal(await attempt([`${closed},${swap}`]), '55000', 'EXIT_PENDING -> CLOSED with a swap');
   });
 });

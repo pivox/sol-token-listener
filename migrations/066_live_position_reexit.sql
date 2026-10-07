@@ -2,7 +2,8 @@
 -- no send possible) may have its exit_intent_id replaced by a new PENDING SELL intent, at most
 -- three times per position. guard_execution_live_position_update is the 036 body verbatim,
 -- except that the transition check gains one EXIT_PENDING -> EXIT_PENDING branch. Every other
--- transition still goes through execution_live_state_transition_allowed, which is unchanged.
+-- transition still goes through execution_live_state_transition_allowed, which is unchanged,
+-- and may no longer change exit_intent_id except on the first exit (OPEN -> EXIT_PENDING).
 -- Each condition is written with IS NULL / IS DISTINCT FROM / EXISTS so that a NULL rejects.
 
 CREATE OR REPLACE FUNCTION guard_execution_live_position_update()
@@ -53,6 +54,8 @@ BEGIN
         WHERE old_exit.id=OLD.exit_intent_id
           AND new_exit.strategy_id=old_exit.strategy_id
           AND new_exit.strategy_version=old_exit.strategy_version
+          AND new_exit.mint=old_exit.mint AND new_exit.quote_mint=old_exit.quote_mint
+          AND new_exit.venue_policy=old_exit.venue_policy
           AND old_exit.logical_command_id ~ ('^(?:maximum-holding|fast-exit:[A-Z_]+):'
             || 'execution_live_position_[0-9a-f]{64}(?::retry-[12])?$')
           AND right(regexp_replace(old_exit.logical_command_id, ':retry-[12]$', ''),
@@ -77,6 +80,10 @@ BEGIN
     END IF;
   ELSIF NOT execution_live_state_transition_allowed('LIVE_POSITION',OLD.state,NEW.state) THEN
     RAISE EXCEPTION 'illegal execution live position state transition' USING ERRCODE='55000';
+  ELSIF NEW.exit_intent_id IS DISTINCT FROM OLD.exit_intent_id
+    AND NOT (OLD.state='OPEN' AND OLD.exit_intent_id IS NULL AND NEW.state='EXIT_PENDING') THEN
+    -- Outside the re-exit branch, exit_intent_id is only ever set by the first exit.
+    RAISE EXCEPTION 'execution live position exit intent is immutable' USING ERRCODE='55000';
   END IF;
   RETURN NEW;
 END;
