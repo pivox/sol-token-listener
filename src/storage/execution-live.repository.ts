@@ -1558,6 +1558,7 @@ export class PostgresExecutionLiveRepository {
             +($1::BIGINT*INTERVAL '1 millisecond')
           AND buy.observed_slot IS NOT NULL
         ORDER BY position.opened_at,position.position_id LIMIT 20`, [observedAtMs]);
+      // Fixed oldest-first order is acceptable: K=1 allows one OPEN position per generation.
       for (const raw of candidates.rows) {
         const candidate = exactRow(raw, [
           'position_id', 'generation_id', 'mint', 'wallet_public_key', 'remaining_base_raw',
@@ -1570,17 +1571,20 @@ export class PostgresExecutionLiveRepository {
           || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
           throw failure('INVALID_DATA');
         }
-        // One candidate whose facts cannot be read is skipped for this pass: the savepoint keeps
-        // the scan transaction (and its 51007 lock) usable for the next candidates.
+        // A candidate whose facts raise a data exception (SQLSTATE class 22) is skipped for this
+        // pass: the savepoint keeps the scan transaction (and its 51007 lock) usable. Any other
+        // error (privilege, timeout, connection, SQL) fails the lane instead of silently
+        // disabling every early exit.
         let reason: FastExitReason | null = null;
         await client.query('SAVEPOINT execution_live_early_exit_facts');
         try {
           const facts = await readFastExitFacts(client, mint, candidate);
           reason = facts === null ? null : decideFastExit(facts, rules);
           await client.query('RELEASE SAVEPOINT execution_live_early_exit_facts');
-        } catch {
+        } catch (error) {
           await client.query('ROLLBACK TO SAVEPOINT execution_live_early_exit_facts');
           await client.query('RELEASE SAVEPOINT execution_live_early_exit_facts');
+          if (!(databaseCode(error)?.startsWith('22') ?? false)) throw error;
           reason = null;
         }
         if (reason === null) continue;

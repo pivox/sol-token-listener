@@ -3947,7 +3947,7 @@ void test('early exit rejects an invalid policy before any database access', asy
   }
 });
 
-void test('early exit skips a candidate whose facts fail and exits the next one',
+void test('early exit skips a candidate whose facts raise a data exception and exits the next one',
   async (context) => {
     const databaseUrl = earlyExitDatabaseUrl(context);
     if (databaseUrl === null) return;
@@ -3961,25 +3961,8 @@ void test('early exit skips a candidate whose facts fail and exits the next one'
           { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
         ]);
       }
-      // The first (oldest) candidate's trade read fails with a real PostgreSQL error.
-      const failing = new PostgresExecutionLiveRepository({
-        connect: async () => {
-          const client = await pool.connect();
-          return {
-            query: async (text: string, values?: readonly unknown[]) => {
-              if (text.includes("type='BondingCurveTradeObserved'") && values?.[0] === fixture.mint) {
-                await client.query('SELECT 1/0');
-              }
-              const result = await client.query(text, values as unknown[] | undefined);
-              return {
-                rows: result.rows as readonly Readonly<Record<string, unknown>>[],
-                rowCount: result.rowCount,
-              };
-            },
-            release: (error?: boolean) => { client.release(error); },
-          };
-        },
-      });
+      // The first (oldest) candidate's trade read fails with a data exception (22012).
+      const failing = failingTradeReadRepository(pool, fixture.mint, 'SELECT 1/0');
       const skipped = await failing.createNextEarlyExitIntent(earlyExitPolicy);
       assert.equal(skipped?.reason, 'CREATOR_SOLD');
       assert.equal(skipped?.intent.positionId, second.positionId);
@@ -3993,6 +3976,57 @@ void test('early exit skips a candidate whose facts fail and exits the next one'
         [fixture.positionId, second.positionId].sort());
     });
   });
+
+void test('early exit fails instead of skipping on a non-data facts error', async (context) => {
+  const databaseUrl = earlyExitDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  for (const sqlState of ['42501', '57014', '08006', '42601']) {
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await earlyExitFixture(pool, 'ACTIVE');
+      const creator = earlyExitPublicKey();
+      await insertLaunchEvent(pool, fixture.mint, creator);
+      await insertTradeEvents(pool, fixture.mint, [
+        { kind: 'SELL', trader: creator, baseAmountRaw: 1_000_000n, quoteAmountRaw: 100n },
+      ]);
+      const failing = failingTradeReadRepository(pool, fixture.mint,
+        `DO $raise$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE='${sqlState}'; END $raise$`);
+      await assert.rejects(failing.createNextEarlyExitIntent(earlyExitPolicy),
+        isLiveRepositoryError('DATABASE_FAILURE'), sqlState);
+      const durable = await pool.query(`SELECT
+        (SELECT COUNT(*)::INTEGER FROM execution_intents WHERE side='SELL') AS sells,
+        (SELECT state FROM execution_live_positions WHERE position_id=$1) AS state`, [
+        fixture.positionId,
+      ]);
+      assert.deepEqual(durable.rows, [{ sells: 0, state: 'OPEN' }], sqlState);
+    });
+  }
+});
+
+/** A repository whose trade read for `mint` first runs `failure` on the same connection. */
+function failingTradeReadRepository(
+  pool: InstanceType<typeof pg.Pool>,
+  mint: string,
+  failure: string,
+): PostgresExecutionLiveRepository {
+  return new PostgresExecutionLiveRepository({
+    connect: async () => {
+      const client = await pool.connect();
+      return {
+        query: async (text: string, values?: readonly unknown[]) => {
+          if (text.includes("type='BondingCurveTradeObserved'") && values?.[0] === mint) {
+            await client.query(failure);
+          }
+          const result = await client.query(text, values as unknown[] | undefined);
+          return {
+            rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+            rowCount: result.rowCount,
+          };
+        },
+        release: (error?: boolean) => { client.release(error); },
+      };
+    },
+  });
+}
 
 /**
  * A second OPEN position of the same armament (envelope), opened 5 s after the first, on a new
