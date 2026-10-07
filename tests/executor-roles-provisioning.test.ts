@@ -96,7 +96,7 @@ void test('executor role provisioning is explicit, passwordless and least-privil
   assert.match(sql, /GRANT SELECT \([\s\S]*?\), INSERT \([\s\S]*?\)\s+ON TABLE execution_safety_qualifications TO sol_token_executor_operations/iu);
   assert.match(sql, /INSERT \(generation_id\), UPDATE \(state,state_revision,last_event_id,updated_at\)\s+ON TABLE execution_control_state TO sol_token_executor_operations/iu);
   assert.match(sql, /ON TABLE execution_activation_armaments TO sol_token_executor_operations/iu);
-  assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_operations/iu);
+  assert.match(sql, /GRANT SELECT \(intent_id,pair_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_operations/iu);
   assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_worker/iu);
   assert.match(sql, /GRANT SELECT \(intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_live/iu);
   assert.doesNotMatch(sql, /GRANT[^;]*execution_preflight_intent_pairs[^;]*TO sol_token_executor_(?:readiness|live|live_recovery)/iu);
@@ -152,6 +152,74 @@ void test('executor role provisioning is explicit, passwordless and least-privil
         ?.split(',').map((target) => target.trim());
       assert.ok(targets !== undefined && !targets.includes(alias),
         `${table} must not be row-locked by the SELECT-only live role`);
+    }
+  }
+});
+
+void test('operations provisioning grants the lot 4a envelope columns and never UPDATE(envelope_id)', async () => {
+  const sql = await readFile(scriptUrl, 'utf8');
+  const executable = sql.replace(/--[^\r\n]*/gu, ' ');
+  const operationsGrant = (table: string): string => {
+    const statements = executable.split(';').filter((statement) => (
+      new RegExp(`ON TABLE ${table} TO sol_token_executor_operations\\s*$`, 'u').test(statement)));
+    assert.equal(statements.length, 1, `one operations grant on ${table}`);
+    return statements[0] ?? '';
+  };
+  const columns = (grant: string, privilege: 'SELECT' | 'INSERT' | 'UPDATE'): readonly string[] => (
+    new RegExp(`${privilege} \\(([^)]*)\\)`, 'u').exec(grant)?.[1]
+      ?.split(',').map((column) => column.trim()) ?? []);
+
+  const envelopes = operationsGrant('execution_entry_envelopes');
+  assert.deepEqual(columns(envelopes, 'SELECT'), [
+    'envelope_id', 'generation_id', 'operator_id', 'payload_version', 'fingerprint',
+    'per_buy_quote_amount_raw', 'max_buys', 'max_open_positions', 'max_total_exposure_raw',
+    'max_realized_loss_raw', 'valid_from', 'valid_until', 'state', 'buys_armed',
+    'realized_loss_raw', 'revoked_at', 'created_at', 'updated_at', 'authorization_id',
+    'risk_policy', 'policy_fingerprint', 'maximum_holding_ms',
+  ]);
+  assert.deepEqual(columns(envelopes, 'INSERT'), [
+    'envelope_id', 'generation_id', 'operator_id', 'payload_version', 'fingerprint',
+    'per_buy_quote_amount_raw', 'max_buys', 'max_open_positions', 'max_total_exposure_raw',
+    'max_realized_loss_raw', 'valid_from', 'valid_until', 'state', 'buys_armed',
+    'realized_loss_raw', 'created_at', 'updated_at', 'authorization_id', 'risk_policy',
+    'policy_fingerprint', 'maximum_holding_ms',
+  ]);
+  assert.deepEqual(columns(envelopes, 'UPDATE'), ['state', 'buys_armed', 'revoked_at', 'updated_at']);
+  const qualifications = operationsGrant('execution_safety_qualifications');
+  for (const privilege of ['SELECT', 'INSERT'] as const) {
+    assert.ok(columns(qualifications, privilege).includes('scope'), `${privilege} scope`);
+    assert.ok(columns(qualifications, privilege).includes('envelope_id'), `${privilege} envelope_id`);
+  }
+  const armaments = operationsGrant('execution_activation_armaments');
+  for (const privilege of ['SELECT', 'INSERT'] as const) {
+    assert.ok(columns(armaments, privilege).includes('envelope_id'), `${privilege} envelope_id`);
+  }
+  assert.deepEqual(columns(armaments, 'UPDATE'), ['state', 'state_revision', 'terminal_at', 'purge_after']);
+  // Columns the SECURITY INVOKER guards read when the operations role arms or resumes (A25).
+  assert.ok(columns(operationsGrant('execution_operator_authorizations'), 'SELECT')
+    .includes('payload_version'));
+  assert.ok(columns(operationsGrant('execution_risk_admission_reports'), 'SELECT')
+    .includes('quota_state'));
+  const controlEvents = columns(operationsGrant('execution_control_events'), 'SELECT');
+  for (const column of ['qualification_id', 'authorization_id', 'operator_id']) {
+    assert.ok(controlEvents.includes(column), `control event ${column}`);
+  }
+  assert.ok(columns(operationsGrant('execution_provider_rate_limit_events'), 'SELECT')
+    .includes('event_id'));
+  // envelope_id is immutable identity: no role may ever be granted UPDATE on it.
+  for (const statement of executable.split(';')) {
+    if (!/\bGRANT\b/iu.test(statement)
+      || !/execution_(?:activation_armaments|safety_qualifications|entry_envelopes)\b/u.test(statement)) {
+      continue;
+    }
+    assert.doesNotMatch(statement, /UPDATE\s*\([^)]*\benvelope_id\b[^)]*\)/iu, statement);
+    assert.doesNotMatch(statement, /GRANT\s+(?:ALL|UPDATE\s+ON)\b/iu, statement);
+  }
+  // The listener keeps its own capacity grant: envelopes are not in the operations REVOKE ALL list.
+  assert.match(executable, /GRANT SELECT \(\s*envelope_id,per_buy_quote_amount_raw,max_buys,buys_armed,state,valid_from,valid_until,created_at\s*\)\s*ON TABLE execution_entry_envelopes TO sol_token_listener_writer/u);
+  for (const statement of executable.split(';')) {
+    if (/\bREVOKE ALL ON TABLE\b/iu.test(statement)) {
+      assert.doesNotMatch(statement, /execution_entry_envelopes/u, statement);
     }
   }
 });
@@ -218,6 +286,41 @@ void test('read-only recovery provisioning matches its closed authority policy',
   assert.deepEqual(submissionEvents.select, [
     'artifact_id', 'generation_id', 'previous_state', 'next_state', 'reason_code',
   ]);
+
+  // Task 10: SELL reconciliation accumulates the envelope realized loss.
+  const recoveryGrant = (table: string): string => {
+    const statements = executable.split(';').filter((statement) => (
+      new RegExp(`ON TABLE ${table} TO sol_token_executor_live_recovery\\s*$`, 'u').test(statement)));
+    assert.equal(statements.length, 1, `one recovery grant on ${table}`);
+    return statements[0] ?? '';
+  };
+  const grantColumns = (grant: string, privilege: 'SELECT' | 'INSERT' | 'UPDATE') => (
+    new RegExp(`${privilege} \\(([^)]*)\\)`, 'u').exec(grant)?.[1]
+      ?.split(',').map((column) => column.trim()) ?? []);
+  const expectedRecovery = {
+    execution_activation_armaments: {
+      select: ['armament_id', 'provider_id', 'state', 'state_revision', 'maximum_holding_ms',
+        'envelope_id'],
+      insert: [],
+      update: ['state', 'state_revision', 'terminal_at', 'purge_after'],
+    },
+    execution_entry_envelopes: {
+      select: ['envelope_id', 'state', 'realized_loss_raw', 'max_realized_loss_raw', 'updated_at'],
+      insert: [],
+      update: ['realized_loss_raw', 'state', 'updated_at'],
+    },
+  } as const;
+  for (const [name, expected] of Object.entries(expectedRecovery)) {
+    const entry = authority.tables.find((table) => table.name === name);
+    assert.ok(entry !== undefined, `recovery authority for ${name}`);
+    assert.deepEqual(entry.select, expected.select, `${name} authority SELECT`);
+    assert.deepEqual(entry.insert, expected.insert, `${name} authority INSERT`);
+    assert.deepEqual(entry.update, expected.update, `${name} authority UPDATE`);
+    const grant = recoveryGrant(name);
+    assert.deepEqual(grantColumns(grant, 'SELECT'), expected.select, `${name} grant SELECT`);
+    assert.deepEqual(grantColumns(grant, 'INSERT'), expected.insert, `${name} grant INSERT`);
+    assert.deepEqual(grantColumns(grant, 'UPDATE'), expected.update, `${name} grant UPDATE`);
+  }
 });
 
 void test('signed live capability is visible only to the dedicated executor role', async () => {

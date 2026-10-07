@@ -8,6 +8,7 @@ import {
   type ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
 import type { ExecutionLivePhase } from '../domain/execution-safety-qualification.js';
+import type { EntryEnvelopeV2 } from '../domain/execution-entry-envelope.js';
 
 export interface OperatorTerminal {
   readonly isTTY: boolean;
@@ -62,6 +63,15 @@ export interface AuthorizeOperatorCanaryArmInput {
   readonly pairFingerprint?: string;
   readonly preparationManifestFingerprint?: string;
   readonly proofFingerprint?: string;
+}
+
+export interface AuthorizeEnvelopeCreationInput {
+  readonly terminal: OperatorTerminal;
+  readonly nonceSource: () => string;
+  readonly walletPublicKey: string;
+  readonly envelope: EntryEnvelopeV2;
+  /** The DB now the envelope's validFromMs was taken from (A15). */
+  readonly nowMs: number;
 }
 
 export class ExecutionOperatorTerminalError extends Error {
@@ -187,6 +197,61 @@ export async function authorizeCanaryArmament(
     payloadVersion: 2, generationId: input.generationId, action: input.action,
     phase: input.phase, contextFingerprint: input.contextFingerprint, nonceHash,
     operatorId: input.operatorId, issuedAtMs: input.nowMs, expiresAtMs: input.nowMs + 60_000,
+    });
+  } catch {
+    throw invalid();
+  }
+}
+
+/**
+ * The human consent for an entry envelope: every limit is shown, the phrase repeats them and
+ * the first 8 hex characters of the envelope fingerprint (A16).
+ */
+export async function authorizeEnvelopeCreation(
+  input: AuthorizeEnvelopeCreationInput,
+): Promise<ExecutionOperatorAuthorizationV1> {
+  try {
+    if (!input.terminal.isTTY) throw invalid();
+    const envelope = input.envelope;
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/u.test(input.walletPublicKey)
+      || !/^[0-9a-f]{64}$/u.test(envelope.fingerprint)
+      || envelope.envelopeId !== `execution_entry_envelope_${envelope.fingerprint}`
+      || !Number.isSafeInteger(input.nowMs) || input.nowMs !== envelope.validFromMs) throw invalid();
+    const nonce = input.nonceSource();
+    if (!/^[0-9a-f]{12}$/u.test(nonce)) throw invalid();
+    const details = [
+      'ENVELOPE_DETAILS', 'V1', `envelopeId=${envelope.envelopeId}`,
+      `perBuyLamports=${envelope.perBuyQuoteAmountRaw.toString()}`,
+      `maxBuys=${envelope.maxBuys}`,
+      `maxExposureLamports=${envelope.maxTotalExposureRaw.toString()}`,
+      `maxLossLamports=${envelope.maxRealizedLossRaw.toString()}`,
+      `holdingMs=${envelope.maximumHoldingMs}`,
+      `validFromMs=${envelope.validFromMs}`, `validUntilMs=${envelope.validUntilMs}`,
+      `policyFingerprint=${envelope.policy.policyFingerprint}`,
+      `qualificationId=${envelope.qualificationId}`,
+    ].join(' ');
+    const phrase = [
+      'CONFIRM', 'ENVELOPE', input.walletPublicKey, envelope.perBuyQuoteAmountRaw.toString(),
+      String(envelope.maxBuys), envelope.maxTotalExposureRaw.toString(),
+      envelope.maxRealizedLossRaw.toString(), String(envelope.maximumHoldingMs),
+      String(envelope.validUntilMs), envelope.fingerprint.slice(0, 8), nonce,
+    ].join(' ');
+    input.terminal.write(`${details}\n${phrase}\n`);
+    if (await input.terminal.readLine() !== phrase) throw invalid();
+    const nonceHash = createHash('sha256').update(JSON.stringify([
+      'execution-operator-nonce-v1', nonce, envelope.generationId, 'ENVELOPE',
+      null, envelope.fingerprint, envelope.operatorId, input.nowMs,
+    ])).digest('hex');
+    return createOperatorAuthorization({
+      payloadVersion: 1,
+      generationId: envelope.generationId,
+      action: 'ENVELOPE',
+      phase: null,
+      contextFingerprint: envelope.fingerprint,
+      nonceHash,
+      operatorId: envelope.operatorId,
+      issuedAtMs: input.nowMs,
+      expiresAtMs: input.nowMs + 60_000,
     });
   } catch {
     throw invalid();

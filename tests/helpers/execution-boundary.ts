@@ -125,7 +125,7 @@ const OPERATIONS_ALLOWED_NODE_BUILTINS = new Set([
 const OPERATIONS_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor-operations\/(?:config|database|main|service|terminal)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor\/database\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/(?:execution-(?:canary|canary-attestation|fault-policy|intent|operations|preflight-bundle|preflight-draft|provider-quota|readiness|reconciliation|risk-policy|safety-(?:attestation|qualification)|simulation|wallet-snapshot)|solana-public-key)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/(?:execution-(?:canary|canary-attestation|entry-envelope|fault-policy|intent|operations|preflight-bundle|preflight-draft|provider-quota|readiness|reconciliation|risk-policy|safety-(?:attestation|qualification)|simulation|wallet-snapshot)|solana-public-key)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor-risk\/admission-service\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-operations-repository\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/(?:database|execution-intent-expiration|execution-intent-lineage\.repository|execution-operations\.repository|execution-risk\.repository)\.(?:js|ts)$/u,

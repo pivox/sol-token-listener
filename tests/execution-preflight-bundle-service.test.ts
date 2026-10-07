@@ -4,9 +4,16 @@ import test from 'node:test';
 import { verifySignedExecutionCanaryEvidence } from '../src/domain/execution-canary-attestation.js';
 import { createExecutionReadinessManifest } from '../src/domain/execution-readiness.js';
 import { verifySignedSafetyQualificationEvidence } from '../src/domain/execution-safety-attestation.js';
-import { createExecutionPreflightBundlePackage } from '../src/preflight-bundle/service.js';
+import {
+  createEnvelopeQualificationPackage,
+  createExecutionPreflightBundlePackage,
+} from '../src/preflight-bundle/service.js';
 import { canonicalStringifyJson, parseJson } from '../src/utils/json.js';
-import { canaryEvidenceInput } from './helpers/execution-canary-fixture.js';
+import {
+  canaryEvidenceInput,
+  envelopeCanaryEvidenceInput,
+  NOW_MS,
+} from './helpers/execution-canary-fixture.js';
 
 const PACKAGE_NOW_MS = 1_788_134_400_000;
 
@@ -117,3 +124,73 @@ function deepFreeze(value: unknown): unknown {
   }
   return value;
 }
+
+function encodedEnvelopeDraft(
+  qualification: object = envelopeCanaryEvidenceInput().qualification,
+  extra: Readonly<Record<string, unknown>> = {},
+): string {
+  return canonicalStringifyJson(Object.freeze({
+    schemaVersion: 'execution-envelope-qualification-draft.v1',
+    qualification: omit(qualification, ['qualificationId', 'qualificationFingerprint']),
+    ...extra,
+  }));
+}
+
+void test('signs an ENVELOPE qualification draft into a verified v2 qualification and no canary', () => {
+  const keys = generateKeyPairSync('ed25519');
+  const privateKeyText = keys.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+  const expected = envelopeCanaryEvidenceInput().qualification;
+  const result = createEnvelopeQualificationPackage(encodedEnvelopeDraft(), privateKeyText, NOW_MS);
+  const publicKey = keys.publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+  const qualification = verifySignedSafetyQualificationEvidence(
+    deepFreeze(parseJson(result.qualificationEnvelope)), publicKey);
+  assert.equal(qualification.payloadVersion, 2);
+  assert.equal(qualification.qualificationId, expected.qualificationId);
+  assert.equal(qualification.qualificationFingerprint, expected.qualificationFingerprint);
+  assert.equal('canaryEnvelope' in result, false);
+  assert.deepEqual(result.manifest, {
+    schemaVersion: 'execution-envelope-qualification-package.v1',
+    state: 'ENVELOPE_QUALIFICATION_PACKAGED',
+    scope: 'ENVELOPE',
+    qualificationId: expected.qualificationId,
+    qualificationFingerprint: expected.qualificationFingerprint,
+    generationId: expected.generationId,
+    walletPublicKey: expected.walletPublicKey,
+    providerId: expected.providerId,
+    qualifiedAtMs: expected.qualifiedAtMs,
+    expiresAtMs: expected.expiresAtMs,
+    evidencePublicKeyBase64: publicKey,
+    paperMainnet49Status: 'NON_EXECUTED_NON_VALIDATED',
+    liveCapabilityPresent: false,
+  });
+  assert.doesNotMatch(canonicalStringifyJson(result.manifest), /signatureBase64|signedPayload/u);
+});
+
+void test('refuses an envelope draft that is v1, stale, future, extended or not canonical', () => {
+  const keys = generateKeyPairSync('ed25519');
+  const privateKeyText = keys.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+  for (const [draft, nowMs] of [
+    [encodedEnvelopeDraft(canaryEvidenceInput().qualification), NOW_MS],
+    [encodedEnvelopeDraft(), NOW_MS + 1_800_001],
+    [encodedEnvelopeDraft(), NOW_MS - 1],
+    [encodedEnvelopeDraft(undefined, { extra: true }), NOW_MS],
+    [` ${encodedEnvelopeDraft()}`, NOW_MS],
+    [encodedDraft(), NOW_MS],
+  ] as const) assert.throws(() => createEnvelopeQualificationPackage(draft, privateKeyText, nowMs));
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  assert.throws(() => createEnvelopeQualificationPackage(encodedEnvelopeDraft(),
+    rsa.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(), NOW_MS));
+  assert.throws(() => createExecutionPreflightBundlePackage(encodedEnvelopeDraft(), privateKeyText,
+    NOW_MS));
+});
+
+void test('signs a one-hour envelope draft a few seconds after its qualification', () => {
+  const keys = generateKeyPairSync('ed25519');
+  const privateKeyText = keys.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+  const expected = envelopeCanaryEvidenceInput().qualification;
+  assert.equal(expected.expiresAtMs - expected.qualifiedAtMs, 3_600_000);
+  const result = createEnvelopeQualificationPackage(encodedEnvelopeDraft(), privateKeyText,
+    expected.qualifiedAtMs + 5_000);
+  assert.equal(result.manifest.qualificationId, expected.qualificationId);
+  assert.equal(result.manifest.expiresAtMs, expected.qualifiedAtMs + 3_600_000);
+});

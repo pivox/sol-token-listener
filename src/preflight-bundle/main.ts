@@ -18,13 +18,22 @@ import {
   sep,
 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { canonicalStringifyJson } from '../utils/json.js';
+import { canonicalStringifyJson, parseJson } from '../utils/json.js';
 import { parseExecutionPreflightBundleConfig } from './config.js';
-import { createExecutionPreflightBundlePackage } from './service.js';
+import {
+  createEnvelopeQualificationPackage,
+  createExecutionPreflightBundlePackage,
+  ENVELOPE_QUALIFICATION_DRAFT_SCHEMA,
+} from './service.js';
 
 interface AtomicBundleFiles {
   readonly qualificationEnvelope: string;
   readonly canaryEnvelope: string;
+  readonly manifestJson: string;
+}
+
+interface AtomicEnvelopeQualificationFiles {
+  readonly qualificationEnvelope: string;
   readonly manifestJson: string;
 }
 
@@ -56,6 +65,46 @@ export async function writeAtomicPreflightBundle(
   synchronize: (path: string) => Promise<void> = syncDirectory,
 ): Promise<void> {
   validateOutput(outputDirectory, files);
+  await writeAtomicDirectory(outputDirectory, [
+    ['qualification.json', files.qualificationEnvelope],
+    ['canary.json', files.canaryEnvelope],
+    ['manifest.json', files.manifestJson],
+  ], synchronize);
+}
+
+/** The envelope variant: only `qualification.json` and `manifest.json`. */
+export async function writeAtomicEnvelopeQualificationPackage(
+  outputDirectory: string,
+  files: AtomicEnvelopeQualificationFiles,
+  synchronize: (path: string) => Promise<void> = syncDirectory,
+): Promise<void> {
+  if (!isAbsolute(outputDirectory) || outputDirectory.includes('\0')) throw new TypeError();
+  const values = [files.qualificationEnvelope, files.manifestJson];
+  if (values.some((value) => value.length === 0 || value.includes('\0'))
+    || Buffer.byteLength(files.qualificationEnvelope, 'utf8') > 131_072
+    || Buffer.byteLength(files.manifestJson, 'utf8') > 32_768) throw new TypeError();
+  await writeAtomicDirectory(outputDirectory, [
+    ['qualification.json', files.qualificationEnvelope],
+    ['manifest.json', files.manifestJson],
+  ], synchronize);
+}
+
+export function isEnvelopeQualificationDraft(encodedDraft: string): boolean {
+  try {
+    const decoded = parseJson(encodedDraft);
+    return typeof decoded === 'object' && decoded !== null && !Array.isArray(decoded)
+      && (decoded as Readonly<Record<string, unknown>>).schemaVersion
+        === ENVELOPE_QUALIFICATION_DRAFT_SCHEMA;
+  } catch {
+    return false;
+  }
+}
+
+async function writeAtomicDirectory(
+  outputDirectory: string,
+  files: readonly (readonly [name: string, content: string])[],
+  synchronize: (path: string) => Promise<void>,
+): Promise<void> {
   await assertMissing(outputDirectory);
   const parent = dirname(outputDirectory);
   const temporaryDirectory = await mkdtemp(join(parent, `.preflight-bundle-${randomUUID()}-`));
@@ -63,9 +112,7 @@ export async function writeAtomicPreflightBundle(
   let renamed = false;
   try {
     await import('node:fs/promises').then(({ chmod }) => chmod(temporaryDirectory, 0o700));
-    await writeProtected(join(temporaryDirectory, 'qualification.json'), files.qualificationEnvelope);
-    await writeProtected(join(temporaryDirectory, 'canary.json'), files.canaryEnvelope);
-    await writeProtected(join(temporaryDirectory, 'manifest.json'), files.manifestJson);
+    for (const [name, content] of files) await writeProtected(join(temporaryDirectory, name), content);
     await synchronize(temporaryDirectory);
     await assertMissing(outputDirectory);
     await rename(temporaryDirectory, outputDirectory);
@@ -101,6 +148,16 @@ export async function main(): Promise<void> {
   );
   const encodedDraft = await readPreflightProtectedFile(config.draftPath, 1_048_576);
   const privateKey = await readPreflightProtectedFile(config.privateKeyPath, 8_192);
+  if (isEnvelopeQualificationDraft(encodedDraft)) {
+    const envelopePackage = createEnvelopeQualificationPackage(encodedDraft, privateKey);
+    const envelopeManifestJson = canonicalStringifyJson(envelopePackage.manifest);
+    await writeAtomicEnvelopeQualificationPackage(config.outputDirectory, Object.freeze({
+      qualificationEnvelope: envelopePackage.qualificationEnvelope,
+      manifestJson: envelopeManifestJson,
+    }));
+    process.stdout.write(`${envelopeManifestJson}\n`);
+    return;
+  }
   const packaged = createExecutionPreflightBundlePackage(encodedDraft, privateKey);
   const manifestJson = canonicalStringifyJson(packaged.manifest);
   await writeAtomicPreflightBundle(config.outputDirectory, Object.freeze({

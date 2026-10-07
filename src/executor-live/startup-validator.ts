@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '064_fast_entry_decisions.sql';
+  readonly migrationHead: '065_entry_envelope_auto_arm.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -199,7 +199,16 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
       table('execution_safety_qualifications', names(
         'qualification_id', 'qualification_fingerprint', 'generation_id', 'phase',
         'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
-        'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'expires_at',
+        'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'expires_at', 'scope',
+      )),
+      table('execution_entry_envelopes', names(
+        'generation_id', 'payload_version', 'state', 'valid_until',
+      )),
+      table('execution_wallet_snapshots', names(
+        'snapshot_fingerprint', 'superseded_at',
+      )),
+      table('execution_safety_gate_evidence', names(
+        'qualification_id', 'gate_index', 'gate_id', 'status', 'evidence_fingerprint', 'expires_at',
       )),
       table('execution_control_state', names(
         'generation_id', 'state', 'state_revision', 'last_event_id',
@@ -589,7 +598,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '064_fast_entry_decisions.sql',
+    migrationHead: '065_entry_envelope_auto_arm.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,

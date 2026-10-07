@@ -952,3 +952,82 @@ d'opportunité, un BUY refusé ou une fermeture sans transaction ne vaut pas
 `PASS`.
 
 Ce critère H2c ne modifie pas le constat livré défini en tête de ce runbook.
+
+## Enveloppe d'entrée et auto-arm (lot 4a)
+
+Chemin simple : l'opérateur crée une enveloppe d'entrée confirmée au TTY, puis un
+démon `live:auto-arm` (rôle operations, sans secret ni signature) arme chaque intent
+BUY `fast-entry-v1` éligible dans l'enveloppe ACTIVE, un à la fois (K=1). H2b exécute
+le BUY inchangé ; H2a vend à l'échéance (`maximum_holding_ms`). Plan et décisions :
+`docs/superpowers/plans/2026-10-07-simple-path-lot4a-envelope-auto-arm.md`.
+
+### Procédure
+
+1. Arrêter les workers dry-run et simulation. Pour produire l'artefact de simulation
+   (gate 10), lancer une fois le worker simulation-only avec `ENTRY_MODE=fast`, puis l'arrêter.
+   L'artefact doit avoir moins de 24 h au moment de `prepare`.
+2. Exécuter H2e et H2d pour un snapshot provider et un snapshot wallet autoritatifs frais.
+3. Préparer, signer, créer, reprendre :
+   - `npm run live:envelope -- prepare --valid-ms=N` (N de 3 600 000 à 86 400 000) écrit un
+     brouillon de qualification non signé ;
+   - H2f signe ce brouillon hors ligne. H2f refuse un brouillon dont l'expiration est dans
+     moins de 30 min ;
+   - `npm run live:envelope -- create --per-buy-lamports=… --max-buys=… --max-exposure-lamports=…
+     --max-loss-lamports=… --holding-ms=…` (TTY, `--holding-ms` de 30 000 à 900 000) ;
+   - `npm run live:resume` (TTY) pour repasser en `RUNNING`.
+4. Démarrer H2a, puis H2b, puis `npm run live:auto-arm`, puis le listener avec `ENTRY_MODE=fast`
+   et `LISTENER_INGESTION_SCOPE=creates-only`.
+5. Arrêts :
+   - `npm run live:envelope -- revoke --envelope-id=…` arrête l'armement et révoque un
+     armement ARMED (pas encore LOCKED) ;
+   - `live:kill-switch --mode=entry-stop` arrête la signature des BUY ; `hard-stop` arrête aussi les SELL ;
+   - les positions ouvertes sont vendues à l'échéance.
+6. Surveiller avec `npm run live:envelope -- show` et `npm run live:status`.
+7. Le démon auto-arm doit rester actif tant qu'une position est ouverte (rafraîchissement du
+   snapshot provider nécessaire au SELL).
+8. Politique recommandée pour 0,01 SOL × 5 buys et plafond de perte 0,03 SOL :
+   `initialCapitalLamports=maximumCapitalLamports=230000000`, `positionSizeBps=1000`,
+   `maximumTotalExposureBps=500`, `maximumOpenPositions=1`, `feeReserveLamports=20000000`,
+   `walletSnapshotMaxAgeMs` et `providerUsageMaxAgeMs` >= `2×lease + 30000`.
+
+### Confirmation TTY et préconditions de `create`
+
+- Phrase : `CONFIRM ENVELOPE <wallet> <perBuy> <maxBuys> <maxExposure> <maxLoss> <holdingMs>
+  <validUntilMs> <empreinte 8 hex> <nonce>`. L'autorisation vit 60 s : la saisir sans tarder.
+- La politique de risque vient du catalogue de gates (non signé). Le TTY n'affiche que son
+  empreinte : la vérifier.
+- `create` refuse si : le capital réconcilié est inférieur à 20 × per_buy ; la politique
+  n'admet pas un BUY quand le plafond de perte est atteint ; l'artefact gate 10 a plus de 24 h.
+
+### Comportement du démon et de H2b
+
+- H2b démarre inactif tant qu'une enveloppe est ACTIVE, mais ne vérifie pas que sa
+  configuration runtime correspond à celle du démon : utiliser les mêmes valeurs `EXECUTOR_*`
+  dans les deux (voir `.env.example`).
+- Un intent refusé avec CONFLICT ou INVALID_DATA est exclu jusqu'à son expiration ; les codes
+  transitoires sont réessayés au tick suivant.
+- `revoke` met l'enveloppe en REVOKED et révoque un armement ARMED. Un BUY déjà LOCKED se
+  termine et sa position est vendue à l'échéance (pas de sortie immédiate en 4a).
+- `intent.requested_at >= valid_from` repose sur l'horloge du listener.
+
+### Risque accepté (A21)
+
+Le rôle operations peut lui-même créer et consommer une autorisation ENVELOPE et insérer une
+enveloppe et sa qualification. Un démon auto-arm compromis peut donc armer hors des limites
+humaines ; un login séparé n'y change rien. Seuls le solde du wallet et les contrôles de risque
+au BUY bornent encore ce cas.
+
+### Limites connues
+
+1. Gate 10 : `prepare` exige un artefact de simulation de moins de 24 h ; le seul producteur
+   prévu est le worker simulation-only sur un intent fast-entry, démon auto-arm arrêté.
+2. Les snapshots provider `EXECUTOR_COUNTERS` ne reportent que les compteurs de cet exécuteur :
+   si le listener partage le même plan provider, `used_units` est sous-estimé. Prévoir un
+   provider id ou une clé dédiée à l'exécuteur. Le report est conservateur (double comptage
+   possible) : une sonde H2e ultérieure plus basse peut être refusée `STALE_MEASUREMENT`
+   jusqu'au changement de période (A22).
+3. Qualification ENVELOPE valable jusqu'à 24 h : un SELL qui échoue au-delà de `valid_until`
+   ne peut plus être préparé ; intervention manuelle. Garder `maximum_holding_ms` <= 300 000.
+4. Revoke n'est pas une sortie immédiate (voir ci-dessus) ; la sortie immédiate est prévue au lot 4b.
+5. Un armement ARMED jamais acheté (lane BUY arrêtée) a déjà consommé un `buys_armed` : cela peut
+   épuiser l'enveloppe sans trade ; les logs du démon le montrent.

@@ -7,6 +7,7 @@ import {
   ExecutionPreflightSourceRepositoryError,
   PostgresExecutionPreflightSourceRepository,
 } from '../src/preflight-source/repository.js';
+import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
 import {
@@ -64,6 +65,38 @@ void test('bounds the exported proof expiry by candidate eligibility and retenti
     preparationRunId: input.source.lineage.preparationRunId,
   });
   assert.equal(exported.expiresAtMs, candidateExpiryMs);
+});
+
+void test('reads a current executor-counter provider snapshot', async () => {
+  const input = preflightDraftInputs();
+  const rows = rowsFrom(input.source);
+  const original = input.source.providerSnapshot;
+  const counters = createProviderUsageSnapshot(Object.freeze({
+    providerId: original.providerId, planId: original.planId,
+    billingPeriodId: original.billingPeriodId,
+    billingPeriodStartedAtMs: original.billingPeriodStartedAtMs,
+    billingPeriodEndsAtMs: original.billingPeriodEndsAtMs, limitUnits: original.limitUnits,
+    usedUnits: original.usedUnits, measuredAtMs: original.measuredAtMs,
+    expiresAtMs: original.expiresAtMs, provenance: 'EXECUTOR_COUNTERS',
+  }));
+  const providerIndex = rows.findIndex((row) => row.snapshot_id === original.snapshotId);
+  assert.notEqual(providerIndex, -1);
+  rows[providerIndex] = Object.freeze({ ...rows[providerIndex], snapshot_id: counters.snapshotId,
+    snapshot_fingerprint: counters.snapshotFingerprint, provenance: 'EXECUTOR_COUNTERS' });
+  let index = 0;
+  const repository = new PostgresExecutionPreflightSourceRepository({ connect: async () => ({
+    query: async (sql) => {
+      if (sql.startsWith('BEGIN') || sql === 'COMMIT') return { rows: [], rowCount: null };
+      const row = rows[index++];
+      if (row === undefined) throw new Error('unexpected query');
+      return { rows: [row], rowCount: 1 };
+    },
+    release() {},
+  }) });
+  const exported = await repository.export({
+    preparationRunId: input.source.lineage.preparationRunId,
+  });
+  assert.deepEqual(exported.providerSnapshot, counters);
 });
 
 void test('rolls back a contradictory snapshot and returns one redacted error', async () => {

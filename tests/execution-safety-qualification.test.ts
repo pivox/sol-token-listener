@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createEnvelopeBindingGates,
   createSafetyQualification,
+  ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS,
   EXECUTION_SAFETY_GATE_IDS,
   ExecutionSafetyQualificationValidationError,
+  qualificationScope,
 } from '../src/domain/execution-safety-qualification.js';
 
 const NOW_MS = 1_788_134_400_000;
@@ -68,6 +71,117 @@ void test('rejects extra keys, accessors, proxies, unsafe timestamps and malform
       && error.message === 'Invalid execution safety qualification.',
   );
 });
+
+void test('keeps the CANARY v1 identity byte-identical', () => {
+  const qualification = createSafetyQualification(input());
+  assert.equal(qualification.qualificationFingerprint,
+    'e1df15d5f8b1d596a79d75b03600e2e63fe3fa92a7f45ef801ec121dc6cb055c');
+  assert.equal(qualification.qualificationId,
+    'execution_safety_qualification_e1df15d5f8b1d596a79d75b03600e2e63fe3fa92a7f45ef801ec121dc6cb055c');
+  assert.equal(qualification.payloadVersion, 1);
+  assert.equal('scope' in qualification, false);
+  assert.equal(qualificationScope(qualification), 'CANARY');
+  assert.throws(() => createSafetyQualification(input({ scope: 'CANARY' })),
+    ExecutionSafetyQualificationValidationError);
+  assert.throws(() => createSafetyQualification(input({ scope: 'ENVELOPE' })),
+    ExecutionSafetyQualificationValidationError);
+});
+
+void test('creates a frozen ENVELOPE-scoped v2 qualification for up to 24 hours', () => {
+  for (const ttl of [1, 3_600_000, ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS]) {
+    const qualification = createSafetyQualification(envelopeInput(ttl));
+    assert.equal(qualification.payloadVersion, 2);
+    assert.equal(qualificationScope(qualification), 'ENVELOPE');
+    assert.equal(qualification.payloadVersion === 2 && qualification.scope, 'ENVELOPE');
+    assert.equal(qualification.phase, 'CANARY');
+    assert.equal(qualification.expiresAtMs - qualification.qualifiedAtMs, ttl);
+    assert.match(qualification.qualificationId, /^execution_safety_qualification_[0-9a-f]{64}$/u);
+    assert.equal(Object.isFrozen(qualification), true);
+    assert.equal(Object.isFrozen(qualification.gates), true);
+    assert.deepEqual(createSafetyQualification(envelopeInput(ttl)), qualification);
+  }
+  assert.equal(ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS, 86_400_000);
+});
+
+void test('rejects ENVELOPE v2 qualifications outside scope, phase and TTL bounds', () => {
+  for (const candidate of [
+    envelopeInput(ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS + 1),
+    envelopeInput(0),
+    { ...envelopeInput(3_600_000), phase: 'MICRO_LIVE' },
+    { ...envelopeInput(3_600_000), phase: 'PILOT' },
+    { ...envelopeInput(3_600_000), scope: 'CANARY' },
+    { ...envelopeInput(3_600_000), evaluatorVersion: 2 },
+    (() => { const { scope: _scope, ...rest } = envelopeInput(3_600_000); return rest; })(),
+    { ...envelopeInput(3_600_000), payloadVersion: 3 },
+    { ...envelopeInput(3_600_000), extra: true },
+  ]) assert.throws(() => createSafetyQualification(candidate),
+    ExecutionSafetyQualificationValidationError);
+  const accessor = { ...envelopeInput(3_600_000) } as Record<string, unknown>;
+  Object.defineProperty(accessor, 'payloadVersion', { enumerable: true, get() { return 2; } });
+  assert.throws(() => createSafetyQualification(accessor), ExecutionSafetyQualificationValidationError);
+});
+
+void test('requires ENVELOPE gates 7 and 9 to be the deterministic binding evidence', () => {
+  const ttl = 3_600_000;
+  const valid = envelopeInput(ttl);
+  const gates = valid.gates;
+  for (const index of [7, 9]) {
+    for (const change of [
+      { evidenceId: 'evidence:other' },
+      { evidenceFingerprint: 'f'.repeat(64) },
+    ]) {
+      const candidate = { ...valid,
+        gates: gates.map((gate, gateIndex) => gateIndex === index ? { ...gate, ...change } : gate) };
+      assert.throws(() => createSafetyQualification(candidate),
+        ExecutionSafetyQualificationValidationError);
+    }
+  }
+  const otherProvider = createEnvelopeBindingGates({
+    generationId: valid.generationId, walletPublicKey: valid.walletPublicKey,
+    providerId: 'secondary', observedAtMs: NOW_MS - 1_000, expiresAtMs: NOW_MS + ttl,
+  });
+  assert.throws(() => createSafetyQualification({ ...valid,
+    gates: gates.map((gate, index) => index === 7 ? otherProvider.provider : gate) }),
+  ExecutionSafetyQualificationValidationError);
+  const binding = createEnvelopeBindingGates({
+    generationId: valid.generationId, walletPublicKey: valid.walletPublicKey,
+    providerId: valid.providerId, observedAtMs: NOW_MS - 1_000, expiresAtMs: NOW_MS + ttl,
+  });
+  assert.equal(binding.provider.gateId, 'PROVIDER_EXIT_CAPACITY_VERIFIED');
+  assert.equal(binding.provider.evidenceType, 'PROVIDER_SNAPSHOT');
+  assert.equal(binding.provider.evidenceId, 'envelope-provider:primary');
+  assert.equal(binding.wallet.gateId, 'WALLET_CHAIN_LIMITS_VERIFIED');
+  assert.equal(binding.wallet.evidenceType, 'WALLET_SNAPSHOT');
+  assert.equal(binding.wallet.evidenceId, valid.generationId);
+  assert.equal(Object.isFrozen(binding), true);
+  assert.equal(Object.isFrozen(binding.provider), true);
+  assert.notEqual(binding.provider.evidenceFingerprint, otherProvider.provider.evidenceFingerprint);
+});
+
+void test('ENVELOPE v2 fingerprint differs from the CANARY v1 fingerprint for identical fields', () => {
+  const v2 = createSafetyQualification(envelopeInput(300_000));
+  const { scope: _scope, ...rest } = envelopeInput(300_000);
+  const v1 = createSafetyQualification({ ...rest, payloadVersion: 1 });
+  assert.equal(v1.payloadVersion, 1);
+  assert.notEqual(v2.qualificationFingerprint, v1.qualificationFingerprint);
+  assert.notEqual(v2.qualificationId, v1.qualificationId);
+});
+
+function envelopeInput(ttlMs: number) {
+  const base = input({ expiresAtMs: NOW_MS + ttlMs });
+  const binding = createEnvelopeBindingGates({
+    generationId: base.generationId as string, walletPublicKey: base.walletPublicKey as string,
+    providerId: base.providerId as string, observedAtMs: NOW_MS - 1_000,
+    expiresAtMs: NOW_MS + Math.max(ttlMs, 300_000),
+  });
+  const gates = gateEvidence().map((gate, index) => index === 7 ? binding.provider
+    : index === 9 ? binding.wallet
+      : { ...gate, expiresAtMs: NOW_MS + Math.max(ttlMs, 300_000) });
+  return { ...base, payloadVersion: 2, scope: 'ENVELOPE', gates } as Record<string, unknown> & {
+    generationId: string; walletPublicKey: string; providerId: string;
+    gates: readonly Record<string, unknown>[];
+  };
+}
 
 function input(overrides: Readonly<Record<string, unknown>> = {}) {
   return {

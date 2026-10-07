@@ -4,12 +4,23 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
 import { verifySignedExecutionCanaryEvidence } from '../domain/execution-canary-attestation.js';
-import { createExecutionPreflightDraftSource } from '../domain/execution-preflight-draft.js';
+import {
+  createEnvelopeQualificationDraft,
+  createExecutionPreflightDraftSource,
+} from '../domain/execution-preflight-draft.js';
+import { createExecutionRiskPolicy } from '../domain/execution-risk-policy.js';
 import { canonicalStringifyJson, parseJson } from '../utils/json.js';
-import { parseExecutionCanaryArmConfig, parseExecutionOperationsConfig } from './config.js';
+import {
+  parseExecutionCanaryArmConfig,
+  parseExecutionEnvelopeConfig,
+  parseExecutionOperationsConfig,
+  type ExecutionEnvelopeConfig,
+} from './config.js';
 import { openExecutionOperationsDatabase } from './database.js';
 import {
   createExecutionOperationsService,
+  ExecutionEnvelopeCommandError,
+  type ExecutionEnvelopeCommandErrorCode,
   type ExecutionOperationsService,
 } from './service.js';
 import {
@@ -26,13 +37,21 @@ interface CommandDependencies {
 }
 
 const MAX_CANARY_EVIDENCE_ENVELOPE_BYTES = 196_608;
+const MAX_QUALIFICATION_EVIDENCE_BYTES = 131_072;
+const MAX_GATE_CATALOG_BYTES = 1_048_576;
+const ENVELOPE_CREATE_OPTIONS = Object.freeze([
+  'per-buy-lamports', 'max-buys', 'max-exposure-lamports', 'max-loss-lamports', 'holding-ms',
+]);
 
 export class ExecutionOperationsCliError extends Error {
   public readonly code = 'INVALID_EXECUTION_OPERATIONS_COMMAND' as const;
+  /** Set only for refusals the operator must tell apart; the message stays fixed. */
+  public readonly reason: ExecutionEnvelopeCommandErrorCode | null;
 
-  public constructor() {
+  public constructor(reason: ExecutionEnvelopeCommandErrorCode | null = null) {
     super('Execution operations command failed.');
     this.name = 'ExecutionOperationsCliError';
+    this.reason = reason;
   }
 }
 
@@ -49,11 +68,13 @@ export async function runExecutionOperationsCommand(
       case 'preflight': {
         requireNoOptions(command.options);
         const encoded = await dependencies.readTextFile(config.evidencePath);
-        if (Buffer.byteLength(encoded, 'utf8') > 131_072) throw invalid();
+        if (Buffer.byteLength(encoded, 'utf8') > MAX_QUALIFICATION_EVIDENCE_BYTES) throw invalid();
         const qualificationDraft = verifySignedSafetyQualificationEvidence(
           JSON.parse(encoded) as unknown,
           config.evidencePublicKeyBase64,
         );
+        // An ENVELOPE qualification is only ever persisted by `envelope create`, bound to it.
+        if (qualificationDraft.payloadVersion !== 1) throw invalid();
         assertQualificationBinding(qualificationDraft, config, nowMs);
         const qualification = await dependencies.service.preflight(qualificationDraft);
         return JSON.stringify({
@@ -146,9 +167,83 @@ export async function runExecutionOperationsCommand(
         });
         return statusJson('resume', resumed);
       }
+      case 'envelope-prepare': {
+        requireOnly(command.options, ['valid-ms']);
+        const validMs = decimalInteger(requiredOption(command.options, 'valid-ms'),
+          3_600_000, 86_400_000);
+        const envelopeConfig = parseExecutionEnvelopeConfig(environment);
+        const catalog = await readGateCatalog(dependencies, envelopeConfig);
+        const facts = await dependencies.service.prepareEnvelopeFacts(envelopeConfig.generationId, {
+          buildHash: envelopeConfig.buildHash,
+          configurationFingerprint: envelopeConfig.configurationFingerprint,
+          walletPublicKey: envelopeConfig.walletPublicKey,
+          providerId: envelopeConfig.providerId,
+          genesisHash: envelopeConfig.genesisHash,
+        });
+        if (facts === null) throw new ExecutionEnvelopeCommandError('ENVELOPE_FACTS_UNAVAILABLE');
+        if (facts.generation.generationId !== envelopeConfig.generationId) throw invalid();
+        return canonicalStringifyJson(createEnvelopeQualificationDraft({
+          catalog,
+          generation: facts.generation,
+          providerId: envelopeConfig.providerId,
+          simulation: facts.simulation,
+          qualifiedAtMs: facts.databaseNowMs,
+          expiresAtMs: facts.databaseNowMs + validMs,
+        }));
+      }
+      case 'envelope-create': {
+        const limits = envelopeCreateOptions(command.options);
+        const envelopeConfig = parseExecutionEnvelopeConfig(environment);
+        const encoded = await dependencies.readTextFile(envelopeConfig.evidencePath);
+        if (Buffer.byteLength(encoded, 'utf8') > MAX_QUALIFICATION_EVIDENCE_BYTES) throw invalid();
+        const qualification = verifySignedSafetyQualificationEvidence(
+          JSON.parse(encoded) as unknown,
+          envelopeConfig.evidencePublicKeyBase64,
+        );
+        if (qualification.payloadVersion !== 2) throw invalid();
+        assertQualificationBinding(qualification, envelopeConfig, nowMs);
+        const catalog = await readGateCatalog(dependencies, envelopeConfig);
+        const envelope = await dependencies.service.createEnvelope({
+          payloadVersion: 1, qualification,
+          policy: createExecutionRiskPolicy(catalog.policy),
+          operatorId: envelopeConfig.operatorId,
+          ...limits,
+          terminal: dependencies.terminal,
+        });
+        return JSON.stringify({
+          payloadVersion: 1, command: 'envelope-create', envelopeId: envelope.envelopeId,
+          validUntilMs: envelope.validUntilMs,
+          perBuyQuoteAmountRaw: envelope.perBuyQuoteAmountRaw.toString(),
+          maxBuys: envelope.maxBuys, qualificationId: envelope.qualificationId,
+          liveCapabilityPresent: false,
+        });
+      }
+      case 'envelope-revoke': {
+        requireOnly(command.options, ['envelope-id']);
+        const envelopeId = requiredOption(command.options, 'envelope-id');
+        if (!/^execution_entry_envelope_[0-9a-f]{64}$/u.test(envelopeId)) throw invalid();
+        const revocation = await dependencies.service.revokeEnvelope({
+          generationId: config.generationId, envelopeId,
+          operatorId: config.operatorId, occurredAtMs: nowMs,
+        });
+        return JSON.stringify({
+          payloadVersion: 1, command: 'envelope-revoke', envelopeId: revocation.envelopeId,
+          state: revocation.state, replayed: revocation.replayed,
+          armamentRevoked: revocation.armamentRevoked, databaseNowMs: revocation.databaseNowMs,
+          liveCapabilityPresent: false,
+        });
+      }
+      case 'envelope-show': {
+        requireNoOptions(command.options);
+        const envelopes = await dependencies.service.readEnvelopes(config.generationId);
+        return JSON.stringify({
+          payloadVersion: 1, command: 'envelope-show', envelopes,
+          liveCapabilityPresent: false,
+        }, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value);
+      }
     }
-  } catch {
-    throw invalid();
+  } catch (error) {
+    throw invalid(error instanceof ExecutionEnvelopeCommandError ? error.code : null);
   }
 }
 
@@ -162,6 +257,7 @@ export async function main(): Promise<void> {
   const service = createExecutionOperationsService({
     repository: database.repository,
     canaryRepository: database.repository,
+    envelopeRepository: database.repository,
     nonceSource: createOperatorNonce,
   });
   try {
@@ -177,13 +273,28 @@ export async function main(): Promise<void> {
   }
 }
 
+type CommandName = 'preflight' | 'status' | 'report' | 'kill-switch' | 'arm' | 'resume'
+  | 'envelope-prepare' | 'envelope-create' | 'envelope-revoke' | 'envelope-show';
+
 function singleCommand(argv: readonly string[]): Readonly<{
-  name: 'preflight' | 'status' | 'report' | 'kill-switch' | 'arm' | 'resume';
+  name: CommandName;
   options: ReadonlyMap<string, string>;
 }> {
-  const [name, ...encodedOptions] = argv;
-  if (name !== 'preflight' && name !== 'status' && name !== 'report'
-    && name !== 'kill-switch' && name !== 'arm' && name !== 'resume') throw invalid();
+  const [first, ...rest] = argv;
+  let name: CommandName;
+  let encodedOptions: readonly string[];
+  if (first === 'envelope') {
+    const [subCommand, ...envelopeOptions] = rest;
+    if (subCommand !== 'prepare' && subCommand !== 'create' && subCommand !== 'revoke'
+      && subCommand !== 'show') throw invalid();
+    name = `envelope-${subCommand}`;
+    encodedOptions = envelopeOptions;
+  } else {
+    if (first !== 'preflight' && first !== 'status' && first !== 'report'
+      && first !== 'kill-switch' && first !== 'arm' && first !== 'resume') throw invalid();
+    name = first;
+    encodedOptions = rest;
+  }
   const options = new Map<string, string>();
   for (const encoded of encodedOptions) {
     const match = /^--([a-z][a-z-]{0,31})=(.{1,256})$/u.exec(encoded);
@@ -225,6 +336,39 @@ function armOnlyCommand(options: ReadonlyMap<string, string>): Readonly<{
     maximumCapitalLamports: positiveU64(requiredOption(options, 'maximum-lamports')),
     maximumHoldingMs: decimalInteger(requiredOption(options, 'holding-ms'), 30_000, 900_000),
     operatorReason });
+}
+
+function envelopeCreateOptions(options: ReadonlyMap<string, string>): Readonly<{
+  perBuyQuoteAmountRaw: bigint;
+  maxBuys: number;
+  maxTotalExposureRaw: bigint;
+  maxRealizedLossRaw: bigint;
+  maximumHoldingMs: number;
+}> {
+  requireOnly(options, ENVELOPE_CREATE_OPTIONS);
+  if (options.size !== ENVELOPE_CREATE_OPTIONS.length) throw invalid();
+  return Object.freeze({
+    perBuyQuoteAmountRaw: positiveU64(requiredOption(options, 'per-buy-lamports')),
+    maxBuys: decimalInteger(requiredOption(options, 'max-buys'), 1, 1_000),
+    maxTotalExposureRaw: positiveU64(requiredOption(options, 'max-exposure-lamports')),
+    maxRealizedLossRaw: positiveU64(requiredOption(options, 'max-loss-lamports')),
+    maximumHoldingMs: decimalInteger(requiredOption(options, 'holding-ms'), 30_000, 900_000),
+  });
+}
+
+/** The H2g gate catalog: canonical JSON whose strategy is this runtime's. */
+async function readGateCatalog(
+  dependencies: CommandDependencies,
+  config: ExecutionEnvelopeConfig,
+): Promise<Readonly<{ policy: unknown }> & Readonly<Record<string, unknown>>> {
+  const encoded = await dependencies.readTextFile(config.gateCatalogPath);
+  if (Buffer.byteLength(encoded, 'utf8') > MAX_GATE_CATALOG_BYTES) throw invalid();
+  const decoded = parseJson(encoded);
+  if (canonicalStringifyJson(decoded) !== encoded || typeof decoded !== 'object'
+    || decoded === null || Array.isArray(decoded)) throw invalid();
+  const catalog = deepFreeze(decoded) as Readonly<Record<string, unknown>>;
+  if (catalog.strategyFingerprint !== config.strategyFingerprint) throw invalid();
+  return catalog as Readonly<{ policy: unknown }> & Readonly<Record<string, unknown>>;
 }
 
 function positiveU64(value: string): bigint {
@@ -287,8 +431,8 @@ function statusJson(command: string, status: Awaited<ReturnType<
   });
 }
 
-function invalid(): ExecutionOperationsCliError {
-  return new ExecutionOperationsCliError();
+function invalid(reason: ExecutionEnvelopeCommandErrorCode | null = null): ExecutionOperationsCliError {
+  return new ExecutionOperationsCliError(reason);
 }
 
 function deepFreeze(value: unknown): unknown {
@@ -299,12 +443,14 @@ function deepFreeze(value: unknown): unknown {
 
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
-  void main().catch(() => {
+  void main().catch((error: unknown) => {
     process.exitCode = 1;
+    const reason = error instanceof ExecutionOperationsCliError ? error.reason : null;
     process.stderr.write(`${JSON.stringify({
       service: 'sol-token-executor-operations',
       event: 'executor.operations_failed',
       errorCode: 'EXECUTION_OPERATIONS_FAILED',
+      ...(reason === null ? {} : { reason }),
     })}\n`);
   });
 }

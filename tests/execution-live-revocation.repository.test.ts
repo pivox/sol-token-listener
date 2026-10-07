@@ -116,6 +116,44 @@ void test('expired pre-signature lock is atomically revoked and stops new entrie
     });
   });
 
+void test('CANARY signing still binds gates 7 and 9 to the exact target snapshots',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = await createBuyFixture(pool);
+      const live = new PostgresExecutionLiveRepository(pool);
+      const input = Object.freeze({
+        claim: fixture.claim, attempt: fixture.attempt, generationId,
+        runtime: fixture.runtime, material: fixture.material,
+      });
+      const setGate = async (gateIndex: number, value: string | null) => {
+        const client = await pool.connect();
+        try {
+          await client.query('SET session_replication_role=replica');
+          await client.query(`UPDATE execution_safety_gate_evidence SET evidence_fingerprint=COALESCE($3,
+            (SELECT CASE WHEN $2::INTEGER=9 THEN armament.target_wallet_snapshot_fingerprint
+              ELSE armament.target_provider_snapshot_fingerprint END
+              FROM execution_activation_armaments armament WHERE armament.qualification_id=$1))
+            WHERE qualification_id=$1 AND gate_index=$2::INTEGER`,
+          [fixture.qualificationId, gateIndex, value]);
+        } finally {
+          await client.query('SET session_replication_role=origin');
+          client.release();
+        }
+      };
+      for (const gateIndex of [9, 7]) {
+        await setGate(gateIndex, 'f'.repeat(64));
+        await assert.rejects(live.authorizeExactSigning(input), isLiveRepositoryError('PREFLIGHT_EXPIRED'));
+        await setGate(gateIndex, null);
+      }
+      await live.authorizeExactSigning(input);
+      await setGate(9, 'f'.repeat(64));
+      await assert.rejects(live.authorizeExactSigning(input), isLiveRepositoryError('CONFLICT'));
+    });
+  });
+
 void test('stranded lock recovery never lowers an operator HARD_STOP', async (context) => {
   const databaseUrl = requiredDatabaseUrl(context);
   if (databaseUrl === null) return;
@@ -621,11 +659,6 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
   const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
-  await insertExecutionDecisionEvent(
-    pool,
-    `maximum-holding:${entry.position.positionId}`,
-    entry.position.mint,
-  );
   const exit = await live.createDeadlineExitIntent({
     positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });

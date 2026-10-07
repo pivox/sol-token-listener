@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  isEnvelopeQualificationDraft,
   readPreflightProtectedFile,
+  writeAtomicEnvelopeQualificationPackage,
   writeAtomicPreflightBundle,
 } from '../src/preflight-bundle/main.js';
 
@@ -54,4 +56,32 @@ void test('removes the published directory when the parent durability fence fail
   }));
   assert.equal(calls, 2);
   await assert.rejects(() => stat(output), { code: 'ENOENT' });
+});
+
+void test('publishes an envelope qualification package without a canary file', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'preflight-envelope-'));
+  context.after(async () => { await import('node:fs/promises').then(({ rm }) => rm(root, { recursive: true, force: true })); });
+  const output = join(root, 'package');
+  await writeAtomicEnvelopeQualificationPackage(output, Object.freeze({
+    qualificationEnvelope: '{"qualification":true}',
+    manifestJson: '{"manifest":true}',
+  }));
+  assert.equal((await lstat(output)).mode & 0o777, 0o700);
+  assert.deepEqual((await readdir(output)).sort(), ['manifest.json', 'qualification.json']);
+  for (const file of ['qualification.json', 'manifest.json']) {
+    assert.equal((await lstat(join(output, file))).mode & 0o777, 0o600);
+  }
+  assert.equal(await readFile(join(output, 'qualification.json'), 'utf8'), '{"qualification":true}');
+  await assert.rejects(() => writeAtomicEnvelopeQualificationPackage(output, Object.freeze({
+    qualificationEnvelope: '{}', manifestJson: '{}',
+  })));
+});
+
+void test('dispatches only a canonical envelope draft schema to the envelope packager', () => {
+  assert.equal(isEnvelopeQualificationDraft(
+    '{"qualification":{},"schemaVersion":"execution-envelope-qualification-draft.v1"}'), true);
+  assert.equal(isEnvelopeQualificationDraft(
+    '{"schemaVersion":"execution-preflight-bundle-draft.v1"}'), false);
+  assert.equal(isEnvelopeQualificationDraft('not json'), false);
+  assert.equal(isEnvelopeQualificationDraft('["execution-envelope-qualification-draft.v1"]'), false);
 });

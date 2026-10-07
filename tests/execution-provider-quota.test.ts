@@ -234,3 +234,12 @@ function assertInvalid(operation: () => unknown): void {
     return true;
   });
 }
+
+void test('accepts the unsigned EXECUTOR_COUNTERS provenance without changing other identities', () => {
+  const counters = createProviderUsageSnapshot(snapshotInput({ provenance: 'EXECUTOR_COUNTERS' }));
+  assert.equal(counters.provenance, 'EXECUTOR_COUNTERS');
+  assert.equal(Object.isFrozen(counters), true);
+  assert.notEqual(counters.snapshotFingerprint, createProviderUsageSnapshot(snapshotInput()).snapshotFingerprint);
+  assert.throws(() => createProviderUsageSnapshot(snapshotInput({ provenance: 'EXECUTOR_COUNTER' })),
+    ExecutionProviderQuotaValidationError);
+});

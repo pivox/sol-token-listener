@@ -565,8 +565,11 @@ function fingerprintValue(value: unknown): string {
   return parsed;
 }
 function nullableString(value: unknown): string | null { return value === null ? null : stringValue(value); }
-function providerProvenance(value: unknown): 'AUTHORITATIVE_PROBE' | 'OPERATOR_REPORT' {
-  if (value !== 'AUTHORITATIVE_PROBE' && value !== 'OPERATOR_REPORT') throw new TypeError();
+function providerProvenance(
+  value: unknown,
+): 'AUTHORITATIVE_PROBE' | 'OPERATOR_REPORT' | 'EXECUTOR_COUNTERS' {
+  if (value !== 'AUTHORITATIVE_PROBE' && value !== 'OPERATOR_REPORT'
+    && value !== 'EXECUTOR_COUNTERS') throw new TypeError();
   return value;
 }
 function numberValue(value: unknown): number { if (!Number.isSafeInteger(value)) throw new TypeError(); return value as number; }

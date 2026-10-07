@@ -217,6 +217,10 @@ const RUNNABLE_WORK_SQL = `SELECT (
       AND armament.runtime_max_fee_payer_lamport_debit=$15::NUMERIC
       AND armament.runtime_max_rpc_calls_per_attempt=$16
       AND armament.runtime_lease_ms=$17)
+  -- An open envelope is work: the operations auto-arm daemon arms its intents while H2b idles.
+  OR EXISTS (SELECT 1 FROM execution_entry_envelopes envelope
+    WHERE envelope.generation_id=$1 AND envelope.payload_version=2
+      AND envelope.state='ACTIVE' AND envelope.valid_until>statement_timestamp())
 ) AS runnable_work`;
 export class PostgresExecutionLiveRepository {
   readonly #source: DatabaseSource;
@@ -325,6 +329,7 @@ export class PostgresExecutionLiveRepository {
         qualification.genesis_hash AS qualification_genesis_hash,
         qualification.provider_id AS qualification_provider_id,
         trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT AS qualification_expires_at_ms,
+        qualification.scope AS qualification_scope,
         control.state AS control_state,risk.unknown_block,
         wallet.superseded_at AS wallet_superseded_at,
         provider.superseded_at AS provider_superseded_at,
@@ -391,6 +396,7 @@ export class PostgresExecutionLiveRepository {
         qualification.genesis_hash AS qualification_genesis_hash,
         qualification.provider_id AS qualification_provider_id,
         trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT AS qualification_expires_at_ms,
+        qualification.scope AS qualification_scope,
         armament.armament_id,armament.payload_version AS armament_payload_version,
         armament.state AS armament_state,armament.state_revision::TEXT AS armament_state_revision,
         armament.phase AS armament_phase,armament.build_hash AS armament_build_hash,
@@ -427,7 +433,6 @@ export class PostgresExecutionLiveRepository {
         admission.decision AS admission_decision,admission.quota_state,
         admission.quote_amount_raw::TEXT AS admission_quote_amount_raw,
         risk.unknown_block,wallet.superseded_at AS wallet_superseded_at,
-        trunc(EXTRACT(EPOCH FROM wallet.observed_at)*1000)::TEXT AS wallet_observed_at_ms,
         provider.superseded_at AS provider_superseded_at,
         trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms,
         provider_gate.status AS provider_gate_status,
@@ -2408,6 +2413,20 @@ function unsignedSimulationFingerprint(value: ExecutionSimulationEvidenceV1): st
   ]);
 }
 
+/** Signing accepts only the two qualification scopes; anything else fails closed. */
+function knownQualificationScope(row: Row): boolean {
+  return row.qualification_scope === 'CANARY' || row.qualification_scope === 'ENVELOPE';
+}
+
+/**
+ * CANARY gates 7 and 9 carry the armament's exact snapshot fingerprints. ENVELOPE gates carry
+ * deterministic generation/provider bindings instead (checked at arming by migration 065), so
+ * only their status and expiry are re-checked here.
+ */
+function canaryScoped(row: Row): boolean {
+  return row.qualification_scope === 'CANARY';
+}
+
 function validateExactSigningBinding(
   row: Row,
   input: ExecutionExactSigningInputV1,
@@ -2469,11 +2488,13 @@ function validateExactSigningBinding(
     || row.admission_provider_snapshot_fingerprint !== row.target_provider_snapshot_fingerprint
     || row.unknown_block !== false || row.wallet_superseded_at !== null
     || row.provider_superseded_at !== null
+    || !knownQualificationScope(row)
     || row.wallet_gate_status !== 'PASSED'
-    || row.wallet_gate_fingerprint !== row.target_wallet_snapshot_fingerprint
+    || (canaryScoped(row) && row.wallet_gate_fingerprint !== row.target_wallet_snapshot_fingerprint)
     || timestampText(row.wallet_gate_expires_at_ms) < deadlineMs
     || row.provider_gate_status !== 'PASSED'
-    || row.provider_gate_fingerprint !== row.target_provider_snapshot_fingerprint
+    || (canaryScoped(row)
+      && row.provider_gate_fingerprint !== row.target_provider_snapshot_fingerprint)
     || timestampText(row.provider_gate_expires_at_ms) < deadlineMs
     || timestampText(row.provider_expires_at_ms) < deadlineMs
     || material.quoteObservedAtMs > nowMs
@@ -2510,11 +2531,12 @@ function exactSigningReplay(
     || timestampText(row.qualification_expires_at_ms) < deadlineMs
     || row.control_state !== 'RUNNING' || row.unknown_block !== false
     || row.wallet_superseded_at !== null || row.provider_superseded_at !== null
+    || !knownQualificationScope(row)
     || row.wallet_gate_status !== 'PASSED'
-    || row.wallet_gate_fingerprint !== row.wallet_snapshot_fingerprint
+    || (canaryScoped(row) && row.wallet_gate_fingerprint !== row.wallet_snapshot_fingerprint)
     || timestampText(row.wallet_gate_expires_at_ms) < deadlineMs
     || row.provider_gate_status !== 'PASSED'
-    || row.provider_gate_fingerprint !== row.provider_snapshot_fingerprint
+    || (canaryScoped(row) && row.provider_gate_fingerprint !== row.provider_snapshot_fingerprint)
     || timestampText(row.provider_gate_expires_at_ms) < deadlineMs
     || timestampText(row.provider_expires_at_ms) < deadlineMs
     || row.armament_phase !== input.runtime.phase
@@ -4517,6 +4539,28 @@ export const LIVE_POSITION_LEDGER_INSERT_SQL = `INSERT INTO execution_live_posit
   WHERE position.position_id=$4::TEXT
   ON CONFLICT DO NOTHING`;
 
+// Adds the closed position's realized loss to its entry envelope (lot 4a, deviation 8): the
+// loss is max(0, -net_lamports), computed exactly like execution_live_position_ledger.net_lamports
+// (BUY wallet lamport delta + SELL wallet lamport delta); gains never offset losses. An ACTIVE
+// envelope that reaches its maximum becomes EXHAUSTED; any other state is kept, so a REVOKED,
+// EXHAUSTED or EXPIRED envelope still accumulates. A CANARY armament has no envelope and updates
+// nothing. The caller holds the generation lock (51005) and the armament row lock. $1 closed-at
+// epoch ms, $2 exit wallet lamport delta, $3 position id.
+export const ENVELOPE_REALIZED_LOSS_SQL = `UPDATE execution_entry_envelopes envelope SET
+  realized_loss_raw=envelope.realized_loss_raw+loss.amount,
+  state=CASE WHEN envelope.state='ACTIVE'
+      AND envelope.realized_loss_raw+loss.amount>=envelope.max_realized_loss_raw
+    THEN 'EXHAUSTED' ELSE envelope.state END,
+  updated_at=GREATEST(envelope.updated_at,TIMESTAMPTZ 'epoch'+($1::BIGINT*INTERVAL '1 millisecond'))
+FROM (SELECT armament.envelope_id,
+    GREATEST(0::NUMERIC,-(buy.wallet_lamport_delta+$2::NUMERIC)) AS amount
+  FROM execution_live_positions position
+  JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+  JOIN execution_reconciliation_evidence buy
+    ON buy.evidence_fingerprint=position.entry_reconciliation_fingerprint AND buy.side='BUY'
+  WHERE position.position_id=$3::TEXT AND armament.envelope_id IS NOT NULL) loss
+WHERE envelope.envelope_id=loss.envelope_id`;
+
 async function commitSellReconciliation(
   client: DatabaseClient,
   claim: ClaimedExecutionIntent,
@@ -4965,6 +5009,12 @@ async function commitSellReconciliation(
   await client.query(LIVE_POSITION_LEDGER_INSERT_SQL, [
     finalizedAtMs, evidence.walletLamportDelta.toString(), evidence.signature, row.position_id,
   ]);
+  // Runs once per close: a replayed SELL evidence returned above. lockGeneration already holds
+  // 51005 for this generation, the same order as arming (51005, then the envelope row).
+  const envelopeLoss = await client.query(ENVELOPE_REALIZED_LOSS_SQL, [
+    finalizedAtMs, evidence.walletLamportDelta.toString(), row.position_id,
+  ]);
+  if (envelopeLoss.rowCount !== 0 && envelopeLoss.rowCount !== 1) throw failure('CONFLICT');
   await insertLiveStateEvent(
     client, artifact, 'CONFIRMED', 'RECONCILED', 'INTENT_SUCCEEDED', finalizedAtMs,
   );
@@ -5020,13 +5070,15 @@ async function createDeadlineExitIntentLocked(
     position.remaining_base_raw::TEXT AS remaining_base_raw,
     trunc(EXTRACT(EPOCH FROM position.exit_deadline_at)*1000)::TEXT AS exit_deadline_at_ms,
     position.entry_reconciliation_fingerprint,
-    buy.quote_token_program,buy.quote_decimals
+    buy.quote_token_program,buy.quote_decimals,
+    buy.decision_event_id AS buy_decision_event_id
     FROM execution_live_positions position
     JOIN execution_intents buy ON buy.id=position.buy_intent_id
     WHERE position.position_id=$1 FOR UPDATE OF position`, [input.positionId])), [
     'position_id', 'generation_id', 'state', 'position_revision', 'exit_intent_id', 'mint',
     'quote_mint', 'remaining_base_raw', 'exit_deadline_at_ms',
     'entry_reconciliation_fingerprint', 'quote_token_program', 'quote_decimals',
+    'buy_decision_event_id',
   ] as const);
   if (row.position_id !== input.positionId || row.generation_id !== input.generationId) {
     throw failure('INVALID_DATA');
@@ -5052,7 +5104,7 @@ async function createDeadlineExitIntentLocked(
     quoteAmountRaw: null,
     baseAmountRaw: unsignedBigint(row.remaining_base_raw),
     minimumAmountOutRaw: 1n,
-    decisionEventId: logicalCommandId,
+    decisionEventId: text(row.buy_decision_event_id),
     decisionFingerprint: row.entry_reconciliation_fingerprint,
     requestedAtMs: input.observedAtMs,
     expiresAtMs: input.observedAtMs + 120_000,

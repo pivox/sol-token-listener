@@ -169,7 +169,7 @@ export interface ExecutionOperatorAuthorizationV1 {
   readonly payloadVersion: 1;
   readonly authorizationFingerprint: string;
   readonly generationId: string;
-  readonly action: 'ARM' | 'RESUME';
+  readonly action: 'ARM' | 'RESUME' | 'ENVELOPE';
   readonly phase: ExecutionLivePhase | null;
   readonly contextFingerprint: string;
   readonly nonceHash: string;
@@ -178,8 +178,10 @@ export interface ExecutionOperatorAuthorizationV1 {
   readonly expiresAtMs: number;
 }
 
-export interface ExecutionOperatorAuthorizationV2 extends Omit<ExecutionOperatorAuthorizationV1, 'payloadVersion'> {
+export interface ExecutionOperatorAuthorizationV2
+  extends Omit<ExecutionOperatorAuthorizationV1, 'payloadVersion' | 'action'> {
   readonly payloadVersion: 2;
+  readonly action: 'ARM' | 'RESUME';
 }
 
 export class ExecutionOperationsValidationError extends TypeError {
@@ -198,12 +200,13 @@ export function createOperatorAuthorization(input: unknown): ExecutionOperatorAu
       /^execution_wallet_generation_[0-9a-f]{64}$/u,
       96,
     );
-    if (record.action !== 'ARM' && record.action !== 'RESUME') throw invalid();
+    if (record.action !== 'ARM' && record.action !== 'RESUME'
+      && record.action !== 'ENVELOPE') throw invalid();
     const action = record.action;
     const phase = action === 'ARM'
       ? enumValue(record.phase, ['CANARY', 'MICRO_LIVE', 'PILOT'] as const)
       : null;
-    if (action === 'RESUME' && record.phase !== null) throw invalid();
+    if (action !== 'ARM' && record.phase !== null) throw invalid();
     const contextFingerprint = fingerprint(record.contextFingerprint);
     const nonceHash = fingerprint(record.nonceHash);
     const operatorId = patternedText(record.operatorId, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u, 64);
@@ -470,7 +473,8 @@ function qualificationFrom(value: unknown): ExecutionSafetyQualificationV1 {
     gates: record.gates,
   });
   if (record.qualificationId !== canonical.qualificationId
-    || record.qualificationFingerprint !== canonical.qualificationFingerprint) throw invalid();
+    || record.qualificationFingerprint !== canonical.qualificationFingerprint
+    || canonical.payloadVersion !== 1) throw invalid();
   return canonical;
 }
 

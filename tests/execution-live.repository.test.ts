@@ -185,6 +185,41 @@ void test('two concurrent deadline scanners create one deterministic SELL intent
     });
   });
 
+void test('deadline exit references the BUY decision event without a maximum-holding event',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: deadline decision event test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
+      const events = await pool.query(`SELECT 1 FROM domain_events WHERE event_id=$1`, [
+        `maximum-holding:${fixture.position.positionId}`,
+      ]);
+      assert.equal(events.rowCount, 0);
+      const created = await fixture.live.createDeadlineExitIntent({
+        positionId: fixture.position.positionId, observedAtMs: dueAtMs,
+      });
+      assert.equal(created.kind, 'CREATED');
+      assert.ok(created.intent);
+      const ids = await pool.query<{ readonly buy: string; readonly sell: string }>(
+        `SELECT buy.decision_event_id AS buy, sell.decision_event_id AS sell
+         FROM execution_live_positions position
+         JOIN execution_intents buy ON buy.id=position.buy_intent_id
+         JOIN execution_intents sell ON sell.id=position.exit_intent_id
+         WHERE position.position_id=$1`, [fixture.position.positionId]);
+      assert.equal(ids.rows.length, 1);
+      assert.equal(ids.rows[0]?.sell, ids.rows[0]?.buy);
+      const replay = await fixture.live.createDeadlineExitIntent({
+        positionId: fixture.position.positionId, observedAtMs: dueAtMs,
+      });
+      assert.equal(replay.kind, 'REPLAYED');
+      assert.equal(replay.intent?.id, created.intent.id);
+    });
+  });
+
 void test('deadline scanner commit-unknown retries safely through durable targeted replay',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -430,11 +465,6 @@ void test('deadline scanner selects the oldest of two due PostgreSQL candidates'
       const oldestDeadlineMs = nowMs - 60_000;
       const newerDeadlineMs = nowMs - 30_000;
       await setPositionDeadline(pool, fixture.position.positionId, oldestDeadlineMs);
-      await insertExecutionDecisionEvent(
-        pool,
-        `maximum-holding:${fixture.position.positionId}`,
-        fixture.position.mint,
-      );
       const newerPositionId = `execution_live_position_${'b'.repeat(64)}`;
       const newerGenerationId = `execution_wallet_generation_${'b'.repeat(64)}`;
       await pool.query(`UPDATE execution_wallet_generations SET
@@ -3184,13 +3214,6 @@ async function makePositionDue(
   pool: InstanceType<typeof pg.Pool>,
   positionId: string,
 ): Promise<number> {
-  const position = await pool.query<{ readonly mint: string }>(
-    'SELECT mint FROM execution_live_positions WHERE position_id=$1',
-    [positionId],
-  );
-  const mint = position.rows[0]?.mint;
-  assert.equal(typeof mint, 'string');
-  await insertExecutionDecisionEvent(pool, `maximum-holding:${positionId}`, mint ?? '');
   const dueAtMs = (await databaseNowMs(pool)) - 60_000;
   await setPositionDeadline(pool, positionId, dueAtMs);
   return dueAtMs;

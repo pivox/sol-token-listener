@@ -159,7 +159,7 @@ void test('recordBuy writes the decision, the event and a PENDING intent atomica
     assert.equal(intent.base_amount_raw, null);
     assert.equal(intent.minimum_amount_out_raw, '1000000');
     assert.equal(intent.candidate_id, null);
-    assert.equal(intent.ttl_ms, '30000');
+    assert.equal(intent.ttl_ms, '120000');
     const decisionId = createEntryDecisionId(mint);
     assert.equal(intent.logical_command_id, decisionId);
     assert.equal(intent.position_id, `fast_position_${decisionId.slice('entry_decision_'.length)}`);

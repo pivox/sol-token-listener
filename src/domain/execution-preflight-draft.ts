@@ -20,8 +20,10 @@ import {
 } from './execution-readiness.js';
 import { createExecutionRiskPolicy } from './execution-risk-policy.js';
 import {
+  createEnvelopeBindingGates,
   createMainnetSimulationEvidenceFingerprint,
   createSafetyQualification,
+  ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS,
   type ExecutionSafetyGateEvidenceV1,
 } from './execution-safety-qualification.js';
 import type { ExecutionWalletSnapshotV1 } from './execution-wallet-snapshot.js';
@@ -87,6 +89,16 @@ const STATIC_GATES = Object.freeze([
   ['FAULT_MATRIX_VERIFIED', 'FAULT_TEST'],
   ['RECONCILIATION_CLEAN', 'RECONCILIATION_STATE'],
   ['STOP_CONTROLS_VERIFIED', 'STOP_CONTROL_TEST'],
+] as const);
+const ENVELOPE_DRAFT_INPUT_KEYS = Object.freeze([
+  'catalog', 'generation', 'providerId', 'simulation', 'qualifiedAtMs', 'expiresAtMs',
+] as const);
+const ENVELOPE_GENERATION_KEYS = Object.freeze([
+  'generationId', 'walletPublicKey', 'genesisHash',
+] as const);
+const ENVELOPE_SIMULATION_KEYS = Object.freeze([
+  'artifactId', 'resultFingerprint', 'recordedAtMs', 'buildFingerprint',
+  'configurationFingerprint',
 ] as const);
 const QUALIFICATION_TTL_MS = 300_000;
 const MINIMUM_MARGIN_MS = 5_000;
@@ -156,6 +168,30 @@ export interface ExecutionPreflightGateCatalogV1 {
   readonly strategyFingerprint: string;
   readonly policy: Readonly<Record<string, unknown>>;
   readonly gates: readonly ExecutionSafetyGateEvidenceV1[];
+}
+
+export interface ExecutionEnvelopeQualificationDraftInputV1 {
+  readonly catalog: unknown;
+  readonly generation: Readonly<{
+    generationId: string;
+    walletPublicKey: string;
+    genesisHash: string;
+  }>;
+  readonly providerId: string;
+  readonly simulation: Readonly<{
+    artifactId: string;
+    resultFingerprint: string;
+    recordedAtMs: number;
+    buildFingerprint: string;
+    configurationFingerprint: string;
+  }>;
+  readonly qualifiedAtMs: number;
+  readonly expiresAtMs: number;
+}
+
+export interface ExecutionEnvelopeQualificationDraftV1 {
+  readonly schemaVersion: 'execution-envelope-qualification-draft.v1';
+  readonly qualification: Readonly<Record<string, unknown>>;
 }
 
 export class ExecutionPreflightDraftValidationError extends TypeError {
@@ -313,6 +349,81 @@ export function createExecutionPreflightDraft(
     });
     createExecutionPreflightBundle(draft);
     return draft;
+  } catch {
+    throw invalid();
+  }
+}
+
+/**
+ * Assembles the unsigned ENVELOPE (payload v2) qualification: static gates from the catalog,
+ * identity-bound gates 7 and 9, and the mainnet simulation artifact for gate 10. Every gate
+ * expires no earlier than the qualification, so a stale catalog gate is refused.
+ */
+export function createEnvelopeQualificationDraft(
+  input: ExecutionEnvelopeQualificationDraftInputV1,
+): ExecutionEnvelopeQualificationDraftV1 {
+  try {
+    const record = exactRecord(input, ENVELOPE_DRAFT_INPUT_KEYS);
+    const catalog = exactRecord(record.catalog, CATALOG_KEYS);
+    if (catalog.schemaVersion !== 'execution-preflight-gate-catalog.v1') throw invalid();
+    const generation = exactRecord(record.generation, ENVELOPE_GENERATION_KEYS);
+    const simulation = exactRecord(record.simulation, ENVELOPE_SIMULATION_KEYS);
+    createExecutionRiskPolicy(catalog.policy);
+    const strategyFingerprint = fingerprint(catalog.strategyFingerprint);
+    const qualifiedAtMs = timestamp(record.qualifiedAtMs);
+    const expiresAtMs = timestamp(record.expiresAtMs);
+    const recordedAtMs = timestamp(simulation.recordedAtMs);
+    if (expiresAtMs <= qualifiedAtMs
+      || expiresAtMs - qualifiedAtMs > ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS
+      || recordedAtMs > qualifiedAtMs) throw invalid();
+    const staticGates = staticGatesFrom(catalog.gates, qualifiedAtMs, expiresAtMs);
+    const binding = createEnvelopeBindingGates({
+      generationId: generation.generationId as string,
+      walletPublicKey: generation.walletPublicKey as string,
+      providerId: record.providerId as string,
+      observedAtMs: qualifiedAtMs,
+      expiresAtMs,
+    });
+    const mainnetSimulationFingerprint = createMainnetSimulationEvidenceFingerprint({
+      artifactId: simulation.artifactId,
+      resultFingerprint: simulation.resultFingerprint,
+      buildHash: simulation.buildFingerprint,
+      configurationFingerprint: simulation.configurationFingerprint,
+      strategyFingerprint,
+      walletPublicKey: generation.walletPublicKey,
+      genesisHash: generation.genesisHash,
+      providerId: record.providerId,
+    });
+    const gates = Object.freeze([
+      ...staticGates.slice(0, 7),
+      binding.provider,
+      staticGates[7],
+      binding.wallet,
+      dynamicGate('MAINNET_PREFLIGHT_SIMULATED', 'MAINNET_SIMULATION_ARTIFACT',
+        text(simulation.artifactId, 256), mainnetSimulationFingerprint,
+        recordedAtMs, expiresAtMs),
+    ]);
+    const qualification = createSafetyQualification(Object.freeze({
+      payloadVersion: 2,
+      scope: 'ENVELOPE',
+      evaluatorVersion: 1,
+      phase: 'CANARY',
+      buildHash: simulation.buildFingerprint,
+      configurationFingerprint: simulation.configurationFingerprint,
+      strategyFingerprint,
+      generationId: generation.generationId,
+      walletPublicKey: generation.walletPublicKey,
+      cluster: 'mainnet-beta',
+      genesisHash: generation.genesisHash,
+      providerId: record.providerId,
+      qualifiedAtMs,
+      expiresAtMs,
+      gates,
+    }));
+    return Object.freeze({
+      schemaVersion: 'execution-envelope-qualification-draft.v1' as const,
+      qualification: without(qualification, ['qualificationId', 'qualificationFingerprint']),
+    });
   } catch {
     throw invalid();
   }

@@ -69,6 +69,7 @@ export function createExecutionPreflightBundle(input: unknown): ExecutionPreflig
     if (draft.schemaVersion !== 'execution-preflight-bundle-draft.v1') throw invalid();
     const readiness = readinessFrom(draft.readiness);
     const qualification = createSafetyQualification(draft.qualification);
+    if (qualification.payloadVersion !== 1) throw invalid();
     const canaryDraft = exactRecord(draft.canary, CANARY_KEYS);
     if (canaryDraft.payloadVersion !== 1
       || canaryDraft.allEndpointsUnavailable !== false) throw invalid();

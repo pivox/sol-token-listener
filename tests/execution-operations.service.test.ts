@@ -7,14 +7,25 @@ import {
   createSafetyQualification,
   EXECUTION_SAFETY_GATE_IDS,
 } from '../src/domain/execution-safety-qualification.js';
-import { createExecutionOperationsService } from '../src/executor-operations/service.js';
+import {
+  createExecutionOperationsService,
+  ExecutionEnvelopeCommandError,
+} from '../src/executor-operations/service.js';
+import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
+import type { ExecutionOperatorAuthorizationV1 } from '../src/domain/execution-operations.js';
 import type {
+  ExecutionEntryEnvelopeRepository,
+  ExecutionEnvelopeCreationV1,
   ExecutionCanaryArmamentRepository,
   ExecutionCanaryTargetIntentV1,
   ExecutionOperationsRepository,
 } from '../src/ports/execution-operations-repository.js';
 import type { ExecutionActivationArmamentV2 } from '../src/domain/execution-operations.js';
-import { canaryEvidenceInput } from './helpers/execution-canary-fixture.js';
+import {
+  canaryEvidenceInput,
+  envelopeCanaryEvidenceInput,
+  WSOL_MINT,
+} from './helpers/execution-canary-fixture.js';
 import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
 import { createExecutionPreflightDraft } from '../src/domain/execution-preflight-draft.js';
 import { createExecutionPreflightBundle } from '../src/domain/execution-preflight-bundle.js';
@@ -324,6 +335,123 @@ void test('resume requires fresh terminal authorization before repository mutati
   });
   assert.equal(status.controlState, 'RUNNING');
   assert.deepEqual(calls, ['authorization', 'resume']);
+});
+
+function envelopePolicy(overrides: Readonly<Record<string, unknown>> = {}) {
+  return createExecutionRiskPolicy({
+    quoteMintAllowlist: [WSOL_MINT], initialCapitalLamports: 230_000_000n,
+    maximumCapitalLamports: 230_000_000n, positionSizeBps: 1_000n, maximumOpenPositions: 1,
+    maximumTotalExposureBps: 500n, drawdownPauseBps: 2_500n, feeReserveLamports: 20_000_000n,
+    walletSnapshotMaxAgeMs: 300_000, providerUsageMaxAgeMs: 300_000, providerEntryCostUnits: 8n,
+    providerExitCostUnitsPerPosition: 4n, providerConfirmationCostUnitsPerPosition: 2n,
+    providerReconciliationCostUnitsPerPosition: 3n, providerSafetyMarginUnits: 5n,
+    maximumConsecutiveTechnicalFailures: 2, ...overrides,
+  });
+}
+
+function envelopeHarness(terminal: {
+  readonly isTTY: boolean;
+  readonly write: (value: string) => void;
+  readonly readLine: () => Promise<string>;
+}, policyOverrides: Readonly<Record<string, unknown>> = {}) {
+  const calls: string[] = [];
+  const qualification = envelopeCanaryEvidenceInput().qualification;
+  const databaseNowMs = qualification.qualifiedAtMs + 1_000;
+  let recorded: ExecutionOperatorAuthorizationV1 | null = null;
+  let created: ExecutionEnvelopeCreationV1 | null = null;
+  const envelopeRepository: ExecutionEntryEnvelopeRepository = {
+    prepareEnvelopeFacts: async () => { throw new Error('unexpected facts'); },
+    expireEnvelopes: async () => {
+      calls.push('now');
+      return Object.freeze({ payloadVersion: 1, expiredCount: 0, databaseNowMs });
+    },
+    createEnvelope: async (input) => { calls.push('create'); created = input; return input.envelope; },
+    revokeEnvelope: async () => { throw new Error('unexpected revoke'); },
+    readEnvelopes: async () => { throw new Error('unexpected read'); },
+  };
+  const service = createExecutionOperationsService({
+    repository: repositoryStub({ recordAuthorization: async (authorization) => {
+      calls.push('authorization'); recorded = authorization; return 'RECORDED';
+    } }),
+    envelopeRepository,
+    nonceSource: () => 'abcdef123456',
+  });
+  const operation = service.createEnvelope({
+    payloadVersion: 1, qualification: qualification as never, policy: envelopePolicy(policyOverrides),
+    operatorId: 'operator-primary', perBuyQuoteAmountRaw: 10_000_000n, maxBuys: 5,
+    maxTotalExposureRaw: 50_000_000n, maxRealizedLossRaw: 30_000_000n, maximumHoldingMs: 120_000,
+    terminal,
+  });
+  return {
+    calls, qualification, databaseNowMs, operation,
+    recorded: () => recorded, created: () => created,
+  };
+}
+
+void test('envelope create binds DB now, shows its limits at TTY and records then consumes ENVELOPE',
+  async () => {
+    const writes: string[] = [];
+    let typed = '';
+    const harness = envelopeHarness({
+      isTTY: true,
+      write: (value) => { writes.push(value); },
+      readLine: async () => {
+        typed = writes.join('').trim().split('\n').at(-1) ?? '';
+        return typed;
+      },
+    });
+    const envelope = await harness.operation;
+    assert.deepEqual(harness.calls, ['now', 'authorization', 'create']);
+    assert.equal(envelope.validFromMs, harness.databaseNowMs);
+    assert.equal(envelope.validUntilMs, harness.qualification.expiresAtMs);
+    assert.equal(envelope.qualificationId, harness.qualification.qualificationId);
+    const [details, phrase] = writes.join('').trim().split('\n');
+    assert.equal(details, [
+      'ENVELOPE_DETAILS', 'V1', `envelopeId=${envelope.envelopeId}`, 'perBuyLamports=10000000',
+      'maxBuys=5', 'maxExposureLamports=50000000', 'maxLossLamports=30000000', 'holdingMs=120000',
+      `validFromMs=${harness.databaseNowMs}`, `validUntilMs=${harness.qualification.expiresAtMs}`,
+      `policyFingerprint=${envelope.policy.policyFingerprint}`,
+      `qualificationId=${harness.qualification.qualificationId}`,
+    ].join(' '));
+    assert.equal(phrase, [
+      'CONFIRM', 'ENVELOPE', harness.qualification.walletPublicKey, '10000000', '5', '50000000',
+      '30000000', '120000', String(harness.qualification.expiresAtMs),
+      envelope.fingerprint.slice(0, 8), 'abcdef123456',
+    ].join(' '));
+    assert.equal(typed, phrase);
+    const authorization = harness.recorded() as unknown as ExecutionOperatorAuthorizationV1;
+    assert.equal(authorization.action, 'ENVELOPE');
+    assert.equal(authorization.phase, null);
+    assert.equal(authorization.payloadVersion, 1);
+    assert.equal(authorization.contextFingerprint, envelope.fingerprint);
+    assert.equal(authorization.operatorId, 'operator-primary');
+    assert.equal(authorization.issuedAtMs, harness.databaseNowMs);
+    assert.equal(authorization.expiresAtMs, harness.databaseNowMs + 60_000);
+    const created = harness.created() as unknown as ExecutionEnvelopeCreationV1;
+    assert.equal(created.envelope, envelope);
+    assert.equal(created.authorization, authorization);
+    assert.equal(created.qualification.qualificationId, harness.qualification.qualificationId);
+  });
+
+void test('envelope create refuses without a TTY or with a wrong phrase before any write', async () => {
+  const noTty = envelopeHarness({ isTTY: false, write() {}, readLine: async () => '' });
+  await assert.rejects(noTty.operation);
+  assert.deepEqual(noTty.calls, ['now']);
+  const wrong = envelopeHarness({ isTTY: true, write() {}, readLine: async () => 'CONFIRM ENVELOPE' });
+  await assert.rejects(wrong.operation);
+  assert.deepEqual(wrong.calls, ['now']);
+});
+
+void test('envelope create surfaces limits the policy cannot carry (A17) before the TTY', async () => {
+  let prompted = false;
+  const harness = envelopeHarness({ isTTY: true, write: () => { prompted = true; },
+    readLine: async () => '' }, {
+    initialCapitalLamports: 150_000_000n, maximumCapitalLamports: 150_000_000n,
+  });
+  await assert.rejects(harness.operation, (error) => error instanceof ExecutionEnvelopeCommandError
+    && error.code === 'ENVELOPE_LIMITS_REJECTED');
+  assert.equal(prompted, false);
+  assert.deepEqual(harness.calls, ['now']);
 });
 
 function repositoryStub(

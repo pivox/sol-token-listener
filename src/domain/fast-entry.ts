@@ -5,7 +5,7 @@ import { PaperTradingError } from './paper-trading.js';
 
 export const FAST_ENTRY_STRATEGY_ID = 'fast-entry-v1';
 export const FAST_ENTRY_SLIPPAGE_BPS = 1_000n;
-export const FAST_ENTRY_INTENT_TTL_MS = 30_000;
+export const FAST_ENTRY_INTENT_TTL_MS = 120_000;
 export const FAST_ENTRY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** A create first observed longer ago than this is never decided (retries, replays, catch-up). */
 export const FAST_ENTRY_MAX_CREATE_AGE_MS = 15_000;

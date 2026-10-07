@@ -3,6 +3,7 @@ import { isProxy } from 'node:util/types';
 import { PublicKey } from '@solana/web3.js';
 
 const QUALIFICATION_TTL_MS = 300_000;
+export const ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS = 86_400_000;
 const DATE_MAX_MS = 8_640_000_000_000_000;
 const INPUT_KEYS = Object.freeze([
   'payloadVersion', 'evaluatorVersion', 'phase', 'buildHash',
@@ -10,6 +11,9 @@ const INPUT_KEYS = Object.freeze([
   'walletPublicKey', 'cluster', 'genesisHash', 'providerId', 'qualifiedAtMs',
   'expiresAtMs', 'gates',
 ] as const);
+const INPUT_KEYS_V2 = Object.freeze([...INPUT_KEYS, 'scope'] as const);
+const ENVELOPE_PROVIDER_GATE_INDEX = 7;
+const ENVELOPE_WALLET_GATE_INDEX = 9;
 const EVIDENCE_KEYS = Object.freeze([
   'payloadVersion', 'gateId', 'status', 'evidenceType', 'evidenceId',
   'evidenceFingerprint', 'observedAtMs', 'expiresAtMs',
@@ -82,6 +86,34 @@ export interface ExecutionSafetyQualificationV1 {
   readonly gates: readonly ExecutionSafetyGateEvidenceV1[];
 }
 
+/** An ENVELOPE-scoped qualification: payload v2, phase CANARY, valid for up to 24 hours. */
+export interface ExecutionSafetyQualificationV2
+  extends Omit<ExecutionSafetyQualificationV1, 'payloadVersion' | 'phase'> {
+  readonly payloadVersion: 2;
+  readonly scope: 'ENVELOPE';
+  readonly phase: 'CANARY';
+}
+
+export type ExecutionSafetyQualification =
+  | ExecutionSafetyQualificationV1
+  | ExecutionSafetyQualificationV2;
+
+export type ExecutionSafetyQualificationScope = 'CANARY' | 'ENVELOPE';
+
+export function qualificationScope(
+  qualification: ExecutionSafetyQualification,
+): ExecutionSafetyQualificationScope {
+  return qualification.payloadVersion === 2 ? 'ENVELOPE' : 'CANARY';
+}
+
+export interface ExecutionEnvelopeBindingGatesInput {
+  readonly generationId: string;
+  readonly walletPublicKey: string;
+  readonly providerId: string;
+  readonly observedAtMs: number;
+  readonly expiresAtMs: number;
+}
+
 export class ExecutionSafetyQualificationValidationError extends TypeError {
   public constructor() {
     super('Invalid execution safety qualification.');
@@ -112,7 +144,57 @@ export function createMainnetSimulationEvidenceFingerprint(input: unknown): stri
   }
 }
 
-export function createSafetyQualification(input: unknown): ExecutionSafetyQualificationV1 {
+/**
+ * Gates 7 and 9 of an ENVELOPE qualification bind to identities (generation, wallet,
+ * provider), not to snapshot instants: the envelope outlives every individual snapshot.
+ */
+export function createEnvelopeBindingGates(input: ExecutionEnvelopeBindingGatesInput): Readonly<{
+  provider: ExecutionSafetyGateEvidenceV1;
+  wallet: ExecutionSafetyGateEvidenceV1;
+}> {
+  try {
+    const record = exactRecord(input, [
+      'generationId', 'walletPublicKey', 'providerId', 'observedAtMs', 'expiresAtMs',
+    ] as const);
+    const binding = envelopeBinding(record.generationId, record.walletPublicKey, record.providerId);
+    const observedAtMs = timestamp(record.observedAtMs);
+    const expiresAtMs = timestamp(record.expiresAtMs);
+    if (expiresAtMs < observedAtMs) throw invalid();
+    return Object.freeze({
+      provider: Object.freeze({
+        payloadVersion: 1,
+        gateId: 'PROVIDER_EXIT_CAPACITY_VERIFIED',
+        status: 'PASSED',
+        evidenceType: 'PROVIDER_SNAPSHOT',
+        evidenceId: binding.providerEvidenceId,
+        evidenceFingerprint: binding.providerEvidenceFingerprint,
+        observedAtMs,
+        expiresAtMs,
+      }),
+      wallet: Object.freeze({
+        payloadVersion: 1,
+        gateId: 'WALLET_CHAIN_LIMITS_VERIFIED',
+        status: 'PASSED',
+        evidenceType: 'WALLET_SNAPSHOT',
+        evidenceId: binding.walletEvidenceId,
+        evidenceFingerprint: binding.walletEvidenceFingerprint,
+        observedAtMs,
+        expiresAtMs,
+      }),
+    });
+  } catch {
+    throw invalid();
+  }
+}
+
+export function createSafetyQualification(input: unknown): ExecutionSafetyQualification {
+  const payloadVersion = ownDataProperty(input, 'payloadVersion');
+  return payloadVersion === 2
+    ? createEnvelopeSafetyQualification(input)
+    : createCanarySafetyQualification(input);
+}
+
+function createCanarySafetyQualification(input: unknown): ExecutionSafetyQualificationV1 {
   try {
     const record = exactRecord(input, INPUT_KEYS);
     if (record.payloadVersion !== 1 || record.evaluatorVersion !== 1) throw invalid();
@@ -164,6 +246,108 @@ export function createSafetyQualification(input: unknown): ExecutionSafetyQualif
   } catch {
     throw invalid();
   }
+}
+
+function createEnvelopeSafetyQualification(input: unknown): ExecutionSafetyQualificationV2 {
+  try {
+    const record = exactRecord(input, INPUT_KEYS_V2);
+    if (record.payloadVersion !== 2 || record.evaluatorVersion !== 1
+      || record.scope !== 'ENVELOPE' || record.phase !== 'CANARY') throw invalid();
+    const phase = 'CANARY' as const;
+    const buildHash = fingerprint(record.buildHash);
+    const configurationFingerprint = fingerprint(record.configurationFingerprint);
+    const strategyFingerprint = fingerprint(record.strategyFingerprint);
+    const generationId = patternedText(
+      record.generationId,
+      /^execution_wallet_generation_[0-9a-f]{64}$/u,
+      96,
+    );
+    const walletPublicKey = publicKey(record.walletPublicKey);
+    if (record.cluster !== 'mainnet-beta') throw invalid();
+    const genesisHash = publicKey(record.genesisHash);
+    const providerId = identifier(record.providerId);
+    const qualifiedAtMs = timestamp(record.qualifiedAtMs);
+    const expiresAtMs = timestamp(record.expiresAtMs);
+    const ttlMs = expiresAtMs - qualifiedAtMs;
+    if (ttlMs <= 0 || ttlMs > ENVELOPE_QUALIFICATION_MAXIMUM_TTL_MS) throw invalid();
+    const gates = evidenceFrom(record.gates, qualifiedAtMs, expiresAtMs);
+    const binding = envelopeBinding(generationId, walletPublicKey, providerId);
+    const providerGate = gates[ENVELOPE_PROVIDER_GATE_INDEX];
+    const walletGate = gates[ENVELOPE_WALLET_GATE_INDEX];
+    if (providerGate?.gateId !== 'PROVIDER_EXIT_CAPACITY_VERIFIED'
+      || providerGate.evidenceId !== binding.providerEvidenceId
+      || providerGate.evidenceFingerprint !== binding.providerEvidenceFingerprint
+      || walletGate?.gateId !== 'WALLET_CHAIN_LIMITS_VERIFIED'
+      || walletGate.evidenceId !== binding.walletEvidenceId
+      || walletGate.evidenceFingerprint !== binding.walletEvidenceFingerprint) throw invalid();
+    const qualificationFingerprint = hash([
+      'execution-safety-qualification-v2', 2, 'ENVELOPE', phase, buildHash,
+      configurationFingerprint, strategyFingerprint, generationId,
+      walletPublicKey, 'mainnet-beta', genesisHash, providerId,
+      qualifiedAtMs, expiresAtMs,
+      gates.map((gate) => [
+        gate.gateId, gate.status, gate.evidenceType, gate.evidenceId,
+        gate.evidenceFingerprint, gate.observedAtMs, gate.expiresAtMs,
+      ]),
+    ]);
+    return Object.freeze({
+      qualificationId: `execution_safety_qualification_${qualificationFingerprint}`,
+      payloadVersion: 2,
+      scope: 'ENVELOPE',
+      evaluatorVersion: 1,
+      qualificationFingerprint,
+      phase,
+      buildHash,
+      configurationFingerprint,
+      strategyFingerprint,
+      generationId,
+      walletPublicKey,
+      cluster: 'mainnet-beta',
+      genesisHash,
+      providerId,
+      qualifiedAtMs,
+      expiresAtMs,
+      gates,
+    });
+  } catch {
+    throw invalid();
+  }
+}
+
+function envelopeBinding(
+  generationIdValue: unknown,
+  walletPublicKeyValue: unknown,
+  providerIdValue: unknown,
+): Readonly<{
+  providerEvidenceId: string;
+  providerEvidenceFingerprint: string;
+  walletEvidenceId: string;
+  walletEvidenceFingerprint: string;
+}> {
+  const generationId = patternedText(
+    generationIdValue,
+    /^execution_wallet_generation_[0-9a-f]{64}$/u,
+    96,
+  );
+  const walletPublicKey = publicKey(walletPublicKeyValue);
+  const providerId = identifier(providerIdValue);
+  return Object.freeze({
+    providerEvidenceId: `envelope-provider:${providerId}`,
+    providerEvidenceFingerprint: hash([
+      'execution-envelope-provider-binding-v1', generationId, providerId,
+    ]),
+    walletEvidenceId: generationId,
+    walletEvidenceFingerprint: hash([
+      'execution-envelope-wallet-binding-v1', generationId, walletPublicKey,
+    ]),
+  });
+}
+
+function ownDataProperty(value: unknown, key: string): unknown {
+  if (!isPlainObject(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+  return descriptor.value;
 }
 
 function evidenceFrom(
