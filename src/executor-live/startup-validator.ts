@@ -204,6 +204,12 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
       table('execution_entry_envelopes', names(
         'generation_id', 'payload_version', 'state', 'valid_until',
       )),
+      table('execution_wallet_snapshots', names(
+        'snapshot_fingerprint', 'observed_at', 'superseded_at',
+      )),
+      table('execution_safety_gate_evidence', names(
+        'qualification_id', 'gate_index', 'gate_id', 'status', 'evidence_fingerprint', 'expires_at',
+      )),
       table('execution_control_state', names(
         'generation_id', 'state', 'state_revision', 'last_event_id',
       ), names(), names('state', 'state_revision', 'last_event_id', 'updated_at')),

@@ -1817,6 +1817,14 @@ ON TABLE execution_safety_qualifications TO sol_token_executor_live;
 GRANT SELECT (generation_id,payload_version,state,valid_until)
 ON TABLE execution_entry_envelopes TO sol_token_executor_live;
 
+-- The BUY signing binding and its replay re-check the armament's wallet snapshot and
+-- qualification gates 7 and 9 (read-only).
+GRANT SELECT (snapshot_fingerprint,observed_at,superseded_at)
+ON TABLE execution_wallet_snapshots TO sol_token_executor_live;
+
+GRANT SELECT (qualification_id,gate_index,gate_id,status,evidence_fingerprint,expires_at)
+ON TABLE execution_safety_gate_evidence TO sol_token_executor_live;
+
 GRANT SELECT (generation_id,state,state_revision,last_event_id),
   UPDATE (state,state_revision,last_event_id,updated_at)
 ON TABLE execution_control_state TO sol_token_executor_live;

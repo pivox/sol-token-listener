@@ -7,8 +7,11 @@ import pg from 'pg';
 import {
   createExecutionArmamentRequestV2,
   createOperatorAuthorization,
+  createOperatorAuthorizationV2,
   type ExecutionActivationArmamentV2,
+  type ExecutionArmamentRequestV2,
   type ExecutionOperatorAuthorizationV1,
+  type ExecutionOperatorAuthorizationV2,
 } from '../../src/domain/execution-operations.js';
 import {
   createEntryEnvelope,
@@ -27,6 +30,7 @@ import {
   createMainnetSimulationEvidenceFingerprint,
   createSafetyQualification,
   EXECUTION_SAFETY_GATE_IDS,
+  type ExecutionSafetyQualificationV1,
   type ExecutionSafetyQualificationV2,
 } from '../../src/domain/execution-safety-qualification.js';
 import { createExecutionWalletSnapshot } from '../../src/domain/execution-wallet-snapshot.js';
@@ -488,4 +492,140 @@ export async function withProvisionedDatabase(
       try { await release(); } finally { await maintenance.end(); }
     }
   }
+}
+
+export function canaryQualification(
+  nowMs: number,
+  simulation: SeededSimulation,
+  snapshots?: Readonly<{
+    wallet: ReturnType<typeof createExecutionWalletSnapshot>;
+    provider: ReturnType<typeof createProviderUsageSnapshot>;
+  }>,
+): ExecutionSafetyQualificationV1 {
+  const gates = staticGates(nowMs, nowMs + 300_000, simulation).map((gate) => (
+    snapshots !== undefined && gate.gateId === 'WALLET_CHAIN_LIMITS_VERIFIED'
+      ? { ...gate, evidenceId: snapshots.wallet.snapshotId,
+        evidenceFingerprint: snapshots.wallet.snapshotFingerprint }
+      : snapshots !== undefined && gate.gateId === 'PROVIDER_EXIT_CAPACITY_VERIFIED'
+        ? { ...gate, evidenceId: snapshots.provider.snapshotId,
+          evidenceFingerprint: snapshots.provider.snapshotFingerprint }
+        : gate));
+  const qualification = createSafetyQualification({
+    payloadVersion: 1, evaluatorVersion: 1, phase: 'CANARY',
+    buildHash: hash, configurationFingerprint: simulation.configurationFingerprint,
+    strategyFingerprint: '3'.repeat(64), generationId, walletPublicKey: publicKey,
+    cluster: 'mainnet-beta', genesisHash: publicKey, providerId: 'primary',
+    qualifiedAtMs: nowMs, expiresAtMs: nowMs + 300_000, gates,
+  });
+  assert.equal(qualification.payloadVersion, 1);
+  return qualification;
+}
+
+
+export function canaryPolicy() {
+  return createExecutionRiskPolicy({
+    quoteMintAllowlist: [WSOL],
+    initialCapitalLamports: 1_000_000n,
+    maximumCapitalLamports: 1_000_000n,
+    positionSizeBps: 1_000n,
+    maximumOpenPositions: 1,
+    maximumTotalExposureBps: 500n,
+    drawdownPauseBps: 2_500n,
+    feeReserveLamports: 100_000n,
+    walletSnapshotMaxAgeMs: 60_000,
+    providerUsageMaxAgeMs: 300_000,
+    providerEntryCostUnits: 8n,
+    providerExitCostUnitsPerPosition: 4n,
+    providerConfirmationCostUnitsPerPosition: 2n,
+    providerReconciliationCostUnitsPerPosition: 3n,
+    providerSafetyMarginUnits: 5n,
+    maximumConsecutiveTechnicalFailures: 2,
+  });
+}
+
+/** The CANARY v2 path of tests/execution-operations.repository.test.ts, through `repository`. */
+export async function armCanary(
+  pool: Pool,
+  repository: PostgresExecutionOperationsRepository,
+  simulation: SeededSimulation,
+): Promise<ExecutionActivationArmamentV2>;
+export async function armCanary(
+  pool: Pool,
+  repository: PostgresExecutionOperationsRepository,
+  simulation: SeededSimulation,
+  options: Readonly<{ returnRequest: true }>,
+): Promise<Readonly<{
+  armament: ExecutionActivationArmamentV2;
+  request: ExecutionArmamentRequestV2;
+  authorization: ExecutionOperatorAuthorizationV2;
+}>>;
+export async function armCanary(
+  pool: Pool,
+  repository: PostgresExecutionOperationsRepository,
+  simulation: SeededSimulation,
+  options: Readonly<{ returnRequest?: true }> = {},
+) {
+  const snapshotNowMs = await currentDatabaseTimeMs(pool);
+  const walletSnapshot = createExecutionWalletSnapshot({
+    generationId, providerId: 'primary', stateRevision: 0n, slot: 10n,
+    blockTimeMs: snapshotNowMs - 100, observedAtMs: snapshotNowMs - 50, commitment: 'finalized',
+    walletLamports: 1_000_000n, tokenBalanceCount: 0, openPositions: [], realizedNetPnlRaw: 0n,
+  });
+  const providerSnapshot = createProviderUsageSnapshot({
+    providerId: 'primary', planId: 'canary-v1', billingPeriodId: 'period-1',
+    billingPeriodStartedAtMs: snapshotNowMs - 60_000, billingPeriodEndsAtMs: snapshotNowMs + 600_000,
+    limitUnits: 1_000n, usedUnits: 1n, measuredAtMs: snapshotNowMs - 50,
+    expiresAtMs: snapshotNowMs + 300_000, provenance: 'OPERATOR_REPORT',
+  });
+  const nowMs = await currentDatabaseTimeMs(pool);
+  const qualification = canaryQualification(nowMs, simulation,
+    { wallet: walletSnapshot, provider: providerSnapshot });
+  await repository.persistQualification(qualification);
+  const resumeAuthorization = createOperatorAuthorization({
+    payloadVersion: 1, generationId, action: 'RESUME', phase: null,
+    contextFingerprint: qualification.qualificationFingerprint, nonceHash: '9'.repeat(64),
+    operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+  });
+  await repository.recordAuthorization(resumeAuthorization);
+  await repository.resume({
+    payloadVersion: 1, commandId: 'command:envelope-canary-resume', generationId,
+    qualificationId: qualification.qualificationId, authorization: resumeAuthorization,
+    operatorId: 'operator-primary', occurredAtMs: nowMs,
+  });
+  await insertExecutionDecisionEvent(pool, 'decision:canary-target', publicKey);
+  const target = await new PostgresExecutionIntentRepository(pool).create(createExecutionIntentDraft({
+    strategyId: 'canary-target', strategyVersion: 1,
+    positionId: 'position:canary-target', logicalCommandId: 'command:canary-target',
+    mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint: WSOL,
+    quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+    quoteAmountRaw: 40_000n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+    decisionEventId: 'decision:canary-target', decisionFingerprint: 'd'.repeat(64),
+    requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 120_000,
+  }));
+  const request = createExecutionArmamentRequestV2({
+    payloadVersion: 2, qualification, targetIntentId: target.intent.id, policy: canaryPolicy(),
+    walletSnapshot, providerSnapshot, allEndpointsUnavailable: false,
+    capturedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+    target: {
+      intentId: target.intent.id, stateRevision: target.intent.stateRevision,
+      strategyId: target.intent.strategyId, strategyVersion: target.intent.strategyVersion,
+      decisionFingerprint: target.intent.decisionFingerprint, mint: target.intent.mint,
+      quoteMint: target.intent.quoteMint, quoteAmountRaw: target.intent.quoteAmountRaw,
+    },
+    maximumBuys: 1, maximumCapitalLamports: 40_000n, maximumExposureBps: 500n,
+    maximumOpenPositions: 1, maximumHoldingMs: 30_000, runtimeQuoteMaxAgeMs: 60_000,
+    runtimeSlippageBps: 100n, runtimeSnapshotMaxSlotLag: 8,
+    runtimeMaxComputeUnits: 200_000n, runtimeMaxFeeLamports: 5_000n,
+    runtimeMaxFeePayerLamportDebit: 100_000n, runtimeMaxRpcCallsPerAttempt: 12,
+    runtimeLeaseMs: 3_000, armedAtMs: nowMs, armamentExpiresAtMs: nowMs + 120_000,
+    operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
+  });
+  const authorization = createOperatorAuthorizationV2({
+    payloadVersion: 2, generationId, action: 'ARM', phase: 'CANARY',
+    contextFingerprint: request.armamentRequestFingerprint, nonceHash: 'e'.repeat(64),
+    operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+  });
+  const armament = await repository.armCanary(Object.freeze({ request, authorization }));
+  return options.returnRequest === true
+    ? Object.freeze({ armament, request, authorization }) : armament;
 }

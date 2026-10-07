@@ -282,6 +282,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_provider_usage_counters',
     'execution_provider_usage_snapshots',
     'execution_risk_admission_reports',
+    'execution_safety_gate_evidence',
     'execution_safety_qualifications',
     'execution_signed_simulation_evidence',
     'execution_signed_transactions',
@@ -290,14 +291,27 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_submission_preflight_evidence',
     'execution_wallet_generations',
     'execution_wallet_risk_state',
+    'execution_wallet_snapshots',
     'market_pools',
     'migration_history',
     'migrations',
   ]);
   for (const forbidden of [
     'execution_reconciliation_evidence', 'execution_fault_ledger',
-    'execution_safety_gate_evidence', 'execution_wallet_snapshots',
   ]) assert.equal(byName.has(forbidden), false);
+  // The BUY signing binding re-checks the wallet snapshot and gates 7/9: read-only columns.
+  assert.deepEqual(byName.get('execution_wallet_snapshots'), {
+    name: 'execution_wallet_snapshots',
+    select: ['snapshot_fingerprint', 'observed_at', 'superseded_at'],
+    insert: [], update: [],
+  });
+  assert.deepEqual(byName.get('execution_safety_gate_evidence'), {
+    name: 'execution_safety_gate_evidence',
+    select: [
+      'qualification_id', 'gate_index', 'gate_id', 'status', 'evidence_fingerprint', 'expires_at',
+    ],
+    insert: [], update: [],
+  });
 
   for (const forbiddenInsert of [
     'execution_intents', 'execution_wallet_risk_state',

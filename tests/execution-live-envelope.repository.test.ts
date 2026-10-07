@@ -9,7 +9,7 @@ import {
 } from '../src/storage/execution-live.repository.js';
 import { PostgresExecutionOperationsRepository } from '../src/storage/execution-operations.repository.js';
 import {
-  armEnvelope, currentDatabaseTimeMs, fastEntryIntent, generationId, hash, openEnvelope,
+  armCanary, armEnvelope, currentDatabaseTimeMs, fastEntryIntent, generationId, hash, openEnvelope,
   type Pool, prepareEnvelope, publicKey, roleSource, type SeededSimulation, seedEnvelopeBase,
   seedProviderSnapshot, withProvisionedDatabase, withSchema,
 } from './helpers/entry-envelope-fixture.js';
@@ -130,6 +130,22 @@ void test('PostgreSQL 16 live role starts on an ACTIVE envelope and reads the qu
     });
   });
 
+for (const scope of ['ENVELOPE', 'CANARY'] as const) {
+  void test(`PostgreSQL 16 live role authorizes and replays the BUY signing of a ${scope} armament`,
+    async (context) => {
+      await withProvisionedDatabase(context, async (pool) => {
+        const live = new PostgresExecutionLiveRepository(roleSource(pool, 'sol_token_executor_live'));
+        const simulation = await seedEnvelopeBase(pool);
+        const fixture = scope === 'ENVELOPE'
+          ? await envelopeBuyFixture(pool, simulation) : await canaryBuyFixture(pool, simulation);
+        const authorization = await live.authorizeExactSigning(fixture.input);
+        assert.equal(authorization.binding.armamentId, fixture.armamentId);
+        const replay = await live.authorizeExactSigning(fixture.input);
+        assert.equal(replay.preSignatureLockId, authorization.preSignatureLockId);
+      });
+    });
+}
+
 function runnableBinding(simulation: SeededSimulation) {
   return Object.freeze({
     payloadVersion: 1 as const, generationId, phase: 'CANARY' as const, buildHash: hash,
@@ -148,6 +164,24 @@ async function envelopeBuyFixture(pool: Pool, seeded?: SeededSimulation) {
   await seedProviderSnapshot(pool);
   const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
   const armament = await armEnvelope(operations, prepared, intentId);
+  return beginArmedBuy(pool, simulation, armament.armamentId, runtimeLimits.slippageBps);
+}
+
+/** A CANARY v2 armament (operator ARM), claimed and begun as H2b does before signing. */
+async function canaryBuyFixture(pool: Pool, simulation: SeededSimulation) {
+  const armament = await armCanary(pool, new PostgresExecutionOperationsRepository(pool), simulation);
+  return beginArmedBuy(pool, simulation, armament.armamentId, 100n);
+}
+
+async function beginArmedBuy(
+  pool: Pool,
+  simulation: SeededSimulation,
+  armamentId: string,
+  slippageBps: bigint,
+) {
+  const intentId = (await pool.query<{ readonly target_intent_id: string }>(`SELECT target_intent_id
+    FROM execution_activation_armaments WHERE armament_id=$1`, [armamentId])).rows[0]?.target_intent_id;
+  assert.ok(intentId !== undefined);
   const intents = new PostgresExecutionIntentRepository(pool);
   const claimed = await intents.claim({
     ownerId: 'envelope-live-test', leaseMs: 60_000, purpose: 'LIVE_EXECUTE',
@@ -197,10 +231,10 @@ async function envelopeBuyFixture(pool: Pool, seeded?: SeededSimulation) {
     configurationFingerprint: simulation.configurationFingerprint,
     strategyFingerprint: '3'.repeat(64), walletPublicKey: publicKey,
     cluster: 'mainnet-beta' as const, expectedGenesisHash: publicKey,
-    observedGenesisHash: publicKey, providerId: 'primary', ...runtimeLimits,
+    observedGenesisHash: publicKey, providerId: 'primary', ...runtimeLimits, slippageBps,
   });
   return Object.freeze({
-    armamentId: armament.armamentId,
+    armamentId,
     input: Object.freeze({
       claim: begun.claim, attempt: begun.attempt, generationId, runtime, material,
     }),
