@@ -2092,7 +2092,8 @@ GRANT SELECT (
 )
 ON TABLE execution_intents TO sol_token_executor_operations;
 
-GRANT SELECT (intent_id,lane)
+-- pair_id: the CANARY arm reads the target's membership to refuse an unexpected pair.
+GRANT SELECT (intent_id,pair_id,lane)
 ON TABLE execution_preflight_intent_pair_memberships TO sol_token_executor_operations;
 
 GRANT SELECT (
@@ -2141,13 +2142,15 @@ GRANT SELECT (provider_id,billing_period_id,units,recorded_at), INSERT (
 )
 ON TABLE execution_provider_usage_counters TO sol_token_executor_operations;
 
-GRANT SELECT (provider_id,billing_period_id,observed_at)
+-- event_id orders the admission's recent rate-limit window.
+GRANT SELECT (event_id,provider_id,billing_period_id,observed_at)
 ON TABLE execution_provider_rate_limit_events TO sol_token_executor_operations;
 
+-- quota_state is read by the SECURITY INVOKER armament insert guard.
 GRANT SELECT (
   report_id,decision,reason_code,input_fingerprint,policy_fingerprint,
   wallet_snapshot_fingerprint,provider_snapshot_fingerprint,wallet_state_revision,
-  intent_id,generation_id,report_fingerprint,quote_amount_raw
+  intent_id,generation_id,report_fingerprint,quote_amount_raw,quota_state
 ), INSERT (
   report_id,payload_version,report_fingerprint,intent_id,generation_id,policy_fingerprint,
   wallet_snapshot_fingerprint,provider_snapshot_fingerprint,decision,reason_code,
@@ -2179,11 +2182,11 @@ ON TABLE execution_simulation_artifacts TO sol_token_executor_operations;
 GRANT SELECT (
   qualification_id,payload_version,evaluator_version,qualification_fingerprint,phase,
   build_hash,configuration_fingerprint,strategy_fingerprint,generation_id,wallet_public_key,
-  cluster,genesis_hash,provider_id,qualified_at,expires_at,purge_after
+  cluster,genesis_hash,provider_id,qualified_at,expires_at,purge_after,scope,envelope_id
 ), INSERT (
   qualification_id,payload_version,evaluator_version,qualification_fingerprint,phase,
   build_hash,configuration_fingerprint,strategy_fingerprint,generation_id,wallet_public_key,
-  cluster,genesis_hash,provider_id,qualified_at,expires_at,purge_after
+  cluster,genesis_hash,provider_id,qualified_at,expires_at,purge_after,scope,envelope_id
 )
 ON TABLE execution_safety_qualifications TO sol_token_executor_operations;
 
@@ -2200,17 +2203,20 @@ GRANT SELECT (generation_id,state,state_revision,last_event_id),
   INSERT (generation_id), UPDATE (state,state_revision,last_event_id,updated_at)
 ON TABLE execution_control_state TO sol_token_executor_operations;
 
+-- qualification_id, authorization_id and operator_id are read by the SECURITY INVOKER
+-- control-state guard on a RUNNING transition (resume).
 GRANT SELECT (
   event_id,event_fingerprint,generation_id,previous_state,next_state,reason_code,
-  actor_type,occurred_at
+  qualification_id,authorization_id,operator_id,actor_type,occurred_at
 ), INSERT (
   event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
   reason_code,qualification_id,authorization_id,operator_id,actor_type,actor_id,occurred_at
 )
 ON TABLE execution_control_events TO sol_token_executor_operations;
 
+-- payload_version is read by the SECURITY INVOKER armament and envelope insert guards.
 GRANT SELECT (
-  authorization_id,authorization_fingerprint,generation_id,action,phase,
+  authorization_id,payload_version,authorization_fingerprint,generation_id,action,phase,
   context_fingerprint,operator_id,issued_at,expires_at,consumed_at
 ), INSERT (
   authorization_id,payload_version,authorization_fingerprint,generation_id,action,phase,
@@ -2233,7 +2239,7 @@ GRANT SELECT (
   runtime_quote_max_age_ms,runtime_slippage_bps,runtime_snapshot_max_slot_lag,
   runtime_max_compute_units,runtime_max_fee_lamports,runtime_max_fee_payer_lamport_debit,
   runtime_max_rpc_calls_per_attempt,runtime_lease_ms,locked_intent_id,
-  locked_attempt_number,locked_reservation_id,locked_lease_token,locked_at
+  locked_attempt_number,locked_reservation_id,locked_lease_token,locked_at,envelope_id
 ), INSERT (
   armament_id,payload_version,armament_fingerprint,qualification_id,
   qualification_fingerprint,generation_id,authorization_id,state,state_revision,phase,
@@ -2247,9 +2253,26 @@ GRANT SELECT (
   target_policy_fingerprint,target_wallet_snapshot_fingerprint,
   target_provider_snapshot_fingerprint,runtime_quote_max_age_ms,runtime_slippage_bps,
   runtime_snapshot_max_slot_lag,runtime_max_compute_units,runtime_max_fee_lamports,
-  runtime_max_fee_payer_lamport_debit,runtime_max_rpc_calls_per_attempt,runtime_lease_ms
+  runtime_max_fee_payer_lamport_debit,runtime_max_rpc_calls_per_attempt,runtime_lease_ms,
+  envelope_id
 ), UPDATE (state,state_revision,terminal_at,purge_after)
 ON TABLE execution_activation_armaments TO sol_token_executor_operations;
+
+-- Lot 4a entry envelopes: created, revoked and expired by the operator CLI and the auto-arm
+-- daemon. buys_armed is written by the armament insert guard, which runs as the invoker.
+-- No role ever holds UPDATE(envelope_id) here, on armaments or on qualifications.
+GRANT SELECT (
+  envelope_id,generation_id,operator_id,payload_version,fingerprint,per_buy_quote_amount_raw,
+  max_buys,max_open_positions,max_total_exposure_raw,max_realized_loss_raw,valid_from,
+  valid_until,state,buys_armed,realized_loss_raw,revoked_at,created_at,updated_at,
+  authorization_id,risk_policy,policy_fingerprint,maximum_holding_ms
+), INSERT (
+  envelope_id,generation_id,operator_id,payload_version,fingerprint,per_buy_quote_amount_raw,
+  max_buys,max_open_positions,max_total_exposure_raw,max_realized_loss_raw,valid_from,
+  valid_until,state,buys_armed,realized_loss_raw,created_at,updated_at,authorization_id,
+  risk_policy,policy_fingerprint,maximum_holding_ms
+), UPDATE (state,buys_armed,revoked_at,updated_at)
+ON TABLE execution_entry_envelopes TO sol_token_executor_operations;
 
 GRANT INSERT (
   event_id,payload_version,event_fingerprint,armament_id,generation_id,
