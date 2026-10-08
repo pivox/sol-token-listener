@@ -49,6 +49,9 @@ import {
   earlyExitPolicy, earlyExitPublicKey, entrySlot, everyRuleTrades, insertLaunchEvent,
   insertTradeEvents,
 } from './helpers/fast-exit-events.js';
+import {
+  blockhashValidity, createBuyFixture, rpcBudget, signedSimulation,
+} from './helpers/live-sell-fixture.js';
 import { waitForBackendDrain } from './helpers/postgres-backend-drain.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
@@ -4042,6 +4045,39 @@ async function cloneOpenPosition(
   }
   return Object.freeze({ positionId: clonePositionId, mint });
 }
+
+// Lot 5 sweep: persisting the signed BUY fires a deferred trigger that reads
+// execution_submission_events, and the submission gate reads armament.armament_fingerprint; the
+// live role's column grants omitted both, like armed_at. H2b's BUY path runs under the role.
+void test('PostgreSQL 16 live role persists, simulates and starts the submission of a signed BUY',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const buy = await createBuyFixture(pool);
+      const live = new PostgresExecutionLiveRepository(roleSource(pool, 'sol_token_executor_live'));
+      await live.persistSigned({
+        payloadVersion: 1, claim: buy.claim, qualificationId: buy.qualificationId,
+        preSignatureLockId: buy.preSignatureLockId, reservationId: buy.reservationId,
+        artifact: buy.artifact, unsignedSimulation: buy.unsignedSimulation, rpcBudget,
+      });
+      const simulated = await live.recordSignedSimulation(buy.claim, signedSimulation(
+        buy.artifact, buy.unsignedSimulation, 95n, -1_000n, buy.artifact.signedAtMs + 1,
+      ));
+      const started = await live.beginSubmission({
+        claim: buy.claim, artifactId: buy.artifact.artifactId,
+        expectedRevision: simulated.stateRevision, runtime: buy.runtime,
+        blockhashValidity: blockhashValidity(buy.artifact, Date.now()),
+      });
+      assert.equal(started.state, 'SUBMISSION_STARTED');
+      const accepted = await live.recordSubmissionOutcome(buy.claim, {
+        payloadVersion: 1, artifactId: buy.artifact.artifactId,
+        expectedRevision: started.stateRevision, outcome: 'ACCEPTED',
+        returnedSignature: buy.artifact.signature, reasonCode: 'SUBMISSION_ACCEPTED',
+        observedAtMs: Date.now(),
+      });
+      assert.equal(accepted.artifact.artifactId, buy.artifact.artifactId);
+      assert.equal(accepted.claim.intent.status, 'SUBMITTED');
+    });
+  });
 
 void test('PostgreSQL 16 recovery role creates an early exit SELL from observed creator trades',
   async (context) => {
