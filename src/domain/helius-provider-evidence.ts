@@ -27,6 +27,7 @@ const USAGE_KEYS = Object.freeze([
 // other entry must be a counter; the quota itself comes from the top-level fields.
 const BREAKDOWN_REQUIRED_KEYS = Object.freeze(['rpc'] as const);
 const MAX_BREAKDOWN_KEYS = 64;
+const BREAKDOWN_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9]{0,63}$/u;
 const DATA_TRANSFER_KEYS = Object.freeze([
   'laserstreamGrpc', 'laserstreamWebsocket',
 ] as const);
@@ -162,11 +163,11 @@ function validateCounters(value: unknown, keys: readonly string[]): void {
 function validateBreakdownCounters(value: unknown): void {
   const own = exactOwnKeys(value);
   if (own.length === 0 || own.length > MAX_BREAKDOWN_KEYS
-    || own.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 64)
+    || own.some((key) => typeof key !== 'string' || !BREAKDOWN_KEY_PATTERN.test(key))
     || BREAKDOWN_REQUIRED_KEYS.some((key) => !own.includes(key))) throw invalid();
   for (const key of own) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !('value' in descriptor)) throw invalid();
+    if (!descriptor?.enumerable || !('value' in descriptor)) throw invalid();
     counter(descriptor.value);
   }
 }
