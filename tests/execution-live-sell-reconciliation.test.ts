@@ -262,6 +262,77 @@ void test('PostgreSQL 16 recovery role reconciles an envelope SELL and accumulat
     });
   });
 
+// Production 2026-10-08: a WSOL BUY's quote_cost_raw includes the token ATA rent, so it exceeds
+// the admitted reservation; the close must release the reservation, not the realized cost.
+const RENT_INFLATED_ENTRY_DELTA = -1_200n;
+
+void test('SELL MATCHED releases the BUY reservation when the realized cost exceeds it',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createSellFixture(
+        pool, 'ACCEPTED', undefined, 'DEADLINE', RENT_INFLATED_ENTRY_DELTA,
+      );
+      const envelopeId = await linkEnvelope(pool, generationId, {
+        state: 'ACTIVE', priorLossRaw: '0', maxLossRaw: '1000000',
+      });
+      assert.deepEqual(await exposureState(pool, fixture), {
+        quote_cost_raw: '1200', buy_reserved_amount_raw: '1000', reserved_exposure_raw: '1000',
+      });
+      const matched = sellEvidence(fixture, 'MATCHED', fixture.observedAtMs);
+
+      assert.equal((await fixture.live.commitReconciliation(fixture.claim, matched)).result,
+        'MATCHED');
+      assert.equal((await fixture.live.commitReconciliation(fixture.claim, matched)).result,
+        'MATCHED');
+
+      assert.deepEqual(await durableState(pool, fixture),
+        expectedClosedState(fixture.claim.intent.id));
+      assert.deepEqual(await exposureState(pool, fixture), {
+        quote_cost_raw: '1200', buy_reserved_amount_raw: '1000', reserved_exposure_raw: '0',
+      });
+      const envelope = await envelopeRow(pool, envelopeId);
+      assert.deepEqual({ state: envelope.state, realized_loss_raw: envelope.realized_loss_raw },
+        { state: 'ACTIVE', realized_loss_raw: '4205' });
+    });
+  });
+
+void test('PostgreSQL 16 recovery role reads the BUY reservation and closes a rent-inflated position',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const fixture = await createSellFixture(
+        pool, 'ACCEPTED', undefined, 'DEADLINE', RENT_INFLATED_ENTRY_DELTA,
+      );
+      const envelopeId = await linkEnvelope(pool, generationId, {
+        state: 'ACTIVE', priorLossRaw: '0', maxLossRaw: '1000000',
+      });
+      const recoverySource = roleSource(pool, 'sol_token_executor_live_recovery');
+      const asRecovery = await recoverySource.connect();
+      try {
+        const readable = await asRecovery.query(`SELECT
+          buy_reservation.maximum_amount_raw::TEXT AS buy_reserved_amount_raw
+          FROM execution_live_positions position
+          JOIN execution_exposure_reservations buy_reservation
+            ON buy_reservation.intent_id=position.buy_intent_id
+          WHERE position.exit_intent_id=$1`, [fixture.claim.intent.id]);
+        assert.deepEqual(readable.rows, [{ buy_reserved_amount_raw: '1000' }]);
+      } finally {
+        asRecovery.release();
+      }
+      const recovery = new PostgresExecutionLiveRepository(recoverySource);
+      const matched = sellEvidence(fixture, 'MATCHED', fixture.observedAtMs);
+
+      assert.equal((await recovery.commitReconciliation(fixture.claim, matched)).result,
+        'MATCHED');
+
+      assert.deepEqual(await durableState(pool, fixture),
+        expectedClosedState(fixture.claim.intent.id));
+      const envelope = await envelopeRow(pool, envelopeId);
+      assert.equal(envelope.realized_loss_raw, '4205');
+    });
+  });
+
 void test('SELL MATCHED direct from ACCEPTED journals confirmation before success',
   async (context) => {
     const databaseUrl = requiredDatabaseUrl(context);
@@ -782,6 +853,34 @@ async function persistedEvidence(
 async function controlState(pool: InstanceType<typeof pg.Pool>) {
   return (await pool.query<Record<string, unknown>>(`SELECT state,state_revision::TEXT AS state_revision
     FROM execution_control_state WHERE generation_id=$1`, [generationId])).rows;
+}
+
+function expectedClosedState(intentId: string) {
+  return {
+    artifact_state: 'RECONCILED', intent_status: 'SUCCEEDED', attempt_status: 'COMPLETED',
+    attempt_reason: 'ATTEMPT_COMPLETED', position_state: 'CLOSED', remaining_base_raw: '0',
+    authorization_state: 'CONSUMED', locked_intent_id: intentId, locked_attempt_number: 1,
+    armament_state: 'CONSUMED', unknown_block: false, reserved_exposure_raw: '0',
+    open_positions: 0, evidence_count: 1, unresolved_evidence_count: 0, sell_artifact_count: 1,
+  };
+}
+
+async function exposureState(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: Awaited<ReturnType<typeof createAmbiguousSellFixture>>,
+) {
+  const result = await pool.query<{
+    quote_cost_raw: string; buy_reserved_amount_raw: string; reserved_exposure_raw: string;
+  }>(`SELECT position.quote_cost_raw::TEXT AS quote_cost_raw,
+    buy_reservation.maximum_amount_raw::TEXT AS buy_reserved_amount_raw,
+    risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw
+    FROM execution_live_positions position
+    JOIN execution_exposure_reservations buy_reservation
+      ON buy_reservation.intent_id=position.buy_intent_id
+    JOIN execution_wallet_risk_state risk ON risk.generation_id=position.generation_id
+    WHERE position.exit_intent_id=$1`, [fixture.claim.intent.id]);
+  assert.equal(result.rows.length, 1);
+  return result.rows[0];
 }
 
 function expectedUnknownState(intentId: string, evidenceCount: number) {

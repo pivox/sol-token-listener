@@ -28,8 +28,21 @@ void test('fresh lane transitions, begins one attempt and exposes authenticated 
 
   assert.equal(await lanes.sell(signal()), 'WORKED');
   assert.deepEqual(fixture.calls, [
-    'claim:LIVE_EXECUTE:SELL', 'transition:SELL', 'begin:SELL',
+    'claim:LIVE_EXECUTE:SELL', 'transition:SELL:null', 'begin:SELL',
     'fresh:SELL:1', 'renew:SELL', 'release:SELL',
+  ]);
+});
+
+void test('fresh lane resumes a RETRY_READY intent with its abandoned attempt number', async () => {
+  // Production 2026-10-08: a SELL whose attempt 1 was ABANDONED by a NO_EFFECT reconciliation
+  // is RETRY_READY with attemptCount 1; the transition fence rejects a null attempt number.
+  const fixture = laneFixture('RETRY_READY');
+  const lanes = createLiveSignableLanes(fixture.dependencies);
+
+  assert.equal(await lanes.sell(signal()), 'WORKED');
+  assert.deepEqual(fixture.calls, [
+    'claim:LIVE_EXECUTE:SELL', 'transition:SELL:1', 'begin:SELL',
+    'fresh:SELL:2', 'renew:SELL', 'release:SELL',
   ]);
 });
 
@@ -115,7 +128,7 @@ function laneFixture(
         active: Parameters<LiveSignableLaneDependencies['intents']['transition']>[0],
         input: Parameters<LiveSignableLaneDependencies['intents']['transition']>[1],
       ) => {
-        calls.push(`transition:${active.intent.side}`);
+        calls.push(`transition:${active.intent.side}:${String(input.evidence.attemptNumber)}`);
         return Promise.resolve(Object.freeze({
           ...active.intent,
           status: input.nextStatus,
@@ -126,11 +139,14 @@ function laneFixture(
         active: Parameters<LiveSignableLaneDependencies['intents']['beginAttempt']>[0],
       ) => {
         calls.push(`begin:${active.intent.side}`);
+        const attemptNumber = active.intent.attemptCount + 1;
         return Promise.resolve(Object.freeze({
-          claim: active,
+          claim: Object.freeze({
+            ...active, intent: Object.freeze({ ...active.intent, attemptCount: attemptNumber }),
+          }),
           attempt: Object.freeze({
             intentId: active.intent.id,
-            attemptNumber: 1,
+            attemptNumber,
             startedAtMs: 1_000,
           } satisfies ExecutionAttemptIdentity),
         }));
@@ -212,11 +228,13 @@ function claimFor(
       requestedAtMs: 0,
       expiresAtMs: 2_000,
       status,
-      attemptCount: started ? 1 : 0,
+      attemptCount: started || status === 'RETRY_READY' ? 1 : 0,
       stateRevision: status === 'SIGNED_NOT_SUBMITTED' ? 3n
-        : status === 'PROCESSING' ? 1n : 0n,
+        : status === 'RETRY_READY' ? 5n
+          : status === 'PROCESSING' ? 1n : 0n,
       lastReasonCode: status === 'SIGNED_NOT_SUBMITTED' ? 'SIGNATURE_PERSISTED'
-        : status === 'PROCESSING' ? 'EXECUTION_STARTED' : null,
+        : status === 'RETRY_READY' ? 'RECONCILIATION_PROVED_NO_EFFECT'
+          : status === 'PROCESSING' ? 'EXECUTION_STARTED' : null,
       terminalAtMs: null,
       reconciliationCompletedAtMs: null,
       purgeAfterMs: null,
