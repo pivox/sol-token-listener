@@ -1174,10 +1174,12 @@ async function currentProviderOf(
   }
   if (row.payload_version !== 1 || row.snapshot_id !== snapshot.snapshotId
     || row.snapshot_fingerprint !== snapshot.snapshotFingerprint) throw failure('INVALID_DATA');
+  // Strictly after the measurement: a counter recorded in the same millisecond as a
+  // carried-forward snapshot is already inside its used_units and must not count twice.
   const local = exactRow(singleRow(await client.query(`SELECT COALESCE(SUM(units),0)::TEXT AS local_units
     FROM execution_provider_usage_counters
     WHERE provider_id=$1 AND billing_period_id=$2
-      AND recorded_at >= TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')`, [
+      AND recorded_at > TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')`, [
     snapshot.providerId, snapshot.billingPeriodId, snapshot.measuredAtMs,
   ])), ['local_units'] as const);
   return Object.freeze({ snapshot, localUsedUnits: unsignedBigint(local.local_units) });

@@ -933,6 +933,33 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
     });
   });
 
+void test('a counter recorded in the same millisecond as the snapshot measurement is not local usage',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      await openEnvelope(pool, repository, simulation);
+      await seedProviderSnapshot(pool);
+      const snapshot = (await repository.readAutoArmContext(contextQuery())).provider?.snapshot;
+      assert.ok(snapshot !== undefined);
+      await recordProviderUnits(pool, snapshot, 'same-ms', 5n);
+      const identity = createProviderUsageOperationId({
+        providerId: snapshot.providerId, billingPeriodId: snapshot.billingPeriodId,
+        category: 'ENTRY', logicalOperationId: 'same-ms',
+      });
+      // Tie: recorded exactly at the measurement millisecond → already inside used_units.
+      await mutateWithTriggersDisabled(pool, `UPDATE execution_provider_usage_counters SET
+        recorded_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond') WHERE operation_id=$1`,
+      [identity, snapshot.measuredAtMs]);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).provider?.localUsedUnits, 0n);
+      // One millisecond later → local usage.
+      await mutateWithTriggersDisabled(pool, `UPDATE execution_provider_usage_counters SET
+        recorded_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond') WHERE operation_id=$1`,
+      [identity, snapshot.measuredAtMs + 1]);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).provider?.localUsedUnits, 5n);
+    });
+  });
+
 void test('after the last arm EXHAUSTS the envelope, a fresh context still has the refresh policy',
   async (context) => {
     await withSchema(context, async (pool) => {
