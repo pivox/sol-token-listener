@@ -152,8 +152,16 @@ export async function createAmbiguousSellFixture(pool: InstanceType<typeof pg.Po
 /** How the fixture's first SELL intent is created. */
 export type SellExitKind = 'DEADLINE' | 'EARLY_REVOKED';
 
-/** A CANARY position OPEN after its exact BUY was reconciled MATCHED (no exit intent). */
-export async function createOpenPositionFixture(pool: InstanceType<typeof pg.Pool>) {
+/**
+ * A CANARY position OPEN after its exact BUY was reconciled MATCHED (no exit intent).
+ * `entryQuoteDeltaRaw` is the BUY's observed quote delta (position.quote_cost_raw = its
+ * negation); the BUY reservation stays 1_000, so a value below -1_000 reproduces a realized
+ * cost above the reservation (WSOL quote: swap spend plus the token ATA rent).
+ */
+export async function createOpenPositionFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  entryQuoteDeltaRaw = -1_000n,
+) {
   await migrateDatabase({ pool });
   const buy = await createBuyFixture(pool);
   const live = new PostgresExecutionLiveRepository(pool);
@@ -202,7 +210,7 @@ export async function createOpenPositionFixture(pool: InstanceType<typeof pg.Poo
         snapshotFingerprint: buy.artifact.snapshotFingerprint,
       }),
       feeLamports: 5_000n, walletLamportDelta: -5_000n,
-      baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+      baseDeltaRaw: 95n, quoteDeltaRaw: entryQuoteDeltaRaw,
       unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: buyReconciliationAtMs,
       finalizedAtMs: buyReconciliationAtMs,
     }),
@@ -226,8 +234,9 @@ export async function createOpenPositionFixture(pool: InstanceType<typeof pg.Poo
 export async function createExitPendingFixture(
   pool: InstanceType<typeof pg.Pool>,
   exitKind: SellExitKind = 'DEADLINE',
+  entryQuoteDeltaRaw = -1_000n,
 ) {
-  const open = await createOpenPositionFixture(pool);
+  const open = await createOpenPositionFixture(pool, entryQuoteDeltaRaw);
   const { live, positionId } = open;
   if (exitKind === 'EARLY_REVOKED') {
     const envelopeId = await linkEnvelope(pool, generationId, {
@@ -287,9 +296,11 @@ export async function createSellFixture(
   submissionState: SellSubmissionState,
   beforePersistSigned?: BeforePersistSigned,
   exitKind: SellExitKind = 'DEADLINE',
+  entryQuoteDeltaRaw = -1_000n,
 ) {
   return driveSellFixture(
-    pool, await createExitPendingFixture(pool, exitKind), submissionState, beforePersistSigned,
+    pool, await createExitPendingFixture(pool, exitKind, entryQuoteDeltaRaw), submissionState,
+    beforePersistSigned,
   );
 }
 

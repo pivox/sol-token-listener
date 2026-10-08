@@ -4955,6 +4955,7 @@ async function commitSellReconciliation(
     position.armament_id AS position_armament_id,
     risk.state_revision::TEXT AS risk_revision,
     risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,risk.open_positions,
+    buy_reservation.maximum_amount_raw::TEXT AS buy_reserved_amount_raw,
     armament.state AS armament_state,armament.state_revision::TEXT AS armament_revision
     FROM execution_signed_transactions transaction
     JOIN execution_intents intent ON intent.id=transaction.intent_id
@@ -4967,6 +4968,8 @@ async function commitSellReconciliation(
     JOIN execution_live_positions position ON position.position_id=exit_auth.position_id
     JOIN execution_wallet_risk_state risk ON risk.generation_id=transaction.generation_id
     JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+    LEFT JOIN execution_exposure_reservations buy_reservation
+      ON buy_reservation.intent_id=position.buy_intent_id
     WHERE transaction.intent_id=$1 AND transaction.attempt_number=$2
     FOR UPDATE OF transaction,intent,attempt,exit_auth,position,risk,armament`, [
     evidence.intentId, evidence.attemptNumber,
@@ -5310,9 +5313,16 @@ async function commitSellReconciliation(
   ]);
   const riskRevision = unsignedBigint(row.risk_revision);
   const reservedExposure = unsignedBigint(row.reserved_exposure_raw);
-  const quoteCost = unsignedBigint(row.quote_cost_raw);
   const openPositions = integer(row.open_positions);
-  if (reservedExposure < quoteCost || openPositions < 1) throw failure('INVALID_DATA');
+  // Release what admission reserved for this position (the BUY's maximum_amount_raw, which the
+  // BUY MATCHED reconciliation consumed but kept in reserved_exposure_raw), never the realized
+  // quote_cost_raw: for a WSOL quote that cost includes the new token ATA rent on top of the
+  // swap spend, so it legitimately exceeds the reservation and must not block the close.
+  if (row.buy_reserved_amount_raw === null || openPositions < 1) throw failure('INVALID_DATA');
+  const released = unsignedBigint(row.buy_reserved_amount_raw);
+  // The reserved exposure always carries this position's reservation while it is open; anything
+  // less is a ledger inconsistency and is refused, like every other release path.
+  if (reservedExposure < released) throw failure('INVALID_DATA');
   const riskUpdate = await client.query(`UPDATE execution_wallet_risk_state SET
     state_revision=$2::BIGINT,reserved_exposure_raw=$3::NUMERIC,open_positions=$4,
     unknown_block=(EXISTS (SELECT 1 FROM execution_exposure_reservations reservation
@@ -5323,7 +5333,7 @@ async function commitSellReconciliation(
     updated_at=TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')
     WHERE generation_id=$1 AND state_revision=$6::BIGINT`, [
     artifact.generationId, (riskRevision + 1n).toString(),
-    (reservedExposure - quoteCost).toString(), openPositions - 1,
+    (reservedExposure - released).toString(), openPositions - 1,
     finalizedAtMs, riskRevision.toString(),
   ]);
   let inferredIntentTransition: QueryResult | null = null;

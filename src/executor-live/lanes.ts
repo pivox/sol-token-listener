@@ -113,7 +113,10 @@ async function executeOnce(
         activationPhase: dependencies.phase,
         evidence: Object.freeze({
           payloadVersion: 1,
-          attemptNumber: null,
+          // A RETRY_READY intent already has an attempt (ABANDONED by a NO_EFFECT
+          // reconciliation); the transition fence requires its number, null only for the first.
+          attemptNumber: activeClaim.intent.attemptCount === 0
+            ? null : activeClaim.intent.attemptCount,
           sourceEventId: null,
           observedAtMs: now(dependencies.clock),
         }),
