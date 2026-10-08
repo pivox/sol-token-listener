@@ -24,6 +24,7 @@ import {
   stringifyJson,
   toJsonValue,
 } from '../utils/json.js';
+import { MAX_OBSERVED_PIPELINE_ITEMS } from '../application/observed-transaction-pipeline.js';
 import { getDatabasePool } from './database.js';
 import { FOUNDATION_RETENTION_SHARED_FENCE_SQL } from './foundation-retention-fence.js';
 import { createRepositoryId } from './repository-id.js';
@@ -126,6 +127,11 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     throw new LaunchpadEventRepositoryError('record');
   }
 
+  /**
+   * The replay mints of the signature come first, then the globally tracked
+   * mints in their priority order (open positions and pending intents, then the
+   * newest launches); the union never exceeds the pipeline cap.
+   */
   public async listTrackedMints(signature: string): Promise<ReadonlySet<string>> {
     return this.read(async (client) => {
       const globallyTracked = this.workerAdmissionPolicy.enabled
@@ -133,18 +139,38 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
           client,
           this.workerAdmissionPolicy.trackingWindowSeconds,
         )
-        : (await client.query(`SELECT mint FROM token_launches
-          WHERE terminal_at IS NULL ORDER BY mint`)).rows.map((row) =>
-          requiredText(row, 'mint'));
+        : (await client.query(`SELECT mint FROM (
+          SELECT launch.mint, launch.detected_at,
+            EXISTS (SELECT 1 FROM listener_worker_tracking_live_mints AS live
+              WHERE live.mint=launch.mint)
+            OR EXISTS (SELECT 1 FROM execution_intents AS intent
+              WHERE intent.mint=launch.mint AND intent.terminal_at IS NULL
+                AND intent.status NOT IN ('SUCCEEDED','FAILED','EXPIRED','CANCELLED'))
+            AS held
+          FROM token_launches AS launch
+          WHERE launch.terminal_at IS NULL
+        ) AS launch
+        WHERE launch.held
+          OR launch.detected_at + ($1::INTEGER * INTERVAL '1 second') > clock_timestamp()
+        ORDER BY launch.held DESC, launch.detected_at DESC, launch.mint
+        LIMIT $2`, [
+          this.workerAdmissionPolicy.trackingWindowSeconds,
+          MAX_OBSERVED_PIPELINE_ITEMS,
+        ])).rows.map((row) => requiredText(row, 'mint'));
       const replay = await client.query(`SELECT DISTINCT mint FROM domain_events
         WHERE signature=$1 AND confirmation_status <> 'orphaned'
           AND type IN ('TokenLaunchDetected','BondingCurveTradeObserved')
           AND terminal_at IS NULL
         ORDER BY mint`, [signature]);
-      return immutableSet([...new Set([
-        ...globallyTracked,
+      const tracked = new Set<string>();
+      for (const mint of [
         ...replay.rows.map((row) => requiredText(row, 'mint')),
-      ])].sort());
+        ...globallyTracked,
+      ]) {
+        if (tracked.size === MAX_OBSERVED_PIPELINE_ITEMS) break;
+        tracked.add(mint);
+      }
+      return immutableSet([...tracked].sort());
     });
   }
 

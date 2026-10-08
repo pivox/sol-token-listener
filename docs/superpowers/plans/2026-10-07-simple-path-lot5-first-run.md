@@ -1216,3 +1216,11 @@ Suite proposée : afficher `ExecutionEnvelopeCommandError.code` dans le log d'é
   merger avant le run réel (go/no-go, point 0b).
 - Wallet après le dry-run : **≈ 0,403 SOL**, **22 comptes Token-2022 vides** (≈ 0,033 SOL de rente
   récupérable), aucun solde de token. L'utilisateur garde le solde en l'état.
+
+### 6. Run réel du 2026-10-08 : listener muet après 4 096 lancements
+
+L'ensemble des mints suivis est désormais borné par la fenêtre de suivi (plus les positions live
+ouvertes et les intents non terminaux, sous le plafond du pipeline) ; avant ce correctif, les
+`token_launches` n'étant jamais terminalisés en `creates-only`, le listener s'arrêtait silencieusement
+après 4 096 lancements (chaque transaction échouait en `load_tracked_mints`, aucun create ni décision
+pendant 45 minutes).
