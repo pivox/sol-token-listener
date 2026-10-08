@@ -1002,7 +1002,9 @@ le BUY inchangé ; H2a vend à l'échéance (`maximum_holding_ms`). Plan et déc
 - Phrase : `CONFIRM ENVELOPE <wallet> <perBuy> <maxBuys> <maxExposure> <maxLoss> <holdingMs>
   <validUntilMs> <empreinte 8 hex> <nonce>`. L'autorisation vit 60 s : la saisir sans tarder.
 - La politique de risque vient du catalogue de gates (non signé). Le TTY n'affiche que son
-  empreinte : la vérifier.
+  empreinte : la vérifier. Chaque `evidenceId` du catalogue doit respecter
+  `^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$` (pas de `/`, donc ni URL ni chemin), sinon `prepare`
+  échoue avec le code générique `EXECUTION_OPERATIONS_FAILED`.
 - `create` refuse si : le capital réconcilié est inférieur à 20 × per_buy ; la politique
   n'admet pas un BUY quand le plafond de perte est atteint ; l'artefact gate 10 a plus de 24 h.
 

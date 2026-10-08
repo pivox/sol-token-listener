@@ -3,7 +3,8 @@
 **Date :** 2026-10-07. **Base :** `main` à `d223abf2` (lots 1 à 4b mergés), plus le mini-lot 5a
 (sonde de gate 10, migration 067, branche `docs/lot5-readiness`) et le correctif du bloquant 5
 (migration 068, branche `fix/build-hash-per-transaction`). Head de migration : **068**.
-**Statut :** préparation seulement. Rien n'a été lancé : aucun RPC, aucun listener, aucune transaction.
+**Statut :** préparation le 2026-10-07 ; gate 10 et dry-run C exécutés les 2026-10-07/08 (voir le
+journal en fin de document). Aucune transaction n'a été envoyée.
 
 ### Décisions de l'utilisateur (2026-10-07)
 
@@ -12,8 +13,10 @@
    worker simulation-only le simule et produit l'artefact. Implémenté au mini-lot 5a (§A.7, point 1).
    Le gate 10 se fait démon auto-arm arrêté, puis la sonde est désactivée avant l'enveloppe.
 2. **Base :** un conteneur PG16 dédié, publié sur `127.0.0.1:5433` (§A.4, étape B2).
-3. **Fournisseur :** l'exécuteur **partage le Helius du listener** (même projet, même clé). Risque
-   de sous-comptage et marge : voir §A.8.
+3. **Fournisseur :** décision initiale, l'exécuteur partage le Helius du listener. **Révisée le
+   2026-10-07** après le gate 10 : la clé Free partagée répond 429 dès le 3e appel consécutif pendant
+   que le listener tourne. L'exécuteur a désormais **son propre projet Helius** (clé dédiée) ; le
+   listener garde le sien. H2e mesure le projet de l'exécuteur. Voir §A.8 et le journal.
 4. **Montants :** 5 achats × 0,01 SOL, exposition cumulée 0,05 SOL, perte maximale 0,03 SOL,
    holding 180 s, wallet financé à 0,1 SOL (§B.2). La variante prudente à 3 achats est écartée.
 
@@ -60,7 +63,7 @@ noms de variables ont été lus, avec l'indication « valeur présente » ou « 
 3. **Preuves et clés absentes.** Aucun de ces éléments n'existe :
    - le catalogue de gates (8 gates statiques, politique de risque, empreinte de stratégie) ;
    - la clé d'attestation Ed25519 (H2e et H2f) ;
-   - la clé API Helius en fichier et l'UUID du projet (celui du listener, partagé : décision 3).
+   - la clé API Helius en fichier et l'UUID du projet (projet dédié à l'exécuteur : décision 3 révisée).
    H2e ne sait interroger que l'API Admin Helius.
 4. **Environnements et logins absents.**
    - `live.env` suit l'ancien schéma `LIVE_*`, qu'aucun code actuel ne lit.
@@ -216,7 +219,7 @@ partiellement dans `live-recovery`.
 | `EXECUTOR_SNAPSHOT_MAX_SLOT_LAG` | `8` | 0 à 128 (auto-arm observe au plus 8) |
 | `EXECUTOR_MAX_COMPUTE_UNITS` | `300000` | 1 à 1 400 000 |
 | `EXECUTOR_MAX_FEE_LAMPORTS` | `100000` | 0 à 10 000 000 |
-| `EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT` | `2500000` | 0 à 1e10 |
+| `EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT` | `15000000` (gate 10 : un BUY de 0,01 SOL débite ≈ 11,6 M lamports, rente ATA Token-2022 comprise ; voir le journal) | 0 à 1e10 |
 | `EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS` | `0` | exactement 0 |
 | `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT` | **`14`** pour H2b et auto-arm, **`8`** pour le worker simulation | H2b et auto-arm : 12 à 16. Simulation : 6 à 16, et elle **doit valoir H2b − 6** |
 | `LIVE_QUOTE_MINT_ALLOWLIST` | `So11111111111111111111111111111111111111112` | WSOL exactement |
@@ -234,7 +237,7 @@ Fraîcheur minimale exigée de la politique : `2×40000 + 30000 = 110 000 ms`.
 | `DATABASE_URL` | `postgresql://<login-listener>:<secret>@127.0.0.1:5433/<db>?options=-c%20role%3Dsol_token_listener_writer` |
 | `POSTGRES_AUTO_MIGRATE` | `false` |
 | `SOLANA_CLUSTER` | `mainnet-beta` |
-| `SOLANA_HTTP_RPC_URL` / `SOLANA_WS_RPC_URL` | `https://…` / `wss://…`, le Helius partagé avec l'exécuteur (décision 3) |
+| `SOLANA_HTTP_RPC_URL` / `SOLANA_WS_RPC_URL` | `https://…` / `wss://…`, le projet Helius du listener (distinct de celui de l'exécuteur, décision 3 révisée) |
 | `SOLANA_EXPECTED_GENESIS_HASH` | base58, 32 octets, vérifié indépendamment (obligatoire avec `LISTENER_ENABLED=true`) |
 | `LISTENER_ENABLED` | `true` |
 | `LISTENER_INGESTION_SCOPE` | `creates-only` |
@@ -244,7 +247,7 @@ Fraîcheur minimale exigée de la politique : `2×40000 + 30000 = 110 000 ms`.
 | `EXECUTION_MODE` | `observe` |
 | `EXECUTION_INTENT_EMISSION_ENABLED` / `PAPER_STRATEGY_ENABLED` | `false` / `false` |
 | `RISK_MAX_ROUNDTRIP_LOSS_BPS` | `3000` (défaut) |
-| `LISTENER_TRACKED_POOL_POLL_INTERVAL_MS` | `10000` (poller de curves, au plus 20 curves) |
+| `LISTENER_TRACKED_POOL_POLL_INTERVAL_MS` | `60000` (poller de curves, au plus 20 curves ; à `10000`, la clé Free du listener échoue ≈ 80 % des lectures, voir le journal) |
 | `API_ENABLED` / `API_HOST` / `API_PORT` | `true` / `127.0.0.1` / `3000` |
 
 Le listener refuse toute variable de clé privée (`rejectPrivateKeyConfiguration`).
@@ -258,7 +261,7 @@ Le listener refuse toute variable de clé privée (`rejectPrivateKeyConfiguratio
 | `EXECUTOR_MODE` / `LIVE_TRADING_ENABLED` | `simulation-only` / `false` |
 | `EXECUTOR_PUBLIC_KEY` | adresse base58 du wallet de l'exécuteur |
 | `EXECUTOR_RPC_PROVIDER_ID` | identifiant du fournisseur de l'exécuteur (par exemple `helius`), le même partout |
-| `SOLANA_HTTP_RPC_URL` | endpoint Helius (partagé avec le listener) |
+| `SOLANA_HTTP_RPC_URL` | endpoint du projet Helius dédié à l'exécuteur (décision 3 révisée) |
 | `SOLANA_EXPECTED_GENESIS_HASH` | idem listener |
 | Valeurs runtime communes | voir le tableau, avec `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT=8` |
 
@@ -268,7 +271,7 @@ Aucun nom de keypair, même vide.
 
 | Variable | Format |
 |---|---|
-| `HELIUS_PROJECT_ID` | UUID du projet Helius (partagé avec le listener) |
+| `HELIUS_PROJECT_ID` | UUID du projet Helius de l'exécuteur (dédié, décision 3 révisée) |
 | `HELIUS_API_KEY_PATH` | chemin absolu hors checkout, fichier `0600` |
 | `EXECUTOR_RPC_PROVIDER_ID` | même identifiant que l'exécuteur |
 | `EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH` | clé PEM PKCS#8 Ed25519 `0600` hors checkout |
@@ -531,7 +534,7 @@ Le keypair n'a pas été lu.
    - Aucun script du dépôt ne le génère : voir l'extrait de l'étape B5.
 3. **La clé d'attestation Ed25519** (PEM PKCS#8, `0600`), la **clé API Helius** en fichier et
    `HELIUS_PROJECT_ID`.
-4. **Le fournisseur RPC de l'exécuteur** : décision 3, il partage le Helius du listener (§A.8).
+4. **Le fournisseur RPC de l'exécuteur** : décision 3 révisée, un projet Helius dédié (§A.8).
 5. **La base PG16** sur `127.0.0.1:5433` et les 6 logins (§A.4).
 6. **Les 9 fichiers d'environnement** de §A.2 et le keypair hors dépôt.
 7. **Les valeurs dérivées**, qui n'existent qu'après certaines étapes :
@@ -539,25 +542,26 @@ Le keypair n'a pas été lu.
    - `EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64` (manifeste H2e) ;
    - `EXECUTOR_BUILD_HASH` et `EXECUTOR_CONFIGURATION_FINGERPRINT` (artefact gate 10).
 
-### A.8 Helius partagé entre listener et exécuteur (décision 3)
+### A.8 Deux projets Helius : listener et exécuteur (décision 3 révisée)
 
-- H2e mesure l'usage **du projet entier** (API Admin) : la mesure de départ inclut le listener.
-- Ensuite, auto-arm reporte cet usage avec les seuls compteurs de l'exécuteur
-  (`EXECUTOR_COUNTERS`). Les crédits consommés par le listener après H2e ne sont **pas comptés** :
-  `used_units` est sous-estimé pendant toute la fenêtre de l'enveloppe (runbook, limites lot 4a, point 2).
-- Le listener est le gros consommateur : quotes BUY et SELL à chaque create, poller de curves,
-  WebSocket. Le risque réel n'est pas le compteur mais l'épuisement du plan ou des 429 au moment
-  d'un SELL.
+- Version initiale (2026-10-07, matin) : un seul projet partagé. Abandonnée au gate 10 : la clé
+  Free répond 429 dès le 3e appel consécutif de l'exécuteur pendant que le listener tourne.
+- Version retenue : l'exécuteur a **son propre projet Helius** ; le listener garde le sien.
+  - H2e mesure l'usage **du projet de l'exécuteur** (API Admin). Les compteurs reportés par
+    auto-arm (`EXECUTOR_COUNTERS`) portent sur le même projet : il n'y a plus de sous-comptage dû
+    au listener.
+  - `providerSafetyMarginUnits` couvre seulement les appels de l'exécuteur non comptés (retries,
+    H2a) : l'exemple `10000` de B5 est suffisant sur un plan Free neuf.
+- Le listener reste le gros consommateur (quotes BUY et SELL à chaque create, poller de curves,
+  WebSocket) et sa clé Free **sature** : voir le journal (≈ 80 % de lectures du poller en échec à
+  10 s ; 491 HTTP 429 sur 1 689 tentatives en 4 min pendant le dry-run). Le risque réel est une
+  quote indisponible ou un `ENTRY_BLOCKED` (3 réponses 429 récentes), pas le compteur.
 - Parades :
-  - `providerSafetyMarginUnits` **généreux** : au moins **deux fois** la consommation attendue du
-    listener sur toute la fenêtre de l'enveloppe (2 h), mesurée sur le tableau de bord Helius
-    pendant le dry-run, et en tout cas très inférieur à `limit − used` ;
+  - **plan payant sur le projet du listener** avant le run réel (recommandation du journal) ;
+  - `LISTENER_TRACKED_POOL_POLL_INTERVAL_MS=60000` ;
   - lancer H2e juste avant `create` (B14 à B18 enchaînés), pour partir d'une mesure fraîche ;
-  - surveiller les 429 (heartbeat du listener, `fast-path:report`) ; à partir de 3 réponses 429
-    récentes, les entrées sont bloquées (`ENTRY_BLOCKED`) ;
+  - surveiller les 429 (heartbeat du listener, `fast-path:report`) ;
   - en cas de doute, `entry-stop` : les sorties continuent.
-- Donnée à relever par l'utilisateur : la limite de crédits du plan Helius et l'usage du listener
-  par heure, pour fixer `providerSafetyMarginUnits` dans le catalogue (B5).
 
 ---
 
@@ -657,10 +661,10 @@ node --input-type=module -e "
       providerEntryCostUnits: 16n, providerExitCostUnitsPerPosition: 16n,
       providerConfirmationCostUnitsPerPosition: 16n, providerReconciliationCostUnitsPerPosition: 16n,
       providerSafetyMarginUnits: 10000n, maximumConsecutiveTechnicalFailures: 2 },
-    gates: [ g('QUALITY_GATES_PASSED','CI_RUN','<id>','<64-hex>'), g('MIGRATIONS_VERIFIED','MIGRATION_TEST','<id>','<64-hex>'),
-      g('ARCHITECTURE_BOUNDARIES_VERIFIED','ARCHITECTURE_TEST','<id>','<64-hex>'), g('DRY_RUN_RECOVERY_VERIFIED','DRY_RUN_TEST','<id>','<64-hex>'),
-      g('SIMULATION_MATRIX_VERIFIED','SIMULATION_ARTIFACT','<id>','<64-hex>'), g('FAULT_MATRIX_VERIFIED','FAULT_TEST','<id>','<64-hex>'),
-      g('RECONCILIATION_CLEAN','RECONCILIATION_STATE','<id>','<64-hex>'), g('STOP_CONTROLS_VERIFIED','STOP_CONTROL_TEST','<id>','<64-hex>') ] };
+    gates: [ g('QUALITY_GATES_PASSED','CI_RUN','gha-run-<id>','<64-hex>'), g('MIGRATIONS_VERIFIED','MIGRATION_TEST','tests:<fichier>','<64-hex>'),
+      g('ARCHITECTURE_BOUNDARIES_VERIFIED','ARCHITECTURE_TEST','tests:<fichier>','<64-hex>'), g('DRY_RUN_RECOVERY_VERIFIED','DRY_RUN_TEST','tests:<fichier>','<64-hex>'),
+      g('SIMULATION_MATRIX_VERIFIED','SIMULATION_ARTIFACT','tests:<fichier>','<64-hex>'), g('FAULT_MATRIX_VERIFIED','FAULT_TEST','tests:<fichier>','<64-hex>'),
+      g('RECONCILIATION_CLEAN','RECONCILIATION_STATE','reconciliation:<date>','<64-hex>'), g('STOP_CONTROLS_VERIFIED','STOP_CONTROL_TEST','tests:<fichier>','<64-hex>') ] };
   writeFileSync('$L/evidence/gate-catalog.json', canonicalStringifyJson(catalog), { flag: 'wx', mode: 0o600 });
 "
 ```
@@ -668,6 +672,9 @@ node --input-type=module -e "
 À vérifier :
 
 - le fichier est en `0600` ;
+- chaque `evidenceId` respecte `^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$` (pas de `/`, donc pas d'URL
+  ni de chemin) : sinon `prepare` échoue avec le code générique `EXECUTION_OPERATIONS_FAILED`
+  (voir le journal, point 4) ;
 - son dernier octet n'est pas `\n` (`tail -c1 … | xxd`) ;
 - `createExecutionRiskPolicy(parseJson(...).policy)` (importé de `dist/src/domain/execution-risk-policy.js`)
   ne lève pas d'erreur.
@@ -679,11 +686,13 @@ tard, il faut régénérer le catalogue.
 du runbook (section « Produire la preuve Helius H2e »), avec `flag: 'wx'` et `mode: 0o600`, vers
 `$L/keys/provider-attestation-key.pem`.
 
-**B7. Fournisseur (Helius partagé, décision 3).** Action web manuelle de l'utilisateur, hors du bot.
+**B7. Fournisseur (projet Helius dédié à l'exécuteur, décision 3 révisée).** Action web manuelle
+de l'utilisateur, hors du bot.
 
-- Enregistrer la clé API Helius du listener dans `$L/keys/helius-api-key` (`0600`).
-- Noter l'UUID du projet, l'endpoint RPC mainnet, la limite de crédits du plan et l'usage horaire
-  du listener (§A.8).
+- Créer un projet Helius dédié à l'exécuteur et enregistrer sa clé API dans
+  `$L/keys/helius-api-key` (`0600`). Le listener garde son propre projet et sa propre clé.
+- Noter l'UUID du projet de l'exécuteur, son endpoint RPC mainnet et la limite de crédits du plan
+  (§A.8).
 - Choisir l'identifiant `EXECUTOR_RPC_PROVIDER_ID`, par exemple `helius`, identique dans tous les
   environnements de l'exécuteur.
 
@@ -938,7 +947,8 @@ snapshot fournisseur dont le SELL a besoin.
 8. Retirer le SOL restant vers le wallet personnel. Transaction manuelle de l'utilisateur, hors du
    bot.
 9. Laisser le job de rétention reprendre seulement après le rapport.
-10. Conserver `L/evidence`. La clé Helius est celle du listener (partagée) : ne pas la révoquer.
+10. Conserver `L/evidence`. La clé Helius de l'exécuteur est dédiée : la révoquer ou non est au
+    choix de l'utilisateur ; celle du listener n'est pas concernée.
 
 ### B.2 Paramètres d'enveloppe et de politique : calculs
 
@@ -985,8 +995,8 @@ Valeurs :
   `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT` ou plus.
 - Montants **décidés** par l'utilisateur (décision 4) : 5 × 0,01 SOL, exposition 0,05 SOL, perte
   0,03 SOL, holding 180 s, wallet 0,1 SOL.
-- **Coûts fournisseur avec le Helius partagé** : `providerSafetyMarginUnits` suit §A.8 (au moins
-  deux fois l'usage du listener sur la fenêtre), pas la valeur d'exemple `10000`.
+- **Coûts fournisseur** : avec le projet Helius dédié à l'exécuteur (§A.8), `providerSafetyMarginUnits`
+  ne couvre que les appels de l'exécuteur non comptés ; la valeur d'exemple `10000` convient.
 
 ---
 
@@ -1071,7 +1081,7 @@ c'est à l'utilisateur de décider s'il la fait.
   la vraie politique.
 - Les décisions d'entrée rapide se forment sur le vrai flux, avec la latence create → décision → armement.
 - La charge RPC du listener tient avec une enveloppe active (quotes à chaque create, poller de curves),
-  ou non (429). Avec le Helius partagé, c'est aussi la mesure de l'usage horaire pour §A.8.
+  ou non (429) : c'est la mesure qui décide du plan Helius du listener (§A.8).
 - L'armement auto-arm de bout en bout fonctionne : RPC wallet, report fournisseur, admission,
   triggers 065, compteurs d'enveloppe, `EXHAUSTED`.
 - `revoke` et `entry-stop` fonctionnent, ainsi que le rapport.
@@ -1099,8 +1109,12 @@ c'est à l'utilisateur de décider s'il la fait.
 Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concernent le wallet) :
 
 1. [ ] Accord explicite de l'utilisateur pour le lot 5, avec les montants décidés (§B.2).
-0. [ ] Le correctif du bloquant 5 (branche `fix/build-hash-per-transaction`, testé) est mergé
-   dans `main` et déployé ; sinon H2b refuse chaque BUY fast-entry en consommant un `buys_armed`.
+0. [x] Le correctif du bloquant 5 est mergé dans `main` (PR #244, migration 068) ; sans lui, H2b
+   refuserait chaque BUY fast-entry en consommant un `buys_armed`. Reste à déployer sur la machine du run.
+0b. [ ] PR #249 mergée (expiration des armements) : sans elle, un armement `ARMED` expiré garde sa
+   réservation et auto-arm reste `OPEN_POSITION` (dead-lock D9 du dry-run, voir le journal).
+0c. [ ] Clé Helius de l'exécuteur dédiée (B7 révisé) et plan du listener suffisant : pas de 429
+   persistant côté listener pendant le dernier dry-run (§A.8).
 2. [ ] La base de production est en PG16 (`127.0.0.1:5433`), migrée à 068, avec les rôles
    reprovisionnés **après** 068 (inventaire RLS `5 | 1 | t`) et 6 logins mono-rôle.
 3. [ ] Aucune position n'est `MISMATCH` (sur un SELL antérieur à 4b), `UNKNOWN` ou `EXIT_PENDING`,
@@ -1109,8 +1123,8 @@ Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concern
    Aucun `CONFIG_BINDING_MISMATCH`, `POLICY_FRESHNESS` ni 429 persistant.
 5. [ ] Les 8 valeurs runtime sont identiques entre `operations.env` et `live.env`. Le worker de
    simulation utilise la valeur H2b − 6, et toutes ses autres valeurs sont identiques à H2b.
-6. [ ] La preuve H2e du Helius partagé est fraîche (B14 et B15 enchaînés) et
-   `providerSafetyMarginUnits` couvre au moins deux fois l'usage du listener sur la fenêtre (§A.8).
+6. [ ] La preuve H2e du projet Helius de l'exécuteur est fraîche (B14 et B15 enchaînés) et
+   `providerSafetyMarginUnits` couvre les appels non comptés de l'exécuteur (§A.8).
 7. [ ] Le keypair est hors dépôt, en `0400`, sa clé publique est égale à `EXECUTOR_PUBLIC_KEY`, et
    le wallet est neuf et dédié.
 8. [ ] Le wallet est financé à 0,1 SOL au plus, sans autre token.
@@ -1126,8 +1140,8 @@ Tous les points doivent être vrais avant B23 (et avant B9 pour ceux qui concern
 
 ## Questions ouvertes (réponses de l'utilisateur requises)
 
-Tranché le 2026-10-07 : sonde de gate 10, base PG16 sur `127.0.0.1:5433`, Helius partagé,
-montants (voir « Décisions de l'utilisateur » en tête). Reste :
+Tranché le 2026-10-07 : sonde de gate 10, base PG16 sur `127.0.0.1:5433`, projet Helius dédié à
+l'exécuteur (décision 3 révisée), montants (voir « Décisions de l'utilisateur » en tête). Reste :
 
 1. **Machine du run** : le poste de l'opérateur ou un serveur ? Le run demande un TTY pour `create`
    et `resume`, la présence de l'opérateur, une horloge NTP et une connexion stable.
@@ -1140,3 +1154,65 @@ montants (voir « Décisions de l'utilisateur » en tête). Reste :
 5. **Fumée de démarrage H2b (D14)** : la faire avant le run réel ?
 6. **Les 8 preuves statiques du catalogue** : quels artefacts concrets (identifiant de run CI, tests)
    l'utilisateur accepte-t-il comme preuve ?
+
+---
+
+## Journal du 2026-10-07/08 : gate 10 et dry-run
+
+Relevé factuel des exécutions. Rien n'a été envoyé sur mainnet.
+
+### 1. RPC : la clé Free partagée ne tient pas
+
+- Avec la clé Free partagée (décision 3 initiale), l'exécuteur reçoit **429 dès le 3e appel
+  consécutif** pendant que le listener tourne. L'utilisateur a créé un **projet Helius dédié à
+  l'exécuteur** ; le listener garde le sien (décision 3 révisée, §A.8).
+- La clé Free du listener **sature seule** : le poller de curves échoue sur ≈ 80 % de ses lectures
+  à 10 s. Le dry-run a tourné avec `LISTENER_TRACKED_POOL_POLL_INTERVAL_MS=60000`. Le rapport
+  `fast-path:report` compte **491 HTTP 429 sur 1 689 tentatives** du listener en 4 min.
+- Recommandation : **plan payant sur le projet du listener** avant le run réel. Sans cela, les
+  quotes manquent (`QUOTE_UNAVAILABLE`) et l'entrée se bloque sur 3 réponses 429 récentes.
+
+### 2. Agave 4.3 (RPC `apiVersion` 4.3.0) : quatre correctifs
+
+Le nœud Helius répond désormais en Agave 4.3. Le parseur fermé du bot refusait les réponses ;
+correctifs mergés dans `main` :
+
+- **#245** : nouveaux champs de `simulateTransaction`, `getTransaction` et `getSignatureStatuses` ;
+- **#246** : comptes par défaut renvoyés vides au lieu de `null` ; `rentEpoch` à 2^64 ;
+- **#247** : les CPI internes des programmes connus arrivent déjà parsées (`parsed`) ;
+- **#248** : catégorie `parsedStreams` dans les ventilations d'usage de l'API Admin Helius.
+
+Méthode de diagnostic, à réutiliser : un hook de capture sur `fetch` enregistre les réponses brutes
+hors Git ; elles sont rejouées hors ligne dans le parseur jusqu'à isoler le champ refusé ; une trace
+temporaire dans le `catch` de la passerelle compilée (`dist/`) donne le chemin exact, puis est retirée.
+
+### 3. Gate 10 : mesures de la sonde
+
+- Un BUY de sonde de 0,001 SOL débite **≈ 2,4 M lamports** : rente de l'ATA Token-2022
+  (1 513 840 lamports) plus frais. Un BUY de **0,01 SOL débitera ≈ 11,6 M**.
+- `EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT` est fixé à **`15000000`** dans `worker-sim`, `operations`
+  et `live` : il fait partie de l'empreinte de configuration, donc identique partout (§A.2).
+- Issue des sondes : environ **la moitié en `QUOTE_UNAVAILABLE`** (curve pas encore lisible juste
+  après le create, plus les 429 du listener). Sur ≈ 6 simulations réelles, **une erreur 6002 du
+  programme pump.fun (slippage)**. En run réel, ce cas échoue en fermé (aucun envoi) mais consomme
+  un `buys_armed`.
+
+### 4. Catalogue : contrainte sur `evidenceId`
+
+Chaque `evidenceId` du catalogue doit respecter `^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$`
+(`src/domain/execution-safety-qualification.ts`) : pas de `/`, donc ni URL ni chemin. Sinon
+`envelope prepare` échoue avec le code générique `EXECUTION_OPERATIONS_FAILED`, la CLI masquant le
+code précis. L'extrait B5 utilise désormais des exemples conformes (`gha-run-<id>`, `tests:<fichier>`).
+Suite proposée : afficher `ExecutionEnvelopeCommandError.code` dans le log d'échec de la CLI.
+
+### 5. Dry-run C : résultat
+
+- **D1 à D8 et D10 à D13 passés** : `create` et `resume` au TTY ; démarrage de H2a, d'auto-arm et du
+  listener ; premier `ARMED` **≈ 2 s** après la décision d'entrée ; les 8 colonnes `runtime_*`, le
+  build hash et l'empreinte de configuration de l'armement égaux à `live.env` ; `revoke` a libéré
+  l'armement et la réservation ; kill switch `ENTRY_STOP` ; rapport lisible.
+- **D9** a révélé un dead-lock : un armement `ARMED` expiré gardait sa réservation et auto-arm
+  restait `OPEN_POSITION` sans réarmer. Corrigé par la **PR #249** (expiration des armements), à
+  merger avant le run réel (go/no-go, point 0b).
+- Wallet après le dry-run : **≈ 0,403 SOL**, **22 comptes Token-2022 vides** (≈ 0,033 SOL de rente
+  récupérable), aucun solde de token. L'utilisateur garde le solde en l'état.

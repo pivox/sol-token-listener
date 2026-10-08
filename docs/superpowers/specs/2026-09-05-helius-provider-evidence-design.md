@@ -112,7 +112,9 @@ logs. Le projet doit correspondre à cette clé ; Helius refuse le désaccord.
 ## 5. Contrats Helius et conversion entière
 
 Le producteur reconnaît exactement deux variantes complètes. Il refuse les
-formes hybrides, les clés inconnues et les objets partiels.
+formes hybrides, les clés inconnues et les objets partiels, à la seule
+exception des ventilations par service `credits` et `requests` de la variante
+courante (voir plus bas).
 
 La variante historique contient :
 
@@ -131,12 +133,16 @@ globaux et `subscriptionDetails`, avec :
 - `subscriptionDetails.billingCycle` comme cycle informatif valide ou `null`
   pour un plan sans facturation ;
 - `creditCycle.start|end` comme bornes calendaires effectives ;
-- `credits` avec exactement `rpc`, `enhancedApi`, `walletApi`, `das`,
-  `webhooks`, `laserstreamGrpc`, `laserstreamWebsocket`, `preConfirmations`,
-  `preprocessedTransactions`, `archival`, `photon` et `other` ;
-- `requests` avec exactement `rpc`, `enhancedApi`, `walletApi`, `das`,
-  `webhooks`, `preConfirmations`, `preprocessedTransactions`, `archival`,
-  `photon` et `other` ;
+- `credits` et `requests` : ventilations par service, informatives. Chacune
+  doit contenir `rpc` et compte de 1 à 64 clés, chaque clé étant un
+  identifiant camelCase (`^[A-Za-z][A-Za-z0-9]{0,63}$`) porté par une
+  propriété énumérable dont la valeur est un entier sûr positif ou nul.
+  Helius ajoute des catégories au fil du temps (`parsedStreams` est apparue
+  en octobre 2026, à côté de `enhancedApi`, `walletApi`, `das`, `webhooks`,
+  `laserstreamGrpc`, `laserstreamWebsocket`, `preConfirmations`,
+  `preprocessedTransactions`, `archival`, `photon` et `other`) : une nouvelle
+  catégorie ne doit pas invalider la preuve, le quota venant des compteurs
+  globaux ;
 - `dataTransfer` avec exactement `laserstreamGrpc` et
   `laserstreamWebsocket`.
 
@@ -144,7 +150,10 @@ globaux et `subscriptionDetails`, avec :
 même lorsque le cycle informatif de facturation est présent et différent.
 
 Tous les compteurs doivent être des entiers JSON sûrs et positifs ou nuls.
-Les champs inconnus sont refusés afin qu'une dérive du contrat soit visible.
+Les champs inconnus sont refusés afin qu'une dérive du contrat soit visible :
+clés de premier niveau, `subscriptionDetails`, cycles et `dataTransfer`
+restent exacts ; seules les ventilations `credits` et `requests` acceptent des
+catégories supplémentaires, dans les limites ci-dessus.
 La conversion durable utilise :
 
 ```text
