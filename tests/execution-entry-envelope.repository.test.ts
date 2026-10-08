@@ -333,6 +333,59 @@ for (const initialState of ['ACTIVE', 'EXHAUSTED', 'EXPIRED'] as const) {
     });
 }
 
+void test('expireEnvelopes terminalizes an ARMED armament past its deadline, releases its reservation and lets the envelope re-arm',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      const prepared = await openEnvelope(pool, repository, simulation);
+      await seedProviderSnapshot(pool);
+      const first = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      const armament = await armEnvelope(repository, prepared, first);
+      const armed = await repository.readAutoArmContext(contextQuery());
+      assert.equal(armed.activeArmament, 'ARMED');
+      assert.equal(armed.openPositions, 1);
+      // Nobody (no H2b) took the armament before its deadline.
+      await moveArmamentIntoThePast(pool, armament.armamentId);
+      // The deadlock facts: no active armament, yet the position slot is still held.
+      const stale = await repository.readAutoArmContext(contextQuery());
+      assert.equal(stale.activeArmament, null);
+      assert.equal(stale.openPositions, 1);
+      const swept = await repository.expireEnvelopes(generationId);
+      assert.equal(swept.expiredCount, 0);
+      const released = await repository.readAutoArmContext(contextQuery());
+      assert.equal(released.activeArmament, null);
+      assert.equal(released.openPositions, 0);
+      // The expired armament's buy stays consumed.
+      assert.equal(released.buysArmed, 1);
+      assert.deepEqual(await armamentLedger(pool, armament.armamentId), {
+        state: 'EXPIRED', revision: '1', reservation_state: 'RELEASED', reserved_exposure_raw: '0',
+        open_positions: 0, intent_status: 'PENDING', live_reserved: true,
+        events: ['OPERATOR_ARMED', 'ARMAMENT_EXPIRED'],
+      });
+      // Idempotent: a second sweep writes nothing.
+      assert.equal((await repository.expireEnvelopes(generationId)).expiredCount, 0);
+      assert.equal((await armamentLedger(pool, armament.armamentId)).revision, '1');
+      // The envelope re-arms the next eligible intent.
+      const second = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      const rearmed = await armEnvelope(repository, prepared, second);
+      assert.equal(rearmed.state, 'ARMED');
+      const rearmedView = await repository.readAutoArmContext(contextQuery());
+      assert.equal(rearmedView.activeArmament, 'ARMED');
+      assert.equal(rearmedView.openPositions, 1);
+      assert.equal(rearmedView.buysArmed, 2);
+      // A LOCKED armament (H2b holds it) past its deadline is never touched.
+      await lockArmamentAfterBuy(pool, rearmed.armamentId, second, 'SUBMITTED');
+      await moveArmamentIntoThePast(pool, rearmed.armamentId);
+      assert.equal((await repository.expireEnvelopes(generationId)).expiredCount, 0);
+      const locked = await armamentLedger(pool, rearmed.armamentId);
+      assert.equal(locked.state, 'LOCKED');
+      assert.equal(locked.reservation_state, 'RESERVED');
+      assert.equal(locked.open_positions, 1);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).activeArmament, 'LOCKED');
+    });
+  });
+
 void test('expireEnvelopes expires only ACTIVE envelopes past valid_until', async (context) => {
   await withSchema(context, async (pool) => {
     const simulation = await seedEnvelopeBase(pool);
@@ -385,6 +438,16 @@ void test('PostgreSQL 16 operations role arms a CANARY and an ENVELOPE, reads th
       const armament = await armEnvelope(operations, second, intentId, SHORT_PROVIDER);
       assert.equal(armament.state, 'ARMED');
       assert.equal((await operations.readAutoArmContext(contextQuery())).activeArmament, 'ARMED');
+      // The armament nobody took: the role expires it, releases its reservation and re-arms.
+      await moveArmamentIntoThePast(pool, armament.armamentId);
+      assert.equal((await operations.expireEnvelopes(generationId)).expiredCount, 0);
+      const swept = await operations.readAutoArmContext(contextQuery());
+      assert.equal(swept.activeArmament, null);
+      assert.equal(swept.openPositions, 0);
+      assert.equal((await armamentLedger(pool, armament.armamentId)).state, 'EXPIRED');
+      const rearmedIntent = await fastEntryIntent(pool, second.envelope, await currentDatabaseTimeMs(pool));
+      const rearmed = await armEnvelope(operations, second, rearmedIntent, SHORT_PROVIDER);
+      assert.equal(rearmed.state, 'ARMED');
       const revoked = await operations.revokeEnvelope(Object.freeze({
         generationId, envelopeId: second.envelope.envelopeId,
         operatorId: 'operator-primary', occurredAtMs: Date.now(),
@@ -393,7 +456,7 @@ void test('PostgreSQL 16 operations role arms a CANARY and an ENVELOPE, reads th
       assert.equal(revoked.armamentRevoked, true);
       // Refresh needs a LOCKED envelope armament whose BUY SUCCEEDED (H2b state, forged here);
       // it reads and writes only what the role holds, and needs no ACTIVE envelope.
-      await lockArmamentAfterBuy(pool, armament.armamentId, intentId, 'SUCCEEDED');
+      await lockArmamentAfterBuy(pool, rearmed.armamentId, rearmedIntent, 'SUCCEEDED');
       const due = await operations.readAutoArmContext(contextQuery());
       assert.equal(due.envelope, null);
       assert.equal(due.activeArmament, 'LOCKED');
@@ -970,6 +1033,34 @@ async function lockArmamentAfterBuy(
       attempt_count=1,
       terminal_at=GREATEST(date_trunc('milliseconds',statement_timestamp()),requested_at) WHERE id=$1`,
   [intentId]);
+}
+
+/** The armament deadline passed (its intent TTL) without anyone taking it. */
+async function moveArmamentIntoThePast(pool: Pool, armamentId: string): Promise<void> {
+  await mutateWithTriggersDisabled(pool, `UPDATE execution_activation_armaments SET
+    armed_at=armed_at-INTERVAL '3 minutes',
+    expires_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second'
+    WHERE armament_id=$1`, [armamentId]);
+}
+
+async function armamentLedger(pool: Pool, armamentId: string) {
+  const [row] = (await pool.query(`SELECT armament.state,armament.state_revision::TEXT AS revision,
+    reservation.state AS reservation_state,
+    risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,risk.open_positions,
+    intent.status AS intent_status,intent.live_reserved,
+    ARRAY(SELECT event.reason_code FROM execution_activation_events event
+      WHERE event.armament_id=armament.armament_id ORDER BY event.occurred_at,event.next_state) AS events
+    FROM execution_activation_armaments armament
+    JOIN execution_exposure_reservations reservation
+      ON reservation.reservation_id=armament.target_reservation_id
+    JOIN execution_wallet_risk_state risk ON risk.generation_id=armament.generation_id
+    JOIN execution_intents intent ON intent.id=armament.target_intent_id
+    WHERE armament.armament_id=$1`, [armamentId])).rows;
+  assert.ok(row !== undefined);
+  return row as Readonly<{
+    state: string; revision: string; reservation_state: string; reserved_exposure_raw: string;
+    open_positions: number; intent_status: string; live_reserved: boolean; events: readonly string[];
+  }>;
 }
 
 async function moveEnvelopeIntoThePast(pool: Pool, envelopeId: string) {
