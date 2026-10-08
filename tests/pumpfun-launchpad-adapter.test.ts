@@ -189,7 +189,7 @@ function decoded(raw: NormalizedTransaction): DecodedPumpTransaction {
       tokenTotalSupply: 1_000n, tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
       isMayhemMode: true, isCashbackEnabled: true, quoteMint: QUOTE,
       virtualQuoteReserves: 2_000n, creatorFeeBps: 1_200n,
-      isHolderReward: true,
+      isHolderReward: true, depth: 0,
     }),
     eventCpi: Object.freeze({ kind: 'CREATE' as const, event: undefined as never, instruction: instruction(2, 0), trailingDataHex: '' }),
     quoteAsset,

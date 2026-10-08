@@ -100,17 +100,25 @@ void test('décode CreateEvent avec Token-2022, Mayhem, Cashback et quote mint',
   assert.equal(decoded.event.virtualQuoteReserves, 30_000_000_001n);
   assert.equal(decoded.event.creatorFeeBps, 1_200n);
   assert.equal(decoded.event.isHolderReward, true);
+  assert.equal(decoded.event.depth, 0);
   assert.equal(decoded.trailingDataHex, '');
 });
 
 void test('décode uniquement les suffixes officiels historiques de CreateEvent', () => {
   const cases = [
-    { suffix: Buffer.alloc(0), creatorFeeBps: 0n, holderReward: false },
-    { suffix: encodeInteger(975n, 8, true), creatorFeeBps: 975n, holderReward: false },
+    { suffix: Buffer.alloc(0), creatorFeeBps: 0n, holderReward: false, depth: 0 },
+    { suffix: encodeInteger(975n, 8, true), creatorFeeBps: 975n, holderReward: false, depth: 0 },
     {
       suffix: Buffer.concat([encodeInteger(1_200n, 8, true), Buffer.from([1])]),
       creatorFeeBps: 1_200n,
       holderReward: true,
+      depth: 0,
+    },
+    {
+      suffix: Buffer.concat([encodeInteger(300n, 8, true), Buffer.from([0, 2])]),
+      creatorFeeBps: 300n,
+      holderReward: false,
+      depth: 2,
     },
   ] as const;
 
@@ -120,12 +128,48 @@ void test('décode uniquement les suffixes officiels historiques de CreateEvent'
     assert.equal(decoded.kind, 'CREATE');
     assert.equal(decoded.event.creatorFeeBps, fixture.creatorFeeBps);
     assert.equal(decoded.event.isHolderReward, fixture.holderReward);
+    assert.equal(decoded.event.depth, fixture.depth);
     assert.equal(decoded.trailingDataHex, '');
   }
 });
 
+// `Program data:` log of mainnet tx oz8bNwZ17b6B5TYbxNuvQ2BiVeSpdC96RFjjAKKdN1Cv9rJd3Umns2Zb276Xoj
+// rNqyAjGoVSVTbRzbTiszKsw9K (slot 454599224), the first CreateEvent layout emitted after the
+// pump program upgrade at slot 454596459: creator_fee_bps, is_holder_reward, then depth (u8).
+const MAINNET_CREATE_EVENT_DEPTH_BASE64 =
+  'G3KpTd7rY3YIAAAAbW9uZXlkb2cIAAAAbW9uZXlkb2c8AAAAaHR0cHM6Ly9tZXRhZGF0YS5qN3RyYWNrZXIuaW8vbWV0'
+  + 'YWRhdGEvY2VmYTg5ODM5YzNiNDI0Zi5qc29uQlKUdEk9czfdGMTNAaKU4bhkR0vraK/SsIvy5TipLXU9AMYHfedYUwRR'
+  + 'quq/mf7Ctpif8OVa+pUfEv7y8xWG/w+1Mg3Na+Lj4VMLvxDHnF3iBagGmrqyolpjJjKtGH4ID7UyDc1r4uPhUwu/EMec'
+  + 'XeIFqAaaurKiWmMmMq0YfgitxcdqAAAAAAAQ2EfjzwMAAKwj/AYAAAAAeMX7UdECAACAxqR+jQMABt324e51j94YQl28'
+  + '5GzN2rYa/E2DuQ0n/r35KNihi/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKwj/AYAAAAAAAAAAAAA'
+  + 'AAAA';
+
+void test('décode le CreateEvent Mainnet post-upgrade avec son suffixe de 10 octets', () => {
+  const logged = Buffer.from(MAINNET_CREATE_EVENT_DEPTH_BASE64, 'base64');
+  const discriminator = Uint8Array.from(PUMP_EVENTS.CreateEvent.discriminator);
+  assert.deepEqual(Uint8Array.from(logged.subarray(0, 8)), discriminator);
+  const payload = logged.subarray(8);
+  assert.equal(payload.subarray(-10).toString('hex'), '00000000000000000000');
+
+  const decoded = decodePumpCpiEvent(eventInstruction(discriminator, payload));
+
+  assert.ok(decoded);
+  assert.equal(decoded.kind, 'CREATE');
+  assert.equal(decoded.event.name, 'moneydog');
+  assert.equal(decoded.event.mint, '5TtweLdNKMDWT35ybnwurwKkpMPhd7jntuNn5wJqnSWx');
+  assert.equal(decoded.event.bondingCurve, '578Z7drB5DC5N14VF67WxwpLb6JQfzdUowBz6NhwgkWi');
+  assert.equal(decoded.event.timestamp, 1_791_477_165n);
+  assert.equal(decoded.event.tokenProgram, TOKEN_2022_PROGRAM_ADDRESS);
+  assert.equal(decoded.event.quoteMint, '11111111111111111111111111111111');
+  assert.equal(decoded.event.virtualQuoteReserves, 30_000_000_000n);
+  assert.equal(decoded.event.creatorFeeBps, 0n);
+  assert.equal(decoded.event.isHolderReward, false);
+  assert.equal(decoded.event.depth, 0);
+  assert.equal(decoded.trailingDataHex, '');
+});
+
 void test('refuse les suffixes CreateEvent non officiels', () => {
-  for (const length of [1, 7, 10]) {
+  for (const length of [1, 7, 11, 18]) {
     assert.throws(
       () => decodePumpCpiEvent(createEventWithSuffix(Buffer.alloc(length))),
       (error: unknown) =>

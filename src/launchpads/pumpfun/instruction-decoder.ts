@@ -166,9 +166,14 @@ function decodeInstructionArgs(
   if (name === 'buy_exact_quote_in_v2') {
     return decodeExactQuoteBuyArgs(definition, reader, observeSuffix);
   }
+  if (name === 'buy_v2') return decodeBuyV2Args(definition, reader, observeSuffix);
   return decodeIdlFields(definition.args, reader);
 }
 
+// Since the program upgrade at slot 454596459 the @pump-fun/pump-sdk 4.0.0 IDL appends an
+// EOF-tolerant `partial_fill: OptionBool` to `buy`, `buy_exact_sol_in`, `buy_exact_quote_in_v2`
+// and `buy_v2` (one byte, 0 or 1, after the existing arguments). The pinned IDL predates it, so
+// the byte is read here by name; absent means the argument is not present in the instruction.
 function decodeLegacyBuyArgs(
   name: 'buy' | 'buy_exact_sol_in',
   definition: InstructionDefinition,
@@ -176,32 +181,26 @@ function decodeLegacyBuyArgs(
   observeSuffix: (length: number) => void,
 ): Readonly<Record<string, PumpIdlValue>> {
   const required = decodeIdlFields(definition.args.slice(0, 2), reader);
-  const trackVolume = decodeLegacyBuySuffix(name, reader, observeSuffix);
-  if (trackVolume === undefined) return required;
-  return Object.freeze({
-    ...required,
-    track_volume: Object.freeze([trackVolume]),
-  });
-}
-
-function decodeLegacyBuySuffix(
-  name: 'buy' | 'buy_exact_sol_in',
-  reader: PumpBorshReader,
-  observeSuffix: (length: number) => void,
-): boolean | undefined {
   const suffixLength = reader.remaining;
   observeSuffix(suffixLength);
-  if (suffixLength === 0) return undefined;
-  if (suffixLength === 1) return reader.readBool();
-  if (suffixLength !== 2) throw invalidBuySuffix(name, suffixLength);
-  const historicalSuffix = reader.readBytes(2);
-  if (
-    historicalSuffix[0] !== 1
-    || (historicalSuffix[1] !== 0 && historicalSuffix[1] !== 1)
-  ) {
+  if (suffixLength === 0) return required;
+  if (suffixLength > 2) throw invalidBuySuffix(name, suffixLength);
+  const suffix = reader.readBytes(suffixLength);
+  const first = suffix[0];
+  const second = suffix[1];
+  if (!isBorshBool(first) || (second !== undefined && !isBorshBool(second))) {
     throw invalidBuySuffix(name, suffixLength);
   }
-  return historicalSuffix[1] === 1;
+  if (second === undefined) return withOptionBools(required, { track_volume: first === 1 });
+  // Two bytes `[t, p]` are `track_volume` then `partial_fill` under pump-sdk 4.0.0 (the SDK
+  // itself emits `[1, 0]` for `buy`). The historical Mainnet form `[1, b]` (an older Option<bool>
+  // `Some(b)`) is byte-identical; its historical reading track_volume = b is kept, so only
+  // `[1, 0]` is ambiguous: it decodes as track_volume = false, partial_fill = false, whereas the
+  // 4.0.0 layout would read track_volume = true.
+  return withOptionBools(required, {
+    track_volume: first === 1 && second === 1,
+    partial_fill: second === 1,
+  });
 }
 
 function decodeExactQuoteBuyArgs(
@@ -216,16 +215,44 @@ function decodeExactQuoteBuyArgs(
   if (suffixLength !== 1) {
     throw invalidBuySuffix('buy_exact_quote_in_v2', suffixLength);
   }
-  const trackVolume = reader.readBool();
-  if (!trackVolume) throw invalidBuySuffix('buy_exact_quote_in_v2', suffixLength);
+  const partialFill = reader.readBool();
+  // pump-sdk 4.0.0 names this single trailing byte `partial_fill`; the historical Mainnet `[1]`
+  // form was recorded as track_volume = true before that IDL existed and keeps that label too.
+  return withOptionBools(required, partialFill
+    ? { track_volume: true, partial_fill: true }
+    : { partial_fill: false });
+}
+
+function decodeBuyV2Args(
+  definition: InstructionDefinition,
+  reader: PumpBorshReader,
+  observeSuffix: (length: number) => void,
+): Readonly<Record<string, PumpIdlValue>> {
+  const required = decodeIdlFields(definition.args, reader);
+  const suffixLength = reader.remaining;
+  observeSuffix(suffixLength);
+  if (suffixLength === 0) return required;
+  if (suffixLength !== 1) throw invalidBuySuffix('buy_v2', suffixLength);
+  return withOptionBools(required, { partial_fill: reader.readBool() });
+}
+
+function isBorshBool(value: number | undefined): value is 0 | 1 {
+  return value === 0 || value === 1;
+}
+
+function withOptionBools(
+  required: Readonly<Record<string, PumpIdlValue>>,
+  options: Readonly<Record<string, boolean>>,
+): Readonly<Record<string, PumpIdlValue>> {
   return Object.freeze({
     ...required,
-    track_volume: Object.freeze([true]),
+    ...Object.fromEntries(Object.entries(options).map(([name, value]) =>
+      [name, Object.freeze([value])])),
   });
 }
 
 function invalidBuySuffix(
-  name: 'buy' | 'buy_exact_quote_in_v2' | 'buy_exact_sol_in',
+  name: 'buy' | 'buy_exact_quote_in_v2' | 'buy_exact_sol_in' | 'buy_v2',
   suffixLength: number,
 ): PumpDecodingError {
   return createPumpDecodingError(

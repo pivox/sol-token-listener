@@ -103,6 +103,7 @@ void test('omet track_volume pour les deux suffixes BUY absents', () => {
     );
     assert.ok(decoded);
     assert.equal(Object.hasOwn(decoded.args, 'track_volume'), false);
+    assert.equal(Object.hasOwn(decoded.args, 'partial_fill'), false);
   }
 });
 
@@ -129,6 +130,21 @@ void test('normalise les deux booléens Some historiques des BUY', () => {
       );
       assert.ok(decoded);
       assert.deepEqual(decoded.args.track_volume, [trackVolume]);
+      // The second byte is `partial_fill` under the pump-sdk 4.0.0 layout.
+      assert.deepEqual(decoded.args.partial_fill, [trackVolume]);
+    }
+  }
+});
+
+void test('décode partial_fill (pump-sdk 4.0.0) après track_volume sur les BUY historiques', () => {
+  for (const name of ['buy', 'buy_exact_sol_in'] as const) {
+    for (const partialFill of [false, true]) {
+      const decoded = decodePumpInstruction(
+        buyInstructionWithSuffix(name, Buffer.from([0, Number(partialFill)])),
+      );
+      assert.ok(decoded);
+      assert.deepEqual(decoded.args.track_volume, [false]);
+      assert.deepEqual(decoded.args.partial_fill, [partialFill]);
     }
   }
 });
@@ -139,14 +155,91 @@ void test('conserve le booléen historique borné de buy_exact_quote_in_v2', () 
   );
   assert.ok(decoded);
   assert.deepEqual(decoded.args.track_volume, [true]);
+  assert.deepEqual(decoded.args.partial_fill, [true]);
+
+  const partialFillOnly = decodePumpInstruction(
+    buyInstructionWithSuffix('buy_exact_quote_in_v2', Buffer.from([0])),
+  );
+  assert.ok(partialFillOnly);
+  assert.equal(Object.hasOwn(partialFillOnly.args, 'track_volume'), false);
+  assert.deepEqual(partialFillOnly.args.partial_fill, [false]);
+});
+
+void test('décode uniquement le partial_fill EOF-tolérant d’un octet de buy_v2', () => {
+  const absent = decodePumpInstruction(buyInstructionWithSuffix('buy_v2', Buffer.alloc(0)));
+  assert.ok(absent);
+  assert.equal(Object.hasOwn(absent.args, 'partial_fill'), false);
+  for (const partialFill of [false, true]) {
+    const decoded = decodePumpInstruction(
+      buyInstructionWithSuffix('buy_v2', Buffer.from([Number(partialFill)])),
+    );
+    assert.ok(decoded);
+    assert.deepEqual(decoded.args.partial_fill, [partialFill]);
+    assert.equal(Object.hasOwn(decoded.args, 'track_volume'), false);
+  }
+  for (const suffix of [Buffer.from([2]), Buffer.from([0, 0]), Buffer.from([1, 1]), Buffer.alloc(3)]) {
+    assert.throws(
+      () => decodePumpInstruction(buyInstructionWithSuffix('buy_v2', suffix)),
+      isPumpError('PUMP_BORSH_INVALID'),
+    );
+  }
+});
+
+// Inner `buy_v2` of Mainnet tx 3VgL4L8Wwgjfz3stUniw8gXJtrtzQoHw8kxf34C9yoS9dSz37AiJ8GTHeY368zuKKXPm
+// WFtCBxvHEj2G9bXYtL6Q (slot 454600935, after the program upgrade at slot 454596459): the data
+// ends with the one-byte `partial_fill = false` that pump-sdk 4.0.0 appends.
+const MAINNET_BUY_V2_PARTIAL_FILL: NormalizedInstruction = {
+  programId: PUMP_PROGRAM,
+  accounts: [
+    '4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf', '9tuDmzSo5jUrPzeZBTpwBXuPhAJGFT5Eq5CXqoHzpump',
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+    'GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS', '41xY1DU1zzo893bEg2HzTFxPVVM84UvDCNsQm6aKRq8Z',
+    'GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL', 'H2CUXP4v2ZSWEFvnj9C6RbbD8cNNZPLK3H374nKARN1t',
+    'HbCP4C1pVKjoDyfcpqS4VPxJTZmqaWhetfKJQYHar9Uo', 'AG7S3ztZbn51wuUHRVzSRLJUgZHP2fvHdWAYT7FzanYk',
+    '8G45FQFrei1qcoDW6FD7JeMub1R2coYDHjGktuJyGJFA', 'BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s',
+    'GBVgmWwY6HMKnWHECskKN54gwi5A7Z4bKmWhzww21xgx', '2Y3wfpoDxGWYsuqDhSZKWeVh5Mgg42edV9bd5CFYA679',
+    '3hSpBCuPaSoNMWUXzHD2PtQgsYsixZbcdPZ552vkaCAL', '9ANqrCyqnGiKokHdUWEJsm5rupzEuwJebrYFZ12SGRSB',
+    '9RiJA9w2PArEBdpdKE18bTDpX81bMrBUuVJJGYn2eJRa', 'Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y',
+    'FGFrX2q1iAjyAojjeyFDxXqdmvegjPpSWsrPmrJjeQ2f', '2hcbDhq9CacWu2FZa7n1YbftAgo8FfKRDkVahRo7TwST',
+    '8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt', 'pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ',
+    '11111111111111111111111111111111', 'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1',
+    PUMP_PROGRAM,
+  ],
+  data: Uint8Array.from(Buffer.from('b817ee6167c5d33dd793f804e3000000a9b626000000000000', 'hex')),
+  instructionIndex: 2,
+  innerInstructionIndex: 0,
+  parentInstructionIndex: 2,
+  stackHeight: 2,
+};
+
+void test('décode le buy_v2 Mainnet post-upgrade avec partial_fill = false', () => {
+  assert.equal(MAINNET_BUY_V2_PARTIAL_FILL.data.length, 8 + 16 + 1);
+  const decoded = decodePumpInstruction(MAINNET_BUY_V2_PARTIAL_FILL);
+
+  assert.ok(decoded);
+  assert.equal(decoded.name, 'buy_v2');
+  assert.equal(decoded.family, 'BUY');
+  assert.deepEqual(decoded.args, {
+    amount: 975_040_975_831n,
+    max_sol_cost: 2_537_129n,
+    partial_fill: [false],
+  });
+  assert.equal(decoded.accounts.base_mint, '9tuDmzSo5jUrPzeZBTpwBXuPhAJGFT5Eq5CXqoHzpump');
+  assert.equal(decoded.accounts.quote_mint, 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+  assert.equal(decoded.accounts.user, 'BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s');
+  assert.equal(decoded.accounts.program, PUMP_PROGRAM);
+  const candidate = decodePumpInstructionForTransaction(MAINNET_BUY_V2_PARTIAL_FILL);
+  assert.equal(candidate?.profile, null);
+  assert.deepEqual(candidate?.action, decoded);
 });
 
 void test('refuse les suffixes BUY historiques ambigus ou non booléens', () => {
   for (const name of ['buy', 'buy_exact_sol_in'] as const) {
     for (const suffix of [
       Buffer.from([2]),
-      Buffer.from([0, 0]),
-      Buffer.from([0, 1]),
+      Buffer.from([0, 2]),
+      Buffer.from([2, 0]),
       Buffer.from([1, 2]),
       Buffer.alloc(3),
     ]) {
@@ -157,7 +250,7 @@ void test('refuse les suffixes BUY historiques ambigus ou non booléens', () => 
     }
   }
 
-  for (const suffix of [Buffer.from([0]), Buffer.from([2]), Buffer.alloc(2)]) {
+  for (const suffix of [Buffer.from([2]), Buffer.alloc(2), Buffer.from([1, 0])]) {
     assert.throws(
       () => decodePumpInstruction(
         buyInstructionWithSuffix('buy_exact_quote_in_v2', suffix),
@@ -371,7 +464,7 @@ for (const fixture of [
         amount: 25_659_383_952_290n, min_sol_output: 0n,
       });
     }
-    for (const optional of ['is_cashback_enabled', 'creator_fee_bps', 'is_holder_reward', 'track_volume']) {
+    for (const optional of ['is_cashback_enabled', 'creator_fee_bps', 'is_holder_reward', 'track_volume', 'partial_fill']) {
       assert.equal(Object.hasOwn(candidate.action.args, optional), false);
     }
     for (const value of [candidate, candidate.action, candidate.action.args, candidate.action.accounts]) {
@@ -421,7 +514,8 @@ void test('ne reconnaît aucun profil opaque pour les autres discriminateurs ou 
     accounts: pumpInstruction('sell_v2').accounts,
     data: Uint8Array.from([...PUMP_INSTRUCTIONS.sell_v2.discriminator, ...sell.data.subarray(8)]),
   }, 'PUMP_BORSH_INVALID');
-  assertSameStrictFailure(buyInstructionWithSuffix('buy', Uint8Array.of(0, 1)), 'PUMP_BORSH_INVALID');
+  // `[0, 1]` is a valid track_volume + partial_fill pair since pump-sdk 4.0.0; `[1, 2]` is not a bool.
+  assertSameStrictFailure(buyInstructionWithSuffix('buy', Uint8Array.of(1, 2)), 'PUMP_BORSH_INVALID');
 });
 
 void test('préserve les rejets des comptes requis et remaining accounts opaques', () => {
@@ -515,7 +609,7 @@ function createV2InstructionWithSuffix(suffix: Uint8Array): NormalizedInstructio
 }
 
 function buyInstructionWithSuffix(
-  name: 'buy' | 'buy_exact_quote_in_v2' | 'buy_exact_sol_in',
+  name: 'buy' | 'buy_exact_quote_in_v2' | 'buy_exact_sol_in' | 'buy_v2',
   suffix: Uint8Array,
 ): NormalizedInstruction {
   const definition = PUMP_INSTRUCTIONS[name];

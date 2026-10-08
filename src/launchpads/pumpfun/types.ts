@@ -81,6 +81,8 @@ export interface DecodedPumpCreateEvent {
   readonly virtualQuoteReserves: bigint;
   readonly creatorFeeBps: bigint;
   readonly isHolderReward: boolean;
+  /** `CreateEvent.depth` (u8, pump-sdk 4.0.0): 0 unless the quote mint is itself a pump coin. */
+  readonly depth: number;
 }
 
 export interface DecodedPumpTradeEvent {
