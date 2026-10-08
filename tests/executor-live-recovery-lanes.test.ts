@@ -10,7 +10,10 @@ import {
 import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../src/domain/execution-reconciliation.js';
 import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
-import type { ExecutionLiveConfirmationV1 } from '../src/ports/execution-live-repository.js';
+import type {
+  ExecutionLiveConfirmationExpiryV1,
+  ExecutionLiveConfirmationV1,
+} from '../src/ports/execution-live-repository.js';
 import type { FastExitPolicy } from '../src/domain/fast-exit.js';
 import type { LiveRecoveryLogContext } from '../src/executor-live-recovery/logger.js';
 
@@ -75,7 +78,7 @@ void test('confirmation releases pending work and does not starve the deadline l
     calls.push('read-confirmation');
     return Promise.resolve(Object.freeze({
       payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-      expectedRevision: 3n, signature, providerId: 'primary',
+      expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_001n,
     }));
   };
   fixture.live.createNextDeadlineExitIntent = () => {
@@ -87,7 +90,7 @@ void test('confirmation releases pending work and does not starve the deadline l
   assertDeferred(await lanes.confirmation(signal()), null);
   assert.equal(await lanes.deadline(signal()), 'WORKED');
   assert.deepEqual(calls, [
-    'claim:CONFIRM', 'read-confirmation', 'renew:1', 'rpc:confirmation',
+    'claim:CONFIRM', 'read-confirmation', 'renew:1', 'rpc:confirmation', 'rpc:height',
     'release', 'deadline',
   ]);
 });
@@ -120,7 +123,7 @@ void test('confirmation releases typed retryable RPC failures with their safe co
   const fixture = dependencies(calls, 'SUBMITTED');
   fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
     payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-    expectedRevision: 3n, signature, providerId: 'primary',
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
   }));
   fixture.gateway.observeSignature = () => {
     calls.push('rpc:confirmation');
@@ -140,7 +143,7 @@ void test('confirmation fails closed for an arbitrary gateway error and does not
   const fixture = dependencies(calls, 'SUBMITTED');
   fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
     payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-    expectedRevision: 3n, signature, providerId: 'primary',
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
   }));
   fixture.gateway.observeSignature = () => {
     calls.push('rpc:confirmation');
@@ -174,7 +177,7 @@ void test('a cancelled confirmation is not deferred', async () => {
   const fixture = dependencies([], 'SUBMITTED');
   fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
     payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-    expectedRevision: 3n, signature, providerId: 'primary',
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
   }));
   const controller = new AbortController();
   fixture.gateway.observeSignature = async () => {
@@ -189,12 +192,145 @@ void test('a cancelled confirmation is not deferred', async () => {
 });
 
 void test('confirmation treats not found as a deferred result without an error code', async () => {
+  // The finalized height (1_001) has not passed the last valid block height: still pending.
   const fixture = dependencies([], 'SUBMITTED', 'NOT_FOUND');
   fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
     payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-    expectedRevision: 3n, signature, providerId: 'primary',
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_001n,
   }));
   assertDeferred(await createLiveRecoveryLanes(fixture).confirmation(signal()), null);
+  assert.deepEqual(fixture.logs, []);
+});
+
+void test('confirmation expires a not found transaction once the finalized height passed its last valid block height', async () => {
+  const calls: string[] = [];
+  let committedClaim: ClaimedExecutionIntent | null = null;
+  let committed: ExecutionLiveConfirmationExpiryV1 | null = null;
+  const fixture = dependencies(calls, 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
+  }));
+  fixture.live.recordConfirmationExpiry = (claim, expiry) => {
+    calls.push(`expire:${expiry.finalizedBlockHeight.toString()}`);
+    committedClaim = claim;
+    committed = expiry;
+    return Promise.resolve(Object.freeze({ artifactId: expiry.artifactId }));
+  };
+
+  assert.equal(await createLiveRecoveryLanes(fixture).confirmation(signal()), 'WORKED');
+  assert.deepEqual(calls, [
+    'claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'rpc:height', 'renew:2', 'expire:1001',
+  ]);
+  assert.equal((committedClaim as ClaimedExecutionIntent | null)?.leaseExpiresAtMs, 3_000);
+  assert.deepEqual(committed, {
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, finalizedBlockHeight: 1_001n, observedAtMs: 2_000,
+  });
+  assert.equal(Object.isFrozen(committed), true);
+  assert.deepEqual(fixture.logs, [{
+    level: 'info', event: 'executor_live_recovery.confirmation_expired',
+    executionMode: 'live-recovery', lane: 'CONFIRMATION',
+  }]);
+});
+
+void test('confirmation releases a typed retryable height failure with its safe code', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
+  }));
+  fixture.gateway.readFinalizedBlockHeight = () => {
+    calls.push('rpc:height');
+    throw rpcFailure('RPC_TIMEOUT');
+  };
+
+  assertDeferred(await createLiveRecoveryLanes(fixture).confirmation(signal()), 'RPC_TIMEOUT');
+  assert.deepEqual(calls, [
+    'claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'rpc:height', 'release',
+  ]);
+  assert.deepEqual(fixture.logs, []);
+});
+
+void test('confirmation fails closed for an arbitrary height error and does not leak it', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
+  }));
+  fixture.gateway.readFinalizedBlockHeight = () => {
+    calls.push('rpc:height');
+    throw new Error('https://credential@rpc.private.test');
+  };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).confirmation(signal()),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'GATEWAY_FAILED'
+      && !error.message.includes('credential'),
+  );
+  assert.deepEqual(calls, ['claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'rpc:height', 'release']);
+});
+
+void test('confirmation fails closed for a malformed finalized height', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
+  }));
+  fixture.gateway.readFinalizedBlockHeight = () => {
+    calls.push('rpc:height');
+    return Promise.resolve(1_001 as never);
+  };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).confirmation(signal()),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'GATEWAY_FAILED',
+  );
+  assert.deepEqual(calls, ['claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'rpc:height', 'release']);
+});
+
+void test('a confirmation cancelled during the height read is not deferred', async () => {
+  const fixture = dependencies([], 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
+  }));
+  const controller = new AbortController();
+  fixture.gateway.readFinalizedBlockHeight = async () => {
+    controller.abort();
+    throw rpcFailure('RPC_TIMEOUT');
+  };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).confirmation(controller.signal),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'OPERATION_ABORTED',
+  );
+});
+
+void test('a failed expiry commit releases the claim and fails closed as COMMIT_FAILED', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
+  }));
+  fixture.live.recordConfirmationExpiry = () => {
+    calls.push('expire');
+    return Promise.reject(new Error('postgresql://credential@db.private.test'));
+  };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).confirmation(signal()),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'COMMIT_FAILED'
+      && !error.message.includes('credential'),
+  );
+  assert.deepEqual(calls, [
+    'claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'rpc:height', 'renew:2', 'expire', 'release',
+  ]);
+  assert.deepEqual(fixture.logs, []);
 });
 
 void test('confirmation releases and fails closed for inconsistent finality observations', async () => {
@@ -207,7 +343,7 @@ void test('confirmation releases and fails closed for inconsistent finality obse
     const fixture = dependencies(calls, 'SUBMITTED');
     fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
       payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-      expectedRevision: 3n, signature, providerId: 'primary',
+      expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
     }));
     fixture.gateway.observeSignature = () => {
       calls.push('rpc:confirmation');
@@ -230,7 +366,7 @@ void test('confirmation commits with a post-RPC renewal and never uses the stale
   const fixture = dependencies(calls, 'SUBMITTED', 'FINALIZED');
   fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
     payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-    expectedRevision: 3n, signature, providerId: 'primary',
+    expectedRevision: 3n, signature, providerId: 'primary', lastValidBlockHeight: 1_000n,
   }));
   fixture.live.recordConfirmation = (claim, confirmation) => {
     calls.push(`confirm:${confirmation.observedSlot.toString()}`);
@@ -251,7 +387,7 @@ void test('provider mismatch releases the claim before any RPC and fails closed'
   const fixture = dependencies(calls, 'SUBMITTED');
   fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
     payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
-    expectedRevision: 3n, signature, providerId: 'secondary',
+    expectedRevision: 3n, signature, providerId: 'secondary', lastValidBlockHeight: 1_000n,
   }));
   await assert.rejects(
     createLiveRecoveryLanes(fixture).confirmation(signal()),
@@ -432,6 +568,10 @@ function dependencies(
     readConfirmationWork: () => Promise.reject(new Error('unexpected confirmation read')),
     recordConfirmation: (_claim: ClaimedExecutionIntent, _input: ExecutionLiveConfirmationV1) =>
       Promise.reject(new Error('unexpected confirmation commit')),
+    recordConfirmationExpiry: (
+      _claim: ClaimedExecutionIntent,
+      _input: ExecutionLiveConfirmationExpiryV1,
+    ) => Promise.reject(new Error('unexpected confirmation expiry commit')),
     createNextDeadlineExitIntent: () => {
       calls.push('deadline');
       return Promise.resolve(null);

@@ -246,6 +246,22 @@ export interface ExecutionLiveConfirmationWorkV1 {
   readonly expectedRevision: bigint;
   readonly signature: string;
   readonly providerId: string;
+  /** The attempt's durable `reconciliation_last_valid_block_height`: past it, the blockhash is dead. */
+  readonly lastValidBlockHeight: bigint;
+}
+
+/**
+ * A submitted transaction that was never observed although the finalized block height passed
+ * its last valid block height: it can no longer land, so the intent leaves SUBMITTED for
+ * reconciliation (the same ACCEPTED→AMBIGUOUS / SUBMITTED→UNKNOWN pairing as an ambiguous send).
+ */
+export interface ExecutionLiveConfirmationExpiryV1 {
+  readonly payloadVersion: 1;
+  readonly artifactId: string;
+  readonly expectedRevision: bigint;
+  readonly signature: string;
+  readonly finalizedBlockHeight: bigint;
+  readonly observedAtMs: number;
 }
 
 export interface ExecutionLiveReconciliationWorkV1 {
@@ -368,6 +384,10 @@ export interface ExecutionLiveRepository {
   recordConfirmation(
     claim: ClaimedExecutionIntent,
     confirmation: ExecutionLiveConfirmationV1,
+  ): Promise<ExecutionLiveArtifactReferenceV1>;
+  recordConfirmationExpiry(
+    claim: ClaimedExecutionIntent,
+    expiry: ExecutionLiveConfirmationExpiryV1,
   ): Promise<ExecutionLiveArtifactReferenceV1>;
   readConfirmationWork(
     claim: ClaimedExecutionIntent,

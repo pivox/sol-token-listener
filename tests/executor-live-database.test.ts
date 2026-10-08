@@ -205,7 +205,7 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
     'recordSubmissionOutcome',
   ]);
   for (const absent of [
-    'authenticatePersistedSignedTransaction', 'recordConfirmation',
+    'authenticatePersistedSignedTransaction', 'recordConfirmation', 'recordConfirmationExpiry',
     'readConfirmationWork', 'readReconciliationWork', 'commitReconciliation',
     'createDeadlineExitIntent', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
     'createNextReExitIntent', 'listCappedDeadExits',

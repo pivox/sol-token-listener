@@ -178,12 +178,14 @@ void test('exposes exact frozen null-prototype facades and fixes claim purposes'
 
   const liveCalls: string[] = [];
   const liveSource = (Object.fromEntries([
-    'readConfirmationWork', 'recordConfirmation', 'readReconciliationWork',
+    'readConfirmationWork', 'recordConfirmation', 'recordConfirmationExpiry',
+    'readReconciliationWork',
     'commitReconciliation', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
     'createNextReExitIntent', 'listCappedDeadExits',
   ].map((name) => [name, async () => { liveCalls.push(name); return null; }]))) as unknown as Pick<ExecutionLiveRepository,
       | 'readConfirmationWork'
       | 'recordConfirmation'
+      | 'recordConfirmationExpiry'
       | 'readReconciliationWork'
       | 'commitReconciliation'
       | 'createNextDeadlineExitIntent'
@@ -193,7 +195,8 @@ void test('exposes exact frozen null-prototype facades and fixes claim purposes'
   const live = createExecutionLiveRecoveryRepository(liveSource);
 
   assert.deepEqual(Object.keys(live), [
-    'readConfirmationWork', 'recordConfirmation', 'readReconciliationWork',
+    'readConfirmationWork', 'recordConfirmation', 'recordConfirmationExpiry',
+    'readReconciliationWork',
     'commitReconciliation', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
     'createNextReExitIntent', 'listCappedDeadExits',
   ]);
@@ -202,6 +205,7 @@ void test('exposes exact frozen null-prototype facades and fixes claim purposes'
   assert.equal(Object.hasOwn(live, 'persistSigned'), false);
   await live.readConfirmationWork(undefined as never);
   await live.recordConfirmation(undefined as never, undefined as never);
+  await live.recordConfirmationExpiry(undefined as never, undefined as never);
   await live.readReconciliationWork(undefined as never);
   await live.commitReconciliation(undefined as never, undefined as never);
   await live.createNextDeadlineExitIntent();
@@ -209,7 +213,8 @@ void test('exposes exact frozen null-prototype facades and fixes claim purposes'
   await live.createNextReExitIntent();
   await live.listCappedDeadExits();
   assert.deepEqual(liveCalls, [
-    'readConfirmationWork', 'recordConfirmation', 'readReconciliationWork',
+    'readConfirmationWork', 'recordConfirmation', 'recordConfirmationExpiry',
+    'readReconciliationWork',
     'commitReconciliation', 'createNextDeadlineExitIntent', 'createNextEarlyExitIntent',
     'createNextReExitIntent', 'listCappedDeadExits',
   ]);
