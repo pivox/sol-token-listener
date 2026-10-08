@@ -6,6 +6,7 @@ import { createTokenLaunchDetectedEvent, createBondingCurveTradeObservedEvent } 
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
 import { ConfirmationStatusConflictError } from '../src/domain/confirmation-status.js';
 import { createPumpFunWorkerAdmissionPolicy } from '../src/domain/worker-admission.js';
+import { MAX_OBSERVED_PIPELINE_ITEMS } from '../src/application/observed-transaction-pipeline.js';
 import type { LaunchParameterObject } from '../src/domain/types.js';
 import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
 import { migrateDatabase } from '../src/storage/database.js';
@@ -101,6 +102,73 @@ void test('unites global tracking with active mints from only the exact replay s
         [...await repository.listTrackedMints('expired-signature')],
         [MINT_B],
       );
+    });
+  });
+
+void test('bounds the disabled-admission tracked mints to the tracking window, open positions and pending intents under the pipeline cap',
+  async (context) => {
+    await withDatabase(context, async (pool) => {
+      const twoHoursAgoMs = Date.now() - 2 * 3_600_000;
+      const repository = new PostgresLaunchpadEventRepository(pool);
+      await repository.record(fixture('confirmed', 'old-signature', MINT_A, twoHoursAgoMs, null));
+      await repository.record(fixture('confirmed', 'position-signature', MINT_B, twoHoursAgoMs, null));
+      await repository.record(fixture('confirmed', 'intent-signature', MINT_C, twoHoursAgoMs, null));
+      const launchCount = MAX_OBSERVED_PIPELINE_ITEMS + 104;
+      const insideWindowCount = MAX_OBSERVED_PIPELINE_ITEMS + 54;
+      await pool.query(`INSERT INTO token_launches (
+        mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+        created_signature,created_slot,created_transaction_index,created_instruction_index,
+        created_inner_instruction_index,detected_at,updated_at,terminal_at,purge_after
+      ) SELECT 'L' || lpad(index::TEXT, 31, '0'),'pumpfun','pump','creator','SPL_TOKEN','[]'::jsonb,
+        'DETECTED','synthetic-' || index::TEXT,index,0,0,NULL,
+        CASE WHEN index <= $2 THEN clock_timestamp() - (index * INTERVAL '1 millisecond')
+          ELSE clock_timestamp() - INTERVAL '2 hours' END,
+        clock_timestamp(),NULL,NULL
+      FROM generate_series(1, $1::INTEGER) AS index`, [launchCount, insideWindowCount]);
+      const syntheticMint = (index: number): string => `L${String(index).padStart(31, '0')}`;
+
+      const connection = await pool.connect();
+      try {
+        await connection.query(`CREATE TEMP TABLE listener_worker_tracking_live_mints (mint TEXT NOT NULL)`);
+        await connection.query(`CREATE TEMP TABLE execution_intents (
+          mint TEXT NOT NULL,status TEXT NOT NULL,terminal_at TIMESTAMPTZ)`);
+        await connection.query('INSERT INTO listener_worker_tracking_live_mints (mint) VALUES ($1)', [MINT_B]);
+        await connection.query(`INSERT INTO execution_intents (mint,status,terminal_at)
+          VALUES ($1,'PENDING',NULL)`, [MINT_C]);
+        const shadowed = new PostgresLaunchpadEventRepository({
+          connect: async () => ({
+            query: (text: string, values?: readonly unknown[]) =>
+              connection.query(text, values === undefined ? undefined : [...values]),
+            release() {},
+          }),
+        });
+
+        const tracked = await shadowed.listTrackedMints('foreign-signature');
+        assert.equal(tracked.size, MAX_OBSERVED_PIPELINE_ITEMS);
+        assert.equal(tracked.has(MINT_A), false);
+        assert.equal(tracked.has(MINT_B), true);
+        assert.equal(tracked.has(MINT_C), true);
+        assert.equal(tracked.has(syntheticMint(1)), true);
+        assert.equal(tracked.has(syntheticMint(MAX_OBSERVED_PIPELINE_ITEMS - 2)), true);
+        assert.equal(tracked.has(syntheticMint(MAX_OBSERVED_PIPELINE_ITEMS - 1)), false);
+        assert.equal(tracked.has(syntheticMint(insideWindowCount + 1)), false);
+        assert.deepEqual([...tracked], [...tracked].sort());
+
+        const replay = await shadowed.listTrackedMints('old-signature');
+        assert.equal(replay.size, MAX_OBSERVED_PIPELINE_ITEMS);
+        assert.equal(replay.has(MINT_A), true);
+        assert.equal(replay.has(MINT_B), true);
+        assert.equal(replay.has(syntheticMint(MAX_OBSERVED_PIPELINE_ITEMS - 2)), false);
+
+        await connection.query(`UPDATE execution_intents SET status='SUCCEEDED'`);
+        await connection.query('DELETE FROM listener_worker_tracking_live_mints');
+        const released = await shadowed.listTrackedMints('foreign-signature');
+        assert.equal(released.has(MINT_B), false);
+        assert.equal(released.has(MINT_C), false);
+        assert.equal(released.has(syntheticMint(MAX_OBSERVED_PIPELINE_ITEMS)), true);
+      } finally {
+        connection.release();
+      }
     });
   });
 
@@ -252,7 +320,7 @@ void test('preserves multiple outer and inner events in one transaction and acce
     assert.deepEqual(active.map(event => [event.cursor.instructionIndex, event.cursor.innerInstructionIndex]), [[2, null], [2, null], [2, 1]]);
     assert.equal((active[0]?.id ?? '') < (active[1]?.id ?? ''), true);
 
-    await Promise.all([repository.record(fixture('confirmed', 'signature-b', MINT_B)), repository.record(fixture('confirmed', 'signature-c', MINT_C))]);
+    await Promise.all([repository.record(fixture('confirmed', 'signature-b', MINT_B, Date.now(), null)), repository.record(fixture('confirmed', 'signature-c', MINT_C, Date.now(), null))]);
     assert.deepEqual([...await repository.listTrackedMints('signature-a')], [MINT_A, MINT_B, MINT_C].sort());
   });
 });

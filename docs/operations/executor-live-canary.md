@@ -1185,3 +1185,9 @@ dernier heartbeat (depuis le démarrage du processus) ; ceux de l'exécuteur ont
    Token-2022) arrivent sous forme `parsed` (sans comptes ni données bruts) ; elles sont acceptées
    lorsque le programme est dans l'allowlist et fait partie des comptes statiques de la transaction,
    les autres CPI restant exigées en forme partiellement décodée sur comptes statiques uniquement.
+9. L'ensemble des mints suivis par le listener (`listTrackedMints`, politique d'admission désactivée)
+   est borné à la fenêtre de suivi (`trackingWindowSeconds`) plus les mints ayant une position live
+   ouverte ou un intent non terminal, sous le plafond du pipeline (4 096) ; avant ce correctif, les
+   `token_launches` n'étant jamais terminalisés en `creates-only`, le listener rejetait chaque
+   transaction (`RangeError('too many mints')`, stage `load_tracked_mints`) après 4 096 lancements
+   et s'arrêtait silencieusement.
