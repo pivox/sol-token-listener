@@ -1064,7 +1064,12 @@ anticipées sont alors arrêtées. L'échéance n'est pas touchée. Si on le voi
    la persistance en consommant un `buys_armed`).
 2. Re-provisionner les rôles (`scripts/provision-executor-roles.sql`) AVANT de redémarrer H2a et H2b.
    Sinon le validateur de démarrage refuse de lancer H2a, et les sorties à l'échéance ne tournent
-   pas non plus.
+   pas non plus. Rejouer aussi le provisioning après le correctif issu de la première exécution
+   réelle du lot 5 : il ajoute `armed_at` (et `armament_fingerprint`) au SELECT du rôle
+   `sol_token_executor_live` sur `execution_activation_armaments`, ainsi que les colonnes de
+   `execution_submission_events` et `execution_submission_preflight_evidence` lues par les
+   triggers de `execution_signed_transactions`, sans quoi chaque passe BUY de H2b échoue en
+   `DATABASE_FAILURE` (42501) et le validateur de démarrage de H2b refuse l'autorité.
 3. Redémarrer H2a, puis H2b.
 
 ### Sorties anticipées (lane `exit`)

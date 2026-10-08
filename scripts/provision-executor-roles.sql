@@ -1851,10 +1851,10 @@ GRANT SELECT (
 ON TABLE execution_control_events TO sol_token_executor_live;
 
 GRANT SELECT (
-  armament_id,generation_id,qualification_id,qualification_fingerprint,phase,
-  build_hash,configuration_fingerprint,strategy_fingerprint,wallet_public_key,
+  armament_id,armament_fingerprint,generation_id,qualification_id,qualification_fingerprint,
+  phase,build_hash,configuration_fingerprint,strategy_fingerprint,wallet_public_key,
   cluster,genesis_hash,provider_id,state,state_revision,maximum_capital_lamports,
-  maximum_exposure_bps,maximum_open_positions,maximum_buys,consumed_buys,expires_at,
+  maximum_exposure_bps,maximum_open_positions,maximum_buys,consumed_buys,armed_at,expires_at,
   payload_version,armament_request_fingerprint,canary_evidence_fingerprint,
   target_intent_id,target_intent_state_revision,target_strategy_id,target_strategy_version,
   target_decision_fingerprint,target_mint,target_quote_mint,target_quote_amount_raw,
@@ -1960,7 +1960,13 @@ GRANT SELECT (
 )
 ON TABLE execution_signed_simulation_evidence TO sol_token_executor_live;
 
-GRANT INSERT (
+-- The signed-transaction state trigger checks the SUBMISSION_STARTED preflight evidence under
+-- the invoker: the live role reads the fourteen columns that check compares.
+GRANT SELECT (
+  artifact_id,intent_id,attempt_number,generation_id,armament_id,reservation_id,
+  provider_id,wallet_public_key,quote_fingerprint,quote_observed_at,quote_expires_at,
+  blockhash,last_valid_block_height,authorized_at
+), INSERT (
   gate_id,payload_version,gate_fingerprint,artifact_id,intent_id,attempt_number,
   generation_id,armament_id,reservation_id,provider_id,phase,build_hash,
   configuration_fingerprint,strategy_fingerprint,wallet_public_key,cluster,genesis_hash,
@@ -1985,7 +1991,11 @@ GRANT SELECT (
 )
 ON TABLE execution_pre_submission_revocations TO sol_token_executor_live;
 
-GRANT INSERT (
+-- The deferred trigger on execution_signed_transactions counts the artifact's events at COMMIT
+-- under the invoker: the live role reads the same five columns as the recovery role.
+GRANT SELECT (
+  artifact_id,generation_id,previous_state,next_state,reason_code
+), INSERT (
   event_id,payload_version,event_fingerprint,artifact_id,generation_id,
   previous_state,next_state,reason_code,occurred_at
 )

@@ -223,11 +223,11 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'intent_id', 'attempt_number', 'lock_id', 'artifact_id', 'occurred_at',
       )),
       table('execution_activation_armaments', names(
-        'armament_id', 'generation_id', 'qualification_id', 'qualification_fingerprint',
-        'phase', 'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
-        'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'state',
-        'state_revision', 'maximum_capital_lamports', 'maximum_exposure_bps',
-        'maximum_open_positions', 'maximum_buys', 'consumed_buys', 'expires_at',
+        'armament_id', 'armament_fingerprint', 'generation_id', 'qualification_id',
+        'qualification_fingerprint', 'phase', 'build_hash', 'configuration_fingerprint',
+        'strategy_fingerprint', 'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id',
+        'state', 'state_revision', 'maximum_capital_lamports', 'maximum_exposure_bps',
+        'maximum_open_positions', 'maximum_buys', 'consumed_buys', 'armed_at', 'expires_at',
         'payload_version', 'armament_request_fingerprint', 'canary_evidence_fingerprint',
         'target_intent_id', 'target_intent_state_revision', 'target_strategy_id',
         'target_strategy_version', 'target_decision_fingerprint', 'target_mint',
@@ -331,7 +331,12 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'simulation_slot', 'units_consumed', 'fee_payer_lamport_debit', 'base_delta_raw',
         'quote_delta_raw', 'logs_fingerprint', 'logs_line_count', 'observed_at',
       )),
-      table('execution_submission_preflight_evidence', names(), names(
+      table('execution_submission_preflight_evidence', names(
+        'artifact_id', 'intent_id', 'attempt_number', 'generation_id', 'armament_id',
+        'reservation_id', 'provider_id', 'wallet_public_key', 'quote_fingerprint',
+        'quote_observed_at', 'quote_expires_at', 'blockhash', 'last_valid_block_height',
+        'authorized_at',
+      ), names(
         'gate_id', 'payload_version', 'gate_fingerprint', 'artifact_id', 'intent_id',
         'attempt_number', 'generation_id', 'armament_id', 'reservation_id', 'provider_id',
         'phase', 'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
@@ -355,7 +360,9 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'expected_revision', 'cause_reason_code', 'evidence_fingerprint', 'observed_at',
         'revoked_at', 'purge_after',
       )),
-      table('execution_submission_events', names(), names(
+      table('execution_submission_events', names(
+        'artifact_id', 'generation_id', 'previous_state', 'next_state', 'reason_code',
+      ), names(
         'event_id', 'payload_version', 'event_fingerprint', 'artifact_id', 'generation_id',
         'previous_state', 'next_state', 'reason_code', 'occurred_at',
       )),

@@ -4,11 +4,13 @@ import {
   ExecutionLiveRepositoryError,
   PostgresExecutionLiveRepository,
 } from '../src/storage/execution-live.repository.js';
+import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import { PostgresExecutionOperationsRepository } from '../src/storage/execution-operations.repository.js';
 import {
-  canaryBuyFixture, envelopeBuyFixture, generationId, hash, liveRuntimeLimits as runtimeLimits,
-  prepareEnvelope, publicKey, roleSource, type SeededSimulation, seedEnvelopeBase, withProvisionedDatabase,
-  withSchema,
+  armEnvelope, canaryBuyFixture, currentDatabaseTimeMs, envelopeBuyFixture, fastEntryIntent,
+  generationId, hash, liveRuntimeLimits as runtimeLimits, openEnvelope,
+  prepareEnvelope, publicKey, roleSource, type SeededSimulation, seedEnvelopeBase, seedProviderSnapshot,
+  withProvisionedDatabase, withSchema,
 } from './helpers/entry-envelope-fixture.js';
 import { mutateWithTriggersDisabled } from './helpers/execution-preflight-v2-source-fixture.js';
 
@@ -169,6 +171,32 @@ void test('PostgreSQL 16 live role starts on an ACTIVE envelope and reads the qu
         operatorId: 'operator-primary', occurredAtMs: Date.now(),
       }));
       await assert.rejects(live.assertRunnableWork(binding), isLiveError('LIVE_EXECUTOR_NO_WORK'));
+    });
+  });
+
+// Lot 5 first real run: the BUY preview filters armament.armed_at, which the live role's column
+// grant omitted, so every BUY pass failed with DATABASE_FAILURE (42501). The real preview and claim
+// must run under the role: no work before the arm, the claim after it, never a permission error.
+void test('PostgreSQL 16 live role previews and claims an ARMED ENVELOPE BUY through the real path',
+  async (context) => {
+    await withProvisionedDatabase(context, async (pool) => {
+      const operations = new PostgresExecutionOperationsRepository(pool);
+      const simulation = await seedEnvelopeBase(pool);
+      const prepared = await openEnvelope(pool, operations, simulation);
+      await seedProviderSnapshot(pool);
+      const intentId = await fastEntryIntent(pool, prepared.envelope, await currentDatabaseTimeMs(pool));
+      const liveIntents = new PostgresExecutionIntentRepository(roleSource(pool, 'sol_token_executor_live'));
+      const options = Object.freeze({
+        ownerId: 'h2b-role-test', leaseMs: runtimeLimits.leaseMs,
+        purpose: 'LIVE_EXECUTE' as const, side: 'BUY' as const, generationId,
+      });
+      assert.equal(await liveIntents.claim(options), null);
+      const armament = await armEnvelope(operations, prepared, intentId);
+      assert.equal(armament.state, 'ARMED');
+      const claimed = await liveIntents.claim(options);
+      assert.ok(claimed);
+      assert.equal(claimed.intent.id, intentId);
+      assert.equal(claimed.leaseOwner, options.ownerId);
     });
   });
 
