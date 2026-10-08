@@ -933,6 +933,37 @@ void test('providerRefreshDue follows the armament and the BUY, and refresh carr
     });
   });
 
+void test('local usage is the half-open interval from the snapshot measurement to now',
+  async (context) => {
+    await withSchema(context, async (pool) => {
+      const simulation = await seedEnvelopeBase(pool);
+      const repository = new PostgresExecutionOperationsRepository(pool);
+      await openEnvelope(pool, repository, simulation);
+      await seedProviderSnapshot(pool);
+      const snapshot = (await repository.readAutoArmContext(contextQuery())).provider?.snapshot;
+      assert.ok(snapshot !== undefined);
+      await recordProviderUnits(pool, snapshot, 'same-ms', 5n);
+      const identity = createProviderUsageOperationId({
+        providerId: snapshot.providerId, billingPeriodId: snapshot.billingPeriodId,
+        category: 'ENTRY', logicalOperationId: 'same-ms',
+      });
+      const moveTo = async (atMs: number): Promise<void> => {
+        assert.equal((await pool.query(`UPDATE execution_provider_usage_counters SET
+          recorded_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond') WHERE operation_id=$1`,
+        [identity, atMs])).rowCount, 1);
+      };
+      // Recorded exactly at the measurement millisecond: the snapshot's own sum stopped just
+      // before it, so it is local usage; one millisecond earlier it was inside used_units.
+      await moveTo(snapshot.measuredAtMs);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).provider?.localUsedUnits, 5n);
+      await moveTo(snapshot.measuredAtMs - 1);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).provider?.localUsedUnits, 0n);
+      // A counter stamped at "now" or later is not local yet for a reader measuring at "now".
+      await moveTo(await currentDatabaseTimeMs(pool) + 60_000);
+      assert.equal((await repository.readAutoArmContext(contextQuery())).provider?.localUsedUnits, 0n);
+    });
+  });
+
 void test('after the last arm EXHAUSTS the envelope, a fresh context still has the refresh policy',
   async (context) => {
     await withSchema(context, async (pool) => {
