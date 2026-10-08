@@ -52,6 +52,37 @@ void test('wallet snapshots require the canonical domain identity', async (conte
   });
 });
 
+void test('wallet snapshots keep appending past state revision 10 (numeric, not text, frontier ordering)', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk wallet snapshot revision ordering test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_wallet_revision_order', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionRiskRepository(pool);
+    const generation = await repository.registerWalletGeneration(generationDraft('a', 1));
+    // Revisions 0..12: as text, '9' > '12' > '10', so the frontier lookup picked a superseded
+    // row once a two-digit revision existed and every later append failed INVALID_DATA.
+    for (let revision = 0; revision <= 12; revision += 1) {
+      const snapshot = createExecutionWalletSnapshot({
+        generationId: generation.generationId,
+        providerId: 'rpc-primary',
+        stateRevision: BigInt(revision),
+        slot: BigInt(100 + revision),
+        blockTimeMs: 1_000 + revision,
+        observedAtMs: 10_000 + revision * 1_000,
+        commitment: 'finalized',
+        walletLamports: 1_000_000n + BigInt(revision),
+        tokenBalanceCount: 0,
+        openPositions: [],
+        realizedNetPnlRaw: 0n,
+      });
+      assert.deepEqual(await repository.appendWalletSnapshot(snapshot), snapshot, `revision ${revision}`);
+    }
+    const current = await pool.query(`SELECT state_revision::TEXT AS state_revision
+      FROM execution_wallet_snapshots WHERE superseded_at IS NULL`);
+    assert.deepEqual(current.rows, [{ state_revision: '12' }]);
+  });
+});
+
 void test('wallet snapshot transaction primitive delegates locks and transaction boundaries to its caller', async (context) => {
   const databaseUrl = testDatabaseUrl(context, 'execution risk transaction primitive test');
   if (databaseUrl === null) return;

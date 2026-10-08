@@ -1071,7 +1071,11 @@ export async function appendWalletSnapshotInTransaction(
     superseded_at IS NULL AS current
     FROM execution_wallet_snapshots
     WHERE generation_id=$1
-    ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC`, [draft.generationId]);
+    ORDER BY execution_wallet_snapshots.state_revision DESC,observed_at DESC,snapshot_id DESC`, [
+    draft.generationId,
+  ]);
+  // The ORDER BY is qualified on purpose: a bare `state_revision` would resolve to the TEXT
+  // output alias, and '9' sorts after '10' as text. The frontier must be the numeric maximum.
   const snapshotRows = snapshots.rows.map((row) => exactRow(row, [
     'snapshot_id', 'state_revision', 'observed_at_ms', 'current',
   ] as const));
