@@ -314,9 +314,25 @@ function sameUnsignedMaterial(value: unknown, expected: ExecutionUnsignedSigning
     && candidate.unsignedTransactionHash === expected.unsignedTransactionHash
     && candidate.blockhash === expected.blockhash
     && candidate.lastValidBlockHeight === expected.lastValidBlockHeight
-    && candidate.unsignedSimulation === expected.unsignedSimulation
+    && sameUnsignedSimulation(candidate.unsignedSimulation, expected.unsignedSimulation)
     && sameBytes(candidate.messageBytes, expected.messageBytes)
     && sameBytes(candidate.unsignedTransactionBytes, expected.unsignedTransactionBytes);
+}
+
+const UNSIGNED_SIMULATION_KEYS = Object.freeze([
+  'outcome', 'snapshotFingerprint', 'buildFingerprint', 'messageHash', 'blockhash',
+  'lastValidBlockHeight', 'blockhashContextSlot', 'feeContextSlot', 'estimatedFeeLamports',
+  'simulationSlot', 'simulatedFeePayerLamportDebit', 'unitsConsumed', 'simulatedBaseDeltaRaw',
+  'simulatedQuoteDeltaRaw', 'logsFingerprint', 'logsLineCount',
+] as const satisfies readonly (keyof ExecutionSimulationEvidenceV1)[]);
+
+/**
+ * The durable authorization re-reads the material, so its evidence record is never the gateway's
+ * object: it is compared field by field (every field is a primitive) rather than by identity.
+ */
+function sameUnsignedSimulation(value: unknown, expected: ExecutionSimulationEvidenceV1): boolean {
+  const candidate = exactDataRecord(value, UNSIGNED_SIMULATION_KEYS);
+  return UNSIGNED_SIMULATION_KEYS.every((key) => candidate[key] === expected[key]);
 }
 
 function sameBytes(value: unknown, expected: readonly number[]): boolean {

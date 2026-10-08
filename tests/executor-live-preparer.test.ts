@@ -156,6 +156,75 @@ void test('rejects invalid quote windows before simulation or signing', async ()
   assert.equal(signerCalls, 0);
 });
 
+void test('signs when the durable authorization re-reads the exact material as new objects', async () => {
+  // The repository re-reads the lock row and rebuilds the material (fresh byte arrays and a
+  // re-created unsigned simulation record): equal by value, never the caller's object identities.
+  // Lot 5 first BUY (2026-10-08): the lock was AUTHORIZED, then preparation failed before signing.
+  const plan = await loadPumpSwapSellGoldenPlan();
+  const inspected = inspectUnsignedBuildPlan(plan);
+  const blockhash = new PublicKey(new Uint8Array(32).fill(11)).toBase58();
+  const compiled = compileInspectedV0Message(Object.freeze({
+    feePayer: inspected.feePayer, instructions: inspected.instructions, recentBlockhash: blockhash,
+    maximumTransactionBytes: 1_232,
+  }));
+  const evidence = simulationEvidence(compiled.messageHash, blockhash, plan.identity.snapshotFingerprint);
+  let signerCalls = 0;
+  const preparer = new LiveTransactionPreparer(
+    new StubSimulationGateway(evidence),
+    Object.freeze({
+      publicKey: plan.feePayer,
+      signMessage: () => { signerCalls += 1; return Promise.resolve(Object.freeze({ signature: new Uint8Array(64).fill(3) })); },
+      close: () => Promise.resolve(),
+    }), new LiveTransactionCandidateAuthority(), 1_232,
+  );
+  const request = Object.freeze({
+    plan, snapshot: Object.freeze({ providerId: 'primary', slot: plan.identity.snapshotSlot,
+      addresses: Object.freeze([]), accounts: Object.freeze([]) }),
+    receipt: Object.freeze({ payloadVersion: 1 as const }),
+  });
+  const quoteWindow = Object.freeze({ quoteObservedAtMs: 1_800_000_000_000, quoteExpiresAtMs: 1_800_000_003_000 });
+
+  const prepared = await preparer.prepare(request, quoteWindow, async (material) => {
+    const valid = authorization(material);
+    return Object.freeze({
+      ...valid,
+      material: Object.freeze({
+        ...material,
+        messageBytes: Object.freeze([...material.messageBytes]),
+        unsignedTransactionBytes: Object.freeze([...material.unsignedTransactionBytes]),
+        unsignedSimulation: Object.freeze({ ...material.unsignedSimulation }),
+      }),
+    });
+  }, new AbortController().signal);
+
+  assert.equal(signerCalls, 1);
+  assert.equal(prepared.evidence, evidence);
+  for (const variant of ['simulation-field', 'simulation-extra', 'simulation-missing'] as const) {
+    let hostileSignerCalls = 0;
+    const hostile = new LiveTransactionPreparer(
+      new StubSimulationGateway(evidence),
+      Object.freeze({
+        publicKey: plan.feePayer,
+        signMessage: () => { hostileSignerCalls += 1; return Promise.resolve(Object.freeze({ signature: new Uint8Array(64) })); },
+        close: () => Promise.resolve(),
+      }), new LiveTransactionCandidateAuthority(), 1_232,
+    );
+    await assert.rejects(hostile.prepare(request, quoteWindow, async (material) => {
+      const { logsLineCount, ...rest } = material.unsignedSimulation;
+      const simulation = variant === 'simulation-field'
+        ? Object.freeze({ ...material.unsignedSimulation, unitsConsumed: material.unsignedSimulation.unitsConsumed + 1n })
+        : variant === 'simulation-extra'
+          ? Object.freeze({ ...material.unsignedSimulation, extra: logsLineCount })
+          : Object.freeze(rest);
+      return Object.freeze({
+        ...authorization(material),
+        material: Object.freeze({ ...material, unsignedSimulation: simulation }),
+      }) as never;
+    }, new AbortController().signal), /Live transaction preparation failed/u, variant);
+    assert.equal(hostileSignerCalls, 0, variant);
+  }
+});
+
 void test('rejects hostile exact-authorizations before signing', async () => {
   const plan = await loadPumpSwapSellGoldenPlan();
   const inspected = inspectUnsignedBuildPlan(plan);
