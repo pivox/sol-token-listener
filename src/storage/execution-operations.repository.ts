@@ -514,7 +514,8 @@ export class PostgresExecutionOperationsRepository implements
       const armament = await activeArmamentOf(client, query.generationId, nowMs);
       const providerId = armament?.envelopeBound === true && armament.state === 'LOCKED'
         ? armament.providerId : active?.qualification.providerId ?? null;
-      const provider = providerId === null ? null : await currentProviderOf(client, providerId, false);
+      const provider = providerId === null ? null
+        : await currentProviderOf(client, providerId, false, nowMs);
       // The refresh policy outlives the ACTIVE state: the last buy makes its envelope EXHAUSTED.
       const refreshPolicy = armament?.state === 'LOCKED' && armament.envelopeId !== null
         ? await envelopePolicyOf(client, armament.envelopeId, query.generationId)
@@ -583,19 +584,25 @@ export class PostgresExecutionOperationsRepository implements
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))', [
         armament.providerId,
       ]);
-      const provider = await currentProviderOf(client, armament.providerId, true);
-      if (!refreshDue(armament, provider, nowMs, thresholdMs) || provider === null) return notRefreshed;
+      // Measured under the provider lock: no counter can commit between the sum and the stamp.
+      const measuredAtMs = await databaseNowMs(client);
+      const provider = await currentProviderOf(client, armament.providerId, true, measuredAtMs);
+      if (!refreshDue(armament, provider, measuredAtMs, thresholdMs) || provider === null) {
+        return notRefreshed;
+      }
       let carried: ProviderUsageSnapshotV1;
       try {
         carried = createEnvelopeProviderSnapshot(Object.freeze({
           latest: provider.snapshot, localUsedUnits: provider.localUsedUnits,
-          measuredAtMs: nowMs, maximumAgeMs,
+          measuredAtMs, maximumAgeMs,
         }));
       } catch {
         throw failure('PROVIDER_CARRY_FORWARD_REJECTED');
       }
       const snapshot = await appendProviderUsageInTransaction(client, carried);
-      return Object.freeze({ payloadVersion: 1, refreshed: true, snapshot, databaseNowMs: nowMs });
+      return Object.freeze({
+        payloadVersion: 1, refreshed: true, snapshot, databaseNowMs: measuredAtMs,
+      });
     });
   }
 
@@ -1144,10 +1151,14 @@ interface CurrentProvider {
 }
 
 /** The provider's current snapshot (row-locked when `lock`) and its local counter units. */
+// Local usage covers the half-open interval [measured_at, untilMs): a carried-forward snapshot
+// stamped at `untilMs` therefore sums exactly the counters the next reader excludes, whatever the
+// commit timing within a millisecond. Without `untilMs` (carry-forward verification) it is open.
 async function currentProviderOf(
   client: DatabaseClient,
   providerId: string,
   lock: boolean,
+  untilMs: number | null = null,
 ): Promise<CurrentProvider | null> {
   const result = await client.query(`SELECT ${PROVIDER_ROW_PROJECTION}
     FROM execution_provider_usage_snapshots WHERE provider_id=$1 AND superseded_at IS NULL
@@ -1174,13 +1185,12 @@ async function currentProviderOf(
   }
   if (row.payload_version !== 1 || row.snapshot_id !== snapshot.snapshotId
     || row.snapshot_fingerprint !== snapshot.snapshotFingerprint) throw failure('INVALID_DATA');
-  // Strictly after the measurement: a counter recorded in the same millisecond as a
-  // carried-forward snapshot is already inside its used_units and must not count twice.
   const local = exactRow(singleRow(await client.query(`SELECT COALESCE(SUM(units),0)::TEXT AS local_units
     FROM execution_provider_usage_counters
     WHERE provider_id=$1 AND billing_period_id=$2
-      AND recorded_at > TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')`, [
-    snapshot.providerId, snapshot.billingPeriodId, snapshot.measuredAtMs,
+      AND recorded_at >= TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+      AND ($4::BIGINT IS NULL OR recorded_at < TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'))`, [
+    snapshot.providerId, snapshot.billingPeriodId, snapshot.measuredAtMs, untilMs,
   ])), ['local_units'] as const);
   return Object.freeze({ snapshot, localUsedUnits: unsignedBigint(local.local_units) });
 }
