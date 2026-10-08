@@ -463,6 +463,24 @@ void test('maps HTTP status, JSON-RPC errors and genesis mismatch to closed code
 
   const mismatch = new SolanaLiveRpcSession(config(), rpcTransport(() => BLOCKHASH).fetch);
   await rejectsCode(mismatch.verifyGenesis(signal()), 'GENESIS_MISMATCH');
+
+  // A -32016 "minimum context slot not reached" lag is an immediate, session-killing
+  // provider failure here: the tail budget is exact (6 calls for a BUY), so no retry.
+  let requests = 0;
+  const lagging = new SolanaLiveRpcSession(config(), async () => {
+    requests += 1;
+    return response({
+      jsonrpc: '2.0', id: requests,
+      error: {
+        code: -32_016, message: 'Minimum context slot has not been reached',
+        data: { contextSlot: 122 },
+      },
+    });
+  });
+  await rejectsCode(lagging.verifyGenesis(signal()), 'RPC_UNAVAILABLE');
+  await rejectsCode(lagging.verifyGenesis(signal()), 'SESSION_FAILED');
+  assert.equal(requests, 1);
+  assert.equal(lagging.usage().rpcCallsUsed, 1);
 });
 
 void test('bounds declared Content-Length and streamed response bytes', async () => {
