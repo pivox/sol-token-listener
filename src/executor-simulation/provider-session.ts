@@ -74,6 +74,18 @@ const AGAVE_4_3_SIMULATION_KEYS = Object.freeze([
   'preTokenBalances', 'postTokenBalances',
 ] as const);
 const INTERNAL_ERRORS = new WeakSet<ExecutionProviderSessionError>();
+// JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED: the answering node lags the
+// requested minContextSlot. Behind a load balancer this is transient, so the identical
+// request is retried after these delays (3 attempts total), each one consuming a call.
+const MIN_CONTEXT_SLOT_NOT_REACHED_CODE = -32_016;
+const MIN_CONTEXT_SLOT_RETRY_DELAYS_MS = Object.freeze([250, 500] as const);
+const LAGGING_OUTCOME = Object.freeze({ kind: 'LAGGING' } as const);
+
+export type ProviderSessionSleep = (delayMs: number, signal: AbortSignal) => Promise<void>;
+
+type DispatchOutcome =
+  | typeof LAGGING_OUTCOME
+  | Readonly<{ readonly kind: 'RESULT'; readonly value: unknown }>;
 
 interface ValidatedConfig {
   readonly providerId: string;
@@ -93,6 +105,7 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
   public readonly providerId: string;
   private readonly config: ValidatedConfig;
   private readonly fetchImplementation: typeof fetch;
+  private readonly sleepImplementation: ProviderSessionSleep;
   private callsUsed = 0;
   private genesisEvidence: ExecutionGenesisEvidence | null = null;
   private genesisReserved = false;
@@ -111,11 +124,15 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
   public constructor(
     configValue: ProviderAffineSessionConfig,
     fetchImplementation: typeof fetch = fetch,
+    sleepImplementation: ProviderSessionSleep = sleep,
   ) {
     try {
       this.config = configInput(configValue);
-      if (typeof fetchImplementation !== 'function') throw inputError();
+      if (typeof fetchImplementation !== 'function' || typeof sleepImplementation !== 'function') {
+        throw inputError();
+      }
       this.fetchImplementation = fetchImplementation;
+      this.sleepImplementation = sleepImplementation;
       this.providerId = this.config.providerId;
     } catch { throw inputError(); }
   }
@@ -228,13 +245,14 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
     if (this.blockhashContextSlot === null || this.feeReserved || this.feeContextSlot !== null
       || this.simulationCompleted) throw inputError();
     this.feeReserved = true;
+    const floor = this.blockhashFloor(snapshotSlot);
     const raw = await this.dispatch('getFeeForMessage', Object.freeze([
       messageBase64,
-      Object.freeze({ commitment: 'confirmed', minContextSlot: Number(snapshotSlot) }),
+      Object.freeze({ commitment: 'confirmed', minContextSlot: Number(floor) }),
     ]), signal);
     try {
       const contextual = contextValue(raw);
-      if (contextual.contextSlot < snapshotSlot) throw new Error();
+      if (contextual.contextSlot < floor) throw new Error();
       const feeLamports = contextual.value === null
         ? null : safeIntegerBigint(contextual.value, false);
       const result = Object.freeze({
@@ -258,11 +276,12 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
       || this.simulationReserved
       || this.simulationCompleted) throw inputError();
     this.simulationReserved = true;
+    const floor = this.blockhashFloor(request.snapshotSlot);
     const raw = await this.dispatch('simulateTransaction', Object.freeze([
       request.transactionBase64,
       Object.freeze({
         encoding: 'base64', commitment: 'confirmed', sigVerify: false,
-        replaceRecentBlockhash: false, minContextSlot: Number(request.snapshotSlot),
+        replaceRecentBlockhash: false, minContextSlot: Number(floor),
         innerInstructions: true,
         accounts: Object.freeze({
           encoding: 'base64', addresses: request.accountAddresses,
@@ -271,7 +290,7 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
     ]), signal);
     try {
       const contextual = contextValue(raw);
-      if (contextual.contextSlot < this.blockhashContextSlot) throw new Error();
+      if (contextual.contextSlot < floor) throw new Error();
       const value = plainRecord(contextual.value);
       knownKeys(value, ['err', 'logs', 'unitsConsumed', 'accounts', 'returnData',
         'innerInstructions', 'loadedAccountsDataSize', 'replacementBlockhash',
@@ -314,6 +333,26 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
     if (this.snapshotSlot === null || snapshotSlot !== this.snapshotSlot) throw inputError();
   }
 
+  /**
+   * Causal floor for every call that depends on the recent blockhash. Behind a
+   * load-balanced provider a node that satisfies `minContextSlot = snapshotSlot`
+   * may still lag the node that issued the blockhash one slot later; it then
+   * legitimately answers `null` to getFeeForMessage or BlockhashNotFound to
+   * simulateTransaction. Raising the floor to the blockhash context slot forces
+   * the answering node to know the blockhash.
+   */
+  private blockhashFloor(snapshotSlot: bigint): bigint {
+    if (this.blockhashContextSlot === null) throw inputError();
+    return this.blockhashContextSlot > snapshotSlot ? this.blockhashContextSlot : snapshotSlot;
+  }
+
+  /**
+   * Sends one JSON-RPC request. A -32016 "minimum context slot not reached" answer is
+   * a lagging node, not evidence: the identical request is re-sent after 250 ms, then
+   * 500 ms (3 attempts total). Every attempt consumes one call of the session budget;
+   * when the budget would be exceeded or the attempts are exhausted the session fails
+   * with RPC_UNAVAILABLE (a provider failure, never RPC_RESPONSE_INVALID).
+   */
   private async dispatch(
     method: string,
     params: readonly unknown[],
@@ -322,6 +361,39 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
     validateSignal(signal);
     if (signal.aborted) throw sessionError('OPERATION_ABORTED');
     if (this.failed || this.callsUsed >= this.config.maxCalls) throw inputError();
+    for (let attempt = 0; ; attempt += 1) {
+      const outcome = await this.dispatchOnce(method, params, signal);
+      if (outcome.kind === 'RESULT') return outcome.value;
+      const delayMs = MIN_CONTEXT_SLOT_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined || this.callsUsed >= this.config.maxCalls) {
+        this.failed = true;
+        throw sessionError('RPC_UNAVAILABLE');
+      }
+      await this.backoff(delayMs, signal);
+    }
+  }
+
+  private async backoff(delayMs: number, signal: AbortSignal): Promise<void> {
+    let slept = false;
+    try {
+      await this.sleepImplementation(delayMs, signal);
+      slept = true;
+    } catch { /* classified below */ }
+    if (signal.aborted) {
+      this.failed = true;
+      throw sessionError('OPERATION_ABORTED');
+    }
+    if (!slept) {
+      this.failed = true;
+      throw sessionError('RPC_UNAVAILABLE');
+    }
+  }
+
+  private async dispatchOnce(
+    method: string,
+    params: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<DispatchOutcome> {
     this.callsUsed += 1;
     const id = this.callsUsed;
     const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
@@ -388,10 +460,11 @@ export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
           this.failed = true;
           throw sessionError('RPC_UNAVAILABLE');
         }
+        if (code === MIN_CONTEXT_SLOT_NOT_REACHED_CODE) return LAGGING_OUTCOME;
         throw new Error();
       }
       if (!keys.includes('result') || keys.includes('error')) throw new Error();
-      return envelope.result;
+      return Object.freeze({ kind: 'RESULT', value: envelope.result });
     } catch (error) {
       if (isInternalError(error)) throw error;
       return this.failInvalidResponse();
@@ -458,6 +531,18 @@ async function readBoundedResponse(response: Response, signal: AbortSignal): Pro
   try { return new TextDecoder('utf-8', { fatal: true }).decode(combined); } catch {
     throw sessionError('RPC_RESPONSE_INVALID');
   }
+}
+
+function sleep(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) { reject(new Error('aborted')); return; }
+    const onAbort = (): void => { clearTimeout(timer); reject(new Error('aborted')); };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function cancelResponseBody(response: Response): void {

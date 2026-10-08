@@ -19,7 +19,7 @@ void test('pins one provider and normalizes the complete causal RPC sequence', a
     rpcResult(PUBLIC_KEY, 1),
     rpcResult(context(100, [account(DATA), null]), 2),
     rpcResult(context(101, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
-    rpcResult(context(100, 5_000), 4),
+    rpcResult(context(101, 5_000), 4),
     rpcResult(context(102, {
       err: null,
       logs: ['Program log: ok'],
@@ -72,7 +72,7 @@ void test('pins one provider and normalizes the complete causal RPC sequence', a
     lastValidBlockHeight: 500n,
   }));
   assert.deepEqual(fee, Object.freeze({
-    providerId: 'primary', contextSlot: 100n, feeLamports: 5_000n,
+    providerId: 'primary', contextSlot: 101n, feeLamports: 5_000n,
   }));
   assert.equal(simulation.contextSlot, 102n);
   assert.equal(simulation.failureKind, null);
@@ -107,12 +107,14 @@ void test('pins one provider and normalizes the complete causal RPC sequence', a
     [PUBLIC_KEY, OTHER_KEY], { encoding: 'base64', commitment: 'confirmed' },
   ]);
   assert.deepEqual(bodies[2]?.params, [{ commitment: 'confirmed', minContextSlot: 100 }]);
+  // Fee and simulation depend on the blockhash: their floor is its context slot (101), not the
+  // snapshot slot (100), so a lagging load-balanced node cannot answer without knowing it.
   assert.deepEqual(bodies[3]?.params, ['AQID', {
-    commitment: 'confirmed', minContextSlot: 100,
+    commitment: 'confirmed', minContextSlot: 101,
   }]);
   assert.deepEqual(bodies[4]?.params, ['AQID', {
     encoding: 'base64', commitment: 'confirmed', sigVerify: false,
-    replaceRecentBlockhash: false, minContextSlot: 100, innerInstructions: true,
+    replaceRecentBlockhash: false, minContextSlot: 101, innerInstructions: true,
     accounts: { encoding: 'base64', addresses: [PUBLIC_KEY] },
   }]);
   for (const call of scripted.calls) {
@@ -121,6 +123,84 @@ void test('pins one provider and normalizes the complete causal RPC sequence', a
     assert.equal(call.contentType, 'application/json');
     assert.ok(call.signal instanceof AbortSignal);
   }
+});
+
+void test('raises the fee and simulation minContextSlot to a blockhash context above the snapshot', async () => {
+  // Production race (2026-10-08, twice): snapshot at S, blockhash issued at S+1 by one node,
+  // then getFeeForMessage with minContextSlot=S answered `null` by another node still at S.
+  const scripted = new ScriptedFetch([
+    rpcResult(PUBLIC_KEY, 1),
+    rpcResult(context(454_538_709, [account(DATA)]), 2),
+    rpcResult(context(454_538_710, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
+    rpcResult(context(454_538_710, 5_000), 4),
+    rpcResult(context(454_538_710, { err: null, logs: [] }), 5),
+  ]);
+  const session = new ProviderAffineSession(config(5), scripted.fetch);
+  await session.verifyGenesis(activeSignal());
+  await session.readAccountSnapshot(Object.freeze([PUBLIC_KEY]), activeSignal());
+  await session.getLatestBlockhash(454_538_709n, activeSignal());
+  const fee = await session.getFeeForMessage('AQID', 454_538_709n, activeSignal());
+  const simulation = await session.simulateUnsignedTransaction(Object.freeze({
+    transactionBase64: 'AQID', snapshotSlot: 454_538_709n,
+    accountAddresses: Object.freeze([]),
+  }), activeSignal());
+
+  assert.equal(fee.contextSlot, 454_538_710n);
+  assert.equal(fee.feeLamports, 5_000n);
+  assert.equal(simulation.contextSlot, 454_538_710n);
+  const bodies = scripted.calls.map((call) => JSON.parse(call.body) as Record<string, unknown>);
+  assert.deepEqual(bodies[2]?.params, [{ commitment: 'confirmed', minContextSlot: 454_538_709 }]);
+  assert.deepEqual(bodies[3]?.params, ['AQID', { commitment: 'confirmed', minContextSlot: 454_538_710 }]);
+  assert.deepEqual(bodies[4]?.params, ['AQID', {
+    encoding: 'base64', commitment: 'confirmed', sigVerify: false,
+    replaceRecentBlockhash: false, minContextSlot: 454_538_710, innerInstructions: true,
+    accounts: { encoding: 'base64', addresses: [] },
+  }]);
+
+  // A fee answered below the blockhash context (even at or above the snapshot) is not evidence
+  // about this blockhash and is rejected instead of being surfaced as a null fee.
+  const lagging = new ScriptedFetch([
+    rpcResult(PUBLIC_KEY, 1),
+    rpcResult(context(100, [account(DATA)]), 2),
+    rpcResult(context(101, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
+    rpcResult(context(100, null), 4),
+  ]);
+  const laggingSession = new ProviderAffineSession(config(4), lagging.fetch);
+  await laggingSession.verifyGenesis(activeSignal());
+  await laggingSession.readAccountSnapshot(Object.freeze([PUBLIC_KEY]), activeSignal());
+  await laggingSession.getLatestBlockhash(100n, activeSignal());
+  await expectCode(laggingSession.getFeeForMessage('AQID', 100n, activeSignal()), 'RPC_RESPONSE_INVALID');
+  assert.equal(lagging.calls.length, 4);
+});
+
+void test('keeps the snapshot slot as the floor when the blockhash context equals it', async () => {
+  const scripted = new ScriptedFetch([
+    rpcResult(PUBLIC_KEY, 1),
+    rpcResult(context(100, [account(DATA)]), 2),
+    rpcResult(context(100, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
+    rpcResult(context(100, 5_000), 4),
+    rpcResult(context(100, { err: null, logs: [] }), 5),
+  ]);
+  const session = new ProviderAffineSession(config(5), scripted.fetch);
+  await session.verifyGenesis(activeSignal());
+  await session.readAccountSnapshot(Object.freeze([PUBLIC_KEY]), activeSignal());
+  await session.getLatestBlockhash(100n, activeSignal());
+  const fee = await session.getFeeForMessage('AQID', 100n, activeSignal());
+  const simulation = await session.simulateUnsignedTransaction(Object.freeze({
+    transactionBase64: 'AQID', snapshotSlot: 100n,
+    accountAddresses: Object.freeze([]),
+  }), activeSignal());
+
+  assert.equal(fee.contextSlot, 100n);
+  assert.equal(simulation.contextSlot, 100n);
+  const bodies = scripted.calls.map((call) => JSON.parse(call.body) as Record<string, unknown>);
+  assert.deepEqual(bodies[2]?.params, [{ commitment: 'confirmed', minContextSlot: 100 }]);
+  assert.deepEqual(bodies[3]?.params, ['AQID', { commitment: 'confirmed', minContextSlot: 100 }]);
+  assert.deepEqual(bodies[4]?.params, ['AQID', {
+    encoding: 'base64', commitment: 'confirmed', sigVerify: false,
+    replaceRecentBlockhash: false, minContextSlot: 100, innerInstructions: true,
+    accounts: { encoding: 'base64', addresses: [] },
+  }]);
 });
 
 void test('keeps address discovery separate from the one provider-owned causal snapshot', async () => {
@@ -214,6 +294,112 @@ void test('normalizes 429, transport, malformed JSON, and genesis mismatch witho
   assert.doesNotMatch(String(error), /credential|secret|header|provider message/iu);
 });
 
+void test('retries the identical request once after a -32016 lag and charges both calls to the budget', async () => {
+  const scripted = new ScriptedFetch([
+    minContextSlotNotReached(1),
+    rpcResult(PUBLIC_KEY, 2),
+    rpcResult(context(100, [account(DATA)]), 3),
+  ]);
+  const sleeps: number[] = [];
+  const session = new ProviderAffineSession(config(5), scripted.fetch, async (delayMs) => {
+    sleeps.push(delayMs);
+  });
+
+  const genesis = await session.verifyGenesis(activeSignal());
+  assert.equal(genesis.observedGenesisHash, PUBLIC_KEY);
+  assert.equal(session.usage().rpcCallsUsed, 2);
+  assert.deepEqual(sleeps, [250]);
+  assert.equal(scripted.calls.length, 2);
+  const bodies = scripted.calls.map((call) => JSON.parse(call.body) as Record<string, unknown>);
+  assert.deepEqual(bodies[0], { jsonrpc: '2.0', id: 1, method: 'getGenesisHash', params: [] });
+  assert.deepEqual(bodies[1], { jsonrpc: '2.0', id: 2, method: 'getGenesisHash', params: [] });
+
+  // The session is not failed: the causal sequence continues on the remaining budget.
+  const snapshot = await session.readAccountSnapshot(Object.freeze([PUBLIC_KEY]), activeSignal());
+  assert.equal(snapshot.slot, 100n);
+  assert.equal(session.usage().rpcCallsUsed, 3);
+});
+
+void test('fails the session with RPC_UNAVAILABLE after three -32016 answers and 250/500 ms backoffs', async () => {
+  const scripted = new ScriptedFetch([
+    minContextSlotNotReached(1), minContextSlotNotReached(2), minContextSlotNotReached(3),
+  ]);
+  const sleeps: number[] = [];
+  const session = new ProviderAffineSession(config(5), scripted.fetch, async (delayMs) => {
+    sleeps.push(delayMs);
+  });
+
+  const error = await expectCode(session.verifyGenesis(activeSignal()), 'RPC_UNAVAILABLE');
+  assert.doesNotMatch(String(error), /Minimum context slot|lagging secret/iu);
+  assert.deepEqual(sleeps, [250, 500]);
+  assert.equal(scripted.calls.length, 3);
+  assert.equal(session.usage().rpcCallsUsed, 3);
+  await expectCode(session.verifyGenesis(activeSignal()), 'INVALID_INPUT');
+  assert.equal(scripted.calls.length, 3);
+});
+
+void test('does not retry a -32016 lag beyond the call budget and fails with RPC_UNAVAILABLE', async () => {
+  const scripted = new ScriptedFetch([minContextSlotNotReached(1)]);
+  const sleeps: number[] = [];
+  const session = new ProviderAffineSession(config(1), scripted.fetch, async (delayMs) => {
+    sleeps.push(delayMs);
+  });
+
+  await expectCode(session.verifyGenesis(activeSignal()), 'RPC_UNAVAILABLE');
+  assert.deepEqual(sleeps, []);
+  assert.equal(scripted.calls.length, 1);
+  assert.deepEqual(session.usage(), Object.freeze({
+    providerId: 'primary', rpcCallsUsed: 1, rpcCallsLimit: 1,
+  }));
+  await expectCode(session.verifyGenesis(activeSignal()), 'INVALID_INPUT');
+
+  // Two calls left: the second lag answer exhausts the budget before the third attempt.
+  const twoLeft = new ScriptedFetch([minContextSlotNotReached(1), minContextSlotNotReached(2)]);
+  const twoSleeps: number[] = [];
+  const twoSession = new ProviderAffineSession(config(2), twoLeft.fetch, async (delayMs) => {
+    twoSleeps.push(delayMs);
+  });
+  await expectCode(twoSession.verifyGenesis(activeSignal()), 'RPC_UNAVAILABLE');
+  assert.deepEqual(twoSleeps, [250]);
+  assert.equal(twoLeft.calls.length, 2);
+  assert.equal(twoSession.usage().rpcCallsUsed, 2);
+});
+
+void test('aborting during the -32016 backoff yields OPERATION_ABORTED without a further call', async () => {
+  const scripted = new ScriptedFetch([minContextSlotNotReached(1)]);
+  const session = new ProviderAffineSession(config(5), scripted.fetch);
+  const controller = new AbortController();
+  const pending = session.verifyGenesis(controller.signal);
+  await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+  assert.equal(scripted.calls.length, 1);
+  controller.abort();
+
+  await expectCode(pending, 'OPERATION_ABORTED');
+  assert.equal(scripted.calls.length, 1);
+  assert.equal(session.usage().rpcCallsUsed, 1);
+  await expectCode(session.verifyGenesis(activeSignal()), 'INVALID_INPUT');
+});
+
+void test('keeps 429 and -32005 JSON-RPC errors immediate and session-killing despite the lag retry', async () => {
+  for (const code of [429, -32_005] as const) {
+    const scripted = new ScriptedFetch([jsonResponse({
+      jsonrpc: '2.0', id: 1, error: { code, message: 'provider secret' },
+    })]);
+    const sleeps: number[] = [];
+    const session = new ProviderAffineSession(config(5), scripted.fetch, async (delayMs) => {
+      sleeps.push(delayMs);
+    });
+    await expectCode(
+      session.verifyGenesis(activeSignal()),
+      code === 429 ? 'RPC_RATE_LIMITED' : 'RPC_UNAVAILABLE',
+    );
+    assert.deepEqual(sleeps, []);
+    assert.equal(scripted.calls.length, 1);
+    assert.equal(session.usage().rpcCallsUsed, 1);
+    await expectCode(session.verifyGenesis(activeSignal()), 'INVALID_INPUT');
+  }
+});
+
 void test('distinguishes timeout and caller abort while counting only dispatched calls', async () => {
   const timeoutFetch = new ScriptedFetch(['WAIT_FOR_ABORT']);
   const timeout = new ProviderAffineSession(config(2, 5), timeoutFetch.fetch);
@@ -269,7 +455,7 @@ void test('accepts omitted optional simulation fields and rejects hostile return
     rpcResult(PUBLIC_KEY, 1),
     rpcResult(context(1, [account(DATA)]), 2),
     rpcResult(context(2, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
-    rpcResult(context(1, 5_000), 4),
+    rpcResult(context(2, 5_000), 4),
     rpcResult(context(2, { err: 'BlockhashNotFound', logs: null }), 5),
   ]);
   const optional = new ProviderAffineSession(config(5), optionalFetch.fetch);
@@ -290,7 +476,7 @@ void test('accepts omitted optional simulation fields and rejects hostile return
     rpcResult(PUBLIC_KEY, 1),
     rpcResult(context(1, [account(DATA)]), 2),
     rpcResult(context(2, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
-    rpcResult(context(1, 5_000), 4),
+    rpcResult(context(2, 5_000), 4),
     rpcResult(context(2, {
       err: null, logs: [], returnData: {
         programId: PUBLIC_KEY, data: ['A'.repeat(1_500_000), 'base64'],
@@ -313,7 +499,7 @@ void test('enforces one exact snapshot and the causal blockhash, fee, simulation
     rpcResult(PUBLIC_KEY, 1),
     rpcResult(context(100, [account(DATA)]), 2),
     rpcResult(context(101, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
-    rpcResult(context(100, 5_000), 4),
+    rpcResult(context(101, 5_000), 4),
     rpcResult(context(100, { err: null, logs: [] }), 5),
   ]);
   const session = new ProviderAffineSession(config(5), scripted.fetch);
@@ -356,7 +542,7 @@ void test('rejects prototype-polluting decoded records instead of consuming inhe
     rpcResult(PUBLIC_KEY, 1),
     rpcResult(context(1, [account(DATA)]), 2),
     rpcResult(context(2, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
-    rpcResult(context(1, 5_000), 4),
+    rpcResult(context(2, 5_000), 4),
     hostileSimulation,
   ]);
   const session = new ProviderAffineSession(config(5), scripted.fetch);
@@ -795,7 +981,7 @@ async function preparedSimulationSession(
     rpcResult(PUBLIC_KEY, 1),
     rpcResult(context(100, [account(DATA)]), 2),
     rpcResult(context(101, { blockhash: OTHER_KEY, lastValidBlockHeight: 500 }), 3),
-    rpcResult(context(100, 5_000), 4),
+    rpcResult(context(101, 5_000), 4),
     simulationValue instanceof Response
       ? simulationValue
       : rpcResult(context(102, simulationValue), 5),
@@ -822,6 +1008,16 @@ function simulationRequest(): Readonly<{
 
 function rpcResult(result: unknown, id = 1): Response {
   return jsonResponse({ jsonrpc: '2.0', id, result });
+}
+
+function minContextSlotNotReached(id: number): Response {
+  return jsonResponse({
+    jsonrpc: '2.0', id,
+    error: {
+      code: -32_016, message: 'Minimum context slot has not been reached lagging secret',
+      data: { contextSlot: 99 },
+    },
+  });
 }
 
 function jsonResponse(value: unknown): Response {
