@@ -159,20 +159,46 @@ async function confirmationLane(
     try {
       observation = await gateway.observeSignature(work.signature, signal);
     } catch (error) {
-      await release(dependencies, activeClaim);
-      if (signal.aborted) {
-        throw new ClaimReleaseHandledError(laneFailure('OPERATION_ABORTED'));
-      }
-      const deferredCode = retryableRpcErrorCode(ownStringDataProperty(error, 'code'));
-      if (deferredCode !== null) return deferredResult(deferredCode);
-      throw new ClaimReleaseHandledError(laneFailure('GATEWAY_FAILED'));
+      return await releaseAfterRpcFailure(dependencies, activeClaim, signal, error);
     }
     const confirmationStatus: unknown = observation.confirmationStatus;
     const observedSlot: unknown = observation.observedSlot;
     if (confirmationStatus === 'NOT_FOUND') {
       if (observedSlot !== null) throw laneFailure('GATEWAY_FAILED');
-      await release(dependencies, activeClaim);
-      return deferredResult(null);
+      // Not seen yet: still pending until the finalized height passes the last valid block height.
+      // The gateway maps `processed` to NOT_FOUND; that is safe behind this gate: a transaction in
+      // a processed block at height h <= lastValid means the finalized height is still below
+      // lastValid (DEFER), and a fork block at h <= lastValid can no longer finalize once the
+      // finalized height is past lastValid.
+      let finalizedBlockHeight: unknown;
+      try {
+        finalizedBlockHeight = await gateway.readFinalizedBlockHeight(signal);
+      } catch (error) {
+        return await releaseAfterRpcFailure(dependencies, activeClaim, signal, error);
+      }
+      if (typeof finalizedBlockHeight !== 'bigint' || finalizedBlockHeight < 0n) {
+        throw laneFailure('GATEWAY_FAILED');
+      }
+      if (finalizedBlockHeight <= work.lastValidBlockHeight) {
+        await release(dependencies, activeClaim);
+        return deferredResult(null);
+      }
+      activeClaim = await renew(dependencies, activeClaim, signal);
+      stage = 'COMMIT';
+      await dependencies.live.recordConfirmationExpiry(activeClaim, Object.freeze({
+        payloadVersion: 1,
+        artifactId: work.artifactId,
+        expectedRevision: work.expectedRevision,
+        signature: work.signature,
+        finalizedBlockHeight,
+        observedAtMs: observation.observedAtMs,
+      }));
+      dependencies.logger.info(Object.freeze({
+        event: 'executor_live_recovery.confirmation_expired',
+        executionMode: 'live-recovery',
+        lane: 'CONFIRMATION',
+      }));
+      return 'WORKED';
     }
     if ((confirmationStatus !== 'CONFIRMED' && confirmationStatus !== 'FINALIZED')
       || typeof observedSlot !== 'bigint' || observedSlot < 0n) {
@@ -346,6 +372,25 @@ async function release(
   } catch {
     throw laneFailure('RELEASE_FAILED');
   }
+}
+
+/**
+ * A confirmation RPC failure: the claim is released, a typed retryable code defers the work,
+ * anything else fails closed without leaking the error.
+ */
+async function releaseAfterRpcFailure(
+  dependencies: LiveRecoveryLaneDependencies,
+  activeClaim: ClaimedExecutionIntent,
+  signal: AbortSignal,
+  error: unknown,
+): Promise<LiveRecoveryDeferredResult> {
+  await release(dependencies, activeClaim);
+  if (signal.aborted) {
+    throw new ClaimReleaseHandledError(laneFailure('OPERATION_ABORTED'));
+  }
+  const deferredCode = retryableRpcErrorCode(ownStringDataProperty(error, 'code'));
+  if (deferredCode !== null) return deferredResult(deferredCode);
+  throw new ClaimReleaseHandledError(laneFailure('GATEWAY_FAILED'));
 }
 
 class ClaimReleaseHandledError extends Error {

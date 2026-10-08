@@ -580,6 +580,7 @@ void test('worker read-models expose fenced provider-affine inputs without signe
         expectedRevision: 3n,
         signature: fixture.artifact.signature,
         providerId: 'primary',
+        lastValidBlockHeight: aboveSafeInteger,
       });
       await live.recordConfirmation(confirmationClaim, Object.freeze({
         payloadVersion: 1,

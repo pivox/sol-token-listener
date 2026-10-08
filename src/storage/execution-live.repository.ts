@@ -54,6 +54,7 @@ import type {
   ExecutionDeadlineExitResultV1,
   ExecutionEarlyExitResultV1,
   ExecutionReExitResultV1,
+  ExecutionLiveConfirmationExpiryV1,
   ExecutionLiveConfirmationV1,
   ExecutionLiveConfirmationWorkV1,
   ExecutionLiveArtifactReferenceV1,
@@ -1151,6 +1152,8 @@ export class PostgresExecutionLiveRepository {
         attempt.intent_id AS attempt_intent_id,attempt.attempt_number,
         attempt.status AS attempt_status,attempt.provider_id AS attempt_provider_id,
         attempt.reconciliation_signature,
+        attempt.reconciliation_last_valid_block_height::TEXT
+          AS reconciliation_last_valid_block_height,
         transaction.artifact_id,transaction.intent_id AS artifact_intent_id,
         transaction.attempt_number AS artifact_attempt_number,
         transaction.generation_id,transaction.provider_id AS artifact_provider_id,
@@ -1171,7 +1174,8 @@ export class PostgresExecutionLiveRepository {
         FOR UPDATE OF intent,attempt,transaction`, [claim.intent.id])), [
         'intent_id', 'intent_status', 'intent_revision', 'attempt_count', 'lease_owner',
         'lease_token', 'lease_expires_at_ms', 'attempt_intent_id', 'attempt_number',
-        'attempt_status', 'attempt_provider_id', 'reconciliation_signature', 'artifact_id',
+        'attempt_status', 'attempt_provider_id', 'reconciliation_signature',
+        'reconciliation_last_valid_block_height', 'artifact_id',
         'artifact_intent_id', 'artifact_attempt_number', 'generation_id',
         'artifact_provider_id', 'artifact_reservation_id', 'artifact_message_hash',
         'artifact_quote_observed_at_ms', 'artifact_quote_expires_at_ms',
@@ -1200,6 +1204,7 @@ export class PostgresExecutionLiveRepository {
         expectedRevision: unsignedBigint(row.artifact_revision),
         signature,
         providerId,
+        lastValidBlockHeight: unsignedBigint(row.reconciliation_last_valid_block_height),
       });
     });
   }
@@ -1418,6 +1423,74 @@ export class PostgresExecutionLiveRepository {
       await insertLiveStateEvent(
         client, artifact, previousState, 'CONFIRMED',
         'CONFIRMATION_OBSERVED', confirmation.observedAtMs,
+      );
+      return artifact;
+    });
+  }
+
+  /**
+   * A SUBMITTED transaction never observed once the finalized block height passed the attempt's
+   * last valid block height can no longer land. It leaves the confirmation lane for the
+   * reconciliation lane: artifact `ACCEPTED -> AMBIGUOUS`, intent
+   * `SUBMITTED -> UNKNOWN_REQUIRES_RECONCILIATION` (reason `RECONCILIATION_REQUIRED`), lease
+   * released. The height is re-checked against the durable attempt expectation here.
+   */
+  public async recordConfirmationExpiry(
+    claimValue: ClaimedExecutionIntent,
+    expiry: ExecutionLiveConfirmationExpiryV1,
+  ): Promise<ExecutionLiveArtifactReferenceV1> {
+    const claim = claimFrom(claimValue);
+    validateConfirmationExpiry(expiry);
+    return this.transaction(async (client) => {
+      await lockWorkerTrackingMints(client, [claim.intent.mint]);
+      const identity = await artifactIdentity(client, expiry.artifactId);
+      await lockGeneration(client, identity.generationId);
+      const row = await findArtifactReference(client, expiry.artifactId, true);
+      const databaseNowMs = await freshDatabaseNow(client);
+      if (row?.intent_id !== claim.intent.id
+        || row.state !== 'ACCEPTED' || row.intent_status !== 'SUBMITTED'
+        || unsignedBigint(row.state_revision) !== expiry.expectedRevision
+        || row.signature !== expiry.signature
+        || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
+        || row.lease_expires_at_ms === null
+        || timestampText(row.lease_expires_at_ms) <= databaseNowMs) {
+        throw failure('LEASE_LOST');
+      }
+      const artifact = artifactReferenceFromRow(row);
+      const attempt = exactRow(singleRow(await client.query(`SELECT status,
+        reconciliation_last_valid_block_height::TEXT AS last_valid_block_height
+        FROM execution_attempts WHERE intent_id=$1 AND attempt_number=$2::INTEGER
+        FOR UPDATE`, [artifact.intentId, artifact.attemptNumber])), [
+        'status', 'last_valid_block_height',
+      ] as const);
+      if (attempt.status !== 'STARTED'
+        || expiry.finalizedBlockHeight <= unsignedBigint(attempt.last_valid_block_height)) {
+        throw failure('CONFLICT');
+      }
+      const updated = await client.query(`UPDATE execution_signed_transactions SET
+        state='AMBIGUOUS',state_revision=$2::BIGINT
+        WHERE artifact_id=$1 AND state='ACCEPTED' AND state_revision=$3::BIGINT`, [
+        artifact.artifactId, (expiry.expectedRevision + 1n).toString(),
+        expiry.expectedRevision.toString(),
+      ]);
+      if (updated.rowCount !== 1) throw failure('CONFLICT');
+      await insertLiveStateEvent(
+        client, artifact, 'ACCEPTED', 'AMBIGUOUS', 'RECONCILIATION_REQUIRED',
+        expiry.observedAtMs,
+      );
+      const intent = await client.query(`UPDATE execution_intents SET
+        status='UNKNOWN_REQUIRES_RECONCILIATION',
+        state_revision=state_revision+1,last_reason_code='RECONCILIATION_REQUIRED',
+        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+        updated_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE id=$1 AND status='SUBMITTED' AND lease_owner=$2 AND lease_token=$3::UUID
+          AND lease_expires_at > statement_timestamp()`, [
+        artifact.intentId, claim.leaseOwner, claim.leaseToken,
+      ]);
+      if (intent.rowCount !== 1) throw failure('LEASE_LOST');
+      await insertStandardIntentTransition(
+        client, artifact, 'SUBMITTED', 'UNKNOWN_REQUIRES_RECONCILIATION',
+        'RECONCILIATION_REQUIRED', expiry.observedAtMs,
       );
       return artifact;
     });
@@ -2403,6 +2476,50 @@ async function abandonRevokedAttempt(
     WHERE intent_id=$1 AND attempt_number=$2 AND status='STARTED'`, [
     artifact.intentId, artifact.attemptNumber, revokedAtMs,
   ]);
+}
+
+/**
+ * A BUY proved without effect never opens a position, so its LOCKED armament would otherwise
+ * stay the generation's active armament forever (K=1) and block every further arming. It is
+ * terminalised like a pre-submission revocation; its buy stays counted. An armament already
+ * terminal is left as it is.
+ */
+async function revokeArmamentWithoutEffect(
+  client: ExecutionRiskClient,
+  armamentId: string,
+  generationId: string,
+  occurredAtMs: number,
+): Promise<void> {
+  // Keyed by the primary key only: the recovery role may not read armament.generation_id, and
+  // the artifact -> armament generation binding is already enforced by the 036 insert guard.
+  const row = exactRow(singleRow(await client.query(`SELECT state,
+    state_revision::TEXT AS revision FROM execution_activation_armaments
+    WHERE armament_id=$1 FOR UPDATE`, [armamentId])), [
+    'state', 'revision',
+  ] as const);
+  if (row.state === 'CONSUMED' || row.state === 'REVOKED' || row.state === 'EXPIRED') return;
+  if (row.state !== 'LOCKED') throw failure('CONFLICT');
+  const revision = unsignedBigint(row.revision);
+  const eventFingerprint = hash([
+    'execution-activation-event-v1', armamentId, 'LOCKED', 'REVOKED',
+    'ARMAMENT_REVOKED', occurredAtMs,
+  ]);
+  const activation = await client.query(`INSERT INTO execution_activation_events (
+    event_id,payload_version,event_fingerprint,armament_id,generation_id,
+    previous_state,next_state,reason_code,occurred_at
+  ) VALUES ($1,1,$2,$3,$4,'LOCKED','REVOKED','ARMAMENT_REVOKED',
+    TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_activation_event_${eventFingerprint}`, eventFingerprint,
+    armamentId, generationId, occurredAtMs,
+  ]);
+  const armament = await client.query(`UPDATE execution_activation_armaments SET
+    state='REVOKED',state_revision=$2::BIGINT,
+    terminal_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+    purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond')
+    WHERE armament_id=$1 AND state='LOCKED' AND state_revision=$4::BIGINT`, [
+    armamentId, (revision + 1n).toString(), occurredAtMs, revision.toString(),
+  ]);
+  if (activation.rowCount !== 1 || armament.rowCount !== 1) throw failure('CONFLICT');
 }
 
 async function insertRevokedActivationEvent(
@@ -4398,6 +4515,14 @@ function validateConfirmation(confirmation: ExecutionLiveConfirmationV1): void {
     || !validTimestamp(confirmation.observedAtMs)) throw failure('INVALID_INPUT');
 }
 
+function validateConfirmationExpiry(expiry: ExecutionLiveConfirmationExpiryV1): void {
+  if (!ARTIFACT_ID.test(expiry.artifactId)
+    || typeof expiry.expectedRevision !== 'bigint' || expiry.expectedRevision < 1n
+    || typeof expiry.signature !== 'string' || expiry.signature.length < 64
+    || !unsigned(expiry.finalizedBlockHeight)
+    || !validTimestamp(expiry.observedAtMs)) throw failure('INVALID_INPUT');
+}
+
 async function insertLiveStateEvent(
   client: DatabaseClient,
   artifact: ExecutionLiveArtifactReferenceV1,
@@ -4551,6 +4676,9 @@ async function applyLiveReconciliation(
       client, artifact, 'AMBIGUOUS', 'RECONCILED',
       'RECONCILIATION_PROVED_NO_EFFECT', finalizedAtMs,
     );
+    if (artifact.side === 'BUY' && artifact.armamentId !== null) {
+      await revokeArmamentWithoutEffect(client, artifact.armamentId, artifact.generationId, finalizedAtMs);
+    }
     return Object.freeze({ artifact, position: null, exitAuthorization: null });
   }
   if (evidence.result !== 'MATCHED') {

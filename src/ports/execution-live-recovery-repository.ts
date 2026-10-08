@@ -4,6 +4,7 @@ import type {
   ExecutionIntentRepository,
 } from './execution-intent-repository.js';
 import type {
+  ExecutionLiveConfirmationExpiryV1,
   ExecutionLiveConfirmationV1,
   ExecutionLiveRepository,
 } from './execution-live-repository.js';
@@ -31,6 +32,10 @@ export interface ExecutionLiveRecoveryRepository {
   readonly recordConfirmation: (
     claim: ClaimedExecutionIntent,
     confirmation: ExecutionLiveConfirmationV1,
+  ) => Promise<unknown>;
+  readonly recordConfirmationExpiry: (
+    claim: ClaimedExecutionIntent,
+    expiry: ExecutionLiveConfirmationExpiryV1,
   ) => Promise<unknown>;
   readonly readReconciliationWork: ExecutionLiveRepository['readReconciliationWork'];
   readonly commitReconciliation: (
@@ -67,6 +72,7 @@ export function createExecutionLiveRecoveryRepository(
   source: Pick<ExecutionLiveRepository,
     | 'readConfirmationWork'
     | 'recordConfirmation'
+    | 'recordConfirmationExpiry'
     | 'readReconciliationWork'
     | 'commitReconciliation'
     | 'createNextDeadlineExitIntent'
@@ -77,6 +83,7 @@ export function createExecutionLiveRecoveryRepository(
   return exactFacade({
     readConfirmationWork: source.readConfirmationWork.bind(source),
     recordConfirmation: source.recordConfirmation.bind(source),
+    recordConfirmationExpiry: source.recordConfirmationExpiry.bind(source),
     readReconciliationWork: source.readReconciliationWork.bind(source),
     commitReconciliation: source.commitReconciliation.bind(source),
     createNextDeadlineExitIntent: source.createNextDeadlineExitIntent.bind(source),
