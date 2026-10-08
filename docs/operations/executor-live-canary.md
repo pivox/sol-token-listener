@@ -988,6 +988,9 @@ le BUY inchangé ; H2a vend à l'échéance (`maximum_holding_ms`). Plan et déc
    - `npm run live:envelope -- revoke --envelope-id=…` arrête l'armement et révoque un
      armement ARMED (pas encore LOCKED) ;
    - `live:kill-switch --mode=entry-stop` arrête la signature des BUY ; `hard-stop` arrête aussi les SELL ;
+   - un armement `ARMED` qui expire sans BUY (H2b absent ou bail non pris avant le TTL de
+     l'intent) est terminalisé `EXPIRED` par le tick auto-arm suivant et sa réservation
+     d'exposition libérée ; le `buys_armed` de l'enveloppe reste consommé ;
    - les positions ouvertes sont vendues à l'échéance.
 6. Surveiller avec `npm run live:envelope -- show` et `npm run live:status`.
 7. Le démon auto-arm doit rester actif tant qu'une position est ouverte (rafraîchissement du

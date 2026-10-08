@@ -1021,7 +1021,7 @@ puis :
 | D6 | Démarrer le listener (B25) | `creates-only`, quotes fast-entry à chaque create, `entry_decisions` BUY/REJECTED, intents `fast-entry-v1` | READ-ONLY-RPC |
 | D7 | Logs auto-arm, puis requête SQL ci-dessous | tick `ARMED` : wallet observé, report du snapshot fournisseur, admission risque, triggers 065, réservation | NO-NETWORK |
 | D8 | Comparer les colonnes runtime de l'armement avec les valeurs de `live.env` | les 8 valeurs runtime sont identiques, sinon H2b ne prendrait jamais l'intent | NO-NETWORK |
-| D9 | Attendre l'expiration de l'armement (environ 2 min, celle de l'intent), puis le second `ARMED` ; l'enveloppe passe `EXHAUSTED` | transitions `ACTIVE_ARMAMENT` → expiration → réarmement → `CAPACITY` | NO-NETWORK |
+| D9 | Attendre l'expiration de l'armement (environ 2 min, celle de l'intent), puis le second `ARMED` ; l'enveloppe passe `EXHAUSTED` | transitions `ACTIVE_ARMAMENT` → expiration → réarmement → `CAPACITY`. Un armement qui expire sans BUY est terminalisé `EXPIRED` par le tick auto-arm suivant (`expireEnvelopes`), sa réservation d'exposition libérée (`open_positions` à 0) ; le `buys_armed` qu'il a consommé reste compté | NO-NETWORK |
 | D10 | `live:envelope -- revoke --envelope-id=<id>` (lancé plus tôt, pendant un armement `ARMED`) | `armamentRevoked: true`, état `REVOKED` | NO-NETWORK |
 | D11 | `live:kill-switch --mode=entry-stop`, puis `live:status` | `ENTRY_STOP` | NO-NETWORK |
 | D12 | `fast-path:report --format=json` | entonnoir créations → décisions → intents → armés (soumis = 0), latences create → décision → armement, 429 | NO-NETWORK |

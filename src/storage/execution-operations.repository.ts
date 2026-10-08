@@ -719,12 +719,18 @@ export class PostgresExecutionOperationsRepository implements
     });
   }
 
+  /**
+   * Expires the ACTIVE envelope past valid_until and the ARMED armament past expires_at
+   * (nobody claimed it: its exposure reservation is released, so the envelope can re-arm;
+   * its buy stays counted). A LOCKED armament belongs to H2b and is never touched here.
+   */
   public async expireEnvelopes(generationId: string): Promise<ExecutionEnvelopeExpiryV1> {
     const parsed = generationIdFrom(generationId);
     return this.transaction(async (client) => {
       await lockGeneration(client, parsed);
       const nowMs = await databaseNowMs(client);
       const expiredCount = await expireActiveEnvelopes(client, parsed);
+      await terminalizeActiveArmament(client, parsed, 'EXPIRED', true);
       return Object.freeze({ payloadVersion: 1, expiredCount, databaseNowMs: nowMs });
     });
   }

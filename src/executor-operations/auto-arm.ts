@@ -85,8 +85,9 @@ export function createAutoArmState(): AutoArmState {
 }
 
 /**
- * One tick: expire envelopes, read one context, carry the provider snapshot forward when the
- * envelope position needs it, otherwise arm the oldest eligible fast-entry intent (K=1).
+ * One tick: expire the envelope and an unclaimed armament past their deadlines, read one
+ * context, carry the provider snapshot forward when the envelope position needs it, otherwise
+ * arm the oldest eligible fast-entry intent (K=1).
  * Nothing here signs or sends: H2b executes the armed intent.
  */
 export async function runAutoArmTick(
