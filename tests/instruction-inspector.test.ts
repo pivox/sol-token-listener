@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   getAssociatedTokenAddressSync,
   NATIVE_MINT,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
@@ -36,7 +37,9 @@ void test('inspects a real canonical Pump.fun SELL plan into fresh gateway input
   const inspected = inspectUnsignedBuildPlan(plan);
 
   assert.equal(inspected.feePayer, input.user);
-  assert.equal(inspected.instructions.length, 1);
+  assert.equal(inspected.instructions.length, 2);
+  assert.equal(inspected.instructions[0]?.programId, PUMP_PROGRAM_ID.toBase58());
+  assert.equal(inspected.instructions[1]?.programId, TOKEN_PROGRAM_ID.toBase58());
   assert.deepEqual(inspected.instructions, plan.instructions);
   assert.deepEqual(inspected.identity, plan.identity);
   assert.deepEqual(inspected.amounts, plan.amounts);
@@ -44,12 +47,118 @@ void test('inspects a real canonical Pump.fun SELL plan into fresh gateway input
   assert.throws(() => { (inspected.identity as { mint: string }).mint = key(250); }, TypeError);
 });
 
+void test('requires the exact base ATA close after a Pump.fun SELL and binds it to the base token program', async () => {
+  const plan = await buildPumpFunPlan(request());
+  const sell = plan.instructions[0];
+  const close = plan.instructions[1];
+  assert.ok(sell);
+  assert.ok(close);
+  assert.equal(closeBaseAtaOf(plan), true);
+  assert.equal(close.programId, TOKEN_PROGRAM_ID.toBase58());
+  assert.equal(close.dataBase64, Buffer.from([9]).toString('base64'));
+  const withClose = (mutated: typeof close): unknown => deepFreeze({ ...plan, instructions: [sell, mutated] });
+  const meta = (index: number, patch: Partial<(typeof close.accounts)[number]>): typeof close => ({
+    ...close,
+    accounts: close.accounts.map((account, candidate) => (candidate === index ? { ...account, ...patch } : account)),
+  });
+  const cases: unknown[] = [
+    // No close at all, close before the trade, or a duplicated close.
+    deepFreeze({ ...plan, instructions: [sell] }),
+    deepFreeze({ ...plan, instructions: [close, sell] }),
+    deepFreeze({ ...plan, instructions: [sell, close, close] }),
+    // Wrong program for an SPL Token mint.
+    withClose({ ...close, programId: TOKEN_2022_PROGRAM_ID.toBase58() }),
+    withClose({ ...close, programId: PUMP_PROGRAM_ID.toBase58() }),
+    // Wrong instruction byte (CloseAccount is exactly [9]).
+    withClose({ ...close, dataBase64: Buffer.from([8]).toString('base64') }),
+    withClose({ ...close, dataBase64: Buffer.from([9, 0]).toString('base64') }),
+    // Wrong account to close, destination, or owner.
+    withClose(meta(0, { address: key(240) })),
+    withClose(meta(0, { address: getAssociatedTokenAddressSync(
+      NATIVE_MINT, new PublicKey(plan.feePayer), true, TOKEN_PROGRAM_ID,
+    ).toBase58() })),
+    withClose(meta(1, { address: key(241) })),
+    withClose(meta(2, { address: key(242) })),
+    // Privilege mutations: owner must sign, destination and ATA must be writable.
+    withClose(meta(2, { isSigner: false })),
+    withClose(meta(0, { isSigner: true })),
+    withClose(meta(1, { isSigner: true })),
+    withClose(meta(0, { isWritable: false })),
+    withClose(meta(1, { isWritable: false })),
+    withClose(meta(2, { isWritable: true })),
+    withClose({ ...close, accounts: close.accounts.slice(0, 2) }),
+    // The close is only permitted when the evidence says the balance was exact.
+    deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, closeBaseAta: false } }),
+    deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, closeBaseAta: 'true' } }),
+  ];
+  for (const candidate of cases) rejects(candidate);
+  assert.deepEqual(inspectUnsignedBuildPlan(plan).instructions, plan.instructions);
+});
+
+void test('keeps a dust-leaving Pump.fun SELL at one instruction and binds the absent close to its evidence', async () => {
+  const base = request();
+  const input = deepFreeze({
+    ...base,
+    userBaseTokenAccount: { ...base.userBaseTokenAccount, closeBaseAta: false },
+  }) as PumpFunBuildRequestV1;
+  const plan = await buildPumpFunPlan(input);
+  const sell = plan.instructions[0];
+  assert.ok(sell);
+  assert.equal(plan.instructions.length, 1);
+  assert.equal(closeBaseAtaOf(plan), false);
+  const inspected = inspectUnsignedBuildPlan(plan);
+  assert.equal(inspected.instructions.length, 1);
+  assert.equal(inspected.closesUserBaseAta, false);
+  assert.equal(inspectUnsignedBuildPlan(await buildPumpFunPlan(base)).closesUserBaseAta, true);
+
+  const exact = await buildPumpFunPlan(base);
+  const close = exact.instructions[1];
+  assert.ok(close);
+  const cases: unknown[] = [
+    // Evidence claims an exact balance but the close is missing.
+    deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, closeBaseAta: true } }),
+    // A close appended to a plan whose evidence did not permit it.
+    deepFreeze({ ...plan, instructions: [sell, close] }),
+  ];
+  for (const candidate of cases) rejects(candidate);
+});
+
+void test('accepts the Token-2022 base ATA close for a Pump.fun SELL only with the Token-2022 program', async () => {
+  const base = request();
+  const input = deepFreeze({
+    ...base,
+    quote: { ...base.quote, baseTokenProgram: 'TOKEN_2022' as const },
+    userBaseTokenAccount: {
+      address: getAssociatedTokenAddressSync(
+        new PublicKey(base.quote.mint), new PublicKey(base.user), true, TOKEN_2022_PROGRAM_ID,
+      ).toBase58(),
+      exists: true,
+      closeBaseAta: true,
+    },
+  }) as PumpFunBuildRequestV1;
+  const plan = await buildPumpFunPlan(input);
+  const sell = plan.instructions[0];
+  const close = plan.instructions[1];
+  assert.ok(sell);
+  assert.ok(close);
+  assert.equal(plan.identity.baseTokenProgram, 'TOKEN_2022');
+  assert.equal(close.programId, TOKEN_2022_PROGRAM_ID.toBase58());
+  assert.equal(close.accounts[0]?.address, input.userBaseTokenAccount.address);
+
+  const inspected = inspectUnsignedBuildPlan(plan);
+  assert.equal(inspected.instructions.length, 2);
+  assert.deepEqual(inspected.instructions, plan.instructions);
+
+  rejects(deepFreeze({ ...plan, instructions: [sell, { ...close, programId: TOKEN_PROGRAM_ID.toBase58() }] }));
+  rejects(deepFreeze({ ...plan, instructions: [sell] }));
+});
+
 void test('retains the exact idempotent base-ATA setup for a Pump.fun BUY', async () => {
   const base = request();
   const input = deepFreeze({
     ...base,
     quote: { ...base.quote, side: 'BUY' as const },
-    userBaseTokenAccount: { ...base.userBaseTokenAccount, exists: false },
+    userBaseTokenAccount: { ...base.userBaseTokenAccount, exists: false, closeBaseAta: false },
   }) as PumpFunBuildRequestV1;
   const plan = await buildPumpFunPlan(input);
   const inspected = inspectUnsignedBuildPlan(plan);
@@ -64,7 +173,7 @@ void test('binds Pump.fun policy flags, snapshot and addresses to the exact inst
     ...base,
     quote: { ...base.quote, side: 'BUY' as const },
     curve: { ...base.curve, isMayhemMode: true },
-    userBaseTokenAccount: { ...base.userBaseTokenAccount, exists: false },
+    userBaseTokenAccount: { ...base.userBaseTokenAccount, exists: false, closeBaseAta: false },
   }) as PumpFunBuildRequestV1;
   const plan = await buildPumpFunPlan(mayhemInput);
   assert.equal(inspectUnsignedBuildPlan(plan).instructions.length, 2);
@@ -82,6 +191,7 @@ void test('binds Pump.fun policy flags, snapshot and addresses to the exact inst
     deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, isMayhemMode: false } }),
     deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, snapshotFingerprint: 'c'.repeat(64) } }),
     deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, userBaseAtaExisted: true } }),
+    deepFreeze({ ...plan, policyEvidence: { ...plan.policyEvidence, closeBaseAta: true } }),
     deepFreeze({ ...plan, instructions: plan.instructions.slice(1) }),
     deepFreeze({
       ...plan,
@@ -269,6 +379,7 @@ function request(): PumpFunBuildRequestV1 {
         new PublicKey(mint), new PublicKey(user), true, TOKEN_PROGRAM_ID,
       ).toBase58(),
       exists: true,
+      closeBaseAta: true,
     }),
     recipients: Object.freeze({
       feeRecipient: key(100), feeRecipients: frozenKeys(101, 7),
@@ -276,6 +387,11 @@ function request(): PumpFunBuildRequestV1 {
       buybackFeeRecipients: frozenKeys(120, 8),
     }),
   });
+}
+
+function closeBaseAtaOf(plan: Awaited<ReturnType<typeof buildPumpFunPlan>>): boolean {
+  assert.equal(plan.policyEvidence.venue, 'PUMP_FUN');
+  return plan.policyEvidence.venue === 'PUMP_FUN' && plan.policyEvidence.closeBaseAta;
 }
 
 function key(seed: number): string {

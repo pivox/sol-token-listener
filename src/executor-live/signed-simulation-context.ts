@@ -312,7 +312,7 @@ function envelopeTrade(
     && (instructions.length === 1 || instructions.length === 2)) {
     index = instructions.length - 1;
   } else if (artifact.effectiveVenue === 'PUMP_FUN' && artifact.side === 'SELL'
-    && instructions.length === 1) {
+    && (instructions.length === 1 || instructions.length === 2)) {
     index = 0;
   } else if (artifact.effectiveVenue === 'PUMP_SWAP' && artifact.side === 'SELL'
     && instructions.length >= 2 && instructions.length <= 4) {
@@ -573,6 +573,13 @@ function validateEnvelope(
           wallet, baseAta, wallet, mint, baseProgram,
         ));
       return Object.freeze([setup, tradeExpectation]);
+    }
+    if (instructions.length === 2) {
+      // Pump.fun SELL of the exact balance: the emptied base ATA is closed
+      // right after the trade. A SELL that leaves dust carries no close.
+      const baseClose = validateOfficialInstruction(instructions[1],
+        createCloseAccountInstruction(baseAta, wallet, wallet, [], baseProgram));
+      return Object.freeze([tradeExpectation, baseClose]);
     }
     return Object.freeze([tradeExpectation]);
   }

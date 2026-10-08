@@ -357,6 +357,7 @@ function simulationEvidence(
   inspected: Readonly<{
     readonly side: 'BUY' | 'SELL';
     readonly allowsMissingUserBaseAta: boolean;
+    readonly closesUserBaseAta: boolean;
     readonly identity: UnsignedBuildIdentityV1;
     readonly amounts: Readonly<{ readonly amountInRaw: bigint; readonly protectedAmountOutRaw: bigint }>;
   }>,
@@ -386,7 +387,10 @@ function simulationEvidence(
   const postPayer = requiredAccount(accounts, 0);
   const postBase = requiredAccount(accounts, 1);
   const postQuote = requiredAccount(accounts, 2);
-  if (prePayer === null || postPayer === null || postBase === null
+  // A SELL whose plan closes the emptied base ATA legitimately returns no
+  // post account; every other plan must leave the base ATA funded.
+  if (prePayer === null || postPayer === null
+    || (postBase === null && !inspected.closesUserBaseAta)
     || (preBase === null && !inspected.allowsMissingUserBaseAta)) rejectEvidence();
   validateSystemPayer(prePayer, requested.feePayer);
   validateSystemPayer(postPayer, requested.feePayer);
@@ -394,8 +398,11 @@ function simulationEvidence(
   if (payerDebit > limits.maxFeePayerLamportDebit) rejectEvidence();
   const baseProgram = inspected.identity.baseTokenProgram === 'SPL_TOKEN'
     ? TOKEN_PROGRAM_ID.toBase58() : TOKEN_2022_PROGRAM_ID.toBase58();
+  const preBaseAmount = tokenAmount(preBase, requested.base, inspected.identity.mint, requested.feePayer, baseProgram, false);
+  // The close is only sound when the SELL empties the account exactly.
+  if (inspected.closesUserBaseAta && preBaseAmount !== inspected.amounts.amountInRaw) rejectEvidence();
   const baseDelta = tokenAmount(postBase, requested.base, inspected.identity.mint, requested.feePayer, baseProgram, false)
-    - tokenAmount(preBase, requested.base, inspected.identity.mint, requested.feePayer, baseProgram, false);
+    - preBaseAmount;
   // SOL wealth includes the payer and every user-owned account which can be
   // closed by the allowed plan. This cancels ATA rent on a BUY creation and a
   // terminal WSOL close, rather than misclassifying recoverable rent as flow.

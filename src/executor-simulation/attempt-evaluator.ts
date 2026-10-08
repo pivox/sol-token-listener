@@ -996,6 +996,11 @@ function pumpFunBuildRequest(
     userBaseTokenAccount: Object.freeze({
       address: baseAddress,
       exists: baseAccount !== null && baseAccount !== undefined,
+      // Close the base ATA only when the SELL empties it exactly: a close on
+      // a non-zero balance fails the whole transaction and would trap the exit
+      // behind any dust (including dust sent by a third party).
+      closeBaseAta: quote.side === 'SELL' && baseAccount !== null && baseAccount !== undefined
+        && tokenAmount(baseAccount) === quote.amountInRaw,
     }),
     recipients: Object.freeze({
       feeRecipient: state.global.feeRecipient.toBase58(),

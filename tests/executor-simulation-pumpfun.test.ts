@@ -176,24 +176,85 @@ void test('builds exact official SELL V2 arguments and rejects a missing base AT
       protectedAmountOutRaw: 9_007_199_254_740_993n,
     }),
     curve: curve('TOKEN_2022'),
-    userBaseTokenAccount: userAta('TOKEN_2022', true),
+    userBaseTokenAccount: userAta('TOKEN_2022', true, true),
   });
   const plan = await buildPumpFunPlan(input);
   const swap = plan.instructions[0];
+  const close = plan.instructions[1];
   assert.ok(swap);
-  assert.equal(plan.instructions.length, 1);
+  assert.ok(close);
+  assert.equal(plan.instructions.length, 2);
   assert.equal(swap.accounts.length, 26);
   assert.equal(swap.accounts[3]?.address, TOKEN_2022_PROGRAM_ID.toBase58());
   const data = Buffer.from(swap.dataBase64, 'base64');
   assert.equal(data.toString('hex', 0, 8), SELL_DISCRIMINATOR);
   assert.equal(data.readBigUInt64LE(8), input.quote.amountInRaw);
   assert.equal(data.readBigUInt64LE(16), input.quote.protectedAmountOutRaw);
+  assert.deepEqual(close, expectedBaseAtaClose(input, TOKEN_2022_PROGRAM_ID));
+  assert.equal(closeBaseAtaOf(plan), true);
 
-  await rejectsPolicy(request({
-    quote: quote('SELL', '2'.repeat(64), 'TOKEN_2022'),
-    curve: curve('TOKEN_2022'),
-    userBaseTokenAccount: userAta('TOKEN_2022', false),
+  for (const closeBaseAta of [false, true]) {
+    await rejectsPolicy(request({
+      quote: quote('SELL', '2'.repeat(64), 'TOKEN_2022'),
+      curve: curve('TOKEN_2022'),
+      userBaseTokenAccount: userAta('TOKEN_2022', false, closeBaseAta),
+    }));
+  }
+});
+
+void test('appends exactly one canonical base ATA close to an exact-balance SELL for each token program and never to BUY', async () => {
+  const splSell = await buildPumpFunPlan(request({
+    quote: quote('SELL', '3'.repeat(64), 'SPL_TOKEN'),
+    userBaseTokenAccount: userAta('SPL_TOKEN', true, true),
   }));
+  assert.equal(splSell.instructions.length, 2);
+  assert.equal(splSell.instructions[0]?.programId, PUMP_PROGRAM_ID.toBase58());
+  const splClose = splSell.instructions[1];
+  assert.ok(splClose);
+  assert.equal(splClose.programId, TOKEN_PROGRAM_ID.toBase58());
+  assert.equal(splClose.dataBase64, Buffer.from([9]).toString('base64'));
+  assert.deepEqual(splClose.accounts, Object.freeze([
+    Object.freeze({ address: userAta('SPL_TOKEN', true).address, isSigner: false, isWritable: true }),
+    Object.freeze({ address: key(10), isSigner: false, isWritable: true }),
+    Object.freeze({ address: key(10), isSigner: true, isWritable: false }),
+  ]));
+  assertPlainDeepFrozen(splSell);
+
+  const token2022Sell = await buildPumpFunPlan(request({
+    quote: quote('SELL', '3'.repeat(64), 'TOKEN_2022'),
+    curve: curve('TOKEN_2022'),
+    userBaseTokenAccount: userAta('TOKEN_2022', true, true),
+  }));
+  assert.equal(token2022Sell.instructions.length, 2);
+  const token2022Close = token2022Sell.instructions[1];
+  assert.ok(token2022Close);
+  assert.equal(token2022Close.programId, TOKEN_2022_PROGRAM_ID.toBase58());
+  assert.equal(token2022Close.dataBase64, Buffer.from([9]).toString('base64'));
+  assert.deepEqual(
+    token2022Close.accounts.map(({ address }) => address),
+    [userAta('TOKEN_2022', true).address, key(10), key(10)],
+  );
+  assert.notEqual(splClose.accounts[0]?.address, token2022Close.accounts[0]?.address);
+
+  // A SELL that leaves dust in the account (balance != amountInRaw) keeps it open.
+  const dustSell = await buildPumpFunPlan(request({
+    quote: quote('SELL', '3'.repeat(64), 'SPL_TOKEN'),
+    userBaseTokenAccount: userAta('SPL_TOKEN', true, false),
+  }));
+  assert.equal(dustSell.instructions.length, 1);
+  assert.equal(dustSell.instructions[0]?.programId, PUMP_PROGRAM_ID.toBase58());
+  assert.equal(closeBaseAtaOf(dustSell), false);
+  assert.deepEqual(dustSell.instructions[0], splSell.instructions[0]);
+
+  for (const existed of [true, false]) {
+    const buy = await buildPumpFunPlan(request({ userBaseTokenAccount: userAta('SPL_TOKEN', existed) }));
+    assert.equal(buy.instructions.length, existed ? 1 : 2);
+    assert.equal(buy.instructions.at(-1)?.programId, PUMP_PROGRAM_ID.toBase58());
+    assert.equal(closeBaseAtaOf(buy), false);
+    assert.ok(buy.instructions.every(({ dataBase64 }) => dataBase64 !== Buffer.from([9]).toString('base64')));
+    // The close flag is a SELL-only fact; a BUY carrying it is a policy violation.
+    await rejectsPolicy(request({ userBaseTokenAccount: userAta('SPL_TOKEN', existed, true) }));
+  }
 });
 
 void test('requires the exact pinned Global recipient cardinalities', async () => {
@@ -278,6 +339,12 @@ void test('rejects noncanonical and hostile frozen build evidence with one sanit
     Object.freeze({ ...valid, curve: Object.freeze({ ...valid.curve, ownerProgramId: key(232) }) }),
     Object.freeze({ ...valid, user: '11111111111111111111111111111111' }),
     Object.freeze({ ...valid, userBaseTokenAccount: wrongAta }),
+    Object.freeze({ ...valid, userBaseTokenAccount: Object.freeze({
+      ...valid.userBaseTokenAccount, closeBaseAta: 'false',
+    }) }),
+    Object.freeze({ ...valid, userBaseTokenAccount: Object.freeze({
+      address: valid.userBaseTokenAccount.address, exists: true,
+    }) }),
     Object.freeze({ ...valid, recipients: duplicateRecipients }),
     Object.freeze({ ...valid, recipients: Object.freeze({
       ...valid.recipients, buybackFeeRecipients: Object.freeze([]),
@@ -365,6 +432,7 @@ function curve(
 function userAta(
   baseTokenProgram: 'SPL_TOKEN' | 'TOKEN_2022',
   exists: boolean,
+  closeBaseAta = false,
 ): PumpFunBuildRequestV1['userBaseTokenAccount'] {
   const tokenProgram = baseTokenProgram === 'SPL_TOKEN'
     ? TOKEN_PROGRAM_ID
@@ -377,6 +445,28 @@ function userAta(
       tokenProgram,
     ).toBase58(),
     exists,
+    closeBaseAta,
+  });
+}
+
+function expectedBaseAtaClose(
+  input: PumpFunBuildRequestV1,
+  tokenProgram: PublicKey,
+): Readonly<{
+  readonly programId: string;
+  readonly accounts: readonly Readonly<{
+    readonly address: string; readonly isSigner: boolean; readonly isWritable: boolean;
+  }>[];
+  readonly dataBase64: string;
+}> {
+  return Object.freeze({
+    programId: tokenProgram.toBase58(),
+    accounts: Object.freeze([
+      Object.freeze({ address: input.userBaseTokenAccount.address, isSigner: false, isWritable: true }),
+      Object.freeze({ address: input.user, isSigner: false, isWritable: true }),
+      Object.freeze({ address: input.user, isSigner: true, isWritable: false }),
+    ]),
+    dataBase64: Buffer.from([9]).toString('base64'),
   });
 }
 
@@ -409,6 +499,11 @@ async function rejectsPolicy(value: unknown): Promise<void> {
       && error.code === 'BUILD_POLICY_REJECTED'
       && error.message === 'Pump.fun build policy rejected.',
   );
+}
+
+function closeBaseAtaOf(plan: Awaited<ReturnType<typeof buildPumpFunPlan>>): boolean {
+  assert.equal(plan.policyEvidence.venue, 'PUMP_FUN');
+  return plan.policyEvidence.venue === 'PUMP_FUN' && plan.policyEvidence.closeBaseAta;
 }
 
 function key(seed: number): string {

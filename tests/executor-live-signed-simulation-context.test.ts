@@ -74,6 +74,7 @@ void test('accepts every exact builder envelope and its permitted optional setup
       ['pumpfun-buy-v2-plan.json', []],
       ['pumpfun-buy-v2-plan.json', [0]],
       ['pumpfun-sell-v2-plan.json', []],
+      ['pumpfun-sell-v2-plan.json', [1]],
       ['pumpswap-sell-plan.json', []],
       ['pumpswap-sell-plan.json', [0]],
       ['pumpswap-sell-plan.json', [1]],
@@ -102,6 +103,38 @@ void test('rejects extra, unknown and out-of-order instructions with one stable 
         && error.name === 'SignedSimulationContextError'
         && error.message === 'Signed simulation recovery context is invalid.',
     );
+  }
+});
+
+void test('requires the exact base ATA close after a Pump.fun SELL trade', async () => {
+  const accepted = await signedFixture('pumpfun-sell-v2-plan.json');
+  assert.equal(accepted.plan.instructions.length, 2);
+  assert.equal(accepted.plan.instructions[1]?.programId, TOKEN_PROGRAM_ID.toBase58());
+  const context = createSignedSimulationRecoveryContext(accepted.input);
+  assert.deepEqual(context.accountAddresses, [
+    accepted.artifact.walletPublicKey, accepted.baseAta, accepted.quoteAta,
+  ]);
+
+  // A dust-leaving SELL carries no close: the bare trade is still a valid envelope.
+  const bare = await signedFixture('pumpfun-sell-v2-plan.json', { omittedInstructionIndexes: [1] });
+  assert.equal(
+    createSignedSimulationRecoveryContext(bare.input).snapshotSlot,
+    bare.unsignedSimulation.blockhashContextSlot,
+  );
+
+  const rejected = [
+    // Closing a different token account, or paying rent to someone else.
+    await signedFixture('pumpfun-sell-v2-plan.json', {
+      instructionMutations: [randomAddressMutation(1, 0)],
+    }),
+    await signedFixture('pumpfun-sell-v2-plan.json', {
+      instructionMutations: [randomAddressMutation(1, 1)],
+    }),
+    // The close must follow the trade, not precede it.
+    await signedFixture('pumpfun-sell-v2-plan.json', { reverseInstructions: true }),
+  ];
+  for (const fixture of rejected) {
+    assert.throws(() => createSignedSimulationRecoveryContext(fixture.input), isContextError);
   }
 });
 

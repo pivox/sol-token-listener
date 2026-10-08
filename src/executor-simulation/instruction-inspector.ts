@@ -82,6 +82,8 @@ export interface InspectedBuildPlanV1 {
   readonly feePayer: string;
   readonly expectedAccounts: readonly ExpectedBuildAccountV1[];
   readonly allowsMissingUserBaseAta: boolean;
+  /** Pump.fun SELL whose plan closes the emptied base ATA: its post account may be absent. */
+  readonly closesUserBaseAta: boolean;
   readonly allowsMissingUserQuoteAta: boolean;
   readonly requiresPumpSwapCashback: boolean;
   readonly requiresPumpSwapPoolV2: boolean;
@@ -98,6 +100,7 @@ type ValidatedPumpFunPolicyEvidenceV1 = Readonly<{
   readonly curveAddress: string;
   readonly creator: string;
   readonly userBaseAtaExisted: boolean;
+  readonly closeBaseAta: boolean;
   readonly feeSelection: BuildRecipientSelectionV1;
   readonly buybackSelection: BuildRecipientSelectionV1;
 }>;
@@ -145,6 +148,7 @@ export function inspectUnsignedBuildPlan(inputValue: UnsignedBuildPlanV1): Inspe
       feePayer: feePayer.toBase58(),
       expectedAccounts,
       allowsMissingUserBaseAta: evidence.venue === 'PUMP_FUN' && !evidence.userBaseAtaExisted,
+      closesUserBaseAta: evidence.venue === 'PUMP_FUN' && evidence.closeBaseAta,
       allowsMissingUserQuoteAta: evidence.venue === 'PUMP_FUN'
         ? true : !evidence.userQuoteAtaExisted,
       requiresPumpSwapCashback: evidence.venue === 'PUMP_SWAP' && evidence.isCashbackCoin,
@@ -186,11 +190,18 @@ function inspectPumpFun(
     || !userQuoteAta.equals(associatedTokenAddress(NATIVE_MINT, feePayer, TOKEN_PROGRAM_ID))) reject();
   validatePumpFunSelections(evidence, feePayer);
 
-  if (side === 'SELL' && !evidence.userBaseAtaExisted) reject();
+  if ((side === 'SELL' && !evidence.userBaseAtaExisted)
+    || (side === 'BUY' && evidence.closeBaseAta)) reject();
   const requiresAtaSetup = side === 'BUY' && !evidence.userBaseAtaExisted;
   const mainIndex = requiresAtaSetup ? 1 : 0;
-  if (instructions.length !== mainIndex + 1) reject();
+  // A SELL of the exact account balance closes the emptied base ATA right
+  // after the trade (rent recovery); any other SELL leaves it open.
+  const requiresBaseAtaClose = side === 'SELL' && evidence.closeBaseAta;
+  if (instructions.length !== mainIndex + 1 + Number(requiresBaseAtaClose)) reject();
   if (mainIndex === 1) validateAtaSetup(instructions[0], feePayer, userBaseAta, mint, baseProgram);
+  if (requiresBaseAtaClose) {
+    validateClose(requiredInstruction(instructions[mainIndex + 1]), feePayer, userBaseAta, baseProgram);
+  }
   const main = requiredInstruction(instructions[mainIndex]);
   const instructionDefinition = side === 'BUY' ? PUMP_INSTRUCTIONS.buy_v2 : PUMP_INSTRUCTIONS.sell_v2;
   const data = dataFrom(main);
@@ -337,7 +348,7 @@ function inspectPumpSwap(
   validatePumpSwapRemainingRoles(
     accounts.slice(21, -2), feePayer, mint, coinCreator, cashbackExpected, poolV2Expected,
   );
-  validateClose(close, feePayer, userQuoteAta);
+  validateClose(close, feePayer, userQuoteAta, TOKEN_PROGRAM_ID);
   validateUniqueFeePayerSigner(instructions, feePayer);
   return instructions;
 }
@@ -391,7 +402,7 @@ function policyEvidenceFrom(
   const shared = ['venue', 'snapshotSlot', 'snapshotFingerprint', 'isMayhemMode',
     'payloadVersion', 'feeSelection', 'buybackSelection'];
   const input = record(value, venue === 'PUMP_FUN'
-    ? [...shared, 'curveAddress', 'creator', 'userBaseAtaExisted']
+    ? [...shared, 'curveAddress', 'creator', 'userBaseAtaExisted', 'closeBaseAta']
     : [...shared, 'poolAddress', 'isCashbackCoin', 'coinCreator', 'requiresExtend', 'userQuoteAtaExisted']);
   if (input.payloadVersion !== 1 || input.venue !== venue || input.snapshotSlot !== identity.snapshotSlot
     || input.snapshotFingerprint !== identity.snapshotFingerprint
@@ -403,8 +414,8 @@ function policyEvidenceFrom(
   const feeSelection = requiredSelection(selections, 'FEE');
   const buybackSelection = requiredSelection(selections, 'BUYBACK_FEE');
   if (venue === 'PUMP_FUN') {
-    if (typeof input.userBaseAtaExisted !== 'boolean' || typeof input.curveAddress !== 'string'
-      || typeof input.creator !== 'string') reject();
+    if (typeof input.userBaseAtaExisted !== 'boolean' || typeof input.closeBaseAta !== 'boolean'
+      || typeof input.curveAddress !== 'string' || typeof input.creator !== 'string') reject();
     return Object.freeze({
       venue: 'PUMP_FUN', snapshotSlot: input.snapshotSlot,
       snapshotFingerprint: input.snapshotFingerprint,
@@ -412,6 +423,7 @@ function policyEvidenceFrom(
       curveAddress: publicKey(input.curveAddress, false).toBase58(),
       creator: publicKey(input.creator, false).toBase58(),
       userBaseAtaExisted: input.userBaseAtaExisted,
+      closeBaseAta: input.closeBaseAta,
       feeSelection, buybackSelection,
     });
   }
@@ -569,9 +581,9 @@ function validateExtend(instruction: NormalizedInstructionV1, payer: PublicKey, 
   ]);
 }
 
-function validateClose(instruction: NormalizedInstructionV1, payer: PublicKey, wsolAta: PublicKey): void {
-  if (instruction.programId !== TOKEN_PROGRAM_ID.toBase58() || !dataFrom(instruction).equals(Buffer.from([9]))) reject();
-  validateMetas(instruction.accounts, [[wsolAta, false, true], [payer, false, true], [payer, true, false]]);
+function validateClose(instruction: NormalizedInstructionV1, payer: PublicKey, ata: PublicKey, program: PublicKey): void {
+  if (instruction.programId !== program.toBase58() || !dataFrom(instruction).equals(Buffer.from([9]))) reject();
+  validateMetas(instruction.accounts, [[ata, false, true], [payer, false, true], [payer, true, false]]);
 }
 
 function validatePumpSwapRemainingRoles(

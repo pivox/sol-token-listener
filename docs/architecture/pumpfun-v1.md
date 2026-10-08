@@ -558,7 +558,11 @@ privée, keypair, wallet ou acquisition réflexive de signer n'entre dans le
 processus. Les seules préparations de comptes permises sont les créations ATA
 idempotentes attendues et inspectées. Le SELL PumpSwap WSOL accepte uniquement
 la branche SDK auditée, y compris son `CloseAccount` terminal exact ; tout autre
-wrap, unwrap, `SyncNative`, signer ou compte auxiliaire échoue fermé.
+wrap, unwrap, `SyncNative`, signer ou compte auxiliaire échoue fermé. Le SELL
+Pump.fun ajoute un `CloseAccount` exact de l'ATA base (rent rendu au wallet)
+uniquement lorsque la snapshot montre un solde strictement égal à `amountInRaw`
+(`closeBaseAta`) ; tout autre solde laisse l'ATA ouvert et le plan reste à une
+seule instruction.
 
 Une tentative crée une session RPC mono-provider. L'identifiant du provider est
 positionnel, le hash de genesis est comparé à la valeur vérifiée par l'opérateur

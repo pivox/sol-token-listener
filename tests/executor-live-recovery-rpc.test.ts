@@ -443,6 +443,27 @@ void test('requires every wallet token account of the mint to be unchanged and p
   }
 });
 
+void test('treats a wallet base ATA closed by a landed SELL as a zero post balance with no residual', async () => {
+  // Pre: the wallet ATA holds the whole position. Post: the ATA was closed, so
+  // getTransaction reports no post entry for it and the rent returned to the wallet.
+  const fixture = failedSellFixture({
+    err: null,
+    preBalances: [1_000_000, 2_039_280, 1],
+    postBalances: [3_134_280, 0, 1],
+    preTokenBalances: [tokenBalance(1, 'wallet', '500')],
+    postTokenBalances: [],
+  });
+  const deltas = await failedSellDeltas(fixture);
+  assert.deepEqual(deltas, {
+    confirmationStatus: 'FINALIZED', observedSlot: 500n,
+    feeLamports: 5_000n, walletLamportDelta: 2_134_280n,
+    baseDeltaRaw: -500n, quoteDeltaRaw: 2_139_280n,
+    unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: 2_000, finalizedAtMs: 2_000,
+    transactionFailed: false, baseTokenAccountsUnchanged: false,
+  });
+});
+
 void test('reports absent finalized history without inventing a transaction or deltas', async () => {
   const session = sessionFor([], ({ method }) => {
     if (method === 'getBlockHeight') return 1_001;

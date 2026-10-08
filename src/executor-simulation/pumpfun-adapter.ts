@@ -3,6 +3,7 @@ import { isProxy } from 'node:util/types';
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
+  createCloseAccountInstruction,
   getAssociatedTokenAddressSync,
   NATIVE_MINT,
   TOKEN_2022_PROGRAM_ID,
@@ -38,7 +39,7 @@ const CURVE_KEYS = Object.freeze([
   'mint', 'address', 'ownerProgramId', 'exists', 'complete', 'creator',
   'isMayhemMode',
 ] as const);
-const USER_ATA_KEYS = Object.freeze(['address', 'exists'] as const);
+const USER_ATA_KEYS = Object.freeze(['address', 'exists', 'closeBaseAta'] as const);
 const RECIPIENT_KEYS = Object.freeze([
   'feeRecipient', 'feeRecipients', 'reservedFeeRecipient',
   'reservedFeeRecipients', 'buybackFeeRecipients',
@@ -79,6 +80,13 @@ export interface PumpFunCurveBuildEvidenceV1 {
 export interface PumpFunUserBaseTokenAccountEvidenceV1 {
   readonly address: string;
   readonly exists: boolean;
+  /**
+   * SELL only: true when the account holds exactly amountInRaw, so the full
+   * exit empties it and the plan may close it to recover its rent. Any other
+   * balance keeps the account open (CloseAccount fails on a non-zero balance
+   * and would trap the exit). Always false for a BUY.
+   */
+  readonly closeBaseAta: boolean;
 }
 
 export interface PumpFunRecipientEvidenceV1 {
@@ -105,6 +113,7 @@ interface ValidatedPumpFunBuildRequest {
   readonly curve: PublicKey;
   readonly userBaseAta: PublicKey;
   readonly userBaseAtaExists: boolean;
+  readonly closeBaseAta: boolean;
   readonly isMayhemMode: boolean;
   readonly baseTokenProgram: PublicKey;
   readonly feeSelection: BuildRecipientSelectionV1;
@@ -159,6 +168,19 @@ export async function buildPumpFunPlan(
       ));
     }
     instructions.push(normalizeInstruction(instruction));
+    if (input.closeBaseAta) {
+      // The SELL exits exactly the account balance, so the base ATA is empty
+      // afterwards: close it in the same transaction to return its rent
+      // (paid by the BUY) to the wallet. The evaluator sets the flag only on
+      // an exact balance because CloseAccount fails on a non-zero one.
+      instructions.push(normalizeInstruction(createCloseAccountInstruction(
+        input.userBaseAta,
+        input.user,
+        input.user,
+        [],
+        input.baseTokenProgram,
+      )));
+    }
     return Object.freeze({
       payloadVersion: 1,
       venue: 'PUMP_FUN',
@@ -196,6 +218,7 @@ export async function buildPumpFunPlan(
         isMayhemMode: input.isMayhemMode,
         curveAddress: input.curve.toBase58(), creator: input.creator.toBase58(),
         userBaseAtaExisted: input.userBaseAtaExists,
+        closeBaseAta: input.closeBaseAta,
         feeSelection: input.feeSelection, buybackSelection: input.buybackSelection,
       }),
       instructions: Object.freeze(instructions),
@@ -223,7 +246,8 @@ function validateRequest(inputValue: unknown): ValidatedPumpFunBuildRequest {
     || typeof curveRecord.address !== 'string'
     || typeof curveRecord.creator !== 'string'
     || typeof ataRecord.address !== 'string'
-    || typeof ataRecord.exists !== 'boolean') throw policyError();
+    || typeof ataRecord.exists !== 'boolean'
+    || typeof ataRecord.closeBaseAta !== 'boolean') throw policyError();
 
   const user = publicKey(input.user, false);
   const mint = publicKey(quote.mint, false);
@@ -242,7 +266,8 @@ function validateRequest(inputValue: unknown): ValidatedPumpFunBuildRequest {
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
   if (!userBaseAta.equals(expectedAta)
-    || (quote.side === 'SELL' && !ataRecord.exists)) throw policyError();
+    || (quote.side === 'SELL' && !ataRecord.exists)
+    || (quote.side === 'BUY' && ataRecord.closeBaseAta)) throw policyError();
 
   const normalCandidates = recipientList(
     recipientRecord.feeRecipient,
@@ -287,6 +312,7 @@ function validateRequest(inputValue: unknown): ValidatedPumpFunBuildRequest {
     curve,
     userBaseAta,
     userBaseAtaExists: ataRecord.exists,
+    closeBaseAta: ataRecord.closeBaseAta,
     isMayhemMode: curveRecord.isMayhemMode,
     baseTokenProgram,
     feeSelection,
