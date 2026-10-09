@@ -307,8 +307,20 @@ révision, ses chemins officiels, son SHA-256 et son sous-ensemble généré.
 PumpSwap reste épinglé séparément à sa révision auditée précédente.
 
 `create_v2` accepte uniquement ses suffixes EOF officiels de 0, 1, 9 ou 10
-octets et exactement 0, 3 ou 4 comptes restants. Le quatrième compte doit être
-le PDA Pump `quote-control`. `CreateEvent` accepte ses suffixes historiques
+octets et exactement 0, 3, 4, 5 ou 8 comptes restants, positionnels selon
+l'IDL et `createV2QuoteRemainingAccounts` de `@pump-fun/pump-sdk` 4.0.0 : quote
+mint, ATA quote de la courbe, programme token quote, puis le PDA Pump
+`quote-control`, exigé comme quatrième compte. Le cinquième compte, exigé égal
+au PDA `bonding-curve` du quote mint Q, admet comme quote un coin pump que ni
+`Global` ni `quote-control` n'admettent ; une fois Q migré, les comptes six à
+huit sont son pool pump-amm canonique (index 0 sous le PDA Pump
+`pool-authority` de Q, coté dans le quote de Q, WSOL pour une courbe SOL) puis
+les vaults base et quote de ce pool. Seul le vault base, ATA de Q détenue par
+le pool, est re-dérivé : le PDA du pool et son vault quote dépendent du quote
+de Q, absent de l'instruction, et le programme les vérifie
+(`InvalidQuotePool`). Le programme ignore ces comptes quand `Global` ou
+`quote-control` admet déjà Q : `depth` vient donc du `CreateEvent`, jamais du
+nombre de comptes. `CreateEvent` accepte ses suffixes historiques
 officiels de 0, 8, 9 ou 10 octets ; les champs absents valent respectivement
 zéro, faux et zéro. Le dixième octet est `depth` (`u8`), ajouté par la mise à
 jour du programme au slot 454596459 et documenté par l'IDL de
@@ -342,7 +354,9 @@ aux instructions externes et internes et ne modifient aucune capacité
 d’exécution.
 
 Les fixtures mainnet minimisées et versionnées couvrent une création avec
-achat initial, une vente CPI, un achat V2 CPI, une migration V2 avec son
+achat initial, deux créations cotées dans un coin pump (courbe non migrée à
+cinq comptes restants ; coin migré à huit comptes restants, avec achat
+initial), une vente CPI, un achat V2 CPI, une migration V2 avec son
 `create_pool` canonique et une vente PumpSwap dont le quote mint n’est pas
 WSOL. Elles conservent les identifiants publics nécessaires à la preuve exacte,
 mais excluent endpoints, en-têtes, logs, signers et tableaux globaux de

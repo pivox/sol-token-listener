@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import {
+  getAssociatedTokenAddressSync,
+  NATIVE_MINT,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMP_INSTRUCTIONS } from '../src/launchpads/pumpfun/generated/pump-idl.js';
 import { decodePumpInstruction } from '../src/launchpads/pumpfun/instruction-decoder.js';
+import { bondingCurvePda } from '../src/launchpads/pumpfun/official-sdk.js';
 import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
+import { poolPda, pumpPoolAuthorityPda } from '../src/markets/pumpswap/official-sdk.js';
 import { loadPumpFixture, parsePumpFixture } from './helpers/pumpfun-fixture.js';
 
 void test('observe la création opaque finalisée et son achat initial multi-quote', async () => {
@@ -142,6 +150,80 @@ void test('valide le PDA quote-control et le créateur effectif holder-reward Ma
       new PublicKey(PUMP_PROGRAM_ID),
     )[0].toBase58(),
   );
+});
+
+void test('décode la création Mainnet cotée dans un coin pump non migré (cinq remaining accounts)', async () => {
+  const fixture = await loadPumpFixture('create-v2-pump-quote-curve-mainnet.json');
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const creation = decoded.creations[0];
+  const quoteMint = 'AAeVN8d7YSKaf1EDpaFgNVjvCuTYZopJu9pJXW8avamp';
+
+  assert.equal(
+    fixture.provenance.signature,
+    '3nd9NnqSjfJjh6W149rEitdW1LvDcpncw4mmReZjKDvzAgBsxje4bkkhGRg3vTAiYTewFZVGSVCwvQstYPRUNjUC',
+  );
+  assert.equal(fixture.provenance.slot, 454_797_478n);
+  assert.equal(fixture.provenance.transactionIndex, 746);
+  assert.equal(decoded.creations.length, 1);
+  assert.equal(decoded.trades.length, 0);
+  assert.ok(creation);
+  assert.equal(
+    creation.action.instruction.accounts.length,
+    PUMP_INSTRUCTIONS.create_v2.accounts.length + 5,
+  );
+  assert.equal(creation.action.wireEvidence, undefined);
+  assert.deepEqual(creation.quoteAsset, { mint: quoteMint, decimals: 6, tokenProgram: 'TOKEN_2022' });
+  assert.equal(creation.event.quoteMint, quoteMint);
+  assert.equal(creation.event.depth, 1);
+  assert.equal(creation.action.accounts.quote_control, '6z6GDdfb2AjR9ZhJmAUQ5cipJCVxQvLJhB2H8mCwTFBP');
+  assert.equal(creation.action.accounts.quote_bonding_curve, bondingCurvePda(quoteMint).toBase58());
+  assert.equal(creation.action.accounts.quote_bonding_curve, '2sirTTFugL6oxUSvV7ZESG9CHRTzbaS4k4VXAmSESGYQ');
+  assert.equal(Object.hasOwn(creation.action.accounts, 'quote_pool'), false);
+});
+
+void test('décode la création Mainnet cotée dans un coin pump migré et son achat initial (huit remaining accounts)', async () => {
+  const fixture = await loadPumpFixture('create-v2-pump-quote-pool-mainnet.json');
+  const decoded = decodePumpTransaction(fixture.transaction);
+  const creation = decoded.creations[0];
+  const trade = decoded.trades[0];
+  const quoteMint = 'NV2RYH954cTJ3ckFUpvfqaQXU4ARqqDH3562nFSpump';
+  // The migrated quote coin's canonical pump-amm pool: index 0 under its pump pool-authority PDA,
+  // quoted in WSOL like the SOL curve it graduated from.
+  const pool = poolPda(0, pumpPoolAuthorityPda(new PublicKey(quoteMint)), new PublicKey(quoteMint), NATIVE_MINT);
+
+  assert.equal(
+    fixture.provenance.signature,
+    '4MVxbMzFXnGoa3U9NH2xxB5DSPJWmh4pfyKUHXiPVafpcSjR1G2vnc4bcDzTPi6vztif7RSg6UsTEQdce2Dbk3Cd',
+  );
+  assert.equal(fixture.provenance.slot, 454_800_482n);
+  assert.equal(fixture.provenance.transactionIndex, 417);
+  assert.equal(fixture.transaction.version, 1);
+  assert.equal(decoded.creations.length, 1);
+  assert.equal(decoded.trades.length, 1);
+  assert.ok(creation);
+  assert.ok(trade);
+  assert.equal(
+    creation.action.instruction.accounts.length,
+    PUMP_INSTRUCTIONS.create_v2.accounts.length + 8,
+  );
+  assert.equal(creation.action.wireEvidence?.profile, 'CREATE_V2_OPAQUE_0001_V1');
+  assert.equal(creation.isHolderReward, true);
+  assert.deepEqual(creation.quoteAsset, { mint: quoteMint, decimals: 6, tokenProgram: 'TOKEN_2022' });
+  assert.equal(creation.event.depth, 1);
+  assert.equal(creation.action.accounts.quote_bonding_curve, bondingCurvePda(quoteMint).toBase58());
+  assert.equal(creation.action.accounts.quote_pool, pool.toBase58());
+  assert.equal(
+    creation.action.accounts.quote_pool_base_vault,
+    getAssociatedTokenAddressSync(new PublicKey(quoteMint), pool, true, TOKEN_2022_PROGRAM_ID).toBase58(),
+  );
+  assert.equal(
+    creation.action.accounts.quote_pool_quote_vault,
+    getAssociatedTokenAddressSync(NATIVE_MINT, pool, true, TOKEN_PROGRAM_ID).toBase58(),
+  );
+  assert.equal(trade.action.name, 'buy_exact_quote_in_v2');
+  assert.equal(trade.event.isBuy, true);
+  assert.equal(trade.event.mint, creation.event.mint);
+  assert.equal(trade.quoteAsset.mint, quoteMint);
 });
 
 void test('décode hors ligne une vente CPI avec stackHeight 3', async () => {

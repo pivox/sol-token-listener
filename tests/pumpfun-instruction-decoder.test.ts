@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
 import {
   PumpDecodingError,
@@ -25,6 +26,14 @@ const PUMP_PROGRAM =
 const CREATOR = new PublicKey(
   Uint8Array.from({ length: 32 }, (_unused, index) => index + 1),
 ).toBase58();
+const SPL_TOKEN = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const TOKEN_2022 = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const QUOTE_CONTROL = PublicKey.findProgramAddressSync(
+  [Buffer.from('quote-control')],
+  new PublicKey(PUMP_PROGRAM),
+)[0].toBase58();
+const PUMP_QUOTE_MINT = address(31);
+const PUMP_QUOTE_POOL = address(33);
 const VALUES: Record<PumpInstructionName, Readonly<Record<string, unknown>>> = {
   buy: {
     amount: 9_007_199_254_740_993n,
@@ -393,9 +402,9 @@ void test('refuse chaque taille de suffixe create_v2 non documentée', () => {
   }
 });
 
-void test('refuse les remaining account counts create_v2 hors 0, 3 et 4', () => {
+void test('refuse les remaining account counts create_v2 hors 0, 3, 4, 5 et 8', () => {
   const instruction = pumpInstruction('create_v2');
-  for (const count of [1, 2, 5]) {
+  for (const count of [1, 2]) {
     assert.throws(
       () => decodePumpInstruction({
         ...instruction,
@@ -405,6 +414,100 @@ void test('refuse les remaining account counts create_v2 hors 0, 3 et 4', () => 
         ],
       }),
       isPumpError('PUMP_ACCOUNT_MISSING'),
+    );
+  }
+  // Valid pump-coin quote shapes, truncated or extended, keep failing on their count alone.
+  for (const remaining of [
+    [...pumpQuoteRemaining(5), address(40)],
+    pumpQuoteRemaining(8).slice(0, 7),
+    [...pumpQuoteRemaining(8), address(40)],
+  ]) {
+    assertSameStrictFailure(
+      { ...instruction, accounts: [...instruction.accounts, ...remaining] },
+      'PUMP_ACCOUNT_MISSING',
+    );
+    assert.throws(
+      () => decodePumpInstruction({ ...instruction, accounts: [...instruction.accounts, ...remaining] }),
+      (error: unknown) => error instanceof PumpDecodingError
+        && error.retryable
+        && error.message.endsWith(`reçu ${remaining.length}.`),
+    );
+  }
+});
+
+void test('décode les cinq remaining accounts d’un quote coin pump non migré', () => {
+  const instruction = pumpInstruction('create_v2');
+  const remaining = pumpQuoteRemaining(5);
+  const decoded = decodePumpInstruction({
+    ...instruction,
+    accounts: [...instruction.accounts, ...remaining],
+  });
+
+  assert.ok(decoded);
+  assert.equal(decoded.accounts.quote_mint, remaining[0]);
+  assert.equal(decoded.accounts.associated_quote_bonding_curve, remaining[1]);
+  assert.equal(decoded.accounts.quote_token_program, remaining[2]);
+  assert.equal(decoded.accounts.quote_control, QUOTE_CONTROL);
+  assert.equal(
+    decoded.accounts.quote_bonding_curve,
+    pumpPda('bonding-curve', PUMP_QUOTE_MINT),
+  );
+  for (const absent of ['quote_pool', 'quote_pool_base_vault', 'quote_pool_quote_vault']) {
+    assert.equal(Object.hasOwn(decoded.accounts, absent), false);
+  }
+});
+
+void test('décode les huit remaining accounts d’un quote coin pump migré', () => {
+  const instruction = pumpInstruction('create_v2');
+  const remaining = pumpQuoteRemaining(8);
+  const decoded = decodePumpInstruction({
+    ...instruction,
+    accounts: [...instruction.accounts, ...remaining],
+  });
+
+  assert.ok(decoded);
+  assert.equal(decoded.accounts.quote_control, QUOTE_CONTROL);
+  assert.equal(decoded.accounts.quote_bonding_curve, remaining[4]);
+  assert.equal(decoded.accounts.quote_pool, remaining[5]);
+  assert.equal(
+    decoded.accounts.quote_pool_base_vault,
+    ata(PUMP_QUOTE_MINT, PUMP_QUOTE_POOL, TOKEN_2022),
+  );
+  assert.equal(decoded.accounts.quote_pool_quote_vault, remaining[7]);
+  assert.equal(decodeForTransaction({
+    ...instruction,
+    accounts: [...instruction.accounts, ...remaining],
+  })?.profile, null);
+});
+
+void test('refuse un rôle invalide parmi les remaining accounts pump-coin de create_v2', () => {
+  const instruction = pumpInstruction('create_v2');
+  const five = pumpQuoteRemaining(5);
+  const eight = pumpQuoteRemaining(8);
+  for (const remaining of [
+    replaceAt(five, 3, address(35)),
+    replaceAt(five, 4, address(35)),
+    replaceAt(five, 4, PUMP_QUOTE_MINT),
+    replaceAt(five, 4, pumpPda('bonding-curve', address(35))),
+    replaceAt(five, 0, 'quote-mint-invalide'),
+    replaceAt(eight, 3, address(35)),
+    replaceAt(eight, 4, address(35)),
+    replaceAt(eight, 6, eight[7] ?? ''),
+    replaceAt(eight, 6, ata(PUMP_QUOTE_MINT, PUMP_QUOTE_POOL, SPL_TOKEN)),
+    replaceAt(eight, 6, ata(PUMP_QUOTE_MINT, address(35), TOKEN_2022)),
+    replaceAt(eight, 2, SPL_TOKEN),
+    replaceAt(eight, 5, 'pool-invalide'),
+  ]) {
+    assertSameStrictFailure(
+      { ...instruction, accounts: [...instruction.accounts, ...remaining] },
+      'PUMP_ACCOUNT_MISSING',
+    );
+    assert.throws(
+      () => decodePumpInstruction({ ...instruction, accounts: [...instruction.accounts, ...remaining] }),
+      (error: unknown) => error instanceof PumpDecodingError
+        && !error.retryable
+        && /^Remaining account (?:quote_control|quote_bonding_curve|quote_pool_base_vault) create_v2 invalide\.$/u
+          .test(error.message),
     );
   }
 });
@@ -523,7 +626,7 @@ void test('préserve les rejets des comptes requis et remaining accounts opaques
     const instruction = opaqueInstruction(name, name === 'create_v2' ? Uint8Array.of(0, 1) : Uint8Array.of(1, 0));
     assertSameStrictFailure({ ...instruction, accounts: instruction.accounts.slice(0, -1) }, 'PUMP_ACCOUNT_MISSING');
     if (name === 'create_v2') {
-      for (const count of [1, 2, 5]) {
+      for (const count of [1, 2, 6, 7, 9]) {
         assertSameStrictFailure({
           ...instruction,
           accounts: [...instruction.accounts, ...Array.from({ length: count }, () => address(22))],
@@ -532,6 +635,14 @@ void test('préserve les rejets des comptes requis et remaining accounts opaques
       assertSameStrictFailure({
         ...instruction, accounts: [...instruction.accounts, address(21), address(22), address(23), address(24)],
       }, 'PUMP_ACCOUNT_MISSING');
+      for (const remaining of [
+        replaceAt(pumpQuoteRemaining(5), 4, address(35)),
+        replaceAt(pumpQuoteRemaining(8), 6, address(35)),
+      ]) {
+        assertSameStrictFailure({
+          ...instruction, accounts: [...instruction.accounts, ...remaining],
+        }, 'PUMP_ACCOUNT_MISSING');
+      }
     }
   }
 });
@@ -697,6 +808,45 @@ function u64(value: unknown): Buffer {
 
 function address(seed: number): string {
   return new PublicKey(Uint8Array.from({ length: 32 }, () => seed)).toBase58();
+}
+
+/**
+ * create_v2 remaining accounts quoting a pump coin (pump-sdk 4.0.0): the quote mint, the new
+ * curve's quote ATA, the quote token program, quote-control, the coin's own bonding curve and,
+ * once it migrated, its pump-amm pool with the pool's base and quote vaults.
+ */
+function pumpQuoteRemaining(count: 5 | 8): string[] {
+  const remaining = [
+    PUMP_QUOTE_MINT,
+    address(32),
+    TOKEN_2022,
+    QUOTE_CONTROL,
+    pumpPda('bonding-curve', PUMP_QUOTE_MINT),
+  ];
+  if (count === 5) return remaining;
+  return [
+    ...remaining,
+    PUMP_QUOTE_POOL,
+    ata(PUMP_QUOTE_MINT, PUMP_QUOTE_POOL, TOKEN_2022),
+    address(34),
+  ];
+}
+
+function pumpPda(seed: string, key: string): string {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from(seed), new PublicKey(key).toBuffer()],
+    new PublicKey(PUMP_PROGRAM),
+  )[0].toBase58();
+}
+
+function ata(mint: string, owner: string, tokenProgram: string): string {
+  return getAssociatedTokenAddressSync(
+    new PublicKey(mint), new PublicKey(owner), true, new PublicKey(tokenProgram),
+  ).toBase58();
+}
+
+function replaceAt(values: readonly string[], index: number, value: string): string[] {
+  return values.map((current, currentIndex) => currentIndex === index ? value : current);
 }
 
 function isOptionBool(
