@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import { errnoCode } from '../../src/deploy/errno-code.js';
 import { RoleEnvironmentError } from '../../src/deploy/role-environment.js';
 import { isStackMode, type StackMode } from '../../src/deploy/stack.js';
 import {
@@ -206,14 +207,6 @@ function reportFailure(error: unknown, io: VaultPullIo, timeoutMs: number): numb
   }
   io.stderr(`vault-pull: unexpected failure (${errnoCode(error)})\n`);
   return 1;
-}
-
-/** Only an errno code reaches the log, never a message (it may quote a path or a value). */
-function errnoCode(error: unknown): string {
-  const code = typeof error === 'object' && error !== null
-    ? (error as { readonly code?: unknown }).code
-    : undefined;
-  return typeof code === 'string' && /^E[A-Z0-9]+$/u.test(code) ? code : 'unknown';
 }
 
 const entrypoint = process.argv[1];
