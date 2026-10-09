@@ -3,6 +3,7 @@
  * (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 6.1 and 7.1). Pure: no I/O.
  */
 
+import { parse } from 'dotenv';
 import { isVariableName, parseRoleConfig } from './role-environment.js';
 import { secretGrants } from './secret-distribution.js';
 import {
@@ -122,8 +123,8 @@ export function migrateEntries(): readonly PullEntry[] {
 
 /**
  * The `.env` text of a configuration entry: sorted `VARIABLE=value` lines. Refused when a key is
- * no variable name, when the entry breaks the configuration rules (`parseRoleConfig`) or when
- * dotenv would not read it back as is.
+ * no variable name, when dotenv would not read it back as is or when the entry breaks the
+ * configuration rules (`parseRoleConfig`), in that order.
  */
 export function renderConfig(name: ConfigName, data: Readonly<Record<string, unknown>>): string {
   const label = configPath(name);
@@ -138,7 +139,10 @@ export function renderConfig(name: ConfigName, data: Readonly<Record<string, unk
     if (typeof value !== 'string') throw new VaultLayoutError(`${label}: ${key} must be a string`);
     return `${key}=${value}\n`;
   }).join('');
-  const parsed = parseRoleConfig(text, label);
+  // The round trip comes before the configuration rules: a value holding a line break reads as
+  // further variables (`info\nNAME=x` gives `NAME`), and a rule refusing one of them would print
+  // a fragment of the value.
+  const parsed = parse(text);
   const changed = keys.find((key) => parsed[key] !== data[key]);
   if (changed !== undefined || Object.keys(parsed).length !== keys.length) {
     throw new VaultLayoutError(
@@ -146,6 +150,8 @@ export function renderConfig(name: ConfigName, data: Readonly<Record<string, unk
         + '(#, quotes, outer spaces or line breaks)',
     );
   }
+  // The parsed keys are now exactly the validated ones, so a refusal can only name a real variable.
+  parseRoleConfig(text, label);
   return text;
 }
 

@@ -142,6 +142,27 @@ void test('a configuration renders sorted and must survive the .env round trip',
   assertRefused({ RPC: `https://h.invalid/?api-key=${LEAK}` }, RoleEnvironmentError);
 });
 
+void test('a value that reads as further variables is refused naming its own variable, never the fragment', () => {
+  const message = 'config/listener: LOG_LEVEL does not survive the .env format (#, quotes, outer spaces or line breaks)';
+  // dotenv reads each of these separators as the end of a line, so the planted text becomes a
+  // variable of its own. Each fragment below is one the configuration rules refuse by name: a
+  // secret-looking name, an injected one and a credential-looking value.
+  for (const separator of ['\n', '\r', '\r\n']) {
+    for (const fragment of ['SECRET_X=1', 'DATABASE_URL=1', `MARKER_X=https://user:${LEAK}@host/`]) {
+      assertRefused({ LOG_LEVEL: `info${separator}${fragment}` }, VaultLayoutError, message);
+    }
+  }
+  // Another variable stays valid next to the planted one: the message still names the changed one only.
+  assertRefused({ API_HOST: '0.0.0.0', LOG_LEVEL: 'info\nSECRET_X=1' }, VaultLayoutError, message);
+});
+
+void test('dotenv does not end a line at U+2028 or U+2029: such a value is no further variable and comes back intact', () => {
+  for (const separator of [' ', ' ']) {
+    const value = `info${separator}SECRET_X=1`;
+    assert.equal(renderConfig('listener', { LOG_LEVEL: value }), `LOG_LEVEL=${value}\n`);
+  }
+});
+
 void test('a key that is no variable name is refused first and never printed', () => {
   const message = 'config/listener: invalid variable name';
   for (const key of [

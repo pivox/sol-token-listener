@@ -35,9 +35,9 @@ export interface VaultPullDependencies {
   readonly writeFile: (path: string, content: string, mode: number) => void;
 }
 
-/** Owner-only parent directories, then the exact mode whatever the umask. */
+/** Owner-only parents for secrets, 0755 for configurations, then the exact file mode whatever the umask. */
 export function writePulledFile(path: string, content: string, mode: number): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(path), { recursive: true, mode: mode === 0o600 ? 0o700 : 0o755 });
   writeFileSync(path, content, { mode });
   chmodSync(path, mode);
 }
@@ -53,7 +53,12 @@ const RETRY_INTERVAL_MS = 2_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 /** An unreadable AppRole file or missing required entries: EX_CONFIG. */
-class PullConfigurationError extends Error {}
+class PullConfigurationError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'PullConfigurationError';
+  }
+}
 
 type Target =
   | Readonly<{ container: 'back'; mode: StackMode }>
@@ -72,7 +77,8 @@ interface PulledFile {
  * (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 7). Nothing is written until every
  * required entry is read and valid, and no value is ever printed. Exit codes: 0; 64 usage;
  * 69 Vault unavailable past SOL_VAULT_PULL_TIMEOUT_MS (60 s); 77 AppRole or policy refused;
- * 78 unreadable AppRole file, missing required entry or invalid entry.
+ * 78 unreadable AppRole file, missing required entry or invalid entry; 1 any other failure, which
+ * is reported by its errno code only.
  */
 export async function runVaultPullCli(
   argv: readonly string[],
@@ -102,6 +108,7 @@ export async function runVaultPullCli(
       try {
         const values = await readEntries(client, credentials, entries);
         const files = materialize(entries, values, secretsDirectory, configDirectory);
+        // Validation is complete before the first write; a write failing midway leaves files in a tmpfs the container discards.
         for (const file of files) dependencies.writeFile(file.path, file.content, file.mode);
         io.stdout(`${JSON.stringify({
           service: 'vault-pull',
@@ -197,8 +204,16 @@ function reportFailure(error: unknown, io: VaultPullIo, timeoutMs: number): numb
     io.stderr(`vault-pull: ${error.message}\n`);
     return 78;
   }
-  io.stderr('vault-pull: cannot write the pulled files\n');
+  io.stderr(`vault-pull: unexpected failure (${errnoCode(error)})\n`);
   return 1;
+}
+
+/** Only an errno code reaches the log, never a message (it may quote a path or a value). */
+function errnoCode(error: unknown): string {
+  const code = typeof error === 'object' && error !== null
+    ? (error as { readonly code?: unknown }).code
+    : undefined;
+  return typeof code === 'string' && /^E[A-Z0-9]+$/u.test(code) ? code : 'unknown';
 }
 
 const entrypoint = process.argv[1];
