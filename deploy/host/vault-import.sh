@@ -49,7 +49,7 @@ add_key wallet-keypair.json "$wallet_key" EXECUTOR_KEYPAIR_PATH
 set +x
 IFS= read -r -s -p 'Vault operator password: ' password || true
 echo >&2
-if [ -z "$password" ]; then
+if [ -z "${password:-}" ]; then
   echo 'vault-import: no password given' >&2
   exit 64
 fi
