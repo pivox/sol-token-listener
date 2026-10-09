@@ -82,7 +82,8 @@ partageraient le système de fichiers de la keypair, et un superviseur resterait
   publie 80 et 443 ; ni la base ni le back ne publient de port.
 - **Volumes** : `postgres-data`, `caddy-data` (certificats). Les logs vont sur la sortie
   standard.
-- **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie.
+- **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie. Le
+  sous-projet 2 y ajoute un conteneur `vault`, son volume et un réseau d'interface locale.
 
 ## 6. Conteneur back
 
@@ -229,6 +230,12 @@ Seule la source change. Le script d'entrée s'authentifie auprès de Vault avec 
 utilisateur, chaque politique ne donnant accès qu'aux secrets de cet utilisateur, et remplit
 les mêmes dossiers `/run/sol/<utilisateur>/`. La keypair n'est lisible que par la politique de
 `h2b`. Le reste de la stack ne voit aucune différence.
+
+Cette jonction est précisée par le sous-projet 2,
+`docs/superpowers/specs/2026-10-09-vault-secrets-design.md`, avec deux écarts : un AppRole par
+conteneur plutôt qu'un rôle par utilisateur (section 6.3 du spec Vault), la keypair restant
+réservée à `h2b` par la distribution par utilisateur ; et la configuration non secrète, qui
+passe elle aussi dans Vault.
 
 ### 7.4 Rotation
 
