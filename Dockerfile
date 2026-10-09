@@ -83,3 +83,17 @@ COPY --chmod=0755 deploy/front/front-entrypoint /usr/local/bin/front-entrypoint
 EXPOSE 8080 80 443
 
 CMD ["front-entrypoint"]
+
+FROM hashicorp/vault:2.1.2@sha256:c2f666266f383d2cf424d86b8bb8ce7d065562173ffec2b476d762943608bb55 AS vault
+
+# vault-entrypoint starts as root to read the unseal key, then runs Vault as the image's vault
+# user (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 5).
+USER root
+ENV VAULT_ADDR=http://127.0.0.1:8200
+COPY deploy/vault/vault.hcl /vault/config/vault.hcl
+COPY --chmod=0755 deploy/vault/vault-entrypoint /usr/local/bin/vault-entrypoint
+
+EXPOSE 8200
+
+ENTRYPOINT ["vault-entrypoint"]
+CMD []

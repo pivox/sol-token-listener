@@ -24,6 +24,8 @@ const caddyImage =
   'caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d';
 const postgresImage =
   'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3';
+const vaultImage =
+  'hashicorp/vault:2.1.2@sha256:c2f666266f383d2cf424d86b8bb8ce7d065562173ffec2b476d762943608bb55';
 
 async function readArtifact(path: string): Promise<string> {
   return (await readFile(new URL(path, root), 'utf8')).replaceAll('\r\n', '\n');
@@ -61,6 +63,7 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
     [nodeImage, 'production-dependencies'],
     [nodeImage, 'backend'],
     [caddyImage, 'frontend'],
+    [vaultImage, 'vault'],
   ]);
   assert.doesNotMatch(dockerfile, /^COPY\s+(?:--\S+\s+)*\.(?:\s|$)/gim);
 
@@ -89,6 +92,14 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
     productionDependencies,
     /^RUN\s+npm ci --omit=dev --ignore-scripts --workspaces=false\s+&&\s+npm cache clean --force$/m,
   );
+
+  const vault = stage(dockerfile, 'vault');
+  assert.match(vault, /^USER root$/m);
+  assert.match(vault, /^ENV VAULT_ADDR=http:\/\/127\.0\.0\.1:8200$/m);
+  assert.match(vault, /^COPY deploy\/vault\/vault\.hcl \/vault\/config\/vault\.hcl$/m);
+  assert.match(vault, /^COPY --chmod=0755 deploy\/vault\/vault-entrypoint \/usr\/local\/bin\/vault-entrypoint$/m);
+  assert.match(vault, /^EXPOSE 8200$/m);
+  assert.match(vault, /^ENTRYPOINT \["vault-entrypoint"\]$/m);
 });
 
 void test('backend image ships compiled artifacts, supervisor and one Unix user per process', async () => {
