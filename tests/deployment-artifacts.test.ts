@@ -575,7 +575,9 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
     .filter((volume) => volume.type === 'bind')
     .map((volume) => `${volume.source ?? ''}:${volume.target ?? ''}:${volume.read_only === true ? 'ro' : 'rw'}`);
   // Compose creates the missing source of a long-syntax bind unless create_host_path is false: a missing
-  // AppRole file must fail the start, also once the server override is merged.
+  // AppRole file must fail the start, also once the server override is merged. Compose 5 renders the
+  // explicit false; Compose 2 (the CI runner) omits a false bool from its JSON. Either way the resolved
+  // bind must never ask for creation, and the static test pins the explicit `create_host_path: false`.
   const approleBind = (service: ResolvedService | undefined): boolean | undefined => service?.volumes
     ?.find((volume) => volume.target === '/root/vault/approle.json')?.bind?.create_host_path;
 
@@ -603,7 +605,7 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   assert.deepEqual(binds(services.back), [
     '/srv/sol-token-listener/secrets/vault/approle/back.json:/root/vault/approle.json:ro',
   ]);
-  for (const name of ['migrate', 'back']) assert.equal(approleBind(services[name]), false, name);
+  for (const name of ['migrate', 'back']) assert.notEqual(approleBind(services[name]), true, name);
   assert.deepEqual(services.back?.tmpfs, [
     '/run/sol:mode=0711,size=16m', '/root/secrets:mode=0700,size=4m', '/etc/sol/config:mode=0755,size=1m',
   ]);
@@ -640,7 +642,7 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   });
   assert.deepEqual(ports(server.front), [':80:80', ':443:443']);
   assert.equal(server.front?.environment?.SITE_ADDRESS, 'bot.example.invalid');
-  for (const name of ['migrate', 'back']) assert.equal(approleBind(server[name]), false, `${name} after the server override`);
+  for (const name of ['migrate', 'back']) assert.notEqual(approleBind(server[name]), true, `${name} after the server override`);
 });
 
 void test('block hydration canary proves active routing and bounded serialized admission', async () => {
