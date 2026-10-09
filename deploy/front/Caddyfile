@@ -20,6 +20,12 @@
 
 		# The console sends its own `Authorization: Bearer` token, checked by the operator API, which
 		# only answers the Host it binds (OPERATOR_API_HOST:OPERATOR_API_PORT of operator-api.env).
+		# A browser may also attach the front's basic credentials here: they never reach the back.
+		@operator_basic {
+			path /operator/v1/*
+			header_regexp Authorization (?i)^basic\s
+		}
+		request_header @operator_basic -Authorization
 		reverse_proxy /operator/v1/* back:3100 {
 			header_up Host 0.0.0.0:3100
 		}

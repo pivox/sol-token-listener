@@ -159,10 +159,16 @@ configuration `operations.env` invalide.
 Arrêt normal, qui conserve la base :
 
 ```bash
-sol_compose stop --timeout 60
+sol_compose stop
 ```
 
-`down --volumes` est destructif : il efface la base. Ne jamais l'utiliser pour un arrêt normal.
+`stop` attend au plus 240 s (`stop_grace_period`) : `supervisord` arrête les programmes l'un
+après l'autre. Il laisse 40 s à ceux qui ont leur propre délai d'arrêt de 30 s (listener, H2a,
+H2b, auto-arm, worker) et 10 s aux autres. En pratique, chacun s'arrête en quelques secondes.
+
+`down --volumes` efface tous les volumes de la stack : la base, mais aussi les preuves
+(`evidence`) et le certificat TLS (`caddy-data`). Ne jamais l'utiliser. Pour repartir d'une base
+vide, voir l'étape 4 de la reprise.
 
 ## Commandes sol
 
@@ -211,7 +217,7 @@ un intent de 0,001 SOL toutes les 10 minutes, jamais armable.
 sol_compose exec back sol qualify start
 sol_compose exec back sol evidence provider
 sol_compose exec back sol readiness
-sol_compose exec back sh -c 'sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json'
+sol_compose exec back sh -c 'umask 077 && sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json && chown ops:ops /var/lib/sol/evidence/preflight-draft.json'
 sol_compose exec back rm -rf /var/lib/sol/evidence/bundle
 sol_compose exec back sol evidence bundle
 sol_compose exec -it back sol ops envelope create --per-buy-lamports=10000000 --max-buys=5 \
@@ -221,14 +227,20 @@ sol_compose exec -it back sol trading start
 ```
 
 `envelope prepare` échoue tant qu'aucun artefact de simulation `SUCCESS` de moins de 24 h
-n'existe : attendre la sonde suivante, puis recommencer. H2f exige un répertoire de sortie absent,
-d'où le `rm -rf` du paquet précédent, déjà consommé.
+n'existe : attendre la sonde suivante, puis recommencer. H2f ne lit le brouillon que s'il
+appartient à `ops` en mode 0600 : la redirection, faite en root, le crée sous `umask 077`, puis
+`chown` le rend à `ops`. H2f exige aussi un répertoire de sortie absent, d'où le `rm -rf` du
+paquet précédent, déjà consommé.
 
 ## Santé et journaux
 
 - `sol_compose ps` : `back` est sain quand chaque programme du mode tourne, que H2b tourne ou attend
   du travail, et que l'API du listener répond `OK`. Avec `SOL_HEALTH_REQUIRE_OK=false`, l'état
   `DEGRADED` est aussi accepté, utile si le projet RPC du listener est épuisé.
+- Un programme qui ne démarre pas (base ou RPC indisponible) est relancé sans fin, avec un délai
+  qui s'allonge d'une seconde à chaque échec : environ 1 min 30 après une heure de panne.
+  `sol status` le montre en `BACKOFF`, et le message de `sol-health` nomme cet état. Une fois la
+  cause corrigée, `sol_compose exec back sol ctl restart <programme>` le relance tout de suite.
 - `sol_compose logs -f back` : une ligne JSON par événement, avec le nom du service. Le pilote
   `json-file` garde 5 fichiers de 20 Mo par conteneur.
 
@@ -326,8 +338,13 @@ résultats textuels change.
    ```
 
    Le `diff` doit être vide. Une erreur de `pg_restore` annule toute la restauration : corriger la
-   cause, puis repartir d'une base vide avec `sol_compose down --volumes`, qui détruit seulement la
-   base de la stack.
+   cause, puis repartir d'une base vide en supprimant seulement le volume de la base (jamais
+   `down --volumes`, qui efface aussi les preuves et le certificat TLS) :
+
+   ```bash
+   sol_compose down
+   docker volume rm sol-token-listener_postgres-data
+   ```
 
 5. Démarrer en mode `live`, trading arrêté, puis vérifier.
 
@@ -349,7 +366,7 @@ résultats textuels change.
 ## Retour arrière
 
 L'ancien conteneur est conservé sept jours. Tant qu'aucun trade n'a eu lieu dans la stack :
-`sol_compose stop --timeout 60`, `docker start sol-token-listener-live-pg`, puis relancer les
+`sol_compose stop`, `docker start sol-token-listener-live-pg`, puis relancer les
 processus de l'hôte comme avant, depuis un `dist/` reconstruit sur `main`. Après un trade, le
 retour passe par un dump inverse : les étapes 3 et 4 dans l'autre sens, de la stack vers une base
 vide.
@@ -401,8 +418,16 @@ Procédure :
   de groupe ; seul `migrate` reçoit le mot de passe administrateur.
 - Aucun achat sans `sol trading start` après un redémarrage ; les sorties restent automatiques.
 - Ni la base ni le back ne publient de port ; le front n'expose que GET, HEAD et OPTIONS, derrière
-  un mot de passe ou, pour `/operator/v1/`, le jeton de l'API opérateur.
+  un mot de passe ou, pour `/operator/v1/`, le jeton de l'API opérateur. Caddy retire les
+  identifiants du front de toute requête relayée vers le back.
 - Caddy ne bloque pas les tentatives répétées : la longueur du mot de passe (32 caractères
-  aléatoires) compense, et un fail2ban sur les journaux de Caddy reste possible sur le serveur.
+  aléatoires) compense. Chaque tentative coûte une comparaison bcrypt de coût 10 et le front est
+  limité à un demi-CPU : un flot de tentatives ne peut pas affamer le back. Un fail2ban sur les
+  journaux de Caddy reste possible sur le serveur.
+- Le back et `migrate` tournent avec `no-new-privileges`, sans `NET_RAW` ni `MKNOD` et sans
+  fichier core : aucun processus ne regagne un privilège, aucun vidage mémoire n'emporte un
+  secret.
+- `migrate` n'envoie à PostgreSQL que le vérificateur SCRAM de chaque mot de passe de login,
+  jamais le mot de passe lui-même : une erreur journalisée ne peut pas le révéler.
 - La stack est limitée à un réplica unique. Elle n'offre aucune promesse de première position, de
   sellabilité ou de profit.

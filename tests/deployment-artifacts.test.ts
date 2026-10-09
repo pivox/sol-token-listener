@@ -172,6 +172,11 @@ void test('Caddy relays only reads, authenticates every route but the operator A
   for (const marker of [
     '@write not method GET HEAD OPTIONS',
     'respond @write 405',
+    // A browser's cached basic credentials never reach the operator API.
+    '@operator_basic {',
+    'path /operator/v1/*',
+    'header_regexp Authorization (?i)^basic\\s',
+    'request_header @operator_basic -Authorization',
     'reverse_proxy /operator/v1/* back:3100 {',
     'header_up Host 0.0.0.0:3100',
     'basic_auth {',
@@ -266,7 +271,13 @@ void test('Compose defines postgres, migrate, back and front, with no published 
   assert.match(back, /^ {6}SOL_HEALTH_REQUIRE_OK: \$\{SOL_HEALTH_REQUIRE_OK:-true\}$/m);
   assert.match(back, /^ {4}tmpfs: \["\/run\/sol:mode=0711,size=16m"\]$/m);
   assert.match(back, /^ {4}init: true$/m);
-  assert.match(back, /^ {4}stop_grace_period: 60s$/m);
+  assert.match(back, /^ {4}stop_grace_period: 240s$/m);
+  assert.match(compose, /^x-hardening: &hardening\n {2}security_opt: \["no-new-privileges:true"\]\n {2}cap_drop: \[NET_RAW, MKNOD\]\n {2}ulimits:\n {4}core: 0$/m);
+  for (const service of [migrate, back]) assert.match(service, /^ {4}<<: \*hardening$/m);
+  // Caddy binds 80 and 443 as a non-root user through its file capability: no-new-privileges
+  // would drop it. The front gets a CPU share instead, against bcrypt floods.
+  assert.doesNotMatch(front, /hardening|no-new-privileges/u);
+  assert.match(front, /^ {4}cpus: 0\.5$/m);
   assert.match(back, /^ {6}test: \["CMD", "sol-health"\]$/m);
 
   assert.match(postgres, /^ {4}networks: \[internal\]$/m);
@@ -466,6 +477,11 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   }
   interface ResolvedService {
     readonly environment?: Readonly<Record<string, string>>;
+    readonly security_opt?: readonly string[];
+    readonly cap_drop?: readonly string[];
+    readonly ulimits?: Readonly<Record<string, unknown>>;
+    readonly stop_grace_period?: string;
+    readonly cpus?: number;
     readonly ports?: readonly Readonly<{ host_ip?: string; published?: string | number; target?: number }>[];
     readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean }>[];
   }
@@ -510,6 +526,15 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   assert.deepEqual(binds(services.front), [
     '/srv/sol-token-listener/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro',
   ]);
+  for (const name of ['migrate', 'back']) {
+    const service = services[name];
+    assert.deepEqual(service?.security_opt, ['no-new-privileges:true'], name);
+    assert.deepEqual(service?.cap_drop, ['NET_RAW', 'MKNOD'], name);
+    assert.ok(Object.hasOwn(service?.ulimits ?? {}, 'core'), name);
+  }
+  assert.equal(services.front?.security_opt, undefined);
+  assert.equal(services.back?.stop_grace_period, '4m0s');
+  assert.equal(services.front?.cpus, 0.5);
 
   const server = resolvedConfig(['deploy/compose.yaml', 'deploy/compose.server.yaml'], {
     SITE_ADDRESS: 'bot.example.invalid',
@@ -1378,7 +1403,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     'docker compose --env-file "$SOL_ENV" -f deploy/compose.yaml "$@"',
     'docker compose --env-file "$SOL_ENV" -f deploy/compose.yaml -f deploy/compose.server.yaml "$@"',
     'sol_compose up --detach --wait --wait-timeout 180',
-    'sol_compose stop --timeout 60',
+    'sol_compose stop\n',
     'sol_compose exec -it back sol trading start',
     'sol_compose exec back sol trading stop',
     'sol_compose exec back sol qualify start',
@@ -1390,6 +1415,10 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     'deploy/sql/table-row-counts.sql',
     'diff "$takeover/source.counts" "$takeover/target.counts"',
     'docker stop sol-token-listener-live-pg',
+    'docker volume rm sol-token-listener_postgres-data',
+    // H2f reads the draft only when ops owns it with mode 0600 (readPreflightProtectedFile).
+    "sh -c 'umask 077 && sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json && chown ops:ops /var/lib/sol/evidence/preflight-draft.json'",
+    'sol ctl restart <programme>',
     'sudo systemctl enable --now sol-backup.timer',
     'launchctl bootstrap "gui/$(id -u)" "$plist"',
   ]) {
@@ -1399,7 +1428,10 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   assert.doesNotMatch(secrets, /\b(?:cat|echo)\s+"?\$(?:back|SOL_HOST_DIR)/u, 'secrets are copied, never printed');
   assert.match(runbook, /pg_advisory_lock/u);
   assert.match(runbook, /Les migrations\s+restent forward-only/u);
-  assert.match(runbook, /`down --volumes` est destructif/u);
+  // `down --volumes` also deletes the evidence and the TLS certificate: never a documented command.
+  assert.match(runbook, /`down --volumes` efface tous les volumes de la stack/u);
+  assert.doesNotMatch(runbook, /^\s*sol_compose down --volumes/mu);
+  assert.doesNotMatch(runbook, /--timeout 60/u, 'the stop waits for the whole stop_grace_period');
   assert.match(runbook, /ENTRY_STOP/u);
   assert.match(runbook, /0\|0\|0\|0/u);
   assert.match(runbook, /réplica unique/u);

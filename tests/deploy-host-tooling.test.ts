@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 const root = new URL('../', import.meta.url);
 const repository = fileURLToPath(root).replace(/\/$/u, '');
-const FAKE_HASH = `$2a$14$${'a'.repeat(53)}`;
+const FAKE_HASH = `$2a$10$${'a'.repeat(53)}`;
 
 async function artifact(path: string): Promise<string> {
   return readFile(new URL(path, root), 'utf8');
@@ -34,7 +34,9 @@ void test('host scripts are bash and parse', async () => {
 void test('init-secrets creates the host layout once, owner-only, and prints no database secret', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sol-init-'));
   try {
-    const bin = await fakeDocker(directory, `cat > /dev/null; printf '%s\\n' '${FAKE_HASH}'`);
+    const dockerArgs = join(directory, 'docker-args');
+    const bin = await fakeDocker(directory,
+      `cat > /dev/null; printf '%s' "$*" > '${dockerArgs}'; printf '%s\\n' '${FAKE_HASH}'`);
     const host = join(directory, 'host');
     const run = (): ReturnType<typeof spawnSync> => spawnSync(
       'bash', [join(repository, 'deploy/host/init-secrets.sh'), host],
@@ -48,6 +50,7 @@ void test('init-secrets creates the host layout once, owner-only, and prints no 
     assert.equal(output.includes(admin), false);
     assert.equal((output.match(/^front password, shown once/gmu) ?? []).length, 1);
     assert.equal((await readFile(join(host, 'secrets/front/front-basic-auth-hash'), 'utf8')).trim(), FAKE_HASH);
+    assert.match(await readFile(dockerArgs, 'utf8'), / hash-password --bcrypt-cost 10$/u);
     assert.equal((await readdir(join(host, 'secrets/db/logins'))).length, 9);
     assert.equal((await stat(join(host, 'secrets'))).mode & 0o777, 0o700);
     assert.equal((await stat(join(host, 'secrets/db/logins/pg-sol_live-password'))).mode & 0o777, 0o600);
@@ -59,6 +62,29 @@ void test('init-secrets creates the host layout once, owner-only, and prints no 
     assert.equal(second.status, 0, String(second.stderr));
     assert.equal((await readFile(join(host, 'secrets/db/postgres-admin-password'), 'utf8')).trim(), admin);
     assert.doesNotMatch(String(second.stdout), /front password|created/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('init-secrets leaves no front hash behind when Caddy fails, and retries on the next run', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-init-fail-'));
+  try {
+    const host = join(directory, 'host');
+    const hashFile = join(host, 'secrets/front/front-basic-auth-hash');
+    const run = (body: string): Promise<ReturnType<typeof spawnSync>> => fakeDocker(directory, body)
+      .then((bin) => spawnSync('bash', [join(repository, 'deploy/host/init-secrets.sh'), host], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      }));
+    for (const failing of ['cat > /dev/null; exit 1', "cat > /dev/null; printf 'not a hash\\n'"]) {
+      const failed = await run(failing);
+      assert.notEqual(failed.status, 0, failing);
+      assert.doesNotMatch(String(failed.stdout), /front password/u, failing);
+      await assert.rejects(stat(hashFile), { code: 'ENOENT' }, failing);
+    }
+    const retried = await run(`cat > /dev/null; printf '%s\\n' '${FAKE_HASH}'`);
+    assert.equal(retried.status, 0, String(retried.stderr));
+    assert.equal((await readFile(hashFile, 'utf8')).trim(), FAKE_HASH);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

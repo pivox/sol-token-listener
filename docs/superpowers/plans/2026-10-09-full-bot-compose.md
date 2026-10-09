@@ -84,7 +84,7 @@ npm run lint:backend                        # eslint + node --check of the smoke
 | `scripts/deploy/distribute-secrets.ts` | CLI run by the entrypoint as root |
 | `scripts/deploy/admin-database.ts` | CLI behind `sol-admin`: `migrate`, `group-roles`, `url` |
 | `scripts/deploy/operations-state.ts` | Reads `ops status` / `envelope show` JSON for the shell scripts |
-| `deploy/back/bin/{sol-entrypoint,sol-run,sol-h2b,sol,sol-health,sol-admin}` | POSIX scripts of the back image |
+| `deploy/back/bin/{sol-entrypoint,sol-boot-entry-stop,sol-run,sol-h2b,sol,sol-health,sol-admin}` | POSIX scripts of the back image (`sol-boot-entry-stop`: Task 15b) |
 | `deploy/back/supervisor/supervisord.conf`, `deploy/back/supervisor/programs/{common,live}.conf` | Supervisor configuration |
 | `deploy/front/Caddyfile`, `deploy/front/front-entrypoint` | Front configuration and entrypoint |
 | `deploy/compose.yaml` (rewritten), `deploy/compose.server.yaml` (new), `deploy/env.example` (rewritten) | Stack definition, server override, compose inputs |
@@ -98,7 +98,7 @@ npm run lint:backend                        # eslint + node --check of the smoke
 | `tests/deploy-*.test.ts` (7 new files), `tests/deployment-artifacts.test.ts`, `tests/executor-live-main.integration.test.ts` | Tests |
 | `docs/operations/deployment.md` (rewritten), `README.md`, `docs/system-overview.html`, `docs/operations/block-hydration-canary.md`, `docs/operations/executor-live-canary.md`, the spec | Documentation |
 
-Task order: Tasks 1–8 add code and tests without touching any deployment artifact, so the existing deployment tests stay green. Tasks 9–14 replace the artifacts, and each one updates the assertions of `tests/deployment-artifacts.test.ts` it invalidates. Task 15 verifies everything locally and ships the PR. Tasks 16–18 are operational and need the user's explicit go.
+Task order: Tasks 1–8 add code and tests without touching any deployment artifact, so the existing deployment tests stay green. Tasks 9–14 replace the artifacts, and each one updates the assertions of `tests/deployment-artifacts.test.ts` it invalidates. Task 15 verifies everything locally and ships the PR, and Task 15b applies the review's corrections before the merge. Tasks 16–18 are operational and need the user's explicit go.
 
 ---
 
@@ -5845,6 +5845,394 @@ Expected: `quality`, `deployment-contract` and `frontend-e2e` green before the m
 
 ---
 
+## Task 15b: Review corrections before the merge
+
+The independent review of PR #263 approved it with fixes: five should-fix findings and five nits. This task applies all of them before the merge; Tasks 16–18 still need the user's go. Spec section 16, item 7, records the changes.
+
+**Files:**
+- Create: `deploy/back/bin/sol-boot-entry-stop`
+- Modify: `deploy/back/bin/sol-entrypoint`, `deploy/back/bin/sol-health`, `deploy/back/supervisor/programs/common.conf`, `deploy/back/supervisor/programs/live.conf`, `deploy/compose.yaml`, `deploy/front/Caddyfile`, `deploy/host/init-secrets.sh`, `scripts/deployment-smoke.mjs`, `src/deploy/database-logins.ts`, `docs/operations/deployment.md`, `docs/system-overview.html`, the spec
+- Test: `tests/deploy-back-container.test.ts`, `tests/deploy-database-logins.test.ts`, `tests/deploy-host-tooling.test.ts`, `tests/deployment-artifacts.test.ts`
+
+Evidence gathered for this task (2026-10-09, pinned images):
+
+- supervisor 4.2.5 in the pinned Node image, with a program that exits at once and `startretries=1000000`: spawns 1, 2, 3, 4, 5 and 6 s apart, never `FATAL`.
+- Three programs that ignore SIGTERM, `stopwaitsecs=3`, two of them at the same priority: supervisord kills them one after the other, 10 s in all. The stop budget is the sum of the `stopwaitsecs` plus about one second per program.
+- Compose with the hardening block below: `ulimit -c` is 0 (soft and hard), `NoNewPrivs` is 1, the bounding set lacks `NET_RAW` and `MKNOD`, and `setpriv --reuid=1000` still works.
+- Caddy 2.10.2 with the new operator route, in front of an echo back:
+  - a Bearer header reaches port 3100 unchanged, with Host `0.0.0.0:3100`;
+  - `curl -u` and a lower-case `basic` header arrive without `Authorization`;
+  - the listener API still receives no `Authorization`, and POST still gets 405.
+- PostgreSQL 16.14: a role created with `PASSWORD '<client-computed SCRAM verifier>'` logs in over TCP (SCRAM) with its password and refuses another one (28P01).
+
+- [ ] **Step 1: Unbounded retries and a stop budget (finding 1, nit 8)**
+
+Every program of `common.conf` and `live.conf` gets `startretries=1000000`, and `opapi` and `retention` get `stopwaitsecs=10`. The header of `common.conf` becomes:
+
+```ini
+; Programs of both modes (spec 6.2). Each one runs as its own Unix user through sol-run, which
+; injects only that role's configuration and secrets. Lower priority starts first, stops last.
+; A program that cannot start (database or RPC down) is retried with a delay one second longer
+; after each failure (1, 2, 3 s …): startretries is unbounded in practice, so none ends FATAL.
+; supervisord stops the programs one after the other. stopwaitsecs is 40 s where the process has
+; its own 30 s shutdown grace (listener and executors) and 10 s elsewhere; their sum plus a margin
+; stays below the back's stop_grace_period in deploy/compose.yaml (tests/deploy-back-container).
+```
+
+`live.conf` ends its header with `Retries and stop waits: see common.conf.` In `deploy/compose.yaml`, the back service gets:
+
+```yaml
+    init: true
+    # supervisord stops its programs one after the other (deploy/back/supervisor/programs).
+    stop_grace_period: 240s
+```
+
+`deploy/back/bin/sol-health` names the supervisor state of a program that is not running:
+
+```sh
+#!/bin/sh
+# Docker healthcheck of the back container (spec 6.5, amended): every program of the mode is
+# RUNNING, H2b runs or waits for work, and the listener API answers. The message names the
+# supervisor state of a program that is not RUNNING (BACKOFF while it retries, STOPPED, FATAL).
+set -u
+fail() {
+  printf 'sol-health: %s\n' "$1"
+  exit 1
+}
+program_state() {
+  supervisorctl -c /etc/sol/supervisord.conf status "$1" 2> /dev/null | awk '{ print $2 }'
+}
+mode="$(cat /run/sol/mode 2> /dev/null)" || fail 'mode unknown'
+programs='listener opapi'
+if [ ! -e /run/sol/qualify ]; then programs="$programs retention"; fi
+if [ "$mode" = live ]; then programs="$programs h2a h2b autoarm"; fi
+for program in $programs; do
+  state="$(program_state "$program")"
+  [ "$state" = RUNNING ] || fail "$program is ${state:-unknown}"
+done
+if [ "$mode" = live ]; then
+  state="$(cut -d ' ' -f 1 /run/sol/h2b/state 2> /dev/null)"
+  case "$state" in
+    running|idle) ;;
+    *) fail "h2b is ${state:-unknown}" ;;
+  esac
+fi
+if [ "${SOL_HEALTH_REQUIRE_OK:-true}" = true ]; then
+  node /app/dist/scripts/deployment-healthcheck.js --require-ok > /dev/null || fail 'listener API is not OK'
+else
+  node /app/dist/scripts/deployment-healthcheck.js > /dev/null || fail 'listener API is unavailable'
+fi
+```
+
+In `tests/deploy-back-container.test.ts`, the program test also checks `autorestart=true`, `startretries=1000000` and `stopwaitsecs` (`10` for `opapi` and `retention`, `40` otherwise). A new test checks the budget:
+
+```ts
+void test('the back stop grace covers every program stopped one after the other', async () => {
+  const all = [
+    ...programs(await artifact('deploy/back/supervisor/programs/common.conf')),
+    ...programs(await artifact('deploy/back/supervisor/programs/live.conf')),
+  ];
+  // supervisord stops one program at a time, each within stopwaitsecs plus about one second.
+  const budget = all.reduce((total, program) => total + Number(program.settings.get('stopwaitsecs')) + 1, 0);
+  const grace = /^ {4}stop_grace_period: (\d+)s$/mu.exec(await artifact('deploy/compose.yaml'));
+  assert.ok(grace !== null, 'the back has no stop_grace_period in seconds');
+  assert.ok(budget + 10 <= Number(grace[1]), `stop budget ${String(budget)} s + 10 s margin exceeds ${grace[1] ?? ''} s`);
+});
+```
+
+- [ ] **Step 2: The boot entry-stop as its own script, tested by behaviour (finding 5)**
+
+Create `deploy/back/bin/sol-boot-entry-stop` (mode 0755):
+
+```sh
+#!/bin/sh
+# Boot entry-stop (spec 13, invariant 3), run as root by sol-entrypoint in live mode before
+# supervisord: a RUNNING control state becomes ENTRY_STOP, so no new BUY leaves after a restart
+# without a human `sol trading start`. ENTRY_STOP and HARD_STOP stay as they are. An unreadable
+# status or a refused kill-switch exits non-zero, and the entrypoint stops before supervisord.
+set -eu
+state="$(sol-run operations node /app/dist/src/executor-operations/main.js status \
+  | node /app/dist/scripts/deploy/operations-state.js control-state)"
+if [ "$state" = RUNNING ]; then
+  sol-run operations node /app/dist/src/executor-operations/main.js \
+    kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP > /dev/null
+  echo '{"service":"sol-entrypoint","event":"boot.entry_stop","previousControlState":"RUNNING"}'
+fi
+```
+
+In `sol-entrypoint`, the live branch becomes:
+
+```sh
+if [ "$mode" = live ]; then
+  install -m 0644 /etc/sol/programs/live.conf /run/sol/programs/live.conf
+  # Invariant (spec 13): after any restart, no new BUY before a human `sol trading start`.
+  sol-boot-entry-stop
+fi
+```
+
+Add `'sol-boot-entry-stop'` to `SCRIPTS` in `tests/deploy-back-container.test.ts`, and replace the entrypoint test:
+
+```ts
+void test('the entrypoint distributes secrets and applies the boot entry-stop before supervisord', async () => {
+  const entrypoint = await artifact('deploy/back/bin/sol-entrypoint');
+  // Under `set -e`, a failing plain command line ends the entrypoint before supervisord.
+  assert.match(entrypoint, /^set -eu$/mu);
+  assertOrder(entrypoint, [
+    'node /app/dist/scripts/deploy/distribute-secrets.js "$mode"',
+    'install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf',
+    'if [ "$mode" = live ]; then',
+    'install -m 0644 /etc/sol/programs/live.conf /run/sol/programs/live.conf',
+    '\n  sol-boot-entry-stop\nfi\n',
+    'exec supervisord -n -c /etc/sol/supervisord.conf',
+  ]);
+});
+```
+
+Add the behaviour test. The stubbed `node` runs the repository source of `operations-state`, so the real exit codes drive the shell:
+
+```ts
+void test('the boot entry-stop turns only RUNNING into ENTRY_STOP and fails closed', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-boot-entry-stop-'));
+  try {
+    const bin = join(directory, 'bin');
+    const calls = join(directory, 'calls');
+    await mkdir(bin);
+    // sol-run logs its arguments; `status` prints STUB_STATUS and exits STUB_STATUS_EXIT, the
+    // kill-switch exits STUB_KILL_EXIT.
+    await writeFile(join(bin, 'sol-run'), [
+      '#!/bin/sh',
+      `echo "$*" >> '${calls}'`,
+      'case "$*" in',
+      '  *"/main.js status") printf \'%s\' "$STUB_STATUS"; exit "$STUB_STATUS_EXIT" ;;',
+      '  *"/main.js kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP") echo \'{}\'; exit "$STUB_KILL_EXIT" ;;',
+      'esac',
+      'exit 99',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    // node: the image path of operations-state runs the repository source of that command.
+    await writeFile(join(bin, 'node'), [
+      '#!/bin/sh',
+      'if [ "$1" != /app/dist/scripts/deploy/operations-state.js ]; then exit 99; fi',
+      'shift',
+      `exec '${process.execPath}' --import tsx '${fileURLToPath(new URL('scripts/deploy/operations-state.ts', root))}' "$@"`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const status = (state: string): string => JSON.stringify({ payloadVersion: 1, command: 'status', controlState: state });
+    const run = async (stub: Readonly<{ status: string; statusExit?: number; killExit?: number }>) => {
+      await rm(calls, { force: true });
+      const result = spawnSync('sh', [fileURLToPath(new URL('deploy/back/bin/sol-boot-entry-stop', root))], {
+        cwd: fileURLToPath(root),
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          STUB_STATUS: stub.status,
+          STUB_STATUS_EXIT: String(stub.statusExit ?? 0),
+          STUB_KILL_EXIT: String(stub.killExit ?? 0),
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      const invoked = (await readFile(calls, 'utf8').catch(() => '')).split('\n').filter(Boolean);
+      return { code: result.status, stdout: result.stdout, invoked };
+    };
+    const statusCall = 'operations node /app/dist/src/executor-operations/main.js status';
+    const killCall = 'operations node /app/dist/src/executor-operations/main.js kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP';
+
+    assert.deepEqual(await run({ status: status('RUNNING') }), {
+      code: 0,
+      stdout: '{"service":"sol-entrypoint","event":"boot.entry_stop","previousControlState":"RUNNING"}\n',
+      invoked: [statusCall, killCall],
+    });
+    for (const state of ['ENTRY_STOP', 'HARD_STOP']) {
+      assert.deepEqual(await run({ status: status(state) }), { code: 0, stdout: '', invoked: [statusCall] }, state);
+    }
+    for (const failure of [
+      { status: '', statusExit: 1 },
+      { status: 'not json' },
+      { status: status('PAUSED') },
+    ]) {
+      const result = await run(failure);
+      assert.notEqual(result.code, 0, JSON.stringify(failure));
+      assert.deepEqual(result.invoked, [statusCall], JSON.stringify(failure));
+    }
+    const refused = await run({ status: status('RUNNING'), killExit: 1 });
+    assert.notEqual(refused.code, 0);
+    assert.equal(refused.stdout, '');
+    assert.deepEqual(refused.invoked, [statusCall, killCall]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+```
+
+Run: `npx tsx --test tests/deploy-back-container.test.ts`. Expected: 10 tests pass. A mutation that ignores a refused kill-switch (`|| true`) must make the behaviour test fail.
+
+- [ ] **Step 3: A gate-10 draft owned by `ops` (finding 2)**
+
+H2f reads the draft only when `ops` owns it with mode 0400 or 0600 (`readPreflightProtectedFile`). In the runbook, « Qualification d'une enveloppe (gate 10) »:
+
+```bash
+sol_compose exec back sh -c 'umask 077 && sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json && chown ops:ops /var/lib/sol/evidence/preflight-draft.json'
+```
+
+The paragraph after the block explains why. `tests/deployment-artifacts.test.ts` requires this exact command.
+
+- [ ] **Step 4: Never `down --volumes` (finding 3)**
+
+`down --volumes` also deletes `evidence` and `caddy-data`. In « Démarrage et arrêt », the stop is `sol_compose stop`: it waits for the whole `stop_grace_period`, so no `--timeout 60`. The `down --volumes` paragraph says what it deletes and forbids it. In step 4 of the takeover, an empty database comes from:
+
+```bash
+sol_compose down
+docker volume rm sol-token-listener_postgres-data
+```
+
+« Retour arrière » uses `sol_compose stop`. The runbook test requires `docker volume rm sol-token-listener_postgres-data`, rejects `--timeout 60` and any `sol_compose down --volumes` line. `docs/system-overview.html` says what `down --volumes` would delete.
+
+- [ ] **Step 5: Cheaper bcrypt and a CPU share for the front (finding 4, nit 9)**
+
+`deploy/host/init-secrets.sh` hashes at cost 10 and writes the hash in place only once complete:
+
+```bash
+hash_file="$host/secrets/front/front-basic-auth-hash"
+if [ ! -e "$hash_file" ]; then
+  password="$(openssl rand -base64 24 | tr -d '\n')"
+  # Cost 10: each failed login costs Caddy one bcrypt comparison, and the password is random.
+  # The hash lands in place only once complete: a failed run leaves no empty secret behind.
+  printf '%s\n' "$password" \
+    | docker run --rm -i --entrypoint caddy "$caddy_image" hash-password --bcrypt-cost 10 > "$hash_file.tmp"
+  grep -Eq '^\$2a\$10\$[./A-Za-z0-9]{53}$' "$hash_file.tmp"
+  chmod 0600 "$hash_file.tmp"
+  mv "$hash_file.tmp" "$hash_file"
+  printf 'front password, shown once (store it in your password manager): %s\n' "$password"
+  unset password
+fi
+```
+
+The smoke passes `'--bcrypt-cost', '10'` to `caddy hash-password` and expects `$2a$10$`. In `deploy/compose.yaml`, the front service gets:
+
+```yaml
+    # Each failed basic_auth attempt costs one bcrypt comparison: a flood stays within this share.
+    cpus: 0.5
+```
+
+In `tests/deploy-host-tooling.test.ts`, `FAKE_HASH` becomes `$2a$10$…`, the first test checks that the fake `docker` received `hash-password --bcrypt-cost 10`, and a new test covers the failures:
+
+```ts
+void test('init-secrets leaves no front hash behind when Caddy fails, and retries on the next run', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-init-fail-'));
+  try {
+    const host = join(directory, 'host');
+    const hashFile = join(host, 'secrets/front/front-basic-auth-hash');
+    const run = (body: string): Promise<ReturnType<typeof spawnSync>> => fakeDocker(directory, body)
+      .then((bin) => spawnSync('bash', [join(repository, 'deploy/host/init-secrets.sh'), host], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      }));
+    for (const failing of ['cat > /dev/null; exit 1', "cat > /dev/null; printf 'not a hash\\n'"]) {
+      const failed = await run(failing);
+      assert.notEqual(failed.status, 0, failing);
+      assert.doesNotMatch(String(failed.stdout), /front password/u, failing);
+      await assert.rejects(stat(hashFile), { code: 'ENOENT' }, failing);
+    }
+    const retried = await run(`cat > /dev/null; printf '%s\\n' '${FAKE_HASH}'`);
+    assert.equal(retried.status, 0, String(retried.stderr));
+    assert.equal((await readFile(hashFile, 'utf8')).trim(), FAKE_HASH);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+```
+
+- [ ] **Step 6: A SCRAM verifier instead of the login password (nit 6)**
+
+In `src/deploy/database-logins.ts`, import `createHash`, `createHmac`, `pbkdf2Sync` and `randomBytes` from `node:crypto`, add `const SCRAM_ITERATIONS = 4096;`, then:
+
+```ts
+/**
+ * The SCRAM-SHA-256 verifier PostgreSQL stores for a password (RFC 5802, RFC 7677). Sent in place
+ * of the password, it keeps the password out of the server's logs, even when a statement fails.
+ * SASLprep leaves the ASCII alphabet of `assertPassword` unchanged.
+ */
+export function scramSha256Verifier(password: string, salt: Buffer = randomBytes(16)): string {
+  const salted = pbkdf2Sync(password, salt, SCRAM_ITERATIONS, 32, 'sha256');
+  const clientKey = createHmac('sha256', salted).update('Client Key').digest();
+  const storedKey = createHash('sha256').update(clientKey).digest('base64');
+  const serverKey = createHmac('sha256', salted).update('Server Key').digest('base64');
+  return `SCRAM-SHA-256$${String(SCRAM_ITERATIONS)}:${salt.toString('base64')}$${storedKey}:${serverKey}`;
+}
+```
+
+`ensureLogin` sends `PASSWORD ${literal(scramSha256Verifier(password))}` in `CREATE ROLE` and `ALTER ROLE`. In `tests/deploy-database-logins.test.ts`, the create and alter tests match `PASSWORD 'SCRAM-SHA-256$4096:…'` and check that no statement contains the password. A test proves the verifier against the RFC 7677 exchange:
+
+```ts
+void test('the SCRAM-SHA-256 verifier answers the RFC 7677 exchange', () => {
+  const verifier = scramSha256Verifier('pencil', Buffer.from('W22ZaJ0SNY7soEsUEjb6gQ==', 'base64'));
+  const parts = /^SCRAM-SHA-256\$4096:([^$]+)\$([^:]+):(.+)$/u.exec(verifier);
+  assert.ok(parts !== null, verifier);
+  assert.equal(parts[1], 'W22ZaJ0SNY7soEsUEjb6gQ==');
+  const storedKey = Buffer.from(parts[2] ?? '', 'base64');
+  const serverKey = Buffer.from(parts[3] ?? '', 'base64');
+  const nonce = 'rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0';
+  const authMessage = `n=user,r=rOprNGfwEbeRWgbNEkqO,r=${nonce},s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,c=biws,r=${nonce}`;
+  // ServerKey reproduces the RFC's server signature; StoredKey accepts the RFC's client proof.
+  assert.equal(createHmac('sha256', serverKey).update(authMessage).digest('base64'),
+    '6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=');
+  const signature = createHmac('sha256', storedKey).update(authMessage).digest();
+  const proof = Buffer.from('dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=', 'base64');
+  const clientKey = Buffer.from(proof.map((byte, index) => byte ^ (signature[index] ?? 0)));
+  assert.deepEqual(createHash('sha256').update(clientKey).digest(), storedKey);
+});
+```
+
+- [ ] **Step 7: The operator route drops basic credentials (nit 7)**
+
+In `deploy/front/Caddyfile`, inside `route`, before `basic_auth`:
+
+```caddyfile
+		# The console sends its own `Authorization: Bearer` token, checked by the operator API, which
+		# only answers the Host it binds (OPERATOR_API_HOST:OPERATOR_API_PORT of operator-api.env).
+		# A browser may also attach the front's basic credentials here: they never reach the back.
+		@operator_basic {
+			path /operator/v1/*
+			header_regexp Authorization (?i)^basic\s
+		}
+		request_header @operator_basic -Authorization
+		reverse_proxy /operator/v1/* back:3100 {
+			header_up Host 0.0.0.0:3100
+		}
+```
+
+The Caddy test of `tests/deployment-artifacts.test.ts` requires these lines, in this order.
+
+- [ ] **Step 8: Hardening of `back` and `migrate` (nit 10)**
+
+In `deploy/compose.yaml`, after `x-logging`:
+
+```yaml
+# The back image drops root itself (setpriv, supervisord `user=`): no process may gain privileges
+# again, and no core dump may carry a secret out of memory.
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [NET_RAW, MKNOD]
+  ulimits:
+    core: 0
+```
+
+`back` and `migrate` start with `<<: *hardening`. The front keeps its defaults: Caddy binds 80 and 443 as a non-root user through its file capability, which `no-new-privileges` would drop. `tests/deployment-artifacts.test.ts` checks the block, its two uses, the 240 s grace and the front's `cpus: 0.5`, both in the file and in the resolved configuration (`docker compose config`).
+
+- [ ] **Step 9: Verify and commit**
+
+Run:
+
+```bash
+npm run check:backend
+npm run lint
+npx tsx --test tests/deploy-*.test.ts tests/deployment-artifacts.test.ts
+npm run build:backend
+npm run deployment:smoke
+npm run deployment:smoke:signal
+```
+
+Expected: everything passes, and the smoke ends with `Deployment smoke passed.` Then commit, push and wait for a green CI before the merge.
+
 ## Task 16: Validation on the Mac (spec 11.3) — STOP: needs the user's explicit go
 
 Live mode calls Helius (listener, H2a, auto-arm, H2b) with the real keys. Do not start this task without an explicit go from the user. The listener also needs a usable RPC project, which is the pending decision about the exhausted listener project. Until then, validate with `SOL_HEALTH_REQUIRE_OK=false`.
@@ -5893,18 +6281,18 @@ The server switch (spec section 10) is phase 2: a new plan once the listener RPC
 | Spec section | Tasks |
 |---|---|
 | 5 Topology, networks, ports, volumes | 11 |
-| 6.1 Supervisor and users | 9, 10 |
-| 6.2 Programs, modes | 3, 9 |
+| 6.1 Supervisor and users | 9, 10, 15b |
+| 6.2 Programs, modes | 3, 9, 15b |
 | 6.3 H2b on demand, exit 75 | 2, 9 |
 | 6.4 Trading start/stop (amended) | 1, 8, 9 |
-| 6.5 Health | 9 |
+| 6.5 Health | 9, 15b |
 | 6.6 Logs | 9, 11 |
 | 6.7 Manual commands | 9, 14 |
 | 7.1–7.2 Secrets inventory and file phase | 3, 4, 5, 6, 11, 13 |
 | 7.3 Vault seam | unchanged directories `/run/sol/<user>/` (sub-project 2) |
 | 7.4 Rotation | 14 |
-| 8 Caddy front | 10 |
-| 9.1 Logins | 7 |
+| 8 Caddy front | 10, 15b |
+| 9.1 Logins | 7, 15b |
 | 9.2 Takeover | 13, 14, 17 |
 | 9.3 Rollback | 14 |
 | 9.4 Backups | 13, 18 |
@@ -5912,5 +6300,5 @@ The server switch (spec section 10) is phase 2: a new plan once the listener RPC
 | 11.1 Static tests | 9, 10, 11, 12, 13, 14 |
 | 11.2 Container tests in CI | 12 |
 | 11.3 Mac validation | 16 |
-| 13 Live invariants | 2, 6, 9, 10, 11, 12 |
+| 13 Live invariants | 2, 6, 9, 10, 11, 12, 15b |
 | 15 Acceptance criteria | 15, 16, 17 |

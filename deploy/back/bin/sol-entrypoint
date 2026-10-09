@@ -16,12 +16,6 @@ install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf
 if [ "$mode" = live ]; then
   install -m 0644 /etc/sol/programs/live.conf /run/sol/programs/live.conf
   # Invariant (spec 13): after any restart, no new BUY before a human `sol trading start`.
-  state="$(sol-run operations node /app/dist/src/executor-operations/main.js status \
-    | node /app/dist/scripts/deploy/operations-state.js control-state)"
-  if [ "$state" = RUNNING ]; then
-    sol-run operations node /app/dist/src/executor-operations/main.js \
-      kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP > /dev/null
-    echo '{"service":"sol-entrypoint","event":"boot.entry_stop","previousControlState":"RUNNING"}'
-  fi
+  sol-boot-entry-stop
 fi
 exec supervisord -n -c /etc/sol/supervisord.conf

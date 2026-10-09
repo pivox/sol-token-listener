@@ -851,8 +851,9 @@ function publicBaseUrl() {
 async function writeSmokeHost() {
   const { stdout: frontHash } = await runDocker([
     'run', '--rm', '-i', '--entrypoint', 'caddy', deploymentImages.frontend, 'hash-password',
+    '--bcrypt-cost', '10',
   ], { input: `${frontPassword}\n`, reflectFailureOutput: false });
-  if (!/^\$2a\$\d{2}\$[./A-Za-z0-9]{53}\n$/u.test(frontHash)) throw new Error('Caddy did not return a bcrypt hash.');
+  if (!/^\$2a\$10\$[./A-Za-z0-9]{53}\n$/u.test(frontHash)) throw new Error('Caddy did not return a bcrypt hash.');
   const secrets = join(hostDirectory, 'secrets');
   const files = [
     ['secrets/db/postgres-admin-password', `${postgresPassword}\n`],

@@ -33,8 +33,13 @@ generate "$host/secrets/back/operator-api-token"
 hash_file="$host/secrets/front/front-basic-auth-hash"
 if [ ! -e "$hash_file" ]; then
   password="$(openssl rand -base64 24 | tr -d '\n')"
-  printf '%s\n' "$password" | docker run --rm -i --entrypoint caddy "$caddy_image" hash-password > "$hash_file"
-  chmod 0600 "$hash_file"
+  # Cost 10: each failed login costs Caddy one bcrypt comparison, and the password is random.
+  # The hash lands in place only once complete: a failed run leaves no empty secret behind.
+  printf '%s\n' "$password" \
+    | docker run --rm -i --entrypoint caddy "$caddy_image" hash-password --bcrypt-cost 10 > "$hash_file.tmp"
+  grep -Eq '^\$2a\$10\$[./A-Za-z0-9]{53}$' "$hash_file.tmp"
+  chmod 0600 "$hash_file.tmp"
+  mv "$hash_file.tmp" "$hash_file"
   printf 'front password, shown once (store it in your password manager): %s\n' "$password"
   unset password
 fi

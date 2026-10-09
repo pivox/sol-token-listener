@@ -8,6 +8,14 @@ x-logging: &logging
     max-size: "20m"
     max-file: "5"
 
+# The back image drops root itself (setpriv, supervisord `user=`): no process may gain privileges
+# again, and no core dump may carry a secret out of memory.
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [NET_RAW, MKNOD]
+  ulimits:
+    core: 0
+
 services:
   postgres:
     image: postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3
@@ -29,6 +37,7 @@ services:
     restart: unless-stopped
 
   migrate:
+    <<: *hardening
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     command: ["sol-admin", "migrate"]
     environment:
@@ -43,6 +52,7 @@ services:
     restart: "no"
 
   back:
+    <<: *hardening
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     build:
       context: ..
@@ -60,7 +70,8 @@ services:
       - evidence:/var/lib/sol/evidence
     tmpfs: ["/run/sol:mode=0711,size=16m"]
     init: true
-    stop_grace_period: 60s
+    # supervisord stops its programs one after the other (deploy/back/supervisor/programs).
+    stop_grace_period: 240s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -87,6 +98,8 @@ services:
       - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro
       - caddy-data:/data
     ports: ["127.0.0.1:${FRONT_PORT:-8080}:8080"]
+    # Each failed basic_auth attempt costs one bcrypt comparison: a flood stays within this share.
+    cpus: 0.5
     depends_on:
       back:
         condition: service_healthy

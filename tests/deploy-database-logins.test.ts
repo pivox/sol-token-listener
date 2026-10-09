@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,10 +10,12 @@ import {
   adminDatabaseUrl,
   ensureLogin,
   groupRolesSql,
+  scramSha256Verifier,
   type SqlClient,
 } from '../src/deploy/database-logins.js';
 
 const ATTRIBUTES = 'LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS';
+const VERIFIER = "'SCRAM-SHA-256\\$4096:[A-Za-z0-9+/]{22}==\\$[A-Za-z0-9+/]{43}=:[A-Za-z0-9+/]{43}='";
 
 class RecordingClient implements SqlClient {
   public readonly statements: string[] = [];
@@ -38,7 +41,8 @@ void test('a new login is created NOINHERIT with exactly its group membership', 
   const client = new RecordingClient(false, []);
   await ensureLogin(client, 'sol_live', 'a'.repeat(64));
   assert.equal(client.statements[0], 'BEGIN');
-  assert.equal(client.statements[2], `CREATE ROLE "sol_live" ${ATTRIBUTES} PASSWORD '${'a'.repeat(64)}'`);
+  assert.match(client.statements[2] ?? '', new RegExp(`^CREATE ROLE "sol_live" ${ATTRIBUTES} PASSWORD ${VERIFIER}$`, 'u'));
+  assert.ok(client.statements.every((statement) => !statement.includes('a'.repeat(64))), 'password sent in clear');
   assert.equal(
     client.statements.at(-2),
     'GRANT "sol_token_executor_live" TO "sol_live" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE',
@@ -49,9 +53,29 @@ void test('a new login is created NOINHERIT with exactly its group membership', 
 void test('an existing login gets its new password and loses every other membership', async () => {
   const client = new RecordingClient(true, ['sol_token_executor_live', 'sol_token_executor_operations']);
   await ensureLogin(client, 'sol_live', 'b'.repeat(64));
-  assert.ok(client.statements.includes(`ALTER ROLE "sol_live" WITH ${ATTRIBUTES} PASSWORD '${'b'.repeat(64)}'`));
+  const alter = new RegExp(`^ALTER ROLE "sol_live" WITH ${ATTRIBUTES} PASSWORD ${VERIFIER}$`, 'u');
+  assert.equal(client.statements.filter((statement) => alter.test(statement)).length, 1);
+  assert.ok(client.statements.every((statement) => !statement.includes('b'.repeat(64))), 'password sent in clear');
   assert.ok(client.statements.includes('REVOKE "sol_token_executor_operations" FROM "sol_live"'));
   assert.equal(client.statements.includes('REVOKE "sol_token_executor_live" FROM "sol_live"'), false);
+});
+
+void test('the SCRAM-SHA-256 verifier answers the RFC 7677 exchange', () => {
+  const verifier = scramSha256Verifier('pencil', Buffer.from('W22ZaJ0SNY7soEsUEjb6gQ==', 'base64'));
+  const parts = /^SCRAM-SHA-256\$4096:([^$]+)\$([^:]+):(.+)$/u.exec(verifier);
+  assert.ok(parts !== null, verifier);
+  assert.equal(parts[1], 'W22ZaJ0SNY7soEsUEjb6gQ==');
+  const storedKey = Buffer.from(parts[2] ?? '', 'base64');
+  const serverKey = Buffer.from(parts[3] ?? '', 'base64');
+  const nonce = 'rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0';
+  const authMessage = `n=user,r=rOprNGfwEbeRWgbNEkqO,r=${nonce},s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,c=biws,r=${nonce}`;
+  // ServerKey reproduces the RFC's server signature; StoredKey accepts the RFC's client proof.
+  assert.equal(createHmac('sha256', serverKey).update(authMessage).digest('base64'),
+    '6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=');
+  const signature = createHmac('sha256', storedKey).update(authMessage).digest();
+  const proof = Buffer.from('dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=', 'base64');
+  const clientKey = Buffer.from(proof.map((byte, index) => byte ^ (signature[index] ?? 0)));
+  assert.deepEqual(createHash('sha256').update(clientKey).digest(), storedKey);
 });
 
 void test('a weak or unsafe password is refused before any statement', async () => {

@@ -8,7 +8,9 @@ import { test } from 'node:test';
 import { ROLES, type RoleName } from '../src/deploy/stack.js';
 
 const root = new URL('../', import.meta.url);
-const SCRIPTS = Object.freeze(['sol', 'sol-admin', 'sol-entrypoint', 'sol-h2b', 'sol-health', 'sol-run']);
+const SCRIPTS = Object.freeze([
+  'sol', 'sol-admin', 'sol-boot-entry-stop', 'sol-entrypoint', 'sol-h2b', 'sol-health', 'sol-run',
+]);
 const SUPERVISOR_FILES = Object.freeze([
   'deploy/back/supervisor/supervisord.conf',
   'deploy/back/supervisor/programs/common.conf',
@@ -60,7 +62,7 @@ void test('every back script is POSIX sh and parses', async () => {
   }
 });
 
-void test('supervisor runs each program as its own user with bounded stops', async () => {
+void test('supervisor runs each program as its own user, retries forever and bounds its stop', async () => {
   const common = programs(await artifact('deploy/back/supervisor/programs/common.conf'));
   const live = programs(await artifact('deploy/back/supervisor/programs/live.conf'));
   assert.deepEqual(common.map((program) => program.name), ['listener', 'opapi', 'retention']);
@@ -80,8 +82,13 @@ void test('supervisor runs each program as its own user with bounded stops', asy
     assert.equal(settings.get('user'), ROLES[program.name as RoleName].user, program.name);
     assert.equal(settings.get('directory'), '/app', program.name);
     assert.equal(settings.get('autostart'), program.name === 'worker' ? 'false' : 'true', program.name);
+    assert.equal(settings.get('autorestart'), 'true', program.name);
+    // supervisord waits one more second before each new attempt and never gives up (FATAL).
+    assert.equal(settings.get('startretries'), '1000000', program.name);
     assert.equal(settings.get('stopsignal'), 'TERM', program.name);
-    assert.equal(settings.get('stopwaitsecs'), '40', program.name);
+    // 40 s where the process has its own 30 s shutdown grace; the API and the purge stop at once.
+    assert.equal(settings.get('stopwaitsecs'),
+      program.name === 'opapi' || program.name === 'retention' ? '10' : '40', program.name);
     assert.equal(settings.get('killasgroup'), 'true', program.name);
     assert.equal(settings.get('stdout_logfile'), '/dev/stdout', program.name);
     assert.equal(settings.get('stdout_logfile_maxbytes'), '0', program.name);
@@ -89,6 +96,18 @@ void test('supervisor runs each program as its own user with bounded stops', asy
   }
   // sol-h2b forwards TERM to H2b itself: supervisord must not signal the child directly.
   assert.equal(live.find((program) => program.name === 'h2b')?.settings.get('stopasgroup'), 'false');
+});
+
+void test('the back stop grace covers every program stopped one after the other', async () => {
+  const all = [
+    ...programs(await artifact('deploy/back/supervisor/programs/common.conf')),
+    ...programs(await artifact('deploy/back/supervisor/programs/live.conf')),
+  ];
+  // supervisord stops one program at a time, each within stopwaitsecs plus about one second.
+  const budget = all.reduce((total, program) => total + Number(program.settings.get('stopwaitsecs')) + 1, 0);
+  const grace = /^ {4}stop_grace_period: (\d+)s$/mu.exec(await artifact('deploy/compose.yaml'));
+  assert.ok(grace !== null, 'the back has no stop_grace_period in seconds');
+  assert.ok(budget + 10 <= Number(grace[1]), `stop budget ${String(budget)} s + 10 s margin exceeds ${grace[1] ?? ''} s`);
 });
 
 void test('supervisord keeps its socket root-only and loads the programs the entrypoint selects', async () => {
@@ -103,15 +122,88 @@ void test('supervisord keeps its socket root-only and loads the programs the ent
 
 void test('the entrypoint distributes secrets and applies the boot entry-stop before supervisord', async () => {
   const entrypoint = await artifact('deploy/back/bin/sol-entrypoint');
+  // Under `set -e`, a failing plain command line ends the entrypoint before supervisord.
+  assert.match(entrypoint, /^set -eu$/mu);
   assertOrder(entrypoint, [
     'node /app/dist/scripts/deploy/distribute-secrets.js "$mode"',
     'install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf',
+    'if [ "$mode" = live ]; then',
     'install -m 0644 /etc/sol/programs/live.conf /run/sol/programs/live.conf',
-    'executor-operations/main.js status',
-    'if [ "$state" = RUNNING ]; then',
-    'kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP',
+    '\n  sol-boot-entry-stop\nfi\n',
     'exec supervisord -n -c /etc/sol/supervisord.conf',
   ]);
+});
+
+void test('the boot entry-stop turns only RUNNING into ENTRY_STOP and fails closed', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-boot-entry-stop-'));
+  try {
+    const bin = join(directory, 'bin');
+    const calls = join(directory, 'calls');
+    await mkdir(bin);
+    // sol-run logs its arguments; `status` prints STUB_STATUS and exits STUB_STATUS_EXIT, the
+    // kill-switch exits STUB_KILL_EXIT.
+    await writeFile(join(bin, 'sol-run'), [
+      '#!/bin/sh',
+      `echo "$*" >> '${calls}'`,
+      'case "$*" in',
+      '  *"/main.js status") printf \'%s\' "$STUB_STATUS"; exit "$STUB_STATUS_EXIT" ;;',
+      '  *"/main.js kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP") echo \'{}\'; exit "$STUB_KILL_EXIT" ;;',
+      'esac',
+      'exit 99',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    // node: the image path of operations-state runs the repository source of that command.
+    await writeFile(join(bin, 'node'), [
+      '#!/bin/sh',
+      'if [ "$1" != /app/dist/scripts/deploy/operations-state.js ]; then exit 99; fi',
+      'shift',
+      `exec '${process.execPath}' --import tsx '${fileURLToPath(new URL('scripts/deploy/operations-state.ts', root))}' "$@"`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const status = (state: string): string => JSON.stringify({ payloadVersion: 1, command: 'status', controlState: state });
+    const run = async (stub: Readonly<{ status: string; statusExit?: number; killExit?: number }>) => {
+      await rm(calls, { force: true });
+      const result = spawnSync('sh', [fileURLToPath(new URL('deploy/back/bin/sol-boot-entry-stop', root))], {
+        cwd: fileURLToPath(root),
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          STUB_STATUS: stub.status,
+          STUB_STATUS_EXIT: String(stub.statusExit ?? 0),
+          STUB_KILL_EXIT: String(stub.killExit ?? 0),
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      const invoked = (await readFile(calls, 'utf8').catch(() => '')).split('\n').filter(Boolean);
+      return { code: result.status, stdout: result.stdout, invoked };
+    };
+    const statusCall = 'operations node /app/dist/src/executor-operations/main.js status';
+    const killCall = 'operations node /app/dist/src/executor-operations/main.js kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP';
+
+    assert.deepEqual(await run({ status: status('RUNNING') }), {
+      code: 0,
+      stdout: '{"service":"sol-entrypoint","event":"boot.entry_stop","previousControlState":"RUNNING"}\n',
+      invoked: [statusCall, killCall],
+    });
+    for (const state of ['ENTRY_STOP', 'HARD_STOP']) {
+      assert.deepEqual(await run({ status: status(state) }), { code: 0, stdout: '', invoked: [statusCall] }, state);
+    }
+    for (const failure of [
+      { status: '', statusExit: 1 },
+      { status: 'not json' },
+      { status: status('PAUSED') },
+    ]) {
+      const result = await run(failure);
+      assert.notEqual(result.code, 0, JSON.stringify(failure));
+      assert.deepEqual(result.invoked, [statusCall], JSON.stringify(failure));
+    }
+    const refused = await run({ status: status('RUNNING'), killExit: 1 });
+    assert.notEqual(refused.code, 0);
+    assert.equal(refused.stdout, '');
+    assert.deepEqual(refused.invoked, [statusCall, killCall]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 void test('sol-run drops root to the role user and refuses a foreign role', async () => {

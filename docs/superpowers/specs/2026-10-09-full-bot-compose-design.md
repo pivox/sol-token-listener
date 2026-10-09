@@ -103,6 +103,10 @@ chaque programme tourne sous un utilisateur dédié, créé dans l'image avec un
 | `worker` | 10007 | worker de simulation (qualification) |
 | `ops` | 10008 | commandes manuelles |
 
+Le back et la tâche `migrate` tournent avec `no-new-privileges`, sans les capacités `NET_RAW` et
+`MKNOD`, et sans fichier core : aucun processus ne regagne un privilège, aucun vidage mémoire
+n'emporte un secret.
+
 ### 6.2 Programmes
 
 | Programme | Commande | Démarrage | Login PostgreSQL → rôle de groupe |
@@ -115,11 +119,15 @@ chaque programme tourne sous un utilisateur dédié, créé dans l'image avec un
 | `retention` | `dist/scripts/purge-retained-data.js` | automatique | `sol_retention` → `sol_token_retention_worker` |
 | `worker` | `dist/src/executor/main.js` | manuel, pendant une qualification | `sol_worker` → `sol_token_executor_worker` |
 
-Chaque programme reçoit SIGTERM et dispose de 40 s pour s'arrêter ; le conteneur a un
-`stop_grace_period` de 60 s. Le mode `observe` (`SOL_STACK_MODE=observe`, valeur par défaut)
-ne démarre que `listener`, `opapi` et `retention` et n'exige aucun secret d'exécution : `opapi`
-y utilise l'URL Helius du listener. Le mode `live` ajoute `h2b`, `h2a` et `autoarm`, et rend
-`worker` disponible ; `opapi` y utilise l'URL Helius de l'exécuteur.
+Chaque programme reçoit SIGTERM et dispose de 40 s pour s'arrêter, 10 s pour `opapi` et
+`retention`. `supervisord` les arrête l'un après l'autre, d'où un `stop_grace_period` de 240 s.
+Un programme qui ne démarre pas (base ou RPC indisponible) est relancé sans fin, avec un délai
+qui croît d'une seconde à chaque échec : aucun ne reste `FATAL`.
+
+Le mode `observe` (`SOL_STACK_MODE=observe`, valeur par défaut) ne démarre que `listener`,
+`opapi` et `retention` et n'exige aucun secret d'exécution : `opapi` y utilise l'URL Helius du
+listener. Le mode `live` ajoute `h2b`, `h2a` et `autoarm`, et rend `worker` disponible ; `opapi`
+y utilise l'URL Helius de l'exécuteur.
 
 La qualification d'une enveloppe suspend la rétention pendant la sonde, comme dans le runbook
 actuel : `sol qualify` arrête `retention` et la redémarre à la fin.
@@ -160,7 +168,8 @@ humaine, alors que les sorties continuent.
 est sain si chaque programme attendu dans le mode courant est `RUNNING`, si `h2b` est `RUNNING`
 ou en attente normale de travail, et si `autoarm` est `RUNNING` en mode `live`. Par défaut,
 l'endpoint du listener doit répondre `OK` ; `SOL_HEALTH_REQUIRE_OK=false` accepte `DEGRADED`
-(listener désactivé dans le smoke, ou projet RPC du listener épuisé).
+(listener désactivé dans le smoke, ou projet RPC du listener épuisé). Le message d'échec nomme
+l'état `supervisorctl` du programme fautif, par exemple `BACKOFF` pendant ses relances.
 
 ### 6.6 Logs
 
@@ -243,14 +252,17 @@ relancer `migrate` avant le back.
   la console y envoie son propre `Authorization: Bearer`, que l'API opérateur vérifie avec
   `operator-api-token`, et un navigateur ne peut pas joindre en plus des identifiants HTTP
   basic. L'API ne répond qu'à l'en-tête Host qu'elle écoute : Caddy le réécrit en
-  `0.0.0.0:3100` sur cette route. Mot de passe aléatoire d'au moins 24 caractères ; Caddy ne reçoit que son empreinte
-  bcrypt, depuis le fichier secret, jamais dans le `Caddyfile` ni dans le compose. Caddy retire
-  l'en-tête `Authorization` avant de relayer vers l'API du listener.
+  `0.0.0.0:3100` sur cette route, et retire un éventuel `Authorization: Basic` que le navigateur
+  y joindrait. Mot de passe aléatoire d'au moins 24 caractères ; Caddy ne reçoit que son
+  empreinte bcrypt de coût 10, depuis le fichier secret, jamais dans le `Caddyfile` ni dans le
+  compose. Caddy retire l'en-tête `Authorization` avant de relayer vers l'API du listener.
 - Mode Mac : HTTP sur `127.0.0.1:8080`. Mode serveur : nom de domaine en variable, certificat
   Let's Encrypt automatique sur 80 et 443, HSTS, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`.
 - Limite connue : pas de blocage des tentatives répétées dans Caddy. La longueur du mot de
-  passe compense ; un fail2ban sur les logs Caddy reste une option côté serveur.
+  passe compense. Chaque tentative coûte une comparaison bcrypt et le front est limité à un
+  demi-CPU, si bien qu'un flot de tentatives n'affame pas le back ; un fail2ban sur les logs
+  Caddy reste une option côté serveur.
 
 ## 9. Base de données
 
@@ -261,7 +273,9 @@ fichiers secrets : `LOGIN NOINHERIT`, membre d'exactement un rôle de groupe (ta
 `sol_ops` → `sol_token_executor_operations` et `sol_readiness` →
 `sol_token_executor_readiness` pour les commandes manuelles. Les règles sont celles du runbook
 `docs/operations/executor-live-canary.md`. L'administrateur s'appelle `sol_owner`, comme
-aujourd'hui, pour que la propriété des tables reste identique après restauration.
+aujourd'hui, pour que la propriété des tables reste identique après restauration. `migrate`
+n'envoie que le vérificateur SCRAM-SHA-256 de chaque mot de passe, calculé côté client : le mot
+de passe n'atteint jamais le serveur ni ses journaux.
 
 ### 9.2 Reprise de la base actuelle
 
@@ -379,7 +393,7 @@ recherche dans la stack.
 
 ## 16. Amendements du 2026-10-09 (plan d'implémentation)
 
-Le plan `docs/superpowers/plans/2026-10-09-full-bot-compose.md` a modifié ce spec sur six points,
+Le plan `docs/superpowers/plans/2026-10-09-full-bot-compose.md` a modifié ce spec sur sept points,
 reportés dans les sections concernées :
 
 1. Trading par l'état de contrôle en base (6.2, 6.4, 6.5, 11.1, 13) : `autoarm` rafraîchit aussi
@@ -391,3 +405,7 @@ reportés dans les sections concernées :
 5. Santé stricte par défaut, assouplie par `SOL_HEALTH_REQUIRE_OK=false` (6.5).
 6. `sol qualify start` active la sonde du gate 10 par une surcharge en tmpfs, `sol qualify stop`
    la retire (runbook du lot 4a, étape 1).
+7. Corrections de la revue de la PR #263 (6.1, 6.2, 6.5, 8, 9.1) : relances sans fin, arrêt
+   séquentiel couvert par 240 s, durcissement du back et de `migrate`, front limité à un
+   demi-CPU avec une empreinte bcrypt de coût 10, identifiants basic retirés sur `/operator/v1/`,
+   vérificateur SCRAM à la place du mot de passe des logins.
