@@ -52,8 +52,9 @@ class SetupFileError extends Error {
  * `vault-setup init` runs once, from deploy/host/vault-init.sh, in the `vault-setup` tools
  * container (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 8.1). It initializes Vault
  * with one key share and saves the unseal key first, then:
- * - unseals Vault and enables a `file` audit device writing to its stdout (every later request
- *   reaches the container log, values HMAC'd), then `sol/` (KV v2), AppRole and userpass;
+ * - unseals Vault and enables a `file` audit device writing to its stdout (every later
+ *   authenticated request reaches the container log, string values HMAC'd), then `sol/` (KV v2),
+ *   AppRole and userpass;
  * - loads the four policies, creates the three AppRoles and writes their files;
  * - generates the nine login passwords and the operator API token in Vault;
  * - creates the `operator` login, prints its password once and revokes the root token.

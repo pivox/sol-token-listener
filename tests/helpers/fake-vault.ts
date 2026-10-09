@@ -193,7 +193,7 @@ export class FakeVault {
     const audit = /^sys\/audit\/(.+)$/u.exec(path);
     if (method === 'PUT' && audit !== null) {
       const name = audit[1] ?? '';
-      if (this.audits.has(name)) return json(400, { errors: [`path already in use at ${name}/`] });
+      if (this.audits.has(name)) return json(400, { errors: ['path already in use: invalid configuration'] });
       this.audits.add(name);
       return new Response(null, { status: 204 });
     }

@@ -171,7 +171,11 @@ export class VaultClient {
     await this.json('POST', `sys/auth/${type}`, { token, body: { type } });
   }
 
-  /** A `file` audit device writing to the server's stdout, so every request and response reaches the container log with values HMAC'd (spec 1 and 3). */
+  /**
+   * A `file` audit device writing to the server's stdout, so every authenticated request and its
+   * answer reach the container log (spec 1 and 3). String values are HMAC'd; numbers and booleans
+   * in answers are logged as is, which is why every entry holds strings only.
+   */
   public async enableStdoutAudit(token: string): Promise<void> {
     await this.json('PUT', 'sys/audit/file', { token, body: { type: 'file', options: { file_path: 'stdout' } } });
   }
