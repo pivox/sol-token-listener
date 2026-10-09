@@ -1,0 +1,12 @@
+# Server backup job (spec 9.4). Install: deploy/host/sol-backup.service and .timer into
+# /etc/systemd/system, then `systemctl enable --now sol-backup.timer`.
+[Unit]
+Description=Backup of the sol-token-listener database (pg_dump -Fc)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=SOL_HOST_DIR=/srv/sol-token-listener
+Environment=SOL_REPOSITORY=/srv/sol-token-listener/repository
+ExecStart=/usr/bin/env bash /srv/sol-token-listener/repository/deploy/host/backup.sh
