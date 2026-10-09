@@ -16,6 +16,8 @@ const INITIALIZE_TIMEOUT_MS = 60_000;
 const SNAPSHOT_TIMEOUT_MS = 120_000;
 /** How long `unseal` waits for the node to become active. */
 const ACTIVE_WAIT_MS = 60_000;
+/** The longest delay Node's timers honour (`AbortSignal.timeout`, `setTimeout`): 2^31 − 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** One segment of a path: lower case, digits, `_` and `-`, plus `.` after the first character. */
 const PATH_SEGMENT = /^[a-z0-9_-][a-z0-9._-]*$/u;
@@ -274,7 +276,9 @@ export class VaultClient {
 }
 
 function positiveInteger(name: string, value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${name} must be a positive integer`);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_TIMER_MS) {
+    throw new TypeError(`${name} must be an integer from 1 to ${String(MAX_TIMER_MS)}`);
+  }
   return value;
 }
 

@@ -125,12 +125,14 @@ export class FakeVault {
     this.initialized = true;
     this.sealed = true;
     this.standbyRemaining = 0;
-    // A fresh Vault has no mount, no auth method, no policy and no AppRole.
+    // A fresh Vault has no mount, no auth method, no policy, no AppRole, no entry and no user.
     this.mounts.clear();
     this.auths.clear();
     this.policies.clear();
     this.appRoles.clear();
     this.rolePolicies.clear();
+    this.kv.clear();
+    this.users.clear();
     return json(200, { keys: ['00'], keys_base64: [this.unsealKey], root_token: this.rootToken });
   }
 

@@ -377,17 +377,20 @@ void test('a path segment outside the safe alphabet is refused before any reques
   for (const path of paths) await assert.rejects(client.readKv(vault.rootToken, path), VaultMissingError, path);
 });
 
-void test('the timeouts are positive safe integers', () => {
+void test('the timeouts are integers within what Node timers honour', () => {
   const build = (option: 'timeoutMs' | 'pollIntervalMs', value: number): VaultClient => new VaultClient(
     option === 'timeoutMs' ? { address: ADDRESS, timeoutMs: value } : { address: ADDRESS, pollIntervalMs: value },
   );
   for (const option of ['timeoutMs', 'pollIntervalMs'] as const) {
-    for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
-      assert.throws(() => build(option, value), new RegExp(`^TypeError: ${option} must be a positive integer$`, 'u'),
-        `${option} ${String(value)}`);
+    for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648, Number.MAX_SAFE_INTEGER]) {
+      assert.throws(
+        () => build(option, value),
+        new RegExp(`^TypeError: ${option} must be an integer from 1 to 2147483647$`, 'u'),
+        `${option} ${String(value)}`,
+      );
     }
     assert.doesNotThrow(() => build(option, 1));
-    assert.doesNotThrow(() => build(option, Number.MAX_SAFE_INTEGER));
+    assert.doesNotThrow(() => build(option, 2_147_483_647));
   }
 });
 
