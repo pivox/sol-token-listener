@@ -1,3 +1,4 @@
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
 import { trustedObservedPipelineOrigin } from '../../domain/observed-pipeline-failure.js';
 import { registerTrustedTerminalAttribution } from '../../domain/terminal-attribution.js';
@@ -37,9 +38,11 @@ const DEFINITION_BY_DISCRIMINATOR = new Map(
 );
 const CREATE_V2_REQUIRED_ARGUMENT_COUNT = 5;
 const CREATE_V2_SUFFIX_LENGTHS = new Set([0, 1, 9, 10]);
+const CREATE_V2_REMAINING_ACCOUNT_COUNTS = new Set([0, 3, 4, 5, 8]);
+const PUMP_PROGRAM = new PublicKey(PUMP_PROGRAM_ID);
 const QUOTE_CONTROL_PDA = PublicKey.findProgramAddressSync(
   [Buffer.from('quote-control')],
-  new PublicKey(PUMP_PROGRAM_ID),
+  PUMP_PROGRAM,
 )[0].toBase58();
 
 export function decodePumpInstruction(
@@ -317,51 +320,110 @@ function mapAccounts(
     return [account.name, address] as const;
   });
 
-  const remainingCount =
-    instruction.accounts.length - definition.accounts.length;
   if (name === 'create_v2') {
-    if (remainingCount !== 0 && remainingCount !== 3 && remainingCount !== 4) {
-      throw createPumpDecodingError(
-        'PUMP_ACCOUNT_MISSING',
-        true,
-        `create_v2 attend zéro, trois ou quatre remaining accounts, reçu ${remainingCount}.`,
-      );
-    }
-    if (remainingCount >= 3) {
-      const quoteMint = instruction.accounts[definition.accounts.length];
-      const quoteCurve = instruction.accounts[definition.accounts.length + 1];
-      const quoteProgram = instruction.accounts[definition.accounts.length + 2];
-      if (
-        quoteMint === undefined
-        || quoteCurve === undefined
-        || quoteProgram === undefined
-      ) {
-        throw createPumpDecodingError(
-          'PUMP_ACCOUNT_MISSING',
-          true,
-          'Remaining accounts create_v2 incomplets.',
-        );
-      }
-      entries.push(
-        ['quote_mint', quoteMint],
-        ['associated_quote_bonding_curve', quoteCurve],
-        ['quote_token_program', quoteProgram],
-      );
-    }
-    if (remainingCount === 4) {
-      const quoteControl = instruction.accounts[definition.accounts.length + 3];
-      if (quoteControl !== QUOTE_CONTROL_PDA) {
-        throw createPumpDecodingError(
-          'PUMP_ACCOUNT_MISSING',
-          false,
-          'Remaining account quote_control create_v2 invalide.',
-        );
-      }
-      entries.push(['quote_control', quoteControl]);
-    }
+    entries.push(...createV2RemainingAccounts(
+      instruction.accounts.slice(definition.accounts.length),
+    ));
   }
 
   return Object.freeze(Object.fromEntries(entries));
+}
+
+// Positional create_v2 remaining accounts (@pump-fun/pump-sdk 4.0.0 IDL docs and its
+// `createV2QuoteRemainingAccounts`): none for SOL; the quote mint, the curve's quote ATA and the
+// quote token program; the `quote-control` PDA; for a quote that is a pump coin Q listed neither on
+// `Global` nor in quote control, Q's own `bonding-curve` PDA; once Q migrated, its canonical
+// pump-amm pool and the pool's base and quote vaults. The pool PDA and its quote vault derive from
+// Q's own quote mint, which the instruction does not carry, and the program checks both (6103
+// InvalidQuotePool), so only the base vault is re-derived here.
+function createV2RemainingAccounts(
+  remaining: readonly string[],
+): (readonly [string, string])[] {
+  if (!CREATE_V2_REMAINING_ACCOUNT_COUNTS.has(remaining.length)) {
+    throw createPumpDecodingError(
+      'PUMP_ACCOUNT_MISSING',
+      true,
+      `create_v2 attend zéro, trois, quatre, cinq ou huit remaining accounts, reçu ${remaining.length}.`,
+    );
+  }
+  if (remaining.length === 0) return [];
+  const [quoteMint, quoteCurve, quoteProgram] = remaining;
+  if (quoteMint === undefined || quoteCurve === undefined || quoteProgram === undefined) {
+    throw createPumpDecodingError(
+      'PUMP_ACCOUNT_MISSING',
+      true,
+      'Remaining accounts create_v2 incomplets.',
+    );
+  }
+  const entries: (readonly [string, string])[] = [
+    ['quote_mint', quoteMint],
+    ['associated_quote_bonding_curve', quoteCurve],
+    ['quote_token_program', quoteProgram],
+  ];
+  if (remaining.length >= 4) {
+    entries.push(['quote_control', requireRemainingRole(
+      remaining[3], QUOTE_CONTROL_PDA, 'quote_control',
+    )]);
+  }
+  if (remaining.length >= 5) {
+    entries.push(['quote_bonding_curve', requireRemainingRole(
+      remaining[4], derivedAddress(() => pumpPda('bonding-curve', quoteMint)), 'quote_bonding_curve',
+    )]);
+  }
+  if (remaining.length === 8) {
+    const pool = remaining[5];
+    const quoteVault = remaining[7];
+    if (pool === undefined || quoteVault === undefined) {
+      throw createPumpDecodingError(
+        'PUMP_ACCOUNT_MISSING',
+        true,
+        'Remaining accounts create_v2 incomplets.',
+      );
+    }
+    entries.push(
+      ['quote_pool', pool],
+      ['quote_pool_base_vault', requireRemainingRole(
+        remaining[6],
+        derivedAddress(() => getAssociatedTokenAddressSync(
+          new PublicKey(quoteMint), new PublicKey(pool), true, new PublicKey(quoteProgram),
+        )),
+        'quote_pool_base_vault',
+      )],
+      ['quote_pool_quote_vault', quoteVault],
+    );
+  }
+  return entries;
+}
+
+function requireRemainingRole(
+  actual: string | undefined,
+  expected: string | null,
+  role: string,
+): string {
+  if (actual === undefined || expected === null || actual !== expected) {
+    throw createPumpDecodingError(
+      'PUMP_ACCOUNT_MISSING',
+      false,
+      `Remaining account ${role} create_v2 invalide.`,
+    );
+  }
+  return actual;
+}
+
+function pumpPda(seed: string, address: string): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from(seed), new PublicKey(address).toBuffer()],
+    PUMP_PROGRAM,
+  )[0];
+}
+
+/** A malformed address cannot match any derived role. */
+function derivedAddress(derive: () => PublicKey): string | null {
+  try {
+    return derive().toBase58();
+  } catch {
+    return null;
+  }
 }
 
 function familyOf(name: PumpInstructionName): PumpInstructionFamily {
