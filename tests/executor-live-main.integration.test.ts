@@ -913,6 +913,29 @@ void test('fatal handler preserves closed H2b startup identities without exposin
   }
 });
 
+void test('fatal handler exits 75 (EX_TEMPFAIL) only when H2b has no runnable work', () => {
+  const hostileNoWork = Object.freeze({
+    name: 'Error',
+    get code() { return 'LIVE_EXECUTOR_NO_WORK'; },
+  });
+  const cases: readonly (readonly [unknown, number])[] = [
+    [new ExecutionLiveRepositoryError('LIVE_EXECUTOR_NO_WORK'), 75],
+    [new ExecutionLiveRepositoryError('LIVE_EXECUTOR_FOREIGN_LEASE_ACTIVE'), 1],
+    [hostileNoWork, 1],
+    [new Error('LIVE_EXECUTOR_NO_WORK'), 1],
+  ];
+  for (const [error, expected] of cases) {
+    const writes: string[] = [];
+    const processLike: { exitCode?: string | number; stderr: { write(chunk: string): unknown } } = {
+      stderr: { write: (chunk) => { writes.push(chunk); } },
+    };
+    reportLiveExecutorEntrypointFailure(error, processLike);
+    assert.equal(processLike.exitCode, expected);
+    assert.equal(writes.length, 1);
+    assert.match(writes[0] ?? '', /"event":"executor_live\.start_failed"/u);
+  }
+});
+
 void test('terminal recovery inspects durable state without constructing a tail RPC session', async () => {
   let tailSessions = 0;
   const worker = createLiveExecutionWorkerForWork(Object.freeze({

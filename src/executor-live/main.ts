@@ -418,18 +418,22 @@ const SAFE_FATAL_NAMES = new Set([
   'Error', 'TypeError', 'RangeError', 'AggregateError',
 ]);
 
+/** EX_TEMPFAIL: no runnable work yet; the `sol-h2b` loop relaunches H2b later (spec 6.3). */
+export const LIVE_EXECUTOR_NO_WORK_EXIT_CODE = 75;
+
 export function reportLiveExecutorEntrypointFailure(
   error: unknown,
   runtime: { exitCode?: string | number | undefined; stderr: Readonly<{ write(chunk: string): unknown }> } = process,
 ): void {
-  runtime.exitCode = 1;
+  const errorCode = safeErrorProperty(
+    error, 'code', LIVE_EXECUTOR_SAFE_ERROR_CODE_SET, 'LIVE_EXECUTOR_START_FAILED',
+  );
+  runtime.exitCode = errorCode === 'LIVE_EXECUTOR_NO_WORK' ? LIVE_EXECUTOR_NO_WORK_EXIT_CODE : 1;
   runtime.stderr.write(`${JSON.stringify(Object.freeze({
     service: 'sol-token-executor-live',
     event: 'executor_live.start_failed',
     errorName: safeErrorProperty(error, 'name', SAFE_FATAL_NAMES, 'UnknownError'),
-    errorCode: safeErrorProperty(
-      error, 'code', LIVE_EXECUTOR_SAFE_ERROR_CODE_SET, 'LIVE_EXECUTOR_START_FAILED',
-    ),
+    errorCode,
   }))}\n`);
 }
 
