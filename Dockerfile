@@ -41,27 +41,45 @@ FROM node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca
 
 ENV NODE_ENV=production
 
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends supervisor \
+  && rm -rf /var/lib/apt/lists/*
+
+# One Unix user per process family (spec 6.1); only the entrypoint and supervisord stay root.
+RUN set -eu; \
+  for entry in listener:10001 h2b:10002 h2a:10003 autoarm:10004 opapi:10005 retention:10006 worker:10007 ops:10008; do \
+    name="${entry%%:*}"; uid="${entry##*:}"; \
+    groupadd --system --gid "$uid" "$name"; \
+    useradd --system --uid "$uid" --gid "$uid" --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$name"; \
+  done; \
+  install -d -o ops -g ops -m 0700 /var/lib/sol/evidence
+
 WORKDIR /app
 
-COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
-COPY --from=build --chown=node:node /app/dist ./dist
-COPY --chown=node:node package.json package-lock.json ./
+COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json package-lock.json ./
+COPY --from=build /app/scripts/provision-executor-roles.sql ./dist/scripts/provision-executor-roles.sql
+# The build writes the qualification profiles owner-only; every service user reads dist/.
+RUN chmod -R a+rX /app/dist
+COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/
+COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf
+COPY deploy/back/supervisor/programs/ /etc/sol/programs/
 
-USER node
+EXPOSE 3000 3100
 
-EXPOSE 3000
+CMD ["sol-entrypoint"]
 
-CMD ["node", "dist/src/app.js"]
+FROM caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d AS frontend
 
-FROM nginxinc/nginx-unprivileged:1.30.4-alpine@sha256:44e36330f74d4f3a1d4e222acca9e23b401fb87811a7597024502bb759c4dd49 AS frontend
+RUN addgroup -S -g 10100 caddy \
+  && adduser -S -D -H -u 10100 -G caddy -s /sbin/nologin caddy \
+  && chown -R caddy:caddy /data /config
 
-USER root
+COPY --from=build /app/frontend/dist /srv
+COPY deploy/front/Caddyfile /etc/caddy/Caddyfile
+COPY --chmod=0755 deploy/front/front-entrypoint /usr/local/bin/front-entrypoint
 
-RUN find /usr/share/nginx/html -mindepth 1 -maxdepth 1 -delete
+EXPOSE 8080 80 443
 
-COPY --from=build /app/frontend/dist /usr/share/nginx/html
-COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
-
-USER nginx
-
-EXPOSE 8080
+CMD ["front-entrypoint"]

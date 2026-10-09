@@ -1,0 +1,13 @@
+#!/bin/sh
+# Boot entry-stop (spec 13, invariant 3), run as root by sol-entrypoint in live mode before
+# supervisord: a RUNNING control state becomes ENTRY_STOP, so no new BUY leaves after a restart
+# without a human `sol trading start`. ENTRY_STOP and HARD_STOP stay as they are. An unreadable
+# status or a refused kill-switch exits non-zero, and the entrypoint stops before supervisord.
+set -eu
+state="$(sol-run operations node /app/dist/src/executor-operations/main.js status \
+  | node /app/dist/scripts/deploy/operations-state.js control-state)"
+if [ "$state" = RUNNING ]; then
+  sol-run operations node /app/dist/src/executor-operations/main.js \
+    kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP > /dev/null
+  echo '{"service":"sol-entrypoint","event":"boot.entry_stop","previousControlState":"RUNNING"}'
+fi

@@ -1,0 +1,59 @@
+# Front of the stack (spec 8): static console and read-only relays to the back. basic_auth
+# covers every route except the operator API, which checks its own bearer token.
+{
+	admin localhost:2019
+}
+
+{$SITE_ADDRESS:http://:8080} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	route {
+		# Read-only surface: nothing but GET, HEAD and OPTIONS reaches a backend.
+		@write not method GET HEAD OPTIONS
+		respond @write 405
+
+		# The console sends its own `Authorization: Bearer` token, checked by the operator API, which
+		# only answers the Host it binds (OPERATOR_API_HOST:OPERATOR_API_PORT of operator-api.env).
+		# A browser may also attach the front's basic credentials here: they never reach the back.
+		@operator_basic {
+			path /operator/v1/*
+			header_regexp Authorization (?i)^basic\s
+		}
+		request_header @operator_basic -Authorization
+		reverse_proxy /operator/v1/* back:3100 {
+			header_up Host 0.0.0.0:3100
+		}
+
+		basic_auth {
+			{$FRONT_BASIC_AUTH_USER} {$FRONT_BASIC_AUTH_HASH}
+		}
+
+		reverse_proxy /api/v1/events back:3000 {
+			header_up -Authorization
+			flush_interval -1
+			transport http {
+				read_timeout 1h
+			}
+		}
+
+		@api path /api/v1 /api/v1/*
+		reverse_proxy @api back:3000 {
+			header_up -Authorization
+		}
+
+		@immutable path /assets/*
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		@mutable not path /assets/*
+		header @mutable Cache-Control "no-store"
+
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

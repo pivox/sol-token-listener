@@ -10,6 +10,8 @@ function harness(fetchImpl: typeof fetch = async () => { throw new Error('Unexpe
     Error, TypeError, AggregateError, Buffer, AbortController, AbortSignal,
     setTimeout, clearTimeout, fetch: fetchImpl,
     deadlineAt: Date.now() + 60_000, postgresPassword: 'generated-test-password',
+    smokeSecrets: ['generated-test-password'], hostDirectory: '/nonexistent/smoke-host',
+    rm: async () => undefined,
     baseUrl: 'http://127.0.0.1:43210', cleanupDeadlineAt: null, activeSignalRuntime: null,
     projectResourceChecks: [], environment: {}, deploymentImages: {},
     canonicalMigrations: [], signalExitCodes: { SIGINT: 130, SIGTERM: 143 },
@@ -148,7 +150,11 @@ void test('real deployment sequencing attaches the failing phase and preserves s
     compose = async () => ({ stdout: '', stderr: '' });
     composeCommand = (args) => args;
     discoverFrontendBaseUrl = async () => 'http://127.0.0.1:43210';
-    assertNonRoot = async () => undefined;
+    writeSmokeHost = async () => undefined;
+    assertProcessUsers = async () => undefined;
+    assertFrontNonRoot = async () => undefined;
+    assertSecretIsolation = async () => undefined;
+    assertFrontAuthentication = async () => undefined;
     assertPublicHealth = async () => { throw injectedFailure; };
     runDocker = async () => ({ stdout: '', stderr: '' });
     cleanupExplicitImages = async () => undefined;

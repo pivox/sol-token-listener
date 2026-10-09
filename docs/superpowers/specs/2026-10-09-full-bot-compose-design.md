@@ -103,6 +103,10 @@ chaque programme tourne sous un utilisateur dédié, créé dans l'image avec un
 | `worker` | 10007 | worker de simulation (qualification) |
 | `ops` | 10008 | commandes manuelles |
 
+Le back et la tâche `migrate` tournent avec `no-new-privileges`, sans les capacités `NET_RAW` et
+`MKNOD`, et sans fichier core : aucun processus ne regagne un privilège, aucun vidage mémoire
+n'emporte un secret.
+
 ### 6.2 Programmes
 
 | Programme | Commande | Démarrage | Login PostgreSQL → rôle de groupe |
@@ -110,16 +114,20 @@ chaque programme tourne sous un utilisateur dédié, créé dans l'image avec un
 | `listener` | `dist/src/app.js` | automatique | `sol_listener` → `sol_token_listener_writer` |
 | `h2b` | boucle `sol-h2b` (6.3) | automatique, à la demande | `sol_live` → `sol_token_executor_live` |
 | `h2a` | `dist/src/executor-live-recovery/main.js` | automatique | `sol_recovery` → `sol_token_executor_live_recovery` |
-| `autoarm` | `dist/src/executor-operations/auto-arm-main.js` | jamais seul (6.4) | `sol_autoarm` → `sol_token_executor_operations` |
+| `autoarm` | `dist/src/executor-operations/auto-arm-main.js` | automatique en mode `live` ; n'arme qu'en état de contrôle `RUNNING` (6.4) | `sol_autoarm` → `sol_token_executor_operations` |
 | `opapi` | `dist/src/operator-api/main.js` | automatique | `sol_reader` → `sol_token_operator_reader` |
 | `retention` | `dist/scripts/purge-retained-data.js` | automatique | `sol_retention` → `sol_token_retention_worker` |
 | `worker` | `dist/src/executor/main.js` | manuel, pendant une qualification | `sol_worker` → `sol_token_executor_worker` |
 
-Chaque programme reçoit SIGTERM et dispose de 40 s pour s'arrêter ; le conteneur a un
-`stop_grace_period` de 60 s. Le mode `observe` (`SOL_STACK_MODE=observe`, valeur par défaut)
-ne démarre que `listener`, `opapi` et `retention` et n'exige aucun secret d'exécution : `opapi`
-y utilise l'URL Helius du listener. Le mode `live` ajoute `h2b`, `h2a` et rend `autoarm` et
-`worker` disponibles ; `opapi` y utilise l'URL Helius de l'exécuteur.
+Chaque programme reçoit SIGTERM et dispose de 40 s pour s'arrêter, 10 s pour `opapi` et
+`retention`. `supervisord` les arrête l'un après l'autre, d'où un `stop_grace_period` de 240 s.
+Un programme qui ne démarre pas (base ou RPC indisponible) est relancé sans fin, avec un délai
+qui croît d'une seconde à chaque échec : aucun ne reste `FATAL`.
+
+Le mode `observe` (`SOL_STACK_MODE=observe`, valeur par défaut) ne démarre que `listener`,
+`opapi` et `retention` et n'exige aucun secret d'exécution : `opapi` y utilise l'URL Helius du
+listener. Le mode `live` ajoute `h2b`, `h2a` et `autoarm`, et rend `worker` disponible ; `opapi`
+y utilise l'URL Helius de l'exécuteur.
 
 La qualification d'une enveloppe suspend la rétention pendant la sonde, comme dans le runbook
 actuel : `sol qualify` arrête `retention` et la redémarre à la fin.
@@ -139,18 +147,29 @@ seul et la sortie s'exécute sans intervention.
 
 ### 6.4 Démarrage du trading
 
-`sol trading start` exige une enveloppe active, attend au plus 60 s que H2b soit `RUNNING`, puis
-démarre `autoarm` ; sans enveloppe active ou sans H2b prêt dans ce délai, la commande échoue
-sans démarrer `autoarm`. `sol trading stop` arrête `autoarm`, puis laisse H2b finir son travail
-en cours. Après un crash ou un redémarrage du conteneur, `autoarm` reste arrêté : aucun nouvel
-achat ne part sans une commande humaine, alors que les sorties continuent.
+`autoarm` a deux rôles : armer les achats d'une enveloppe active et rafraîchir le snapshot
+provider d'une position ouverte, sans lequel le SELL est refusé. Il tourne donc en permanence en
+mode `live`, et l'autorisation d'acheter passe par l'état de contrôle en base :
+
+- au démarrage du conteneur, avant `supervisord`, le script d'entrée ramène un état `RUNNING` à
+  `ENTRY_STOP` (`kill-switch --mode=entry-stop`) ; un état `HARD_STOP` est laissé tel quel ;
+- `sol trading start` exige une enveloppe `ACTIVE`, attend au plus 60 s que H2b soit `RUNNING`
+  depuis au moins 15 s, puis lance `resume`, confirmé au TTY ; sans enveloppe active ou sans H2b
+  prêt dans ce délai, la commande échoue sans rien changer ;
+- `sol trading stop` pose `ENTRY_STOP` : plus aucun armement ni signature de BUY, alors que les
+  sorties continuent.
+
+Après un crash ou un redémarrage du conteneur, aucun nouvel achat ne part sans une commande
+humaine, alors que les sorties continuent.
 
 ### 6.5 Santé
 
 `sol-health` interroge `supervisorctl` et l'endpoint `/api/v1/health` du listener. Le conteneur
 est sain si chaque programme attendu dans le mode courant est `RUNNING`, si `h2b` est `RUNNING`
-ou en attente normale de travail, et si `autoarm` est `RUNNING` lorsque le trading a été
-démarré.
+ou en attente normale de travail, et si `autoarm` est `RUNNING` en mode `live`. Par défaut,
+l'endpoint du listener doit répondre `OK` ; `SOL_HEALTH_REQUIRE_OK=false` accepte `DEGRADED`
+(listener désactivé dans le smoke, ou projet RPC du listener épuisé). Le message d'échec nomme
+l'état `supervisorctl` du programme fautif, par exemple `BACKOFF` pendant ses relances.
 
 ### 6.6 Logs
 
@@ -163,7 +182,9 @@ nom du service. Pilote `json-file` avec rotation : `max-size` 20 Mo, `max-file` 
 configuration et les secrets du rôle demandé, puis exécute la commande sous l'utilisateur `ops`,
 confirmations TTY comprises. Exemples : `sol ops envelope create …`, `sol ops resume`,
 `sol ops status`, `sol readiness …`, `sol evidence provider`, `sol evidence bundle`,
-`sol report`.
+`sol qualify start|stop`, `sol trading start|stop`. Le rapport lit la base en administrateur :
+il passe par la tâche `migrate`, seule détentrice du mot de passe administrateur,
+avec `docker compose run --rm migrate sol-admin report`.
 
 ## 7. Secrets
 
@@ -178,14 +199,19 @@ confirmations TTY comprises. Exemples : `sol ops envelope create …`, `sol ops 
 | Clé de l'API d'administration Helius | `helius-admin-api-key` | `back`, `ops` |
 | Clé privée Ed25519 des preuves | `evidence-private-key` | `back`, `ops` |
 | Keypair du wallet | `wallet-keypair.json` | `back`, `h2b` |
+| Jeton de l'API opérateur (32 à 256 caractères) | `operator-api-token` | `back`, `opapi` |
 | Empreinte bcrypt du mot de passe du front | `front-basic-auth-hash` | `front` |
 
 ### 7.2 Phase fichiers
 
 - Dossier sur l'hôte, hors du dépôt, en 0700 : `~/.sol-token-listener/docker/secrets/` sur le
-  Mac, `/srv/sol-token-listener/secrets/` sur le serveur. Un fichier par secret, en 0600.
-- Chaque conteneur ne monte que les fichiers qu'il utilise, en lecture seule, sous
-  `/root/secrets/` : seul root peut traverser `/root`.
+  Mac, `/srv/sol-token-listener/secrets/` sur le serveur. Un fichier par secret, en 0600, rangé
+  par destinataire : `db/postgres-admin-password`, `db/logins/pg-<login>-password`, `back/…`,
+  `front/front-basic-auth-hash`.
+- Chaque conteneur ne monte que ses fichiers ou dossiers, en lecture seule, sous
+  `/root/secrets/` : seul root peut traverser `/root`. `postgres` monte le fichier
+  administrateur, `migrate` le dossier `db/`, `back` les dossiers `db/logins/` et `back/`,
+  `front` le fichier d'empreinte.
 - Le script d'entrée du back copie les secrets de chaque utilisateur dans
   `/run/sol/<utilisateur>/`, un tmpfs, avec le propriétaire de l'utilisateur et les droits
   0400, puis lance `supervisord`.
@@ -222,14 +248,21 @@ relancer `migrate` avant le back.
 - Lecture seule : seules les méthodes GET et OPTIONS sont relayées, tout le reste reçoit 405.
   Règle de conception : aucune route d'écriture ne sera exposée sans authentification à deux
   facteurs.
-- Authentification `basic_auth` sur toutes les routes, interface comprise. Mot de passe
-  aléatoire d'au moins 24 caractères ; Caddy ne reçoit que son empreinte bcrypt, depuis le
-  fichier secret, jamais dans le `Caddyfile` ni dans le compose.
+- Authentification `basic_auth` sur toutes les routes, interface comprise, sauf `/operator/v1/` :
+  la console y envoie son propre `Authorization: Bearer`, que l'API opérateur vérifie avec
+  `operator-api-token`, et un navigateur ne peut pas joindre en plus des identifiants HTTP
+  basic. L'API ne répond qu'à l'en-tête Host qu'elle écoute : Caddy le réécrit en
+  `0.0.0.0:3100` sur cette route, et retire un éventuel `Authorization: Basic` que le navigateur
+  y joindrait. Mot de passe aléatoire d'au moins 24 caractères ; Caddy ne reçoit que son
+  empreinte bcrypt de coût 10, depuis le fichier secret, jamais dans le `Caddyfile` ni dans le
+  compose. Caddy retire l'en-tête `Authorization` avant de relayer vers l'API du listener.
 - Mode Mac : HTTP sur `127.0.0.1:8080`. Mode serveur : nom de domaine en variable, certificat
   Let's Encrypt automatique sur 80 et 443, HSTS, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`.
 - Limite connue : pas de blocage des tentatives répétées dans Caddy. La longueur du mot de
-  passe compense ; un fail2ban sur les logs Caddy reste une option côté serveur.
+  passe compense. Chaque tentative coûte une comparaison bcrypt et le front est limité à un
+  demi-CPU, si bien qu'un flot de tentatives n'affame pas le back ; un fail2ban sur les logs
+  Caddy reste une option côté serveur.
 
 ## 9. Base de données
 
@@ -240,7 +273,9 @@ fichiers secrets : `LOGIN NOINHERIT`, membre d'exactement un rôle de groupe (ta
 `sol_ops` → `sol_token_executor_operations` et `sol_readiness` →
 `sol_token_executor_readiness` pour les commandes manuelles. Les règles sont celles du runbook
 `docs/operations/executor-live-canary.md`. L'administrateur s'appelle `sol_owner`, comme
-aujourd'hui, pour que la propriété des tables reste identique après restauration.
+aujourd'hui, pour que la propriété des tables reste identique après restauration. `migrate`
+n'envoie que le vérificateur SCRAM-SHA-256 de chaque mot de passe, calculé côté client : le mot
+de passe n'atteint jamais le serveur ni ses journaux.
 
 ### 9.2 Reprise de la base actuelle
 
@@ -292,8 +327,9 @@ pour vérifier :
   back ne publient de port ;
 - aucun secret n'apparaît dans le compose, les modèles de configuration ou l'image ;
 - le `Caddyfile` ne relaie que GET et OPTIONS, et `basic_auth` couvre toutes les routes ;
-- dans la configuration de `supervisord`, `autoarm` n'a jamais `autostart=true`, et chaque
-  programme a son utilisateur et ses délais d'arrêt ;
+- dans la configuration de `supervisord`, `worker` n'a jamais `autostart=true`, `autoarm`
+  n'existe qu'en mode `live`, chaque programme a son utilisateur et ses délais d'arrêt, et le
+  script d'entrée pose l'entry-stop avant de lancer `supervisord` ;
 - seul le lanceur de `h2b` référence la keypair.
 
 ### 11.2 Tests de conteneur en CI
@@ -330,8 +366,10 @@ attente normale. Ensuite seulement, la bascule de 9.2.
   le compose, une variable d'environnement de conteneur ou un log.
 - Chaque processus se connecte avec son propre login PostgreSQL `NOINHERIT`, membre d'un seul
   rôle de groupe.
-- `autoarm` ne démarre jamais sans `sol trading start` ; après tout redémarrage, aucun nouvel
-  achat sans action humaine. Les sorties restent automatiques.
+- Aucun armement sans `sol trading start` : au démarrage du conteneur en mode `live`, un état
+  de contrôle `RUNNING` est ramené à `ENTRY_STOP` avant le lancement des programmes, et seul
+  `sol trading start` (confirmation TTY) le rétablit. Les sorties restent automatiques : H2a,
+  H2b et le rafraîchissement provider d'`autoarm` tournent en permanence.
 - Aucun port PostgreSQL ni port du back n'est publié sur le serveur.
 - Le front n'expose que GET et OPTIONS, derrière HTTPS et un mot de passe fort ; aucune route
   d'écriture sans authentification à deux facteurs.
@@ -352,3 +390,22 @@ recherche dans la stack.
 - Le runbook `docs/operations/deployment.md` décrit le démarrage, l'arrêt, les commandes
   `sol`, la reprise de la base, les sauvegardes, le retour arrière et la bascule vers le
   serveur.
+
+## 16. Amendements du 2026-10-09 (plan d'implémentation)
+
+Le plan `docs/superpowers/plans/2026-10-09-full-bot-compose.md` a modifié ce spec sur sept points,
+reportés dans les sections concernées :
+
+1. Trading par l'état de contrôle en base (6.2, 6.4, 6.5, 11.1, 13) : `autoarm` rafraîchit aussi
+   le snapshot provider des positions ouvertes ; l'arrêter bloquerait les sorties.
+2. Jeton de l'API opérateur (7.1) et route `/operator/v1/` hors `basic_auth`, authentifiée par ce
+   jeton (8).
+3. Rapport administrateur par `docker compose run --rm migrate sol-admin report` (6.7).
+4. Secrets rangés par destinataire, montés par dossier (7.2).
+5. Santé stricte par défaut, assouplie par `SOL_HEALTH_REQUIRE_OK=false` (6.5).
+6. `sol qualify start` active la sonde du gate 10 par une surcharge en tmpfs, `sol qualify stop`
+   la retire (runbook du lot 4a, étape 1).
+7. Corrections de la revue de la PR #263 (6.1, 6.2, 6.5, 8, 9.1) : relances sans fin, arrêt
+   séquentiel couvert par 240 s, durcissement du back et de `migrate`, front limité à un
+   demi-CPU avec une empreinte bcrypt de coût 10, identifiants basic retirés sur `/operator/v1/`,
+   vérificateur SCRAM à la place du mot de passe des logins.

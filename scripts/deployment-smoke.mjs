@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { dirname, resolve } from 'node:path';
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const GLOBAL_TIMEOUT_MS = 600_000;
@@ -16,9 +18,10 @@ const MAX_RETENTION_COUNTERS = 128;
 const MAX_FAILURE_SUMMARY_BYTES = 1_024;
 const smokeFailureContext = new WeakMap();
 const SMOKE_PHASES = new Set([
-  'BUILD', 'START', 'PORT_DISCOVERY', 'SIGNAL_PROBE', 'NON_ROOT_APP',
-  'NON_ROOT_FRONTEND', 'PUBLIC_HEALTH', 'CORS', 'MIGRATIONS', 'FRONTEND',
-  'SSE_SHUTDOWN', 'APP_RESTART', 'HEALTH_RECOVERY', 'RETENTION', 'CLEANUP',
+  'BUILD', 'HOST_SETUP', 'START', 'PORT_DISCOVERY', 'SIGNAL_PROBE', 'PROCESS_USERS',
+  'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'PUBLIC_HEALTH', 'CORS', 'MIGRATIONS',
+  'LOGINS', 'OPERATIONS', 'FRONTEND', 'SSE_SHUTDOWN', 'APP_RESTART', 'HEALTH_RECOVERY',
+  'RETENTION', 'CLEANUP',
 ]);
 const SMOKE_OPERATIONS = new Set(['HTTP_HEADERS', 'HTTP_BODY', 'SSE_BODY']);
 const TRANSPORT_CODES = new Set([
@@ -33,7 +36,6 @@ const FAILURE_NAMES = new Set([
 ]);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
-const smokeComposeFile = resolve(root, 'deploy/compose.smoke.yaml');
 const scriptPath = fileURLToPath(import.meta.url);
 let invocationMode;
 let invocationFailure;
@@ -47,7 +49,32 @@ const projectName = invocationMode === 'self-sigterm' || invocationMode === 'sel
   : `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
 const projectLabel = `label=com.docker.compose.project=${projectName}`;
 const deploymentImages = deploymentImagesFor(projectName);
+const hostDirectory = hostDirectoryFor(projectName);
+const SMOKE_USER = 'smoke';
 const postgresPassword = randomBytes(24).toString('hex');
+const frontPassword = randomBytes(24).toString('hex');
+const operatorApiToken = randomBytes(32).toString('hex');
+// Same table as src/deploy/stack.ts DATABASE_LOGINS (tests/deployment-artifacts.test.ts checks it).
+const loginGroups = Object.freeze({
+  sol_listener: 'sol_token_listener_writer',
+  sol_live: 'sol_token_executor_live',
+  sol_recovery: 'sol_token_executor_live_recovery',
+  sol_autoarm: 'sol_token_executor_operations',
+  sol_reader: 'sol_token_operator_reader',
+  sol_retention: 'sol_token_retention_worker',
+  sol_worker: 'sol_token_executor_worker',
+  sol_ops: 'sol_token_executor_operations',
+  sol_readiness: 'sol_token_executor_readiness',
+});
+const loginPasswords = Object.freeze(Object.fromEntries(
+  Object.keys(loginGroups).map((login) => [login, randomBytes(24).toString('hex')]),
+));
+// Throwaway: random bytes, never a funded key; only used to prove the tmpfs isolation.
+const throwawayKeypair = JSON.stringify([...randomBytes(64)]);
+const smokeSecrets = Object.freeze([
+  postgresPassword, frontPassword, operatorApiToken, ...Object.values(loginPasswords),
+]);
+const basicAuthorization = `Basic ${Buffer.from(`${SMOKE_USER}:${frontPassword}`).toString('base64')}`;
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
 const signalExitCodes = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
 let cleanupDeadlineAt = null;
@@ -205,6 +232,10 @@ function projectResourceChecksFor(label) {
   ]);
 }
 
+function hostDirectoryFor(name) {
+  return join(tmpdir(), `${name}-host`);
+}
+
 function deploymentImagesFor(name) {
   return Object.freeze({
     backend: `sol-token-listener-smoke-backend:${name}`,
@@ -215,16 +246,14 @@ function deploymentImagesFor(name) {
 const environment = Object.freeze({
   ...process.env,
   COMPOSE_PROJECT_NAME: projectName,
+  SOL_HOST_DIR: hostDirectory,
+  SOL_STACK_MODE: 'observe',
+  SOL_HEALTH_REQUIRE_OK: 'false',
   POSTGRES_DB: 'smoke',
-  POSTGRES_USER: 'smoke',
-  POSTGRES_PASSWORD: postgresPassword,
-  POSTGRES_PASSWORD_URI_ENCODED: encodeURIComponent(postgresPassword),
   BACKEND_IMAGE: deploymentImages.backend,
   FRONTEND_IMAGE: deploymentImages.frontend,
-  SOLANA_HTTP_RPC_URL: 'https://rpc.invalid',
-  SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
-  LISTENER_ENABLED: 'false',
-  FRONTEND_PORT: '0',
+  FRONT_PORT: '0',
+  FRONT_BASIC_AUTH_USER: SMOKE_USER,
 });
 let baseUrl = null;
 
@@ -255,14 +284,17 @@ async function runDeployment(selfSignal) {
   const cleanupFailures = [];
   try {
     try {
-      await smokePhase('BUILD', async () => { await compose(['build', 'app', 'frontend']); });
-      await smokePhase('START', async () => { await compose(['up', '--detach', '--wait', '--wait-timeout', '120']); });
+      await smokePhase('BUILD', async () => { await compose(['build', 'back', 'front']); });
+      await smokePhase('HOST_SETUP', writeSmokeHost);
+      await smokePhase('START', async () => { await compose(['up', '--detach', '--wait', '--wait-timeout', '180']); });
       baseUrl = await smokePhase('PORT_DISCOVERY', discoverFrontendBaseUrl);
       if (selfSignal !== null) {
         await smokePhase('SIGNAL_PROBE', async () => { await runActiveChildSignalProbe(selfSignal); });
       }
-      await smokePhase('NON_ROOT_APP', () => assertNonRoot('app'));
-      await smokePhase('NON_ROOT_FRONTEND', () => assertNonRoot('frontend'));
+      await smokePhase('PROCESS_USERS', assertProcessUsers);
+      await smokePhase('NON_ROOT_FRONT', assertFrontNonRoot);
+      await smokePhase('SECRET_ISOLATION', assertSecretIsolation);
+      await smokePhase('FRONT_AUTH', assertFrontAuthentication);
       await smokePhase('PUBLIC_HEALTH', assertPublicHealth);
       await smokePhase('CORS', assertCorsContract);
 
@@ -279,9 +311,11 @@ async function runDeployment(selfSignal) {
         );
       });
 
+      await smokePhase('LOGINS', assertLogins);
+      await smokePhase('OPERATIONS', assertOperations);
       await smokePhase('FRONTEND', assertFrontendContract);
       await smokePhase('SSE_SHUTDOWN', assertGracefulSseShutdown);
-      await smokePhase('APP_RESTART', async () => { await compose(['start', 'app']); });
+      await smokePhase('APP_RESTART', async () => { await compose(['exec', '-T', 'back', 'sol', 'ctl', 'start', 'listener']); });
       await smokePhase('HEALTH_RECOVERY', waitForPublicHealth);
       await smokePhase('RETENTION', assertRetentionOneShot);
     } catch (error) {
@@ -299,6 +333,11 @@ async function runDeployment(selfSignal) {
         cleanupFailures.push(error);
       }
       await cleanupExplicitImages(deploymentImages, environment, cleanupFailures);
+      try {
+        await rm(hostDirectory, { recursive: true, force: true });
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
       for (const check of projectResourceChecks) {
         try {
           const { stdout, stderr } = await runDocker(check.args, {
@@ -339,7 +378,7 @@ async function runActiveChildSignalProbe(signal) {
   }, SELF_SIGNAL_TIMEOUT_MS);
   try {
     await compose([
-      'exec', '-T', 'app', 'node', '-e', 'setInterval(() => undefined, 1_000)',
+      'exec', '-T', 'back', 'node', '-e', 'setInterval(() => undefined, 1_000)',
     ], { reflectFailureOutput: false });
     throw new Error('Deployment signal fault child exited without interruption.');
   } finally {
@@ -460,6 +499,11 @@ async function cleanupFaultProject(faultName, cleanupFailures) {
     cleanupFailures.push(error);
   }
   await cleanupExplicitImages(deploymentImagesFor(faultName), faultEnvironment, cleanupFailures);
+  try {
+    await rm(hostDirectoryFor(faultName), { recursive: true, force: true });
+  } catch (error) {
+    cleanupFailures.push(error);
+  }
   const faultLabel = `label=com.docker.compose.project=${faultName}`;
   for (const check of projectResourceChecksFor(faultLabel)) {
     try {
@@ -510,16 +554,11 @@ function faultCleanupEnvironment(faultName) {
   return Object.freeze({
     ...process.env,
     COMPOSE_PROJECT_NAME: faultName,
+    SOL_HOST_DIR: hostDirectoryFor(faultName),
     POSTGRES_DB: 'smoke',
-    POSTGRES_USER: 'smoke',
-    POSTGRES_PASSWORD: 'cleanup-only',
-    POSTGRES_PASSWORD_URI_ENCODED: 'cleanup-only',
     BACKEND_IMAGE: deploymentImagesFor(faultName).backend,
     FRONTEND_IMAGE: deploymentImagesFor(faultName).frontend,
-    SOLANA_HTTP_RPC_URL: 'https://rpc.invalid',
-    SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
-    LISTENER_ENABLED: 'false',
-    FRONTEND_PORT: '0',
+    FRONT_PORT: '0',
   });
 }
 
@@ -594,7 +633,7 @@ function composeCommand(args, projectNameOverride) {
   const projectArgs = projectNameOverride === undefined
     ? []
     : ['--project-name', projectNameOverride];
-  return ['compose', ...projectArgs, '-f', composeFile, '-f', smokeComposeFile, ...args];
+  return ['compose', ...projectArgs, '-f', composeFile, ...args];
 }
 
 async function runDocker(args, options = {}) {
@@ -604,7 +643,7 @@ async function runDocker(args, options = {}) {
 async function runCommand(
   command,
   args,
-  { cleanup = false, reflectFailureOutput = true, commandEnvironment = environment } = {},
+  { cleanup = false, reflectFailureOutput = true, commandEnvironment = environment, input } = {},
 ) {
   const timeoutMs = cleanup
     ? remainingCleanupMs()
@@ -619,8 +658,9 @@ async function runCommand(
       cwd: root,
       env: commandEnvironment,
       shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
+    if (input !== undefined) child.stdin.end(input);
     activeSignalRuntime?.track(child, !cleanup);
     const stdout = [];
     const stderr = [];
@@ -692,14 +732,16 @@ function commandLabel(args) {
   const action = args.find((value) =>
     value !== 'compose'
     && value !== '-f'
-    && value !== composeFile
-    && value !== smokeComposeFile);
+    && value !== composeFile);
   return `Docker ${action ?? 'command'}`;
 }
 
 function redact(value) {
-  return value.replaceAll(postgresPassword, '[REDACTED]')
-    .replaceAll(encodeURIComponent(postgresPassword), '[REDACTED]');
+  let redacted = value;
+  for (const secret of smokeSecrets) {
+    redacted = redacted.replaceAll(secret, '[REDACTED]').replaceAll(encodeURIComponent(secret), '[REDACTED]');
+  }
+  return redacted;
 }
 
 async function smokePhase(phase, operation) {
@@ -789,7 +831,7 @@ function failureCategory(message) {
 
 async function discoverFrontendBaseUrl() {
   const { stdout, stderr } = await compose(
-    ['port', 'frontend', '8080'],
+    ['port', 'front', '8080'],
     { reflectFailureOutput: false },
   );
   if (stderr !== '') throw new Error('Frontend port discovery emitted unexpected stderr.');
@@ -806,10 +848,123 @@ function publicBaseUrl() {
   return baseUrl;
 }
 
-async function assertNonRoot(service) {
-  const { stdout } = await compose(['exec', '-T', service, 'id', '-u']);
-  const uid = stdout.trim();
-  assertMatch(uid, /^[1-9][0-9]*$/u, `${service} runs as root or returned an invalid UID.`);
+async function writeSmokeHost() {
+  const { stdout: frontHash } = await runDocker([
+    'run', '--rm', '-i', '--entrypoint', 'caddy', deploymentImages.frontend, 'hash-password',
+    '--bcrypt-cost', '10',
+  ], { input: `${frontPassword}\n`, reflectFailureOutput: false });
+  if (!/^\$2a\$10\$[./A-Za-z0-9]{53}\n$/u.test(frontHash)) throw new Error('Caddy did not return a bcrypt hash.');
+  const secrets = join(hostDirectory, 'secrets');
+  const files = [
+    ['secrets/db/postgres-admin-password', `${postgresPassword}\n`],
+    ...Object.entries(loginPasswords).map(([login, password]) => [`secrets/db/logins/pg-${login}-password`, `${password}\n`]),
+    ['secrets/back/helius-listener-http-url', 'https://rpc.invalid\n'],
+    ['secrets/back/helius-listener-ws-url', 'wss://rpc.invalid\n'],
+    ['secrets/back/operator-api-token', `${operatorApiToken}\n`],
+    ['secrets/back/wallet-keypair.json', `${throwawayKeypair}\n`],
+    ['secrets/front/front-basic-auth-hash', frontHash],
+  ];
+  for (const directory of ['secrets/db/logins', 'secrets/back', 'secrets/front', 'config']) {
+    await mkdir(join(hostDirectory, directory), { recursive: true, mode: 0o700 });
+  }
+  for (const [path, content] of files) await writeFile(join(hostDirectory, path), content, { mode: 0o600 });
+  await chmod(hostDirectory, 0o700);
+  await chmod(secrets, 0o700);
+  for (const name of [
+    'listener', 'live', 'live-recovery', 'operations', 'operator-api', 'retention', 'worker-sim',
+    'readiness', 'provider-evidence', 'preflight-bundle',
+  ]) {
+    const template = await readFile(resolve(root, `deploy/config/${name}.env.example`), 'utf8');
+    // The smoke never contacts an RPC: its listener only serves the API.
+    const override = name === 'listener' ? 'LISTENER_ENABLED=false\n' : '';
+    await writeFile(join(hostDirectory, 'config', `${name}.env`), `${template}${override}`, { mode: 0o644 });
+  }
+  await chmod(join(hostDirectory, 'config'), 0o755);
+}
+
+async function assertProcessUsers() {
+  const { stdout } = await compose([
+    'exec', '-T', 'back', 'sh', '-c',
+    'for program in listener opapi retention; do pid="$(sol ctl pid "$program")"; printf "%s %s\\n" "$program" "$(stat -c %u "/proc/$pid")"; done',
+  ]);
+  assertEqual(stdout, 'listener 10001\nopapi 10005\nretention 10006\n', 'Back programs do not run as their own users.');
+}
+
+async function assertFrontNonRoot() {
+  const { stdout } = await compose(['exec', '-T', 'front', 'stat', '-c', '%u', '/proc/1']);
+  assertEqual(stdout.trim(), '10100', 'Caddy does not run as the unprivileged caddy user.');
+}
+
+async function assertSecretIsolation() {
+  const secretPaths = ['/run/sol/h2b/wallet-keypair.json', '/run/sol/opapi/operator-api-token'];
+  const { stdout } = await compose(['exec', '-T', 'back', 'stat', '-c', '%U %a', ...secretPaths]);
+  assertEqual(stdout, 'h2b 400\nopapi 400\n', 'Secrets are not owner-only in the tmpfs.');
+  for (const path of secretPaths) {
+    let readable = true;
+    try {
+      await compose([
+        'exec', '-T', 'back', 'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path,
+      ], { reflectFailureOutput: false });
+    } catch {
+      readable = false;
+    }
+    if (readable) throw new Error('The listener user can read the secret of another user.');
+  }
+}
+
+async function assertFrontAuthentication() {
+  const anonymous = await fetchBounded('/index.html', { authenticated: false });
+  assertEqual(anonymous.status, 401, 'The front served the console without credentials.');
+  const write = await fetchBounded('/api/v1/health', { method: 'POST' });
+  assertEqual(write.status, 405, 'The front relayed a write method.');
+  const operator = await fetchBounded('/operator/v1/live/overview', { authenticated: false });
+  assertEqual(operator.status, 401, 'The operator API answered without its bearer token.');
+  const authorized = await fetchBounded('/operator/v1/live/overview', {
+    authenticated: false, headers: { authorization: `Bearer ${operatorApiToken}` },
+  });
+  assertEqual(authorized.status, 200, 'The operator API refused its bearer token through the front.');
+}
+
+async function assertLogins() {
+  const sql = [
+    "SELECT grantee.rolname || '|' || grantee.rolinherit || '|' || coalesce(string_agg(",
+    "granted.rolname || ':' || membership.admin_option || ':' || membership.inherit_option || ':'",
+    "|| membership.set_option, ','), '') FROM pg_roles grantee",
+    'LEFT JOIN pg_auth_members membership ON membership.member = grantee.oid',
+    'LEFT JOIN pg_roles granted ON granted.oid = membership.roleid',
+    "WHERE grantee.rolcanlogin AND grantee.rolname <> 'sol_owner'",
+    'GROUP BY grantee.rolname, grantee.rolinherit ORDER BY grantee.rolname',
+  ].join(' ');
+  const { stdout } = await runDocker(composeCommand([
+    'exec', '-T', 'postgres', 'psql', '-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-U', 'sol_owner', '-d', 'smoke', '-c', sql,
+  ]));
+  const expected = Object.keys(loginGroups).sort()
+    .map((login) => `${login}|false|${loginGroups[login]}:false:false:true`).join('\n');
+  assertEqual(stdout.trim(), expected, 'Logins are not NOINHERIT members of exactly their group role.');
+  for (const [login, group] of Object.entries(loginGroups)) {
+    const { stdout: role } = await runDocker(composeCommand([
+      'exec', '-T', '-e', `PGPASSWORD=${loginPasswords[login]}`, '-e', `PGOPTIONS=-c role=${group}`,
+      'postgres', 'psql', '-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-h', '127.0.0.1', '-U', login, '-d', 'smoke',
+      '-c', 'SELECT current_user',
+    ]), { reflectFailureOutput: false });
+    assertEqual(role.trim(), group, `Login ${login} cannot take its group role.`);
+  }
+}
+
+async function assertOperations() {
+  const { stdout } = await compose(['exec', '-T', 'back', 'sh', '-c', 'sol ops status 2>&1; echo "exit=$?"']);
+  assertMatch(
+    stdout,
+    /^\{"service":"sol-token-executor-operations","event":"executor\.operations_failed","errorCode":"EXECUTION_OPERATIONS_FAILED"\}\nexit=[1-9][0-9]*\n$/u,
+    'sol ops status did not give its closed answer on a database without wallet generation.',
+  );
+  const supervised = await compose(['exec', '-T', 'back', 'sh', '-c', 'sol ctl status h2b; echo "exit=$?"']);
+  assertMatch(supervised.stdout, /^h2b: ERROR \(no such process\)\nexit=4\n$/u, 'H2b is supervised in observe mode.');
+  const { stdout: counts } = await runDocker(composeCommand([
+    'exec', '-T', 'postgres', 'psql', '-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-U', 'sol_owner', '-d', 'smoke', '-c',
+    "SELECT (SELECT count(*) FROM execution_entry_envelopes) || '|' || (SELECT count(*) FROM execution_signed_transactions)",
+  ]));
+  assertEqual(counts.trim(), '0|0', 'The observe stack created an envelope or a signed transaction.');
 }
 
 async function assertPublicHealth() {
@@ -848,7 +1003,7 @@ async function readMigrationHistory() {
   const sql = "SELECT version, applied_at::text FROM migration_history ORDER BY version";
   const { stdout } = await runDocker(composeCommand([
     'exec', '-T', 'postgres', 'psql',
-    '-X', '-A', '-t', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-U', 'smoke', '-d', 'smoke', '-c', sql,
+    '-X', '-A', '-t', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-U', 'sol_owner', '-d', 'smoke', '-c', sql,
   ]));
   return stdout.trim().split('\n').filter(Boolean).map((line) => {
     const separator = line.indexOf('|');
@@ -896,7 +1051,7 @@ async function assertFrontendContract() {
 async function assertGracefulSseShutdown() {
   const controller = new AbortController();
   const response = await requestWithDeadline(`${publicBaseUrl()}/api/v1/events`, {
-    headers: { accept: 'text/event-stream' },
+    headers: { accept: 'text/event-stream', authorization: basicAuthorization },
     signal: controller.signal,
   });
   assertEqual(response.status, 200, 'SSE did not open.');
@@ -907,7 +1062,7 @@ async function assertGracefulSseShutdown() {
   try {
     const stream = readSseToEof(response.body, controller);
     [, body] = await Promise.all([
-      compose(['stop', '--timeout', '40', 'app']),
+      compose(['exec', '-T', 'back', 'sol', 'ctl', 'stop', 'listener']),
       stream,
     ]);
   } finally {
@@ -964,7 +1119,7 @@ async function waitForPublicHealth() {
 
 async function assertRetentionOneShot() {
   const { stdout, stderr } = await compose([
-    'exec', '-T', 'retention', 'node', 'dist/scripts/purge-retained-data.js', '--once',
+    'exec', '-T', 'back', 'sol-run', 'retention', 'node', '/app/dist/scripts/purge-retained-data.js', '--once',
   ], { reflectFailureOutput: false });
   if (stderr !== '') throw new Error('Retention emitted unexpected stderr.');
   if (
@@ -1009,8 +1164,11 @@ async function assertRetentionOneShot() {
   }
 }
 
-async function fetchBounded(path, options = {}) {
-  const response = await requestWithDeadline(`${publicBaseUrl()}${path}`, options);
+async function fetchBounded(path, { authenticated = true, headers = {}, ...options } = {}) {
+  const response = await requestWithDeadline(`${publicBaseUrl()}${path}`, {
+    ...options,
+    headers: authenticated ? { authorization: basicAuthorization, ...headers } : headers,
+  });
   const declaredLength = response.headers.get('content-length');
   if (declaredLength !== null && Number(declaredLength) > MAX_RESPONSE_BYTES) {
     void response.body?.cancel().catch(() => undefined);

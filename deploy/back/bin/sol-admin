@@ -1,0 +1,19 @@
+#!/bin/sh
+# Administrator commands of the migrate container (root; the admin password lives only here):
+#   sol-admin migrate       migrations, provisioning replay, the nine logins (default command)
+#   sol-admin group-roles   the NOLOGIN group roles only, before a pg_restore
+#   sol-admin report        fast-path report as the administrator, run as the node user
+set -eu
+command="${1:-}"
+[ "$#" -eq 0 ] || shift
+case "$command" in
+  migrate|group-roles)
+    exec node /app/dist/scripts/deploy/admin-database.js "$command" ;;
+  report)
+    DATABASE_URL="$(node /app/dist/scripts/deploy/admin-database.js url)"
+    export DATABASE_URL
+    exec setpriv --reuid=1000 --regid=1000 --clear-groups -- node /app/dist/src/cli/fast-path-report.js "$@" ;;
+  *)
+    echo 'usage: sol-admin migrate|group-roles|report' >&2
+    exit 64 ;;
+esac

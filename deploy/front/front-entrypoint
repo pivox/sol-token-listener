@@ -1,0 +1,20 @@
+#!/bin/sh
+# Entrypoint of the front container (root): read the bcrypt hash of the basic_auth password
+# from its secret file, then run Caddy as the unprivileged `caddy` user. The hash never enters
+# the Caddyfile, the image or the compose file.
+set -eu
+hash_file=/root/secrets/front-basic-auth-hash
+if [ ! -s "$hash_file" ]; then
+  echo 'front-entrypoint: missing secret front-basic-auth-hash' >&2
+  exit 78
+fi
+FRONT_BASIC_AUTH_HASH="$(head -n 1 "$hash_file")"
+case "$FRONT_BASIC_AUTH_HASH" in
+  '$2a$'*|'$2b$'*|'$2y$'*) ;;
+  *) echo 'front-entrypoint: front-basic-auth-hash is not a bcrypt hash' >&2; exit 78 ;;
+esac
+case "${FRONT_BASIC_AUTH_USER:-}" in
+  ''|*[!A-Za-z0-9._-]*) echo 'front-entrypoint: FRONT_BASIC_AUTH_USER must match [A-Za-z0-9._-]+' >&2; exit 78 ;;
+esac
+export FRONT_BASIC_AUTH_HASH
+exec su -s /bin/sh caddy -c 'exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'

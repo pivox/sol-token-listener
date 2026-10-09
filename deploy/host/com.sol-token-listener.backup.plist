@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Mac backup job (spec 9.4). Replace __SOL_REPOSITORY__ and __SOL_HOST_DIR__, copy to
+     ~/Library/LaunchAgents/ and load it with launchctl (docs/operations/deployment.md). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sol-token-listener.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__SOL_REPOSITORY__/deploy/host/backup.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SOL_HOST_DIR</key>
+    <string>__SOL_HOST_DIR__</string>
+    <key>SOL_REPOSITORY</key>
+    <string>__SOL_REPOSITORY__</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__SOL_HOST_DIR__/backups/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__SOL_HOST_DIR__/backups/launchd.log</string>
+</dict>
+</plist>

@@ -1,25 +1,27 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { parseRoleConfig } from '../src/deploy/role-environment.js';
+import { DATABASE_LOGINS, ROLES, STACK_USERS } from '../src/deploy/stack.js';
 
 const root = new URL('../', import.meta.url);
-void test('frontend readiness waits for local HTTP without weakening backend checks', async () => {
-  const frontend = composeService(await readArtifact('deploy/compose.yaml'), 'frontend');
+void test('front readiness probes the local Caddy admin endpoint, never the protected site', async () => {
+  const front = composeService(await readArtifact('deploy/compose.yaml'), 'front');
   for (const line of [
     '    healthcheck:',
-    '      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/index.html"]',
-    '      interval: 2s', '      timeout: 3s', '      retries: 30', '      start_period: 10s',
-  ]) assert.ok(frontend.includes(line), `Missing frontend readiness line: ${line}`);
+    '      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]',
+    '      interval: 5s', '      timeout: 3s', '      retries: 30', '      start_period: 10s',
+  ]) assert.ok(front.includes(line), `Missing front readiness line: ${line}`);
 });
 
 const nodeImage =
   'node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94';
-const nginxImage =
-  'nginxinc/nginx-unprivileged:1.30.4-alpine@sha256:44e36330f74d4f3a1d4e222acca9e23b401fb87811a7597024502bb759c4dd49';
+const caddyImage =
+  'caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d';
 const postgresImage =
   'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3';
 
@@ -58,7 +60,7 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
     ['dependencies', 'build'],
     [nodeImage, 'production-dependencies'],
     [nodeImage, 'backend'],
-    [nginxImage, 'frontend'],
+    [caddyImage, 'frontend'],
   ]);
   assert.doesNotMatch(dockerfile, /^COPY\s+(?:--\S+\s+)*\.(?:\s|$)/gim);
 
@@ -89,40 +91,50 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
   );
 });
 
-void test('backend image contains only compiled application artifacts and production dependencies', async () => {
+void test('backend image ships compiled artifacts, supervisor and one Unix user per process', async () => {
   const dockerfile = await readArtifact('Dockerfile');
   const backend = stage(dockerfile, 'backend');
   const copies = backend.match(/^COPY\s+.+$/gm) ?? [];
 
   assert.deepEqual(copies, [
-    'COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules',
-    'COPY --from=build --chown=node:node /app/dist ./dist',
-    'COPY --chown=node:node package.json package-lock.json ./',
+    'COPY --from=production-dependencies /app/node_modules ./node_modules',
+    'COPY --from=build /app/dist ./dist',
+    'COPY package.json package-lock.json ./',
+    'COPY --from=build /app/scripts/provision-executor-roles.sql ./dist/scripts/provision-executor-roles.sql',
+    'COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/',
+    'COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf',
+    'COPY deploy/back/supervisor/programs/ /etc/sol/programs/',
   ]);
-  assert.doesNotMatch(backend, /tests?|fixtures?|\.env|\.git|\.worktrees|npm-cache/i);
+  assert.doesNotMatch(backend, /\btests?\/|fixtures?|\.env\b|\.git\b|\.worktrees|npm-cache|secret|keypair|wallet/iu);
   assert.match(backend, /^ENV\s+NODE_ENV=production$/m);
-  assert.match(backend, /^USER\s+node$/m);
-  assert.match(backend, /^EXPOSE\s+3000$/m);
-  assert.match(backend, /^CMD\s+\["node",\s*"dist\/src\/app\.js"\]$/m);
+  assert.match(backend, /apt-get install --yes --no-install-recommends supervisor/u);
+  for (const [user, uid] of Object.entries(STACK_USERS)) {
+    assert.ok(backend.includes(`${user}:${uid}`), `missing Unix user ${user}`);
+  }
+  assert.match(backend, /install -d -o ops -g ops -m 0700 \/var\/lib\/sol\/evidence/u);
+  // The build writes the qualification profiles 0600: without this the listener user cannot start.
+  assert.match(backend, /^RUN chmod -R a\+rX \/app\/dist$/mu);
+  assert.doesNotMatch(backend, /^USER\s+/mu, 'the entrypoint needs root; each program drops to its user');
+  assert.match(backend, /^EXPOSE\s+3000 3100$/m);
+  assert.match(backend, /^CMD\s+\["sol-entrypoint"\]$/m);
 });
 
-void test('frontend image contains only built static assets and the reviewed unprivileged config', async () => {
+void test('front image serves only the built console through the reviewed Caddyfile, as a non-root user', async () => {
   const dockerfile = await readArtifact('Dockerfile');
   const frontend = stage(dockerfile, 'frontend');
   const copies = frontend.match(/^COPY\s+.+$/gm) ?? [];
-  const users = [...frontend.matchAll(/^USER\s+(\S+)$/gm)].map((match) => match[1]);
 
   assert.deepEqual(copies, [
-    'COPY --from=build /app/frontend/dist /usr/share/nginx/html',
-    'COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf',
+    'COPY --from=build /app/frontend/dist /srv',
+    'COPY deploy/front/Caddyfile /etc/caddy/Caddyfile',
+    'COPY --chmod=0755 deploy/front/front-entrypoint /usr/local/bin/front-entrypoint',
   ]);
-  assert.match(
-    frontend,
-    /^RUN\s+find \/usr\/share\/nginx\/html -mindepth 1 -maxdepth 1 -delete$/m,
-  );
-  assert.deepEqual(users, ['root', 'nginx']);
-  assert.match(frontend, /^EXPOSE\s+8080$/m);
-  assert.doesNotMatch(frontend, /(?:^|\/)src(?:\/|\s)|tests?|fixtures?|\.env|\.git|\.worktrees/i);
+  assert.match(frontend, /addgroup -S -g 10100 caddy/u);
+  assert.match(frontend, /adduser -S -D -H -u 10100 -G caddy -s \/sbin\/nologin caddy/u);
+  assert.match(frontend, /chown -R caddy:caddy \/data \/config/u);
+  assert.match(frontend, /^EXPOSE\s+8080 80 443$/m);
+  assert.match(frontend, /^CMD\s+\["front-entrypoint"\]$/m);
+  assert.doesNotMatch(frontend, /(?:^|\/)src(?:\/|\s)|\btests?\b|fixtures?|\.env\b|\.git\b|\.worktrees/iu);
 });
 
 void test('.dockerignore removes secrets, repositories, generated output, fixtures, and caches', async () => {
@@ -153,146 +165,146 @@ void test('.dockerignore removes secrets, repositories, generated output, fixtur
   assert.equal(rules.some((rule) => rule.startsWith('!.env')), false);
 });
 
-void test('Nginx serves the SPA with bounded caching and proxies only the read-only V1 API', async () => {
-  const nginx = await readArtifact('deploy/nginx.conf');
-
-  assert.match(nginx, /listen\s+8080;/);
-  assert.match(nginx, /autoindex\s+off;/);
-  assert.match(nginx, /resolver\s+127\.0\.0\.11\s+ipv6=off\s+valid=1s;/);
-  assert.match(nginx, /resolver_timeout\s+5s;/);
-  assert.match(nginx, /set\s+\$app_upstream\s+app:3000;/);
-  assert.match(
-    nginx,
-    /location\s+=\s+\/config\.json\s*\{[^}]*Cache-Control\s+"no-store"[^}]*try_files\s+\$uri\s+=404;/s,
-  );
-  assert.match(
-    nginx,
-    /location\s+=\s+\/index\.html\s*\{[^}]*Cache-Control\s+"no-store"[^}]*try_files\s+\$uri\s+=404;/s,
-  );
-  assert.match(
-    nginx,
-    /location\s+\^~\s+\/assets\/\s*\{[^}]*Cache-Control\s+"public, max-age=31536000, immutable"[^}]*try_files\s+\$uri\s+=404;/s,
-  );
-  assert.match(nginx, /location\s+\/\s*\{[^}]*try_files\s+\$uri\s+\$uri\/\s+\/index\.html;/s);
-
-  assert.match(nginx, /location\s+=\s+\/api\/v1\/events\s*\{/);
-  assert.match(nginx, /location\s+\^~\s+\/api\/v1\/\s*\{/);
-  assert.match(nginx, /location\s+=\s+\/api\/v1\s*\{/);
-  assert.equal((nginx.match(/proxy_pass\s+http:\/\/\$app_upstream\$request_uri;/g) ?? []).length, 3);
-  assert.doesNotMatch(nginx, /proxy_pass\s+http:\/\/app:3000/);
-  assert.equal((nginx.match(/proxy_set_header\s+Host\s+\$host;/g) ?? []).length, 3);
-  assert.equal((nginx.match(/limit_except\s+GET\s+OPTIONS/g) ?? []).length, 3);
-  assert.match(
-    nginx,
-    /location\s+=\s+\/api\/v1\/events\s*\{[\s\S]*?proxy_buffering\s+off;[\s\S]*?proxy_cache\s+off;[\s\S]*?proxy_read_timeout\s+1h;/,
-  );
-
-  assert.doesNotMatch(nginx, /Access-Control-Allow-Credentials/i);
-  assert.doesNotMatch(nginx, /websocket|proxy_set_header\s+Upgrade|\/live(?:\W|$)/i);
+void test('Caddy relays only reads, authenticates every route but the operator API, streams SSE', async () => {
+  const caddyfile = await readArtifact('deploy/front/Caddyfile');
+  const route = caddyfile.slice(caddyfile.indexOf('route {'));
+  let previous = -1;
+  for (const marker of [
+    '@write not method GET HEAD OPTIONS',
+    'respond @write 405',
+    // A browser's cached basic credentials never reach the operator API.
+    '@operator_basic {',
+    'path /operator/v1/*',
+    'header_regexp Authorization (?i)^basic\\s',
+    'request_header @operator_basic -Authorization',
+    'reverse_proxy /operator/v1/* back:3100 {',
+    'header_up Host 0.0.0.0:3100',
+    'basic_auth {',
+    '{$FRONT_BASIC_AUTH_USER} {$FRONT_BASIC_AUTH_HASH}',
+    'reverse_proxy /api/v1/events back:3000 {',
+    'reverse_proxy @api back:3000 {',
+    'try_files {path} /index.html',
+    'file_server',
+  ]) {
+    const index = route.indexOf(marker);
+    assert.ok(index > previous, `${marker} is missing or out of order`);
+    previous = index;
+  }
+  assert.ok(caddyfile.includes('{$SITE_ADDRESS:http://:8080} {'));
+  assert.ok(caddyfile.includes('admin localhost:2019'));
+  assert.match(caddyfile, /@api path \/api\/v1 \/api\/v1\/\*/u);
+  assert.match(caddyfile, /flush_interval -1/u);
+  assert.match(caddyfile, /read_timeout 1h/u);
+  assert.equal((caddyfile.match(/header_up -Authorization/gu) ?? []).length, 2);
+  for (const header of [
+    'Strict-Transport-Security "max-age=31536000"', 'X-Frame-Options "DENY"',
+    'Referrer-Policy "no-referrer"', 'X-Content-Type-Options "nosniff"', '-Server',
+  ]) {
+    assert.ok(caddyfile.includes(header), `missing header ${header}`);
+  }
+  assert.ok(caddyfile.includes('header @immutable Cache-Control "public, max-age=31536000, immutable"'));
+  assert.ok(caddyfile.includes('header @mutable Cache-Control "no-store"'));
+  assert.doesNotMatch(caddyfile, /\$2[aby]\$|password/iu);
 });
 
-void test('Compose defines an observe-only, five-service deployment without exposed database or backend', async () => {
-  const compose = await readArtifact('deploy/compose.yaml');
-  const smokeOverride = await readArtifact('deploy/compose.smoke.yaml');
+void test('the front entrypoint reads only the bcrypt hash and drops root before starting Caddy', async () => {
+  const entrypoint = await readArtifact('deploy/front/front-entrypoint');
+  assert.ok(entrypoint.startsWith('#!/bin/sh\n'));
+  assert.match(entrypoint, /^set -eu$/mu);
+  assert.ok(entrypoint.includes('hash_file=/root/secrets/front-basic-auth-hash'));
+  assert.ok(entrypoint.includes("'$2a$'*|'$2b$'*|'$2y$'*) ;;"));
+  assert.ok(entrypoint.includes(
+    "exec su -s /bin/sh caddy -c 'exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'",
+  ));
+  const syntax = spawnSync('sh', ['-n'], { input: entrypoint, encoding: 'utf8' });
+  assert.equal(syntax.status, 0, syntax.stderr);
+});
+
+void test('Compose defines postgres, migrate, back and front, with no published database or backend port', async () => {
+  const [compose, server] = await Promise.all([
+    readArtifact('deploy/compose.yaml'),
+    readArtifact('deploy/compose.server.yaml'),
+  ]);
 
   assert.match(compose, /^name: sol-token-listener$/m);
-  assert.match(compose, /^services:\s*$/m);
   const networksOffset = compose.indexOf('\nnetworks:');
   assert.notEqual(networksOffset, -1, 'missing networks section');
-  const services = compose.slice(0, networksOffset);
-  const serviceNames = [...services.matchAll(/^ {2}([a-z][a-z-]*):\s*$/gm)]
+  const serviceNames = [...compose.slice(compose.indexOf('\nservices:'), networksOffset)
+    .matchAll(/^ {2}([a-z][a-z-]*):\s*$/gm)]
     .map((match) => match[1])
     .filter((name): name is string => name !== undefined);
-  assert.deepEqual(serviceNames, ['postgres', 'migrate', 'app', 'retention', 'frontend']);
+  assert.deepEqual(serviceNames, ['postgres', 'migrate', 'back', 'front']);
   assert.match(compose, new RegExp(`^    image: ${postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
-  assert.match(composeService(compose, 'app'), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
-  assert.match(composeService(compose, 'migrate'), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
-  assert.match(composeService(compose, 'retention'), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
-  assert.match(composeService(compose, 'frontend'), /^ {4}image: \$\{FRONTEND_IMAGE:\?FRONTEND_IMAGE is required\}$/m);
-  assert.match(composeService(compose, 'app'), /^ {4}build:\s*$/m);
-  assert.match(composeService(compose, 'frontend'), /^ {4}build:\s*$/m);
+  for (const service of ['migrate', 'back']) {
+    assert.match(composeService(compose, service), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
+  }
+  assert.match(composeService(compose, 'front'), /^ {4}image: \$\{FRONTEND_IMAGE:\?FRONTEND_IMAGE is required\}$/m);
+  assert.match(composeService(compose, 'back'), /^ {4}build:\s*$/m);
+  assert.match(composeService(compose, 'front'), /^ {4}build:\s*$/m);
   assert.doesNotMatch(composeService(compose, 'migrate'), /^ {4}build:\s*$/m);
-  assert.doesNotMatch(composeService(compose, 'retention'), /^ {4}build:\s*$/m);
-  assert.match(compose, /^ {4}ports:\s*\["127\.0\.0\.1:\$\{FRONTEND_PORT:-8080\}:8080"\]\s*$/m);
+
   assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
-  assert.match(compose, /^x-database-environment: &database-environment$/m);
-  assert.match(compose, /^ {2}DATABASE_URL: postgresql:/m);
-  assert.match(compose, /^ {2}POSTGRES_AUTO_MIGRATE: "false"$/m);
+  assert.match(composeService(compose, 'front'), /^ {4}ports: \["127\.0\.0\.1:\$\{FRONT_PORT:-8080\}:8080"\]$/m);
+  assert.match(server, /^ {4}ports: !override\n {6}- "80:80"\n {6}- "443:443"$/m);
+  assert.match(server, /^ {6}SITE_ADDRESS: \$\{SITE_ADDRESS:\?SITE_ADDRESS is required on the server\}$/m);
 
+  const postgres = composeService(compose, 'postgres');
   const migrate = composeService(compose, 'migrate');
-  assert.match(migrate, /^ {4}environment: \*database-environment$/m);
-  assert.doesNotMatch(migrate, /SOLANA_|EXECUTION_MODE|PAPER_STRATEGY|API_|DATA_RETENTION|RETENTION_PURGE/);
+  const back = composeService(compose, 'back');
+  const front = composeService(compose, 'front');
+  assert.match(postgres, /^ {6}POSTGRES_USER: sol_owner$/m);
+  assert.match(postgres, /^ {6}POSTGRES_PASSWORD_FILE: \/root\/secrets\/postgres-admin-password$/m);
+  for (const [service, mount] of [
+    [postgres, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro'],
+    [migrate, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db:/root/secrets/db:ro'],
+    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/logins:/root/secrets/logins:ro'],
+    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/back:/root/secrets/back:ro'],
+    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/config:/etc/sol/config:ro'],
+    [back, '      - evidence:/var/lib/sol/evidence'],
+    [front, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro'],
+  ] as const) {
+    assert.ok(service.includes(mount), `missing mount ${mount}`);
+  }
+  assert.match(migrate, /^ {4}command: \["sol-admin", "migrate"\]$/m);
+  assert.match(back, /^ {4}command: \["sol-entrypoint"\]$/m);
+  assert.match(back, /^ {6}SOL_STACK_MODE: \$\{SOL_STACK_MODE:-observe\}$/m);
+  assert.match(back, /^ {6}SOL_HEALTH_REQUIRE_OK: \$\{SOL_HEALTH_REQUIRE_OK:-true\}$/m);
+  assert.match(back, /^ {4}tmpfs: \["\/run\/sol:mode=0711,size=16m"\]$/m);
+  assert.match(back, /^ {4}init: true$/m);
+  assert.match(back, /^ {4}stop_grace_period: 240s$/m);
+  assert.match(compose, /^x-hardening: &hardening\n {2}security_opt: \["no-new-privileges:true"\]\n {2}cap_drop: \[NET_RAW, MKNOD\]\n {2}ulimits:\n {4}core: 0$/m);
+  for (const service of [migrate, back]) assert.match(service, /^ {4}<<: \*hardening$/m);
+  // Caddy binds 80 and 443 as a non-root user through its file capability: no-new-privileges
+  // would drop it. The front gets a CPU share instead, against bcrypt floods.
+  assert.doesNotMatch(front, /hardening|no-new-privileges/u);
+  assert.match(front, /^ {4}cpus: 0\.5$/m);
+  assert.match(back, /^ {6}test: \["CMD", "sol-health"\]$/m);
 
-  const retention = composeService(compose, 'retention');
-  assert.match(retention, /^ {4}environment:\s*\n {6}<<: \*database-environment$/m);
-  assert.match(retention, /^ {6}DATA_RETENTION_HOURS: "4"$/m);
-  assert.match(retention, /^ {6}RETENTION_PURGE_INTERVAL_MS: \$\{RETENTION_PURGE_INTERVAL_MS:-900000\}$/m);
-  assert.doesNotMatch(retention, /SOLANA_|EXECUTION_MODE|PAPER_STRATEGY|API_/);
+  assert.match(postgres, /^ {4}networks: \[internal\]$/m);
+  assert.match(migrate, /^ {4}networks: \[internal\]$/m);
+  assert.match(back, /^ {4}networks: \[internal, egress, edge\]$/m);
+  assert.match(front, /^ {4}networks: \[edge\]$/m);
+  assert.match(compose, /^networks:\n {2}internal:\n {4}internal: true\n {2}egress:\n {2}edge:$/m);
+  assert.match(compose, /^volumes:\n {2}postgres-data:\n {2}evidence:\n {2}caddy-data:$/m);
+  assert.match(migrate, /depends_on:\n {6}postgres:\n {8}condition: service_healthy/);
+  assert.match(back, /depends_on:\n {6}migrate:\n {8}condition: service_completed_successfully/);
+  assert.match(front, /depends_on:\n {6}back:\n {8}condition: service_healthy/);
+  assert.match(compose, /^x-logging: &logging\n {2}driver: json-file\n {2}options:\n {4}max-size: "20m"\n {4}max-file: "5"$/m);
+  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 4);
 
-  const app = composeService(compose, 'app');
-  assert.match(app, /^ {4}environment:\s*\n {6}<<: \*database-environment$/m);
-  assert.match(
-    app,
-    /^ {6}SOLANA_HTTP_RPC_URL: \$\{SOLANA_HTTP_RPC_URL:\?SOLANA_HTTP_RPC_URL is required\}\n {6}SOLANA_HTTP_RPC_FALLBACK_URLS: \$\{SOLANA_HTTP_RPC_FALLBACK_URLS:-\}$/m,
-  );
-  assert.match(
-    app,
-    /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}\n {6}SOLANA_WS_RPC_FALLBACK_URLS: \$\{SOLANA_WS_RPC_FALLBACK_URLS:-\}$/m,
-  );
-  assert.match(
-    app,
-    /^ {6}SOLANA_EXPECTED_GENESIS_HASH: \$\{SOLANA_EXPECTED_GENESIS_HASH:-\}$/m,
-  );
-  assert.match(app, /^ {6}EXECUTION_MODE: observe$/m);
-  assert.match(app, /^ {6}PAPER_STRATEGY_ENABLED: "false"$/m);
-  assert.match(app, /^ {6}API_ENABLED: "true"$/m);
-  assert.match(app, /^ {6}DATA_RETENTION_HOURS: "4"$/m);
-  assert.match(app, /^ {6}API_HOST: 0\.0\.0\.0$/m);
-  assert.match(app, /^ {6}API_PORT: "3000"$/m);
-  assert.match(app, /^ {6}LISTENER_ENABLED: \$\{LISTENER_ENABLED:-true\}$/m);
-  assert.match(compose, /^ {4}init: true$/m);
-  assert.match(compose, /^ {4}stop_grace_period: 40s$/m);
-  assert.match(
-    composeService(compose, 'app'),
-    /^ {6}test: \["CMD", "node", "dist\/scripts\/deployment-healthcheck\.js", "--require-ok"\]$/m,
-  );
-  assert.doesNotMatch(composeService(compose, 'app'), /deployment-healthcheck\.js"\s*\]/);
-  assert.equal(smokeOverride, [
-    'services:',
-    '  app:',
-    '    environment:',
-    '      LISTENER_ENABLED: "false"',
-    '    healthcheck:',
-    '      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]',
-    '',
-  ].join('\n'));
-  assert.match(compose, /^ {4}command: \["node", "dist\/scripts\/migrate\.js"\]$/m);
-  assert.match(compose, /^ {4}command: \["node", "dist\/scripts\/purge-retained-data\.js"\]$/m);
-  assert.equal((compose.match(/depends_on:\s*\n {6}migrate:\s*\n {8}condition: service_completed_successfully/g) ?? []).length, 2);
-  assert.match(compose, /depends_on:\s*\n {6}postgres:\s*\n {8}condition: service_healthy/);
-  assert.match(compose, /depends_on:\s*\n {6}app:\s*\n {8}condition: service_healthy/);
-  assert.match(composeService(compose, 'postgres'), /^ {4}networks: \[internal\]$/m);
-  assert.match(composeService(compose, 'migrate'), /^ {4}networks: \[internal\]$/m);
-  assert.match(composeService(compose, 'app'), /^ {4}networks: \[internal, application\]$/m);
-  assert.match(composeService(compose, 'retention'), /^ {4}networks: \[internal\]$/m);
-  assert.match(composeService(compose, 'frontend'), /^ {4}networks: \[application\]$/m);
-  assert.match(compose, /^ {4}volumes: \["postgres-data:\/var\/lib\/postgresql\/data"\]$/m);
-  assert.match(compose, /^networks:\s*\n {2}internal:\s*\n {4}internal: true\s*\n {2}application:$/m);
-  assert.match(compose, /^volumes:\s*\n {2}postgres-data:$/m);
-  assert.doesNotMatch(compose, /privileged:|network_mode: host|docker\.sock|PRIVATE_KEY|SECRET_KEY|WALLET/i);
-  assert.doesNotMatch(compose, /EXECUTION_MODE:\s*\$\{|POSTGRES_AUTO_MIGRATE:\s*\$\{/);
+  assert.doesNotMatch(compose, /DATABASE_URL|SOLANA_|LISTENER_|EXECUTOR_|POSTGRES_PASSWORD:|privileged:|network_mode: host|docker\.sock/u);
+  assert.doesNotMatch(compose, /api-key|keypair|wallet/iu);
   for (const imageLine of compose.match(/^ {4}image: .+$/gm) ?? []) {
     assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND)_IMAGE:\?)/u);
   }
 });
 
-void test('Compose forwards catch-up policy, block hydration and ingestion scope with safe defaults', async () => {
-  const [compose, environment, localEnvironment] = await Promise.all([
+void test('the listener template keeps the catch-up, block hydration and ingestion scope defaults', async () => {
+  const [compose, listener, localEnvironment] = await Promise.all([
     readArtifact('deploy/compose.yaml'),
-    readArtifact('deploy/env.example'),
+    readArtifact('deploy/config/listener.env.example'),
     readArtifact('.env.example'),
   ]);
-  const app = composeService(compose, 'app');
   const settings = Object.freeze([
     ['LISTENER_WORKER_COUNT', '1'],
     ['LISTENER_CATCH_UP_POLICY', 'live-edge'],
@@ -310,35 +322,26 @@ void test('Compose forwards catch-up policy, block hydration and ingestion scope
   ] as const);
 
   for (const [name, fallback] of settings) {
-    assert.match(
-      app,
-      new RegExp(`^ {6}${name}: "\\$\\{${name}:-${fallback}\\}"$`, 'mu'),
-    );
-    assert.match(environment, new RegExp(`^${name}=${fallback}$`, 'mu'));
-    assert.equal((compose.match(new RegExp(`^ {6}${name}:`, 'gmu')) ?? []).length, 1);
+    assert.equal((listener.match(new RegExp(`^${name}=${fallback}$`, 'gmu')) ?? []).length, 1, name);
   }
-  assert.match(
-    app,
-    /^ {6}LISTENER_INGESTION_SCOPE: "\$\{LISTENER_INGESTION_SCOPE:-launchpad-and-market\}"$/mu,
-  );
-  assert.match(environment, /^LISTENER_INGESTION_SCOPE=launchpad-and-market$/mu);
-  assert.match(environment, /^LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false$/mu);
-  assert.match(environment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
+  assert.match(listener, /^LISTENER_INGESTION_SCOPE=launchpad-and-market$/mu);
+  assert.match(listener, /^EXECUTION_MODE=observe$/mu);
+  assert.match(listener, /^API_HOST=0\.0\.0\.0$/mu);
+  assert.match(listener, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
   assert.match(localEnvironment, /^LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED=false$/mu);
   assert.match(localEnvironment, /# Restart-only Pump\.fun catch-up page admission canary\. Keep false outside an explicitly observed canary\./u);
-  assert.equal((compose.match(/^ {6}LISTENER_INGESTION_SCOPE:/gmu) ?? []).length, 1);
-  assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
+  assert.doesNotMatch(compose, /LISTENER_/u);
+  assert.doesNotMatch(listener, /PRIVATE_KEY|SECRET_KEY|WALLET/iu);
 });
 
 void test('deployment keeps executable bounded admission disabled until the follow-up delivery gates', async () => {
   const [compose, environment, localEnvironment, overview, readme] = await Promise.all([
     readArtifact('deploy/compose.yaml'),
-    readArtifact('deploy/env.example'),
+    readArtifact('deploy/config/listener.env.example'),
     readArtifact('.env.example'),
     readArtifact('docs/system-overview.html'),
     readArtifact('README.md'),
   ]);
-  const app = composeService(compose, 'app');
   const settings = Object.freeze([
     ['LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED', 'false'],
     ['LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS', '45'],
@@ -348,12 +351,9 @@ void test('deployment keeps executable bounded admission disabled until the foll
     const assignment = new RegExp(`^${name}=${fallback}$`, 'gmu');
     assert.equal((environment.match(assignment) ?? []).length, 1);
     assert.equal((localEnvironment.match(assignment) ?? []).length, 1);
-    assert.equal(
-      (app.match(new RegExp(`^ {6}${name}: "\\$\\{${name}:-${fallback}\\}"$`, 'gmu')) ?? [])
-        .length,
-      1,
-    );
   }
+
+  assert.doesNotMatch(compose, /LISTENER_/u);
 
   for (const example of [environment, localEnvironment]) {
     assert.match(example, /restart-only/iu);
@@ -406,7 +406,7 @@ void test('bounded worker admission canary remains post-merge, observe-only and 
   const [compose, environment, localEnvironment, runbook, readme, architecture, overview] =
     await Promise.all([
       readArtifact('deploy/compose.yaml'),
-      readArtifact('deploy/env.example'),
+      readArtifact('deploy/config/listener.env.example'),
       readArtifact('.env.example'),
       readArtifact('docs/operations/block-hydration-canary.md'),
       readArtifact('README.md'),
@@ -414,10 +414,7 @@ void test('bounded worker admission canary remains post-merge, observe-only and 
       readArtifact('docs/system-overview.html'),
     ]);
 
-  assert.match(
-    composeService(compose, 'app'),
-    /LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: "\$\{LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED:-false\}"/u,
-  );
+  assert.doesNotMatch(compose, /LISTENER_/u);
   for (const example of [environment, localEnvironment]) {
     assert.match(example, /^LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=false$/mu);
     assert.doesNotMatch(example, /^LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED=true$/mu);
@@ -472,77 +469,78 @@ void test('versioned admission design and plan restrict strict ingress parity to
   }
 });
 
-void test('Compose resolves catch-up scan limit defaults and overrides only for app', (context) => {
+void test('Compose resolves the stack: only mode inputs reach the containers, secrets stay read-only files', (context) => {
   const docker = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 10_000 });
   if (docker.error !== undefined || docker.status !== 0) {
     context.skip('Docker Compose unavailable: resolved configuration contract skipped');
     return;
   }
-  for (const configured of [
-    Object.freeze({ workerCount: undefined, maxPages: undefined, pageSize: undefined, expectedWorkerCount: '1', expectedMaxPages: '20', expectedPageSize: '100' }),
-    Object.freeze({ workerCount: '2', maxPages: '37', pageSize: '777', expectedWorkerCount: '2', expectedMaxPages: '37', expectedPageSize: '777' }),
-  ]) {
+  interface ResolvedService {
+    readonly environment?: Readonly<Record<string, string>>;
+    readonly security_opt?: readonly string[];
+    readonly cap_drop?: readonly string[];
+    readonly ulimits?: Readonly<Record<string, unknown>>;
+    readonly stop_grace_period?: string;
+    readonly cpus?: number;
+    readonly ports?: readonly Readonly<{ host_ip?: string; published?: string | number; target?: number }>[];
+    readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean }>[];
+  }
+  const resolvedConfig = (
+    files: readonly string[],
+    extra: Readonly<Record<string, string>> = {},
+  ): Readonly<Record<string, ResolvedService>> => {
     const result = spawnSync('docker', [
-      'compose', '--env-file', '/dev/null', '-f', 'deploy/compose.yaml', 'config', '--format', 'json',
+      'compose', '--env-file', 'deploy/env.example', ...files.flatMap((file) => ['-f', file]),
+      'config', '--format', 'json',
     ], {
       cwd: fileURLToPath(root), encoding: 'utf8', timeout: 10_000,
-      env: {
-        PATH: process.env.PATH,
-        POSTGRES_DB: 'compose_contract', POSTGRES_USER: 'compose_contract',
-        POSTGRES_PASSWORD: 'contract-only', POSTGRES_PASSWORD_URI_ENCODED: 'contract-only',
-        BACKEND_IMAGE: 'registry.invalid/backend:test', FRONTEND_IMAGE: 'registry.invalid/frontend:test',
-        SOLANA_HTTP_RPC_URL: 'https://rpc.invalid', SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
-        ...(configured.workerCount === undefined ? {} : { LISTENER_WORKER_COUNT: configured.workerCount }),
-        ...(configured.maxPages === undefined ? {} : { LISTENER_CATCH_UP_MAX_PAGES: configured.maxPages }),
-        ...(configured.pageSize === undefined ? {} : { LISTENER_CATCH_UP_PAGE_SIZE: configured.pageSize }),
-      },
+      env: { PATH: process.env.PATH, ...extra },
     });
     assert.equal(result.status, 0, result.stderr);
-    const resolved = JSON.parse(result.stdout) as {
-      readonly services: Readonly<Record<string, { readonly environment?: Readonly<Record<string, string>> }>>;
-    };
-    assert.equal(resolved.services.app?.environment?.LISTENER_WORKER_COUNT, configured.expectedWorkerCount);
-    assert.equal(resolved.services.app?.environment?.LISTENER_CATCH_UP_MAX_PAGES, configured.expectedMaxPages);
-    assert.equal(resolved.services.app?.environment?.LISTENER_CATCH_UP_PAGE_SIZE, configured.expectedPageSize);
-    for (const service of ['postgres', 'migrate', 'retention', 'frontend']) {
-      assert.equal(resolved.services[service]?.environment?.LISTENER_WORKER_COUNT, undefined);
-      assert.equal(resolved.services[service]?.environment?.LISTENER_CATCH_UP_MAX_PAGES, undefined);
-      assert.equal(resolved.services[service]?.environment?.LISTENER_CATCH_UP_PAGE_SIZE, undefined);
-    }
-  }
-});
+    return (JSON.parse(result.stdout) as { readonly services: Readonly<Record<string, ResolvedService>> }).services;
+  };
+  const ports = (service: ResolvedService | undefined): string[] => (service?.ports ?? [])
+    .map((port) => `${port.host_ip ?? ''}:${String(port.published)}:${String(port.target)}`);
+  const binds = (service: ResolvedService | undefined): string[] => (service?.volumes ?? [])
+    .filter((volume) => volume.type === 'bind')
+    .map((volume) => `${volume.source ?? ''}:${volume.target ?? ''}:${volume.read_only === true ? 'ro' : 'rw'}`);
 
-void test('Compose catch-up admission resolves default-off and explicit activation without other service exposure', (context) => {
-  const docker = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 10_000 });
-  if (docker.error !== undefined || docker.status !== 0) {
-    context.skip('Docker Compose unavailable: resolved configuration contract skipped');
-    return;
+  const services = resolvedConfig(['deploy/compose.yaml']);
+  assert.deepEqual(Object.keys(services).sort(), ['back', 'front', 'migrate', 'postgres']);
+  assert.deepEqual(services.back?.environment, {
+    POSTGRES_DB: 'sol_token_listener', SOL_HEALTH_REQUIRE_OK: 'true', SOL_STACK_MODE: 'observe',
+  });
+  assert.deepEqual(services.migrate?.environment, { POSTGRES_DB: 'sol_token_listener' });
+  assert.deepEqual(services.front?.environment, { FRONT_BASIC_AUTH_USER: 'operator', SITE_ADDRESS: 'http://:8080' });
+  assert.deepEqual(ports(services.front), ['127.0.0.1:8080:8080']);
+  for (const name of ['postgres', 'migrate', 'back']) assert.deepEqual(ports(services[name]), [], name);
+  assert.deepEqual(binds(services.postgres), [
+    '/srv/sol-token-listener/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro',
+  ]);
+  assert.deepEqual(binds(services.migrate), ['/srv/sol-token-listener/secrets/db:/root/secrets/db:ro']);
+  assert.deepEqual(binds(services.back), [
+    '/srv/sol-token-listener/secrets/db/logins:/root/secrets/logins:ro',
+    '/srv/sol-token-listener/secrets/back:/root/secrets/back:ro',
+    '/srv/sol-token-listener/config:/etc/sol/config:ro',
+  ]);
+  assert.deepEqual(binds(services.front), [
+    '/srv/sol-token-listener/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro',
+  ]);
+  for (const name of ['migrate', 'back']) {
+    const service = services[name];
+    assert.deepEqual(service?.security_opt, ['no-new-privileges:true'], name);
+    assert.deepEqual(service?.cap_drop, ['NET_RAW', 'MKNOD'], name);
+    assert.ok(Object.hasOwn(service?.ulimits ?? {}, 'core'), name);
   }
-  const name = 'LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED';
-  for (const configured of [undefined, 'false', 'true']) {
-    const result = spawnSync('docker', [
-      'compose', '--env-file', '/dev/null', '-f', 'deploy/compose.yaml', 'config', '--format', 'json',
-    ], {
-      cwd: fileURLToPath(root), encoding: 'utf8', timeout: 10_000,
-      env: {
-        PATH: process.env.PATH,
-        POSTGRES_DB: 'compose_contract', POSTGRES_USER: 'compose_contract',
-        POSTGRES_PASSWORD: 'contract-only', POSTGRES_PASSWORD_URI_ENCODED: 'contract-only',
-        BACKEND_IMAGE: 'registry.invalid/backend:test', FRONTEND_IMAGE: 'registry.invalid/frontend:test',
-        SOLANA_HTTP_RPC_URL: 'https://rpc.invalid', SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
-        ...(configured === undefined ? {} : { [name]: configured }),
-      },
-    });
-    assert.equal(result.status, 0, result.stderr);
-    const resolved = JSON.parse(result.stdout) as {
-      readonly services: Readonly<Record<string, { readonly environment?: Readonly<Record<string, string>> }>>;
-    };
-    assert.equal(resolved.services.app?.environment?.[name], configured ?? 'false');
-    assert.equal(resolved.services.app?.environment?.EXECUTION_MODE, 'observe');
-    for (const service of ['postgres', 'migrate', 'retention', 'frontend']) {
-      assert.equal(resolved.services[service]?.environment?.[name], undefined);
-    }
-  }
+  assert.equal(services.front?.security_opt, undefined);
+  assert.equal(services.back?.stop_grace_period, '4m0s');
+  assert.equal(services.front?.cpus, 0.5);
+
+  const server = resolvedConfig(['deploy/compose.yaml', 'deploy/compose.server.yaml'], {
+    SITE_ADDRESS: 'bot.example.invalid',
+  });
+  assert.deepEqual(ports(server.front), [':80:80', ':443:443']);
+  assert.equal(server.front?.environment?.SITE_ADDRESS, 'bot.example.invalid');
 });
 
 void test('block hydration canary proves active routing and bounded serialized admission', async () => {
@@ -1125,69 +1123,53 @@ void test('cross-origin Playwright uses a generated dist-only runtime config wit
   );
 });
 
-void test('Compose keeps the raw PostgreSQL password separate from its URI-encoded form', async () => {
+void test('Compose never carries a database password or URL: the containers read secret files', async () => {
   const compose = await readArtifact('deploy/compose.yaml');
-  const rawPassword = 'example:@/?#[]';
-  const encodedPassword = 'example%3A%40%2F%3F%23%5B%5D';
-
-  assert.match(
-    compose,
-    /DATABASE_URL: postgresql:\/\/\$\{POSTGRES_USER:\?POSTGRES_USER is required\}:\$\{POSTGRES_PASSWORD_URI_ENCODED:\?POSTGRES_PASSWORD_URI_ENCODED is required\}@postgres:5432\/\$\{POSTGRES_DB:\?POSTGRES_DB is required\}/,
-  );
-  assert.match(
-    composeService(compose, 'postgres'),
-    /POSTGRES_PASSWORD: \$\{POSTGRES_PASSWORD:\?POSTGRES_PASSWORD is required\}/,
-  );
-  assert.doesNotMatch(compose, /DATABASE_URL:[^\n]*\$\{POSTGRES_PASSWORD:\?/);
-
-  const databaseUrl = `postgresql://listener:${encodedPassword}@postgres:5432/listener`;
-  const postgresEnvironment = { POSTGRES_PASSWORD: rawPassword };
-  assert.equal(new URL(databaseUrl).password, encodedPassword);
-  assert.equal(postgresEnvironment.POSTGRES_PASSWORD, rawPassword);
-  assert.notEqual(postgresEnvironment.POSTGRES_PASSWORD, new URL(databaseUrl).password);
+  assert.match(composeService(compose, 'postgres'), /^ {6}POSTGRES_PASSWORD_FILE: \/root\/secrets\/postgres-admin-password$/m);
+  assert.doesNotMatch(compose, /POSTGRES_PASSWORD:|POSTGRES_PASSWORD_URI_ENCODED|DATABASE_URL|postgresql:\/\//u);
 });
 
-void test('Compose environment template contains documentation-only required inputs', async () => {
+void test('the compose input template holds no secret and documents every input', async () => {
   const environment = await readArtifact('deploy/env.example');
-
+  const lines = environment.split('\n');
   for (const value of [
+    'SOL_HOST_DIR=/srv/sol-token-listener',
+    'SOL_STACK_MODE=observe',
+    'SOL_HEALTH_REQUIRE_OK=true',
     'POSTGRES_DB=sol_token_listener',
-    'POSTGRES_USER=sol_token_listener',
-    'POSTGRES_PASSWORD=replace-with-a-secret',
-    'POSTGRES_PASSWORD_URI_ENCODED=replace-with-a-secret',
     `BACKEND_IMAGE=registry.invalid/sol-token-listener/backend@sha256:${'0'.repeat(64)}`,
     `FRONTEND_IMAGE=registry.invalid/sol-token-listener/frontend@sha256:${'1'.repeat(64)}`,
-    'SOLANA_HTTP_RPC_URL=https://rpc-provider.invalid',
-    'SOLANA_HTTP_RPC_FALLBACK_URLS=',
-    'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
-    'SOLANA_WS_RPC_FALLBACK_URLS=',
-    'SOLANA_EXPECTED_GENESIS_HASH=',
-    'FRONTEND_PORT=8080',
-    'LISTENER_ENABLED=true',
-    'RETENTION_PURGE_INTERVAL_MS=900000',
+    'FRONT_PORT=8080',
+    'FRONT_BASIC_AUTH_USER=operator',
+    'SITE_ADDRESS=',
   ]) {
-    assert.ok(environment.includes(value), `missing deploy environment value: ${value}`);
+    assert.ok(lines.includes(value), `missing compose input: ${value}`);
   }
-  assert.match(environment, /outside version control/i);
-  assert.match(environment, /must be replaced/i);
-  assert.match(environment, /POSTGRES_PASSWORD_URI_ENCODED must be the percent-encoding of POSTGRES_PASSWORD/i);
-  assert.match(environment, /unreserved example values can be identical/i);
-  assert.match(
-    environment,
-    /^# Optional ordered, comma-separated fallback HTTP RPC URLs \(maximum 3\); use the same scheme and this can remain blank\.\nSOLANA_HTTP_RPC_FALLBACK_URLS=$/m,
-  );
-  assert.match(
-    environment,
-    /^# Optional paired WebSocket fallbacks; positions must match the HTTP fallback list and this can remain blank\.\nSOLANA_WS_RPC_FALLBACK_URLS=$/m,
-  );
-  assert.match(
-    environment,
-    /canonical 32-byte base58 genesis hash/i,
-  );
-  assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
+  assert.match(environment, /outside version control/iu);
+  assert.match(environment, /holds no secret/iu);
+  assert.doesNotMatch(environment, /PASSWORD|PRIVATE_KEY|SECRET_KEY|WALLET|api-key|SOLANA_/iu);
   for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
     assert.match(environment, new RegExp(`^${name}=registry\\.invalid/[^\\s@]+@sha256:[0-9a-f]{64}$`, 'm'));
   }
+});
+
+void test('every role has a configuration template, and no template carries a secret', async () => {
+  const files = [...new Set(Object.values(ROLES).map((role) => role.configFile))].sort();
+  assert.deepEqual(files, [
+    'listener.env', 'live-recovery.env', 'live.env', 'operations.env', 'operator-api.env',
+    'preflight-bundle.env', 'provider-evidence.env', 'readiness.env', 'retention.env', 'worker-sim.env',
+  ]);
+  assert.deepEqual((await readdir(new URL('deploy/config/', root))).sort(), files.map((file) => `${file}.example`));
+  for (const file of files) {
+    const text = await readArtifact(`deploy/config/${file}.example`);
+    assert.doesNotThrow(() => parseRoleConfig(text, file), file);
+    assert.doesNotMatch(text, /api-key|postgresql:\/\//iu, file);
+  }
+  const operatorApi = parseRoleConfig(await readArtifact('deploy/config/operator-api.env.example'), 'operator-api.env');
+  assert.equal(operatorApi.OPERATOR_API_HOST, '0.0.0.0');
+  assert.equal(operatorApi.OPERATOR_API_PORT, '3100');
+  const operations = parseRoleConfig(await readArtifact('deploy/config/operations.env.example'), 'operations.env');
+  assert.equal(operations.SOLANA_HTTP_RPC_URL, undefined);
 });
 
 void test('deployment smoke is bounded, isolated, secret-free, and always cleans its project', async () => {
@@ -1201,20 +1183,20 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /GLOBAL_TIMEOUT_MS\s*=\s*600_000/);
   assert.match(smoke, /REQUEST_TIMEOUT_MS\s*=\s*10_000/);
   assert.match(smoke, /postgresPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
-  assert.match(smoke, /POSTGRES_PASSWORD:\s*postgresPassword/);
-  assert.match(smoke, /POSTGRES_PASSWORD_URI_ENCODED:\s*encodeURIComponent\(postgresPassword\)/);
-  assert.match(smoke, /SOLANA_HTTP_RPC_URL:\s*'https:\/\/rpc\.invalid'/);
-  assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
-  assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
+  assert.match(smoke, /frontPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
+  assert.match(smoke, /operatorApiToken\s*=\s*randomBytes\(32\)\.toString\('hex'\)/);
+  assert.match(smoke, /SOL_HOST_DIR:\s*hostDirectory/);
+  assert.match(smoke, /SOL_STACK_MODE:\s*'observe'/);
+  assert.match(smoke, /SOL_HEALTH_REQUIRE_OK:\s*'false'/);
+  assert.match(smoke, /\['secrets\/back\/helius-listener-http-url', 'https:\/\/rpc\.invalid\\n'\]/);
+  assert.match(smoke, /\['secrets\/back\/helius-listener-ws-url', 'wss:\/\/rpc\.invalid\\n'\]/);
+  assert.match(smoke, /const override = name === 'listener' \? 'LISTENER_ENABLED=false\\n' : '';/);
   assert.doesNotMatch(smoke, /SOLANA_EXPECTED_GENESIS_HASH/);
   assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
   assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
-  assert.match(smoke, /const smokeComposeFile = resolve\(root, 'deploy\/compose\.smoke\.yaml'\)/);
-  assert.match(
-    smoke,
-    /return \['compose', \.\.\.projectArgs, '-f', composeFile, '-f', smokeComposeFile, \.\.\.args\];/,
-  );
-  assert.match(smoke, /await compose\(\['build', 'app', 'frontend'\]\)/);
+  assert.doesNotMatch(smoke, /compose\.smoke\.yaml|smokeComposeFile/);
+  assert.match(smoke, /return \['compose', \.\.\.projectArgs, '-f', composeFile, \.\.\.args\];/);
+  assert.match(smoke, /await compose\(\['build', 'back', 'front'\]\)/);
   assert.match(smoke, /composeCommand\(\[\s*'exec', '-T', 'postgres', 'psql'/);
   assert.match(smoke, /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\]\)/);
   assert.equal((smoke.match(/\['compose'/g) ?? []).length, 1);
@@ -1239,7 +1221,9 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'executionAttempts'/);
   assert.match(smoke, /'executionIntents'/);
   assert.doesNotMatch(smoke, /Migration history does not contain exactly 14 rows\./);
-  assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
+  assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key/iu);
+  // The only keypair is random bytes that prove the tmpfs isolation; it never holds funds.
+  assert.match(smoke, /const throwawayKeypair = JSON\.stringify\(\[\.\.\.randomBytes\(64\)\]\);/u);
   assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
 
   assert.equal(packageJson.scripts?.['deployment:smoke'], 'node scripts/deployment-smoke.mjs');
@@ -1260,7 +1244,7 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
 
   assert.match(
     retention,
-    /const \{ stdout, stderr \} = await compose\(\[\s*'exec', '-T', 'retention'/,
+    /const \{ stdout, stderr \} = await compose\(\[\s*'exec', '-T', 'back', 'sol-run', 'retention'/,
   );
   assert.match(retention, /if \(stderr !== ''\) throw new Error\('Retention emitted unexpected stderr\.'\)/);
   assert.match(retention, /reflectFailureOutput: false/);
@@ -1322,7 +1306,7 @@ void test('deployment smoke handles signals through one bounded cleanup path bef
   assert.match(smoke, /--signal-fault-probe/);
   assert.match(smoke, /await runSignalFaultProbe\(invocationMode === 'signal-fault-probe-kill' \? 'SIGKILL' : 'SIGTERM'\)/);
   assert.match(smoke, /await runActiveChildSignalProbe\(selfSignal\)/);
-  assert.match(smoke, /'exec', '-T', 'app', 'node', '-e', 'setInterval\(\(\) => undefined, 1_000\)'/);
+  assert.match(smoke, /'exec', '-T', 'back', 'node', '-e', 'setInterval\(\(\) => undefined, 1_000\)'/);
   assert.match(smoke, /if \(exitCode === 0\) process\.stdout\.write\('Deployment smoke passed\.\\n'\)/);
   assert.equal(packageJson.scripts?.['deployment:smoke:signal'], 'node scripts/deployment-smoke.mjs --signal-fault-probe');
   assert.match(ci, /deployment-contract:[\s\S]*?- run: npm run deployment:smoke:signal/);
@@ -1331,8 +1315,8 @@ void test('deployment smoke handles signals through one bounded cleanup path bef
 void test('deployment smoke discovers Docker allocated loopback port after startup', async () => {
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
 
-  assert.match(smoke, /FRONTEND_PORT:\s*'0'/);
-  assert.match(smoke, /\['port', 'frontend', '8080'\]/);
+  assert.match(smoke, /FRONT_PORT:\s*'0'/);
+  assert.match(smoke, /\['port', 'front', '8080'\]/);
   assert.match(smoke, /\^127\\\.0\\\.0\\\.1:\(\[1-9\]\[0-9\]\{0,4\}\)\\n\$/);
   assert.doesNotMatch(smoke, /reserveLoopbackPort|createServer/);
 });
@@ -1342,6 +1326,7 @@ void test('failed signal fault probes always clean only their explicit child pro
 
   assert.match(smoke, /finally\s*{\s*cleanupDeadlineAt = Date\.now\(\) \+ CLEANUP_TIMEOUT_MS;/);
   assert.match(smoke, /await cleanupFaultProject\(faultName, cleanupFailures\)/);
+  assert.match(smoke, /await rm\(hostDirectoryFor\(faultName\), \{ recursive: true, force: true \}\)/);
   assert.match(
     smoke,
     /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\], faultName\)/,
@@ -1350,6 +1335,30 @@ void test('failed signal fault probes always clean only their explicit child pro
   assert.match(smoke, /--signal-fault-probe-kill/);
   assert.match(smoke, /--self-sigkill/);
   assert.match(smoke, /new AggregateError\(\[primaryFailure, \.\.\.cleanupFailures\]/);
+});
+
+void test('deployment smoke proves users, secret isolation, front authentication, logins and closed operations', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  for (const phase of ['HOST_SETUP', 'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'LOGINS', 'OPERATIONS']) {
+    assert.ok(smoke.includes(`await smokePhase('${phase}'`), `missing smoke phase ${phase}`);
+  }
+  for (const statement of [
+    "assertEqual(stdout, 'listener 10001\\nopapi 10005\\nretention 10006\\n'",
+    "assertEqual(stdout.trim(), '10100'",
+    "assertEqual(stdout, 'h2b 400\\nopapi 400\\n'",
+    "'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path",
+    'assertEqual(anonymous.status, 401',
+    'assertEqual(write.status, 405',
+    'assertEqual(operator.status, 401',
+    'assertEqual(authorized.status, 200',
+    '`PGOPTIONS=-c role=${group}`',
+    "assertEqual(counts.trim(), '0|0'",
+  ]) {
+    assert.ok(smoke.includes(statement), `missing smoke check: ${statement}`);
+  }
+  for (const [login, group] of Object.entries(DATABASE_LOGINS)) {
+    assert.ok(smoke.includes(`  ${login}: '${group}',`), `smoke login table differs for ${login}`);
+  }
 });
 
 void test('top-level deployment errors are categorized, bounded, and never reflect input', () => {
@@ -1376,113 +1385,57 @@ void test('deployment error summaries categorize aggregate causes without raw me
   assert.doesNotMatch(smoke, /process\.stderr\.write\([^)]*error\.(?:message|stack)/s);
 });
 
-void test('deployment runbook documents the safe production lifecycle and safety boundary', async () => {
+void test('deployment runbook documents the full-bot lifecycle, takeover and security boundary', async () => {
   const runbook = await readArtifact('docs/operations/deployment.md');
-  const packageJson = JSON.parse(await readArtifact('package.json')) as {
-    readonly scripts?: Readonly<Record<string, string>>;
-  };
-
+  let previous = -1;
   for (const heading of [
-    '## Prérequis',
-    '## Images immuables',
-    '## Secrets externes',
-    '## Migration et verrou consultatif',
-    '## Démarrage',
-    '## Arrêt normal',
-    '## Santé et supervision',
-    '## Rétention et confidentialité',
-    '## Sauvegarde',
-    '## Répétition de restauration',
-    '## Rollback',
-    '## Proxy SSE et TLS externe',
-    '## Limite de réplica unique',
-    '## Arrêt incident',
-    '## Frontière no-live',
+    '## Topologie', '## Prérequis', '## Dossier hôte, secrets et configuration', '## Images',
+    '## Démarrage et arrêt', '## Commandes sol', '## Trading', "## Qualification d'une enveloppe (gate 10)",
+    '## Santé et journaux', '## Sauvegardes', '## Reprise de la base actuelle', '## Retour arrière',
+    '## Bascule vers le serveur', '## Rotation des secrets', '## Frontière de sécurité',
   ]) {
-    assert.ok(runbook.includes(heading), `missing runbook section: ${heading}`);
+    const index = runbook.indexOf(`\n${heading}\n`);
+    assert.ok(index > previous, `missing or misplaced runbook section: ${heading}`);
+    previous = index;
   }
-
-  assert.match(runbook, /export DEPLOY_ENV=\/etc\/sol-token-listener\/deploy\.env/);
-  assert.match(runbook, /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml/);
-  assert.match(runbook, /deploy\/env\.example[^\n]*jamais[^\n]*secret[^\n]*production/i);
-  assert.match(runbook, /pg_advisory_lock/);
-  assert.match(
-    runbook,
-    /verrou[\s\S]{0,240}(?:sérialise|coordonne)[^\n]*migrateurs[\s\S]{0,240}(?:n’arrête|ne stoppe|ne coordonne)[^\n]*(?:app|application|worker)/i,
-  );
-  assert.match(
-    runbook,
-    /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres/,
-  );
-  assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
-  assert.match(runbook, /pull postgres migrate app retention frontend/);
-  const escapedPostgresImage = postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const validationPipeline = new RegExp(
-    `docker compose --env-file "\\$DEPLOY_ENV" -f deploy/compose\\.yaml --project-name sol-token-listener config --images migrate app retention frontend \\| grep -Fvx '${escapedPostgresImage}' \\| npm run --silent deployment:validate-images`,
-    'g',
-  );
-  assert.equal((runbook.match(validationPipeline) ?? []).length, 2);
-  assert.equal(
-    packageJson.scripts?.['deployment:validate-images'],
-    'node scripts/validate-deployment-images.mjs',
-  );
-  assert.match(runbook, /up --detach --wait --wait-timeout 60 --no-build postgres/);
-  assert.match(runbook, /deployment-healthcheck\.js --require-ok/);
-  assert.equal((runbook.match(/up -d --wait --wait-timeout 60 --no-build --no-deps frontend/g) ?? []).length, 2);
-  assert.match(runbook, /4 heures/);
-  assert.match(runbook, /15 minutes/);
-  assert.match(runbook, /DEGRADED[\s\S]{0,120}smoke[\s\S]{0,120}listener[\s\S]{0,120}désactivé/i);
-  assert.match(runbook, /production[^\n]*OK/i);
-  assert.match(runbook, /down --volumes[\s\S]{0,120}destructif[\s\S]{0,120}jamais[\s\S]{0,120}arrêt normal/i);
-  assert.match(runbook, /sans inverser[^\n]*migration/i);
-  const startup = runbook.slice(runbook.indexOf('## Démarrage'), runbook.indexOf('## Arrêt normal'));
-  const startupStop = 'stop --timeout 40 frontend app retention';
-  const startupStopIndex = startup.indexOf(startupStop);
-  assert.notEqual(startupStopIndex, -1, 'rollout must stop every application service');
-  assert.ok(startupStopIndex > startup.indexOf('sauvegarde'), 'backup must precede downtime');
-  assert.ok(startupStopIndex > startup.indexOf('pull postgres migrate app retention frontend'));
-  assert.ok(startupStopIndex > startup.indexOf('deployment:validate-images'));
-  assert.ok(startupStopIndex < startup.indexOf('run --rm --no-deps migrate'));
-  assert.match(startup, /indisponib|downtime/i);
-  assert.match(startup, /commande[^\n]*(?:attend|bloque)|(?:attend|bloque)[^\n]*commande/i);
-
-  const rollback = runbook.slice(runbook.indexOf('## Rollback'), runbook.indexOf('## Proxy SSE'));
-  const rollbackStopIndex = rollback.indexOf(startupStop);
-  assert.notEqual(rollbackStopIndex, -1, 'rollback must stop every application service');
-  assert.ok(rollbackStopIndex < rollback.indexOf('BACKEND_IMAGE'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('pull app frontend retention'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention'));
-  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE[\s\S]*références immuables précédentes/iu);
-  assert.match(rollback, /repository@sha256:…/u);
-  assert.match(rollback, /ne doivent pas être vides|refus(?:e|ent) une\s+valeur vide/iu);
-  assert.match(rollback, /pull app frontend retention/);
-  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps app retention/);
-  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps frontend/);
-  assert.ok(
-    rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention')
-      < rollback.indexOf('deployment-healthcheck.js --require-ok')
-      && rollback.indexOf('deployment-healthcheck.js --require-ok')
-        < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps frontend'),
-    'backend readiness and strict health must precede frontend re-exposure',
-  );
-  assert.doesNotMatch(
-    rollback,
-    /stop app\n.*up -d --wait --wait-timeout 60 app\n.*deployment-healthcheck\.js --require-ok/s,
-  );
-  assert.match(runbook, /restauration[^\n]*répétée/i);
-  assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
-  assert.match(runbook, /observe|paper/i);
-  assert.match(runbook, /aucun[^\n]*(?:wallet|clé privée|ordre réel|transaction live)/i);
-  assert.equal((runbook.match(/^health_attempt=0$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^until docker compose .*deployment-healthcheck\.js --require-ok; do$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {2}if \[ "\$health_attempt" -ge 30 \]; then$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {4}if ! docker compose .* stop --timeout 40 app retention; then$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {6}echo 'Le healthcheck strict a échoué et l’arrêt de sécurité app\/retention a aussi échoué\.' >&2$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(
-    /^ {4}echo 'Le healthcheck strict n’a pas convergé ; le déploiement est interrompu\.' >&2\n {4}exit 1\n {2}fi$/gm,
-  ) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {2}sleep 2$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^set -euo pipefail$/gm) ?? []).length, 2);
+  for (const command of [
+    'deploy/host/init-secrets.sh "$SOL_HOST_DIR"',
+    'docker compose --env-file "$SOL_ENV" -f deploy/compose.yaml "$@"',
+    'docker compose --env-file "$SOL_ENV" -f deploy/compose.yaml -f deploy/compose.server.yaml "$@"',
+    'sol_compose up --detach --wait --wait-timeout 180',
+    'sol_compose stop\n',
+    'sol_compose exec -it back sol trading start',
+    'sol_compose exec back sol trading stop',
+    'sol_compose exec back sol qualify start',
+    'sol_compose exec back sol qualify stop',
+    'sol_compose run --rm migrate sol-admin report',
+    'sol_compose run --rm migrate sol-admin group-roles',
+    'pg_restore --exit-on-error --single-transaction -U sol_owner',
+    'deploy/sql/takeover-precondition.sql',
+    'deploy/sql/table-row-counts.sql',
+    'diff "$takeover/source.counts" "$takeover/target.counts"',
+    'docker stop sol-token-listener-live-pg',
+    'docker volume rm sol-token-listener_postgres-data',
+    // H2f reads the draft only when ops owns it with mode 0600 (readPreflightProtectedFile).
+    "sh -c 'umask 077 && sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json && chown ops:ops /var/lib/sol/evidence/preflight-draft.json'",
+    'sol ctl restart <programme>',
+    'sudo systemctl enable --now sol-backup.timer',
+    'launchctl bootstrap "gui/$(id -u)" "$plist"',
+  ]) {
+    assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
+  }
+  const secrets = runbook.slice(runbook.indexOf('## Dossier hôte'), runbook.indexOf('## Images'));
+  assert.doesNotMatch(secrets, /\b(?:cat|echo)\s+"?\$(?:back|SOL_HOST_DIR)/u, 'secrets are copied, never printed');
+  assert.match(runbook, /pg_advisory_lock/u);
+  assert.match(runbook, /Les migrations\s+restent forward-only/u);
+  // `down --volumes` also deletes the evidence and the TLS certificate: never a documented command.
+  assert.match(runbook, /`down --volumes` efface tous les volumes de la stack/u);
+  assert.doesNotMatch(runbook, /^\s*sol_compose down --volumes/mu);
+  assert.doesNotMatch(runbook, /--timeout 60/u, 'the stop waits for the whole stop_grace_period');
+  assert.match(runbook, /ENTRY_STOP/u);
+  assert.match(runbook, /0\|0\|0\|0/u);
+  assert.match(runbook, /réplica unique/u);
+  assert.match(runbook, /sauvegarde externe/u);
 });
 
 void test('every deployment runbook shell block is syntactically valid Bash', async () => {
@@ -1527,14 +1480,14 @@ void test('operator documentation activates the safe websocket failover contract
   assert.match(readme, /réplica unique|single replica/i);
   assert.match(readme, /observe\/paper|observe et paper/i);
   assert.match(readme, /4\s+heures/);
-  assert.match(readme, /TLS externe/i);
+  assert.match(readme, /HTTPS/u);
   assert.match(readme, /sauvegarde externe/i);
   assert.match(readme, /aucune promesse[^\n]*(?:première position|sellabilité|profit)/i);
 
   assert.match(overview, /href="operations\/deployment\.md"/);
   assert.match(overview, /npm run deployment:smoke/);
   assert.match(overview, /réplica unique|single replica/i);
-  assert.match(overview, /TLS externe/i);
+  assert.match(overview, /HTTPS/u);
   assert.match(overview, /sauvegarde externe/i);
   assert.match(overview, /aucune promesse[^<]*(?:première position|sellabilité|profit)/i);
 
@@ -1551,17 +1504,9 @@ void test('operator documentation activates the safe websocket failover contract
     'SolanaProgramSubscriber',
   ]) assert.ok(documentation.includes(statement), `missing active operational statement: ${statement}`);
   assert.doesNotMatch(documentation, /inactive until #63|inactive.*#63|jusqu[^\n]{0,80}#63/iu);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d migrate/);
-  assert.match(deployment, /DOTENV_CONFIG_PATH=deploy\/\.env npm run rpc:check/);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d --wait --wait-timeout 60 app frontend retention/);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml exec -T app[\s\S]*deployment-healthcheck\.js --require-ok/);
-  assert.match(deployment, /références immuables précédentes/i);
-  assert.match(deployment, /migrations[^.]*forward-only/i);
-  assert.ok(
-    deployment.indexOf('up -d --wait --wait-timeout 60 app frontend retention')
-      < deployment.indexOf('deployment-healthcheck.js --require-ok'),
-    'Compose readiness must be awaited before the strict healthcheck',
-  );
+  assert.match(deployment, /sol_compose up --detach --wait --wait-timeout 180/u);
+  assert.match(deployment, /Les migrations\s+restent forward-only/u);
+  assert.match(deployment, /SOL_HEALTH_REQUIRE_OK=false/u);
 });
 
 void test('documented RPC preflight uses dotenv explicit-path support', async () => {

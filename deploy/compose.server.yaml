@@ -1,0 +1,7 @@
+services:
+  front:
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?SITE_ADDRESS is required on the server}
+    ports: !override
+      - "80:80"
+      - "443:443"
