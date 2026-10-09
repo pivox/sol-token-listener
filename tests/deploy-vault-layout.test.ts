@@ -152,12 +152,16 @@ void test('a value that reads as further variables is refused naming its own var
       assertRefused({ LOG_LEVEL: `info${separator}${fragment}` }, VaultLayoutError, message);
     }
   }
+  // After a closing quote, dotenv also ends the line at U+2028 or U+2029.
+  for (const separator of ['\u2028', '\u2029']) {
+    assertRefused({ LOG_LEVEL: `'x'${separator}SECRET_X=1` }, VaultLayoutError, message);
+  }
   // Another variable stays valid next to the planted one: the message still names the changed one only.
   assertRefused({ API_HOST: '0.0.0.0', LOG_LEVEL: 'info\nSECRET_X=1' }, VaultLayoutError, message);
 });
 
-void test('dotenv does not end a line at U+2028 or U+2029: such a value is no further variable and comes back intact', () => {
-  for (const separator of [' ', ' ']) {
+void test('an unquoted value keeps U+2028 or U+2029 and comes back intact', () => {
+  for (const separator of ['\u2028', '\u2029']) {
     const value = `info${separator}SECRET_X=1`;
     assert.equal(renderConfig('listener', { LOG_LEVEL: value }), `LOG_LEVEL=${value}\n`);
   }

@@ -266,11 +266,11 @@ void test('the file writer creates owner-only parents for secrets, readable ones
   try {
     // A strict umask: the 0644 below is the mode the file itself is given, not what open() left.
     withUmask(0o077, () => {
-      writePulledFile(join(directory, 'secrets/back/token'), 'v', 0o600);
       writePulledFile(join(directory, 'config.env'), 'A=b\n', 0o644);
     });
-    // A directory takes its mode from mkdir, minus the umask: the usual 022 makes 0755 observable.
+    // A directory takes its mode from mkdir, minus the umask: the usual 022 tells 0700 from 0755.
     withUmask(0o022, () => {
+      writePulledFile(join(directory, 'secrets/back/token'), 'v', 0o600);
       writePulledFile(join(directory, 'config/listener.env'), 'A=b\n', 0o644);
     });
     assert.equal((await stat(join(directory, 'secrets'))).mode & 0o777, 0o700);
