@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { parseRoleConfig } from '../src/deploy/role-environment.js';
-import { ROLES, STACK_USERS } from '../src/deploy/stack.js';
+import { DATABASE_LOGINS, ROLES, STACK_USERS } from '../src/deploy/stack.js';
 
 const root = new URL('../', import.meta.url);
 void test('front readiness probes the local Caddy admin endpoint, never the protected site', async () => {
@@ -1158,20 +1158,20 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /GLOBAL_TIMEOUT_MS\s*=\s*600_000/);
   assert.match(smoke, /REQUEST_TIMEOUT_MS\s*=\s*10_000/);
   assert.match(smoke, /postgresPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
-  assert.match(smoke, /POSTGRES_PASSWORD:\s*postgresPassword/);
-  assert.match(smoke, /POSTGRES_PASSWORD_URI_ENCODED:\s*encodeURIComponent\(postgresPassword\)/);
-  assert.match(smoke, /SOLANA_HTTP_RPC_URL:\s*'https:\/\/rpc\.invalid'/);
-  assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
-  assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
+  assert.match(smoke, /frontPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
+  assert.match(smoke, /operatorApiToken\s*=\s*randomBytes\(32\)\.toString\('hex'\)/);
+  assert.match(smoke, /SOL_HOST_DIR:\s*hostDirectory/);
+  assert.match(smoke, /SOL_STACK_MODE:\s*'observe'/);
+  assert.match(smoke, /SOL_HEALTH_REQUIRE_OK:\s*'false'/);
+  assert.match(smoke, /\['secrets\/back\/helius-listener-http-url', 'https:\/\/rpc\.invalid\\n'\]/);
+  assert.match(smoke, /\['secrets\/back\/helius-listener-ws-url', 'wss:\/\/rpc\.invalid\\n'\]/);
+  assert.match(smoke, /const override = name === 'listener' \? 'LISTENER_ENABLED=false\\n' : '';/);
   assert.doesNotMatch(smoke, /SOLANA_EXPECTED_GENESIS_HASH/);
   assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
   assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
-  assert.match(smoke, /const smokeComposeFile = resolve\(root, 'deploy\/compose\.smoke\.yaml'\)/);
-  assert.match(
-    smoke,
-    /return \['compose', \.\.\.projectArgs, '-f', composeFile, '-f', smokeComposeFile, \.\.\.args\];/,
-  );
-  assert.match(smoke, /await compose\(\['build', 'app', 'frontend'\]\)/);
+  assert.doesNotMatch(smoke, /compose\.smoke\.yaml|smokeComposeFile/);
+  assert.match(smoke, /return \['compose', \.\.\.projectArgs, '-f', composeFile, \.\.\.args\];/);
+  assert.match(smoke, /await compose\(\['build', 'back', 'front'\]\)/);
   assert.match(smoke, /composeCommand\(\[\s*'exec', '-T', 'postgres', 'psql'/);
   assert.match(smoke, /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\]\)/);
   assert.equal((smoke.match(/\['compose'/g) ?? []).length, 1);
@@ -1196,7 +1196,9 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'executionAttempts'/);
   assert.match(smoke, /'executionIntents'/);
   assert.doesNotMatch(smoke, /Migration history does not contain exactly 14 rows\./);
-  assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
+  assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key/iu);
+  // The only keypair is random bytes that prove the tmpfs isolation; it never holds funds.
+  assert.match(smoke, /const throwawayKeypair = JSON\.stringify\(\[\.\.\.randomBytes\(64\)\]\);/u);
   assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
 
   assert.equal(packageJson.scripts?.['deployment:smoke'], 'node scripts/deployment-smoke.mjs');
@@ -1217,7 +1219,7 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
 
   assert.match(
     retention,
-    /const \{ stdout, stderr \} = await compose\(\[\s*'exec', '-T', 'retention'/,
+    /const \{ stdout, stderr \} = await compose\(\[\s*'exec', '-T', 'back', 'sol-run', 'retention'/,
   );
   assert.match(retention, /if \(stderr !== ''\) throw new Error\('Retention emitted unexpected stderr\.'\)/);
   assert.match(retention, /reflectFailureOutput: false/);
@@ -1279,7 +1281,7 @@ void test('deployment smoke handles signals through one bounded cleanup path bef
   assert.match(smoke, /--signal-fault-probe/);
   assert.match(smoke, /await runSignalFaultProbe\(invocationMode === 'signal-fault-probe-kill' \? 'SIGKILL' : 'SIGTERM'\)/);
   assert.match(smoke, /await runActiveChildSignalProbe\(selfSignal\)/);
-  assert.match(smoke, /'exec', '-T', 'app', 'node', '-e', 'setInterval\(\(\) => undefined, 1_000\)'/);
+  assert.match(smoke, /'exec', '-T', 'back', 'node', '-e', 'setInterval\(\(\) => undefined, 1_000\)'/);
   assert.match(smoke, /if \(exitCode === 0\) process\.stdout\.write\('Deployment smoke passed\.\\n'\)/);
   assert.equal(packageJson.scripts?.['deployment:smoke:signal'], 'node scripts/deployment-smoke.mjs --signal-fault-probe');
   assert.match(ci, /deployment-contract:[\s\S]*?- run: npm run deployment:smoke:signal/);
@@ -1288,8 +1290,8 @@ void test('deployment smoke handles signals through one bounded cleanup path bef
 void test('deployment smoke discovers Docker allocated loopback port after startup', async () => {
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
 
-  assert.match(smoke, /FRONTEND_PORT:\s*'0'/);
-  assert.match(smoke, /\['port', 'frontend', '8080'\]/);
+  assert.match(smoke, /FRONT_PORT:\s*'0'/);
+  assert.match(smoke, /\['port', 'front', '8080'\]/);
   assert.match(smoke, /\^127\\\.0\\\.0\\\.1:\(\[1-9\]\[0-9\]\{0,4\}\)\\n\$/);
   assert.doesNotMatch(smoke, /reserveLoopbackPort|createServer/);
 });
@@ -1299,6 +1301,7 @@ void test('failed signal fault probes always clean only their explicit child pro
 
   assert.match(smoke, /finally\s*{\s*cleanupDeadlineAt = Date\.now\(\) \+ CLEANUP_TIMEOUT_MS;/);
   assert.match(smoke, /await cleanupFaultProject\(faultName, cleanupFailures\)/);
+  assert.match(smoke, /await rm\(hostDirectoryFor\(faultName\), \{ recursive: true, force: true \}\)/);
   assert.match(
     smoke,
     /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\], faultName\)/,
@@ -1307,6 +1310,30 @@ void test('failed signal fault probes always clean only their explicit child pro
   assert.match(smoke, /--signal-fault-probe-kill/);
   assert.match(smoke, /--self-sigkill/);
   assert.match(smoke, /new AggregateError\(\[primaryFailure, \.\.\.cleanupFailures\]/);
+});
+
+void test('deployment smoke proves users, secret isolation, front authentication, logins and closed operations', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  for (const phase of ['HOST_SETUP', 'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'LOGINS', 'OPERATIONS']) {
+    assert.ok(smoke.includes(`await smokePhase('${phase}'`), `missing smoke phase ${phase}`);
+  }
+  for (const statement of [
+    "assertEqual(stdout, 'listener 10001\\nopapi 10005\\nretention 10006\\n'",
+    "assertEqual(stdout.trim(), '10100'",
+    "assertEqual(stdout, 'h2b 400\\nopapi 400\\n'",
+    "'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path",
+    'assertEqual(anonymous.status, 401',
+    'assertEqual(write.status, 405',
+    'assertEqual(operator.status, 401',
+    'assertEqual(authorized.status, 200',
+    '`PGOPTIONS=-c role=${group}`',
+    "assertEqual(counts.trim(), '0|0'",
+  ]) {
+    assert.ok(smoke.includes(statement), `missing smoke check: ${statement}`);
+  }
+  for (const [login, group] of Object.entries(DATABASE_LOGINS)) {
+    assert.ok(smoke.includes(`  ${login}: '${group}',`), `smoke login table differs for ${login}`);
+  }
 });
 
 void test('top-level deployment errors are categorized, bounded, and never reflect input', () => {
