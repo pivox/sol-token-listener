@@ -23,7 +23,10 @@ if [ -e "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" ]; then
   exit 78
 fi
 for directory in unseal approle; do
-  if [ -n "$(ls -A "$SOL_HOST_DIR/secrets/vault/$directory")" ]; then
+  path="$SOL_HOST_DIR/secrets/vault/$directory"
+  # Its own statement: a failing ls aborts here (set -e) instead of reading as an empty directory.
+  listing="$(ls -A "$path")"
+  if [ -n "$listing" ]; then
     echo "vault-init: secrets/vault/$directory holds files of an earlier attempt: start over as the runbook says" >&2
     exit 78
   fi

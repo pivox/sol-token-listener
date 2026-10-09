@@ -27,8 +27,12 @@ mkdir -p "$host/secrets/db" "$host/secrets/front" "$host/secrets/vault/unseal" "
 chmod 0700 "$host" "$host/secrets" "$host/secrets/vault" "$host/secrets/vault/unseal" "$host/secrets/vault/approle" "$host/backups"
 
 if [ ! -e "$admin_file" ]; then
-  openssl rand -hex 32 > "$admin_file"
-  chmod 0600 "$admin_file"
+  # 32 random bytes in hex. Like the hash below, the file lands in place only once it is complete
+  # and checked: a failed openssl leaves no admin password for the next run to take as done.
+  openssl rand -hex 32 > "$admin_file.tmp"
+  grep -Eq '^[0-9a-f]{64}$' "$admin_file.tmp"
+  chmod 0600 "$admin_file.tmp"
+  mv "$admin_file.tmp" "$admin_file"
   echo "created $admin_file"
 fi
 

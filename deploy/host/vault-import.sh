@@ -14,6 +14,9 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 fi
 source_dir="$(cd "$1" && pwd)"
 evidence_dir="${2:-$(dirname "$source_dir")/evidence}"
+# The tool matches this prefix against absolute paths: resolve a relative argument from the current
+# directory (it need not exist).
+case "$evidence_dir" in /*) ;; *) evidence_dir="$PWD/$evidence_dir" ;; esac
 repository="$(cd "$(dirname "$0")/../.." && pwd)"
 compose() {
   docker compose --env-file "$SOL_HOST_DIR/compose.env" -f "$repository/deploy/compose.yaml" "$@"
@@ -36,7 +39,9 @@ add_key() {
 add_key helius-admin-api-key "$(path_of HELIUS_API_KEY_PATH "$source_dir/provider-evidence.env")" HELIUS_API_KEY_PATH
 add_key evidence-private-key "$(path_of EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH "$source_dir/provider-evidence.env")" EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH
 add_key wallet-keypair.json "$(path_of EXECUTOR_KEYPAIR_PATH "$source_dir/live.env")" EXECUTOR_KEYPAIR_PATH
-IFS= read -r -s -p 'Vault operator password: ' password
+# A password piped without a trailing newline makes read fail at EOF but still sets it; an empty
+# one still stops here.
+IFS= read -r -s -p 'Vault operator password: ' password || [ -n "$password" ]
 echo >&2
 printf '%s\n' "$password" \
   | compose run --rm --no-deps -T "${mounts[@]}" -e "SOL_IMPORT_EVIDENCE_PREFIX=$evidence_dir" vault-import

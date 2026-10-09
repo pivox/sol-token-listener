@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,6 +107,34 @@ void test('init-secrets leaves no front hash behind when Caddy fails, and retrie
     const retried = await run(`cat > /dev/null; printf '%s\\n' '${FAKE_HASH}'`);
     assert.equal(retried.status, 0, String(retried.stderr));
     assert.equal((await readFile(hashFile, 'utf8')).trim(), FAKE_HASH);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('init-secrets leaves no admin password behind when openssl fails, and retries on the next run', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-init-openssl-'));
+  try {
+    const bin = await fakeDocker(directory, `cat > /dev/null; printf '%s\\n' '${FAKE_HASH}'`);
+    const host = join(directory, 'host');
+    const adminFile = join(host, 'secrets/db/postgres-admin-password');
+    const run = (): ReturnType<typeof spawnSync> => spawnSync('bash', [join(repository, 'deploy/host/init-secrets.sh'), host], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    });
+    // The fake openssl either fails or answers something that is not 32 bytes of hex.
+    for (const failing of ['exit 1', "printf 'not hex\\n'"]) {
+      await writeFile(join(bin, 'openssl'), `#!/bin/sh\n${failing}\n`, { mode: 0o755 });
+      const failed = run();
+      assert.notEqual(failed.status, 0, failing);
+      assert.doesNotMatch(String(failed.stdout), /created/u, failing);
+      await assert.rejects(stat(adminFile), { code: 'ENOENT' }, failing);
+    }
+    await rm(join(bin, 'openssl'));
+    const retried = run();
+    assert.equal(retried.status, 0, String(retried.stderr));
+    assert.match(await readFile(adminFile, 'utf8'), /^[0-9a-f]{64}\n$/u);
+    assert.equal((await stat(adminFile)).mode & 0o777, 0o600);
+    assert.deepEqual(await readdir(join(host, 'secrets/db')), ['postgres-admin-password']);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -321,6 +349,27 @@ void test('vault-init refuses before any docker call when its directories are mi
   }
 });
 
+void test('vault-init stops before any docker call when it cannot list a directory', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-ls-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'`);
+    // A listing that fails must not read as an empty directory.
+    await writeFile(join(bin, 'ls'), '#!/bin/sh\necho "ls: cannot read the directory" >&2\nexit 2\n', { mode: 0o755 });
+    const host = join(directory, 'host');
+    await mkdir(join(host, 'secrets/vault/unseal'), { recursive: true });
+    await mkdir(join(host, 'secrets/vault/approle'), { recursive: true });
+    const result = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
+    assert.equal(result.status, 2);
+    assert.equal(result.stderr, 'ls: cannot read the directory\n');
+    await assert.rejects(stat(log), { code: 'ENOENT' });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 void test('vault-import mounts the role files, the key files they name and the templates, and sends the password on stdin', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sol-vault-import-'));
   try {
@@ -355,6 +404,27 @@ void test('vault-import mounts the role files, the key files they name and the t
     for (const value of ['secret-value', 'admin-key-value', 'operator-password-0123']) {
       assert.equal(`${result.stdout}${result.stderr}`.includes(value), false, value);
     }
+
+    // A relative evidence directory becomes absolute from the current directory, which need not hold it.
+    const relative = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env, 'evidence'], {
+      encoding: 'utf8', input: 'operator-password-0123\n', cwd: lot5,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
+    assert.equal(relative.status, 0, relative.stderr);
+    const lines = (await readFile(log, 'utf8')).trim().split('\n');
+    assert.equal(
+      lines[lines.length - 1]?.split(' -e ').pop(),
+      `SOL_IMPORT_EVIDENCE_PREFIX=${await realpath(lot5)}/evidence vault-import`,
+    );
+
+    // A password piped without a trailing newline is still read, and sent with the newline printf adds.
+    const unterminated = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env], {
+      encoding: 'utf8', input: 'unterminated-password-4567',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
+    assert.equal(unterminated.status, 0, unterminated.stderr);
+    assert.equal(await readFile(stdin, 'utf8'), 'unterminated-password-4567\n');
+    assert.equal(`${unterminated.stdout}${unterminated.stderr}`.includes('unterminated-password-4567'), false);
 
     await writeFile(join(env, 'live.env'), 'EXECUTOR_KEYPAIR_PATH=/nonexistent/wallet.json\n');
     const missing = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env], {
