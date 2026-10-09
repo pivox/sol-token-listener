@@ -45,3 +45,14 @@ void test('an answer that is no gzip snapshot is refused before any byte is writ
     assert.ok(vault.issuedTokens().length === 1 && vault.isRevoked(vault.issuedTokens()[0] ?? ''));
   }
 });
+
+void test('an output that fails is reported by its errno code only, and the token is still revoked', async () => {
+  const vault = new FakeVault();
+  const stderr: string[] = [];
+  const code = await runVaultSnapshotCli([], {}, JSON.stringify(vault.addAppRole('backup')), async () => {
+    throw Object.assign(new Error('write failed: marker-that-must-not-leak'), { code: 'EPIPE' });
+  }, { stderr: (text) => { stderr.push(text); } }, vault.fetch);
+  assert.equal(code, 1);
+  assert.equal(stderr.join(''), 'vault-snapshot: snapshot failed (EPIPE)\n');
+  assert.ok(vault.issuedTokens().length === 1 && vault.isRevoked(vault.issuedTokens()[0] ?? ''));
+});

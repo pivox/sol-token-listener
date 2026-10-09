@@ -205,11 +205,18 @@ export class VaultClient {
     });
   }
 
-  /** The raft snapshot (gzip), as a stream. 120 s: the timeout also bounds the reading of the body. */
-  public async snapshot(token: string): Promise<ReadableStream<Uint8Array>> {
+  /**
+   * The raft snapshot (gzip), read whole: it weighs about 50 KB. 120 s: the timeout also bounds the
+   * reading of the body. An empty body is empty bytes, which the caller refuses as no gzip.
+   */
+  public async snapshot(token: string): Promise<Uint8Array> {
     const response = await this.send('GET', 'sys/storage/raft/snapshot', { token, timeoutMs: SNAPSHOT_TIMEOUT_MS });
-    if (response.body === null) throw new VaultUnavailableError('vault GET sys/storage/raft/snapshot: empty answer');
-    return response.body;
+    try {
+      return new Uint8Array(await response.arrayBuffer());
+    } catch {
+      // As in `json()`: a reset, an abort or the timeout while the body is read, without the platform error.
+      throw new VaultUnavailableError('vault GET sys/storage/raft/snapshot: unreachable');
+    }
   }
 
   /** Only the active node answers `sys/health` 200: a standby (429), sealed (503) or uninitialized (501) one is an error. */

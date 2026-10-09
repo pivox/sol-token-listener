@@ -11,9 +11,6 @@ import {
   type VaultFetch,
 } from '../../src/deploy/vault-client.js';
 
-/** Every raft snapshot is a gzip stream: anything else is refused before the first byte is written. */
-const GZIP_MAGIC = Object.freeze([0x1f, 0x8b]);
-
 class NotGzipError extends Error {
   public constructor() {
     super('Vault answered no gzip snapshot');
@@ -21,12 +18,19 @@ class NotGzipError extends Error {
   }
 }
 
+/** Every raft snapshot is a gzip stream, whose first bytes are `1f 8b`. */
+function isGzip(bytes: Uint8Array): boolean {
+  return bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+}
+
 /**
  * `vault-snapshot` runs from deploy/host/backup.sh in the `vault-snapshot` tools container
  * (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 8.4). It reads the backup AppRole
- * JSON on stdin and writes Vault's raft snapshot (gzip) to stdout. backup.sh keeps the file only on
- * exit 0. Exit codes: 0; 64 usage; 69 Vault unavailable or no gzip answer; 77 refused; 78 invalid
- * AppRole JSON; 1 any other failure, reported by its errno code only.
+ * JSON on stdin and Vault's raft snapshot (gzip, about 50 KB) whole, checks that it is a gzip
+ * stream, then writes it to stdout in one go: a failed or truncated read, or an answer that is no
+ * gzip, never reaches stdout. backup.sh keeps the file only on exit 0. Exit codes: 0; 64 usage;
+ * 69 Vault unavailable or no gzip answer; 77 refused; 78 invalid AppRole JSON; 1 any other
+ * failure, reported by its errno code only.
  */
 export async function runVaultSnapshotCli(
   argv: readonly string[],
@@ -51,7 +55,9 @@ export async function runVaultSnapshotCli(
   try {
     const token = await client.appRoleLogin(credentials);
     try {
-      await copyGzip((await client.snapshot(token)).getReader(), output);
+      const snapshot = await client.snapshot(token);
+      if (!isGzip(snapshot)) throw new NotGzipError();
+      await output(snapshot);
     } finally {
       await client.revokeSelf(token).catch(() => undefined);
     }
@@ -74,40 +80,11 @@ export async function runVaultSnapshotCli(
   }
 }
 
-/**
- * Holds back the first bytes until the gzip magic is checked, then streams the rest as it comes.
- * On any failure the answer is cancelled: an unread body would keep its socket, and the process, open.
- */
-async function copyGzip(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  output: (chunk: Uint8Array) => Promise<void>,
-): Promise<void> {
-  try {
-    const head: Uint8Array[] = [];
-    let headLength = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (headLength >= GZIP_MAGIC.length) {
-        await output(value);
-        continue;
-      }
-      head.push(value);
-      headLength += value.length;
-      if (headLength < GZIP_MAGIC.length) continue;
-      const start = Buffer.concat(head);
-      if (start[0] !== GZIP_MAGIC[0] || start[1] !== GZIP_MAGIC[1]) throw new NotGzipError();
-      await output(start);
-    }
-    if (headLength < GZIP_MAGIC.length) throw new NotGzipError();
-  } catch (error) {
-    await reader.cancel().catch(() => undefined);
-    throw error;
-  }
-}
-
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
+  // A closed stdout then reaches the write callback as EPIPE instead of crashing the process,
+  // so the token is still revoked.
+  process.stdout.on('error', () => undefined);
   process.exitCode = await runVaultSnapshotCli(
     process.argv.slice(2),
     process.env,

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { parse } from 'dotenv';
 import { errnoCode } from '../../src/deploy/errno-code.js';
-import { INJECTED_KEYS, RoleEnvironmentError } from '../../src/deploy/role-environment.js';
+import { INJECTED_KEYS, RoleEnvironmentError, rpcUrl } from '../../src/deploy/role-environment.js';
 import type { BackSecret } from '../../src/deploy/stack.js';
 import {
   VaultClient,
@@ -75,8 +75,10 @@ interface ImportPlan {
  * - `keys/`: the key files;
  * - `templates/`: the repository templates.
  * Every entry is validated before the first write, every value is a string, and no value is printed.
- * Exit codes: 0; 64 usage; 69 Vault unavailable; 77 operator login refused; 78 invalid source;
- * 1 any other failure, reported by its errno code only.
+ * A source needs at least one role file under `env/`: the templates, which the host script always
+ * mounts, never make an import alone (a wrong source directory would replace every configuration
+ * with placeholders). Exit codes: 0; 64 usage; 69 Vault unavailable; 77 refused by Vault (login,
+ * policy or missing mount); 78 invalid source; 1 any other failure, reported by its errno code only.
  */
 export async function runVaultImportCli(
   argv: readonly string[],
@@ -155,12 +157,9 @@ function planImport(directory: string, evidencePrefix: string, dependencies: Vau
   for (const entry of URL_SECRETS) {
     const value = roleFiles.get(entry.source)?.[entry.variable];
     if (value === undefined || value === '') continue;
-    if (!isUrl(value, entry.protocol)) {
-      throw new ImportSourceError(
-        `${entry.source}.env: ${entry.variable} must be one ${entry.protocol.slice(0, -1)} URL`,
-      );
-    }
-    writes.push([backSecretPath(entry.secret), Object.freeze({ value })]);
+    // The rule boot applies in buildRoleEnvironment: a URL that imports also starts the back.
+    const url = rpcUrl(value, `${entry.source}.env: ${entry.variable}`, entry.protocol);
+    writes.push([backSecretPath(entry.secret), Object.freeze({ value: url })]);
     secrets.push(entry.secret);
   }
   for (const file of KEY_FILES) {
@@ -171,17 +170,9 @@ function planImport(directory: string, evidencePrefix: string, dependencies: Vau
     writes.push([backSecretPath(file), Object.freeze({ value })]);
     secrets.push(file);
   }
-  if (writes.length === 0) throw new ImportSourceError(`nothing to import under ${directory}`);
+  // Last, so that a bad key file is reported first.
+  if (configs.length === 0) throw new ImportSourceError(`no role file under ${directory}/env`);
   return Object.freeze({ writes, configs, templates, secrets });
-}
-
-function isUrl(value: string, protocol: string): boolean {
-  if (/\s/u.test(value)) return false;
-  try {
-    return new URL(value).protocol === protocol;
-  } catch {
-    return false;
-  }
 }
 
 const entrypoint = process.argv[1];

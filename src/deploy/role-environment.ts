@@ -90,7 +90,8 @@ export function loginDatabaseUrl(input: Readonly<{
     + `@${DATABASE_HOST}:${DATABASE_PORT}/${input.databaseName}?options=${encodeURIComponent(options)}`;
 }
 
-function rpcUrl(raw: string, file: string, protocol: 'https:' | 'wss:'): string {
+/** An RPC URL secret as boot reads it (one printable line, a URL of this protocol); vault-import applies the same rule. */
+export function rpcUrl(raw: string, file: string, protocol: 'https:' | 'wss:'): string {
   const value = secretText(raw, file);
   let url: URL;
   try {

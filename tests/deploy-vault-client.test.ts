@@ -68,8 +68,8 @@ void test('init, unseal, administration and snapshot use the root token, then th
   const operator = await client.userpassLogin('operator', 'operator-password-0123456789');
   await client.writeKv(operator, 'secrets/back/y', { value: 'z' });
   assert.deepEqual(await client.readKv(operator, 'secrets/back/y'), { value: 'z' });
-  const stream = await client.snapshot(await client.appRoleLogin(backup));
-  assert.deepEqual([...new Uint8Array(await new Response(stream).arrayBuffer())].slice(0, 2), [0x1f, 0x8b]);
+  const snapshot = await client.snapshot(await client.appRoleLogin(backup));
+  assert.deepEqual([...snapshot].slice(0, 2), [0x1f, 0x8b]);
   await assert.rejects(client.initialize(), VaultDeniedError);
 });
 
@@ -150,10 +150,6 @@ void test('a 2xx answer Vault would not give is unreadable, unexpected or tokenl
       body: JSON.stringify({ data: { role_id: 'r', note: MARKER } }), call: (client) => client.createAppRole('token', 'back'),
       error: VaultUnavailableError, message: 'vault POST auth/approle/role/back/secret-id: unexpected answer',
     },
-    {
-      body: null, call: (client) => client.snapshot('token'),
-      error: VaultUnavailableError, message: 'vault GET sys/storage/raft/snapshot: empty answer',
-    },
   ];
   for (const shape of shapes) {
     const client = new VaultClient({ address: ADDRESS, fetch: async () => new Response(shape.body, { status: 200 }) });
@@ -182,10 +178,23 @@ void test('an answer whose body fails while it is read is unreachable, never the
   }
 });
 
-void test('the snapshot stream is handed over raw: a read failure reaches its consumer unchanged', async () => {
-  const client = new VaultClient({ address: 'http://vault:8200', fetch: async () => brokenBody(new TypeError('terminated')) });
-  const reader = (await client.snapshot('token')).getReader();
-  await assert.rejects(reader.read(), (error) => error instanceof TypeError && error.message === 'terminated');
+void test('a snapshot whose body fails while it is read is unreachable, never the platform error', async () => {
+  for (const failure of [new TypeError('terminated'), new DOMException('timed out', 'TimeoutError')]) {
+    const client = new VaultClient({ address: 'http://vault:8200', fetch: async () => brokenBody(failure) });
+    await assert.rejects(client.snapshot('token'), (error) => (
+      error instanceof VaultUnavailableError
+      && error.message === 'vault GET sys/storage/raft/snapshot: unreachable'
+      && !('cause' in error)
+    ), failure.name);
+  }
+});
+
+void test('the snapshot is read whole, and an empty body is empty bytes for the caller to refuse', async () => {
+  const bytes = Uint8Array.from([0x1f, 0x8b, 0x08, 0x00, 0x2a]);
+  const whole = new VaultClient({ address: ADDRESS, fetch: async () => new Response(bytes, { status: 200 }) });
+  assert.deepEqual(await whole.snapshot('token'), bytes);
+  const empty = new VaultClient({ address: ADDRESS, fetch: async () => new Response(null, { status: 200 }) });
+  assert.deepEqual(await empty.snapshot('token'), new Uint8Array(0));
 });
 
 /** Answers after `delayMs` unless its signal aborts first, as the platform `fetch` does. */
@@ -211,8 +220,7 @@ void test('init and snapshot outlive the default timeout, any other request does
   // Every request takes 100 ms and the default allows 50: only the two long operations get through.
   const client = new VaultClient({ address: ADDRESS, fetch: slowFetch(100, answer), timeoutMs: 50 });
   assert.deepEqual(await client.initialize(), { unsealKey: 'key', rootToken: 'root' });
-  const stream = await client.snapshot('token');
-  assert.deepEqual([...new Uint8Array(await new Response(stream).arrayBuffer())], [0x1f, 0x8b]);
+  assert.deepEqual([...await client.snapshot('token')], [0x1f, 0x8b]);
   await assert.rejects(client.sealStatus(),
     (error) => error instanceof VaultUnavailableError && error.message === 'vault GET sys/seal-status: unreachable');
 });
@@ -352,7 +360,7 @@ void test('the fake answers like the measured Vault: health, uninitialized, role
   await assert.rejects(client.readKv(readerToken, 'config/listener'), VaultDeniedError);
   await assert.rejects(client.snapshot(readerToken), VaultDeniedError);
   const nightlyToken = await client.appRoleLogin(vault.addAppRole('nightly', 'backup'));
-  assert.equal((await new Response(await client.snapshot(nightlyToken)).arrayBuffer()).byteLength, vault.snapshotBytes.length);
+  assert.equal((await client.snapshot(nightlyToken)).length, vault.snapshotBytes.length);
   await assert.rejects(client.readKv(nightlyToken, 'secrets/logins/sol_live'), VaultDeniedError);
 });
 

@@ -47,7 +47,8 @@ const SOURCE = Object.freeze({
   'env/live.env': 'EXECUTOR_PHASE=CANARY\nSOLANA_HTTP_RPC_URL="https://exec.invalid/?api-key=executor-key"\nEXECUTOR_KEYPAIR_PATH=/host/keypair.json\n',
   'env/operations.env': 'EXECUTOR_PREFLIGHT_EVIDENCE_PATH=/Users/me/lot5/evidence/bundle/qualification.json\n',
   'templates/retention.env.example': 'RETENTION_HOURS=4\n',
-  'templates/listener.env.example': 'API_HOST=template\n',
+  // The role file wins whole: its template is neither merged into it (LOG_LEVEL, TEMPLATE_ONLY) nor counted as imported.
+  'templates/listener.env.example': 'API_HOST=template\nLOG_LEVEL=debug\nTEMPLATE_ONLY=1\n',
   'keys/wallet-keypair.json': '[1,2,3]\n',
 });
 
@@ -84,6 +85,8 @@ void test('an evidence path is rewritten only under the prefix directory itself'
       'EXECUTOR_EVIDENCE_DIRECTORY=/Users/me/lot5/evidence',
       'EXECUTOR_ARCHIVE_PATH=/Users/me/lot5/evidence-old/bundle.json', '',
     ].join('\n'),
+    // A template holds no value of its own for a URL secret: those come from role files only.
+    'templates/live.env.example': 'SOLANA_HTTP_RPC_URL=https://template.invalid\n',
   }, async (directory) => {
     const vault = operatorVault();
     const run = await importInto(vault, directory, `${PASSWORD}\n`, { SOL_IMPORT_EVIDENCE_PREFIX: '/Users/me/lot5/evidence/' });
@@ -93,12 +96,18 @@ void test('an evidence path is rewritten only under the prefix directory itself'
       EXECUTOR_EVIDENCE_DIRECTORY: '/var/lib/sol/evidence',
       EXECUTOR_ARCHIVE_PATH: '/Users/me/lot5/evidence-old/bundle.json',
     });
+    assert.equal(vault.kv.has('secrets/back/helius-executor-http-url'), false);
   });
 });
 
 void test('an invalid source is refused before the login, with nothing written', async () => {
   for (const [file, content, message] of [
-    ['env/listener.env', 'SOLANA_HTTP_RPC_URL=http://insecure.invalid\n', 'vault-import: listener.env: SOLANA_HTTP_RPC_URL must be one https URL\n'],
+    // A URL secret meets the rule boot applies (rpcUrl): one that imports must also start the back.
+    ['env/listener.env', 'SOLANA_HTTP_RPC_URL=http://insecure.invalid\n', 'vault-import: listener.env: SOLANA_HTTP_RPC_URL: expected a https URL\n'],
+    ['env/listener.env', 'SOLANA_WS_RPC_URL=https://rpc.invalid/\n', 'vault-import: listener.env: SOLANA_WS_RPC_URL: expected a wss URL\n'],
+    ['env/listener.env', 'SOLANA_HTTP_RPC_URL=not-a-url\n', 'vault-import: listener.env: SOLANA_HTTP_RPC_URL: not a URL\n'],
+    // U+200B is invisible and outside the printable ASCII range: boot refuses it, so does the import.
+    ['env/listener.env', 'SOLANA_HTTP_RPC_URL="https://rpc.invalid/\u200b"\n', 'vault-import: listener.env: SOLANA_HTTP_RPC_URL: expected one printable line without spaces\n'],
     ['env/listener.env', 'API_TOKEN=x\n', 'vault-import: config/listener: API_TOKEN comes from a secret file, not from the configuration\n'],
     ['keys/wallet-keypair.json', ' \n', 'vault-import: keys/wallet-keypair.json is empty\n'],
   ] as const) {
@@ -114,7 +123,23 @@ void test('an invalid source is refused before the login, with nothing written',
   await withSource({}, async (directory) => {
     const run = await importInto(operatorVault(), directory, `${PASSWORD}\n`);
     assert.equal(run.code, 78);
-    assert.equal(run.stderr, `vault-import: nothing to import under ${directory}\n`);
+    assert.equal(run.stderr, `vault-import: no role file under ${directory}/env\n`);
+  });
+});
+
+void test('a source without role files is refused: the templates and the key files never make an import alone', async () => {
+  // The host script always mounts the templates: a wrong source directory would otherwise replace every config/* with placeholders.
+  await withSource({
+    'templates/retention.env.example': 'RETENTION_HOURS=4\n',
+    'templates/listener.env.example': 'API_HOST=template\n',
+    'keys/wallet-keypair.json': '[1,2,3]\n',
+  }, async (directory) => {
+    const vault = operatorVault();
+    const run = await importInto(vault, directory, `${PASSWORD}\n`);
+    assert.equal(run.code, 78);
+    assert.equal(run.stderr, `vault-import: no role file under ${directory}/env\n`);
+    assert.equal(vault.kv.size, 0);
+    assert.deepEqual(vault.requests, []);
   });
 });
 
