@@ -103,11 +103,14 @@ function decodeCreateEvent(
   const fields = decodeIdlFields(definition.slice(0, -2), reader);
   const suffixLength = reader.remaining;
   observeSuffix(suffixLength);
-  if (suffixLength !== 0 && suffixLength !== 8 && suffixLength !== 9) {
-    throw invalidEventSuffix('CreateEvent', suffixLength, '0, 8 ou 9');
+  if (suffixLength !== 0 && suffixLength !== 8 && suffixLength !== 9 && suffixLength !== 10) {
+    throw invalidEventSuffix('CreateEvent', suffixLength, '0, 8, 9 ou 10');
   }
   const creatorFeeBps = suffixLength >= 8 ? reader.readU64() : 0n;
-  const isHolderReward = suffixLength === 9 ? reader.readBool() : false;
+  const isHolderReward = suffixLength >= 9 ? reader.readBool() : false;
+  // Program upgrade at slot 454596459 appended `depth: u8` (@pump-fun/pump-sdk 4.0.0 IDL,
+  // CreateEvent): the curve depth of a coin quoted in another pump coin, 0 otherwise.
+  const depth = suffixLength === 10 ? reader.readU8() : 0;
   const event: DecodedPumpCreateEvent = Object.freeze({
     name: requireString(fields, 'name'),
     symbol: requireString(fields, 'symbol'),
@@ -131,6 +134,7 @@ function decodeCreateEvent(
     ),
     creatorFeeBps,
     isHolderReward,
+    depth,
   });
   return Object.freeze({
     kind: 'CREATE',

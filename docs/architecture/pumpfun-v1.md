@@ -309,22 +309,34 @@ PumpSwap reste épinglé séparément à sa révision auditée précédente.
 `create_v2` accepte uniquement ses suffixes EOF officiels de 0, 1, 9 ou 10
 octets et exactement 0, 3 ou 4 comptes restants. Le quatrième compte doit être
 le PDA Pump `quote-control`. `CreateEvent` accepte ses suffixes historiques
-officiels de 0, 8 ou 9 octets ; les champs absents valent respectivement zéro
-et faux. Le créateur demandé reste distinct du créateur effectif de routage des
-frais pour un token holder-reward, mais ce dernier doit être exactement le PDA
-Pump dérivé de `holder-rewards` et du mint. Le taux effectif vient de
-`CreateEvent` : la présence optionnelle de `quote-control` ne prouve pas que le
-taux demandé a été appliqué, car ce compte peut être redondant pour un quote
-mint déjà autorisé par `Global`. Le mint et la bonding curve de l’événement
-doivent correspondre exactement aux comptes de l’instruction. Aucun octet final
+officiels de 0, 8, 9 ou 10 octets ; les champs absents valent respectivement
+zéro, faux et zéro. Le dixième octet est `depth` (`u8`), ajouté par la mise à
+jour du programme au slot 454596459 et documenté par l'IDL de
+`@pump-fun/pump-sdk` 4.0.0 : la profondeur de courbe d'un coin coté dans un
+autre coin pump, zéro sinon. Le créateur demandé reste distinct du créateur
+effectif de routage des frais pour un token holder-reward, mais ce dernier doit
+être exactement le PDA Pump dérivé de `holder-rewards` et du mint. Le taux
+effectif vient de `CreateEvent` : la présence optionnelle de `quote-control` ne
+prouve pas que le taux demandé a été appliqué, car ce compte peut être
+redondant pour un quote mint déjà autorisé par `Global`. Le mint et la bonding
+curve de l’événement doivent correspondre exactement aux comptes de
+l’instruction. Aucun octet final
 inconnu n’est toléré.
 
 Les BUY conservent également une compatibilité wire explicitement bornée.
 `buy` sans `track_volume` est autorisé par un IDL officiel historique ; le
-décodeur ne synthétise pas ce champ absent. Deux formes supplémentaires sont
-liées à des transactions Mainnet finalisées et réussies :
-`buy_exact_sol_in` avec le suffixe exact `[1, 0]`, et
-`buy_exact_quote_in_v2` avec le suffixe exact `[1]`. Toute autre longueur ou
+décodeur ne synthétise pas ce champ absent. Depuis la mise à jour du programme
+au slot 454596459, l'IDL de `@pump-fun/pump-sdk` 4.0.0 ajoute à `buy`,
+`buy_exact_sol_in`, `buy_exact_quote_in_v2` et `buy_v2` un dernier argument
+EOF-tolérant `partial_fill: OptionBool` : après les arguments connus (et
+`track_volume` là où il existe), le décodeur accepte soit rien, soit un seul
+octet `0` ou `1` exposé comme `partial_fill`, absent sinon. Deux formes
+historiques liées à des transactions Mainnet finalisées et réussies gardent
+leur lecture : `buy`/`buy_exact_sol_in` avec le suffixe `[1, b]` lisent
+`track_volume = b` (le SDK 4.0.0 émet le même `[1, 0]` pour
+`track_volume = true, partial_fill = false` ; seule cette forme est ambiguë et
+reste lue `track_volume = false`), et `buy_exact_quote_in_v2` avec `[1]` garde
+`track_volume = true` en plus de `partial_fill = true`. Toute autre longueur ou
 valeur reste rejetée par `PUMP_BORSH_INVALID`. Les mêmes règles s’appliquent
 aux instructions externes et internes et ne modifient aucune capacité
 d’exécution.

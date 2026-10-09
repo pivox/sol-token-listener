@@ -25,6 +25,10 @@ export class PumpBorshReader {
     );
   }
 
+  public readU8(): number {
+    return this.readBytes(1)[0] ?? 0;
+  }
+
   public readU16(): bigint {
     const data = this.readBytes(2);
     return BigInt(new DataView(
