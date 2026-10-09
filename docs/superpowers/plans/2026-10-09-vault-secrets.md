@@ -24,7 +24,7 @@
 
 1. **The vault files on the host sit in two directories:** `secrets/vault/unseal/unseal-key` and `secrets/vault/approle/<name>.json`.
    - The unseal key does not exist at Vault's first start, before `vault-init`. A bind mount of a missing file makes Docker create a directory in its place, so `vault` mounts the `unseal/` directory instead.
-   - `back` and `migrate` mount their AppRole file with the long bind syntax, which fails on a missing file instead of creating a directory.
+   - `back` and `migrate` mount their AppRole file with the long bind syntax and `bind: {create_host_path: false}`. Only that option makes a missing file fail the start: the long syntax alone still creates a directory.
 2. **Three one-shot tool services under profile `tools`:** `vault-setup`, `vault-import` and `vault-snapshot`.
    - They run on the back image and on the `internal` network. `up` never starts them; the host scripts call `docker compose run`.
    - No Vault client is needed on the host, and Vault stays unreachable from the host except through its local UI port.

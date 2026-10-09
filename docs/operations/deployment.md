@@ -1,16 +1,19 @@
 # Déploiement du bot complet (Docker Compose)
 
-Ce runbook exploite la stack décrite par le spec
-`docs/superpowers/specs/2026-10-09-full-bot-compose-design.md` : trois conteneurs
-(`postgres`, `back`, `front`) et une tâche `migrate`. Il remplace les processus lancés à la main
-sur l'hôte. Les secrets sont des fichiers hors du dépôt, jamais affichés : ne lancez aucun `cat`,
-`echo` ou `env` sur eux.
+Ce runbook exploite la stack décrite par deux specs :
+`docs/superpowers/specs/2026-10-09-full-bot-compose-design.md` et
+`docs/superpowers/specs/2026-10-09-vault-secrets-design.md`. Quatre conteneurs (`postgres`,
+`vault`, `back`, `front`) et une tâche `migrate` remplacent les processus lancés à la main sur
+l'hôte. Configuration et secrets vivent dans Vault. Sur l'hôte ne restent que les secrets
+d'amorçage, des fichiers hors du dépôt, jamais affichés : ne lancez aucun `cat`, `echo` ou `env`
+sur eux.
 
 ## Topologie
 
 | Conteneur | Contenu | Réseaux | Ports publiés |
 |---|---|---|---|
 | `postgres` | PostgreSQL 16.14, volume `postgres-data` | `internal` | aucun |
+| `vault` | HashiCorp Vault 2.1.2, stockage raft dans le volume `vault-data`, déverrouillage automatique | `internal`, `vault-ui` | `127.0.0.1:8200` (interface locale) |
 | `migrate` | tâche ponctuelle : migrations, droits, neuf logins | `internal` | aucun |
 | `back` | `supervisord` et un utilisateur Unix par processus | `internal`, `egress`, `edge` | aucun |
 | `front` | Caddy : console, relais `/api/v1` et `/operator/v1/`, mot de passe | `edge` | Mac : `127.0.0.1:8080` ; serveur : 80 et 443 |
@@ -19,6 +22,10 @@ Programmes du back : `listener`, `opapi` et `retention` en mode `observe` ; s'y 
 `h2b` (relancé à la demande) et `autoarm` en mode `live` ; `worker` ne tourne que pendant
 `sol qualify`. `autoarm` n'arme rien tant que l'état de contrôle n'est pas `RUNNING`, ce que seul
 `sol trading start` rétablit après un redémarrage.
+
+Trois services ponctuels du profil `tools` tournent sur l'image back : `vault-setup`,
+`vault-import` et `vault-snapshot`. `up` ne les démarre jamais. Les scripts de `deploy/host/` les
+lancent par `docker compose run --no-deps`, qui ne démarre ni ne recrée Vault.
 
 ## Prérequis
 
@@ -47,74 +54,153 @@ sol_compose() {
 }
 ```
 
-## Dossier hôte, secrets et configuration
+## Images
 
-Créer l'arborescence, les mots de passe PostgreSQL, le jeton de l'API opérateur et l'empreinte du
-mot de passe du front. Le script ne remplace jamais un fichier existant. Il n'affiche qu'un seul
-secret, le mot de passe du front, une seule fois : le ranger aussitôt dans un gestionnaire de mots
-de passe.
-
-```bash
-deploy/host/init-secrets.sh "$SOL_HOST_DIR"
-cp deploy/env.example "$SOL_ENV"
-chmod 0600 "$SOL_ENV"
-```
-
-Dans `compose.env`, renseigner `SOL_HOST_DIR`, les images et `SOL_STACK_MODE`, puis `SITE_ADDRESS`
-sur le serveur. Ce fichier ne contient aucun secret.
-
-Les six secrets du back proviennent des fichiers actuels. Les commandes suivantes les recopient
-sans jamais les afficher :
+Construire les images sur l'hôte depuis le commit livré, avec une étiquette qui porte son SHA.
+Reporter les trois lignes affichées dans `compose.env` : la construction lit ce fichier, créé à
+l'étape 1 de « Dossier hôte et Vault ».
 
 ```bash
-lot5="$HOME/.sol-token-listener/lot5/env"
-back="$SOL_HOST_DIR/secrets/back"
-value() { sed -n "s/^$1=//p" "$2"; }
-value SOLANA_HTTP_RPC_URL "$lot5/listener.env" > "$back/helius-listener-http-url"
-value SOLANA_WS_RPC_URL "$lot5/listener.env" > "$back/helius-listener-ws-url"
-value SOLANA_HTTP_RPC_URL "$lot5/live.env" > "$back/helius-executor-http-url"
-cp "$(value HELIUS_API_KEY_PATH "$lot5/provider-evidence.env")" "$back/helius-admin-api-key"
-cp "$(value EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH "$lot5/provider-evidence.env")" "$back/evidence-private-key"
-cp "$(value EXECUTOR_KEYPAIR_PATH "$lot5/live.env")" "$back/wallet-keypair.json"
-chmod 0600 "$back"/*
+revision="$(git rev-parse --short=12 HEAD)"
+printf 'BACKEND_IMAGE=sol-token-listener/backend:%s\nFRONTEND_IMAGE=sol-token-listener/frontend:%s\nVAULT_IMAGE=sol-token-listener/vault:%s\n' "$revision" "$revision" "$revision"
+sol_compose build back front vault
 ```
 
-Si une valeur est entourée de guillemets dans le fichier source, retirer les guillemets du
-secret : `sol-run` refuse une URL qui n'en est pas une, sans afficher sa valeur.
+Le smoke isolé valide la topologie avec un Vault jetable, sans RPC ni secret réel :
+`npm run deployment:smoke`.
 
-La configuration non secrète de chaque rôle reprend les fichiers actuels, privés de toute
-variable que `sol-run` injecte depuis les secrets :
+## Dossier hôte et Vault
+
+Les variables des processus vivent dans Vault : configuration de chaque rôle et secrets. Sur
+l'hôte ne restent que les secrets d'amorçage :
+
+- le mot de passe administrateur PostgreSQL ;
+- l'empreinte du mot de passe du front ;
+- la clé de déverrouillage de Vault ;
+- les identifiants AppRole de `back`, `migrate` et de la sauvegarde.
+
+1. Créer le dossier hôte. Le script ne remplace jamais un fichier existant. Il affiche une seule
+   fois le mot de passe du front : le ranger aussitôt dans le gestionnaire de mots de passe.
+
+   ```bash
+   deploy/host/init-secrets.sh "$SOL_HOST_DIR"
+   cp deploy/env.example "$SOL_ENV"
+   chmod 0600 "$SOL_ENV"
+   ```
+
+   Il crée aussi les deux dossiers vides `secrets/vault/unseal/` et `secrets/vault/approle/`.
+
+   Dans `compose.env`, renseigner :
+   - `SOL_HOST_DIR` ;
+   - les trois images `BACKEND_IMAGE`, `FRONTEND_IMAGE` et `VAULT_IMAGE` (section « Images ») ;
+   - `SOL_STACK_MODE` ;
+   - `SITE_ADDRESS`, sur le serveur.
+
+   Ce fichier ne contient aucun secret. Les scripts de `deploy/host/` le lisent à cet endroit,
+   `$SOL_HOST_DIR/compose.env`.
+
+2. Initialiser Vault, une seule fois. Les images doivent déjà exister : construites (section
+   « Images ») ou tirées d'un registre.
+
+   ```bash
+   deploy/host/vault-init.sh
+   ```
+
+   Le script refuse de s'exécuter si `secrets/vault/unseal/` et `secrets/vault/approle/` ne sont
+   pas des dossiers vides, à vous et inscriptibles. `init-secrets.sh` les crée ainsi. Sinon, Docker
+   créerait un dossier manquant au nom de root : la clé ne pourrait pas y être écrite, et elle
+   serait perdue alors que Vault serait déjà initialisé.
+
+   Le script démarre `vault`, attend son API, puis lance `vault-setup` sous votre utilisateur.
+   Celui-ci :
+   - initialise Vault avec une seule part de clé ;
+   - écrit la clé de déverrouillage dans `secrets/vault/unseal/` et les trois AppRoles dans
+     `secrets/vault/approle/` ;
+   - active le journal d'audit (section « Santé et journaux ») ;
+   - génère dans Vault les neuf mots de passe de login et le jeton de l'API opérateur ;
+   - crée le login `operator` et affiche une seule fois son mot de passe ;
+   - révoque le jeton root.
+
+   Le script finit par une ligne `next:`. Ranger aussitôt dans le gestionnaire de mots de passe :
+   - le mot de passe Vault `operator`, distinct de celui du front ;
+   - une copie du fichier `secrets/vault/unseal/unseal-key`. Sans cette clé, aucune sauvegarde de
+     Vault ne se restaure.
+
+   Si le script répond `already initialized` alors que `secrets/vault/unseal/unseal-key` existe,
+   Vault est déjà initialisé : rien à faire. Sans ce fichier, la clé est perdue : le volume
+   `vault-data` contient un Vault initialisé sans elle. Repartir alors de zéro, comme ci-dessous.
+
+   Après un échec qui suit l'initialisation (`start over as the runbook says`), repartir de zéro
+   aussi : supprimer le conteneur, le volume et les fichiers de `secrets/vault/`.
+
+   ```bash
+   sol_compose rm --stop --force vault
+   docker volume rm sol-token-listener_vault-data
+   find "$SOL_HOST_DIR/secrets/vault/unseal" "$SOL_HOST_DIR/secrets/vault/approle" -mindepth 1 -delete
+   ```
+
+   Puis relancer `deploy/host/vault-init.sh`, et l'import (étape 3).
+
+3. Importer les fichiers actuels. Le script lit les fichiers de rôle du lot 5 et les fichiers de
+   clés qu'ils nomment, demande le mot de passe `operator`, puis écrit le tout dans Vault sans
+   afficher aucune valeur :
+
+   ```bash
+   deploy/host/vault-import.sh "$HOME/.sol-token-listener/lot5/env"
+   ```
+
+   L'import :
+   - retire les variables que `sol-run` injecte ;
+   - réécrit les chemins de preuves vers `/var/lib/sol/evidence`. Le second argument, facultatif,
+     nomme le dossier de preuves d'origine ; par défaut, `evidence/` à côté du dossier source ;
+   - fixe `API_HOST=0.0.0.0`, `API_PORT=3000`, `OPERATOR_API_HOST=0.0.0.0` et
+     `OPERATOR_API_PORT=3100` ;
+   - prend le modèle du dépôt pour un rôle absent de la source (`retention` par exemple) ;
+   - valide chaque entrée avant la première écriture ;
+   - n'affiche que les noms des entrées écrites (`vault.imported`).
+
+   Vault doit tourner : l'import ne le démarre pas. Le relancer crée une nouvelle version de
+   chaque entrée : il remplace les modifications faites depuis dans Vault, qui restent dans les
+   versions précédentes.
+
+4. Ouvrir l'interface, `http://127.0.0.1:8200` (login `operator`), et vérifier sous `sol/config/` :
+   - `operator-api` : `OPERATOR_API_ALLOWED_ORIGIN=http://127.0.0.1:8080`, ou
+     `https://<SITE_ADDRESS>` sur le serveur ;
+   - `operations` : `EXECUTOR_PREFLIGHT_EVIDENCE_PATH` et `EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH`
+     sous `/var/lib/sol/evidence` ;
+   - `preflight-bundle` : `EXECUTOR_PREFLIGHT_BUNDLE_OUTPUT_DIRECTORY=/var/lib/sol/evidence/bundle`.
+
+   Sur le serveur, l'interface passe par un tunnel : `ssh -L 8200:127.0.0.1:8200 <serveur>`.
+
+### Modifier une valeur
+
+Dans l'interface, ou en ligne de commande avec le login `operator` :
 
 ```bash
-lot5="$HOME/.sol-token-listener/lot5/env"
-config="$SOL_HOST_DIR/config"
-strip() {
-  grep -v -E '^(DATABASE_URL|OPERATOR_API_DATABASE_URL|SOLANA_HTTP_RPC_URL|SOLANA_WS_RPC_URL|EXECUTOR_KEYPAIR_PATH|HELIUS_API_KEY_PATH|EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH|OPERATOR_API_TOKEN)=' "$1"
-}
-for name in listener live live-recovery operations operator-api readiness worker-sim provider-evidence preflight-bundle; do
-  strip "$lot5/$name.env" > "$config/$name.env"
-done
-sed -i.bak "s#$HOME/.sol-token-listener/lot5/evidence#/var/lib/sol/evidence#g" "$config"/*.env
-rm -f "$config"/*.env.bak
-chmod 0644 "$config"/*.env
+sol_compose exec -it vault sh -c 'vault login -method=userpass username=operator > /dev/null && vault kv patch sol/config/live EXECUTOR_SLIPPAGE_BPS=300'
+sol_compose restart back
 ```
 
-Puis compléter à la main, en s'appuyant sur les modèles `deploy/config/*.env.example` :
+Chaque valeur de Vault est du texte :
 
-- `listener.env` : `API_HOST=0.0.0.0` et `API_PORT=3000`, pour que le front joigne l'API.
-- `operator-api.env` : `OPERATOR_API_HOST=0.0.0.0`, `OPERATOR_API_PORT=3100` et
-  `OPERATOR_API_ALLOWED_ORIGIN=http://127.0.0.1:8080`, ou `https://<SITE_ADDRESS>` sur le serveur.
-  Le front réécrit l'en-tête Host de `/operator/v1/` en `0.0.0.0:3100`, seule valeur que l'API
-  accepte.
-- `operations.env` : `EXECUTOR_PREFLIGHT_EVIDENCE_PATH=/var/lib/sol/evidence/bundle/qualification.json`
-  et `EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH=/var/lib/sol/evidence/<catalogue>.json`.
-- `preflight-bundle.env` : `EXECUTOR_PREFLIGHT_BUNDLE_OUTPUT_DIRECTORY=/var/lib/sol/evidence/bundle`.
-- vérifier qu'aucun autre chemin ne pointe hors de `/var/lib/sol/evidence` :
-  `grep -h '_PATH=\|_DIRECTORY=' "$SOL_HOST_DIR"/config/*.env`.
+- dans le mode JSON de l'interface, mettre les nombres entre guillemets :
+  `"EXECUTOR_SLIPPAGE_BPS": "300"`, jamais `300` ;
+- la keypair (`sol/secrets/back/wallet-keypair.json`, champ `value`) est le texte du fichier,
+  jamais un tableau JSON ;
+- la forme `vault kv patch … VARIABLE=valeur` envoie déjà du texte.
 
-`sol-run` refuse de démarrer un processus dont la configuration contient un mot de passe, une
-clé, un jeton, une URL avec identifiants ou une variable injectée. Le message nomme le fichier et
-la variable, jamais la valeur.
+Le journal d'audit masque les textes, pas les nombres ni les booléens : ceux-ci apparaîtraient en
+clair dans `docker logs`, à chaque lecture.
+
+Vault garde les versions précédentes de chaque entrée : le bouton de l'interface, ou
+`vault kv rollback -version=<n> sol/config/live`, les restaure. Le back ne lit Vault qu'à son
+démarrage. Le redémarrage pose l'entry-stop : relancer `sol trading start` (section « Trading »).
+
+Vault accepte toute saisie : c'est `vault-pull`, au démarrage du back, qui refuse une entrée
+invalide. Il refuse une configuration qui contient un mot de passe, une clé, un jeton, une URL avec
+identifiants ou une variable injectée, et toute valeur sur plusieurs lignes ou qui n'est pas du
+texte. Le back ne démarre pas, et le message nomme l'entrée et la variable, jamais la valeur. Une
+fois l'entrée corrigée, le back, relancé en boucle par Docker, reprend seul.
 
 Les preuves et le catalogue de gates vivent dans le volume `evidence`, propriété de l'utilisateur
 `ops`. Pour y copier un fichier existant, une fois la stack créée :
@@ -125,25 +211,17 @@ sol_compose cp "$HOME/.sol-token-listener/lot5/evidence/$evidence_file" "back:/v
 sol_compose exec back chown ops:ops "/var/lib/sol/evidence/$evidence_file"
 ```
 
-## Images
-
-Construire les images sur l'hôte depuis le commit livré, avec une étiquette qui porte son SHA.
-Renseigner ensuite ces étiquettes dans `compose.env` (`BACKEND_IMAGE`, `FRONTEND_IMAGE`) :
-
-```bash
-revision="$(git rev-parse --short=12 HEAD)"
-printf 'BACKEND_IMAGE=sol-token-listener/backend:%s\nFRONTEND_IMAGE=sol-token-listener/frontend:%s\n' "$revision" "$revision"
-sol_compose build back front
-```
-
-Le smoke isolé valide la topologie sans RPC ni secret réel : `npm run deployment:smoke`.
-
 ## Démarrage et arrêt
 
-La tâche `migrate` s'exécute avant le back, sous le verrou consultatif `pg_advisory_lock` des
-migrations. Elle applique les migrations, rejoue `scripts/provision-executor-roles.sql` et crée
-ou met à jour les neuf logins `NOINHERIT`, chacun membre d'un seul rôle de groupe. Les migrations
-restent forward-only.
+`vault` démarre et se déverrouille seul avec la clé de `secrets/vault/unseal/`. La tâche
+`migrate` attend Vault et PostgreSQL, lit les mots de passe des logins dans Vault, puis s'exécute
+sous le verrou consultatif `pg_advisory_lock` des migrations. Elle :
+- applique les migrations ;
+- rejoue `scripts/provision-executor-roles.sql` ;
+- crée ou met à jour les neuf logins `NOINHERIT`, chacun membre d'un seul rôle de groupe.
+
+Les migrations restent forward-only. Le back lit ensuite sa configuration et ses secrets dans
+Vault. Sans Vault, ni `migrate` ni le back ne démarrent, et aucun ne se rabat sur des fichiers.
 
 ```bash
 sol_compose up --detach --wait --wait-timeout 180
@@ -154,7 +232,7 @@ En mode `live`, le script d'entrée du back ramène un état de contrôle `RUNNI
 avant de lancer les programmes : aucun nouvel achat ne part après un redémarrage, alors que H2a,
 H2b et `autoarm` assurent les sorties. Si le back redémarre en boucle en mode `live`, lire
 `sol_compose logs back` : la lecture de l'état de contrôle a échoué, souvent à cause d'une
-configuration `operations.env` invalide.
+entrée `sol/config/operations` invalide.
 
 Arrêt normal, qui conserve la base :
 
@@ -165,10 +243,11 @@ sol_compose stop
 `stop` attend au plus 240 s (`stop_grace_period`) : `supervisord` arrête les programmes l'un
 après l'autre. Il laisse 40 s à ceux qui ont leur propre délai d'arrêt de 30 s (listener, H2a,
 H2b, auto-arm, worker) et 10 s aux autres. En pratique, chacun s'arrête en quelques secondes.
+`vault`, arrêté après le back, dispose de 30 s pour fermer son stockage raft.
 
 `down --volumes` efface tous les volumes de la stack : la base, mais aussi les preuves
-(`evidence`) et le certificat TLS (`caddy-data`). Ne jamais l'utiliser. Pour repartir d'une base
-vide, voir l'étape 4 de la reprise.
+(`evidence`), le certificat TLS (`caddy-data`) et tout le contenu de Vault (`vault-data`). Ne
+jamais l'utiliser. Pour repartir d'une base vide, voir l'étape 4 de la reprise.
 
 ## Commandes sol
 
@@ -189,10 +268,11 @@ confirmation au TTY.
 | `sol ctl …` | `supervisorctl` (status, restart d'un programme) |
 
 Le rapport fast-path lit la base en administrateur : il passe par la tâche `migrate`, seule
-détentrice du mot de passe administrateur.
+détentrice du mot de passe administrateur. Il ne lit que le fichier de ce mot de passe, jamais
+Vault : avec `--no-deps`, Compose ne démarre ni ne recrée Vault pour lui.
 
 ```bash
-sol_compose run --rm migrate sol-admin report
+sol_compose run --rm --no-deps migrate sol-admin report
 ```
 
 ## Trading
@@ -243,6 +323,18 @@ paquet précédent, déjà consommé.
   cause corrigée, `sol_compose exec back sol ctl restart <programme>` le relance tout de suite.
 - `sol_compose logs -f back` : une ligne JSON par événement, avec le nom du service. Le pilote
   `json-file` garde 5 fichiers de 20 Mo par conteneur.
+- `vault` est sain une fois déverrouillé. Son journal montre `vault.unsealed` à chaque démarrage
+  (`vault.uninitialized` avant `vault-init.sh`). Il montre `vault.unseal_key_missing` si le
+  fichier de clé manque, `vault.unseal_failed` si le déverrouillage échoue, par exemple avec une
+  mauvaise clé. Après avoir remis le bon fichier dans `secrets/vault/unseal/`, lancer
+  `sol_compose restart vault` : le script d'entrée ne déverrouille qu'au démarrage du conteneur.
+- `vault-pull: Vault unavailable for 60 s` dans le journal du back : Vault était arrêté ou
+  verrouillé pendant 60 s. Le back redémarre en boucle jusqu'au retour de Vault, puis reprend
+  seul ; en mode `live`, relancer ensuite `sol trading start`.
+- Le journal d'audit de Vault est `sol_compose logs vault` : chaque requête authentifiée et sa
+  réponse, textes masqués (HMAC). Il tourne avec les autres journaux (`json-file`, 5 fichiers de
+  20 Mo) et disparaît quand le conteneur est recréé : ce n'est pas un audit durable. Si la sortie
+  du conteneur ne peut plus s'écrire, Vault cesse de répondre plutôt que de servir sans trace.
 
 Vérifier le flux SSE à travers le front ; `curl` demande le mot de passe du front :
 
@@ -264,9 +356,18 @@ grep -Fq ': heartbeat' "$sse_body"
 
 ## Sauvegardes
 
-`deploy/host/backup.sh` lance `pg_dump -Fc` dans le conteneur `postgres`, écrit l'empreinte
-SHA-256 à côté et garde 14 jours dans `$SOL_HOST_DIR/backups`. Le dossier des secrets n'est
-jamais sauvegardé. La copie hors machine (sauvegarde externe) reste à la charge de l'opérateur.
+`deploy/host/backup.sh` lance `pg_dump -Fc` dans le conteneur `postgres` et prend un instantané
+raft de Vault avec l'AppRole `backup`. Il écrit l'empreinte SHA-256 de chacun et garde 14 jours
+dans `$SOL_HOST_DIR/backups`.
+
+L'instantané est chiffré. Le restaurer exige la clé de déverrouillage, qui n'est jamais dans les
+sauvegardes. Le dossier des secrets n'est jamais sauvegardé. La copie hors machine
+(sauvegarde externe) reste à la charge de l'opérateur.
+
+Le service `vault-snapshot` tourne avec `--no-deps` : la sauvegarde ne démarre ni ne recrée
+Vault, et un Vault arrêté la fait échouer. Un échec garde ce qui est terminé (le dump, si seul
+l'instantané échoue), jamais un fichier partiel ou vide. Sans `secrets/vault/approle/backup.json`,
+le script s'arrête avec le code 78.
 
 Sur le Mac, avec launchd :
 
@@ -287,6 +388,40 @@ sudo systemctl enable --now sol-backup.timer
 
 La restauration doit être répétée régulièrement sur un projet jetable : les mêmes étapes que la
 reprise ci-dessous, avec un autre `--project-name`.
+
+### Restaurer Vault
+
+Sur un Vault vide, avec la clé de déverrouillage d'origine et les fichiers AppRole d'origine dans
+`secrets/vault/` :
+
+```bash
+snapshot="$SOL_HOST_DIR/backups/vault-<horodatage>.snap"
+sol_compose stop back migrate
+sol_compose rm --stop --force vault
+docker volume rm sol-token-listener_vault-data
+sol_compose up --detach vault
+sol_compose exec -it vault vault operator init -key-shares=1 -key-threshold=1
+sol_compose exec -it vault vault operator unseal
+sol_compose cp "$snapshot" vault:/tmp/restore.snap
+sol_compose exec -it vault sh -c 'vault login > /dev/null && vault operator raft snapshot restore -force /tmp/restore.snap'
+sol_compose restart vault
+```
+
+Pendant la restauration :
+- `operator init` affiche une clé et un jeton root temporaires ;
+- `operator unseal` et `vault login` les demandent au TTY ;
+- `restore -force` remplace ces clés et ces données par celles de l'instantané.
+
+Sur un hôte où la stack n'a jamais tourné, `docker volume rm` signale un volume absent : sans
+conséquence.
+
+Au redémarrage, Vault se déverrouille avec la clé d'origine (`vault.unsealed`). Les AppRoles et le
+login `operator` d'origine fonctionnent de nouveau. Redémarrer ensuite la stack, puis relancer
+`sol trading start` en mode `live` :
+
+```bash
+sol_compose up --detach --wait --wait-timeout 180
+```
 
 ## Reprise de la base actuelle
 
@@ -328,7 +463,7 @@ résultats textuels change.
 
    ```bash
    sol_compose up --detach --wait postgres
-   sol_compose run --rm migrate sol-admin group-roles
+   sol_compose run --rm --no-deps migrate sol-admin group-roles
    sol_compose exec -T postgres sh -c 'exec pg_restore --exit-on-error --single-transaction -U sol_owner -d "$POSTGRES_DB"' \
      < "$takeover/source.dump"
    sol_compose exec -T postgres sh -c 'exec psql -X -A -t -v ON_ERROR_STOP=1 -U sol_owner -d "$POSTGRES_DB"' \
@@ -337,9 +472,13 @@ résultats textuels change.
    sol_compose run --rm migrate
    ```
 
+   `group-roles` n'a pas besoin de Vault : avec `--no-deps`, il tourne sans lui. La dernière
+   commande lit les mots de passe des logins dans Vault, qui doit donc être initialisé
+   (« Dossier hôte et Vault »).
+
    Le `diff` doit être vide. Une erreur de `pg_restore` annule toute la restauration : corriger la
    cause, puis repartir d'une base vide en supprimant seulement le volume de la base (jamais
-   `down --volumes`, qui efface aussi les preuves et le certificat TLS) :
+   `down --volumes`, qui efface aussi Vault, les preuves et le certificat TLS) :
 
    ```bash
    sol_compose down
@@ -378,29 +517,76 @@ Prérequis :
 - Docker et son plugin Compose ;
 - un pare-feu limité à SSH, 80 et 443 ;
 - l'enregistrement DNS de `SITE_ADDRESS` ;
-- les dossiers `/srv/sol-token-listener/{secrets,config,backups}` ;
+- les dossiers `/srv/sol-token-listener/{secrets,backups}` ;
 - le timer de sauvegarde ;
 - un budget RPC du listener tenable. Sa charge HTTP est estimée entre 20 000 et 55 000 crédits par
   heure, au-delà d'un forfait gratuit.
 
 Procédure :
 
-- copier `secrets/` et `config/` du Mac par `scp -rp`, en conservant les modes ;
+- prendre sur le Mac un instantané de Vault à jour : `SOL_REPOSITORY="$PWD" deploy/host/backup.sh` ;
+- copier `secrets/` du Mac par `scp -rp`, en conservant les modes, et cet instantané dans
+  `backups/` ; puis restaurer l'instantané de Vault du Mac (« Restaurer Vault ») jusqu'au
+  redémarrage de `vault`. La stack ne démarre qu'une fois la base restaurée ;
 - arrêter la stack du Mac ;
 - exporter sa base avec `sol_compose exec -T postgres pg_dump -Fc …` ;
 - restaurer sur le serveur avec l'étape 4 ;
 - démarrer avec `deploy/compose.server.yaml`. Caddy obtient le certificat Let's Encrypt au premier
   démarrage.
 
+La bascule restaure un instantané plutôt que de copier le volume `vault-data` : une copie directe
+devrait garder l'uid 100 (l'utilisateur `vault` de l'image) sur chaque fichier.
+
 ## Rotation des secrets
 
-- Un fichier du back (URL Helius, clé, jeton) : remplacer le fichier, puis `sol_compose restart back`.
-- Un mot de passe de login : remplacer le fichier, puis `sol_compose run --rm migrate` et
-  `sol_compose restart back`.
-- Le mot de passe du front : supprimer `secrets/front/front-basic-auth-hash`, relancer
+- **Une valeur de Vault** (URL Helius, clé, jeton, configuration) : la modifier dans Vault
+  (« Modifier une valeur »), puis `sol_compose restart back` et `sol trading start`.
+- **Le mot de passe d'un login :** le modifier dans Vault (`sol/secrets/logins/<login>`), puis
+  `sol_compose run --rm migrate` et `sol_compose restart back`.
+- **Le mot de passe du front :** supprimer `secrets/front/front-basic-auth-hash`, relancer
   `deploy/host/init-secrets.sh "$SOL_HOST_DIR"`, puis `sol_compose restart front`.
-- Le mot de passe administrateur : il passe par l'entrée standard, jamais par la ligne de
-  commande.
+- **Le secret d'un AppRole :** générer un jeton root, écrire un nouveau `secret_id` dans le
+  fichier, révoquer l'ancien.
+
+  `generate-root` fonctionne sans jeton parce que `deploy/vault/vault.hcl` fixe
+  `enable_unauthenticated_access = ["generate-root"]` : sans ce réglage, Vault 2 le refuse.
+  Quiconque joint l'API peut donc lancer ou annuler une tentative, mais seule la clé de
+  déverrouillage la termine.
+
+  Vérifier d'abord qu'aucune tentative n'est en cours (`Started false`) :
+
+  ```bash
+  sol_compose exec -it vault vault operator generate-root -status
+  ```
+
+  Une tentative en cours que vous n'avez pas lancée s'annule avec
+  `sol_compose exec -it vault vault operator generate-root -cancel`. Lancer ensuite la vôtre, avec
+  votre propre OTP :
+
+  ```bash
+  sol_compose exec -it vault vault operator generate-root -generate-otp
+  sol_compose exec -it vault vault operator generate-root -init -otp='<otp>'
+  sol_compose exec -it vault vault operator generate-root
+  sol_compose exec -it vault vault operator generate-root -decode='<encoded>' -otp='<otp>'
+  ```
+
+  La troisième commande affiche `Operation nonce`, puis demande la clé de déverrouillage au TTY.
+  Ne saisir la clé que si ce nonce est celui qu'a affiché `-init` ; sinon, annuler et recommencer.
+  `-decode` affiche le jeton root.
+
+  Avec ce jeton root (`vault login` au TTY), dans `sol_compose exec -it vault sh` :
+  1. `vault write -f auth/approle/role/back/secret-id` affiche le nouveau `secret_id` et son
+     `secret_id_accessor` ;
+  2. sur l'hôte, remplacer `secret_id` dans `secrets/vault/approle/back.json` ;
+  3. `vault list auth/approle/role/back/secret-id` liste les accessors : détruire l'ancien avec
+     `vault write auth/approle/role/back/secret-id-accessor/destroy secret_id_accessor=<ancien>` ;
+  4. `vault token revoke -self`.
+
+  Puis `sol_compose restart back` et `sol trading start`. Pour `migrate` ou `backup`, remplacer
+  `back` dans les chemins : `sol_compose run --rm migrate` et `backup.sh` relisent leur fichier à
+  chaque lancement.
+- **Le mot de passe administrateur PostgreSQL :** il passe par l'entrée standard, jamais par la
+  ligne de commande.
 
   ```bash
   new_password="$(openssl rand -hex 32)"
@@ -424,10 +610,33 @@ Procédure :
   aléatoires) compense. Chaque tentative coûte une comparaison bcrypt de coût 10 et le front est
   limité à un demi-CPU : un flot de tentatives ne peut pas affamer le back. Un fail2ban sur les
   journaux de Caddy reste possible sur le serveur.
-- Le back et `migrate` tournent avec `no-new-privileges`, sans `NET_RAW` ni `MKNOD` et sans
-  fichier core : aucun processus ne regagne un privilège, aucun vidage mémoire n'emporte un
-  secret.
+- Le back, `migrate`, `vault` et les services du profil `tools` tournent avec `no-new-privileges`,
+  sans `NET_RAW` ni `MKNOD` et sans fichier core : aucun processus ne regagne un privilège, aucun
+  vidage mémoire n'emporte un secret.
 - `migrate` n'envoie à PostgreSQL que le vérificateur SCRAM de chaque mot de passe de login,
   jamais le mot de passe lui-même : une erreur journalisée ne peut pas le révéler.
+- Vault n'est joignable que depuis le réseau `internal` et sur `127.0.0.1:8200` de l'hôte ; le
+  front ne le relaie jamais. Sur Docker Desktop (Mac), tout conteneur le joint aussi par
+  `host.docker.internal:8200` : la frontière reste la machine locale. Sur un serveur Linux, seuls
+  les conteneurs du réseau `internal` et la boucle locale de l'hôte l'atteignent.
+- Chaque conteneur lit Vault avec son propre AppRole, en lecture seule sur ses chemins, avec un
+  jeton de 5 minutes révoqué après usage. Aucun jeton root ne survit à l'initialisation.
+- Le déverrouillage automatique garde le bot autonome : qui est root sur l'hôte peut lire la clé.
+  Vault centralise et trace les accès ; il ne protège pas contre un hôte compromis.
+- En mode `observe`, la keypair ne sort jamais de Vault.
 - La stack est limitée à un réplica unique. Elle n'offre aucune promesse de première position, de
   sellabilité ou de profit.
+
+### Sceller Vault en urgence
+
+`vault operator seal` ne tient pas : le déverrouillage automatique le défait au prochain démarrage
+du conteneur. Il exige de plus un jeton root, que le login `operator` n'a pas. Pour garder Vault
+scellé :
+
+- arrêter le conteneur : `sol_compose stop vault` ;
+- ou sortir le fichier de clé de `secrets/vault/unseal/`, puis `sol_compose restart vault` : Vault
+  reste scellé (`vault.unseal_key_missing`).
+
+Le back déjà démarré continue de tourner, sorties comprises. Il ne redémarre plus tant que Vault
+reste scellé : une position ouverte attendrait alors son retour. Pour rouvrir, remettre la clé,
+puis `sol_compose restart vault`.

@@ -854,14 +854,19 @@ listener est activé et n’est jamais exposé par cette santé.
 
 ## Déploiement de référence
 
-La stack Docker Compose exécute le bot complet en trois conteneurs : PostgreSQL
-privé, un conteneur `back` où `supervisord` lance chaque processus Node sous
-son propre utilisateur Unix, et un front Caddy en HTTPS, protégé par mot de passe
-et limité à la lecture. Le mode `observe` ne lance que le listener, l’API
+La stack Docker Compose exécute le bot complet en quatre conteneurs : PostgreSQL
+privé, Vault, un conteneur `back` où `supervisord` lance chaque processus Node
+sous son propre utilisateur Unix, et un front Caddy en HTTPS, protégé par mot de
+passe et limité à la lecture. Le mode `observe` ne lance que le listener, l’API
 opérateur et la rétention ; le mode `live` ajoute H2a, H2b et l’auto-arm, sans
-nouvel achat avant `sol trading start`. Les secrets sont des fichiers hors du
-dépôt et la keypair n’est lisible que par H2b. Les données terminales sont
-gardées 4 heures. La sauvegarde externe (copie hors machine) reste sous la
+nouvel achat avant `sol trading start`.
+
+Les variables des processus (configuration et secrets) vivent dans un conteneur Vault de la stack.
+`deploy/host/vault-init.sh` l'initialise une fois et `deploy/host/vault-import.sh` y importe les
+fichiers actuels. Voir `docs/operations/deployment.md`.
+
+La keypair n’est lisible que par H2b. Les données terminales sont gardées
+4 heures. La sauvegarde externe (copie hors machine) reste sous la
 responsabilité de l’opérateur.
 
 Avant une livraison, exécuter le smoke isolé puis suivre le

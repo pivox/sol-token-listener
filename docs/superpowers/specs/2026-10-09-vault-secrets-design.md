@@ -1,7 +1,7 @@
 # Secrets et configuration sous Vault (sous-projet 2)
 
 - Date : 2026-10-09.
-- Statut : design validé section par section avec l'utilisateur le 2026-10-09 ; amendé par le plan d'implémentation (section 13).
+- Statut : design validé section par section avec l'utilisateur le 2026-10-09 ; amendé par le plan d'implémentation, puis par l'implémentation (section 13).
 - Base :
   - le sous-projet 1, `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, dont la section 7.3 prévoit cette jonction ;
   - la stack Compose fusionnée par la PR #263 (`78fa4d1c`).
@@ -53,7 +53,7 @@ Vault est ailleurs :
 - un seul endroit pour toutes les valeurs ;
 - un historique avec retour arrière ;
 - des politiques au plus juste par conteneur ;
-- un audit des lectures.
+- un audit des lectures (13.7).
 
 ## 4. Approches considérées
 
@@ -100,7 +100,7 @@ d'entrée, et Vault devient une dépendance de chaque redémarrage de processus.
   - la santé est `vault status`, sain seulement une fois initialisé et déverrouillé ;
   - `back` et `migrate` attendent `vault` sain ;
   - `postgres` et `front` n'en dépendent pas.
-- **Exploitation** : `restart: unless-stopped` ; journaux `json-file` comme les autres services ; même durcissement que le back (`no-new-privileges`, sans `NET_RAW` ni `MKNOD`, sans fichier core).
+- **Exploitation** : `restart: unless-stopped` ; journaux `json-file` comme les autres services, qui portent aussi l'audit (13.7) ; même durcissement que le back (`no-new-privileges`, sans `NET_RAW` ni `MKNOD`, sans fichier core).
 - **Ce qui reste en fichiers, et pourquoi** :
   - le mot de passe administrateur PostgreSQL : l'image `postgres` en a besoin pour initialiser la base, avant tout client Vault ;
   - l'empreinte bcrypt du front : Caddy n'a pas de client Vault ;
@@ -124,7 +124,8 @@ La configuration obéit aux mêmes règles qu'aujourd'hui (`parseRoleConfig`) :
 - aucun identifiant dans une valeur ;
 - une seule ligne par valeur.
 
-La keypair est rangée telle quelle : le texte JSON du fichier.
+La keypair est rangée telle quelle : le texte JSON du fichier. Toute valeur est du texte, jamais
+un nombre, un booléen ou un tableau (13.7).
 
 ### 6.2 Politiques
 
@@ -144,7 +145,7 @@ Toutes au plus juste et versionnées dans `deploy/vault/policies/`, en lecture s
   - Le jeton obtenu vit 5 minutes et ne sert qu'au démarrage.
   - Le `secret_id` n'expire pas, car un redémarrage peut survenir à tout moment ; sa rotation est une procédure documentée.
 - **Opérateur** : un login `operator` (méthode userpass), dont le mot de passe est affiché une seule fois à l'initialisation et gardé dans le gestionnaire de mots de passe de l'utilisateur. Son jeton vit une heure, renouvelable jusqu'à 8 heures (13.6).
-- **Jeton root** : il ne sert qu'au script d'initialisation, puis il est révoqué. Une modification ultérieure des politiques le régénère avec la clé de déverrouillage (`vault operator generate-root`), selon une procédure documentée.
+- **Jeton root** : il ne sert qu'au script d'initialisation, puis il est révoqué. Une modification ultérieure des politiques le régénère avec la clé de déverrouillage (`vault operator generate-root`, permis sans jeton : 13.8), selon une procédure documentée.
 
 Le sous-projet 1 prévoyait un rôle Vault par utilisateur Unix (section 7.3). Le script d'entrée du
 back tourne en root et devrait de toute façon détenir les identifiants de tous les utilisateurs :
@@ -159,8 +160,8 @@ dossiers `/run/sol/<utilisateur>/` (0700, fichiers 0400).
   - `/root/secrets/logins` et `/root/secrets/back` sont remplacés par un tmpfs `/root/secrets` (0700) ;
   - `/etc/sol/config` est remplacé par un tmpfs (0755).
 
-  S'y ajoute `secrets/vault/approle/back.json`, monté en lecture seule sur `/root/vault/approle.json`.
-- **Première étape du script d'entrée** : `vault-pull back <mode>`, un client Node sans dépendance qui parle à l'API HTTP de Vault. Il :
+  S'y ajoute `secrets/vault/approle/back.json`, monté en lecture seule sur `/root/vault/approle.json`, avec `create_host_path: false` (13.9).
+- **Première étape du script d'entrée qui contacte Vault** : `vault-pull back <mode>`, un client Node sans dépendance qui parle à l'API HTTP de Vault. La validation du mode et la préparation de `/run/sol` la précèdent (13.11). Il :
   1. s'authentifie : `POST /v1/auth/approle/login` ;
   2. lit les entrées du mode (`GET /v1/sol/data/<chemin>`). Une entrée obligatoire manquante arrête tout ; une entrée facultative absente est ignorée ;
   3. écrit les secrets dans `/root/secrets/{back,logins}/` (0600, root), sous les noms de fichiers actuels ;
@@ -198,12 +199,14 @@ pas, et une position ouverte attend le retour de Vault. Le déverrouillage autom
 
 ### 8.1 Initialisation
 
-Le script `deploy/host/vault-init.sh` ne tourne qu'une fois. Il refuse un Vault déjà initialisé,
-démarre `vault` seul, puis confie les étapes ci-dessous au service ponctuel `vault-setup` (13.2).
-Ce service parle à l'API HTTP de Vault depuis Node (13.3). Il :
+Le script `deploy/host/vault-init.sh` ne tourne qu'une fois. Il refuse un Vault déjà initialisé
+et vérifie les dossiers de `secrets/vault/` (13.10). Il démarre ensuite `vault` seul, puis confie
+les étapes ci-dessous au service ponctuel `vault-setup` (13.2). Ce service parle à l'API HTTP de
+Vault depuis Node (13.3). Il :
 1. initialise Vault avec une part de clé ;
 2. écrit la clé de déverrouillage dans `secrets/vault/unseal/unseal-key` (0600), sans l'afficher ;
-3. déverrouille Vault, active `sol/` (KV v2), AppRole et userpass, et charge les quatre politiques ;
+3. déverrouille Vault, active l'audit sur la sortie standard (13.7), `sol/` (KV v2), AppRole et
+   userpass, et charge les quatre politiques ;
 4. crée les trois AppRoles et écrit leurs fichiers ;
 5. génère directement dans Vault les neuf mots de passe de login et le jeton de l'API opérateur,
    comme `init-secrets.sh` le fait aujourd'hui en fichiers ;
@@ -235,17 +238,18 @@ dans Vault, qui restent dans les versions précédentes.
 
 - **Une valeur** : modifiée dans l'interface (`http://127.0.0.1:8200`, login `operator`) ou en ligne de commande, puis `sol_compose restart back`. Le redémarrage pose l'entry-stop : relancer `sol trading start`.
 - **Le mot de passe d'un login** : modifié dans Vault, puis `sol_compose run --rm migrate`, puis redémarrage du back.
-- **Le `secret_id` d'un AppRole** : jeton root régénéré, nouveau `secret_id` écrit dans son fichier, ancien révoqué, conteneur redémarré.
+- **Le `secret_id` d'un AppRole** : jeton root régénéré (13.8), nouveau `secret_id` écrit dans son fichier, ancien révoqué, conteneur redémarré.
 
 ### 8.4 Sauvegardes
 
 `deploy/host/backup.sh` ajoute un instantané raft de Vault à côté du `pg_dump`. Le service
 ponctuel `vault-snapshot` (13.2) le prend par l'API HTTP de Vault (13.3). Le script lit le
 fichier de l'AppRole `backup` sur l'hôte et le transmet sur l'entrée standard du service.
-La rétention est la même, 14 jours, avec une empreinte SHA-256 pour chaque fichier. L'instantané
-est chiffré, et le restaurer exige la clé de déverrouillage, qui n'est jamais dans les
-sauvegardes. L'utilisateur garde une copie de la clé de déverrouillage et du mot de passe
-`operator` dans son gestionnaire de mots de passe.
+La rétention est la même, 14 jours, avec une empreinte SHA-256 pour chaque fichier. Le script ne
+garde que des fichiers complets et non vides (13.10). L'instantané est chiffré, et le restaurer
+exige la clé de déverrouillage, qui n'est jamais dans les sauvegardes. L'utilisateur garde une
+copie de la clé de déverrouillage et du mot de passe `operator` dans son gestionnaire de mots de
+passe.
 
 ### 8.5 Ce qui reste sur l'hôte
 
@@ -337,21 +341,23 @@ C'est la tâche 16, avec le feu vert de l'utilisateur :
 5. **Sauvegardes** : elles contiennent un instantané raft restaurable avec la clé de déverrouillage.
 6. **Runbook** : il décrit l'initialisation, l'import, les modifications, les rotations, la sauvegarde et la restauration, et la bascule vers le serveur.
 
-## 13. Amendements du 2026-10-09 (plan d'implémentation)
+## 13. Amendements (plan d'implémentation et implémentation)
 
-Le plan `docs/superpowers/plans/2026-10-09-vault-secrets.md` précise ce spec sur six points,
-reportés dans les sections concernées :
+Le plan `docs/superpowers/plans/2026-10-09-vault-secrets.md` précise ce spec sur six points (1 à
+6), puis l'implémentation sur cinq autres (7 à 11). Tous sont reportés dans les sections
+concernées :
 
 1. Les fichiers d'amorçage de Vault sur l'hôte vivent dans deux dossiers, `secrets/vault/unseal/`
    et `secrets/vault/approle/` (sections 5, 6.3, 7.1, 8.1 et 8.5).
    - La clé de déverrouillage n'existe pas au premier démarrage de `vault` : un montage de
      fichier absent ferait créer un dossier par Docker. `vault` monte donc le dossier `unseal/`.
    - `vault-setup` écrit les trois fichiers AppRole dans `approle/`. `back` et `migrate` montent
-     le leur en syntaxe longue de Compose, qui échoue sur un fichier absent au lieu de créer un
-     dossier.
+     le leur en syntaxe longue de Compose, avec `bind: {create_host_path: false}` : seul ce
+     réglage fait échouer le démarrage sur un fichier absent au lieu de créer un dossier (13.9).
 2. Trois services ponctuels sur l'image back, au profil `tools` : `vault-setup`, `vault-import`
    et `vault-snapshot` (sections 5, 8.1, 8.2, 8.4, 9 et 10). Les scripts de l'hôte les lancent par
-   `docker compose run`, jamais par `docker compose up`. Ils rejoignent le réseau `internal` :
+   `docker compose run --no-deps` (13.10), jamais par `docker compose up`. Ils rejoignent le
+   réseau `internal` :
    Vault n'est pas joignable depuis l'hôte, hors son port d'interface local, et l'hôte n'a
    besoin d'aucun client Vault.
 3. Les quatre commandes `vault-pull`, `vault-setup`, `vault-import` et `vault-snapshot` appellent
@@ -372,3 +378,42 @@ reportés dans les sections concernées :
    l'interface, comme les chemins de preuves.
 6. Le login `operator` reçoit un jeton d'une heure, renouvelable jusqu'à 8 heures (sections 6.3
    et 9). La durée par défaut dans Vault, 32 jours, contredirait l'invariant 5.
+7. Un audit tient la promesse des sections 1 et 3, qu'aucune tâche du plan ne réalisait
+   (sections 3, 5, 6.1 et 8.1). Tant qu'il détient le jeton root, `vault-setup` active un audit
+   `file` qui écrit sur la sortie standard du serveur.
+   - La trace est le journal du conteneur, `docker logs` : chaque requête authentifiée et sa
+     réponse.
+   - Vault y masque les textes par HMAC, pas les nombres ni les booléens, qui paraissent en clair
+     dans les réponses lues. Toute valeur de Vault est donc du texte : `vault-import` n'écrit que
+     des chaînes, `vault-pull` refuse toute autre valeur, et la keypair reste le texte du fichier.
+     L'invariant 1 en dépend.
+   - La trace tourne avec les journaux `json-file` (5 fichiers de 20 Mo) et disparaît quand le
+     conteneur est recréé : ce n'est pas un audit durable.
+   - Elle est fail-closed : si la sortie standard du conteneur bloque, Vault cesse de répondre
+     plutôt que de servir sans trace.
+8. `deploy/vault/vault.hcl` fixe `enable_unauthenticated_access = ["generate-root"]` (sections 6.3
+   et 8.3).
+   - Pourquoi : depuis la version 2.0 (correctif de la CVE-2026-5807), Vault refuse un
+     `generate-root` sans jeton. Or l'invariant 5 révoque le jeton root, et seul `generate-root`
+     en régénère un, avec la clé de déverrouillage.
+   - Risque résiduel : tout client de l'API peut lancer ou annuler une tentative. C'est une
+     nuisance seulement, car terminer une tentative exige la clé de déverrouillage. Le runbook
+     vérifie l'état et le nonce de la tentative avant de saisir la clé.
+9. Les montages AppRole de `back` et `migrate` n'échouent sur un fichier absent qu'avec
+   `bind: {create_host_path: false}` (sections 7.1 et 13.1). L'implémentation l'a montré : la
+   syntaxe longue seule crée encore un dossier à la place du fichier manquant. Le point 1 est
+   corrigé en ce sens.
+10. Garde-fous de l'initialisation et des services ponctuels (sections 8.1, 8.4 et 13.2) :
+    - `vault-init.sh` vérifie, avant `compose up vault`, que `secrets/vault/unseal/` et
+      `secrets/vault/approle/` existent, appartiennent à l'appelant, lui sont inscriptibles et
+      sont vides. Sinon, Docker créerait un dossier manquant au nom de root, et la clé, impossible
+      à écrire, serait perdue après l'initialisation ;
+    - les scripts de l'hôte lancent les services ponctuels avec `--no-deps` : ils ne démarrent ni
+      ne recréent jamais Vault ;
+    - `vault-setup` et `vault-snapshot` n'ont aucune copie de journal (pilote `none`) : leur
+      sortie porte le mot de passe `operator` ou l'instantané brut ;
+    - `vault-snapshot` lit l'instantané entier, vérifie son en-tête gzip, puis l'écrit d'un bloc.
+      `backup.sh` ne garde un fichier que si l'outil réussit et que le fichier n'est pas vide.
+11. Section 7.1 : `vault-pull` est la première étape du script d'entrée qui contacte Vault, pas la
+    première étape tout court. La validation du mode et la préparation de `/run/sol` la
+    précèdent.

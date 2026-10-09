@@ -1533,7 +1533,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   const runbook = await readArtifact('docs/operations/deployment.md');
   let previous = -1;
   for (const heading of [
-    '## Topologie', '## Prérequis', '## Dossier hôte, secrets et configuration', '## Images',
+    '## Topologie', '## Prérequis', '## Images', '## Dossier hôte et Vault',
     '## Démarrage et arrêt', '## Commandes sol', '## Trading', "## Qualification d'une enveloppe (gate 10)",
     '## Santé et journaux', '## Sauvegardes', '## Reprise de la base actuelle', '## Retour arrière',
     '## Bascule vers le serveur', '## Rotation des secrets', '## Frontière de sécurité',
@@ -1552,8 +1552,9 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     'sol_compose exec back sol trading stop',
     'sol_compose exec back sol qualify start',
     'sol_compose exec back sol qualify stop',
-    'sol_compose run --rm migrate sol-admin report',
-    'sol_compose run --rm migrate sol-admin group-roles',
+    // --no-deps: neither sol-admin command reads Vault, so Compose never starts or recreates it for them.
+    'sol_compose run --rm --no-deps migrate sol-admin report',
+    'sol_compose run --rm --no-deps migrate sol-admin group-roles',
     'pg_restore --exit-on-error --single-transaction -U sol_owner',
     'deploy/sql/takeover-precondition.sql',
     'deploy/sql/table-row-counts.sql',
@@ -1565,15 +1566,34 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     'sol ctl restart <programme>',
     'sudo systemctl enable --now sol-backup.timer',
     'launchctl bootstrap "gui/$(id -u)" "$plist"',
+    'deploy/host/vault-init.sh',
+    'deploy/host/vault-import.sh "$HOME/.sol-token-listener/lot5/env"',
+    'vault kv patch sol/config/',
+    'sol_compose restart back',
+    'vault operator raft snapshot restore -force /tmp/restore.snap',
+    // The entrypoint unseals only when the container starts.
+    'sol_compose restart vault',
+    // Nobody else's generate-root attempt may receive the unseal key.
+    'vault operator generate-root -status',
+    'vault operator generate-root -cancel',
   ]) {
     assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
   }
-  const secrets = runbook.slice(runbook.indexOf('## Dossier hôte'), runbook.indexOf('## Images'));
+  const secrets = runbook.slice(runbook.indexOf('## Dossier hôte et Vault'), runbook.indexOf('## Démarrage et arrêt'));
+  assert.ok(secrets.length > 0);
   assert.doesNotMatch(secrets, /\b(?:cat|echo)\s+"?\$(?:back|SOL_HOST_DIR)/u, 'secrets are copied, never printed');
+  assert.doesNotMatch(runbook, /run --rm migrate sol-admin/u, 'sol-admin runs with --no-deps');
+  // The audit log HMACs strings only: a number or a JSON array would reach `docker logs` in clear.
+  assert.match(runbook, /mode JSON de l'interface/u);
+  assert.match(runbook, /Operation nonce/u);
+  assert.match(runbook, /enable_unauthenticated_access/u);
+  assert.match(runbook, /vault\.unseal_failed/u);
+  assert.match(runbook, /host\.docker\.internal/u);
   assert.match(runbook, /pg_advisory_lock/u);
   assert.match(runbook, /Les migrations\s+restent forward-only/u);
-  // `down --volumes` also deletes the evidence and the TLS certificate: never a documented command.
+  // `down --volumes` also deletes Vault, the evidence and the TLS certificate: never a documented command.
   assert.match(runbook, /`down --volumes` efface tous les volumes de la stack/u);
+  assert.match(runbook, /`down --volumes` efface tous les volumes de la stack[^.]*`vault-data`/u);
   assert.doesNotMatch(runbook, /^\s*sol_compose down --volumes/mu);
   assert.doesNotMatch(runbook, /--timeout 60/u, 'the stop waits for the whole stop_grace_period');
   assert.match(runbook, /ENTRY_STOP/u);
