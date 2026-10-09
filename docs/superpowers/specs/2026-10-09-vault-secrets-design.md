@@ -1,0 +1,327 @@
+# Secrets et configuration sous Vault (sous-projet 2)
+
+- Date : 2026-10-09.
+- Statut : design validé section par section avec l'utilisateur le 2026-10-09.
+- Base :
+  - le sous-projet 1, `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, dont la section 7.3 prévoit cette jonction ;
+  - la stack Compose fusionnée par la PR #263 (`78fa4d1c`).
+
+## 1. Objet
+
+Toutes les variables des processus du back passent dans un conteneur Vault de la stack : la
+configuration non secrète de chaque rôle comme les secrets. L'opérateur les gère à un seul
+endroit, avec historique, politiques par conteneur et audit. Le reste de la stack ne change pas :
+les scripts d'entrée lisent Vault au démarrage et écrivent les mêmes fichiers qu'aujourd'hui, aux
+mêmes chemins.
+
+La liste des comptes Helius avec bascule automatique est le sous-projet 3. Il réutilisera ce
+stockage : les trois URL Helius y deviendront une seule entrée, la liste JSON des comptes.
+
+## 2. État actuel
+
+Depuis la PR #263, l'hôte porte, sous `$SOL_HOST_DIR` :
+
+| Fichier | Lecteurs |
+|---|---|
+| `secrets/db/postgres-admin-password` | `postgres`, `migrate` |
+| `secrets/db/logins/pg-<login>-password` (9) | `migrate` ; `back` |
+| `secrets/back/<nom>` (7 : trois URL Helius, clé d'administration Helius, clé privée des preuves, keypair, jeton de l'API opérateur) | `back` |
+| `secrets/front/front-basic-auth-hash` | `front` |
+| `config/<fichier>.env` (10 fichiers non secrets) | `back` |
+| `compose.env` (images, mode, port) | Docker Compose |
+
+Le back monte `secrets/db/logins` sur `/root/secrets/logins`, `secrets/back` sur
+`/root/secrets/back` et `config` sur `/etc/sol/config`. Son script d'entrée copie ensuite les
+secrets de chaque utilisateur Unix dans `/run/sol/<utilisateur>/` (`distribute-secrets`), et
+`sol-run` assemble l'environnement de chaque processus. Les valeurs réelles vivent encore dans
+`~/.sol-token-listener/lot5/env/*.env` et dans les fichiers de clés. La validation sur le Mac
+(tâche 16 du plan du sous-projet 1) n'a pas eu lieu : aucune stack ne tourne avec de vraies clés.
+
+## 3. Décisions de cadrage
+
+| Sujet | Décision |
+|---|---|
+| Ordre | Vault d'abord, la liste Helius ensuite (sous-projet 3) |
+| Périmètre | Secrets et configuration non secrète des rôles |
+| Déverrouillage | Automatique, avec une clé dans un fichier de l'hôte |
+| Accès à l'interface | Local seulement : `127.0.0.1:8200` sur le Mac, tunnel SSH sur le serveur |
+| Branchement | Lecture au démarrage par les scripts d'entrée (approche A) |
+
+Le déverrouillage automatique garde le bot autonome après une coupure. En contrepartie, qui est
+root sur l'hôte peut déverrouiller Vault, comme il peut lire les fichiers aujourd'hui. Le gain de
+Vault est ailleurs :
+- un seul endroit pour toutes les valeurs ;
+- un historique avec retour arrière ;
+- des politiques au plus juste par conteneur ;
+- un audit des lectures.
+
+## 4. Approches considérées
+
+### 4.1 Retenue : lecture au démarrage par les scripts d'entrée (A)
+
+`back` et `migrate` s'authentifient à Vault au démarrage, lisent leurs entrées et les écrivent en
+tmpfs aux chemins actuels. Le code applicatif, `sol-run`, la distribution par utilisateur et les
+validations ne changent pas. Une modification dans Vault prend effet au redémarrage du conteneur.
+
+### 4.2 Écartée : agent Vault dans le back (B)
+
+Un `vault agent` sous `supervisord` régénère les fichiers quand une valeur change. Il faut un
+modèle par clé (une trentaine), un processus de plus et une politique de redémarrage par
+programme. Le gain est faible : tout redémarrage du back pose déjà l'entry-stop, par sécurité.
+
+### 4.3 Écartée : lecture par chaque processus Node (C)
+
+Chaque processus lit Vault avec son propre rôle : seul H2b pourrait lire la keypair. C'est le
+moindre privilège réel, mais il faut changer le chargement de configuration de tous les points
+d'entrée, et Vault devient une dépendance de chaque redémarrage de processus.
+
+## 5. Topologie
+
+- **Service `vault`** :
+  - image officielle `hashicorp/vault`, version stable courante, épinglée par digest. Sa licence BSL autorise l'usage interne ; OpenBao, compatible, peut la remplacer ;
+  - stockage intégré (raft) dans un volume `vault-data` ;
+  - interface web activée ;
+  - `disable_mlock`, recommandé avec raft en conteneur ;
+  - `api_addr` et `cluster_addr` sur le nom `vault`.
+- **Écoute** : HTTP sur le port 8200, sans TLS.
+- **Réseaux** :
+  - `internal` : `back` et `migrate` joignent `vault:8200` ;
+  - `vault-ui`, réseau dédié qui ne sert qu'à publier `127.0.0.1:8200:8200` sur l'hôte, car Docker ne publie pas de port depuis un réseau interne.
+
+  Sur le serveur, la publication reste locale ; l'accès passe par `ssh -L 8200:127.0.0.1:8200`.
+- **Script d'entrée `vault-entrypoint`** :
+  1. il lance `vault server` sous l'utilisateur non root de l'image ;
+  2. il attend que l'API réponde ;
+  3. si Vault est initialisé et verrouillé, il le déverrouille avec la clé montée en lecture seule depuis `secrets/vault/unseal-key`. Une seule part de clé (Shamir 1 sur 1) ;
+  4. si Vault n'est pas encore initialisé, il le laisse tourner : le script d'initialisation s'en charge (section 8.1).
+
+  La clé n'apparaît ni dans l'environnement, ni dans les arguments, ni dans les journaux.
+- **Santé et dépendances** :
+  - la santé est `vault status`, sain seulement une fois initialisé et déverrouillé ;
+  - `back` et `migrate` attendent `vault` sain ;
+  - `postgres` et `front` n'en dépendent pas.
+- **Exploitation** : `restart: unless-stopped` ; journaux `json-file` comme les autres services ; même durcissement que le back (`no-new-privileges`, sans `NET_RAW` ni `MKNOD`, sans fichier core).
+- **Ce qui reste en fichiers, et pourquoi** :
+  - le mot de passe administrateur PostgreSQL : l'image `postgres` en a besoin pour initialiser la base, avant tout client Vault ;
+  - l'empreinte bcrypt du front : Caddy n'a pas de client Vault ;
+  - `compose.env` : ce sont des entrées de Docker, pas de l'application.
+
+## 6. Données dans Vault
+
+### 6.1 Arborescence
+
+Moteur KV version 2 monté sur `sol/`. Chaque entrée garde ses versions précédentes (10 par
+défaut), consultables et restaurables depuis l'interface.
+
+| Chemin | Contenu | Remplace |
+|---|---|---|
+| `sol/config/<nom>` | une entrée par fichier de configuration (`listener`, `live`, `live-recovery`, `operations`, `operator-api`, `readiness`, `worker-sim`, `provider-evidence`, `preflight-bundle`, `retention`) ; une clé par variable | `config/<nom>.env` |
+| `sol/secrets/back/<nom>` | les sept secrets du back, sous les noms de fichiers actuels ; champ `value` | `secrets/back/<nom>` |
+| `sol/secrets/logins/<login>` | le mot de passe de chacun des neuf logins ; champ `value` | `secrets/db/logins/pg-<login>-password` |
+
+La configuration obéit aux mêmes règles qu'aujourd'hui (`parseRoleConfig`) :
+- aucune variable injectée ni nom de secret ;
+- aucun identifiant dans une valeur ;
+- une seule ligne par valeur.
+
+La keypair est rangée telle quelle : le texte JSON du fichier.
+
+### 6.2 Politiques
+
+Toutes en lecture seule et au plus juste, versionnées dans `deploy/vault/policies/` :
+
+| Politique | Droits |
+|---|---|
+| `back` | lire `sol/data/config/*`, `sol/data/secrets/back/*`, `sol/data/secrets/logins/*` |
+| `migrate` | lire `sol/data/secrets/logins/*` |
+| `backup` | lire `sys/storage/raft/snapshot` |
+| `operator` | créer, lire, modifier, supprimer et lister sous `sol/` (données, métadonnées, versions) ; rien sur les politiques ni l'authentification |
+
+### 6.3 Authentification
+
+- **Conteneurs** : un AppRole par politique conteneur (`back`, `migrate`, `backup`).
+  - Le couple `role_id` / `secret_id` est un fichier 0600 de l'hôte, `secrets/vault/<rôle>-approle.json`, monté en lecture seule dans le seul conteneur concerné. Le fichier de `backup` n'est lu que par le script de sauvegarde de l'hôte.
+  - Le jeton obtenu vit 5 minutes et ne sert qu'au démarrage.
+  - Le `secret_id` n'expire pas, car un redémarrage peut survenir à tout moment ; sa rotation est une procédure documentée.
+- **Opérateur** : un login `operator` (méthode userpass), dont le mot de passe est affiché une seule fois à l'initialisation et gardé dans le gestionnaire de mots de passe de l'utilisateur.
+- **Jeton root** : il ne sert qu'au script d'initialisation, puis il est révoqué. Une modification ultérieure des politiques le régénère avec la clé de déverrouillage (`vault operator generate-root`), selon une procédure documentée.
+
+Le sous-projet 1 prévoyait un rôle Vault par utilisateur Unix (section 7.3). Le script d'entrée du
+back tourne en root et devrait de toute façon détenir les identifiants de tous les utilisateurs :
+un rôle par utilisateur n'isolerait rien de plus. L'isolation entre utilisateurs reste celle des
+dossiers `/run/sol/<utilisateur>/` (0700, fichiers 0400).
+
+## 7. Démarrage avec Vault
+
+### 7.1 Back
+
+- **Montages** : les trois montages de dossiers de l'hôte disparaissent :
+  - `/root/secrets/logins` et `/root/secrets/back` sont remplacés par un tmpfs `/root/secrets` (0700) ;
+  - `/etc/sol/config` est remplacé par un tmpfs (0755).
+
+  S'y ajoute `secrets/vault/back-approle.json`, monté en lecture seule sur `/root/vault/approle.json`.
+- **Première étape du script d'entrée** : `vault-pull back <mode>`, un client Node sans dépendance qui parle à l'API HTTP de Vault. Il :
+  1. s'authentifie : `POST /v1/auth/approle/login` ;
+  2. lit les entrées du mode (`GET /v1/sol/data/<chemin>`). Une entrée obligatoire manquante arrête tout ; une entrée facultative absente est ignorée ;
+  3. écrit les secrets dans `/root/secrets/{back,logins}/` (0600, root), sous les noms de fichiers actuels ;
+  4. écrit chaque configuration en `/etc/sol/config/<nom>.env` (0644, lignes `VARIABLE=valeur` triées), validée par `parseRoleConfig` avant écriture ;
+  5. révoque son jeton : `POST /v1/auth/token/revoke-self`.
+- **Entrées du mode** :
+  - Elles reprennent `secretGrants(mode)`. Les obligatoires sont celles des rôles que `supervisord` démarre dans ce mode (`REQUIRED_ROLES`), plus leurs fichiers de configuration. Les autres sont facultatives.
+  - En mode `observe`, la keypair n'est jamais lue.
+- **Suite du démarrage** : inchangée (distribution par utilisateur, entry-stop de démarrage en mode `live`, `supervisord`).
+- **Journaux** : `vault-pull` n'écrit jamais une valeur. Seule une ligne JSON de synthèse sort : mode, nombre de secrets et de configurations lus, entrées facultatives absentes par nom.
+
+### 7.2 Migrate
+
+`sol-admin migrate` lit les neuf mots de passe de login avec l'AppRole `migrate`, dans un tmpfs
+`/root/secrets/db/logins`. Le mot de passe administrateur reste le fichier de l'hôte, monté sur
+`/root/secrets/db/postgres-admin-password`. `sol-admin report` n'a pas besoin de Vault.
+
+### 7.3 Échecs
+
+Aucun conteneur ne revient jamais à des fichiers de l'hôte quand Vault fait défaut.
+
+| Cas | Comportement |
+|---|---|
+| Vault injoignable ou verrouillé | nouvelles tentatives toutes les 2 s pendant 60 s, puis sortie 69 ; Docker relance le conteneur |
+| AppRole refusé | sortie 77 immédiate |
+| Entrée obligatoire manquante ou valeur invalide | sortie 78 immédiate ; le message nomme le chemin, jamais la valeur |
+| Usage incorrect | sortie 64 |
+
+Une fois démarré, le back ne parle plus à Vault : un Vault arrêté ne touche pas les processus en
+cours. En revanche, si le back redémarre pendant que Vault est en panne, H2a et H2b ne démarrent
+pas, et une position ouverte attend le retour de Vault. Le déverrouillage automatique et
+`restart: unless-stopped` sur `vault` réduisent ce risque.
+
+## 8. Exploitation
+
+### 8.1 Initialisation
+
+Le script `deploy/host/vault-init.sh` ne tourne qu'une fois. Il refuse un Vault déjà initialisé.
+Il :
+1. démarre `vault` seul, puis l'initialise avec une part de clé ;
+2. écrit la clé de déverrouillage dans `secrets/vault/unseal-key` (0600), sans l'afficher ;
+3. déverrouille Vault, active `sol/` (KV v2), AppRole et userpass, et charge les quatre politiques ;
+4. crée les trois AppRoles et écrit leurs fichiers ;
+5. génère directement dans Vault les neuf mots de passe de login et le jeton de l'API opérateur,
+   comme `init-secrets.sh` le fait aujourd'hui en fichiers ;
+6. crée le login `operator`, dont il affiche une seule fois le mot de passe généré ;
+7. révoque le jeton root.
+
+### 8.2 Import
+
+L'import tourne dans un conteneur de l'image back, avec les sources montées en lecture seule et
+le login `operator` saisi au TTY. Il :
+- lit les sources actuelles : les fichiers `lot5/env/*.env` et les fichiers de clés. Il reprend
+  les correspondances des commandes de copie du runbook actuel, par exemple
+  `SOLANA_HTTP_RPC_URL` de `listener.env` vers `helius-listener-http-url` ;
+- retire de chaque configuration les variables que `sol-run` injecte, comme le fait aujourd'hui la commande `strip` du runbook ;
+- valide chaque entrée avec les mêmes règles que `vault-pull` ;
+- écrit le tout dans Vault, sans afficher aucune valeur.
+
+Il n'y a donc plus de copie intermédiaire en fichiers sur l'hôte. L'import peut être relancé : il
+crée une nouvelle version de chaque entrée.
+
+### 8.3 Modifications et rotation
+
+- **Une valeur** : modifiée dans l'interface (`http://127.0.0.1:8200`, login `operator`) ou en ligne de commande, puis `sol_compose restart back`. Le redémarrage pose l'entry-stop : relancer `sol trading start`.
+- **Le mot de passe d'un login** : modifié dans Vault, puis `sol_compose run --rm migrate`, puis redémarrage du back.
+- **Le `secret_id` d'un AppRole** : jeton root régénéré, nouveau `secret_id` écrit dans son fichier, ancien révoqué, conteneur redémarré.
+
+### 8.4 Sauvegardes
+
+`deploy/host/backup.sh` ajoute un instantané raft de Vault (AppRole `backup`) à côté du `pg_dump`.
+La rétention est la même, 14 jours, avec une empreinte SHA-256 pour chaque fichier. L'instantané
+est chiffré, et le restaurer exige la clé de déverrouillage, qui n'est jamais dans les
+sauvegardes. L'utilisateur garde une copie de la clé de déverrouillage et du mot de passe
+`operator` dans son gestionnaire de mots de passe.
+
+### 8.5 Ce qui reste sur l'hôte
+
+- `secrets/vault/unseal-key` et les trois fichiers AppRole ;
+- `secrets/db/postgres-admin-password` ;
+- `secrets/front/front-basic-auth-hash` ;
+- `compose.env`.
+
+Les dossiers `config/`, `secrets/back/` et `secrets/db/logins/` disparaissent.
+`deploy/host/init-secrets.sh` ne crée plus que ce qui reste en fichiers.
+
+### 8.6 Effets sur le sous-projet 1
+
+- La validation sur le Mac (tâche 16) commence par l'initialisation et l'import, puis suit le runbook sans changement. Elle exige toujours le feu vert de l'utilisateur.
+- La bascule vers le serveur copie `secrets/vault/` et restaure un instantané raft, ou copie le volume `vault-data`.
+- Dans le spec du sous-projet 1, la section 7.3 renvoie vers ce document.
+
+## 9. Invariants de sécurité
+
+1. **Aucune valeur secrète visible** : ni dans un journal, un argument de processus, l'environnement d'un conteneur, le compose ou une image.
+2. **Vault reste local** : il n'est joignable que depuis le réseau `internal` et sur `127.0.0.1` de l'hôte. Il n'est jamais relayé par le front.
+3. **Pas de repli sur des fichiers** : `back` et `migrate` refusent de démarrer sans Vault.
+4. **La keypair ne quitte Vault qu'en mode `live`** : seule la politique `back` peut la lire, et dans le back, seul l'utilisateur `h2b` la reçoit.
+5. **Pas de jeton durable** : chaque politique est en lecture seule sur ses chemins. Aucun jeton root ne survit à l'initialisation, et les jetons des conteneurs vivent 5 minutes puis sont révoqués.
+6. **Fichiers de l'hôte protégés** : la clé de déverrouillage et les fichiers AppRole sont 0600. Chacun est monté en lecture seule dans un seul conteneur au plus ; celui de `backup` reste sur l'hôte et n'est lu que par le script de sauvegarde.
+
+## 10. Tests et validation
+
+### 10.1 Tests unitaires (node:test, sans réseau)
+
+Le client `vault-pull`, contre un faux serveur Vault :
+- authentification AppRole et chemins lus par mode, la keypair n'étant jamais lue en `observe` ;
+- droits des fichiers écrits et rendu trié `VARIABLE=valeur` ;
+- refus d'une valeur multi-ligne, d'un identifiant dans une valeur ou d'un nom de secret en configuration ;
+- les codes de sortie 64, 69, 77 et 78 ;
+- la révocation du jeton ;
+- aucune valeur dans la sortie standard ni dans la sortie d'erreur.
+
+### 10.2 Scripts de l'hôte
+
+`vault-init` et l'import, avec des faux `docker` et `vault`, comme les tests actuels
+d'`init-secrets` :
+- refus d'un Vault déjà initialisé ;
+- seule sortie autorisée : le mot de passe `operator` affiché une fois ;
+- variables injectées retirées ;
+- aucune valeur affichée.
+
+### 10.3 Tests statiques
+
+- les politiques au plus juste, sans joker sur `sys/` ;
+- le service `vault` épinglé, publié seulement sur `127.0.0.1`, avec sa santé et les dépendances de `back` et `migrate` ;
+- plus aucun montage de `config/`, `secrets/back/` ni `secrets/db/logins/`.
+
+### 10.4 Smoke en CI (job `deployment-contract`)
+
+Avec un vrai Vault jetable :
+- initialisation, import de valeurs factices, stack démarrée, back sain ;
+- Vault redémarré : il se redéverrouille seul ;
+- Vault arrêté puis back redémarré : le back refuse de démarrer, sans jamais lancer `supervisord` ;
+- aucune valeur secrète dans `docker inspect` ni dans les journaux ;
+- instantané raft produit par `backup.sh`.
+
+### 10.5 Validation sur le Mac
+
+C'est la tâche 16, avec le feu vert de l'utilisateur :
+1. initialisation ;
+2. import depuis les fichiers `lot5` ;
+3. connexion à l'interface en local ;
+4. démarrage de la stack.
+
+## 11. Hors périmètre
+
+- La liste des comptes Helius avec bascule (sous-projet 3).
+- TLS sur le réseau interne.
+- Vault en haute disponibilité.
+- Identifiants PostgreSQL dynamiques.
+- Rechargement à chaud.
+- Mot de passe administrateur PostgreSQL et empreinte du front dans Vault.
+- Page de configuration dans la console.
+- Exposition publique de Vault.
+
+## 12. Critères d'acceptation
+
+1. **Plus de dossiers de valeurs sur l'hôte** : la stack démarre sans `config/`, `secrets/back/` ni `secrets/db/logins/`. Le back est sain avec des valeurs lues dans Vault.
+2. **Déverrouillage automatique** : Vault se redéverrouille seul après un redémarrage.
+3. **Refus sans Vault** : `back` et `migrate` refusent de démarrer sans Vault, et le message ne contient aucune valeur.
+4. **Effet d'une modification** : une valeur modifiée dans Vault prend effet au redémarrage suivant du back.
+5. **Sauvegardes** : elles contiennent un instantané raft restaurable avec la clé de déverrouillage.
+6. **Runbook** : il décrit l'initialisation, l'import, les modifications, les rotations, la sauvegarde et la restauration, et la bascule vers le serveur.
