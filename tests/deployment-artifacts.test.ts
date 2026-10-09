@@ -115,6 +115,7 @@ void test('backend image ships compiled artifacts, supervisor and one Unix user 
     'COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/',
     'COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf',
     'COPY deploy/back/supervisor/programs/ /etc/sol/programs/',
+    'COPY deploy/vault/policies/ /etc/sol/vault/policies/',
   ]);
   assert.doesNotMatch(backend, /\btests?\/|fixtures?|\.env\b|\.git\b|\.worktrees|npm-cache|secret|keypair|wallet/iu);
   assert.match(backend, /^ENV\s+NODE_ENV=production$/m);

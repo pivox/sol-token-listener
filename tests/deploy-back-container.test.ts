@@ -125,6 +125,7 @@ void test('the entrypoint distributes secrets and applies the boot entry-stop be
   // Under `set -e`, a failing plain command line ends the entrypoint before supervisord.
   assert.match(entrypoint, /^set -eu$/mu);
   assertOrder(entrypoint, [
+    'node /app/dist/scripts/deploy/vault-pull.js back "$mode"',
     'node /app/dist/scripts/deploy/distribute-secrets.js "$mode"',
     'install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf',
     'if [ "$mode" = live ]; then',
@@ -293,4 +294,16 @@ void test('sol-h2b relaunches after exit 75, backs off after a failure and stops
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+void test('sol-admin migrate reads the login passwords from Vault before migrating', async () => {
+  const solAdmin = await artifact('deploy/back/bin/sol-admin');
+  assertOrder(solAdmin, [
+    '  migrate)\n',
+    '    node /app/dist/scripts/deploy/vault-pull.js migrate\n',
+    '    exec node /app/dist/scripts/deploy/admin-database.js migrate ;;\n',
+    '  group-roles)\n',
+    '    exec node /app/dist/scripts/deploy/admin-database.js group-roles ;;\n',
+    '  report)\n',
+  ]);
 });

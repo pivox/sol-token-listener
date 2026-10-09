@@ -65,6 +65,8 @@ RUN chmod -R a+rX /app/dist
 COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/
 COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf
 COPY deploy/back/supervisor/programs/ /etc/sol/programs/
+# vault-setup loads the policies into Vault (deploy/host/vault-init.sh).
+COPY deploy/vault/policies/ /etc/sol/vault/policies/
 
 EXPOSE 3000 3100
 
