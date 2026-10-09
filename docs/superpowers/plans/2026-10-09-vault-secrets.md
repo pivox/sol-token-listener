@@ -151,7 +151,7 @@ reportés dans les sections concernées :
      le leur en syntaxe longue de Compose, qui échoue sur un fichier absent au lieu de créer un
      dossier.
 2. Trois services ponctuels sur l'image back, au profil `tools` : `vault-setup`, `vault-import`
-   et `vault-snapshot` (sections 5, 8.1, 8.2 et 8.4). Les scripts de l'hôte les lancent par
+   et `vault-snapshot` (sections 5, 8.1, 8.2, 8.4, 9 et 10). Les scripts de l'hôte les lancent par
    `docker compose run`, jamais par `docker compose up`. Ils rejoignent le réseau `internal` :
    Vault n'est pas joignable depuis l'hôte, hors son port d'interface local, et l'hôte n'a
    besoin d'aucun client Vault.
@@ -179,7 +179,7 @@ After review, Task 1 also reconciles the spec body with deviations 2–6 (sectio
 
 - [ ] **Step 2: Point the sub-project 1 spec at the Vault spec**
 
-In `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, section 5, bullet « **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie. », append « Le sous-projet 2 y ajoute un conteneur `vault`, son volume et un réseau d'interface locale. » Then, in section 7.3, append this paragraph after the existing one:
+In `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, section 5, bullet « **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie. », replace « sans changer cette topologie. » with « . Le sous-projet 2 ajoute le conteneur `vault`, son volume `vault-data`, le réseau `vault-ui` (interface locale) et, au profil `tools`, trois services ponctuels ; les autres réseaux et ports ne changent pas. » Then, in section 7.3, append this paragraph after the existing one:
 
 ```markdown
 Cette jonction est précisée par le sous-projet 2,
@@ -3797,8 +3797,8 @@ l'hôte ne restent que les secrets d'amorçage :
      `OPERATOR_API_PORT=3100` ;
    - prend le modèle du dépôt pour un rôle absent de la source (`retention` par exemple).
 
-   Le relancer crée une nouvelle version de chaque entrée et écrase les modifications faites
-   depuis dans Vault.
+   Le relancer crée une nouvelle version de chaque entrée : il remplace les modifications faites
+   depuis dans Vault, qui restent dans les versions précédentes.
 
 4. Ouvrir l'interface, `http://127.0.0.1:8200` (login `operator`), et vérifier sous `sol/config/` :
    - `operator-api` : `OPERATOR_API_ALLOWED_ORIGIN=http://127.0.0.1:8080`, ou

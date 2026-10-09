@@ -228,8 +228,8 @@ depuis Node (13.3). Il :
 - écrit le tout dans Vault, sans afficher aucune valeur.
 
 Il n'y a donc plus de copie intermédiaire en fichiers sur l'hôte. L'import peut être relancé : il
-crée une nouvelle version de chaque entrée. Le relancer écrase les modifications faites depuis
-dans Vault.
+crée une nouvelle version de chaque entrée. Le relancer remplace les modifications faites depuis
+dans Vault, qui restent dans les versions précédentes.
 
 ### 8.3 Modifications et rotation
 
@@ -271,7 +271,7 @@ vides `secrets/vault/unseal/` et `secrets/vault/approle/` (0700), que `vault-ini
 3. **Pas de repli sur des fichiers** : `back` et `migrate` refusent de démarrer sans Vault.
 4. **La keypair ne quitte Vault qu'en mode `live`** : seules les politiques `back` et `operator` peuvent la lire ; dans le back, seul l'utilisateur `h2b` la reçoit.
 5. **Pas de jeton durable** : chaque politique de conteneur est en lecture seule sur ses chemins. Aucun jeton root ne survit à l'initialisation ; les jetons des conteneurs vivent 5 minutes puis sont révoqués, celui de l'opérateur une heure, 8 heures au plus.
-6. **Fichiers de l'hôte protégés** : la clé de déverrouillage et les fichiers AppRole sont 0600. Hors de l'initialisation, chacun est monté en lecture seule dans un seul conteneur au plus ; pendant l'initialisation, le service ponctuel `vault-setup` monte `secrets/vault/` en écriture pour les créer. Celui de `backup` n'est monté nulle part : le script de sauvegarde de l'hôte le lit et le transmet sur l'entrée standard de `vault-snapshot`.
+6. **Fichiers de l'hôte protégés** : la clé de déverrouillage et les fichiers AppRole sont 0600. Hors de l'initialisation, chacun est monté en lecture seule dans un seul conteneur au plus ; pendant l'initialisation, le service ponctuel `vault-setup` monte `secrets/vault/` en écriture pour les créer. Hors de l'initialisation, celui de `backup` n'est monté nulle part : le script de sauvegarde de l'hôte le lit et le transmet sur l'entrée standard de `vault-snapshot`.
 
 ## 10. Tests et validation
 
@@ -284,7 +284,7 @@ Le client `vault-pull`, contre un faux serveur Vault :
 - les codes de sortie 64, 69, 77 et 78 ;
 - la révocation du jeton ;
 - aucune valeur dans la sortie standard ni dans la sortie d'erreur ;
-- `vault-setup`, `vault-import` et `vault-snapshot`, contre le même faux serveur : refus d'un Vault déjà initialisé (`vault-setup`), variables injectées retirées (`vault-import`), aucune valeur dans les sorties des trois.
+- `vault-setup`, `vault-import` et `vault-snapshot`, contre le même faux serveur : refus d'un Vault déjà initialisé (`vault-setup`), variables injectées retirées (`vault-import`), aucune valeur secrète en clair dans les sorties des trois.
 
 ### 10.2 Scripts de l'hôte
 
@@ -350,7 +350,7 @@ reportés dans les sections concernées :
      le leur en syntaxe longue de Compose, qui échoue sur un fichier absent au lieu de créer un
      dossier.
 2. Trois services ponctuels sur l'image back, au profil `tools` : `vault-setup`, `vault-import`
-   et `vault-snapshot` (sections 5, 8.1, 8.2 et 8.4). Les scripts de l'hôte les lancent par
+   et `vault-snapshot` (sections 5, 8.1, 8.2, 8.4, 9 et 10). Les scripts de l'hôte les lancent par
    `docker compose run`, jamais par `docker compose up`. Ils rejoignent le réseau `internal` :
    Vault n'est pas joignable depuis l'hôte, hors son port d'interface local, et l'hôte n'a
    besoin d'aucun client Vault.

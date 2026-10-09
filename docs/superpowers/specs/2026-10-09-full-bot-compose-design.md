@@ -82,8 +82,9 @@ partageraient le système de fichiers de la keypair, et un superviseur resterait
   publie 80 et 443 ; ni la base ni le back ne publient de port.
 - **Volumes** : `postgres-data`, `caddy-data` (certificats). Les logs vont sur la sortie
   standard.
-- **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie. Le
-  sous-projet 2 y ajoute un conteneur `vault`, son volume et un réseau d'interface locale.
+- **Vault** sera ajouté plus tard comme quatrième conteneur. Le sous-projet 2 ajoute le
+  conteneur `vault`, son volume `vault-data`, le réseau `vault-ui` (interface locale) et, au
+  profil `tools`, trois services ponctuels ; les autres réseaux et ports ne changent pas.
 
 ## 6. Conteneur back
 
