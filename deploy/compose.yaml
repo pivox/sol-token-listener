@@ -1,15 +1,16 @@
 name: sol-token-listener
 
-# Full-bot stack (docs/superpowers/specs/2026-10-09-full-bot-compose-design.md). Secrets are files
-# under ${SOL_HOST_DIR}/secrets, mounted read-only under /root/secrets: nothing secret lives here.
+# Full-bot stack (docs/superpowers/specs/2026-10-09-full-bot-compose-design.md) whose variables
+# live in Vault (docs/superpowers/specs/2026-10-09-vault-secrets-design.md). Only the bootstrap
+# secrets are host files under ${SOL_HOST_DIR}/secrets: nothing secret lives here.
 x-logging: &logging
   driver: json-file
   options:
     max-size: "20m"
     max-file: "5"
 
-# The back image drops root itself (setpriv, supervisord `user=`): no process may gain privileges
-# again, and no core dump may carry a secret out of memory.
+# The back image drops root itself (setpriv, supervisord `user=`) and Vault runs as its image's
+# vault user: no process may gain privileges again, and no core dump may carry a secret out.
 x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
   cap_drop: [NET_RAW, MKNOD]
@@ -36,16 +37,54 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  vault:
+    <<: *hardening
+    image: ${VAULT_IMAGE:?VAULT_IMAGE is required}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: vault
+    volumes:
+      - vault-data:/vault/file
+      # A directory, not the key file: the key does not exist before deploy/host/vault-init.sh.
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/unseal:/run/vault:ro
+    # Local only; on the server, reach the UI through `ssh -L 8200:127.0.0.1:8200`.
+    ports: ["127.0.0.1:${VAULT_PORT:-8200}:8200"]
+    init: true
+    # Raft gets time for a clean shutdown.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+    networks: [internal, vault-ui]
+    logging: *logging
+    restart: unless-stopped
+
   migrate:
     <<: *hardening
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     command: ["sol-admin", "migrate"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-sol_token_listener}
+      SOL_VAULT_PULL_TIMEOUT_MS: ${SOL_VAULT_PULL_TIMEOUT_MS:-60000}
     volumes:
-      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db:/root/secrets/db:ro
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/db/postgres-admin-password:ro
+      # Compose creates a missing source of a long-syntax bind too, unless create_host_path is
+      # false: an absent AppRole file must fail the start, not become an empty directory.
+      - type: bind
+        source: ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/approle/migrate.json
+        target: /root/vault/approle.json
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs: ["/root/secrets/db/logins:mode=0700,size=1m"]
     depends_on:
       postgres:
+        condition: service_healthy
+      vault:
         condition: service_healthy
     networks: [internal]
     logging: *logging
@@ -63,18 +102,29 @@ services:
       SOL_STACK_MODE: ${SOL_STACK_MODE:-observe}
       SOL_HEALTH_REQUIRE_OK: ${SOL_HEALTH_REQUIRE_OK:-true}
       POSTGRES_DB: ${POSTGRES_DB:-sol_token_listener}
+      SOL_VAULT_PULL_TIMEOUT_MS: ${SOL_VAULT_PULL_TIMEOUT_MS:-60000}
     volumes:
-      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/logins:/root/secrets/logins:ro
-      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/back:/root/secrets/back:ro
-      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/config:/etc/sol/config:ro
+      # create_host_path: false, as for migrate: a missing AppRole file fails the start.
+      - type: bind
+        source: ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/approle/back.json
+        target: /root/vault/approle.json
+        read_only: true
+        bind:
+          create_host_path: false
       - evidence:/var/lib/sol/evidence
-    tmpfs: ["/run/sol:mode=0711,size=16m"]
+    # vault-pull fills /root/secrets and /etc/sol/config at each start (Vault spec 7.1).
+    tmpfs:
+      - /run/sol:mode=0711,size=16m
+      - /root/secrets:mode=0700,size=4m
+      - /etc/sol/config:mode=0755,size=1m
     init: true
     # supervisord stops its programs one after the other (deploy/back/supervisor/programs).
     stop_grace_period: 240s
     depends_on:
       migrate:
         condition: service_completed_successfully
+      vault:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "sol-health"]
       interval: 15s
@@ -113,13 +163,53 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  # One-shot tools on the back image (profile `tools`, never started by `up`), run by
+  # deploy/host/vault-init.sh, deploy/host/vault-import.sh and deploy/host/backup.sh.
+  vault-setup:
+    <<: *hardening
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    profiles: [tools]
+    entrypoint: ["node", "/app/dist/scripts/deploy/vault-setup.js"]
+    command: ["init"]
+    volumes:
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault:/out
+    networks: [internal]
+    logging: *logging
+    restart: "no"
+
+  vault-import:
+    <<: *hardening
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    profiles: [tools]
+    entrypoint: ["node", "/app/dist/scripts/deploy/vault-import.js"]
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+    restart: "no"
+
+  vault-snapshot:
+    <<: *hardening
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    profiles: [tools]
+    entrypoint: ["node", "/app/dist/scripts/deploy/vault-snapshot.js"]
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+    restart: "no"
+
 networks:
   internal:
     internal: true
   egress:
   edge:
+  vault-ui:
 
 volumes:
   postgres-data:
   evidence:
   caddy-data:
+  vault-data:

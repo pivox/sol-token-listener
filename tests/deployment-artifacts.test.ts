@@ -236,7 +236,7 @@ void test('the front entrypoint reads only the bcrypt hash and drops root before
   assert.equal(syntax.status, 0, syntax.stderr);
 });
 
-void test('Compose defines postgres, migrate, back and front, with no published database or backend port', async () => {
+void test('Compose defines postgres, vault, migrate, back, front and the Vault tools, publishing only the front and the local Vault UI', async () => {
   const [compose, server] = await Promise.all([
     readArtifact('deploy/compose.yaml'),
     readArtifact('deploy/compose.server.yaml'),
@@ -249,69 +249,114 @@ void test('Compose defines postgres, migrate, back and front, with no published 
     .matchAll(/^ {2}([a-z][a-z-]*):\s*$/gm)]
     .map((match) => match[1])
     .filter((name): name is string => name !== undefined);
-  assert.deepEqual(serviceNames, ['postgres', 'migrate', 'back', 'front']);
+  const tools = ['vault-setup', 'vault-import', 'vault-snapshot'];
+  assert.deepEqual(serviceNames, ['postgres', 'vault', 'migrate', 'back', 'front', ...tools]);
   assert.match(compose, new RegExp(`^    image: ${postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
-  for (const service of ['migrate', 'back']) {
-    assert.match(composeService(compose, service), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
+  for (const service of ['migrate', 'back', ...tools]) {
+    assert.match(composeService(compose, service), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m, service);
   }
   assert.match(composeService(compose, 'front'), /^ {4}image: \$\{FRONTEND_IMAGE:\?FRONTEND_IMAGE is required\}$/m);
-  assert.match(composeService(compose, 'back'), /^ {4}build:\s*$/m);
-  assert.match(composeService(compose, 'front'), /^ {4}build:\s*$/m);
-  assert.doesNotMatch(composeService(compose, 'migrate'), /^ {4}build:\s*$/m);
+  assert.match(composeService(compose, 'vault'), /^ {4}image: \$\{VAULT_IMAGE:\?VAULT_IMAGE is required\}$/m);
+  for (const service of ['back', 'front', 'vault']) {
+    assert.match(composeService(compose, service), /^ {4}build:\s*$/m, service);
+  }
+  assert.match(composeService(compose, 'vault'), /^ {6}target: vault$/m);
+  for (const service of ['migrate', ...tools]) {
+    assert.doesNotMatch(composeService(compose, service), /^ {4}build:\s*$/m, service);
+  }
 
-  assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
+  assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 2);
   assert.match(composeService(compose, 'front'), /^ {4}ports: \["127\.0\.0\.1:\$\{FRONT_PORT:-8080\}:8080"\]$/m);
+  assert.match(composeService(compose, 'vault'), /^ {4}ports: \["127\.0\.0\.1:\$\{VAULT_PORT:-8200\}:8200"\]$/m);
   assert.match(server, /^ {4}ports: !override\n {6}- "80:80"\n {6}- "443:443"$/m);
   assert.match(server, /^ {6}SITE_ADDRESS: \$\{SITE_ADDRESS:\?SITE_ADDRESS is required on the server\}$/m);
+  assert.doesNotMatch(server, /vault/u);
 
   const postgres = composeService(compose, 'postgres');
+  const vault = composeService(compose, 'vault');
   const migrate = composeService(compose, 'migrate');
   const back = composeService(compose, 'back');
   const front = composeService(compose, 'front');
   assert.match(postgres, /^ {6}POSTGRES_USER: sol_owner$/m);
   assert.match(postgres, /^ {6}POSTGRES_PASSWORD_FILE: \/root\/secrets\/postgres-admin-password$/m);
+  const approle = (name: string): string => [
+    '      - type: bind\n',
+    `        source: \${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/approle/${name}.json\n`,
+    '        target: /root/vault/approle.json\n',
+    '        read_only: true\n',
+  ].join('');
   for (const [service, mount] of [
     [postgres, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro'],
-    [migrate, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db:/root/secrets/db:ro'],
-    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/logins:/root/secrets/logins:ro'],
-    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/back:/root/secrets/back:ro'],
-    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/config:/etc/sol/config:ro'],
+    [vault, '      - vault-data:/vault/file'],
+    [vault, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/unseal:/run/vault:ro'],
+    [migrate, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/db/postgres-admin-password:ro'],
+    [migrate, approle('migrate')],
+    [back, approle('back')],
     [back, '      - evidence:/var/lib/sol/evidence'],
     [front, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro'],
+    [composeService(compose, 'vault-setup'), '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault:/out'],
   ] as const) {
     assert.ok(service.includes(mount), `missing mount ${mount}`);
   }
+  // Vault replaces the host directories of sub-project 1, and no bind creates a missing file.
+  assert.doesNotMatch(compose, /SOL_HOST_DIR[^\n]*\/(?:secrets\/back|secrets\/db\/logins|config)\b|create_host_path: true/u);
+  // Compose creates the missing source of a long-syntax bind too, unless it is told not to: a missing
+  // AppRole file must fail the start, not become a directory.
+  for (const service of [migrate, back]) {
+    assert.match(service, /^ {8}read_only: true\n {8}bind:\n {10}create_host_path: false$/m);
+  }
+  assert.match(migrate, /^ {4}tmpfs: \["\/root\/secrets\/db\/logins:mode=0700,size=1m"\]$/m);
+  assert.match(back, /^ {4}tmpfs:\n {6}- \/run\/sol:mode=0711,size=16m\n {6}- \/root\/secrets:mode=0700,size=4m\n {6}- \/etc\/sol\/config:mode=0755,size=1m$/m);
   assert.match(migrate, /^ {4}command: \["sol-admin", "migrate"\]$/m);
   assert.match(back, /^ {4}command: \["sol-entrypoint"\]$/m);
+  for (const service of [migrate, back]) {
+    assert.match(service, /^ {6}SOL_VAULT_PULL_TIMEOUT_MS: \$\{SOL_VAULT_PULL_TIMEOUT_MS:-60000\}$/m);
+  }
   assert.match(back, /^ {6}SOL_STACK_MODE: \$\{SOL_STACK_MODE:-observe\}$/m);
   assert.match(back, /^ {6}SOL_HEALTH_REQUIRE_OK: \$\{SOL_HEALTH_REQUIRE_OK:-true\}$/m);
-  assert.match(back, /^ {4}tmpfs: \["\/run\/sol:mode=0711,size=16m"\]$/m);
-  assert.match(back, /^ {4}init: true$/m);
+  for (const service of [back, vault]) assert.match(service, /^ {4}init: true$/m);
   assert.match(back, /^ {4}stop_grace_period: 240s$/m);
+  assert.match(vault, /^ {4}stop_grace_period: 30s$/m);
   assert.match(compose, /^x-hardening: &hardening\n {2}security_opt: \["no-new-privileges:true"\]\n {2}cap_drop: \[NET_RAW, MKNOD\]\n {2}ulimits:\n {4}core: 0$/m);
-  for (const service of [migrate, back]) assert.match(service, /^ {4}<<: \*hardening$/m);
+  for (const service of [vault, migrate, back, ...tools.map((name) => composeService(compose, name))]) {
+    assert.match(service, /^ {4}<<: \*hardening$/m);
+  }
   // Caddy binds 80 and 443 as a non-root user through its file capability: no-new-privileges
   // would drop it. The front gets a CPU share instead, against bcrypt floods.
   assert.doesNotMatch(front, /hardening|no-new-privileges/u);
   assert.match(front, /^ {4}cpus: 0\.5$/m);
   assert.match(back, /^ {6}test: \["CMD", "sol-health"\]$/m);
+  assert.match(vault, /^ {6}test: \["CMD", "vault", "status"\]$/m);
+  for (const name of tools) {
+    const tool = composeService(compose, name);
+    assert.match(tool, /^ {4}profiles: \[tools\]$/m, name);
+    assert.match(tool, new RegExp(`^ {4}entrypoint: \\["node", "/app/dist/scripts/deploy/${name}\\.js"\\]$`, 'm'), name);
+    assert.match(tool, /^ {4}networks: \[internal\]$/m, name);
+    assert.match(tool, /^ {4}restart: "no"$/m, name);
+  }
+  assert.match(composeService(compose, 'vault-setup'), /^ {4}command: \["init"\]$/m);
 
   assert.match(postgres, /^ {4}networks: \[internal\]$/m);
+  assert.match(vault, /^ {4}networks: \[internal, vault-ui\]$/m);
   assert.match(migrate, /^ {4}networks: \[internal\]$/m);
   assert.match(back, /^ {4}networks: \[internal, egress, edge\]$/m);
   assert.match(front, /^ {4}networks: \[edge\]$/m);
-  assert.match(compose, /^networks:\n {2}internal:\n {4}internal: true\n {2}egress:\n {2}edge:$/m);
-  assert.match(compose, /^volumes:\n {2}postgres-data:\n {2}evidence:\n {2}caddy-data:$/m);
-  assert.match(migrate, /depends_on:\n {6}postgres:\n {8}condition: service_healthy/);
-  assert.match(back, /depends_on:\n {6}migrate:\n {8}condition: service_completed_successfully/);
+  assert.match(compose, /^networks:\n {2}internal:\n {4}internal: true\n {2}egress:\n {2}edge:\n {2}vault-ui:$/m);
+  assert.match(compose, /^volumes:\n {2}postgres-data:\n {2}evidence:\n {2}caddy-data:\n {2}vault-data:$/m);
+  assert.match(migrate, /depends_on:\n {6}postgres:\n {8}condition: service_healthy\n {6}vault:\n {8}condition: service_healthy/);
+  assert.match(back, /depends_on:\n {6}migrate:\n {8}condition: service_completed_successfully\n {6}vault:\n {8}condition: service_healthy/);
   assert.match(front, /depends_on:\n {6}back:\n {8}condition: service_healthy/);
+  for (const name of ['vault-import', 'vault-snapshot']) {
+    assert.match(composeService(compose, name), /depends_on:\n {6}vault:\n {8}condition: service_healthy/, name);
+  }
+  assert.doesNotMatch(composeService(compose, 'vault-setup'), /depends_on/u);
   assert.match(compose, /^x-logging: &logging\n {2}driver: json-file\n {2}options:\n {4}max-size: "20m"\n {4}max-file: "5"$/m);
-  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 4);
+  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 8);
 
   assert.doesNotMatch(compose, /DATABASE_URL|SOLANA_|LISTENER_|EXECUTOR_|POSTGRES_PASSWORD:|privileged:|network_mode: host|docker\.sock/u);
   assert.doesNotMatch(compose, /api-key|keypair|wallet/iu);
   for (const imageLine of compose.match(/^ {4}image: .+$/gm) ?? []) {
-    assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND)_IMAGE:\?)/u);
+    assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND|VAULT)_IMAGE:\?)/u);
   }
 });
 
@@ -500,6 +545,7 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
     readonly cpus?: number;
     readonly ports?: readonly Readonly<{ host_ip?: string; published?: string | number; target?: number }>[];
     readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean }>[];
+    readonly tmpfs?: readonly string[];
   }
   const resolvedConfig = (
     files: readonly string[],
@@ -522,27 +568,34 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
     .map((volume) => `${volume.source ?? ''}:${volume.target ?? ''}:${volume.read_only === true ? 'ro' : 'rw'}`);
 
   const services = resolvedConfig(['deploy/compose.yaml']);
-  assert.deepEqual(Object.keys(services).sort(), ['back', 'front', 'migrate', 'postgres']);
+  assert.deepEqual(Object.keys(services).sort(), ['back', 'front', 'migrate', 'postgres', 'vault']);
   assert.deepEqual(services.back?.environment, {
     POSTGRES_DB: 'sol_token_listener', SOL_HEALTH_REQUIRE_OK: 'true', SOL_STACK_MODE: 'observe',
+    SOL_VAULT_PULL_TIMEOUT_MS: '60000',
   });
-  assert.deepEqual(services.migrate?.environment, { POSTGRES_DB: 'sol_token_listener' });
+  assert.deepEqual(services.migrate?.environment, { POSTGRES_DB: 'sol_token_listener', SOL_VAULT_PULL_TIMEOUT_MS: '60000' });
   assert.deepEqual(services.front?.environment, { FRONT_BASIC_AUTH_USER: 'operator', SITE_ADDRESS: 'http://:8080' });
   assert.deepEqual(ports(services.front), ['127.0.0.1:8080:8080']);
+  assert.deepEqual(ports(services.vault), ['127.0.0.1:8200:8200']);
   for (const name of ['postgres', 'migrate', 'back']) assert.deepEqual(ports(services[name]), [], name);
   assert.deepEqual(binds(services.postgres), [
     '/srv/sol-token-listener/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro',
   ]);
-  assert.deepEqual(binds(services.migrate), ['/srv/sol-token-listener/secrets/db:/root/secrets/db:ro']);
+  assert.deepEqual(binds(services.vault), ['/srv/sol-token-listener/secrets/vault/unseal:/run/vault:ro']);
+  assert.deepEqual(binds(services.migrate), [
+    '/srv/sol-token-listener/secrets/db/postgres-admin-password:/root/secrets/db/postgres-admin-password:ro',
+    '/srv/sol-token-listener/secrets/vault/approle/migrate.json:/root/vault/approle.json:ro',
+  ]);
   assert.deepEqual(binds(services.back), [
-    '/srv/sol-token-listener/secrets/db/logins:/root/secrets/logins:ro',
-    '/srv/sol-token-listener/secrets/back:/root/secrets/back:ro',
-    '/srv/sol-token-listener/config:/etc/sol/config:ro',
+    '/srv/sol-token-listener/secrets/vault/approle/back.json:/root/vault/approle.json:ro',
+  ]);
+  assert.deepEqual(services.back?.tmpfs, [
+    '/run/sol:mode=0711,size=16m', '/root/secrets:mode=0700,size=4m', '/etc/sol/config:mode=0755,size=1m',
   ]);
   assert.deepEqual(binds(services.front), [
     '/srv/sol-token-listener/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro',
   ]);
-  for (const name of ['migrate', 'back']) {
+  for (const name of ['vault', 'migrate', 'back']) {
     const service = services[name];
     assert.deepEqual(service?.security_opt, ['no-new-privileges:true'], name);
     assert.deepEqual(service?.cap_drop, ['NET_RAW', 'MKNOD'], name);
@@ -550,7 +603,15 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   }
   assert.equal(services.front?.security_opt, undefined);
   assert.equal(services.back?.stop_grace_period, '4m0s');
+  assert.equal(services.vault?.stop_grace_period, '30s');
   assert.equal(services.front?.cpus, 0.5);
+
+  const tools = resolvedConfig(['deploy/compose.yaml'], { COMPOSE_PROFILES: 'tools' });
+  assert.deepEqual(Object.keys(tools).sort(), [
+    'back', 'front', 'migrate', 'postgres', 'vault', 'vault-import', 'vault-setup', 'vault-snapshot',
+  ]);
+  assert.deepEqual(binds(tools['vault-setup']), ['/srv/sol-token-listener/secrets/vault:/out:rw']);
+  for (const name of ['vault-import', 'vault-snapshot']) assert.deepEqual(binds(tools[name]), [], name);
 
   const server = resolvedConfig(['deploy/compose.yaml', 'deploy/compose.server.yaml'], {
     SITE_ADDRESS: 'bot.example.invalid',
@@ -1155,8 +1216,10 @@ void test('the compose input template holds no secret and documents every input'
     'POSTGRES_DB=sol_token_listener',
     `BACKEND_IMAGE=registry.invalid/sol-token-listener/backend@sha256:${'0'.repeat(64)}`,
     `FRONTEND_IMAGE=registry.invalid/sol-token-listener/frontend@sha256:${'1'.repeat(64)}`,
+    `VAULT_IMAGE=registry.invalid/sol-token-listener/vault@sha256:${'2'.repeat(64)}`,
     'FRONT_PORT=8080',
     'FRONT_BASIC_AUTH_USER=operator',
+    'VAULT_PORT=8200',
     'SITE_ADDRESS=',
   ]) {
     assert.ok(lines.includes(value), `missing compose input: ${value}`);
@@ -1164,7 +1227,7 @@ void test('the compose input template holds no secret and documents every input'
   assert.match(environment, /outside version control/iu);
   assert.match(environment, /holds no secret/iu);
   assert.doesNotMatch(environment, /PASSWORD|PRIVATE_KEY|SECRET_KEY|WALLET|api-key|SOLANA_/iu);
-  for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
+  for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE', 'VAULT_IMAGE']) {
     assert.match(environment, new RegExp(`^${name}=registry\\.invalid/[^\\s@]+@sha256:[0-9a-f]{64}$`, 'm'));
   }
 });

@@ -105,7 +105,13 @@ void test('the back stop grace covers every program stopped one after the other'
   ];
   // supervisord stops one program at a time, each within stopwaitsecs plus about one second.
   const budget = all.reduce((total, program) => total + Number(program.settings.get('stopwaitsecs')) + 1, 0);
-  const grace = /^ {4}stop_grace_period: (\d+)s$/mu.exec(await artifact('deploy/compose.yaml'));
+  // The Vault service has its own, shorter grace: read the back service block only.
+  const compose = await artifact('deploy/compose.yaml');
+  const backStart = compose.indexOf('\n  back:\n');
+  const backEnd = compose.indexOf('\n  front:\n');
+  assert.notEqual(backStart, -1, 'compose.yaml has no back service');
+  assert.notEqual(backEnd, -1, 'compose.yaml has no front service after the back');
+  const grace = /^ {4}stop_grace_period: (\d+)s$/mu.exec(compose.slice(backStart, backEnd));
   assert.ok(grace !== null, 'the back has no stop_grace_period in seconds');
   assert.ok(budget + 10 <= Number(grace[1]), `stop budget ${String(budget)} s + 10 s margin exceeds ${grace[1] ?? ''} s`);
 });
