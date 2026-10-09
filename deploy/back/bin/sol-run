@@ -1,0 +1,23 @@
+#!/bin/sh
+# sol-run <role> <command> [args...]: start one process of the stack with its role's
+# configuration and secrets (docs/operations/deployment.md, « Commandes sol »).
+# Run as root, it drops to the role's user; run by supervisord as that user, it refuses any
+# other role. Secret values travel only through the environment, never through argv or logs.
+set -eu
+if [ "$#" -lt 2 ]; then
+  echo 'usage: sol-run <role> <command> [args...]' >&2
+  exit 64
+fi
+role="$1"
+shift
+exports="$(node /app/dist/scripts/deploy/role-env.js "$role")"
+eval "$exports"
+current="$(id -u)"
+if [ "$current" = 0 ]; then
+  exec setpriv --reuid="$SOL_RUN_UID" --regid="$SOL_RUN_UID" --clear-groups -- "$@"
+fi
+if [ "$current" != "$SOL_RUN_UID" ]; then
+  echo "sol-run: role $role belongs to user $SOL_RUN_USER" >&2
+  exit 77
+fi
+exec "$@"

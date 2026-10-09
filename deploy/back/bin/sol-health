@@ -1,0 +1,30 @@
+#!/bin/sh
+# Docker healthcheck of the back container (spec 6.5, amended): every program of the mode is
+# RUNNING, H2b runs or waits for work, and the listener API answers.
+set -u
+fail() {
+  printf 'sol-health: %s\n' "$1"
+  exit 1
+}
+running() {
+  [ "$(supervisorctl -c /etc/sol/supervisord.conf status "$1" 2> /dev/null | awk '{ print $2 }')" = RUNNING ]
+}
+mode="$(cat /run/sol/mode 2> /dev/null)" || fail 'mode unknown'
+programs='listener opapi'
+if [ ! -e /run/sol/qualify ]; then programs="$programs retention"; fi
+if [ "$mode" = live ]; then programs="$programs h2a h2b autoarm"; fi
+for program in $programs; do
+  running "$program" || fail "$program is not RUNNING"
+done
+if [ "$mode" = live ]; then
+  state="$(cut -d ' ' -f 1 /run/sol/h2b/state 2> /dev/null)"
+  case "$state" in
+    running|idle) ;;
+    *) fail "h2b is ${state:-unknown}" ;;
+  esac
+fi
+if [ "${SOL_HEALTH_REQUIRE_OK:-true}" = true ]; then
+  node /app/dist/scripts/deployment-healthcheck.js --require-ok > /dev/null || fail 'listener API is not OK'
+else
+  node /app/dist/scripts/deployment-healthcheck.js > /dev/null || fail 'listener API is unavailable'
+fi

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Entrypoint of the back container (root): distribute the secrets into /run/sol, select the
+# programs of SOL_STACK_MODE, apply the boot entry-stop in live mode, then run supervisord.
+set -eu
+mode="${SOL_STACK_MODE:-observe}"
+case "$mode" in
+  observe|live) ;;
+  *) echo 'sol-entrypoint: SOL_STACK_MODE must be observe or live' >&2; exit 64 ;;
+esac
+install -d -m 0711 /run/sol
+install -d -m 0755 /run/sol/programs /run/sol/overrides
+rm -f /run/sol/programs/*.conf /run/sol/overrides/*.env /run/sol/qualify
+printf '%s\n' "$mode" > /run/sol/mode
+node /app/dist/scripts/deploy/distribute-secrets.js "$mode"
+install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf
+if [ "$mode" = live ]; then
+  install -m 0644 /etc/sol/programs/live.conf /run/sol/programs/live.conf
+  # Invariant (spec 13): after any restart, no new BUY before a human `sol trading start`.
+  state="$(sol-run operations node /app/dist/src/executor-operations/main.js status \
+    | node /app/dist/scripts/deploy/operations-state.js control-state)"
+  if [ "$state" = RUNNING ]; then
+    sol-run operations node /app/dist/src/executor-operations/main.js \
+      kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP > /dev/null
+    echo '{"service":"sol-entrypoint","event":"boot.entry_stop","previousControlState":"RUNNING"}'
+  fi
+fi
+exec supervisord -n -c /etc/sol/supervisord.conf

@@ -1,0 +1,54 @@
+#!/bin/sh
+# H2b on demand (spec 6.3), run by supervisord as user h2b. Exit 75 (EX_TEMPFAIL) means no
+# runnable work: relaunch after SOL_H2B_IDLE_SECONDS. Any other exit: exponential backoff from
+# SOL_H2B_BACKOFF_SECONDS, capped at SOL_H2B_BACKOFF_MAX_SECONDS, reset after 5 min of running.
+# The state file (`running|idle|failing|stopped <epoch>`) feeds sol-health and `sol trading start`.
+set -u
+state_file="${SOL_H2B_STATE_FILE:-/run/sol/h2b/state}"
+idle_seconds="${SOL_H2B_IDLE_SECONDS:-15}"
+backoff_start="${SOL_H2B_BACKOFF_SECONDS:-5}"
+backoff_max="${SOL_H2B_BACKOFF_MAX_SECONDS:-300}"
+backoff="$backoff_start"
+child=0
+pause=0
+
+write_state() {
+  printf '%s %s\n' "$1" "$(date +%s)" > "$state_file.tmp"
+  mv "$state_file.tmp" "$state_file"
+}
+
+stop() {
+  if [ "$pause" -ne 0 ]; then kill "$pause" 2> /dev/null || true; fi
+  if [ "$child" -ne 0 ]; then
+    kill -TERM "$child" 2> /dev/null || true
+    wait "$child" || true
+  fi
+  write_state stopped
+  exit 0
+}
+trap stop TERM INT
+
+while :; do
+  started="$(date +%s)"
+  write_state running
+  sol-run h2b node /app/dist/src/executor-live/main.js &
+  child=$!
+  status=0
+  wait "$child" || status=$?
+  child=0
+  if [ "$status" -eq 75 ]; then
+    write_state idle
+    delay="$idle_seconds"
+    backoff="$backoff_start"
+  else
+    write_state failing
+    if [ $(( $(date +%s) - started )) -ge 300 ]; then backoff="$backoff_start"; fi
+    delay="$backoff"
+    backoff=$(( backoff * 2 ))
+    if [ "$backoff" -gt "$backoff_max" ]; then backoff="$backoff_max"; fi
+  fi
+  sleep "$delay" &
+  pause=$!
+  wait "$pause" || true
+  pause=0
+done

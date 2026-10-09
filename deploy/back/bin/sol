@@ -1,0 +1,83 @@
+#!/bin/sh
+# Operator commands inside the back container (spec 6.7):
+#   docker compose exec -it back sol <command> …
+set -eu
+ctl() { supervisorctl -c /etc/sol/supervisord.conf "$@"; }
+die() {
+  printf 'sol: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+mode() { cat /run/sol/mode; }
+operations() { sol-run operations node /app/dist/src/executor-operations/main.js "$@"; }
+
+h2b_ready() {
+  # `running` for at least 15 s: H2b passed its startup checks (exit 75 or 1 would have ended it).
+  set -- $(cat /run/sol/h2b/state 2> /dev/null || echo none 0)
+  [ "$1" = running ] && [ $(( $(date +%s) - $2 )) -ge 15 ]
+}
+
+trading() {
+  [ "$(mode)" = live ] || die 'trading needs SOL_STACK_MODE=live'
+  case "${1:-}" in
+    start)
+      operations envelope show | node /app/dist/scripts/deploy/operations-state.js active-envelope \
+        || die 'no ACTIVE envelope: create one with sol ops envelope create'
+      deadline=$(( $(date +%s) + 60 ))
+      until h2b_ready; do
+        [ "$(date +%s)" -lt "$deadline" ] || die 'H2b is not RUNNING after 60 s: see docker compose logs back'
+        sleep 2
+      done
+      # TTY confirmation: run it with docker compose exec -it.
+      exec sol-run operations node /app/dist/src/executor-operations/main.js resume ;;
+    stop)
+      exec sol-run operations node /app/dist/src/executor-operations/main.js \
+        kill-switch --mode=entry-stop --reason=OPERATOR_ENTRY_STOP ;;
+    *) die 'usage: sol trading start|stop' 64 ;;
+  esac
+}
+
+qualify() {
+  [ "$(mode)" = live ] || die 'qualification needs SOL_STACK_MODE=live'
+  case "${1:-}" in
+    start)
+      # Gate 10: probe on, retention suspended, simulation-only worker on (lot 4a, step 1).
+      : > /run/sol/qualify
+      ctl stop retention || true
+      printf 'FAST_ENTRY_PROBE_ENABLED=true\n' > /run/sol/overrides/listener.env
+      chmod 0644 /run/sol/overrides/listener.env
+      ctl restart listener
+      ctl start worker ;;
+    stop)
+      ctl stop worker || true
+      rm -f /run/sol/overrides/listener.env
+      ctl restart listener
+      ctl start retention
+      rm -f /run/sol/qualify ;;
+    *) die 'usage: sol qualify start|stop' 64 ;;
+  esac
+}
+
+[ "$(id -u)" = 0 ] || die 'run it as root: docker compose exec -it back sol …' 77
+command="${1:-}"
+[ "$#" -eq 0 ] || shift
+case "$command" in
+  ops) exec sol-run operations node /app/dist/src/executor-operations/main.js "$@" ;;
+  readiness) exec sol-run readiness node /app/dist/src/executor-readiness/main.js "$@" ;;
+  evidence)
+    kind="${1:-}"
+    [ "$#" -eq 0 ] || shift
+    case "$kind" in
+      provider) exec sol-run evidence-provider node /app/dist/src/provider-evidence/main.js "$@" ;;
+      bundle) exec sol-run evidence-bundle node /app/dist/src/preflight-bundle/main.js "$@" ;;
+      *) die 'usage: sol evidence provider|bundle' 64 ;;
+    esac ;;
+  trading) trading "$@" ;;
+  qualify) qualify "$@" ;;
+  ctl) exec supervisorctl -c /etc/sol/supervisord.conf "$@" ;;
+  status)
+    ctl status || true
+    printf 'mode %s\n' "$(mode)"
+    if [ -f /run/sol/h2b/state ]; then printf 'h2b %s\n' "$(cat /run/sol/h2b/state)"; fi
+    if [ -e /run/sol/qualify ]; then echo 'qualification in progress: retention stopped'; fi ;;
+  *) die 'usage: sol ops|readiness|evidence|trading|qualify|ctl|status …' 64 ;;
+esac
