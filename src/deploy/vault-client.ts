@@ -1,13 +1,29 @@
-import { VAULT_MOUNT } from './vault-layout.js';
-
 /**
  * Minimal client of the Vault HTTP API for the stack's scripts
  * (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 7 and 8). No dependency. An error
  * message names the method, the path and the HTTP status, never a body or a value.
  */
+
+import { setTimeout as delay } from 'node:timers/promises';
+import { VAULT_MOUNT } from './vault-layout.js';
+
+/** The `fetch` of the platform, or a stand-in of the tests. */
 export type VaultFetch = (url: string, init: RequestInit) => Promise<Response>;
 
-/** Unreachable, sealed (503), uninitialized (501), rate-limited or failing: try again later. */
+const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_POLL_INTERVAL_MS = 100;
+const INITIALIZE_TIMEOUT_MS = 60_000;
+const SNAPSHOT_TIMEOUT_MS = 120_000;
+/** How long `unseal` waits for the node to become active. */
+const ACTIVE_WAIT_MS = 60_000;
+
+/** One segment of a path: lower case, digits, `_` and `-`, plus `.` after the first character. */
+const PATH_SEGMENT = /^[a-z0-9_-][a-z0-9._-]*$/u;
+
+/**
+ * Unreachable, sealed (503), uninitialized (501), standby (429, 500), redirected (3xx),
+ * rate-limited or failing: try again later.
+ */
 export class VaultUnavailableError extends Error {
   public constructor(message: string) {
     super(message);
@@ -15,7 +31,7 @@ export class VaultUnavailableError extends Error {
   }
 }
 
-/** Credentials or policy refused: 400, 401 or 403. */
+/** Credentials or policy refused: 400, 401 or 403, or a login answered 2xx without a token. */
 export class VaultDeniedError extends Error {
   public constructor(message: string) {
     super(message);
@@ -55,36 +71,50 @@ export function parseAppRoleCredentials(text: string): AppRoleCredentials {
 export interface VaultClientOptions {
   readonly address: string;
   readonly fetch?: VaultFetch | undefined;
+  /** For one request, 10 s by default. A positive integer. */
   readonly timeoutMs?: number;
+  /** Between two `sys/health` polls of `unseal`, 100 ms by default. A positive integer. */
+  readonly pollIntervalMs?: number;
 }
 
 interface RequestOptions {
   readonly token?: string;
   readonly body?: unknown;
+  /** Replaces the client's timeout for this request. */
+  readonly timeoutMs?: number;
 }
 
 export class VaultClient {
   private readonly address: string;
   private readonly fetchImpl: VaultFetch;
   private readonly timeoutMs: number;
+  private readonly pollIntervalMs: number;
 
   public constructor(options: VaultClientOptions) {
     this.address = options.address.replace(/\/+$/u, '');
     this.fetchImpl = options.fetch ?? (async (url, init): Promise<Response> => fetch(url, init));
-    this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.timeoutMs = positiveInteger('timeoutMs', options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.pollIntervalMs = positiveInteger('pollIntervalMs', options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   }
 
   public async sealStatus(): Promise<Readonly<{ initialized: boolean; sealed: boolean }>> {
     const body = await this.json('GET', 'sys/seal-status');
-    return Object.freeze({
-      initialized: field(body, 'initialized') === true,
-      sealed: field(body, 'sealed') !== false,
-    });
+    const initialized = field(body, 'initialized');
+    const sealed = field(body, 'sealed');
+    // Anything but two booleans must not read as "not initialized": a guard would then open.
+    if (typeof initialized !== 'boolean' || typeof sealed !== 'boolean') {
+      throw new VaultUnavailableError('vault GET sys/seal-status: unexpected answer');
+    }
+    return Object.freeze({ initialized, sealed });
   }
 
   /** One key share (spec 5): the unseal key and the root token. */
   public async initialize(): Promise<Readonly<{ unsealKey: string; rootToken: string }>> {
-    const body = await this.json('PUT', 'sys/init', { body: { secret_shares: 1, secret_threshold: 1 } });
+    // 60 s: the first raft leader election takes 5 to 10 s, and an abort after Vault initialized loses both keys.
+    const body = await this.json('PUT', 'sys/init', {
+      body: { secret_shares: 1, secret_threshold: 1 },
+      timeoutMs: INITIALIZE_TIMEOUT_MS,
+    });
     const keys = field(body, 'keys_base64');
     const unsealKey: unknown = Array.isArray(keys) ? keys[0] : undefined;
     const rootToken = field(body, 'root_token');
@@ -94,9 +124,18 @@ export class VaultClient {
     return Object.freeze({ unsealKey, rootToken });
   }
 
+  /**
+   * Unseals, then returns once the node is active: right after the unseal it is briefly standby,
+   * and the next call would get a 500 ("local node not active").
+   */
   public async unseal(key: string): Promise<void> {
     const body = await this.json('PUT', 'sys/unseal', { body: { key } });
     if (field(body, 'sealed') !== false) throw new VaultUnavailableError('vault PUT sys/unseal: still sealed');
+    const deadline = Date.now() + ACTIVE_WAIT_MS;
+    while (!(await this.isActive())) {
+      if (Date.now() >= deadline) throw new VaultUnavailableError('vault GET sys/health: not active');
+      await delay(this.pollIntervalMs);
+    }
   }
 
   public async appRoleLogin(credentials: AppRoleCredentials): Promise<string> {
@@ -143,11 +182,8 @@ export class VaultClient {
         secret_id_ttl: '0', secret_id_num_uses: 0,
       },
     });
-    const roleId = field(field(await this.json('GET', `auth/approle/role/${name}/role-id`, { token }), 'data'), 'role_id');
-    const secretId = field(field(await this.json('POST', `auth/approle/role/${name}/secret-id`, { token }), 'data'), 'secret_id');
-    if (typeof roleId !== 'string' || typeof secretId !== 'string') {
-      throw new VaultUnavailableError(`vault auth/approle/role/${name}: unexpected answer`);
-    }
+    const roleId = await this.dataString('GET', `auth/approle/role/${name}/role-id`, token, 'role_id');
+    const secretId = await this.dataString('POST', `auth/approle/role/${name}/secret-id`, token, 'secret_id');
     return Object.freeze({ role_id: roleId, secret_id: secretId });
   }
 
@@ -158,17 +194,35 @@ export class VaultClient {
     });
   }
 
-  /** The raft snapshot (gzip), as a stream. */
+  /** The raft snapshot (gzip), as a stream. 120 s: the timeout also bounds the reading of the body. */
   public async snapshot(token: string): Promise<ReadableStream<Uint8Array>> {
-    const response = await this.send('GET', 'sys/storage/raft/snapshot', { token });
+    const response = await this.send('GET', 'sys/storage/raft/snapshot', { token, timeoutMs: SNAPSHOT_TIMEOUT_MS });
     if (response.body === null) throw new VaultUnavailableError('vault GET sys/storage/raft/snapshot: empty answer');
     return response.body;
+  }
+
+  /** Only the active node answers `sys/health` 200: a standby (429), sealed (503) or uninitialized (501) one is an error. */
+  private async isActive(): Promise<boolean> {
+    try {
+      await this.json('GET', 'sys/health');
+      return true;
+    } catch (error) {
+      if (error instanceof VaultUnavailableError) return false;
+      throw error;
+    }
   }
 
   private async login(path: string, body: unknown): Promise<string> {
     const token = field(field(await this.json('POST', path, { body }), 'auth'), 'client_token');
     if (typeof token !== 'string' || token === '') throw new VaultDeniedError(`vault POST ${path}: no token`);
     return token;
+  }
+
+  /** `data.<key>` of an answer, which must be a string. */
+  private async dataString(method: string, path: string, token: string, key: string): Promise<string> {
+    const value = field(field(await this.json(method, path, { token }), 'data'), key);
+    if (typeof value !== 'string') throw new VaultUnavailableError(`vault ${method} ${path}: unexpected answer`);
+    return value;
   }
 
   private async json(method: string, path: string, options: RequestOptions = {}): Promise<unknown> {
@@ -190,6 +244,8 @@ export class VaultClient {
   }
 
   private async send(method: string, path: string, options: RequestOptions): Promise<Response> {
+    // The scripts pass constants: a segment outside the alphabet is a programming error.
+    if (!path.split('/').every((segment) => PATH_SEGMENT.test(segment))) throw new TypeError('invalid Vault path');
     const headers: Record<string, string> = {};
     if (options.token !== undefined) headers['X-Vault-Token'] = options.token;
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
@@ -199,7 +255,9 @@ export class VaultClient {
         method,
         headers,
         body: options.body === undefined ? null : JSON.stringify(options.body),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        // A redirect is never followed: the token would travel to its target.
+        redirect: 'manual',
+        signal: AbortSignal.timeout(options.timeoutMs ?? this.timeoutMs),
       });
     } catch {
       throw new VaultUnavailableError(`vault ${method} ${path}: unreachable`);
@@ -213,6 +271,11 @@ export class VaultClient {
     }
     throw new VaultUnavailableError(label);
   }
+}
+
+function positiveInteger(name: string, value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${name} must be a positive integer`);
+  return value;
 }
 
 function field(value: unknown, key: string): unknown {
