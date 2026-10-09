@@ -4700,11 +4700,47 @@ async function fetchBounded(path, { authenticated = true, headers = {}, ...optio
   });
 ```
 
+- [ ] **Step 3b: Update the smoke diagnostics harness**
+
+`tests/deployment-smoke-diagnostics.test.ts` evaluates slices of the smoke inside a `vm` context. That context does not see the module constants added above, and its deployment sequencing test stubs the old phases only. Without this step the 12 diagnostics tests fail: CI caught it on PR #263. Apply both edits.
+
+Old:
+
+```ts
+    deadlineAt: Date.now() + 60_000, postgresPassword: 'generated-test-password',
+```
+
+New:
+
+```ts
+    deadlineAt: Date.now() + 60_000, postgresPassword: 'generated-test-password',
+    smokeSecrets: ['generated-test-password'], hostDirectory: '/nonexistent/smoke-host',
+    rm: async () => undefined,
+```
+
+Old:
+
+```ts
+    discoverFrontendBaseUrl = async () => 'http://127.0.0.1:43210';
+    assertNonRoot = async () => undefined;
+```
+
+New:
+
+```ts
+    discoverFrontendBaseUrl = async () => 'http://127.0.0.1:43210';
+    writeSmokeHost = async () => undefined;
+    assertProcessUsers = async () => undefined;
+    assertFrontNonRoot = async () => undefined;
+    assertSecretIsolation = async () => undefined;
+    assertFrontAuthentication = async () => undefined;
+```
+
 - [ ] **Step 4: Check syntax and the static tests**
 
 ```bash
 node --check scripts/deployment-smoke.mjs
-npx tsx --test tests/deployment-artifacts.test.ts
+npx tsx --test tests/deployment-artifacts.test.ts tests/deployment-smoke-diagnostics.test.ts
 npm run lint:backend
 ```
 
@@ -4722,7 +4758,7 @@ Expected: `Deployment smoke passed.` then `Deployment signal fault probe passed.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/deployment-smoke.mjs tests/deployment-artifacts.test.ts
+git add scripts/deployment-smoke.mjs tests/deployment-artifacts.test.ts tests/deployment-smoke-diagnostics.test.ts
 git commit -m "test(deploy): smoke the four-service stack with throwaway secrets
 
 The smoke writes a throwaway host directory and starts the stack in observe mode without RPC.
