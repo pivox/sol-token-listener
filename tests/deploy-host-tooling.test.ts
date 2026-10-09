@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,8 @@ import { test } from 'node:test';
 const root = new URL('../', import.meta.url);
 const repository = fileURLToPath(root).replace(/\/$/u, '');
 const FAKE_HASH = `$2a$10$${'a'.repeat(53)}`;
+// Root passes every permission check, so the tests that rely on a refusal skip themselves as root.
+const IS_ROOT = process.getuid?.() === 0;
 
 async function artifact(path: string): Promise<string> {
   return readFile(new URL(path, root), 'utf8');
@@ -72,18 +74,18 @@ void test('init-secrets refuses a directory where a secret file belongs', async 
   const directory = await mkdtemp(join(tmpdir(), 'sol-init-dir-'));
   try {
     const bin = await fakeDocker(directory, `cat > /dev/null; printf '%s\\n' '${FAKE_HASH}'`);
-    const host = join(directory, 'host');
     // What a compose run before init-secrets leaves: Docker created the missing file as a directory.
-    await mkdir(join(host, 'secrets/db/postgres-admin-password'), { recursive: true });
-    const result = spawnSync('bash', [join(repository, 'deploy/host/init-secrets.sh'), host], {
-      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
-    });
-    assert.equal(result.status, 78);
-    assert.equal(
-      result.stderr,
-      `init-secrets: ${host}/secrets/db/postgres-admin-password is a directory: remove it, then run again\n`,
-    );
-    await assert.rejects(stat(join(host, 'secrets/front/front-basic-auth-hash')), { code: 'ENOENT' });
+    for (const secret of ['secrets/db/postgres-admin-password', 'secrets/front/front-basic-auth-hash']) {
+      const host = join(directory, secret.replace(/\W/gu, '-'));
+      await mkdir(join(host, secret), { recursive: true });
+      const result = spawnSync('bash', [join(repository, 'deploy/host/init-secrets.sh'), host], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      });
+      assert.equal(result.status, 78, secret);
+      assert.equal(result.stderr, `init-secrets: ${host}/${secret} is a directory: remove it, then run again\n`, secret);
+      // It refuses before creating anything else.
+      await assert.rejects(stat(join(host, 'backups')), { code: 'ENOENT' }, secret);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -215,6 +217,66 @@ void test('backup keeps no empty snapshot', async () => {
     assert.equal(result.status, 1);
     assert.equal(result.stderr, 'backup: the Vault snapshot is empty\n');
     assert.equal((await readdir(join(host, 'backups'))).some((name) => /^vault-\d{8}T\d{6}Z\.snap$/u.test(name)), false);
+    assert.deepEqual((await readdir(join(host, 'backups'))).filter((name) => name.endsWith('.partial')), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('backup leaves no partial file when the snapshot tool fails after writing', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-backup-failing-'));
+  try {
+    const bin = await fakeDocker(directory, [
+      'case "$*" in',
+      '  *" exec -T postgres "*) printf "PGDMP-fake" ;;',
+      '  *" run --rm --no-deps -T vault-snapshot") cat > /dev/null; printf "half"; exit 1 ;;',
+      '  *) exit 99 ;;',
+      'esac',
+    ].join('\n'));
+    const host = join(directory, 'host');
+    await mkdir(join(host, 'backups'), { recursive: true });
+    await mkdir(join(host, 'secrets/vault/approle'), { recursive: true });
+    await writeFile(join(host, 'secrets/vault/approle/backup.json'), '{"role_id":"r","secret_id":"s"}\n');
+    const result = spawnSync('bash', [join(repository, 'deploy/host/backup.sh')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host, SOL_REPOSITORY: repository },
+    });
+    assert.equal(result.status, 1);
+    // The database dump stays, with its checksum; the half snapshot does not.
+    const files = (await readdir(join(host, 'backups'))).sort();
+    assert.equal(files.length, 2, files.join(' '));
+    assert.match(files[0] ?? '', /^sol-\d{8}T\d{6}Z\.dump$/u);
+    assert.equal(files[1], `${files[0] ?? ''}.sha256`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('backup refuses a missing AppRole file, after taking the dump', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-backup-approle-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, [
+      `printf '%s\\n' "$*" >> '${log}'`,
+      'case "$*" in',
+      '  *" exec -T postgres "*) printf "PGDMP-fake" ;;',
+      '  *) exit 99 ;;',
+      'esac',
+    ].join('\n'));
+    const host = join(directory, 'host');
+    await mkdir(join(host, 'backups'), { recursive: true });
+    const result = spawnSync('bash', [join(repository, 'deploy/host/backup.sh')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host, SOL_REPOSITORY: repository },
+    });
+    assert.equal(result.status, 78);
+    assert.equal(result.stderr, 'backup: secrets/vault/approle/backup.json is missing: run deploy/host/vault-init.sh first\n');
+    // The database is still backed up first; nothing else is left, and the snapshot tool never ran.
+    const files = (await readdir(join(host, 'backups'))).sort();
+    assert.equal(files.length, 2, files.join(' '));
+    assert.match(files[0] ?? '', /^sol-\d{8}T\d{6}Z\.dump$/u);
+    assert.equal(files[1], `${files[0] ?? ''}.sha256`);
+    assert.equal((await readFile(log, 'utf8')).includes('vault-snapshot'), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -240,6 +302,7 @@ void test('backup keeps no empty database dump and takes no snapshot after it', 
     assert.equal(result.status, 1);
     assert.equal(result.stderr, 'backup: the database dump is empty\n');
     assert.equal((await readdir(join(host, 'backups'))).some((name) => /\.(?:dump|snap)$/u.test(name)), false);
+    assert.deepEqual((await readdir(join(host, 'backups'))).filter((name) => name.endsWith('.partial')), []);
     assert.equal((await readFile(log, 'utf8')).includes('vault-snapshot'), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -303,7 +366,6 @@ void test('vault-init runs vault-setup once as the calling user and refuses a se
       `${compose} up --detach vault`,
       `${compose} exec -T vault wget -q -O /dev/null http://127.0.0.1:8200/v1/sys/seal-status`,
       `${compose} run --rm --no-deps --user ${user} vault-setup init`,
-      `${compose} exec -T vault vault status`,
     ]);
     assert.equal((String(first.stdout).match(/fake-operator-password/gu) ?? []).length, 1);
     assert.match(String(first.stdout), /^next: store secrets\/vault\/unseal\/unseal-key in your password manager, then run deploy\/host\/vault-import\.sh$/mu);
@@ -312,7 +374,10 @@ void test('vault-init runs vault-setup once as the calling user and refuses a se
     await rm(log);
     const second = run();
     assert.equal(second.status, 78);
-    assert.match(String(second.stderr), /already initialized/u);
+    assert.equal(
+      second.stderr,
+      'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)\n',
+    );
     await assert.rejects(stat(log), { code: 'ENOENT' });
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -328,6 +393,12 @@ void test('vault-init refuses before any docker call when its directories are mi
     const run = (): ReturnType<typeof spawnSync> => spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
       encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
     });
+    // The checks below look at $SOL_HOST_DIR from here, while Compose resolves its bind sources elsewhere.
+    const relative = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: 'relative/host' },
+    });
+    assert.equal(relative.status, 78);
+    assert.equal(relative.stderr, 'vault-init: SOL_HOST_DIR must be an absolute path\n');
     await mkdir(join(host, 'secrets/vault/unseal'), { recursive: true });
     const missing = run();
     assert.equal(missing.status, 78);
@@ -370,6 +441,99 @@ void test('vault-init stops before any docker call when it cannot list a directo
   }
 });
 
+void test('vault-init gives up after 60 tries when the Vault API never answers, without running vault-setup', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-wait-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, [
+      `printf '%s\\n' "$*" >> '${log}'`,
+      'case "$*" in',
+      '  *" exec -T vault wget "*) exit 1 ;;',
+      'esac',
+    ].join('\n'));
+    // No real second between the tries.
+    await writeFile(join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const host = join(directory, 'host');
+    await mkdir(join(host, 'secrets/vault/unseal'), { recursive: true });
+    await mkdir(join(host, 'secrets/vault/approle'), { recursive: true });
+    const result = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
+    assert.equal(result.status, 69);
+    assert.equal(result.stderr, 'vault-init: the Vault API did not answer within 60 tries: see docker compose logs vault\n');
+    const calls = (await readFile(log, 'utf8')).trim().split('\n');
+    assert.equal(calls.filter((call) => call.includes(' exec -T vault wget ')).length, 60);
+    assert.equal(calls.some((call) => call.includes('vault-setup')), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('vault-init refuses before any docker call a directory it cannot write', { skip: IS_ROOT }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-write-'));
+  const host = join(directory, 'host');
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'`);
+    for (const name of ['unseal', 'approle']) {
+      await mkdir(join(host, 'secrets/vault', name), { recursive: true });
+    }
+    for (const name of ['unseal', 'approle']) {
+      await chmod(join(host, 'secrets/vault', name), 0o500);
+      const result = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+      });
+      assert.equal(result.status, 78, name);
+      assert.equal(
+        result.stderr,
+        `vault-init: secrets/vault/${name} must be a directory you own and can write (deploy/host/init-secrets.sh creates it)\n`,
+        name,
+      );
+      await chmod(join(host, 'secrets/vault', name), 0o700);
+    }
+    await assert.rejects(stat(log), { code: 'ENOENT' });
+  } finally {
+    // A read-only directory could not be cleaned up.
+    for (const name of ['unseal', 'approle']) await chmod(join(host, 'secrets/vault', name), 0o700).catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('vault-init refuses before any docker call a directory it does not own', { skip: IS_ROOT }, async (t) => {
+  // A directory the caller can write but another user owns: /tmp is root-owned and world-writable.
+  const foreign = '/tmp';
+  if ((await stat(foreign)).uid === process.getuid?.()) {
+    t.skip(`${foreign} belongs to the caller`);
+    return;
+  }
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-own-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'`);
+    const host = join(directory, 'host');
+    for (const name of ['unseal', 'approle']) {
+      await mkdir(join(host, 'secrets/vault/unseal'), { recursive: true });
+      await mkdir(join(host, 'secrets/vault/approle'), { recursive: true });
+      await rm(join(host, 'secrets/vault', name), { recursive: true });
+      await symlink(foreign, join(host, 'secrets/vault', name));
+      const result = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+      });
+      assert.equal(result.status, 78, name);
+      assert.equal(
+        result.stderr,
+        `vault-init: secrets/vault/${name} must be a directory you own and can write (deploy/host/init-secrets.sh creates it)\n`,
+        name,
+      );
+      // Only the link goes: never what it points to.
+      await rm(join(host, 'secrets/vault', name), { force: true });
+    }
+    await assert.rejects(stat(log), { code: 'ENOENT' });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 void test('vault-import mounts the role files, the key files they name and the templates, and sends the password on stdin', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sol-vault-import-'));
   try {
@@ -382,11 +546,17 @@ void test('vault-import mounts the role files, the key files they name and the t
     await mkdir(env, { recursive: true });
     await mkdir(host, { recursive: true });
     const adminKey = join(lot5, 'keys', 'helius-admin.key');
+    const evidenceKey = join(lot5, 'keys', 'evidence.key');
     const keypair = join(directory, 'wallet.json');
     await mkdir(dirname(adminKey), { recursive: true });
     await writeFile(adminKey, 'admin-key-value\n');
+    await writeFile(evidenceKey, 'evidence-key-value\n');
     await writeFile(keypair, '[1,2]\n');
-    await writeFile(join(env, 'provider-evidence.env'), `HELIUS_API_KEY_PATH="${adminKey}"\n`);
+    // The three quoting styles of the lot5 files: double quotes, single quotes, none.
+    await writeFile(
+      join(env, 'provider-evidence.env'),
+      `HELIUS_API_KEY_PATH="${adminKey}"\nEXECUTOR_EVIDENCE_PRIVATE_KEY_PATH='${evidenceKey}'\n`,
+    );
     await writeFile(join(env, 'live.env'), `EXECUTOR_KEYPAIR_PATH=${keypair}\nSOLANA_HTTP_RPC_URL=https://x.invalid/?api-key=secret-value\n`);
     const result = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env], {
       encoding: 'utf8', input: 'operator-password-0123\n',
@@ -397,24 +567,26 @@ void test('vault-import mounts the role files, the key files they name and the t
     assert.equal((await readFile(log, 'utf8')).trim(), [
       `${compose} run --rm --no-deps -T`,
       `-v ${env}:/import/env:ro -v ${repository}/deploy/config:/import/templates:ro`,
-      `-v ${adminKey}:/import/keys/helius-admin-api-key:ro -v ${keypair}:/import/keys/wallet-keypair.json:ro`,
+      `-v ${adminKey}:/import/keys/helius-admin-api-key:ro -v ${evidenceKey}:/import/keys/evidence-private-key:ro`,
+      `-v ${keypair}:/import/keys/wallet-keypair.json:ro`,
       `-e SOL_IMPORT_EVIDENCE_PREFIX=${lot5}/evidence vault-import`,
     ].join(' '));
     assert.equal(await readFile(stdin, 'utf8'), 'operator-password-0123\n');
-    for (const value of ['secret-value', 'admin-key-value', 'operator-password-0123']) {
+    for (const value of ['secret-value', 'admin-key-value', 'evidence-key-value', 'operator-password-0123']) {
       assert.equal(`${result.stdout}${result.stderr}`.includes(value), false, value);
     }
 
     // A relative evidence directory becomes absolute from the current directory, which need not hold it.
-    const relative = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env, 'evidence'], {
-      encoding: 'utf8', input: 'operator-password-0123\n', cwd: lot5,
+    // Its dot segments stay as typed: the tool normalizes them.
+    const relative = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env, '../evidence'], {
+      encoding: 'utf8', input: 'operator-password-0123\n', cwd: env,
       env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
     });
     assert.equal(relative.status, 0, relative.stderr);
     const lines = (await readFile(log, 'utf8')).trim().split('\n');
     assert.equal(
       lines[lines.length - 1]?.split(' -e ').pop(),
-      `SOL_IMPORT_EVIDENCE_PREFIX=${await realpath(lot5)}/evidence vault-import`,
+      `SOL_IMPORT_EVIDENCE_PREFIX=${await realpath(env)}/../evidence vault-import`,
     );
 
     // A password piped without a trailing newline is still read, and sent with the newline printf adds.
@@ -426,16 +598,72 @@ void test('vault-import mounts the role files, the key files they name and the t
     assert.equal(await readFile(stdin, 'utf8'), 'unterminated-password-4567\n');
     assert.equal(`${unterminated.stdout}${unterminated.stderr}`.includes('unterminated-password-4567'), false);
 
+    // Under `bash -x` the password must not show in the trace (printf would expand it).
+    const traced = spawnSync('bash', ['-x', join(repository, 'deploy/host/vault-import.sh'), env], {
+      encoding: 'utf8', input: 'traced-password-8910\n',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
+    assert.equal(traced.status, 0, traced.stderr);
+    assert.equal(await readFile(stdin, 'utf8'), 'traced-password-8910\n');
+    assert.match(traced.stderr, /set \+x/u, 'the trace is on until the password is read');
+    assert.equal(`${traced.stdout}${traced.stderr}`.includes('traced-password-8910'), false);
+
     await writeFile(join(env, 'live.env'), 'EXECUTOR_KEYPAIR_PATH=/nonexistent/wallet.json\n');
     const missing = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env], {
       encoding: 'utf8', input: 'x\n', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
     });
     assert.equal(missing.status, 78);
     assert.equal(missing.stderr, 'vault-import: /nonexistent/wallet.json (named by EXECUTOR_KEYPAIR_PATH) does not exist\n');
+    // A bare call is a usage error before it is a missing SOL_HOST_DIR.
     const usage = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh')], {
-      encoding: 'utf8', env: { ...process.env, SOL_HOST_DIR: host },
+      encoding: 'utf8', env: { ...process.env, SOL_HOST_DIR: '' },
     });
     assert.equal(usage.status, 64);
+    assert.equal(usage.stderr, 'usage: deploy/host/vault-import.sh <env directory> [evidence directory]\n');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('vault-import refuses an empty password before any docker call', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-import-empty-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'; cat > /dev/null`);
+    const env = join(directory, 'lot5', 'env');
+    await mkdir(env, { recursive: true });
+    // A bare Enter at the prompt, and an input that ends at once.
+    for (const input of ['\n', '']) {
+      const result = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env], {
+        encoding: 'utf8', input,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: join(directory, 'host') },
+      });
+      assert.equal(result.status, 64, JSON.stringify(input));
+      assert.equal(result.stderr.trim(), 'vault-import: no password given', JSON.stringify(input));
+    }
+    await assert.rejects(stat(log), { code: 'ENOENT' });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('vault-import stops when it cannot read a role file for a key path', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-import-sed-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'; cat > /dev/null`);
+    // A read that fails must not pass for "no key path": the wallet key would go missing from the import.
+    await writeFile(join(bin, 'sed'), '#!/bin/sh\necho "sed: cannot read the file" >&2\nexit 2\n', { mode: 0o755 });
+    const env = join(directory, 'lot5', 'env');
+    await mkdir(env, { recursive: true });
+    await writeFile(join(env, 'live.env'), 'EXECUTOR_KEYPAIR_PATH=/some/wallet.json\n');
+    const result = spawnSync('bash', [join(repository, 'deploy/host/vault-import.sh'), env], {
+      encoding: 'utf8', input: 'operator-password-0123\n',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: join(directory, 'host') },
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /sed: cannot read the file/u);
+    await assert.rejects(stat(log), { code: 'ENOENT' });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

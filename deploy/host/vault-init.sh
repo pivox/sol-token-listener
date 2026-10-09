@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Initializes the stack's Vault once (docs/operations/deployment.md, « Dossier hôte et Vault »):
-# starts the vault service, waits for its API, runs `vault-setup init` in a tools container as the
-# calling user (secrets/vault/ stays the operator's), then waits until Vault is unsealed. Prints
-# only the Vault operator password, once. Refuses to run unless secrets/vault/unseal and
-# secrets/vault/approle are empty directories the caller owns: Docker would otherwise create a
-# missing one root-owned, or a leftover file would fail vault-setup after Vault is initialized.
+# starts the vault service, waits for its API, then runs `vault-setup init` in a tools container
+# as the calling user (secrets/vault/ stays the operator's). vault-setup unseals Vault and exits 0
+# only once it has written its entries. Prints only the Vault operator password, once. Refuses to
+# run unless secrets/vault/unseal and secrets/vault/approle are empty directories the caller owns:
+# Docker would otherwise create a missing one root-owned, or a leftover file would fail
+# vault-setup after Vault is initialized.
 set -euo pipefail
 : "${SOL_HOST_DIR:?SOL_HOST_DIR is required}"
+# The checks below read $SOL_HOST_DIR from the current directory, while Compose resolves the same
+# variable in its bind sources from the compose file's: only an absolute path names one place.
+case "$SOL_HOST_DIR" in /*) ;; *) echo 'vault-init: SOL_HOST_DIR must be an absolute path' >&2; exit 78 ;; esac
 repository="$(cd "$(dirname "$0")/../.." && pwd)"
 compose() {
   docker compose --env-file "$SOL_HOST_DIR/compose.env" -f "$repository/deploy/compose.yaml" "$@"
@@ -19,7 +23,7 @@ for directory in unseal approle; do
   fi
 done
 if [ -e "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" ]; then
-  echo 'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized' >&2
+  echo 'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)' >&2
   exit 78
 fi
 for directory in unseal approle; do
@@ -41,18 +45,8 @@ for _ in $(seq 60); do
   sleep 1
 done
 if [ "$ready" != yes ]; then
-  echo 'vault-init: the Vault API did not answer within 60 s: see docker compose logs vault' >&2
+  echo 'vault-init: the Vault API did not answer within 60 tries: see docker compose logs vault' >&2
   exit 69
 fi
 compose run --rm --no-deps --user "$(id -u):$(id -g)" vault-setup init
-# `up --wait` would fail at once on a container already marked unhealthy: poll `vault status`
-# instead (exit 0 once unsealed; vault-setup has just unsealed it).
-for _ in $(seq 60); do
-  if compose exec -T vault vault status > /dev/null 2>&1; then
-    echo 'next: store secrets/vault/unseal/unseal-key in your password manager, then run deploy/host/vault-import.sh'
-    exit 0
-  fi
-  sleep 1
-done
-echo 'vault-init: Vault did not report unsealed within 60 s: see docker compose logs vault' >&2
-exit 69
+echo 'next: store secrets/vault/unseal/unseal-key in your password manager, then run deploy/host/vault-import.sh'

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { posix } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse } from 'dotenv';
 import { errnoCode } from '../../src/deploy/errno-code.js';
@@ -134,7 +135,9 @@ function planImport(directory: string, evidencePrefix: string, dependencies: Vau
   const templates: string[] = [];
   const secrets: string[] = [];
   const roleFiles = new Map<ConfigName, Readonly<Record<string, string>>>();
-  const prefix = evidencePrefix.replace(/\/+$/u, '');
+  // Normalized, so dot segments of a relative directory argument (`../evidence`, resolved by the host
+  // script against its current directory) do not make the prefix miss the absolute paths of the files.
+  const prefix = evidencePrefix === '' ? '' : posix.normalize(evidencePrefix).replace(/\/+$/u, '');
   for (const name of CONFIG_NAMES) {
     const own = `${directory}/env/${name}.env`;
     const template = `${directory}/templates/${name}.env.example`;

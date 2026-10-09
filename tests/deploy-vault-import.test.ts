@@ -98,6 +98,25 @@ void test('an evidence path is rewritten only under the prefix directory itself'
     });
     assert.equal(vault.kv.has('secrets/back/helius-executor-http-url'), false);
   });
+
+  // The host script passes a relative directory argument with its dot segments as typed: they must
+  // not make the prefix miss the absolute paths of the role files.
+  for (const prefix of ['/Users/me/lot5/env/../evidence', '/Users/me/lot5/./evidence/', '/Users/me//lot5/evidence']) {
+    await withSource({
+      'env/operations.env': [
+        'EXECUTOR_PREFLIGHT_EVIDENCE_PATH=/Users/me/lot5/evidence/x',
+        'EXECUTOR_ARCHIVE_PATH=/Users/me/lot5/evidence-old/x', '',
+      ].join('\n'),
+    }, async (directory) => {
+      const vault = operatorVault();
+      const run = await importInto(vault, directory, `${PASSWORD}\n`, { SOL_IMPORT_EVIDENCE_PREFIX: prefix });
+      assert.equal(run.code, 0, `${prefix}: ${run.stderr}`);
+      assert.deepEqual(vault.kv.get('config/operations'), {
+        EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '/var/lib/sol/evidence/x',
+        EXECUTOR_ARCHIVE_PATH: '/Users/me/lot5/evidence-old/x',
+      }, prefix);
+    });
+  }
 });
 
 void test('an invalid source is refused before the login, with nothing written', async () => {
