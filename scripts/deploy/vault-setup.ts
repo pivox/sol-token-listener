@@ -52,7 +52,8 @@ class SetupFileError extends Error {
  * `vault-setup init` runs once, from deploy/host/vault-init.sh, in the `vault-setup` tools
  * container (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 8.1). It initializes Vault
  * with one key share and saves the unseal key first, then:
- * - unseals Vault and enables `sol/` (KV v2), AppRole and userpass;
+ * - unseals Vault and enables a `file` audit device writing to its stdout (every later request
+ *   reaches the container log, values HMAC'd), then `sol/` (KV v2), AppRole and userpass;
  * - loads the four policies, creates the three AppRoles and writes their files;
  * - generates the nine login passwords and the operator API token in Vault;
  * - creates the `operator` login, prints its password once and revokes the root token.
@@ -75,7 +76,7 @@ export async function runVaultSetupCli(
   const client = new VaultClient({
     address: environment.VAULT_ADDR ?? 'http://vault:8200', fetch: dependencies.fetch,
   });
-  let initialized = false;
+  let initRequested = false;
   let unsealKeySaved = false;
   try {
     const policies = VAULT_POLICIES.map((name) => [
@@ -85,11 +86,13 @@ export async function runVaultSetupCli(
       io.stderr('vault-setup: Vault is already initialized; nothing changed\n');
       return 78;
     }
+    // Set before the call: a `sys/init` that dies on the client may have been processed all the same.
+    initRequested = true;
     const { unsealKey, rootToken } = await client.initialize();
-    initialized = true;
     dependencies.writeSecretFile(`${out}/unseal/unseal-key`, `${unsealKey}\n`);
     unsealKeySaved = true;
     await client.unseal(unsealKey);
+    await client.enableStdoutAudit(rootToken);
     await client.enableKv2(rootToken, VAULT_MOUNT);
     await client.enableAuth(rootToken, 'approle');
     await client.enableAuth(rootToken, 'userpass');
@@ -111,13 +114,13 @@ export async function runVaultSetupCli(
       service: 'vault-setup', event: 'vault.initialized',
       approles: VAULT_APPROLES, logins: DATABASE_LOGIN_NAMES.length,
     })}\n`);
-    io.stdout(`operator password, shown once (store it in your password manager): ${operatorPassword}\n`);
+    io.stdout(`Vault operator password, shown once (store it in your password manager): ${operatorPassword}\n`);
     return 0;
   } catch (error) {
     const tail = unsealKeySaved
       ? '; the unseal key is saved: start over as the runbook says'
-      : initialized
-        ? '; Vault is initialized but its unseal key was not saved: start over as the runbook says'
+      : initRequested
+        ? '; Vault may be initialized but its unseal key was not saved: start over as the runbook says'
         : '';
     if (error instanceof SetupFileError) {
       io.stderr(`vault-setup: ${error.message}\n`);

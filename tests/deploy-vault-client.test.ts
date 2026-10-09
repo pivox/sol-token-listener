@@ -356,6 +356,42 @@ void test('the fake answers like the measured Vault: health, uninitialized, role
   await assert.rejects(client.readKv(nightlyToken, 'secrets/logins/sol_live'), VaultDeniedError);
 });
 
+void test('the stdout audit device is enabled by root alone, once, with the body Vault expects', async () => {
+  const vault = new FakeVault();
+  const sent: { readonly method: string | undefined; readonly body: unknown }[] = [];
+  const recording: VaultFetch = async (url, init) => {
+    if (url.endsWith('/v1/sys/audit/file')) {
+      sent.push({ method: init.method, body: typeof init.body === 'string' ? JSON.parse(init.body) as unknown : init.body });
+    }
+    return vault.fetch(url, init);
+  };
+  const client = new VaultClient({ address: ADDRESS, fetch: recording });
+
+  // Only root administers, and a refused call adds nothing: checked before any device exists, so it is no 400.
+  const appRoleToken = await client.appRoleLogin(vault.addAppRole('back'));
+  await assert.rejects(client.enableStdoutAudit(appRoleToken),
+    (error) => error instanceof VaultDeniedError && error.message === 'vault PUT sys/audit/file: HTTP 403');
+  assert.equal(vault.audits.size, 0);
+
+  await client.enableStdoutAudit(vault.rootToken);
+  assert.deepEqual([...vault.audits], ['file']);
+  assert.deepEqual(sent.at(-1), { method: 'PUT', body: { type: 'file', options: { file_path: 'stdout' } } });
+
+  // A device already at `file/` answers 400.
+  await assert.rejects(client.enableStdoutAudit(vault.rootToken),
+    (error) => error instanceof VaultDeniedError && error.message === 'vault PUT sys/audit/file: HTTP 400');
+  assert.deepEqual([...vault.audits], ['file']);
+
+  // `sys/init` hands out a Vault without any device, and until it is unsealed the route answers 503 like the others.
+  vault.initialized = false;
+  vault.sealed = true;
+  await client.initialize();
+  assert.equal(vault.audits.size, 0);
+  await assert.rejects(client.enableStdoutAudit(vault.rootToken),
+    (error) => error instanceof VaultUnavailableError && error.message === 'vault PUT sys/audit/file: HTTP 503');
+  assert.equal(vault.audits.size, 0);
+});
+
 void test('a path segment outside the safe alphabet is refused before any request', async () => {
   const vault = new FakeVault();
   const client = new VaultClient({ address: ADDRESS, fetch: vault.fetch });

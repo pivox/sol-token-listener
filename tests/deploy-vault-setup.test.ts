@@ -67,7 +67,13 @@ void test('init unseals, configures Vault and writes only the unseal key and the
   assert.equal(vault.sealed, false);
   assert.deepEqual([...vault.mounts], ['sol']);
   assert.deepEqual([...vault.auths].sort(), ['approle', 'userpass']);
+  assert.deepEqual([...vault.audits], ['file']);
+  // The audit device comes right after the unseal, so that every later request is audited.
+  assert.deepEqual(vault.requests.slice(0, 6), [
+    'GET sys/seal-status', 'PUT sys/init', 'PUT sys/unseal', 'GET sys/health', 'PUT sys/audit/file', 'POST sys/mounts/sol',
+  ]);
   assert.deepEqual([...vault.policies.keys()].sort(), [...VAULT_POLICIES].sort());
+  for (const name of VAULT_POLICIES) assert.equal(vault.policies.get(name), `# policy ${name}\n`);
   assert.deepEqual([...vault.appRoles.keys()].sort(), [...VAULT_APPROLES].sort());
   assert.deepEqual([...run.files.keys()].sort(), [
     '/out/approle/back.json', '/out/approle/backup.json', '/out/approle/migrate.json', '/out/unseal/unseal-key',
@@ -80,13 +86,17 @@ void test('init unseals, configures Vault and writes only the unseal key and the
   assert.match(String(vault.kv.get('secrets/back/operator-api-token')?.value), /^[0-9a-f]{64}$/u);
   const operator = vault.users.get('operator');
   assert.equal(operator?.policy, 'operator');
+  assert.match(operator?.password ?? '', /^[A-Za-z0-9_-]{32}$/u);
   assert.equal(vault.isRevoked(vault.rootToken), true);
   const lines = run.stdout.trimEnd().split('\n');
   assert.equal(lines.length, 2);
   assert.deepEqual(JSON.parse(lines[0] ?? ''), {
     service: 'vault-setup', event: 'vault.initialized', approles: ['back', 'migrate', 'backup'], logins: 9,
   });
-  assert.equal(lines[1], `operator password, shown once (store it in your password manager): ${operator?.password ?? ''}`);
+  assert.equal(
+    lines[1],
+    `Vault operator password, shown once (store it in your password manager): ${operator?.password ?? ''}`,
+  );
   for (const value of [
     vault.unsealKey, vault.rootToken, vault.appRoles.get('back')?.secret_id ?? '',
     String(vault.kv.get('secrets/logins/sol_live')?.value),
@@ -133,11 +143,30 @@ void test('an unseal key that cannot be saved is reported as lost, by its errno 
   assert.equal(run.code, 1);
   assert.equal(
     run.stderr,
-    'vault-setup: setup failed (EACCES); Vault is initialized but its unseal key was not saved: start over as the runbook says\n',
+    'vault-setup: setup failed (EACCES); Vault may be initialized but its unseal key was not saved: start over as the runbook says\n',
   );
   assert.equal(run.files.size, 0);
   assert.equal(vault.initialized, true);
   assert.equal(vault.sealed, true);
+});
+
+void test('a sys/init whose answer is lost is flagged: Vault may be initialized and no key was saved', async () => {
+  const vault = freshVault();
+  // Vault processes the request, then the connection dies: the keys exist, and nobody holds them.
+  const dying: VaultFetch = async (url, init) => {
+    const response = await vault.fetch(url, init);
+    if (url.endsWith('/v1/sys/init')) throw new TypeError('fetch failed');
+    return response;
+  };
+  const run = await setup(vault, { fetch: dying });
+  assert.equal(run.code, 69);
+  assert.equal(
+    run.stderr,
+    'vault-setup: Vault unavailable (vault PUT sys/init: unreachable); Vault may be initialized but its unseal key was not saved: start over as the runbook says\n',
+  );
+  assert.equal(run.stdout, '');
+  assert.equal(run.files.size, 0);
+  assert.equal(vault.initialized, true);
 });
 
 void test('usage errors exit 64', async () => {

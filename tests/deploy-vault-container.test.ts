@@ -25,6 +25,6 @@ void test('the four policies grant only what spec 6.2 lists', async () => {
   ]);
   for (const name of VAULT_POLICIES) {
     const policy = await artifact(`deploy/vault/policies/${name}.hcl`);
-    assert.equal((policy.match(/^path /gmu) ?? []).length, grants(policy).length, name);
+    assert.equal((policy.match(/^\s*path\s/gmu) ?? []).length, grants(policy).length, name);
   }
 });

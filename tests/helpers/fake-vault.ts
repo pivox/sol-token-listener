@@ -19,8 +19,9 @@ const READABLE: Readonly<Record<string, readonly string[]>> = Object.freeze({
  * on Vault 2.1.2. AppRole tokens read the prefixes of the policy their role was created with; only
  * root and operator tokens write; only root administers; the snapshot is root's or the `backup`
  * policy's. A mount or an auth method that is not enabled does not answer, and `sys/init` hands out
- * a Vault where none is: a test starts from a configured Vault (`sol`, `approle` and `userpass`
- * enabled) unless it initializes it.
+ * a Vault where none is, with no audit device either: a test starts from a configured Vault (`sol`,
+ * `approle` and `userpass` enabled, no audit device) unless it initializes it. An audit device is
+ * enabled by root, once per name.
  */
 export class FakeVault {
   public initialized = true;
@@ -32,6 +33,7 @@ export class FakeVault {
   public readonly policies = new Map<string, string>();
   public readonly mounts = new Set<string>(['sol']);
   public readonly auths = new Set<string>(['approle', 'userpass']);
+  public readonly audits = new Set<string>();
   public readonly appRoles = new Map<string, AppRoleCredentials>();
   public readonly users = new Map<string, Readonly<{ password: string; policy: string }>>();
   public readonly requests: string[] = [];
@@ -125,9 +127,10 @@ export class FakeVault {
     this.initialized = true;
     this.sealed = true;
     this.standbyRemaining = 0;
-    // A fresh Vault has no mount, no auth method, no policy, no AppRole, no entry and no user.
+    // A fresh Vault has no mount, no auth method, no audit device, no policy, no AppRole, no entry and no user.
     this.mounts.clear();
     this.auths.clear();
+    this.audits.clear();
     this.policies.clear();
     this.appRoles.clear();
     this.rolePolicies.clear();
@@ -185,6 +188,13 @@ export class FakeVault {
     const auth = /^sys\/auth\/(.+)$/u.exec(path);
     if (method === 'POST' && auth !== null) {
       this.auths.add(auth[1] ?? '');
+      return new Response(null, { status: 204 });
+    }
+    const audit = /^sys\/audit\/(.+)$/u.exec(path);
+    if (method === 'PUT' && audit !== null) {
+      const name = audit[1] ?? '';
+      if (this.audits.has(name)) return json(400, { errors: [`path already in use at ${name}/`] });
+      this.audits.add(name);
       return new Response(null, { status: 204 });
     }
     const policy = /^sys\/policies\/acl\/(.+)$/u.exec(path);
