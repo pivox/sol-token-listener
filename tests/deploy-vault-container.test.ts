@@ -50,8 +50,9 @@ void test('the vault entrypoint unseals from the key file without ever exposing 
     `trap 'kill -HUP "$server" 2> /dev/null || true' HUP`,
     'unseal_when_ready || true',
     'wait "$server" || status=$?',
-    // Every interrupted wait is retried: a HUP then a TERM must not end the shell before Vault.
-    'while [ "$status" -gt 128 ]; do',
+    // An interrupted wait is retried while Vault runs (a HUP then a TERM must not end the shell
+    // before Vault); a Vault killed by a signal ends the loop with its own status.
+    'while [ "$status" -gt 128 ] && kill -0 "$server" 2> /dev/null; do',
   ]) {
     assert.ok(entrypoint.includes(line), line);
   }

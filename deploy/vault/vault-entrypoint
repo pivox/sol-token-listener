@@ -47,8 +47,9 @@ trap 'kill -HUP "$server" 2> /dev/null || true' HUP
 unseal_when_ready || true
 status=0
 wait "$server" || status=$?
-while [ "$status" -gt 128 ]; do
-  # A trapped signal (TERM, INT or HUP) interrupted wait: let Vault finish its own shutdown.
+while [ "$status" -gt 128 ] && kill -0 "$server" 2> /dev/null; do
+  # A trapped signal (TERM, INT or HUP) interrupted wait while Vault runs: let it finish. A Vault
+  # killed by a signal (137 from the OOM killer) is already reaped, and its status is final.
   status=0
   wait "$server" || status=$?
 done
