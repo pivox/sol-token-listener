@@ -351,9 +351,15 @@ void test('Compose defines postgres, vault, migrate, back, front and the Vault t
   }
   assert.doesNotMatch(composeService(compose, 'vault-setup'), /depends_on/u);
   assert.match(compose, /^x-logging: &logging\n {2}driver: json-file\n {2}options:\n {4}max-size: "20m"\n {4}max-file: "5"$/m);
-  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 8);
+  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 6);
+  // vault-setup prints the Vault operator password once and vault-snapshot streams the raw snapshot on
+  // stdout: json-file would keep a copy of both on disk. vault-import prints names only.
+  for (const name of ['vault-setup', 'vault-snapshot']) {
+    assert.match(composeService(compose, name), /^ {4}logging:\n {6}driver: none$/m, name);
+  }
+  assert.match(composeService(compose, 'vault-import'), /^ {4}logging: \*logging$/m);
 
-  assert.doesNotMatch(compose, /DATABASE_URL|SOLANA_|LISTENER_|EXECUTOR_|POSTGRES_PASSWORD:|privileged:|network_mode: host|docker\.sock/u);
+  assert.doesNotMatch(compose, /DATABASE_URL|SOLANA_|LISTENER_|EXECUTOR_|VAULT_TOKEN|POSTGRES_PASSWORD:|privileged:|network_mode: host|docker\.sock/u);
   assert.doesNotMatch(compose, /api-key|keypair|wallet/iu);
   for (const imageLine of compose.match(/^ {4}image: .+$/gm) ?? []) {
     assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND|VAULT)_IMAGE:\?)/u);
@@ -544,8 +550,10 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
     readonly stop_grace_period?: string;
     readonly cpus?: number;
     readonly ports?: readonly Readonly<{ host_ip?: string; published?: string | number; target?: number }>[];
-    readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean }>[];
+    readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean; bind?: Readonly<{ create_host_path?: boolean }> }>[];
     readonly tmpfs?: readonly string[];
+    readonly restart?: string;
+    readonly logging?: Readonly<{ driver?: string }>;
   }
   const resolvedConfig = (
     files: readonly string[],
@@ -566,6 +574,10 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   const binds = (service: ResolvedService | undefined): string[] => (service?.volumes ?? [])
     .filter((volume) => volume.type === 'bind')
     .map((volume) => `${volume.source ?? ''}:${volume.target ?? ''}:${volume.read_only === true ? 'ro' : 'rw'}`);
+  // Compose creates the missing source of a long-syntax bind unless create_host_path is false: a missing
+  // AppRole file must fail the start, also once the server override is merged.
+  const approleBind = (service: ResolvedService | undefined): boolean | undefined => service?.volumes
+    ?.find((volume) => volume.target === '/root/vault/approle.json')?.bind?.create_host_path;
 
   const services = resolvedConfig(['deploy/compose.yaml']);
   assert.deepEqual(Object.keys(services).sort(), ['back', 'front', 'migrate', 'postgres', 'vault']);
@@ -574,6 +586,8 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
     SOL_VAULT_PULL_TIMEOUT_MS: '60000',
   });
   assert.deepEqual(services.migrate?.environment, { POSTGRES_DB: 'sol_token_listener', SOL_VAULT_PULL_TIMEOUT_MS: '60000' });
+  // Vault has no environment, so no token can be passed to it.
+  assert.equal(services.vault?.environment, undefined);
   assert.deepEqual(services.front?.environment, { FRONT_BASIC_AUTH_USER: 'operator', SITE_ADDRESS: 'http://:8080' });
   assert.deepEqual(ports(services.front), ['127.0.0.1:8080:8080']);
   assert.deepEqual(ports(services.vault), ['127.0.0.1:8200:8200']);
@@ -589,9 +603,11 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   assert.deepEqual(binds(services.back), [
     '/srv/sol-token-listener/secrets/vault/approle/back.json:/root/vault/approle.json:ro',
   ]);
+  for (const name of ['migrate', 'back']) assert.equal(approleBind(services[name]), false, name);
   assert.deepEqual(services.back?.tmpfs, [
     '/run/sol:mode=0711,size=16m', '/root/secrets:mode=0700,size=4m', '/etc/sol/config:mode=0755,size=1m',
   ]);
+  assert.deepEqual(services.migrate?.tmpfs, ['/root/secrets/db/logins:mode=0700,size=1m']);
   assert.deepEqual(binds(services.front), [
     '/srv/sol-token-listener/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro',
   ]);
@@ -604,6 +620,9 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   assert.equal(services.front?.security_opt, undefined);
   assert.equal(services.back?.stop_grace_period, '4m0s');
   assert.equal(services.vault?.stop_grace_period, '30s');
+  assert.equal(services.vault?.restart, 'unless-stopped');
+  assert.equal(services.back?.restart, 'unless-stopped');
+  assert.equal(services.migrate?.restart, 'no');
   assert.equal(services.front?.cpus, 0.5);
 
   const tools = resolvedConfig(['deploy/compose.yaml'], { COMPOSE_PROFILES: 'tools' });
@@ -612,12 +631,16 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   ]);
   assert.deepEqual(binds(tools['vault-setup']), ['/srv/sol-token-listener/secrets/vault:/out:rw']);
   for (const name of ['vault-import', 'vault-snapshot']) assert.deepEqual(binds(tools[name]), [], name);
+  // The setup and snapshot output (operator password, raw snapshot) must not be copied to the json-file log.
+  for (const name of ['vault-setup', 'vault-snapshot']) assert.equal(tools[name]?.logging?.driver, 'none', name);
+  assert.equal(tools['vault-import']?.logging?.driver, 'json-file');
 
   const server = resolvedConfig(['deploy/compose.yaml', 'deploy/compose.server.yaml'], {
     SITE_ADDRESS: 'bot.example.invalid',
   });
   assert.deepEqual(ports(server.front), [':80:80', ':443:443']);
   assert.equal(server.front?.environment?.SITE_ADDRESS, 'bot.example.invalid');
+  for (const name of ['migrate', 'back']) assert.equal(approleBind(server[name]), false, `${name} after the server override`);
 });
 
 void test('block hydration canary proves active routing and bounded serialized admission', async () => {

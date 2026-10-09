@@ -9,8 +9,9 @@ x-logging: &logging
     max-size: "20m"
     max-file: "5"
 
-# The back image drops root itself (setpriv, supervisord `user=`) and Vault runs as its image's
-# vault user: no process may gain privileges again, and no core dump may carry a secret out.
+# The back image drops root itself (setpriv, supervisord `user=`) and the Vault server runs as its
+# image's vault user, while its entrypoint shell stays root to read the unseal key: no process may
+# gain privileges again, and no core dump may carry a secret out.
 x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
   cap_drop: [NET_RAW, MKNOD]
@@ -174,7 +175,9 @@ services:
     volumes:
       - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault:/out
     networks: [internal]
-    logging: *logging
+    # Its stdout shows the operator password once: json-file would keep a copy of it on disk.
+    logging:
+      driver: none
     restart: "no"
 
   vault-import:
@@ -198,7 +201,9 @@ services:
       vault:
         condition: service_healthy
     networks: [internal]
-    logging: *logging
+    # Its stdout is the raw snapshot: json-file would keep a copy of it on disk.
+    logging:
+      driver: none
     restart: "no"
 
 networks:
