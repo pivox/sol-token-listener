@@ -131,7 +131,7 @@ Lint is `npm run lint:backend` (eslint, plus `node --check` of the smoke). Commi
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-10-09-vault-secrets-design.md`
-- Modify: `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md:226-231` (section 7.3)
+- Modify: `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md:85` and `:226-231` (sections 5 and 7.3)
 
 - [ ] **Step 1: Record the deviations in the Vault spec**
 
@@ -143,39 +143,50 @@ In section 6.3, replace « `secrets/vault/<rôle>-approle.json` » with « `secr
 Le plan `docs/superpowers/plans/2026-10-09-vault-secrets.md` précise ce spec sur six points,
 reportés dans les sections concernées :
 
-1. Les fichiers de Vault sur l'hôte vivent dans deux dossiers, `secrets/vault/unseal/` et
-   `secrets/vault/approle/` (5, 6.3, 7.1, 8.1, 8.5).
+1. Les fichiers d'amorçage de Vault sur l'hôte vivent dans deux dossiers, `secrets/vault/unseal/`
+   et `secrets/vault/approle/` (sections 5, 6.3, 7.1, 8.1 et 8.5).
    - La clé de déverrouillage n'existe pas au premier démarrage de `vault` : un montage de
      fichier absent ferait créer un dossier par Docker. `vault` monte donc le dossier `unseal/`.
-   - `back` et `migrate` montent leur fichier AppRole en syntaxe longue, qui échoue sur un
-     fichier absent au lieu de créer un dossier.
+   - `vault-setup` écrit les trois fichiers AppRole dans `approle/`. `back` et `migrate` montent
+     le leur en syntaxe longue de Compose, qui échoue sur un fichier absent au lieu de créer un
+     dossier.
 2. Trois services ponctuels sur l'image back, au profil `tools` : `vault-setup`, `vault-import`
-   et `vault-snapshot`. Ils sont lancés par `docker compose run` depuis les scripts de l'hôte et
-   jamais par `up`. Vault reste sur le réseau `internal`, et l'hôte n'a besoin d'aucun client
-   Vault.
-3. Les scripts appellent l'API HTTP de Vault depuis Node. L'image back n'embarque pas le binaire
-   `vault` ; l'image vault le garde pour sa santé et les procédures manuelles.
-4. `SOL_VAULT_PULL_TIMEOUT_MS` (60000 par défaut) borne les nouvelles tentatives de
-   `vault-pull`. Le smoke la fixe à 5000 pour prouver le refus de démarrer en quelques secondes.
-5. L'import reprend ce que le runbook faisait à la main (8.2) :
+   et `vault-snapshot` (sections 5, 8.1, 8.2 et 8.4). Les scripts de l'hôte les lancent par
+   `docker compose run`, jamais par `docker compose up`. Ils rejoignent le réseau `internal` :
+   Vault n'est pas joignable depuis l'hôte, hors son port d'interface local, et l'hôte n'a
+   besoin d'aucun client Vault.
+3. Les quatre commandes `vault-pull`, `vault-setup`, `vault-import` et `vault-snapshot` appellent
+   l'API HTTP de Vault depuis Node (sections 7.1, 8.1, 8.2 et 8.4). L'image back n'embarque pas
+   le binaire `vault` ; l'image vault le garde pour son contrôle de santé (`vault status`) et les
+   procédures manuelles.
+4. `SOL_VAULT_PULL_TIMEOUT_MS` borne la durée des nouvelles tentatives de `vault-pull` : 60000 ms
+   par défaut, les 60 s de la section 7.3. Le smoke la fixe à 5000 pour prouver le refus de
+   démarrer en quelques secondes.
+5. L'import reprend une partie de ce que le runbook faisait à la main (section 8.2) :
    - il retire les variables injectées ;
    - il réécrit les chemins de preuves vers `/var/lib/sol/evidence` ;
-   - il fixe les liaisons de la stack : `API_HOST`, `API_PORT`, `OPERATOR_API_HOST`,
-     `OPERATOR_API_PORT`.
+   - il fixe les adresses et ports d'écoute : `API_HOST=0.0.0.0` et `API_PORT=3000` pour
+     `listener`, `OPERATOR_API_HOST=0.0.0.0` et `OPERATOR_API_PORT=3100` pour `operator-api`.
 
-   Un fichier de rôle absent de la source vient du modèle du dépôt.
-6. Le login `operator` reçoit un jeton d'une heure, renouvelable jusqu'à 8 heures. La valeur par
-   défaut de Vault est de 32 jours.
+   Un fichier de rôle absent de la source est repris de `deploy/config/<rôle>.env.example`.
+   `OPERATOR_API_ALLOWED_ORIGIN`, qui diffère entre le Mac et le serveur, reste à vérifier dans
+   l'interface, comme les chemins de preuves.
+6. Le login `operator` reçoit un jeton d'une heure, renouvelable jusqu'à 8 heures (sections 6.3
+   et 9). La durée par défaut dans Vault, 32 jours, contredirait l'invariant 5.
 ```
+
+After review, Task 1 also reconciles the spec body with deviations 2–6 (sections 5 to 10).
 
 - [ ] **Step 2: Point the sub-project 1 spec at the Vault spec**
 
-In `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, section 7.3, append this paragraph after the existing one:
+In `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, section 5, bullet « **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie. », append « Le sous-projet 2 y ajoute un conteneur `vault`, son volume et un réseau d'interface locale. » Then, in section 7.3, append this paragraph after the existing one:
 
 ```markdown
-Réalisé par le sous-projet 2, `docs/superpowers/specs/2026-10-09-vault-secrets-design.md` :
-un AppRole par conteneur plutôt qu'un rôle par utilisateur (section 6.3 du spec Vault), et la
-configuration non secrète passe elle aussi dans Vault.
+Cette jonction est précisée par le sous-projet 2,
+`docs/superpowers/specs/2026-10-09-vault-secrets-design.md`, avec deux écarts : un AppRole par
+conteneur plutôt qu'un rôle par utilisateur (section 6.3 du spec Vault), la keypair restant
+réservée à `h2b` par la distribution par utilisateur ; et la configuration non secrète, qui
+passe elle aussi dans Vault.
 ```
 
 - [ ] **Step 3: Commit**
