@@ -1360,113 +1360,50 @@ void test('deployment error summaries categorize aggregate causes without raw me
   assert.doesNotMatch(smoke, /process\.stderr\.write\([^)]*error\.(?:message|stack)/s);
 });
 
-void test('deployment runbook documents the safe production lifecycle and safety boundary', async () => {
+void test('deployment runbook documents the full-bot lifecycle, takeover and security boundary', async () => {
   const runbook = await readArtifact('docs/operations/deployment.md');
-  const packageJson = JSON.parse(await readArtifact('package.json')) as {
-    readonly scripts?: Readonly<Record<string, string>>;
-  };
-
+  let previous = -1;
   for (const heading of [
-    '## Prérequis',
-    '## Images immuables',
-    '## Secrets externes',
-    '## Migration et verrou consultatif',
-    '## Démarrage',
-    '## Arrêt normal',
-    '## Santé et supervision',
-    '## Rétention et confidentialité',
-    '## Sauvegarde',
-    '## Répétition de restauration',
-    '## Rollback',
-    '## Proxy SSE et TLS externe',
-    '## Limite de réplica unique',
-    '## Arrêt incident',
-    '## Frontière no-live',
+    '## Topologie', '## Prérequis', '## Dossier hôte, secrets et configuration', '## Images',
+    '## Démarrage et arrêt', '## Commandes sol', '## Trading', "## Qualification d'une enveloppe (gate 10)",
+    '## Santé et journaux', '## Sauvegardes', '## Reprise de la base actuelle', '## Retour arrière',
+    '## Bascule vers le serveur', '## Rotation des secrets', '## Frontière de sécurité',
   ]) {
-    assert.ok(runbook.includes(heading), `missing runbook section: ${heading}`);
+    const index = runbook.indexOf(`\n${heading}\n`);
+    assert.ok(index > previous, `missing or misplaced runbook section: ${heading}`);
+    previous = index;
   }
-
-  assert.match(runbook, /export DEPLOY_ENV=\/etc\/sol-token-listener\/deploy\.env/);
-  assert.match(runbook, /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml/);
-  assert.match(runbook, /deploy\/env\.example[^\n]*jamais[^\n]*secret[^\n]*production/i);
-  assert.match(runbook, /pg_advisory_lock/);
-  assert.match(
-    runbook,
-    /verrou[\s\S]{0,240}(?:sérialise|coordonne)[^\n]*migrateurs[\s\S]{0,240}(?:n’arrête|ne stoppe|ne coordonne)[^\n]*(?:app|application|worker)/i,
-  );
-  assert.match(
-    runbook,
-    /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres/,
-  );
-  assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
-  assert.match(runbook, /pull postgres migrate app retention frontend/);
-  const escapedPostgresImage = postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const validationPipeline = new RegExp(
-    `docker compose --env-file "\\$DEPLOY_ENV" -f deploy/compose\\.yaml --project-name sol-token-listener config --images migrate app retention frontend \\| grep -Fvx '${escapedPostgresImage}' \\| npm run --silent deployment:validate-images`,
-    'g',
-  );
-  assert.equal((runbook.match(validationPipeline) ?? []).length, 2);
-  assert.equal(
-    packageJson.scripts?.['deployment:validate-images'],
-    'node scripts/validate-deployment-images.mjs',
-  );
-  assert.match(runbook, /up --detach --wait --wait-timeout 60 --no-build postgres/);
-  assert.match(runbook, /deployment-healthcheck\.js --require-ok/);
-  assert.equal((runbook.match(/up -d --wait --wait-timeout 60 --no-build --no-deps frontend/g) ?? []).length, 2);
-  assert.match(runbook, /4 heures/);
-  assert.match(runbook, /15 minutes/);
-  assert.match(runbook, /DEGRADED[\s\S]{0,120}smoke[\s\S]{0,120}listener[\s\S]{0,120}désactivé/i);
-  assert.match(runbook, /production[^\n]*OK/i);
-  assert.match(runbook, /down --volumes[\s\S]{0,120}destructif[\s\S]{0,120}jamais[\s\S]{0,120}arrêt normal/i);
-  assert.match(runbook, /sans inverser[^\n]*migration/i);
-  const startup = runbook.slice(runbook.indexOf('## Démarrage'), runbook.indexOf('## Arrêt normal'));
-  const startupStop = 'stop --timeout 40 frontend app retention';
-  const startupStopIndex = startup.indexOf(startupStop);
-  assert.notEqual(startupStopIndex, -1, 'rollout must stop every application service');
-  assert.ok(startupStopIndex > startup.indexOf('sauvegarde'), 'backup must precede downtime');
-  assert.ok(startupStopIndex > startup.indexOf('pull postgres migrate app retention frontend'));
-  assert.ok(startupStopIndex > startup.indexOf('deployment:validate-images'));
-  assert.ok(startupStopIndex < startup.indexOf('run --rm --no-deps migrate'));
-  assert.match(startup, /indisponib|downtime/i);
-  assert.match(startup, /commande[^\n]*(?:attend|bloque)|(?:attend|bloque)[^\n]*commande/i);
-
-  const rollback = runbook.slice(runbook.indexOf('## Rollback'), runbook.indexOf('## Proxy SSE'));
-  const rollbackStopIndex = rollback.indexOf(startupStop);
-  assert.notEqual(rollbackStopIndex, -1, 'rollback must stop every application service');
-  assert.ok(rollbackStopIndex < rollback.indexOf('BACKEND_IMAGE'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('pull app frontend retention'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention'));
-  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE[\s\S]*références immuables précédentes/iu);
-  assert.match(rollback, /repository@sha256:…/u);
-  assert.match(rollback, /ne doivent pas être vides|refus(?:e|ent) une\s+valeur vide/iu);
-  assert.match(rollback, /pull app frontend retention/);
-  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps app retention/);
-  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps frontend/);
-  assert.ok(
-    rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention')
-      < rollback.indexOf('deployment-healthcheck.js --require-ok')
-      && rollback.indexOf('deployment-healthcheck.js --require-ok')
-        < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps frontend'),
-    'backend readiness and strict health must precede frontend re-exposure',
-  );
-  assert.doesNotMatch(
-    rollback,
-    /stop app\n.*up -d --wait --wait-timeout 60 app\n.*deployment-healthcheck\.js --require-ok/s,
-  );
-  assert.match(runbook, /restauration[^\n]*répétée/i);
-  assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
-  assert.match(runbook, /observe|paper/i);
-  assert.match(runbook, /aucun[^\n]*(?:wallet|clé privée|ordre réel|transaction live)/i);
-  assert.equal((runbook.match(/^health_attempt=0$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^until docker compose .*deployment-healthcheck\.js --require-ok; do$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {2}if \[ "\$health_attempt" -ge 30 \]; then$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {4}if ! docker compose .* stop --timeout 40 app retention; then$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {6}echo 'Le healthcheck strict a échoué et l’arrêt de sécurité app\/retention a aussi échoué\.' >&2$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(
-    /^ {4}echo 'Le healthcheck strict n’a pas convergé ; le déploiement est interrompu\.' >&2\n {4}exit 1\n {2}fi$/gm,
-  ) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {2}sleep 2$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^set -euo pipefail$/gm) ?? []).length, 2);
+  for (const command of [
+    'deploy/host/init-secrets.sh "$SOL_HOST_DIR"',
+    'docker compose --env-file "$SOL_ENV" -f deploy/compose.yaml "$@"',
+    'docker compose --env-file "$SOL_ENV" -f deploy/compose.yaml -f deploy/compose.server.yaml "$@"',
+    'sol_compose up --detach --wait --wait-timeout 180',
+    'sol_compose stop --timeout 60',
+    'sol_compose exec -it back sol trading start',
+    'sol_compose exec back sol trading stop',
+    'sol_compose exec back sol qualify start',
+    'sol_compose exec back sol qualify stop',
+    'sol_compose run --rm migrate sol-admin report',
+    'sol_compose run --rm migrate sol-admin group-roles',
+    'pg_restore --exit-on-error --single-transaction -U sol_owner',
+    'deploy/sql/takeover-precondition.sql',
+    'deploy/sql/table-row-counts.sql',
+    'diff "$takeover/source.counts" "$takeover/target.counts"',
+    'docker stop sol-token-listener-live-pg',
+    'sudo systemctl enable --now sol-backup.timer',
+    'launchctl bootstrap "gui/$(id -u)" "$plist"',
+  ]) {
+    assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
+  }
+  const secrets = runbook.slice(runbook.indexOf('## Dossier hôte'), runbook.indexOf('## Images'));
+  assert.doesNotMatch(secrets, /\b(?:cat|echo)\s+"?\$(?:back|SOL_HOST_DIR)/u, 'secrets are copied, never printed');
+  assert.match(runbook, /pg_advisory_lock/u);
+  assert.match(runbook, /Les migrations\s+restent forward-only/u);
+  assert.match(runbook, /`down --volumes` est destructif/u);
+  assert.match(runbook, /ENTRY_STOP/u);
+  assert.match(runbook, /0\|0\|0\|0/u);
+  assert.match(runbook, /réplica unique/u);
+  assert.match(runbook, /sauvegarde externe/u);
 });
 
 void test('every deployment runbook shell block is syntactically valid Bash', async () => {
@@ -1511,14 +1448,14 @@ void test('operator documentation activates the safe websocket failover contract
   assert.match(readme, /réplica unique|single replica/i);
   assert.match(readme, /observe\/paper|observe et paper/i);
   assert.match(readme, /4\s+heures/);
-  assert.match(readme, /TLS externe/i);
+  assert.match(readme, /HTTPS/u);
   assert.match(readme, /sauvegarde externe/i);
   assert.match(readme, /aucune promesse[^\n]*(?:première position|sellabilité|profit)/i);
 
   assert.match(overview, /href="operations\/deployment\.md"/);
   assert.match(overview, /npm run deployment:smoke/);
   assert.match(overview, /réplica unique|single replica/i);
-  assert.match(overview, /TLS externe/i);
+  assert.match(overview, /HTTPS/u);
   assert.match(overview, /sauvegarde externe/i);
   assert.match(overview, /aucune promesse[^<]*(?:première position|sellabilité|profit)/i);
 
@@ -1535,17 +1472,9 @@ void test('operator documentation activates the safe websocket failover contract
     'SolanaProgramSubscriber',
   ]) assert.ok(documentation.includes(statement), `missing active operational statement: ${statement}`);
   assert.doesNotMatch(documentation, /inactive until #63|inactive.*#63|jusqu[^\n]{0,80}#63/iu);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d migrate/);
-  assert.match(deployment, /DOTENV_CONFIG_PATH=deploy\/\.env npm run rpc:check/);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d --wait --wait-timeout 60 app frontend retention/);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml exec -T app[\s\S]*deployment-healthcheck\.js --require-ok/);
-  assert.match(deployment, /références immuables précédentes/i);
-  assert.match(deployment, /migrations[^.]*forward-only/i);
-  assert.ok(
-    deployment.indexOf('up -d --wait --wait-timeout 60 app frontend retention')
-      < deployment.indexOf('deployment-healthcheck.js --require-ok'),
-    'Compose readiness must be awaited before the strict healthcheck',
-  );
+  assert.match(deployment, /sol_compose up --detach --wait --wait-timeout 180/u);
+  assert.match(deployment, /Les migrations\s+restent forward-only/u);
+  assert.match(deployment, /SOL_HEALTH_REQUIRE_OK=false/u);
 });
 
 void test('documented RPC preflight uses dotenv explicit-path support', async () => {

@@ -1,5 +1,10 @@
 # Canary Mainnet post-merge d’hydratation et admission Pump.fun — 15 minutes
 
+> **Stack de référence.** Les commandes de ce runbook visent la stack d'observation antérieure au
+> 2026-10-09 (services `app`, `frontend`, `retention`). Dans la stack actuelle
+> (`docs/operations/deployment.md`), le listener est le programme `listener` du conteneur `back` :
+> `sol ctl stop listener` remplace `stop app`, et sa configuration vit dans `config/listener.env`.
+
 Version : 1.7.0 — 2026-10-03 — issues #114, #142, #143, #146, #148, #151, #153, #155, #163, #169, #170, #177, #209 et #218.
 
 Cette procédure post-merge est opérateur-only et observe-only et ne confère

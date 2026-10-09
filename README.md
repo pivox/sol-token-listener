@@ -854,16 +854,19 @@ listener est activé et n’est jamais exposé par cette santé.
 
 ## Déploiement de référence
 
-Le compose de référence démarre une seule application listener, un worker de
-rétention et un frontend same-origin ; PostgreSQL et l’API backend restent
-privés. Il est strictement observe/paper : il ne charge aucun wallet, ne signe
-et n’envoie aucune transaction. Le worker conserve les données terminales 4
-heures et les purge à cadence bornée. TLS externe et sauvegarde externe restent
-sous la responsabilité de l’opérateur.
+La stack Docker Compose exécute le bot complet en trois conteneurs : PostgreSQL
+privé, un conteneur `back` où `supervisord` lance chaque processus Node sous
+son propre utilisateur Unix, et un front Caddy en HTTPS, protégé par mot de passe
+et limité à la lecture. Le mode `observe` ne lance que le listener, l’API
+opérateur et la rétention ; le mode `live` ajoute H2a, H2b et l’auto-arm, sans
+nouvel achat avant `sol trading start`. Les secrets sont des fichiers hors du
+dépôt et la keypair n’est lisible que par H2b. Les données terminales sont
+gardées 4 heures. La sauvegarde externe (copie hors machine) reste sous la
+responsabilité de l’opérateur.
 
 Avant une livraison, exécuter le smoke isolé puis suivre le
-[guide de déploiement](docs/operations/deployment.md) pour les secrets, la
-migration, le rollback et l’arrêt :
+[guide de déploiement](docs/operations/deployment.md) pour les secrets, les
+commandes `sol`, la reprise de la base, les sauvegardes et la bascule :
 
 ```bash
 npm run deployment:smoke

@@ -1,5 +1,10 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
+> **Stack Docker Compose.** Depuis le 2026-10-09, les commandes `npm run live:*` et
+> `executor:*` de ce runbook s'exécutent par `docker compose exec -it back sol …`
+> (`docs/operations/deployment.md`, « Commandes sol »), avec la configuration de
+> `config/<rôle>.env` et les secrets distribués par la stack.
+
 **Version :** 1.17.8 — 2026-09-12
 
 La version 1.17.7 ajoute la migration 047. Le hint fermé `PUMPFUN_TRADE`
