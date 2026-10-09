@@ -66,7 +66,7 @@ COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/
 COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf
 COPY deploy/back/supervisor/programs/ /etc/sol/programs/
 # vault-setup loads the policies into Vault (deploy/host/vault-init.sh).
-COPY deploy/vault/policies/ /etc/sol/vault/policies/
+COPY --chmod=0755 deploy/vault/policies/ /etc/sol/vault/policies/
 
 EXPOSE 3000 3100
 
@@ -92,7 +92,7 @@ FROM hashicorp/vault:2.1.2@sha256:c2f666266f383d2cf424d86b8bb8ce7d065562173ffec2
 # user (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 5).
 USER root
 ENV VAULT_ADDR=http://127.0.0.1:8200
-COPY deploy/vault/vault.hcl /vault/config/vault.hcl
+COPY --chmod=0644 deploy/vault/vault.hcl /vault/config/vault.hcl
 COPY --chmod=0755 deploy/vault/vault-entrypoint /usr/local/bin/vault-entrypoint
 
 EXPOSE 8200

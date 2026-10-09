@@ -125,7 +125,8 @@ void test('the entrypoint distributes secrets and applies the boot entry-stop be
   // Under `set -e`, a failing plain command line ends the entrypoint before supervisord.
   assert.match(entrypoint, /^set -eu$/mu);
   assertOrder(entrypoint, [
-    'node /app/dist/scripts/deploy/vault-pull.js back "$mode"',
+    // Alone on its line: a commented-out or `|| true` variant would let the container boot without Vault.
+    '\nnode /app/dist/scripts/deploy/vault-pull.js back "$mode"\n',
     'node /app/dist/scripts/deploy/distribute-secrets.js "$mode"',
     'install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf',
     'if [ "$mode" = live ]; then',

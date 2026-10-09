@@ -94,10 +94,14 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
   );
 
   const vault = stage(dockerfile, 'vault');
+  // Exactly these two copies, with the modes the vault user needs whatever the build host's umask
+  // (a 0600 source would make vault.hcl unreadable for uid 100): nothing else can enter the image.
+  assert.deepEqual(vault.match(/^COPY\s+.+$/gm) ?? [], [
+    'COPY --chmod=0644 deploy/vault/vault.hcl /vault/config/vault.hcl',
+    'COPY --chmod=0755 deploy/vault/vault-entrypoint /usr/local/bin/vault-entrypoint',
+  ]);
   assert.match(vault, /^USER root$/m);
   assert.match(vault, /^ENV VAULT_ADDR=http:\/\/127\.0\.0\.1:8200$/m);
-  assert.match(vault, /^COPY deploy\/vault\/vault\.hcl \/vault\/config\/vault\.hcl$/m);
-  assert.match(vault, /^COPY --chmod=0755 deploy\/vault\/vault-entrypoint \/usr\/local\/bin\/vault-entrypoint$/m);
   assert.match(vault, /^EXPOSE 8200$/m);
   assert.match(vault, /^ENTRYPOINT \["vault-entrypoint"\]$/m);
 });
@@ -115,7 +119,7 @@ void test('backend image ships compiled artifacts, supervisor and one Unix user 
     'COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/',
     'COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf',
     'COPY deploy/back/supervisor/programs/ /etc/sol/programs/',
-    'COPY deploy/vault/policies/ /etc/sol/vault/policies/',
+    'COPY --chmod=0755 deploy/vault/policies/ /etc/sol/vault/policies/',
   ]);
   assert.doesNotMatch(backend, /\btests?\/|fixtures?|\.env\b|\.git\b|\.worktrees|npm-cache|secret|keypair|wallet/iu);
   assert.match(backend, /^ENV\s+NODE_ENV=production$/m);
