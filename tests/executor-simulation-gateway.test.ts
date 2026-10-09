@@ -369,6 +369,124 @@ void test('keeps SELL quote flow stable when a terminal WSOL account is closed',
   assert.equal(result.simulatedBaseDeltaRaw, -100n);
 });
 
+void test('keeps SELL quote flow rent-neutral when the emptied base ATA is closed', async () => {
+  // The pre base ATA holds exactly amountInRaw (100) so the full exit empties it.
+  const pre = pumpFunSnapshot([
+    systemAccount(PAYER, 10_000_000n),
+    tokenAccount(BASE_ATA, MINT, PAYER, 100n, 2_039_280n, false),
+    tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+  ]);
+  const plan = await buildPumpFunPlan(pumpFunRequest('SELL', fingerprint(pre), 'SPL_TOKEN', true));
+  assert.equal(plan.instructions.length, 2);
+  const scenarios: readonly (readonly [string, readonly [ExecutionRpcAccount, ExecutionRpcAccount | null, ExecutionRpcAccount | null]])[] = [
+    // Base ATA closed: its 2,039,280 lamports of rent return to the payer with the 100 proceeds (fee 5).
+    ['base closed', [
+      systemAccount(PAYER, 12_039_375n),
+      null,
+      tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+    ]],
+    // Base ATA and terminal WSOL both closed.
+    ['base and quote closed', [systemAccount(PAYER, 14_078_705n), null, null]],
+    // Base ATA still present and empty (the provider did not drop it): same flow.
+    ['base present and empty', [
+      systemAccount(PAYER, 10_000_095n),
+      tokenAccount(BASE_ATA, MINT, PAYER, 0n, 2_039_280n, false),
+      tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+    ]],
+  ];
+  for (const [label, accounts] of scenarios) {
+    const provider = new ScriptedGateway(pre, Object.freeze({
+      providerId: 'primary', contextSlot: 125n, failureKind: null,
+      logs: Object.freeze(['Program log: success']), unitsConsumed: 25_000n,
+      accounts: Object.freeze(accounts),
+      innerInstructions: Object.freeze([]),
+    }));
+    const result = await new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, pre), activeSignal(),
+    );
+    assert.equal(result.outcome, 'SUCCESS', label);
+    assert.equal(result.simulatedQuoteDeltaRaw, 100n, label);
+    assert.equal(result.simulatedBaseDeltaRaw, -100n, label);
+    assert.equal(result.simulatedFeePayerLamportDebit, 0n, label);
+  }
+
+  // A closing plan whose pre balance is not exactly amountInRaw (1_000 vs 100) is rejected
+  // even when the provider reports a plausible post state.
+  const partialPre = pumpFunSnapshot([
+    systemAccount(PAYER, 10_000_000n),
+    tokenAccount(BASE_ATA, MINT, PAYER, 1_000n, 2_039_280n, false),
+    tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+  ]);
+  const partialPlan = await buildPumpFunPlan(pumpFunRequest('SELL', fingerprint(partialPre), 'SPL_TOKEN', true));
+  for (const postBase of [
+    null,
+    tokenAccount(BASE_ATA, MINT, PAYER, 900n, 2_039_280n, false),
+  ]) {
+    const partialProvider = new ScriptedGateway(partialPre, Object.freeze({
+      providerId: 'primary', contextSlot: 125n, failureKind: null,
+      logs: Object.freeze(['Program log: success']), unitsConsumed: 25_000n,
+      accounts: Object.freeze([
+        systemAccount(PAYER, postBase === null ? 12_039_375n : 10_000_095n),
+        postBase,
+        tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+      ]),
+      innerInstructions: Object.freeze([]),
+    }));
+    await rejectsGateway(
+      new SolanaSimulationGateway(partialProvider, partialProvider.receiptAuthority, limits()).simulate(
+        gatewayInput(partialProvider, partialPlan, partialPre), activeSignal(),
+      ),
+      'SIMULATION',
+      'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
+void test('requires a funded post base ATA for a dust-leaving SELL that carries no close', async () => {
+  const pre = pumpFunSnapshot([
+    systemAccount(PAYER, 10_000_000n),
+    tokenAccount(BASE_ATA, MINT, PAYER, 1_000n, 2_039_280n, false),
+    tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+  ]);
+  const plan = await buildPumpFunPlan(pumpFunRequest('SELL', fingerprint(pre)));
+  assert.equal(plan.instructions.length, 1);
+  const provider = new ScriptedGateway(pre, Object.freeze({
+    providerId: 'primary', contextSlot: 125n, failureKind: null,
+    logs: Object.freeze(['Program log: success']), unitsConsumed: 25_000n,
+    accounts: Object.freeze([
+      systemAccount(PAYER, 12_039_375n),
+      null,
+      tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+    ]),
+    innerInstructions: Object.freeze([]),
+  }));
+  await rejectsGateway(
+    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, pre), activeSignal(),
+    ),
+    'SIMULATION',
+    'RPC_RESPONSE_INVALID',
+  );
+});
+
+void test('still rejects a missing post base ATA on a BUY', async () => {
+  const pre = pumpFunSnapshot([systemAccount(PAYER, 10_000_000n), null, null]);
+  const plan = await buildPumpFunPlan(pumpFunRequest('BUY', fingerprint(pre)));
+  const provider = new ScriptedGateway(pre, Object.freeze({
+    providerId: 'primary', contextSlot: 125n, failureKind: null,
+    logs: Object.freeze(['Program log: success']), unitsConsumed: 25_000n,
+    accounts: Object.freeze([systemAccount(PAYER, 7_960_625n), null, null]),
+    innerInstructions: Object.freeze([]),
+  }));
+  await rejectsGateway(
+    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, pre), activeSignal(),
+    ),
+    'SIMULATION',
+    'RPC_RESPONSE_INVALID',
+  );
+});
+
 void test('rejects a snapshot fingerprint mismatch before any post-snapshot RPC', async () => {
   const pre = pumpFunSnapshot([
     systemAccount(PAYER, 10_000_000n),
@@ -699,6 +817,7 @@ function pumpFunRequest(
   side: 'BUY' | 'SELL',
   snapshotFingerprint: string,
   baseTokenProgram: 'SPL_TOKEN' | 'TOKEN_2022' = 'SPL_TOKEN',
+  closeBaseAta = false,
 ): PumpFunBuildRequestV1 {
   const baseAta = baseTokenProgram === 'SPL_TOKEN' ? BASE_ATA : BASE_ATA_2022;
   return Object.freeze({
@@ -715,7 +834,7 @@ function pumpFunRequest(
       ownerProgramId: PUMP_PROGRAM_ID.toBase58(), exists: true, complete: false,
       creator: key(30), isMayhemMode: false,
     }),
-    userBaseTokenAccount: Object.freeze({ address: baseAta, exists: side === 'SELL' }),
+    userBaseTokenAccount: Object.freeze({ address: baseAta, exists: side === 'SELL', closeBaseAta }),
     recipients: Object.freeze({
       feeRecipient: key(100), feeRecipients: frozenKeys(101, 7),
       reservedFeeRecipient: key(110), reservedFeeRecipients: frozenKeys(111, 7),

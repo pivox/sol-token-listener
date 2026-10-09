@@ -137,7 +137,7 @@ function loadPlan(value: unknown): UnsignedBuildPlanV1 {
     ? (() => {
       exactKeys(evidence, [
         'payloadVersion', 'venue', 'snapshotSlot', 'snapshotFingerprint', 'isMayhemMode',
-        'curveAddress', 'creator', 'userBaseAtaExisted', 'feeSelection', 'buybackSelection',
+        'curveAddress', 'creator', 'userBaseAtaExisted', 'closeBaseAta', 'feeSelection', 'buybackSelection',
       ]);
       return {
         ...commonEvidence,
@@ -145,6 +145,7 @@ function loadPlan(value: unknown): UnsignedBuildPlanV1 {
         curveAddress: string(evidence.curveAddress),
         creator: string(evidence.creator),
         userBaseAtaExisted: boolean(evidence.userBaseAtaExisted),
+        closeBaseAta: boolean(evidence.closeBaseAta),
         feeSelection: selection(evidence.feeSelection),
         buybackSelection: selection(evidence.buybackSelection),
       };

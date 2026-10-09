@@ -69,6 +69,8 @@ export type BuildPolicyEvidenceV1 = Readonly<{
   readonly curveAddress: string;
   readonly creator: string;
   readonly userBaseAtaExisted: boolean;
+  /** SELL only: the base ATA held exactly amountInRaw, so the plan closes it after the trade. */
+  readonly closeBaseAta: boolean;
   readonly feeSelection: BuildRecipientSelectionV1;
   readonly buybackSelection: BuildRecipientSelectionV1;
 }> | Readonly<{
