@@ -131,11 +131,11 @@ Lint is `npm run lint:backend` (eslint, plus `node --check` of the smoke). Commi
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-10-09-vault-secrets-design.md`
-- Modify: `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md:217-222`
+- Modify: `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md:226-231` (section 7.3)
 
 - [ ] **Step 1: Record the deviations in the Vault spec**
 
-In section 6.3, replace « `secrets/vault/<rôle>-approle.json` » with « `secrets/vault/approle/<rôle>.json` ». In section 5, bullet « Script d'entrée `vault-entrypoint` », step 3, replace « la clé montée en lecture seule depuis `secrets/vault/unseal-key` » with « la clé du dossier `secrets/vault/unseal/`, monté en lecture seule ». In section 8.1, step 2, replace « `secrets/vault/unseal-key` » with « `secrets/vault/unseal/unseal-key` ». In section 8.5, replace the first bullet with « `secrets/vault/unseal/unseal-key` et `secrets/vault/approle/{back,migrate,backup}.json` ; ». Then append this section at the end of the spec:
+In section 6.3, replace « `secrets/vault/<rôle>-approle.json` » with « `secrets/vault/approle/<rôle>.json` ». In section 7.1, replace « `secrets/vault/back-approle.json` » with « `secrets/vault/approle/back.json` ». In section 5, bullet « Script d'entrée `vault-entrypoint` », step 3, replace « la clé montée en lecture seule depuis `secrets/vault/unseal-key` » with « la clé du dossier `secrets/vault/unseal/`, monté en lecture seule ». In section 8.1, step 2, replace « `secrets/vault/unseal-key` » with « `secrets/vault/unseal/unseal-key` ». In section 8.5, replace the first bullet with « `secrets/vault/unseal/unseal-key` et `secrets/vault/approle/{back,migrate,backup}.json` ; ». Then append this section at the end of the spec:
 
 ```markdown
 ## 13. Amendements du 2026-10-09 (plan d'implémentation)
@@ -144,7 +144,7 @@ Le plan `docs/superpowers/plans/2026-10-09-vault-secrets.md` précise ce spec su
 reportés dans les sections concernées :
 
 1. Les fichiers de Vault sur l'hôte vivent dans deux dossiers, `secrets/vault/unseal/` et
-   `secrets/vault/approle/` (5, 6.3, 8.1, 8.5).
+   `secrets/vault/approle/` (5, 6.3, 7.1, 8.1, 8.5).
    - La clé de déverrouillage n'existe pas au premier démarrage de `vault` : un montage de
      fichier absent ferait créer un dossier par Docker. `vault` monte donc le dossier `unseal/`.
    - `back` et `migrate` montent leur fichier AppRole en syntaxe longue, qui échoue sur un
@@ -174,7 +174,7 @@ In `docs/superpowers/specs/2026-10-09-full-bot-compose-design.md`, section 7.3, 
 
 ```markdown
 Réalisé par le sous-projet 2, `docs/superpowers/specs/2026-10-09-vault-secrets-design.md` :
-un AppRole par conteneur plutôt qu'un rôle par utilisateur (section 6.3 de ce document), et la
+un AppRole par conteneur plutôt qu'un rôle par utilisateur (section 6.3 du spec Vault), et la
 configuration non secrète passe elle aussi dans Vault.
 ```
 
