@@ -40,11 +40,16 @@ const VARIABLE = /^[A-Z][A-Z0-9_]{0,127}$/u;
 const DATABASE_NAME = /^[a-z_][a-z0-9_]{0,62}$/u;
 const SECRET_TEXT = /^[\x21-\x7e]{1,4096}$/u;
 
+/** The one rule for the name of a configuration variable. */
+export function isVariableName(value: string): boolean {
+  return VARIABLE.test(value);
+}
+
 /** Parses a non-secret dotenv file and refuses anything that belongs in a secret file. */
 export function parseRoleConfig(text: string, label: string): Readonly<Record<string, string>> {
   const parsed = parse(text);
   for (const [key, value] of Object.entries(parsed)) {
-    if (!VARIABLE.test(key)) throw new RoleEnvironmentError(`${label}: invalid variable name`);
+    if (!isVariableName(key)) throw new RoleEnvironmentError(`${label}: invalid variable name`);
     if (INJECTED_KEYS.has(key) || SECRET_KEY.test(key)) {
       throw new RoleEnvironmentError(
         `${label}: ${key} comes from a secret file, not from the configuration`,
@@ -156,7 +161,7 @@ export function buildRoleEnvironment(input: RoleEnvironmentInput): Readonly<Reco
 /** `export NAME='value'` lines for `eval` in POSIX sh; a single quote is the only special case. */
 export function renderShellExports(environment: Readonly<Record<string, string>>): string {
   return Object.keys(environment).sort().map((key) => {
-    if (!VARIABLE.test(key)) throw new RoleEnvironmentError('invalid variable name');
+    if (!isVariableName(key)) throw new RoleEnvironmentError('invalid variable name');
     const value = environment[key] ?? '';
     return `export ${key}='${value.replaceAll("'", "'\\''")}'\n`;
   }).join('');
