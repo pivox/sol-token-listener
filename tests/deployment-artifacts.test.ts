@@ -1291,9 +1291,11 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /SOL_HOST_DIR:\s*hostDirectory/);
   assert.match(smoke, /SOL_STACK_MODE:\s*'observe'/);
   assert.match(smoke, /SOL_HEALTH_REQUIRE_OK:\s*'false'/);
-  // The import source: the smoke's listener never contacts an RPC.
-  assert.match(smoke, /'SOLANA_HTTP_RPC_URL=https:\/\/rpc\.invalid'/);
-  assert.match(smoke, /'SOLANA_WS_RPC_URL=wss:\/\/rpc\.invalid'/);
+  // The import source: the smoke's listener never contacts an RPC, and the fake key traces leaks.
+  assert.match(smoke, /`SOLANA_HTTP_RPC_URL=https:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
+  assert.match(smoke, /`SOLANA_WS_RPC_URL=wss:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
+  assert.match(smoke, /const rpcApiKey = randomBytes\(16\)\.toString\('hex'\);/);
+  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey\];/);
   assert.match(smoke, /'LISTENER_ENABLED=false'/);
   assert.match(smoke, /`EXECUTOR_KEYPAIR_PATH=\$\{keypairFile\}`/);
   assert.match(smoke, /VAULT_IMAGE:\s*deploymentImages\.vault/);
@@ -1334,7 +1336,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'executionIntents'/);
   assert.doesNotMatch(smoke, /Migration history does not contain exactly 14 rows\./);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key/iu);
-  // The only keypair is random bytes that prove the tmpfs isolation; it never holds funds.
+  // The only keypair is random bytes that prove observe mode leaves it in Vault; it never holds funds.
   assert.match(smoke, /const throwawayKeypair = JSON\.stringify\(\[\.\.\.randomBytes\(64\)\]\);/u);
   assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
 
@@ -1451,18 +1453,24 @@ void test('failed signal fault probes always clean only their explicit child pro
 
 void test('deployment smoke proves users, secret isolation, front authentication, logins and closed operations', async () => {
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  let previous = -1;
   for (const phase of [
     'HOST_SETUP', 'VAULT_SETUP', 'VAULT_IMPORT', 'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION',
-    'FRONT_AUTH', 'LOGINS', 'OPERATIONS', 'BACKUP', 'SECRET_LEAKS', 'VAULT_RESTART', 'VAULT_FAIL_CLOSED',
+    'FRONT_AUTH', 'LOGINS', 'OPERATIONS', 'BACKUP', 'VAULT_RESTART', 'VAULT_FAIL_CLOSED', 'SECRET_LEAKS',
   ]) {
-    assert.ok(smoke.includes(`await smokePhase('${phase}'`), `missing smoke phase ${phase}`);
+    const index = smoke.indexOf(`await smokePhase('${phase}'`);
+    assert.ok(index > previous, `missing or misplaced smoke phase ${phase}`);
+    previous = index;
   }
+  // The leak scan comes last: it covers the entrypoint's unseal from the key file and the refused boots.
+  assert.equal(smoke.lastIndexOf('await smokePhase('), smoke.indexOf("await smokePhase('SECRET_LEAKS'"));
   for (const statement of [
     "assertEqual(stdout, 'listener 10001\\nopapi 10005\\nretention 10006\\n'",
     "assertEqual(stdout.trim(), '10100'",
     "assertEqual(stdout, 'listener 400\\nopapi 400\\n'",
     "'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path",
-    "if (pulled.includes('wallet-keypair'))",
+    "'exec', '-T', 'back', 'find', '/root/secrets', '/run/sol', '-name', '*keypair*'",
+    "if (pulled !== '')",
     "await readBackSecret('back/operator-api-token')",
     'assertEqual(anonymous.status, 401',
     'assertEqual(write.status, 405',
@@ -1471,8 +1479,14 @@ void test('deployment smoke proves users, secret isolation, front authentication
     'readBackSecret(`logins/pg-${login}-password`)',
     '`PGOPTIONS=-c role=${group}`',
     "assertEqual(counts.trim(), '0|0'",
-    "stdout.includes('vault-pull: Vault unavailable')",
+    "occurrences(/vault-pull: Vault unavailable/gu)",
+    'if (before < 1)',
+    'if (await failedPulls() >= failedBefore + 2) break;',
+    'if (attempt >= 45)',
     "assertEqual(String(await distributions()), String(before)",
+    "assertNoSmokeSecret(inspect, 'A secret value appears in docker inspect.')",
+    "assertNoSmokeSecret(await composeLogs(), 'A secret value appears in the container logs.')",
+    'return `${stdout}\\n${stderr}`;',
   ]) {
     assert.ok(smoke.includes(statement), `missing smoke check: ${statement}`);
   }
@@ -1488,18 +1502,27 @@ void test('deployment smoke fills its Vault through the host scripts without eve
   const setup = between('async function setupSmokeVault', 'async function importSmokeVault');
   const fill = between('async function importSmokeVault', 'async function readBackSecret');
 
-  // The host scripts read every compose input, the project name included, from compose.env.
+  // The host scripts read every compose input from compose.env. Only Docker's own variables come
+  // from the smoke's environment, plus the project name, in defence in depth.
   assert.match(smoke, /COMPOSE_INPUTS\.map\(\(name\) => `\$\{name\}=\$\{environment\[name\]\}\\n`\)/);
   assert.match(smoke, /const COMPOSE_INPUTS = Object\.freeze\(\[\s*'COMPOSE_PROJECT_NAME', 'SOL_HOST_DIR',/);
-  assert.match(hostEnvironment, /SOL_HOST_DIR: hostDirectory/);
-  assert.doesNotMatch(hostEnvironment, /\.\.\.environment\b/);
-  // vault-init.sh prints the operator password once: no failure message may carry its output.
+  assert.ok(hostEnvironment.includes('.filter(([name]) => /^(?:PATH|HOME|DOCKER_\\w+)$/u.test(name))'));
+  assert.deepEqual(
+    [...hostEnvironment.matchAll(/^ {4}([A-Z_]+): /gmu)].map((match) => match[1]),
+    ['COMPOSE_PROJECT_NAME', 'SOL_HOST_DIR'],
+  );
+  assert.match(hostEnvironment, /COMPOSE_PROJECT_NAME: projectName,\s*SOL_HOST_DIR: hostDirectory,/);
+  assert.doesNotMatch(hostEnvironment, /\.\.\.(?:environment|process\.env)\b/);
+  // vault-init.sh prints the operator password once: no failure message may carry its output, and the
+  // output may show no other secret, checked once the unseal key and the secret_ids are known.
   assert.match(setup, /commandEnvironment: hostScriptEnvironment\(\),\s*reflectFailureOutput: false,/);
   assert.ok(setup.includes(
     '/^Vault operator password, shown once \\(store it in your password manager\\): (\\S+)$/mu',
   ));
-  assert.equal((setup.match(/smokeSecrets\.push\(/gu) ?? []).length, 3, 'password, unseal key and secret_ids');
+  const outputCheck = setup.indexOf("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-init.sh printed a secret.', password);");
+  assert.ok(outputCheck > setup.lastIndexOf('smokeSecrets.push('), 'vault-init output checked after the last push');
   assert.match(fill, /input: `\$\{operatorPassword\}\\n`, reflectFailureOutput: false/);
+  assert.ok(fill.includes("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-import.sh printed a secret.');"));
   assert.ok(fill.includes("summary.configs.join(','), 'listener,live'"));
   assert.ok(fill.includes("readdir(resolve(root, 'deploy/config'))"));
   assert.ok(fill.includes("'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json'"));
