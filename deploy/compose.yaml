@@ -1,125 +1,112 @@
 name: sol-token-listener
 
-x-database-environment: &database-environment
-  DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD_URI_ENCODED:?POSTGRES_PASSWORD_URI_ENCODED is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
-  POSTGRES_AUTO_MIGRATE: "false"
+# Full-bot stack (docs/superpowers/specs/2026-10-09-full-bot-compose-design.md). Secrets are files
+# under ${SOL_HOST_DIR}/secrets, mounted read-only under /root/secrets: nothing secret lives here.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
 
 services:
   postgres:
     image: postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-sol_token_listener}
+      POSTGRES_USER: sol_owner
+      POSTGRES_PASSWORD_FILE: /root/secrets/postgres-admin-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test: ["CMD-SHELL", "pg_isready -U sol_owner -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 5s
-    volumes: ["postgres-data:/var/lib/postgresql/data"]
     networks: [internal]
+    logging: *logging
     restart: unless-stopped
 
   migrate:
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
-    command: ["node", "dist/scripts/migrate.js"]
-    environment: *database-environment
+    command: ["sol-admin", "migrate"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sol_token_listener}
+    volumes:
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db:/root/secrets/db:ro
     depends_on:
       postgres:
         condition: service_healthy
     networks: [internal]
+    logging: *logging
     restart: "no"
 
-  app:
+  back:
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     build:
       context: ..
       dockerfile: Dockerfile
       target: backend
+    command: ["sol-entrypoint"]
     environment:
-      <<: *database-environment
-      SOLANA_HTTP_RPC_URL: ${SOLANA_HTTP_RPC_URL:?SOLANA_HTTP_RPC_URL is required}
-      SOLANA_HTTP_RPC_FALLBACK_URLS: ${SOLANA_HTTP_RPC_FALLBACK_URLS:-}
-      SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
-      SOLANA_WS_RPC_FALLBACK_URLS: ${SOLANA_WS_RPC_FALLBACK_URLS:-}
-      SOLANA_EXPECTED_GENESIS_HASH: ${SOLANA_EXPECTED_GENESIS_HASH:-}
-      EXECUTION_MODE: observe
-      PAPER_STRATEGY_ENABLED: "false"
-      API_ENABLED: "true"
-      DATA_RETENTION_HOURS: "4"
-      API_HOST: 0.0.0.0
-      API_PORT: "3000"
-      LISTENER_ENABLED: ${LISTENER_ENABLED:-true}
-      LISTENER_INGESTION_SCOPE: "${LISTENER_INGESTION_SCOPE:-launchpad-and-market}"
-      ENTRY_MODE: "${ENTRY_MODE:-off}"
-      LISTENER_WORKER_COUNT: "${LISTENER_WORKER_COUNT:-1}"
-      LISTENER_CATCH_UP_POLICY: "${LISTENER_CATCH_UP_POLICY:-live-edge}"
-      LISTENER_CATCH_UP_MAX_PAGES: "${LISTENER_CATCH_UP_MAX_PAGES:-20}"
-      LISTENER_CATCH_UP_PAGE_SIZE: "${LISTENER_CATCH_UP_PAGE_SIZE:-100}"
-      LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED: "${LISTENER_PUMPFUN_CATCH_UP_PAGE_ADMISSION_ENABLED:-false}"
-      LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED: "${LISTENER_PUMPFUN_BOUNDED_WORKER_ADMISSION_ENABLED:-false}"
-      LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS: "${LISTENER_PUMPFUN_TRACKING_WINDOW_SECONDS:-45}"
-      LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED: "${LISTENER_PUMPFUN_CATCH_UP_COVERAGE_FAST_PATH_ENABLED:-false}"
-      LISTENER_BLOCK_HYDRATION_ENABLED: "${LISTENER_BLOCK_HYDRATION_ENABLED:-false}"
-      LISTENER_BLOCK_HYDRATION_MAX_ENTRIES: "${LISTENER_BLOCK_HYDRATION_MAX_ENTRIES:-64}"
-      LISTENER_BLOCK_HYDRATION_MAX_BYTES: "${LISTENER_BLOCK_HYDRATION_MAX_BYTES:-67108864}"
-      LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES: "${LISTENER_BLOCK_HYDRATION_MAX_ENTRY_BYTES:-8388608}"
-      LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS: "${LISTENER_BLOCK_HYDRATION_CONFIRMED_TTL_MS:-10000}"
-      LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS: "${LISTENER_BLOCK_HYDRATION_FINALIZED_TTL_MS:-60000}"
-      LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS: "${LISTENER_BLOCK_HYDRATION_FETCH_INTERVAL_MS:-250}"
+      SOL_STACK_MODE: ${SOL_STACK_MODE:-observe}
+      SOL_HEALTH_REQUIRE_OK: ${SOL_HEALTH_REQUIRE_OK:-true}
+      POSTGRES_DB: ${POSTGRES_DB:-sol_token_listener}
+    volumes:
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/logins:/root/secrets/logins:ro
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/back:/root/secrets/back:ro
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/config:/etc/sol/config:ro
+      - evidence:/var/lib/sol/evidence
+    tmpfs: ["/run/sol:mode=0711,size=16m"]
     init: true
-    stop_grace_period: 40s
+    stop_grace_period: 60s
     depends_on:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js", "--require-ok"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    networks: [internal, application]
+      test: ["CMD", "sol-health"]
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 60s
+    networks: [internal, egress, edge]
+    logging: *logging
     restart: unless-stopped
 
-  retention:
-    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
-    command: ["node", "dist/scripts/purge-retained-data.js"]
-    environment:
-      <<: *database-environment
-      DATA_RETENTION_HOURS: "4"
-      RETENTION_PURGE_INTERVAL_MS: ${RETENTION_PURGE_INTERVAL_MS:-900000}
-    init: true
-    stop_grace_period: 40s
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    networks: [internal]
-    restart: unless-stopped
-
-  frontend:
+  front:
     image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is required}
     build:
       context: ..
       dockerfile: Dockerfile
       target: frontend
+    environment:
+      SITE_ADDRESS: http://:8080
+      FRONT_BASIC_AUTH_USER: ${FRONT_BASIC_AUTH_USER:-operator}
+    volumes:
+      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro
+      - caddy-data:/data
+    ports: ["127.0.0.1:${FRONT_PORT:-8080}:8080"]
+    depends_on:
+      back:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/index.html"]
-      interval: 2s
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 5s
       timeout: 3s
       retries: 30
       start_period: 10s
-    depends_on:
-      app:
-        condition: service_healthy
-    ports: ["127.0.0.1:${FRONTEND_PORT:-8080}:8080"]
-    networks: [application]
+    networks: [edge]
+    logging: *logging
     restart: unless-stopped
 
 networks:
   internal:
     internal: true
-  application:
+  egress:
+  edge:
 
 volumes:
   postgres-data:
+  evidence:
+  caddy-data:

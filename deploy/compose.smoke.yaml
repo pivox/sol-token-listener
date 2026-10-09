@@ -1,6 +1,0 @@
-services:
-  app:
-    environment:
-      LISTENER_ENABLED: "false"
-    healthcheck:
-      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]
