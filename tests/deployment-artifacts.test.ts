@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { STACK_USERS } from '../src/deploy/stack.js';
 
 const root = new URL('../', import.meta.url);
 void test('frontend readiness waits for local HTTP without weakening backend checks', async () => {
@@ -18,8 +19,8 @@ void test('frontend readiness waits for local HTTP without weakening backend che
 
 const nodeImage =
   'node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94';
-const nginxImage =
-  'nginxinc/nginx-unprivileged:1.30.4-alpine@sha256:44e36330f74d4f3a1d4e222acca9e23b401fb87811a7597024502bb759c4dd49';
+const caddyImage =
+  'caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d';
 const postgresImage =
   'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3';
 
@@ -58,7 +59,7 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
     ['dependencies', 'build'],
     [nodeImage, 'production-dependencies'],
     [nodeImage, 'backend'],
-    [nginxImage, 'frontend'],
+    [caddyImage, 'frontend'],
   ]);
   assert.doesNotMatch(dockerfile, /^COPY\s+(?:--\S+\s+)*\.(?:\s|$)/gim);
 
@@ -89,40 +90,50 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
   );
 });
 
-void test('backend image contains only compiled application artifacts and production dependencies', async () => {
+void test('backend image ships compiled artifacts, supervisor and one Unix user per process', async () => {
   const dockerfile = await readArtifact('Dockerfile');
   const backend = stage(dockerfile, 'backend');
   const copies = backend.match(/^COPY\s+.+$/gm) ?? [];
 
   assert.deepEqual(copies, [
-    'COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules',
-    'COPY --from=build --chown=node:node /app/dist ./dist',
-    'COPY --chown=node:node package.json package-lock.json ./',
+    'COPY --from=production-dependencies /app/node_modules ./node_modules',
+    'COPY --from=build /app/dist ./dist',
+    'COPY package.json package-lock.json ./',
+    'COPY --from=build /app/scripts/provision-executor-roles.sql ./dist/scripts/provision-executor-roles.sql',
+    'COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/',
+    'COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf',
+    'COPY deploy/back/supervisor/programs/ /etc/sol/programs/',
   ]);
-  assert.doesNotMatch(backend, /tests?|fixtures?|\.env|\.git|\.worktrees|npm-cache/i);
+  assert.doesNotMatch(backend, /\btests?\/|fixtures?|\.env\b|\.git\b|\.worktrees|npm-cache|secret|keypair|wallet/iu);
   assert.match(backend, /^ENV\s+NODE_ENV=production$/m);
-  assert.match(backend, /^USER\s+node$/m);
-  assert.match(backend, /^EXPOSE\s+3000$/m);
-  assert.match(backend, /^CMD\s+\["node",\s*"dist\/src\/app\.js"\]$/m);
+  assert.match(backend, /apt-get install --yes --no-install-recommends supervisor/u);
+  for (const [user, uid] of Object.entries(STACK_USERS)) {
+    assert.ok(backend.includes(`${user}:${uid}`), `missing Unix user ${user}`);
+  }
+  assert.match(backend, /install -d -o ops -g ops -m 0700 \/var\/lib\/sol\/evidence/u);
+  // The build writes the qualification profiles 0600: without this the listener user cannot start.
+  assert.match(backend, /^RUN chmod -R a\+rX \/app\/dist$/mu);
+  assert.doesNotMatch(backend, /^USER\s+/mu, 'the entrypoint needs root; each program drops to its user');
+  assert.match(backend, /^EXPOSE\s+3000 3100$/m);
+  assert.match(backend, /^CMD\s+\["sol-entrypoint"\]$/m);
 });
 
-void test('frontend image contains only built static assets and the reviewed unprivileged config', async () => {
+void test('front image serves only the built console through the reviewed Caddyfile, as a non-root user', async () => {
   const dockerfile = await readArtifact('Dockerfile');
   const frontend = stage(dockerfile, 'frontend');
   const copies = frontend.match(/^COPY\s+.+$/gm) ?? [];
-  const users = [...frontend.matchAll(/^USER\s+(\S+)$/gm)].map((match) => match[1]);
 
   assert.deepEqual(copies, [
-    'COPY --from=build /app/frontend/dist /usr/share/nginx/html',
-    'COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf',
+    'COPY --from=build /app/frontend/dist /srv',
+    'COPY deploy/front/Caddyfile /etc/caddy/Caddyfile',
+    'COPY --chmod=0755 deploy/front/front-entrypoint /usr/local/bin/front-entrypoint',
   ]);
-  assert.match(
-    frontend,
-    /^RUN\s+find \/usr\/share\/nginx\/html -mindepth 1 -maxdepth 1 -delete$/m,
-  );
-  assert.deepEqual(users, ['root', 'nginx']);
-  assert.match(frontend, /^EXPOSE\s+8080$/m);
-  assert.doesNotMatch(frontend, /(?:^|\/)src(?:\/|\s)|tests?|fixtures?|\.env|\.git|\.worktrees/i);
+  assert.match(frontend, /addgroup -S -g 10100 caddy/u);
+  assert.match(frontend, /adduser -S -D -H -u 10100 -G caddy -s \/sbin\/nologin caddy/u);
+  assert.match(frontend, /chown -R caddy:caddy \/data \/config/u);
+  assert.match(frontend, /^EXPOSE\s+8080 80 443$/m);
+  assert.match(frontend, /^CMD\s+\["front-entrypoint"\]$/m);
+  assert.doesNotMatch(frontend, /(?:^|\/)src(?:\/|\s)|\btests?\b|fixtures?|\.env\b|\.git\b|\.worktrees/iu);
 });
 
 void test('.dockerignore removes secrets, repositories, generated output, fixtures, and caches', async () => {
@@ -153,42 +164,54 @@ void test('.dockerignore removes secrets, repositories, generated output, fixtur
   assert.equal(rules.some((rule) => rule.startsWith('!.env')), false);
 });
 
-void test('Nginx serves the SPA with bounded caching and proxies only the read-only V1 API', async () => {
-  const nginx = await readArtifact('deploy/nginx.conf');
+void test('Caddy relays only reads, authenticates every route but the operator API, streams SSE', async () => {
+  const caddyfile = await readArtifact('deploy/front/Caddyfile');
+  const route = caddyfile.slice(caddyfile.indexOf('route {'));
+  let previous = -1;
+  for (const marker of [
+    '@write not method GET HEAD OPTIONS',
+    'respond @write 405',
+    'reverse_proxy /operator/v1/* back:3100 {',
+    'header_up Host 0.0.0.0:3100',
+    'basic_auth {',
+    '{$FRONT_BASIC_AUTH_USER} {$FRONT_BASIC_AUTH_HASH}',
+    'reverse_proxy /api/v1/events back:3000 {',
+    'reverse_proxy @api back:3000 {',
+    'try_files {path} /index.html',
+    'file_server',
+  ]) {
+    const index = route.indexOf(marker);
+    assert.ok(index > previous, `${marker} is missing or out of order`);
+    previous = index;
+  }
+  assert.ok(caddyfile.includes('{$SITE_ADDRESS:http://:8080} {'));
+  assert.ok(caddyfile.includes('admin localhost:2019'));
+  assert.match(caddyfile, /@api path \/api\/v1 \/api\/v1\/\*/u);
+  assert.match(caddyfile, /flush_interval -1/u);
+  assert.match(caddyfile, /read_timeout 1h/u);
+  assert.equal((caddyfile.match(/header_up -Authorization/gu) ?? []).length, 2);
+  for (const header of [
+    'Strict-Transport-Security "max-age=31536000"', 'X-Frame-Options "DENY"',
+    'Referrer-Policy "no-referrer"', 'X-Content-Type-Options "nosniff"', '-Server',
+  ]) {
+    assert.ok(caddyfile.includes(header), `missing header ${header}`);
+  }
+  assert.ok(caddyfile.includes('header @immutable Cache-Control "public, max-age=31536000, immutable"'));
+  assert.ok(caddyfile.includes('header @mutable Cache-Control "no-store"'));
+  assert.doesNotMatch(caddyfile, /\$2[aby]\$|password/iu);
+});
 
-  assert.match(nginx, /listen\s+8080;/);
-  assert.match(nginx, /autoindex\s+off;/);
-  assert.match(nginx, /resolver\s+127\.0\.0\.11\s+ipv6=off\s+valid=1s;/);
-  assert.match(nginx, /resolver_timeout\s+5s;/);
-  assert.match(nginx, /set\s+\$app_upstream\s+app:3000;/);
-  assert.match(
-    nginx,
-    /location\s+=\s+\/config\.json\s*\{[^}]*Cache-Control\s+"no-store"[^}]*try_files\s+\$uri\s+=404;/s,
-  );
-  assert.match(
-    nginx,
-    /location\s+=\s+\/index\.html\s*\{[^}]*Cache-Control\s+"no-store"[^}]*try_files\s+\$uri\s+=404;/s,
-  );
-  assert.match(
-    nginx,
-    /location\s+\^~\s+\/assets\/\s*\{[^}]*Cache-Control\s+"public, max-age=31536000, immutable"[^}]*try_files\s+\$uri\s+=404;/s,
-  );
-  assert.match(nginx, /location\s+\/\s*\{[^}]*try_files\s+\$uri\s+\$uri\/\s+\/index\.html;/s);
-
-  assert.match(nginx, /location\s+=\s+\/api\/v1\/events\s*\{/);
-  assert.match(nginx, /location\s+\^~\s+\/api\/v1\/\s*\{/);
-  assert.match(nginx, /location\s+=\s+\/api\/v1\s*\{/);
-  assert.equal((nginx.match(/proxy_pass\s+http:\/\/\$app_upstream\$request_uri;/g) ?? []).length, 3);
-  assert.doesNotMatch(nginx, /proxy_pass\s+http:\/\/app:3000/);
-  assert.equal((nginx.match(/proxy_set_header\s+Host\s+\$host;/g) ?? []).length, 3);
-  assert.equal((nginx.match(/limit_except\s+GET\s+OPTIONS/g) ?? []).length, 3);
-  assert.match(
-    nginx,
-    /location\s+=\s+\/api\/v1\/events\s*\{[\s\S]*?proxy_buffering\s+off;[\s\S]*?proxy_cache\s+off;[\s\S]*?proxy_read_timeout\s+1h;/,
-  );
-
-  assert.doesNotMatch(nginx, /Access-Control-Allow-Credentials/i);
-  assert.doesNotMatch(nginx, /websocket|proxy_set_header\s+Upgrade|\/live(?:\W|$)/i);
+void test('the front entrypoint reads only the bcrypt hash and drops root before starting Caddy', async () => {
+  const entrypoint = await readArtifact('deploy/front/front-entrypoint');
+  assert.ok(entrypoint.startsWith('#!/bin/sh\n'));
+  assert.match(entrypoint, /^set -eu$/mu);
+  assert.ok(entrypoint.includes('hash_file=/root/secrets/front-basic-auth-hash'));
+  assert.ok(entrypoint.includes("'$2a$'*|'$2b$'*|'$2y$'*) ;;"));
+  assert.ok(entrypoint.includes(
+    "exec su -s /bin/sh caddy -c 'exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'",
+  ));
+  const syntax = spawnSync('sh', ['-n'], { input: entrypoint, encoding: 'utf8' });
+  assert.equal(syntax.status, 0, syntax.stderr);
 });
 
 void test('Compose defines an observe-only, five-service deployment without exposed database or backend', async () => {
