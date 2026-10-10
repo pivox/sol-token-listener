@@ -1648,7 +1648,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
       '  && sol_compose restart back',
     ].join('\n'),
     // A destructive step shows its project and runs only once its name is typed again.
-    "printf 'Projet %s : retaper son nom pour continuer : ' \"$COMPOSE_PROJECT_NAME\" && IFS= read -r confirm \\\n  && [ \"$confirm\" = \"$COMPOSE_PROJECT_NAME\" ] \\",
+    "printf 'Projet %s : retaper son nom pour continuer : ' \"${COMPOSE_PROJECT_NAME:?}\" && IFS= read -r confirm \\\n  && [ \"$confirm\" = \"$COMPOSE_PROJECT_NAME\" ] \\",
     // restore -force returns early: the restart waits, 60 tries at most, for Vault to seal itself.
     'sol_compose rm --stop --force --volumes vault',
     "/tmp/restore.snap' \\\n  && sealed=no && for i in $(seq 60); do",

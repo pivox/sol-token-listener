@@ -205,7 +205,7 @@ l'hôte ne restent que les secrets d'amorçage :
    ne fait rien tant que son nom n'est pas retapé :
 
    ```bash
-   printf 'Projet %s : retaper son nom pour continuer : ' "$COMPOSE_PROJECT_NAME" && IFS= read -r confirm \
+   printf 'Projet %s : retaper son nom pour continuer : ' "${COMPOSE_PROJECT_NAME:?}" && IFS= read -r confirm \
      && [ "$confirm" = "$COMPOSE_PROJECT_NAME" ] \
      && cp -Rp "$SOL_HOST_DIR/secrets/vault" "$SOL_HOST_DIR/secrets/vault.before-reset-$(date -u +%Y%m%dT%H%M%SZ)" \
      && sol_compose rm --stop --force --volumes vault \
@@ -554,7 +554,7 @@ Puis restaurer. La première commande affiche le projet visé et ne supprime rie
 n'est pas retapé : un shell d'exercice qui aurait gardé le projet de la stack s'arrête là.
 
 ```bash
-printf 'Projet %s : retaper son nom pour continuer : ' "$COMPOSE_PROJECT_NAME" && IFS= read -r confirm \
+printf 'Projet %s : retaper son nom pour continuer : ' "${COMPOSE_PROJECT_NAME:?}" && IFS= read -r confirm \
   && [ "$confirm" = "$COMPOSE_PROJECT_NAME" ] \
   && sol_compose rm --stop --force --volumes vault \
   && docker volume rm "${COMPOSE_PROJECT_NAME:?}_vault-data"
