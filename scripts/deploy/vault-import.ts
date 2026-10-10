@@ -162,6 +162,16 @@ function splitApiKey(value: string, variable: string): Readonly<{ apiKey: string
   return Object.freeze({ apiKey, address: url.toString() });
 }
 
+/** The api-key of the executor address, or null when it is absent or not a URL. */
+function executorApiKey(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  try {
+    return new URL(value).searchParams.get('api-key');
+  } catch {
+    return null;
+  }
+}
+
 function planImport(directory: string, evidencePrefix: string, dependencies: VaultImportDependencies): ImportPlan {
   const writes: (readonly [string, Readonly<Record<string, string>>])[] = [];
   const configs: string[] = [];
@@ -200,6 +210,9 @@ function planImport(directory: string, evidencePrefix: string, dependencies: Vau
     (fromOwn ? configs : templates).push(name);
   }
   if (listenerKey !== null) {
+    if (listenerKey === executorApiKey(roleFiles.get('live')?.SOLANA_HTTP_RPC_URL)) {
+      throw new ImportSourceError('listener.env: the listener key is the executor key');
+    }
     const entry = Object.freeze({ '01': listenerKey });
     try {
       heliusAccountsFromEntry(entry, backSecretPath(HELIUS_LISTENER_ACCOUNTS));

@@ -123,6 +123,19 @@ void test('an evidence path is rewritten only under the prefix directory itself'
   }
 });
 
+void test('the executor key is refused as the listener key, with nothing written', async () => {
+  await withSource({
+    ...SOURCE,
+    'env/listener.env': 'SOLANA_HTTP_RPC_URL=https://rpc.invalid/?api-key=executor-key\nSOLANA_WS_RPC_URL=wss://rpc.invalid/?api-key=executor-key\n',
+  }, async (directory) => {
+    const vault = operatorVault();
+    const run = await importInto(vault, directory, `${PASSWORD}\n`);
+    assert.equal(run.code, 78);
+    assert.equal(run.stderr, 'vault-import: listener.env: the listener key is the executor key\n');
+    assert.equal(vault.kv.size, 0);
+  });
+});
+
 void test('an invalid source is refused before the login, with nothing written', async () => {
   for (const [file, content, message] of [
     // A URL secret meets the rule boot applies (rpcUrl): one that imports must also start the back.

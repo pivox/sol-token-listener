@@ -167,6 +167,9 @@ export function buildRoleEnvironment(input: RoleEnvironmentInput): Readonly<Reco
     );
   }
   if (role.heliusAccounts !== undefined) {
+    if (((environment.HELIUS_RPC_HTTP_URL ?? '') === '') !== ((environment.HELIUS_RPC_WS_URL ?? '') === '')) {
+      throw new RoleEnvironmentError('HELIUS_RPC_HTTP_URL and HELIUS_RPC_WS_URL go together');
+    }
     const path = `${directory}/${role.heliusAccounts}`;
     let first: string | undefined;
     try {

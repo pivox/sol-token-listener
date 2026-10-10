@@ -77,7 +77,7 @@ void test('only H2b gets the keypair path, and the worker pins its search_path',
   assert.equal(worker.EXECUTOR_KEYPAIR_PATH, undefined);
 });
 
-void test('the operator API reads its token and follows the mode for its RPC project', () => {
+void test('the operator API reads its token and takes the executor project for its RPC in both modes', () => {
   const observe = build('opapi', 'OPERATOR_API_HOST=0.0.0.0\n', { mode: 'observe' });
   assert.equal(observe.OPERATOR_API_TOKEN, 'operator-token-0123456789abcdef0123456789abcdef');
   assert.equal(observe.SOLANA_HTTP_RPC_URL, 'https://executor.invalid/?api-key=executor-key');
@@ -91,9 +91,19 @@ void test('the listener takes its Helius addresses from the configuration, witho
   const environment = build('listener', 'HELIUS_RPC_HTTP_URL=https://rpc.invalid/\nHELIUS_RPC_WS_URL=wss://rpc.invalid/\n');
   assert.equal(environment.SOLANA_HTTP_RPC_URL, 'https://rpc.invalid/?api-key=listener-key');
   assert.equal(environment.SOLANA_WS_RPC_URL, 'wss://rpc.invalid/?api-key=listener-key');
-  assert.throws(() => build('listener', 'HELIUS_RPC_WS_URL=https://rpc.invalid/\n'),
+  assert.throws(() => build('listener', 'HELIUS_RPC_HTTP_URL=https://rpc.invalid/\nHELIUS_RPC_WS_URL=https://rpc.invalid/\n'),
     (error: unknown) => error instanceof RoleEnvironmentError && error.message === 'HELIUS_RPC_WS_URL: expected a wss URL');
-  assert.throws(() => build('listener', `HELIUS_RPC_HTTP_URL=https://rpc.invalid/?api-key=${LEAK}\n`),
+  assert.throws(() => build('listener', `HELIUS_RPC_HTTP_URL=https://rpc.invalid/?api-key=${LEAK}\nHELIUS_RPC_WS_URL=wss://rpc.invalid/\n`),
+    (error: unknown) => error instanceof RoleEnvironmentError && !error.message.includes(LEAK));
+});
+
+void test('the Helius addresses go together and refuse userinfo', () => {
+  for (const text of ['HELIUS_RPC_HTTP_URL=https://rpc.invalid/\n', 'HELIUS_RPC_WS_URL=wss://rpc.invalid/\n']) {
+    assert.throws(() => build('listener', text),
+      (error: unknown) => error instanceof RoleEnvironmentError
+        && error.message === 'HELIUS_RPC_HTTP_URL and HELIUS_RPC_WS_URL go together');
+  }
+  assert.throws(() => build('listener', `HELIUS_RPC_HTTP_URL=https://${LEAK}@rpc.invalid/\nHELIUS_RPC_WS_URL=wss://rpc.invalid/\n`),
     (error: unknown) => error instanceof RoleEnvironmentError && !error.message.includes(LEAK));
 });
 
@@ -114,6 +124,10 @@ void test('an invalid account file stops the listener without showing a key', ()
     && error.message === 'helius-listener-accounts: 01-main must be one printable line without spaces');
   assert.throws(() => environment(`{${LEAK}`), (error: unknown) => error instanceof RoleEnvironmentError
     && error.message === 'helius-listener-accounts: not a JSON object');
+  assert.throws(() => environment('[]'), (error: unknown) => error instanceof RoleEnvironmentError
+    && error.message === 'helius-listener-accounts: expected one field per account');
+  assert.throws(() => environment('{}'), (error: unknown) => error instanceof RoleEnvironmentError
+    && error.message === 'helius-listener-accounts: expected 1 to 32 accounts');
 });
 
 void test('evidence roles get secret file paths and nothing else', () => {

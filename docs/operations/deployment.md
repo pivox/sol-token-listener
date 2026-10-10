@@ -339,7 +339,8 @@ champ par compte, nommé (`01-perso`, `02-pro` : minuscules, chiffres, tirets), 
 la clé API. Il démarre sur le premier dans l'ordre alphabétique des noms. Quand un compte répond
 « max usage reached » (quota épuisé) ou refuse sa clé (401, 403), il le met à l'écart une heure
 (`LISTENER_HELIUS_ACCOUNT_COOLDOWN_MS`) et passe au suivant, sans redémarrer. La clé de l'exécuteur
-n'entre jamais dans cette liste.
+n'entre jamais dans cette liste. Relancer l'import remet la liste au seul compte `01` (les versions
+précédentes restent dans l'historique de Vault).
 
 Les clés passent par l'entrée standard. Dans une session `operator` (« Modifier une valeur ») :
 
