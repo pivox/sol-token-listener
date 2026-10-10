@@ -101,7 +101,7 @@ Les règles actuelles des configurations s'appliquent : une adresse qui porte un
 ### 5.4 Lecture au démarrage et distribution
 
 - **`vault-pull`**
-  - Il lit l'entrée et écrit `back/helius-listener-accounts.json` en tmpfs : un objet JSON compact, noms triés.
+  - Il lit l'entrée et écrit `back/helius-listener-accounts` en tmpfs (le nom de l'entrée, comme pour les autres secrets) : un objet JSON compact, noms triés.
   - Il refuse une entrée invalide avec le code 78, comme toute entrée invalide. Le message nomme le champ en faute, jamais sa valeur.
   - L'entrée est requise dans les deux modes, puisque le listener tourne dans les deux.
 - **Distribution :** le fichier ne va qu'à l'utilisateur `listener`, avec les droits des autres secrets distribués.
