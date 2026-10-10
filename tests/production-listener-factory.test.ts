@@ -578,6 +578,7 @@ void test('production shares exactly one RPC HTTP recorder across every transpor
   const source = await readFile(new URL('../src/application/production-listener-factory.ts', import.meta.url), 'utf8');
   assert.equal(count(source, /createRpcHttpEvidenceRecorder\(\)/gu), 1);
   assert.match(source, /new SolanaRpcClient\(config,\s*\{\s*recorder,/u);
+  assert.match(source, /heliusAccounts === undefined \? \{\} : \{ fetch: heliusAccounts\.fetch \}/u);
   assert.match(source, /createProviderPinnedFinalityPass\(\s*providers, providerId, undefined, recorder, roleRecorder, attemptBudget, rpcRequestTimeoutMs,/u);
   assert.match(source, /createProviderPinnedBlockRpc\(providers, providerId, config\.commitment, undefined,\s*\{\s*requestTimeoutMs:\s*rpcRequestTimeoutMs,?\s*\}, recorder, roleRecorder, attemptBudget\)/u);
   assert.match(source, /createProviderPinnedCatchUpSource\(\s*providers,\s*providerId,\s*'confirmed',\s*expectedGenesisHash,\s*undefined,\s*recorder,/u);

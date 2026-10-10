@@ -10,7 +10,7 @@ import { logger } from '../utils/logger.js';
 
 type RotationConfig = Pick<
   AppConfig,
-  'listenerHeliusAccountsPath' | 'listenerHeliusAccountCooldownMs' | 'httpRpcUrl' | 'wsRpcUrl'
+  'listenerHeliusAccountsPath' | 'listenerHeliusAccountCooldownMs' | 'httpRpcUrl' | 'wsRpcUrl' | 'httpRpcFallbackUrls'
 >;
 
 export interface ListenerHeliusAccountDependencies {
@@ -30,6 +30,15 @@ export function createListenerHeliusAccountRotation(
   dependencies: ListenerHeliusAccountDependencies = {},
 ): HeliusAccountRotation | undefined {
   if (config.listenerHeliusAccountsPath === null) return undefined;
+  const primary = new URL(config.httpRpcUrl);
+  for (const fallback of config.httpRpcFallbackUrls) {
+    const url = new URL(fallback);
+    if (url.origin === primary.origin && url.pathname === primary.pathname) {
+      throw new Error(
+        'LISTENER_HELIUS_ACCOUNTS_PATH cannot be combined with a SOLANA_HTTP_RPC_FALLBACK_URLS entry on the primary address.',
+      );
+    }
+  }
   const readFile = dependencies.readFile ?? ((path: string): string => readFileSync(path, 'utf8'));
   const accounts = parseHeliusAccountsFile(
     readFile(config.listenerHeliusAccountsPath),

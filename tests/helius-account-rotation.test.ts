@@ -167,3 +167,53 @@ void test('no event carries a key', async () => {
   const text = JSON.stringify(h.events);
   for (const { apiKey } of ACCOUNTS) assert.ok(!text.includes(apiKey));
 });
+
+void test('a malformed address is refused without echoing its key', () => {
+  for (const [httpUrl, websocketUrl] of [['not a url?api-key=fake-secret', WS], [HTTP, 'not a url?api-key=fake-secret']] as const) {
+    assert.throws(
+      () => new HeliusAccountRotation({ accounts: ACCOUNTS, httpUrl, websocketUrl, cooldownMs: 60_000, log: () => undefined }),
+      (error: unknown) => error instanceof TypeError
+        && error.message === 'Helius account rotation URL is invalid.' && !error.message.includes('fake-secret'),
+    );
+  }
+});
+
+void test('the base fetch is called as a plain function', async () => {
+  const seen: string[] = [];
+  const fetch = function (this: unknown, input: Parameters<FetchFn>[0]): Promise<Response> {
+    if (this !== undefined) throw new Error('fetch called with a receiver');
+    seen.push(typeof input === 'string' ? input : 'other');
+    return Promise.resolve(ok());
+  } as FetchFn;
+  const rotation = new HeliusAccountRotation({
+    accounts: ACCOUNTS, httpUrl: HTTP, websocketUrl: WS, cooldownMs: 60_000, log: () => undefined, fetch,
+  });
+  assert.equal((await rotation.fetch(HTTP, { method: 'POST', body: BODY })).status, 200);
+  assert.equal((await rotation.fetch('https://elsewhere.invalid/', { method: 'POST', body: BODY })).status, 200);
+  assert.equal(seen.length, 2);
+});
+
+void test('the exhaustion text is matched case-insensitively', async () => {
+  const h = harness((key) => (key === 'key-one' ? new Response('Max Usage Reached', { status: 429 }) : ok()));
+  await h.request();
+  const aside = h.events.find(({ event }) => event === 'rpc.helius_account_set_aside');
+  assert.equal(aside?.event === 'rpc.helius_account_set_aside' ? aside.reason : null, 'QUOTA_EXHAUSTED');
+});
+
+void test('unavailability is logged again when every account fails again after the cooldown', async () => {
+  const h = harness(() => exhausted(), ACCOUNTS.slice(0, 2));
+  await h.request();
+  assert.equal(h.events.filter(({ event }) => event === 'rpc.helius_accounts_unavailable').length, 1);
+  h.advance(60_000);
+  await h.request();
+  assert.equal(h.events.filter(({ event }) => event === 'rpc.helius_accounts_unavailable').length, 2);
+});
+
+void test('a Request object passes through unrewritten', async () => {
+  const h = harness(() => ok());
+  const request = new Request(HTTP, { method: 'POST', body: BODY });
+  await h.rotation.fetch(request);
+  assert.deepEqual(h.urls, [request.url]);
+  assert.deepEqual(h.keys, ['key-one']);
+  assert.deepEqual(h.events.map(({ event }) => event), ['rpc.helius_account_selected']);
+});

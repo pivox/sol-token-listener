@@ -65,7 +65,7 @@ export function createRpcProviderCatalog(
   });
 }
 
-/** The catalog's base fetch, read as an own data property: no getter, no proxy trap. */
+/** The catalog's base fetch, read as an own data property, never a getter. */
 export function catalogFetch(catalog: RpcProviderCatalog): FetchFn | undefined {
   const descriptor = Object.getOwnPropertyDescriptor(catalog, 'fetch');
   if (descriptor === undefined) return undefined;

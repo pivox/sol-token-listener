@@ -61,7 +61,14 @@ export class HeliusAccountRotation {
     if (!Number.isSafeInteger(options.cooldownMs) || options.cooldownMs < 1) {
       throw new TypeError('Helius account cooldown is invalid.');
     }
-    const http = new URL(options.httpUrl);
+    let http: URL;
+    let websocketUrl: string;
+    try {
+      http = new URL(options.httpUrl);
+      websocketUrl = new URL(options.websocketUrl).toString();
+    } catch {
+      throw new TypeError('Helius account rotation URL is invalid.');
+    }
     this.#accounts = options.accounts;
     this.#setAsideUntil = options.accounts.map(() => 0);
     this.#cooldownMs = options.cooldownMs;
@@ -70,7 +77,7 @@ export class HeliusAccountRotation {
     this.#base = options.fetch ?? globalThis.fetch;
     this.#origin = http.origin;
     this.#pathname = http.pathname;
-    this.#websocketUrl = new URL(options.websocketUrl).toString();
+    this.#websocketUrl = websocketUrl;
     this.fetch = (input, init): Promise<Response> => this.#send(input, init);
     this.#log(Object.freeze({
       event: 'rpc.helius_account_selected', account: this.#account(0).name, cause: 'STARTUP',
@@ -89,12 +96,13 @@ export class HeliusAccountRotation {
 
   async #send(input: FetchInput, init: FetchInit): Promise<Response> {
     const target = this.#primaryTarget(input);
-    if (target === null) return this.#base(input, init);
+    const base = this.#base;
+    if (target === null) return base(input, init);
     const tried = new Set<number>();
     for (;;) {
       const index = this.#select(this.#now());
       tried.add(index);
-      const response = await this.#base(withApiKey(target, this.#account(index).apiKey), init);
+      const response = await base(withApiKey(target, this.#account(index).apiKey), init);
       const reason = await setAsideReason(response);
       if (reason === null) return response;
       this.#setAside(index, reason, response.status);

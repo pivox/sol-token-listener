@@ -79,6 +79,32 @@ void test('an invalid file stops the listener without showing a key', () => {
   );
 });
 
+void test('an account file cannot be combined with a fallback on the primary address', () => {
+  const config = parseConfig({
+    ...base,
+    LISTENER_HELIUS_ACCOUNTS_PATH: '/run/sol/listener/helius-listener-accounts',
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://rpc.invalid/?api-key=other-secret',
+  });
+  const message = 'LISTENER_HELIUS_ACCOUNTS_PATH cannot be combined with a SOLANA_HTTP_RPC_FALLBACK_URLS entry on the primary address.';
+  assert.throws(
+    () => createListenerHeliusAccountRotation(config, { readFile: () => '{"01-one":"key-one"}', log: () => undefined }),
+    (error: unknown) => error instanceof Error && error.message === message,
+  );
+  const elsewhere = parseConfig({
+    ...base,
+    LISTENER_HELIUS_ACCOUNTS_PATH: '/run/sol/listener/helius-listener-accounts',
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://other.invalid/?api-key=other-secret',
+  });
+  assert.ok(createListenerHeliusAccountRotation(elsewhere, { readFile: () => '{"01-one":"key-one"}', log: () => undefined }));
+});
+
+void test('a whitespace-padded account path is refused', () => {
+  assert.throws(() => parseConfig({ ...base, LISTENER_HELIUS_ACCOUNTS_PATH: ' /run/sol/accounts' }),
+    /LISTENER_HELIUS_ACCOUNTS_PATH must be an absolute path/u);
+  assert.throws(() => parseConfig({ ...base, LISTENER_HELIUS_ACCOUNTS_PATH: '/run/sol/accounts ' }),
+    /LISTENER_HELIUS_ACCOUNTS_PATH must be an absolute path/u);
+});
+
 void test('events map to info, warn and error', () => {
   assert.equal(heliusAccountLogLevel({ event: 'rpc.helius_account_selected', account: 'a', cause: 'STARTUP' }), 'info');
   assert.equal(heliusAccountLogLevel({

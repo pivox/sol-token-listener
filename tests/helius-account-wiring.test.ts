@@ -87,12 +87,8 @@ void test('the pinned block RPC sends through the catalog fetch, with or without
   for (const recorder of [undefined, createRpcHttpEvidenceRecorder()]) {
     const { catalog, keys } = setup();
     const blocks = createProviderPinnedBlockRpc(catalog, 'primary', 'confirmed', undefined, { requestTimeoutMs: 5_000 }, recorder);
-    try {
-      await blocks.getBlockTransactions(12n, 'CONFIRMED');
-    } catch {
-      // A null block may be refused; only the key of each request matters here.
-    }
-    assert.deepEqual(keys.slice(0, 2), ['key-one', 'key-two']);
+    assert.equal(await blocks.getBlockTransactions(12n, 'CONFIRMED'), null);
+    assert.deepEqual(keys, ['key-one', 'key-two']);
   }
 });
 
@@ -105,4 +101,16 @@ void test('the shared client sends through the rotation fetch', async () => {
   );
   assert.equal(await client.getSlot(), 42n);
   assert.deepEqual(keys, ['key-one', 'key-two']);
+});
+
+void test('the shared client rotates primary requests and leaves a fallback untouched', async () => {
+  const { rotation, keys } = setup();
+  const fallback = 'https://fallback.invalid/?api-key=fallback-key';
+  const client = new SolanaRpcClient(
+    { ...CONFIG, httpRpcFallbackUrls: Object.freeze([fallback]), commitment: 'confirmed', finality: 'finalized' },
+    { fetch: rotation.fetch, recorder: createRpcHttpEvidenceRecorder() },
+  );
+  assert.equal(await client.getSlot(), 42n);
+  assert.deepEqual(keys, ['key-one', 'key-two']);
+  assert.ok(!keys.includes('fallback-key'));
 });

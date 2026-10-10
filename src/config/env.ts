@@ -787,7 +787,7 @@ function parseSolToLamports(raw: string | undefined, fallback: string, name: str
 
 function parseHeliusAccountsPath(raw: string | undefined): string | null {
   if (!hasValue(raw)) return null;
-  if (!raw.startsWith('/')) throw new Error('LISTENER_HELIUS_ACCOUNTS_PATH must be an absolute path.');
+  if (!raw.startsWith('/') || raw !== raw.trim()) throw new Error('LISTENER_HELIUS_ACCOUNTS_PATH must be an absolute path.');
   return raw;
 }
 
