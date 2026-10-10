@@ -77,6 +77,7 @@ import {
   type ProviderPinnedBlockRpc,
 } from '../solana/rpc/provider-pinned-block-rpc.js';
 import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-finality-source.js';
+import { createListenerHeliusAccountRotation } from './listener-helius-accounts.js';
 import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
 import { createRpcHttpEvidenceRecorder } from '../solana/rpc/rpc-http-evidence.js';
@@ -280,7 +281,9 @@ export function createProductionListenerRuntime(
     true,
   );
   if (expectedGenesisHash === null) throw new SolanaGenesisHashError();
-  const providers = createRpcProviderCatalog(config);
+  // One rotation per listener process: every primary client and the WebSocket share it.
+  const heliusAccounts = createListenerHeliusAccountRotation(config);
+  const providers = createRpcProviderCatalog(config, heliusAccounts);
   const configuredRpcHttpProviderIds = Object.freeze(
     RPC_PROVIDER_IDS.slice(0, config.httpRpcFallbackUrls.length + 1),
   );
@@ -299,6 +302,7 @@ export function createProductionListenerRuntime(
     roleRecorder,
     ...(attemptBudget === undefined ? {} : { attemptBudget }),
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
+    ...(heliusAccounts === undefined ? {} : { fetch: heliusAccounts.fetch }),
     ...(rpcWorkGate === null && attemptBudget === undefined ? {} : {
       requestTimeoutMs: rpcRequestTimeoutMs,
     }),

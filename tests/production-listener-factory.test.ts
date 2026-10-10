@@ -1339,7 +1339,7 @@ void test('production binds finality to immutable passes selected by the promote
 
   assert.match(factory, /import\s*\{[^}]*\bcreateRpcProviderCatalog\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/rpc-provider-catalog\.js['"]/u);
   assert.match(factory, /import\s*\{[^}]*\bcreateProviderPinnedFinalityPass\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/provider-pinned-finality-source\.js['"]/u);
-  assert.match(factory, /const providers = createRpcProviderCatalog\(config\);/u);
+  assert.match(factory, /const providers = createRpcProviderCatalog\(config, heliusAccounts\);/u);
   assert.match(factory, /providers\.ids\.map\(\(providerId\)[\s\S]*?createProviderPinnedFinalityPass\(\s*providers, providerId, undefined, recorder, roleRecorder, attemptBudget, rpcRequestTimeoutMs,/u);
   assert.match(factory, /new PromotedProviderSelector\(/u);
   assert.match(factory, /new FinalityReconciler\(promoted, inbox,/u);
@@ -1394,7 +1394,7 @@ void test('production source orders the genesis guard before catalog and databas
     'utf8',
   );
   const guard = source.indexOf('const expectedGenesisHash');
-  const catalog = source.indexOf('createRpcProviderCatalog(config)');
+  const catalog = source.indexOf('createRpcProviderCatalog(config, heliusAccounts)');
   const database = source.indexOf('getDatabasePool()', guard);
   assert.ok(guard >= 0);
   assert.ok(catalog > guard);
