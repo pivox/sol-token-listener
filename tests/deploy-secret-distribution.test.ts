@@ -17,7 +17,7 @@ function describe(mode: 'observe' | 'live', user: string): string[] {
 
 void test('live grants give every program its own secrets and nothing else', () => {
   assert.deepEqual(describe('live', 'listener'), [
-    'back/helius-listener-http-url', 'back/helius-listener-ws-url', 'logins/pg-sol_listener-password',
+    'back/helius-listener-accounts', 'logins/pg-sol_listener-password',
   ]);
   assert.deepEqual(describe('live', 'h2b'), [
     'back/helius-executor-http-url', 'back/wallet-keypair.json', 'logins/pg-sol_live-password',
@@ -50,10 +50,9 @@ void test('observe needs only the listener, operator API and retention secrets',
     .map((grant) => `${grant.user}:${grant.file}`)
     .sort();
   assert.deepEqual(required, [
-    'listener:helius-listener-http-url',
-    'listener:helius-listener-ws-url',
+    'listener:helius-listener-accounts',
     'listener:pg-sol_listener-password',
-    'opapi:helius-listener-http-url',
+    'opapi:helius-executor-http-url',
     'opapi:operator-api-token',
     'opapi:pg-sol_reader-password',
     'retention:pg-sol_retention-password',
@@ -80,8 +79,8 @@ function recordingFileSystem(present: readonly string[]): Readonly<{
 
 const OBSERVE_REQUIRED = Object.freeze([
   '/s/logins/pg-sol_listener-password',
-  '/s/back/helius-listener-http-url',
-  '/s/back/helius-listener-ws-url',
+  '/s/back/helius-listener-accounts',
+  '/s/back/helius-executor-http-url',
   '/s/logins/pg-sol_reader-password',
   '/s/back/operator-api-token',
   '/s/logins/pg-sol_retention-password',
@@ -99,7 +98,14 @@ void test('distribution copies present secrets owner-only, and the keypair to H2
     'chown /r/h2b/wallet-keypair.json 10002:10002',
     'chmod /r/h2b/wallet-keypair.json 400',
   ]);
-  assert.ok(operations.includes('copy /s/back/helius-listener-http-url /r/opapi/helius-listener-http-url'));
+  assert.ok(operations.includes('copy /s/back/helius-executor-http-url /r/opapi/helius-executor-http-url'));
+});
+
+void test('only the listener user receives the Helius account list, in both modes', () => {
+  for (const mode of ['observe', 'live'] as const) {
+    const holders = secretGrants(mode).filter(({ file }) => file === 'helius-listener-accounts').map(({ user }) => user);
+    assert.deepEqual(holders, ['listener']);
+  }
 });
 
 void test('a missing required secret stops the distribution before any write', () => {

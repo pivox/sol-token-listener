@@ -44,9 +44,8 @@ void test('observe reads every configuration and secret of the mode except the k
     ['config/retention', true],
     ['secrets/back/evidence-private-key', false],
     ['secrets/back/helius-admin-api-key', false],
-    ['secrets/back/helius-executor-http-url', false],
-    ['secrets/back/helius-listener-http-url', true],
-    ['secrets/back/helius-listener-ws-url', true],
+    ['secrets/back/helius-executor-http-url', true],
+    ['secrets/back/helius-listener-accounts', true],
     ['secrets/back/operator-api-token', true],
     ['secrets/logins/sol_autoarm', false],
     ['secrets/logins/sol_listener', true],
@@ -70,7 +69,7 @@ void test('observe reads every configuration and secret of the mode except the k
   );
   assert.deepEqual(entries.find((entry) => entry.path === 'secrets/back/helius-executor-http-url'), {
     kind: 'secret', path: 'secrets/back/helius-executor-http-url',
-    file: 'back/helius-executor-http-url', required: false,
+    file: 'back/helius-executor-http-url', required: true,
   });
 });
 
@@ -90,8 +89,7 @@ void test('live requires the executor entries, the keypair included', () => {
     ['secrets/back/evidence-private-key', false],
     ['secrets/back/helius-admin-api-key', false],
     ['secrets/back/helius-executor-http-url', true],
-    ['secrets/back/helius-listener-http-url', true],
-    ['secrets/back/helius-listener-ws-url', true],
+    ['secrets/back/helius-listener-accounts', true],
     ['secrets/back/operator-api-token', true],
     ['secrets/back/wallet-keypair.json', true],
     ['secrets/logins/sol_autoarm', true],
@@ -183,4 +181,15 @@ void test('a secret entry keeps its value unchanged and names only its path when
   assert.equal(secretValue('secrets/back/x', { value: '[1,2]\n' }), '[1,2]\n');
   assert.throws(() => secretValue('secrets/back/x', { value: '' }), /^VaultLayoutError: secrets\/back\/x: expected a non-empty value field$/u);
   assert.throws(() => secretValue('secrets/back/x', { other: 'v' }), VaultLayoutError);
+});
+
+void test('the Helius account entry renders as its compact JSON file and refuses a bad entry without a key', () => {
+  assert.equal(
+    secretValue('secrets/back/helius-listener-accounts', { '02-spare': 'key-spare', '01-main': 'key-main' }),
+    '{"01-main":"key-main","02-spare":"key-spare"}',
+  );
+  assert.throws(() => secretValue('secrets/back/helius-listener-accounts', { 'Bad Name': 'k' }),
+    (error: unknown) => error instanceof VaultLayoutError && error.message === 'secrets/back/helius-listener-accounts: invalid account name');
+  assert.throws(() => secretValue('secrets/back/helius-listener-accounts', { '01-main': 'leak me' }),
+    (error: unknown) => error instanceof VaultLayoutError && !error.message.includes('leak me'));
 });

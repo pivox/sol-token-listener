@@ -4,6 +4,7 @@
  */
 
 import { parse } from 'dotenv';
+import { HeliusAccountsError, heliusAccountsFromEntry, renderHeliusAccounts } from '../config/helius-accounts.js';
 import { isVariableName, parseRoleConfig } from './role-environment.js';
 import { secretGrants } from './secret-distribution.js';
 import {
@@ -28,6 +29,9 @@ export type ConfigName = (typeof CONFIG_NAMES)[number];
 
 /** The executor's keypair: the observe mode never reads it. */
 export const WALLET_KEYPAIR: BackSecret = 'wallet-keypair.json';
+
+/** The listener's Helius accounts: one multi-field entry (Helius accounts spec 5.1). */
+export const HELIUS_LISTENER_ACCOUNTS: BackSecret = 'helius-listener-accounts';
 
 /** Messages name entries and variables, never a value. */
 export class VaultLayoutError extends Error {
@@ -157,6 +161,15 @@ export function renderConfig(name: ConfigName, data: Readonly<Record<string, unk
 
 /** A secret entry keeps its text in `value`; the file receives it unchanged. */
 export function secretValue(path: string, data: Readonly<Record<string, unknown>>): string {
+  // The listener's Helius accounts: one field per account, rendered as a compact JSON object.
+  if (path === backSecretPath(HELIUS_LISTENER_ACCOUNTS)) {
+    try {
+      return renderHeliusAccounts(heliusAccountsFromEntry(data, path));
+    } catch (error) {
+      if (error instanceof HeliusAccountsError) throw new VaultLayoutError(error.message);
+      throw error;
+    }
+  }
   const value = data.value;
   if (typeof value !== 'string' || value.length === 0) {
     throw new VaultLayoutError(`${path}: expected a non-empty value field`);
