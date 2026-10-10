@@ -70,5 +70,11 @@ const MESSAGES: Readonly<Record<HeliusAccountEvent['event'], string>> = Object.f
 });
 
 export function logHeliusAccountEvent(event: HeliusAccountEvent): void {
-  logger[heliusAccountLogLevel(event)](event, MESSAGES[event.event]);
+  // Explicit calls: boundary modules may not use computed member calls (tests/bootstrap-safety).
+  const message = MESSAGES[event.event];
+  switch (heliusAccountLogLevel(event)) {
+    case 'info': logger.info(event, message); return;
+    case 'warn': logger.warn(event, message); return;
+    case 'error': logger.error(event, message); return;
+  }
 }
