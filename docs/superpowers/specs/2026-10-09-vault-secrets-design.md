@@ -136,7 +136,7 @@ Toutes au plus juste et versionnées dans `deploy/vault/policies/`, en lecture s
 | `back` | lire `sol/data/config/*`, `sol/data/secrets/back/*`, `sol/data/secrets/logins/*` |
 | `migrate` | lire `sol/data/secrets/logins/*` |
 | `backup` | lire `sys/storage/raft/snapshot` |
-| `operator` | créer, lire, modifier, supprimer et lister sous `sol/` (données, métadonnées, versions) ; la configuration du moteur, `sol/config`, en lecture seule (13.13) ; rien sur les politiques ni l'authentification |
+| `operator` | créer, lire, modifier, supprimer et lister sous `sol/` (données, métadonnées, versions) ; la configuration de tout le moteur, `sol/config`, en lecture seule (13.13) ; rien sur les politiques ni l'authentification |
 
 ### 6.3 Authentification
 
@@ -411,8 +411,10 @@ concernées :
       `secrets/vault/approle/` existent, appartiennent à l'appelant, lui sont inscriptibles et
       sont vides. Sinon, Docker créerait un dossier manquant au nom de root, et la clé, impossible
       à écrire, serait perdue après l'initialisation. Ses refus, tous en 78 et sans appel à
-      Docker, distinguent une initialisation terminée, une initialisation inachevée et une clé
-      perdue : seule la deuxième, ou un reste inconnu, invite à repartir de zéro ;
+      Docker, distinguent une initialisation terminée, une clé perdue, et une clé sans tous ses
+      fichiers AppRole. Ce dernier cas est une initialisation inachevée si aucune ligne `next:`
+      n'est apparue, sinon un Vault en service qui a perdu un fichier : seule l'initialisation
+      inachevée, ou un reste inconnu, invite à repartir de zéro ;
     - les scripts de l'hôte lancent les services ponctuels avec `--no-deps` : ils ne démarrent ni
       ne recréent jamais Vault ;
     - `vault-setup` et `vault-snapshot` n'ont aucune copie de journal (pilote `none`) : leur
@@ -430,7 +432,9 @@ concernées :
       le rôle du back, relancé en boucle par `restart: unless-stopped`, et suspendu les sorties.
     - Un fichier AppRole ou un mot de passe faux est simplement refusé (code 77). Le smoke le
       prouve : six connexions `backup` refusées, puis une sauvegarde réussie.
-13. La politique `operator` laisse la configuration du moteur, `sol/config`, en lecture seule
-    (section 6.2) : le chemin exact l'emporte sur `sol/*`. L'opérateur ne peut plus changer
-    `max_versions`, `delete_version_after` ni `cas_required` : les deux premiers effaceraient des
-    versions de toutes les entrées, le troisième ferait échouer `vault-import`.
+13. La politique `operator` laisse la configuration de tout le moteur, `sol/config`, en lecture
+    seule (section 6.2) : le chemin exact l'emporte sur `sol/*`. L'opérateur ne peut plus changer
+    les réglages `max_versions`, `delete_version_after` ni `cas_required` valables pour tout le
+    moteur : les deux premiers effaceraient des versions de toutes les entrées, le troisième
+    ferait échouer `vault-import`. Les mêmes réglages par entrée, dans les métadonnées de chaque
+    entrée, restent de son ressort.

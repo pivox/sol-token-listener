@@ -24,8 +24,9 @@ for directory in unseal approle; do
   fi
 done
 # vault-setup saves the key first, then the three AppRole files: the key without all three is an
-# init that did not finish, and AppRole files without the key belong to a Vault in service whose
-# key is gone, which starting over would wipe.
+# init that did not finish, or a Vault in service that lost one file (the `next:` line tells them
+# apart), and AppRole files without the key belong to a Vault in service whose key is gone, which
+# starting over would wipe.
 approle_files=0
 for name in back migrate backup; do
   if [ -e "$SOL_HOST_DIR/secrets/vault/approle/$name.json" ]; then approle_files=$((approle_files + 1)); fi
@@ -34,7 +35,7 @@ if [ -e "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" ]; then
   if [ "$approle_files" -eq 3 ]; then
     echo 'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)' >&2
   else
-    echo 'vault-init: secrets/vault/unseal/unseal-key exists but the AppRole files are missing: an earlier vault-init did not finish: start over as the runbook says' >&2
+    echo 'vault-init: secrets/vault/unseal/unseal-key exists but the AppRole files are missing: if vault-init never printed its next: line, start over as the runbook says; otherwise recreate the missing file as the runbook says' >&2
   fi
   exit 78
 fi

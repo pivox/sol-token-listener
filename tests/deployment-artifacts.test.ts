@@ -1638,11 +1638,25 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     // the encoded token is decoded from stdin: only the OTP is ever an argument.
     '-nonce="$nonce" -format=json - < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
     '| sol_vault operator generate-root -decode=- -otp="$otp"',
-    // The new secret_id logs in before it replaces the file.
-    "auth/approle/login - > /dev/null && echo 'secret_id valide'",
-    // restore -force returns early: the restart waits for Vault to seal itself.
+    // The new secret_id must log in before it may replace the file: the write and the restart
+    // are chained on that login, so a failed parse never overwrites a working AppRole file.
+    [
+      "auth/approle/login - > /dev/null \\",
+      "  && echo 'secret_id valide' \\",
+      "  && (umask 077 && printf '{\"role_id\":\"%s\",\"secret_id\":\"%s\"}\\n' \"$role_id\" \"$secret_id\" > \"$approle.new\") \\",
+      '  && mv "$approle.new" "$approle" \\',
+      '  && sol_compose restart back',
+    ].join('\n'),
+    // A destructive step shows its project and runs only once its name is typed again.
+    "printf 'Projet %s : retaper son nom pour continuer : ' \"$COMPOSE_PROJECT_NAME\" && IFS= read -r confirm \\\n  && [ \"$confirm\" = \"$COMPOSE_PROJECT_NAME\" ] \\",
+    // restore -force returns early: the restart waits, 60 tries at most, for Vault to seal itself.
     'sol_compose rm --stop --force --volumes vault',
-    "until sol_compose logs --since 2m vault | grep -q 'vault is sealed'; do sleep 1; done",
+    "/tmp/restore.snap' \\\n  && sealed=no && for i in $(seq 60); do",
+    "if sol_compose logs --since 2m vault | grep -q 'vault is sealed'; then sealed=yes; break; fi",
+    '  && [ "$sealed" = yes ] \\\n  && sol_compose restart vault \\',
+    // The Mac copy is erased only under Docker Desktop with the Mac's host folder: never the server.
+    "[ \"$(docker info --format '{{.OperatingSystem}}')\" = 'Docker Desktop' ] && [ \"$SOL_HOST_DIR\" = \"$HOME/.sol-token-listener/docker\" ] && sol_compose -p sol-token-listener down --volumes",
+    'launchctl bootout "gui/$(id -u)/com.sol-token-listener.backup"',
     // The unseal key goes to the password manager without being displayed, and comes back the same way.
     'pbcopy < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
     // set -C: the paste never overwrites a key file that is already there.
@@ -1659,10 +1673,18 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   }
   assert.doesNotMatch(runbook, /\brm\b[^\n]*secrets\/vault\/unseal\/unseal-key/u, 'the only key is never deleted');
   assert.doesNotMatch(runbook, /docker volume rm sol-token-listener_/u, 'volume names follow COMPOSE_PROJECT_NAME');
-  // `down --volumes` erases a whole project: the command always names it.
-  for (const line of runbook.split('\n').filter((text) => /^\s*sol_compose\b.*\bdown --volumes/u.test(text))) {
-    assert.match(line, /^\s*sol_compose -p \S+ down --volumes$/u, `down --volumes without -p: ${line}`);
+  // `down --volumes` erases a whole project: every command that runs it names the project.
+  const downs = runbook.split('\n').filter((text) => /\bsol_compose\b.*\bdown --volumes/u.test(text));
+  assert.ok(downs.length >= 2);
+  for (const line of downs) assert.match(line, /\bsol_compose -p \S+ down --volumes$/u, `down --volumes without -p: ${line}`);
+  // Every destructive line of the restore and of the start over is chained after the confirmation.
+  for (const block of [runbook.slice(runbook.indexOf('### Restaurer Vault')), runbook.slice(runbook.indexOf('Repartir de zéro aussi'))]) {
+    const confirmation = block.indexOf('IFS= read -r confirm');
+    assert.ok(confirmation > 0 && confirmation < block.indexOf('docker volume rm'), 'confirmation before the wipe');
+    assert.match(block, /\n[ ]+&& sol_compose rm --stop --force --volumes vault \\\n[ ]+&& docker volume rm "\$\{COMPOSE_PROJECT_NAME:\?\}_vault-data"/u);
   }
+  // No AppRole file write runs on its own line, outside the chain that follows the validity login.
+  assert.doesNotMatch(runbook, /^\(umask 077 && printf '\{"role_id"/mu);
   // A token a `vault login` stores would stay on disk in the container.
   for (const match of runbook.matchAll(/vault login\b[^\n]*/gu)) {
     if (!match[0].startsWith('vault login`')) assert.match(match[0], /^vault login -token-only/u, match[0]);
@@ -1671,7 +1693,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   const vaultInit = await readArtifact('deploy/host/vault-init.sh');
   for (const message of [
     'unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)',
-    'unseal-key exists but the AppRole files are missing: an earlier vault-init did not finish: start over as the runbook says',
+    'unseal-key exists but the AppRole files are missing: if vault-init never printed its next: line, start over as the runbook says; otherwise recreate the missing file as the runbook says',
     'unseal-key is missing: Vault is already initialized: put the key back as the runbook says; do not start over',
     'holds files of an earlier attempt: start over as the runbook says',
   ]) {

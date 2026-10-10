@@ -380,12 +380,13 @@ void test('vault-init has nothing to do once the key and the three AppRole files
   });
 });
 
-void test('vault-init calls the key without the three AppRole files an unfinished init, to start over', async () => {
-  // vault-setup saves the key first: it failed before the first AppRole file, or between two.
+void test('vault-init tells an unfinished init from a Vault in service that lost an AppRole file', async () => {
+  // vault-setup saves the key first: it failed before the first AppRole file, or between two. A
+  // Vault in service that lost one AppRole file looks the same: the `next:` line tells them apart.
   for (const approle of [[], APPROLE_FILES.slice(0, 1), APPROLE_FILES.slice(0, 2)]) {
     assert.deepEqual(await vaultInitWith(['unseal/unseal-key', ...approle]), {
       status: 78,
-      stderr: 'vault-init: secrets/vault/unseal/unseal-key exists but the AppRole files are missing: an earlier vault-init did not finish: start over as the runbook says\n',
+      stderr: 'vault-init: secrets/vault/unseal/unseal-key exists but the AppRole files are missing: if vault-init never printed its next: line, start over as the runbook says; otherwise recreate the missing file as the runbook says\n',
       dockerCalls: null,
     }, approle.join(' '));
   }
