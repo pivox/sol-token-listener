@@ -238,7 +238,7 @@ dans Vault, qui restent dans les versions précédentes.
 
 - **Une valeur** : modifiée dans l'interface (`http://127.0.0.1:8200`, login `operator`) ou en ligne de commande, puis `sol_compose restart back`. Le redémarrage pose l'entry-stop : relancer `sol trading start`.
 - **Le mot de passe d'un login** : modifié dans Vault, puis `sol_compose run --rm migrate`, puis redémarrage du back.
-- **Le `secret_id` d'un AppRole** : jeton root régénéré (13.8), nouveau `secret_id` écrit dans son fichier, ancien révoqué, conteneur redémarré.
+- **Le `secret_id` d'un AppRole** : jeton root régénéré (13.8), nouveau `secret_id` écrit dans son fichier, conteneur redémarré et vérifié, puis seulement ancien révoqué.
 
 ### 8.4 Sauvegardes
 
@@ -265,7 +265,7 @@ vides `secrets/vault/unseal/` et `secrets/vault/approle/` (0700), que `vault-ini
 ### 8.6 Effets sur le sous-projet 1
 
 - La validation sur le Mac (tâche 16) commence par l'initialisation et l'import, puis suit le runbook sans changement. Elle exige toujours le feu vert de l'utilisateur.
-- La bascule vers le serveur copie `secrets/vault/` et restaure un instantané raft, ou copie le volume `vault-data`.
+- La bascule vers le serveur copie `secrets/vault/` et restaure un instantané raft. Copier le volume `vault-data` à la place exigerait de garder l'uid 100 (utilisateur `vault`) de ses fichiers.
 - Dans le spec du sous-projet 1, la section 7.3 renvoie vers ce document.
 
 ## 9. Invariants de sécurité
@@ -295,7 +295,7 @@ Le client `vault-pull`, contre un faux serveur Vault :
 `vault-init`, l'import et la sauvegarde, avec un faux `docker` seulement (l'hôte n'a aucun client
 Vault), comme les tests actuels d'`init-secrets` :
 - refus d'un Vault déjà initialisé ;
-- seule sortie autorisée : le mot de passe `operator` affiché une fois ;
+- seul secret affiché : le mot de passe `operator`, une fois ;
 - aucune valeur affichée.
 
 ### 10.3 Tests statiques

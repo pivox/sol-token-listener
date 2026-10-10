@@ -1599,6 +1599,11 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     // Nobody else's generate-root attempt may receive the unseal key.
     'vault operator generate-root -status',
     'vault operator generate-root -cancel',
+    // A secret reaches Vault on stdin, never on a command line that history and ps would keep.
+    '| sol_compose exec -T vault vault kv put sol/secrets/back/helius-listener-http-url value=-',
+    // The unseal key goes to the password manager without being displayed, and comes back the same way.
+    'pbcopy < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
+    '(umask 077 && pbpaste > "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key")',
   ]) {
     assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
   }
@@ -1606,6 +1611,21 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   assert.ok(secrets.length > 0);
   assert.doesNotMatch(secrets, /\b(?:cat|echo)\s+"?\$(?:back|SOL_HOST_DIR)/u, 'secrets are copied, never printed');
   assert.doesNotMatch(runbook, /run --rm migrate sol-admin/u, 'sol-admin runs with --no-deps');
+  // A running back never needs Vault: restoring Vault must not suspend the exits.
+  const restore = runbook.slice(runbook.indexOf('### Restaurer Vault'), runbook.indexOf('## Reprise de la base actuelle'));
+  assert.ok(restore.length > 0);
+  assert.doesNotMatch(restore, /sol_compose stop/u, 'the restore leaves the back running');
+  // The server move checks the precondition, then exports with Vault and the base still running.
+  const move = runbook.slice(runbook.indexOf('## Bascule vers le serveur'), runbook.indexOf('## Rotation des secrets'));
+  const precondition = move.indexOf('< deploy/sql/takeover-precondition.sql');
+  assert.ok(precondition > 0, 'the server move checks the takeover precondition');
+  assert.ok(precondition < move.indexOf('sol_compose stop back'));
+  assert.ok(move.indexOf('sol_compose stop back') < move.indexOf('pg_dump -Fc'));
+  assert.ok(move.indexOf('pg_dump -Fc') < move.indexOf('sol_compose stop\n'));
+  // The new AppRole file must work before the old secret_id is destroyed.
+  const rotation = runbook.slice(runbook.indexOf('## Rotation des secrets'), runbook.indexOf('## Frontière de sécurité'));
+  assert.ok(rotation.indexOf('vault.pulled') > 0);
+  assert.ok(rotation.indexOf('vault.pulled') < rotation.indexOf('secret-id-accessor/destroy'));
   // The audit log HMACs strings only: a number or a JSON array would reach `docker logs` in clear.
   assert.match(runbook, /mode JSON de l'interface/u);
   assert.match(runbook, /Operation nonce/u);

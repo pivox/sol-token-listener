@@ -22,7 +22,8 @@ void test('the four policies grant only what spec 6.2 lists', async () => {
   assert.deepEqual(grants(await artifact('deploy/vault/policies/migrate.hcl')), ['sol/data/secrets/logins/* "read"']);
   assert.deepEqual(grants(await artifact('deploy/vault/policies/backup.hcl')), ['sys/storage/raft/snapshot "read"']);
   assert.deepEqual(grants(await artifact('deploy/vault/policies/operator.hcl')), [
-    'sol/* "create", "read", "update", "delete", "list"',
+    // patch: `vault kv patch` sends PATCH; without it, the CLI's fallback first logs a 403.
+    'sol/* "create", "read", "update", "patch", "delete", "list"',
   ]);
   for (const name of VAULT_POLICIES) {
     const policy = await artifact(`deploy/vault/policies/${name}.hcl`);

@@ -861,9 +861,10 @@ passe et limité à la lecture. Le mode `observe` ne lance que le listener, l’
 opérateur et la rétention ; le mode `live` ajoute H2a, H2b et l’auto-arm, sans
 nouvel achat avant `sol trading start`.
 
-Les variables des processus (configuration et secrets) vivent dans un conteneur Vault de la stack.
-`deploy/host/vault-init.sh` l'initialise une fois et `deploy/host/vault-import.sh` y importe les
-fichiers actuels. Voir `docs/operations/deployment.md`.
+Les variables des processus (configuration et secrets) vivent dans un
+conteneur Vault de la stack. `deploy/host/vault-init.sh` l’initialise une fois
+et `deploy/host/vault-import.sh` y importe les fichiers actuels. Voir
+`docs/operations/deployment.md`.
 
 La keypair n’est lisible que par H2b. Les données terminales sont gardées
 4 heures. La sauvegarde externe (copie hors machine) reste sous la
