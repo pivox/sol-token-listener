@@ -1,4 +1,5 @@
 import { parse } from 'dotenv';
+import { HeliusAccountsError, parseHeliusAccountsFile, withApiKey } from '../config/helius-accounts.js';
 import {
   DATABASE_HOST,
   DATABASE_LOGINS,
@@ -6,7 +7,6 @@ import {
   ROLES,
   STACK_USERS,
   loginPasswordFile,
-  resolveHttpRpc,
   type DatabaseLogin,
   type RoleName,
   type StackMode,
@@ -26,6 +26,7 @@ export const INJECTED_KEYS: ReadonlySet<string> = new Set([
   'OPERATOR_API_DATABASE_URL',
   'SOLANA_HTTP_RPC_URL',
   'SOLANA_WS_RPC_URL',
+  'LISTENER_HELIUS_ACCOUNTS_PATH',
   'EXECUTOR_KEYPAIR_PATH',
   'HELIUS_API_KEY_PATH',
   'EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH',
@@ -105,6 +106,31 @@ export function rpcUrl(raw: string, file: string, protocol: 'https:' | 'wss:'): 
   return value;
 }
 
+export const DEFAULT_HELIUS_RPC_HTTP_URL = 'https://mainnet.helius-rpc.com/';
+export const DEFAULT_HELIUS_RPC_WS_URL = 'wss://mainnet.helius-rpc.com/';
+
+/** A Helius address of the configuration (or its default): this protocol, never a key. */
+function heliusAddress(
+  value: string | undefined,
+  fallback: string,
+  variable: string,
+  protocol: 'https:' | 'wss:',
+): string {
+  let url: URL;
+  try {
+    url = new URL(value === undefined || value === '' ? fallback : value);
+  } catch {
+    throw new RoleEnvironmentError(`${variable}: not a URL`);
+  }
+  if (url.protocol !== protocol) {
+    throw new RoleEnvironmentError(`${variable}: expected a ${protocol.slice(0, -1)} URL`);
+  }
+  if (url.searchParams.has('api-key') || url.username !== '' || url.password !== '' || url.hash !== '') {
+    throw new RoleEnvironmentError(`${variable}: must not carry a key`);
+  }
+  return url.toString();
+}
+
 export interface RoleEnvironmentInput {
   readonly role: RoleName;
   readonly mode: StackMode;
@@ -135,16 +161,31 @@ export function buildRoleEnvironment(input: RoleEnvironmentInput): Readonly<Reco
       searchPath: role.database.searchPath,
     });
   }
-  const httpRpc = resolveHttpRpc(role, input.mode);
-  if (httpRpc !== undefined) {
+  if (role.httpRpc !== undefined) {
     environment.SOLANA_HTTP_RPC_URL = rpcUrl(
-      input.readSecret(`${directory}/${httpRpc}`), httpRpc, 'https:',
+      input.readSecret(`${directory}/${role.httpRpc}`), role.httpRpc, 'https:',
     );
   }
-  if (role.wsRpc !== undefined) {
-    environment.SOLANA_WS_RPC_URL = rpcUrl(
-      input.readSecret(`${directory}/${role.wsRpc}`), role.wsRpc, 'wss:',
-    );
+  if (role.heliusAccounts !== undefined) {
+    if (((environment.HELIUS_RPC_HTTP_URL ?? '') === '') !== ((environment.HELIUS_RPC_WS_URL ?? '') === '')) {
+      throw new RoleEnvironmentError('HELIUS_RPC_HTTP_URL and HELIUS_RPC_WS_URL go together');
+    }
+    const path = `${directory}/${role.heliusAccounts}`;
+    let first: string | undefined;
+    try {
+      first = parseHeliusAccountsFile(input.readSecret(path), role.heliusAccounts)[0]?.apiKey;
+    } catch (error) {
+      if (error instanceof HeliusAccountsError) throw new RoleEnvironmentError(error.message);
+      throw error;
+    }
+    if (first === undefined) throw new RoleEnvironmentError(`${role.heliusAccounts}: no account`);
+    environment.SOLANA_HTTP_RPC_URL = withApiKey(heliusAddress(
+      environment.HELIUS_RPC_HTTP_URL, DEFAULT_HELIUS_RPC_HTTP_URL, 'HELIUS_RPC_HTTP_URL', 'https:',
+    ), first);
+    environment.SOLANA_WS_RPC_URL = withApiKey(heliusAddress(
+      environment.HELIUS_RPC_WS_URL, DEFAULT_HELIUS_RPC_WS_URL, 'HELIUS_RPC_WS_URL', 'wss:',
+    ), first);
+    environment.LISTENER_HELIUS_ACCOUNTS_PATH = path;
   }
   for (const [variable, file] of Object.entries(role.secretPaths ?? {})) {
     const path = `${directory}/${file}`;

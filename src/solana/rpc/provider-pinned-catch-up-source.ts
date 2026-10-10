@@ -6,7 +6,7 @@ import {
   SolanaCatchUpSource,
   type SignaturesForAddressRpc,
 } from './catch-up-source.js';
-import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { catalogFetch, type RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 import { isOrdinaryRpcBudgetError, type OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
@@ -67,7 +67,7 @@ export function createProviderPinnedCatchUpSource(
   }
 
   const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder,
-    attemptBudget, requestTimeoutMs);
+    attemptBudget, requestTimeoutMs, pinnedBaseFetch(catalog, exposedProviderId));
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const rpc = createPinnedRpc(createRpc, httpUrl, commitment, providerId);
   const source = new SolanaCatchUpSource(rpc, commitment);
@@ -200,11 +200,16 @@ function dependencyFactory(
   roleRecorder: RpcHttpRoleEvidenceRecorder | undefined,
   attemptBudget: OrdinaryRpcAttemptBudget | undefined,
   requestTimeoutMs: number,
+  baseFetch: FetchFn | undefined,
 ): (httpUrl: string, commitment: Commitment) => unknown {
   if (dependencies === undefined) {
-    if (recorder === undefined && roleRecorder === undefined && attemptBudget === undefined) return createDefaultRpc;
+    if (recorder === undefined && roleRecorder === undefined && attemptBudget === undefined) {
+      return baseFetch === undefined
+        ? createDefaultRpc
+        : (httpUrl: string, commitment: Commitment): PinnedCatchUpRpc => createDefaultRpc(httpUrl, commitment, baseFetch);
+    }
     const observedFetch = createObservedRpcFetch(
-      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'SOURCE', attemptBudget,
+      selectedProviderId, recorder, baseFetch ?? globalThis.fetch, roleRecorder, 'SOURCE', attemptBudget,
     );
     const boundedFetch = attemptBudget === undefined ? observedFetch : createBoundedRpcFetch(observedFetch, requestTimeoutMs);
     return (httpUrl: string, commitment: Commitment): PinnedCatchUpRpc => (
@@ -369,4 +374,13 @@ function failure(
   providerId: RpcProviderId | null,
 ): ProviderPinnedCatchUpSourceError {
   return new ProviderPinnedCatchUpSourceError(reason, providerId);
+}
+
+/** The catalog's base fetch (the Helius account rotation) or undefined; a malformed catalog is CONFIG_INVALID. */
+function pinnedBaseFetch(catalog: RpcProviderCatalog, providerId: RpcProviderId | null): FetchFn | undefined {
+  try {
+    return catalogFetch(catalog);
+  } catch {
+    throw failure('CONFIG_INVALID', providerId);
+  }
 }

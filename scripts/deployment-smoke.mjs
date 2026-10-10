@@ -20,7 +20,7 @@ const smokeFailureContext = new WeakMap();
 const SMOKE_PHASES = new Set([
   'BUILD', 'HOST_SETUP', 'VAULT_SETUP', 'VAULT_IMPORT', 'START', 'PORT_DISCOVERY', 'SIGNAL_PROBE',
   'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'PUBLIC_HEALTH', 'CORS',
-  'MIGRATIONS', 'LOGINS', 'OPERATIONS', 'FRONTEND', 'SSE_SHUTDOWN', 'APP_RESTART',
+  'MIGRATIONS', 'LOGINS', 'OPERATIONS', 'HELIUS_RELOAD', 'FRONTEND', 'SSE_SHUTDOWN', 'APP_RESTART',
   'HEALTH_RECOVERY', 'RETENTION', 'BACKUP', 'VAULT_RESTART', 'VAULT_FAIL_CLOSED', 'SECRET_LEAKS',
   'CLEANUP',
 ]);
@@ -70,8 +70,11 @@ const loginGroups = Object.freeze({
 const throwawayKeypair = JSON.stringify([...randomBytes(64)]);
 // The fake RPC URLs carry a key, as a provider's do: the leak checks look for it too.
 const rpcApiKey = randomBytes(16).toString('hex');
+const spareRpcApiKey = randomBytes(16).toString('hex');
+// The executor's own project key: vault-import refuses a listener key equal to it.
+const executorRpcApiKey = randomBytes(16).toString('hex');
 // Grows at run time with what Vault generates or the back pulls: every value is redacted.
-const smokeSecrets = [postgresPassword, frontPassword, throwawayKeypair, rpcApiKey];
+const smokeSecrets = [postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey, executorRpcApiKey];
 let operatorPassword = null;
 const basicAuthorization = `Basic ${Buffer.from(`${SMOKE_USER}:${frontPassword}`).toString('base64')}`;
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
@@ -325,6 +328,7 @@ async function runDeployment(selfSignal) {
 
       await smokePhase('LOGINS', assertLogins);
       await smokePhase('OPERATIONS', assertOperations);
+      await smokePhase('HELIUS_RELOAD', assertHeliusReload);
       await smokePhase('FRONTEND', assertFrontendContract);
       await smokePhase('SSE_SHUTDOWN', assertGracefulSseShutdown);
       await smokePhase('APP_RESTART', async () => { await compose(['exec', '-T', 'back', 'sol', 'ctl', 'start', 'listener']); });
@@ -894,7 +898,11 @@ async function writeSmokeHost() {
       `SOLANA_HTTP_RPC_URL=https://rpc.invalid/?api-key=${rpcApiKey}`,
       `SOLANA_WS_RPC_URL=wss://rpc.invalid/?api-key=${rpcApiKey}`,
     ]],
-    ['live', [`EXECUTOR_KEYPAIR_PATH=${keypairFile}`]],
+    ['live', [
+      // opapi reads the wallet balance through the executor project in both modes.
+      `SOLANA_HTTP_RPC_URL=https://rpc.invalid/?api-key=${executorRpcApiKey}`,
+      `EXECUTOR_KEYPAIR_PATH=${keypairFile}`,
+    ]],
   ]) {
     const template = await readFile(resolve(root, `deploy/config/${name}.env.example`), 'utf8');
     await writeFile(join(hostDirectory, `import/env/${name}.env`), [template.trimEnd(), ...lines, ''].join('\n'), { mode: 0o600 });
@@ -968,7 +976,7 @@ async function importSmokeVault() {
   );
   assertEqual(
     summary.secrets.join(','),
-    'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json',
+    'helius-listener-accounts,helius-executor-http-url,wallet-keypair.json',
     'vault-import did not import the expected secrets.',
   );
 }
@@ -996,10 +1004,10 @@ async function assertFrontNonRoot() {
 }
 
 async function assertSecretIsolation() {
-  const secretPaths = ['/run/sol/listener/pg-sol_listener-password', '/run/sol/opapi/operator-api-token'];
+  const secretPaths = ['/run/sol/listener/pg-sol_listener-password', '/run/sol/listener/helius-listener-accounts', '/run/sol/opapi/operator-api-token'];
   const { stdout } = await compose(['exec', '-T', 'back', 'stat', '-c', '%U %a', ...secretPaths]);
-  assertEqual(stdout, 'listener 400\nopapi 400\n', 'Secrets are not owner-only in the tmpfs.');
-  for (const path of secretPaths.slice(1)) {
+  assertEqual(stdout, 'listener 400\nlistener 400\nopapi 400\n', 'Secrets are not owner-only in the tmpfs.');
+  for (const path of secretPaths.slice(2)) {
     let readable = true;
     try {
       await compose([
@@ -1014,6 +1022,54 @@ async function assertSecretIsolation() {
   // either tmpfs, which the container always mounts.
   const { stdout: pulled } = await compose(['exec', '-T', 'back', 'find', '/root/secrets', '/run/sol', '-name', '*keypair*']);
   if (pulled !== '') throw new Error('The observe stack pulled the keypair out of Vault.');
+  // The Helius account list reaches the listener user only (Helius accounts spec 8).
+  let opapiReadsAccounts = true;
+  try {
+    await compose([
+      'exec', '-T', 'back', 'setpriv', '--reuid=opapi', '--regid=opapi', '--clear-groups',
+      'cat', '/run/sol/listener/helius-listener-accounts',
+    ], { reflectFailureOutput: false });
+  } catch {
+    opapiReadsAccounts = false;
+  }
+  if (opapiReadsAccounts) throw new Error('The opapi user can read the Helius account list.');
+  const { stdout: holders } = await compose(['exec', '-T', 'back', 'find', '/run/sol', '-name', 'helius-listener-accounts']);
+  assertEqual(holders, '/run/sol/listener/helius-listener-accounts\n', 'The Helius account list reached another user.');
+}
+
+/** The operator adds a second account through stdin, as the runbook does, then reloads it alone. */
+async function assertHeliusReload() {
+  const { stdout: tokenOutput } = await compose(
+    ['exec', '-T', 'vault', 'vault', 'write', '-field=token', 'auth/userpass/login/operator', 'password=-'],
+    { input: operatorPassword, reflectFailureOutput: false },
+  );
+  const operatorToken = tokenOutput.trim();
+  smokeSecrets.push(operatorToken);
+  const tokenEnvironment = { ...environment, VAULT_TOKEN: operatorToken };
+  await compose(
+    ['exec', '-T', '-e', 'VAULT_TOKEN', 'vault', 'vault', 'kv', 'patch', 'sol/secrets/back/helius-listener-accounts', '02-smoke=-'],
+    { commandEnvironment: tokenEnvironment, input: spareRpcApiKey, reflectFailureOutput: false },
+  );
+  await compose(
+    ['exec', '-T', '-e', 'VAULT_TOKEN', 'vault', 'vault', 'token', 'revoke', '-self'],
+    { commandEnvironment: tokenEnvironment, reflectFailureOutput: false },
+  );
+  const before = await programPids();
+  const { stdout, stderr } = await compose(['exec', '-T', 'back', 'sol', 'helius', 'reload'], { reflectFailureOutput: false });
+  assertNoSmokeSecret(`${stdout}\n${stderr}`, 'sol helius reload printed a secret.');
+  assertEqual(stdout, '{"event":"helius.reloaded","accounts":["01","02-smoke"]}\n', 'sol helius reload did not report both accounts.');
+  const after = await programPids();
+  if (after.listener === before.listener) throw new Error('sol helius reload did not restart the listener.');
+  assertEqual(`${after.opapi} ${after.retention}`, `${before.opapi} ${before.retention}`, 'sol helius reload restarted another program.');
+  await waitForPublicHealth();
+}
+
+async function programPids() {
+  const { stdout } = await compose([
+    'exec', '-T', 'back', 'sh', '-c',
+    'for program in listener opapi retention; do printf "%s %s\\n" "$program" "$(sol ctl pid "$program")"; done',
+  ]);
+  return Object.fromEntries(stdout.trim().split('\n').map((line) => line.split(' ')));
 }
 
 async function assertFrontAuthentication() {

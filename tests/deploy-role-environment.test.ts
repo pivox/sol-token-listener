@@ -15,11 +15,9 @@ import type { RoleName, StackMode } from '../src/deploy/stack.js';
 const LEAK = 'value-that-must-not-leak';
 const SECRETS: Readonly<Record<string, string>> = Object.freeze({
   '/run/sol/listener/pg-sol_listener-password': 'p@ss/word:with?reserved#chars\n',
-  '/run/sol/listener/helius-listener-http-url': 'https://listener.invalid/?api-key=listener-key\n',
-  '/run/sol/listener/helius-listener-ws-url': 'wss://listener.invalid/?api-key=listener-key\n',
+  '/run/sol/listener/helius-listener-accounts': '{"01-main":"listener-key","02-spare":"spare-key"}',
   '/run/sol/opapi/pg-sol_reader-password': 'reader-password-0123456789\n',
   '/run/sol/opapi/operator-api-token': 'operator-token-0123456789abcdef0123456789abcdef\n',
-  '/run/sol/opapi/helius-listener-http-url': 'https://listener.invalid/?api-key=listener-key\n',
   '/run/sol/opapi/helius-executor-http-url': 'https://executor.invalid/?api-key=executor-key\n',
   '/run/sol/h2b/pg-sol_live-password': 'live-password-0123456789\n',
   '/run/sol/h2b/helius-executor-http-url': 'https://executor.invalid/?api-key=executor-key\n',
@@ -59,8 +57,9 @@ void test('the listener gets its configuration, an encoded login URL and both li
     'postgresql://sol_listener:p%40ss%2Fword%3Awith%3Freserved%23chars@postgres:5432/sol_token_listener'
       + '?options=-c%20role%3Dsol_token_listener_writer',
   );
-  assert.equal(environment.SOLANA_HTTP_RPC_URL, 'https://listener.invalid/?api-key=listener-key');
-  assert.equal(environment.SOLANA_WS_RPC_URL, 'wss://listener.invalid/?api-key=listener-key');
+  assert.equal(environment.SOLANA_HTTP_RPC_URL, 'https://mainnet.helius-rpc.com/?api-key=listener-key');
+  assert.equal(environment.SOLANA_WS_RPC_URL, 'wss://mainnet.helius-rpc.com/?api-key=listener-key');
+  assert.equal(environment.LISTENER_HELIUS_ACCOUNTS_PATH, '/run/sol/listener/helius-listener-accounts');
   assert.equal(environment.SOL_RUN_USER, 'listener');
   assert.equal(environment.SOL_RUN_UID, '10001');
   assert.equal(environment.EXECUTOR_KEYPAIR_PATH, undefined);
@@ -78,14 +77,57 @@ void test('only H2b gets the keypair path, and the worker pins its search_path',
   assert.equal(worker.EXECUTOR_KEYPAIR_PATH, undefined);
 });
 
-void test('the operator API reads its token and follows the mode for its RPC project', () => {
+void test('the operator API reads its token and takes the executor project for its RPC in both modes', () => {
   const observe = build('opapi', 'OPERATOR_API_HOST=0.0.0.0\n', { mode: 'observe' });
   assert.equal(observe.OPERATOR_API_TOKEN, 'operator-token-0123456789abcdef0123456789abcdef');
-  assert.equal(observe.SOLANA_HTTP_RPC_URL, 'https://listener.invalid/?api-key=listener-key');
+  assert.equal(observe.SOLANA_HTTP_RPC_URL, 'https://executor.invalid/?api-key=executor-key');
   assert.match(observe.OPERATOR_API_DATABASE_URL ?? '', /^postgresql:\/\/sol_reader:/u);
   assert.equal(observe.DATABASE_URL, undefined);
   const live = build('opapi', 'OPERATOR_API_HOST=0.0.0.0\n', { mode: 'live' });
   assert.equal(live.SOLANA_HTTP_RPC_URL, 'https://executor.invalid/?api-key=executor-key');
+});
+
+void test('the listener takes its Helius addresses from the configuration, without a key there', () => {
+  const environment = build('listener', 'HELIUS_RPC_HTTP_URL=https://rpc.invalid/\nHELIUS_RPC_WS_URL=wss://rpc.invalid/\n');
+  assert.equal(environment.SOLANA_HTTP_RPC_URL, 'https://rpc.invalid/?api-key=listener-key');
+  assert.equal(environment.SOLANA_WS_RPC_URL, 'wss://rpc.invalid/?api-key=listener-key');
+  assert.throws(() => build('listener', 'HELIUS_RPC_HTTP_URL=https://rpc.invalid/\nHELIUS_RPC_WS_URL=https://rpc.invalid/\n'),
+    (error: unknown) => error instanceof RoleEnvironmentError && error.message === 'HELIUS_RPC_WS_URL: expected a wss URL');
+  assert.throws(() => build('listener', `HELIUS_RPC_HTTP_URL=https://rpc.invalid/?api-key=${LEAK}\nHELIUS_RPC_WS_URL=wss://rpc.invalid/\n`),
+    (error: unknown) => error instanceof RoleEnvironmentError && !error.message.includes(LEAK));
+});
+
+void test('the Helius addresses go together and refuse userinfo', () => {
+  for (const text of ['HELIUS_RPC_HTTP_URL=https://rpc.invalid/\n', 'HELIUS_RPC_WS_URL=wss://rpc.invalid/\n']) {
+    assert.throws(() => build('listener', text),
+      (error: unknown) => error instanceof RoleEnvironmentError
+        && error.message === 'HELIUS_RPC_HTTP_URL and HELIUS_RPC_WS_URL go together');
+  }
+  assert.throws(() => build('listener', `HELIUS_RPC_HTTP_URL=https://${LEAK}@rpc.invalid/\nHELIUS_RPC_WS_URL=wss://rpc.invalid/\n`),
+    (error: unknown) => error instanceof RoleEnvironmentError && !error.message.includes(LEAK));
+});
+
+void test('the configuration never sets the account file path', () => {
+  assert.throws(() => build('listener', 'LISTENER_HELIUS_ACCOUNTS_PATH=/tmp/x\n'),
+    (error: unknown) => error instanceof RoleEnvironmentError
+      && error.message === 'listener.env: LISTENER_HELIUS_ACCOUNTS_PATH comes from a secret file, not from the configuration');
+});
+
+void test('an invalid account file stops the listener without showing a key', () => {
+  const environment = (text: string): unknown => buildRoleEnvironment({
+    role: 'listener', mode: 'live', databaseName: 'sol_token_listener', configText: '', overrideText: null,
+    runDirectory: '/run/sol',
+    readSecret: (path) => (path.endsWith('/helius-listener-accounts') ? text : SECRETS[path] ?? ''),
+    secretExists: () => true,
+  });
+  assert.throws(() => environment(`{"01-main":"${LEAK} x"}`), (error: unknown) => error instanceof RoleEnvironmentError
+    && error.message === 'helius-listener-accounts: 01-main must be one printable line without spaces');
+  assert.throws(() => environment(`{${LEAK}`), (error: unknown) => error instanceof RoleEnvironmentError
+    && error.message === 'helius-listener-accounts: not a JSON object');
+  assert.throws(() => environment('[]'), (error: unknown) => error instanceof RoleEnvironmentError
+    && error.message === 'helius-listener-accounts: expected one field per account');
+  assert.throws(() => environment('{}'), (error: unknown) => error instanceof RoleEnvironmentError
+    && error.message === 'helius-listener-accounts: expected 1 to 32 accounts');
 });
 
 void test('evidence roles get secret file paths and nothing else', () => {

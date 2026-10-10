@@ -2,7 +2,7 @@ import { Connection, type FetchFn } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { FinalityProviderPass } from '../../ports/finality-provider-pass.js';
-import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { catalogFetch, type RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
@@ -59,7 +59,7 @@ export function createProviderPinnedFinalityPass(
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)) throw failure('CONFIG_INVALID', exposedProviderId);
   const createRpc = dependencyFactory(dependencies, exposedProviderId, providerId, recorder, roleRecorder,
-    attemptBudget, requestTimeoutMs);
+    attemptBudget, requestTimeoutMs, pinnedBaseFetch(catalog, exposedProviderId));
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const calls = createPinnedCalls(createRpc, httpUrl, providerId);
 
@@ -110,11 +110,16 @@ function dependencyFactory(
   roleRecorder: RpcHttpRoleEvidenceRecorder | undefined,
   attemptBudget: OrdinaryRpcAttemptBudget | undefined,
   requestTimeoutMs: number,
+  baseFetch: FetchFn | undefined,
 ): (httpUrl: string) => unknown {
   if (dependencies === undefined) {
-    if (recorder === undefined && roleRecorder === undefined && attemptBudget === undefined) return createDefaultRpc;
+    if (recorder === undefined && roleRecorder === undefined && attemptBudget === undefined) {
+      return baseFetch === undefined
+        ? createDefaultRpc
+        : (httpUrl: string): Connection => createDefaultRpc(httpUrl, baseFetch);
+    }
     const observedFetch = createObservedRpcFetch(
-      selectedProviderId, recorder, globalThis.fetch, roleRecorder, 'FINALITY', attemptBudget,
+      selectedProviderId, recorder, baseFetch ?? globalThis.fetch, roleRecorder, 'FINALITY', attemptBudget,
     );
     const boundedFetch = attemptBudget === undefined ? observedFetch : createBoundedRpcFetch(observedFetch, requestTimeoutMs);
     return (httpUrl: string): Connection => createDefaultRpc(httpUrl, boundedFetch);
@@ -328,4 +333,13 @@ function failure(
   providerId: RpcProviderId | null,
 ): ProviderPinnedFinalityError {
   return new ProviderPinnedFinalityError(reason, providerId);
+}
+
+/** The catalog's base fetch (the Helius account rotation) or undefined; a malformed catalog is CONFIG_INVALID. */
+function pinnedBaseFetch(catalog: RpcProviderCatalog, providerId: RpcProviderId | null): FetchFn | undefined {
+  try {
+    return catalogFetch(catalog);
+  } catch {
+    throw failure('CONFIG_INVALID', providerId);
+  }
 }

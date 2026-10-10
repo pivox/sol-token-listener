@@ -45,6 +45,7 @@ export function createSolanaConnectionConfig(
   onEndpointSelected?: (endpointId: RpcHttpEndpointId) => void,
 ): ConnectionConfig {
   if (config.httpRpcFallbackUrls.length === 0) {
+    // Without any observer `dependencies.fetch` is not used here: the production factory always passes a recorder.
     // Preserve the legacy measurement/timeout order when admission is OFF.
     const boundedFetch = dependencies.attemptBudget !== undefined || dependencies.requestTimeoutMs === undefined
       ? undefined

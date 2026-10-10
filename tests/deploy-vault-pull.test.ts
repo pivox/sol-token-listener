@@ -22,7 +22,11 @@ const MARKER = 'marker-that-must-not-leak';
 function seededVault(): FakeVault {
   const vault = new FakeVault();
   for (const entry of backEntries('live')) {
-    vault.kv.set(entry.path, entry.kind === 'config' ? { LOG_LEVEL: 'info' } : { value: `value-of-${entry.path}` });
+    vault.kv.set(entry.path, entry.kind === 'config'
+      ? { LOG_LEVEL: 'info' }
+      : entry.path === 'secrets/back/helius-listener-accounts'
+        ? { '01-main': 'value-of-main' }
+        : { value: `value-of-${entry.path}` });
   }
   return vault;
 }
@@ -298,4 +302,23 @@ void test('each container writes under the directory its consumer reads', async 
   assert.equal(back.code, 0, back.stderr);
   assert.ok([...back.files.keys()].every((path) => path.startsWith('/x/back/') || path.startsWith('/x/config/')));
   assert.ok([...back.files.keys()].some((path) => path.startsWith('/x/config/')));
+});
+
+void test('the listener accounts entry becomes its compact JSON file, names sorted', async () => {
+  const vault = seededVault();
+  vault.kv.set('secrets/back/helius-listener-accounts', { '02-spare': 'key-spare', '01-main': 'key-main' });
+  const run = await pull(vault, ['back', 'live'], JSON.stringify(vault.addAppRole('back')));
+  assert.equal(run.code, 0, run.stderr);
+  assert.deepEqual(run.files.get('/root/secrets/back/helius-listener-accounts'), {
+    content: '{"01-main":"key-main","02-spare":"key-spare"}', mode: 0o600,
+  });
+});
+
+void test('an invalid accounts entry stops the pull with 78, writes nothing and shows no key', async () => {
+  const vault = seededVault();
+  vault.kv.set('secrets/back/helius-listener-accounts', { '01-main': 'key with space' });
+  const run = await pull(vault, ['back', 'live'], JSON.stringify(vault.addAppRole('back')));
+  assert.equal(run.code, 78);
+  assert.equal(run.stderr, 'vault-pull: secrets/back/helius-listener-accounts: 01-main must be one printable line without spaces\n');
+  assert.equal(run.files.size, 0);
 });

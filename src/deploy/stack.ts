@@ -52,10 +52,9 @@ export function loginPasswordFile(login: DatabaseLogin): string {
   return `pg-${login}-password`;
 }
 
-/** Secret files of the back container, besides the login passwords (spec 7.1). */
+/** Secret files of the back container, besides the login passwords (spec 7.1, Helius accounts spec 5). */
 export type BackSecret =
-  | 'helius-listener-http-url'
-  | 'helius-listener-ws-url'
+  | 'helius-listener-accounts'
   | 'helius-executor-http-url'
   | 'helius-admin-api-key'
   | 'evidence-private-key'
@@ -87,10 +86,13 @@ export interface RoleDefinition {
   /** Non-secret configuration: `<config directory>/<configFile>`. */
   readonly configFile: string;
   readonly database?: RoleDatabase;
-  /** `SOLANA_HTTP_RPC_URL`. `by-mode`: listener project in observe, executor project in live. */
-  readonly httpRpc?: BackSecret | 'by-mode';
-  /** `SOLANA_WS_RPC_URL`. */
-  readonly wsRpc?: BackSecret;
+  /** `SOLANA_HTTP_RPC_URL`, from a URL secret of the executor project. */
+  readonly httpRpc?: BackSecret;
+  /**
+   * The Helius account list (Helius accounts spec 5.4): `SOLANA_HTTP_RPC_URL` and
+   * `SOLANA_WS_RPC_URL` from its first account, and `LISTENER_HELIUS_ACCOUNTS_PATH` its tmpfs path.
+   */
+  readonly heliusAccounts?: BackSecret;
   /** Variables set to the tmpfs path of a secret file, which the process reads itself. */
   readonly secretPaths?: Readonly<Record<string, BackSecret>>;
   /** Variables set to the content of a secret file. */
@@ -106,7 +108,7 @@ function loginDatabase(login: DatabaseLogin, searchPath = false): RoleDatabase {
 const ROLE_TABLE: Record<RoleName, RoleDefinition> = {
   listener: {
     user: 'listener', configFile: 'listener.env', database: loginDatabase('sol_listener'),
-    httpRpc: 'helius-listener-http-url', wsRpc: 'helius-listener-ws-url',
+    heliusAccounts: 'helius-listener-accounts',
   },
   h2b: {
     user: 'h2b', configFile: 'live.env', database: loginDatabase('sol_live'), httpRpc: EXECUTOR_RPC,
@@ -123,7 +125,8 @@ const ROLE_TABLE: Record<RoleName, RoleDefinition> = {
   opapi: {
     user: 'opapi', configFile: 'operator-api.env',
     database: { login: 'sol_reader', variable: 'OPERATOR_API_DATABASE_URL', searchPath: false },
-    httpRpc: 'by-mode',
+    // The wallet balance comes from the executor project in both modes (Helius accounts spec 5.4).
+    httpRpc: EXECUTOR_RPC,
     secretValues: { OPERATOR_API_TOKEN: 'operator-api-token' },
   },
   retention: {
@@ -169,11 +172,6 @@ export const REQUIRED_ROLES: Readonly<Record<StackMode, readonly RoleName[]>> = 
   ]),
 });
 
-export function resolveHttpRpc(role: RoleDefinition, mode: StackMode): BackSecret | undefined {
-  if (role.httpRpc !== 'by-mode') return role.httpRpc;
-  return mode === 'live' ? EXECUTOR_RPC : 'helius-listener-http-url';
-}
-
 export type SecretSource = 'logins' | 'back';
 
 export interface RoleSecretFile {
@@ -181,15 +179,14 @@ export interface RoleSecretFile {
   readonly file: string;
 }
 
-/** The secret files a role reads in a mode, relative to `/root/secrets/<source>/`. */
-export function roleSecretFiles(role: RoleDefinition, mode: StackMode): readonly RoleSecretFile[] {
+/** The secret files a role reads, relative to `/root/secrets/<source>/`. */
+export function roleSecretFiles(role: RoleDefinition): readonly RoleSecretFile[] {
   const files: RoleSecretFile[] = [];
   if (role.database !== undefined) {
     files.push({ source: 'logins', file: loginPasswordFile(role.database.login) });
   }
-  const httpRpc = resolveHttpRpc(role, mode);
-  if (httpRpc !== undefined) files.push({ source: 'back', file: httpRpc });
-  if (role.wsRpc !== undefined) files.push({ source: 'back', file: role.wsRpc });
+  if (role.httpRpc !== undefined) files.push({ source: 'back', file: role.httpRpc });
+  if (role.heliusAccounts !== undefined) files.push({ source: 'back', file: role.heliusAccounts });
   for (const file of Object.values(role.secretPaths ?? {})) files.push({ source: 'back', file });
   for (const file of Object.values(role.secretValues ?? {})) files.push({ source: 'back', file });
   return Object.freeze(files);

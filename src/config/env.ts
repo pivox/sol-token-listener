@@ -85,6 +85,10 @@ export interface AppConfig {
   readonly listenerCatchUpPageSize: number;
   readonly listenerFinalityMissingPolls: number;
   readonly listenerShutdownTimeoutMs: number;
+  /** The Helius account list the stack's sol-run gives the listener; null outside the stack. */
+  readonly listenerHeliusAccountsPath: string | null;
+  /** How long an exhausted or refused Helius account is set aside. */
+  readonly listenerHeliusAccountCooldownMs: number;
   readonly listenerBlockHydrationEnabled: boolean;
   readonly listenerBlockHydrationMaxEntries: number;
   readonly listenerBlockHydrationMaxBytes: number;
@@ -398,6 +402,14 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     listenerShutdownTimeoutMs: parseInteger(
       environment.LISTENER_SHUTDOWN_TIMEOUT_MS, 30_000, 'LISTENER_SHUTDOWN_TIMEOUT_MS', 1_000, 120_000,
+    ),
+    listenerHeliusAccountsPath: parseHeliusAccountsPath(environment.LISTENER_HELIUS_ACCOUNTS_PATH),
+    listenerHeliusAccountCooldownMs: parseInteger(
+      environment.LISTENER_HELIUS_ACCOUNT_COOLDOWN_MS,
+      3_600_000,
+      'LISTENER_HELIUS_ACCOUNT_COOLDOWN_MS',
+      60_000,
+      86_400_000,
     ),
     ...blockHydration,
     raydiumCpmmProgramId: optional(environment.RAYDIUM_CPMM_PROGRAM_ID, DEFAULT_RAYDIUM_CPMM_PROGRAM_ID),
@@ -771,6 +783,12 @@ function parseSolToLamports(raw: string | undefined, fallback: string, name: str
   const whole = BigInt(match[1] ?? '0');
   const fraction = (match[2] ?? '').padEnd(9, '0');
   return (whole * 1_000_000_000n) + BigInt(fraction || '0');
+}
+
+function parseHeliusAccountsPath(raw: string | undefined): string | null {
+  if (!hasValue(raw)) return null;
+  if (!raw.startsWith('/') || raw !== raw.trim()) throw new Error('LISTENER_HELIUS_ACCOUNTS_PATH must be an absolute path.');
+  return raw;
 }
 
 function parseOptionalBigInt(raw: string | undefined, name: string): bigint | null {

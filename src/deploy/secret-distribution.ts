@@ -31,7 +31,7 @@ export function secretGrants(mode: StackMode): readonly SecretGrant[] {
   const grants = new Map<string, SecretGrant>();
   for (const name of ROLE_NAMES) {
     const role = ROLES[name];
-    for (const secret of roleSecretFiles(role, mode)) {
+    for (const secret of roleSecretFiles(role)) {
       const key = `${role.user}/${secret.file}`;
       grants.set(key, Object.freeze({
         user: role.user,

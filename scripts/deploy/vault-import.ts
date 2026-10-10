@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { posix } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse } from 'dotenv';
+import { HeliusAccountsError, heliusAccountsFromEntry } from '../../src/config/helius-accounts.js';
 import { errnoCode } from '../../src/deploy/errno-code.js';
 import { INJECTED_KEYS, RoleEnvironmentError, rpcUrl } from '../../src/deploy/role-environment.js';
 import type { BackSecret } from '../../src/deploy/stack.js';
@@ -14,6 +15,7 @@ import {
 } from '../../src/deploy/vault-client.js';
 import {
   CONFIG_NAMES,
+  HELIUS_LISTENER_ACCOUNTS,
   VaultLayoutError,
   backSecretPath,
   configPath,
@@ -21,12 +23,10 @@ import {
   type ConfigName,
 } from '../../src/deploy/vault-layout.js';
 
-/** The back's URL secrets and the role-file variable each one comes from (the runbook's former copies). */
+/** The back's URL secret and the role-file variable it comes from (the runbook's former copy). */
 const URL_SECRETS: readonly Readonly<{
   secret: BackSecret; source: ConfigName; variable: string; protocol: 'https:' | 'wss:';
 }>[] = Object.freeze([
-  { secret: 'helius-listener-http-url', source: 'listener', variable: 'SOLANA_HTTP_RPC_URL', protocol: 'https:' },
-  { secret: 'helius-listener-ws-url', source: 'listener', variable: 'SOLANA_WS_RPC_URL', protocol: 'wss:' },
   { secret: 'helius-executor-http-url', source: 'live', variable: 'SOLANA_HTTP_RPC_URL', protocol: 'https:' },
 ]);
 /** Key files that deploy/host/vault-import.sh mounts under /import/keys. */
@@ -129,12 +129,56 @@ export async function runVaultImportCli(
   }
 }
 
+/**
+ * The lot5 listener URLs become account `01` of the Helius account list, and their addresses
+ * without the key become HELIUS_RPC_HTTP_URL and HELIUS_RPC_WS_URL (Helius accounts spec 5.5).
+ */
+function listenerAccount(parsed: Readonly<Record<string, string>>): Readonly<{
+  apiKey: string; httpUrl: string; websocketUrl: string;
+}> | null {
+  const http = parsed.SOLANA_HTTP_RPC_URL;
+  const websocket = parsed.SOLANA_WS_RPC_URL;
+  const httpUrl = http === undefined || http === ''
+    ? null : rpcUrl(http, 'listener.env: SOLANA_HTTP_RPC_URL', 'https:');
+  const websocketUrl = websocket === undefined || websocket === ''
+    ? null : rpcUrl(websocket, 'listener.env: SOLANA_WS_RPC_URL', 'wss:');
+  if (httpUrl === null && websocketUrl === null) return null;
+  if (httpUrl === null || websocketUrl === null) {
+    throw new ImportSourceError('listener.env: SOLANA_HTTP_RPC_URL and SOLANA_WS_RPC_URL go together');
+  }
+  const httpKey = splitApiKey(httpUrl, 'SOLANA_HTTP_RPC_URL');
+  const websocketKey = splitApiKey(websocketUrl, 'SOLANA_WS_RPC_URL');
+  if (httpKey.apiKey !== websocketKey.apiKey) {
+    throw new ImportSourceError('listener.env: SOLANA_HTTP_RPC_URL and SOLANA_WS_RPC_URL carry different api-key values');
+  }
+  return Object.freeze({ apiKey: httpKey.apiKey, httpUrl: httpKey.address, websocketUrl: websocketKey.address });
+}
+
+function splitApiKey(value: string, variable: string): Readonly<{ apiKey: string; address: string }> {
+  const url = new URL(value);
+  const apiKey = url.searchParams.get('api-key');
+  if (apiKey === null || apiKey === '') throw new ImportSourceError(`listener.env: ${variable} has no api-key parameter`);
+  url.searchParams.delete('api-key');
+  return Object.freeze({ apiKey, address: url.toString() });
+}
+
+/** The api-key of the executor address, or null when it is absent or not a URL. */
+function executorApiKey(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  try {
+    return new URL(value).searchParams.get('api-key');
+  } catch {
+    return null;
+  }
+}
+
 function planImport(directory: string, evidencePrefix: string, dependencies: VaultImportDependencies): ImportPlan {
   const writes: (readonly [string, Readonly<Record<string, string>>])[] = [];
   const configs: string[] = [];
   const templates: string[] = [];
   const secrets: string[] = [];
   const roleFiles = new Map<ConfigName, Readonly<Record<string, string>>>();
+  let listenerKey: string | null = null;
   // Normalized, so dot segments of a relative directory argument (`../evidence`, resolved by the host
   // script against its current directory) do not make the prefix miss the absolute paths of the files.
   const prefix = evidencePrefix === '' ? '' : posix.normalize(evidencePrefix).replace(/\/+$/u, '');
@@ -152,10 +196,32 @@ function planImport(directory: string, evidencePrefix: string, dependencies: Vau
         ? `${EVIDENCE_DIRECTORY}${value.slice(prefix.length)}`
         : value;
     }
+    if (name === 'listener' && fromOwn) {
+      const account = listenerAccount(parsed);
+      if (account !== null) {
+        data.HELIUS_RPC_HTTP_URL = account.httpUrl;
+        data.HELIUS_RPC_WS_URL = account.websocketUrl;
+        listenerKey = account.apiKey;
+      }
+    }
     Object.assign(data, STACK_BINDINGS[name] ?? {});
     renderConfig(name, data);
     writes.push([configPath(name), Object.freeze(data)]);
     (fromOwn ? configs : templates).push(name);
+  }
+  if (listenerKey !== null) {
+    if (listenerKey === executorApiKey(roleFiles.get('live')?.SOLANA_HTTP_RPC_URL)) {
+      throw new ImportSourceError('listener.env: the listener key is the executor key');
+    }
+    const entry = Object.freeze({ '01': listenerKey });
+    try {
+      heliusAccountsFromEntry(entry, backSecretPath(HELIUS_LISTENER_ACCOUNTS));
+    } catch (error) {
+      if (error instanceof HeliusAccountsError) throw new ImportSourceError(error.message);
+      throw error;
+    }
+    writes.push([backSecretPath(HELIUS_LISTENER_ACCOUNTS), entry]);
+    secrets.push(HELIUS_LISTENER_ACCOUNTS);
   }
   for (const entry of URL_SECRETS) {
     const value = roleFiles.get(entry.source)?.[entry.variable];

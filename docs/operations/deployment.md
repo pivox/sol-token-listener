@@ -229,6 +229,12 @@ l'hôte ne restent que les secrets d'amorçage :
 
    L'import :
    - retire les variables que `sol-run` injecte ;
+   - convertit `SOLANA_HTTP_RPC_URL` et `SOLANA_WS_RPC_URL` de `listener.env` en un compte `01`
+     de `sol/secrets/back/helius-listener-accounts` (les deux URL doivent porter la même clé), et
+     leurs adresses sans clé en `HELIUS_RPC_HTTP_URL` et `HELIUS_RPC_WS_URL` de `sol/config/listener` ;
+     refuse une clé du listener identique à celle de l'exécuteur ;
+   - importe `SOLANA_HTTP_RPC_URL` de `live.env` dans `sol/secrets/back/helius-executor-http-url`,
+     requise même en mode `observe` : l'API opérateur y lit le solde du wallet ;
    - réécrit les chemins de preuves vers `/var/lib/sol/evidence`. Le second argument, facultatif,
      nomme le dossier de preuves d'origine ; par défaut, `evidence/` à côté du dossier source ;
    - fixe `API_HOST=0.0.0.0`, `API_PORT=3000`, `OPERATOR_API_HOST=0.0.0.0` et
@@ -278,7 +284,7 @@ l'historique du shell la garderait, et `ps` la montrerait. La lire sur l'entrée
 
 ```bash
 printf 'Valeur : ' && IFS= read -rs value && printf '\n'
-printf '%s' "$value" | sol_vault kv put sol/secrets/back/helius-listener-http-url value=-
+printf '%s' "$value" | sol_vault kv put sol/secrets/back/helius-executor-http-url value=-
 unset value
 ```
 
@@ -328,6 +334,54 @@ evidence_file=gate-catalog.json
 sol_compose cp "$HOME/.sol-token-listener/lot5/evidence/$evidence_file" "back:/var/lib/sol/evidence/$evidence_file"
 sol_compose exec back chown ops:ops "/var/lib/sol/evidence/$evidence_file"
 ```
+
+### Comptes Helius du listener
+
+Le listener lit une liste de comptes Helius, `sol/secrets/back/helius-listener-accounts` : un
+champ par compte, nommé (`01-perso`, `02-pro` : minuscules, chiffres, tirets), dont la valeur est
+la clé API. Il démarre sur le premier dans l'ordre alphabétique des noms. Quand un compte répond
+« max usage reached » (quota épuisé) ou refuse sa clé (401, 403), il le met à l'écart une heure
+(`LISTENER_HELIUS_ACCOUNT_COOLDOWN_MS`) et passe au suivant, sans redémarrer. La clé de l'exécuteur
+n'entre jamais dans cette liste. Relancer l'import remet la liste au seul compte `01` (les versions
+précédentes restent dans l'historique de Vault).
+
+Les clés passent par l'entrée standard. Dans une session `operator` (« Modifier une valeur ») :
+
+```bash
+# Ajouter ou remplacer un compte
+printf 'Clé : ' && IFS= read -rs cle && printf '\n'
+printf '%s' "$cle" | sol_vault kv patch sol/secrets/back/helius-listener-accounts 02-pro=-
+unset cle
+# Retirer un compte
+sol_vault kv patch -remove-data=02-pro sol/secrets/back/helius-listener-accounts
+```
+
+La première création utilise `kv put` au lieu de `kv patch` ; `kv put` remplace toute l'entrée,
+il ne sert donc jamais à ajouter un compte. Ne jamais lancer `kv get` sur cette
+entrée : il affiche les clés. Puis recharger la liste sans toucher au trading :
+
+```bash
+sol_compose exec back sol helius reload
+```
+
+La commande relit Vault, redistribue les secrets et redémarre (ou démarre) le seul listener. Elle
+affiche les noms des comptes, jamais une clé. Si Vault refuse ou si la liste est invalide, elle
+s'arrête avant le redémarrage, et le listener garde sa liste. Les autres entrées relues ne prennent
+effet qu'au prochain démarrage de leur programme : pour elles, redémarrer `back`.
+
+Suivre les comptes :
+
+```bash
+sol_compose logs back | grep helius_account
+```
+
+- `rpc.helius_account_set_aside` : un compte mis à l'écart, avec sa raison (`QUOTA_EXHAUSTED`,
+  `KEY_REFUSED`), le compte suivant et le nombre de comptes encore disponibles ;
+- `rpc.helius_accounts_unavailable` : tous les comptes sont à l'écart, le listener est sourd
+  jusqu'au prochain essai. Ajouter un compte, ou attendre le renouvellement d'un quota.
+
+Les anciennes entrées `sol/secrets/back/helius-listener-http-url` et `helius-listener-ws-url` ne
+sont plus lues : les supprimer avec `sol_vault kv metadata delete <chemin>`.
 
 ## Démarrage et arrêt
 
@@ -383,6 +437,7 @@ confirmation au TTY.
 | `sol evidence provider`, `sol evidence bundle` | H2e, H2f |
 | `sol qualify start`, `sol qualify stop` | sonde du gate 10 |
 | `sol trading start`, `sol trading stop` | autoriser ou suspendre les achats |
+| `sol helius reload` | rechargement des comptes Helius du listener |
 | `sol ctl …` | `supervisorctl` (status, restart d'un programme) |
 
 Le rapport fast-path lit la base en administrateur : il passe par la tâche `migrate`, seule

@@ -1295,7 +1295,8 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /`SOLANA_HTTP_RPC_URL=https:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
   assert.match(smoke, /`SOLANA_WS_RPC_URL=wss:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
   assert.match(smoke, /const rpcApiKey = randomBytes\(16\)\.toString\('hex'\);/);
-  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey\];/);
+  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey, executorRpcApiKey\];/);
+  assert.match(smoke, /smokePhase\('HELIUS_RELOAD', assertHeliusReload\)/u);
   assert.match(smoke, /'LISTENER_ENABLED=false'/);
   assert.match(smoke, /`EXECUTOR_KEYPAIR_PATH=\$\{keypairFile\}`/);
   assert.match(smoke, /VAULT_IMAGE:\s*deploymentImages\.vault/);
@@ -1467,7 +1468,7 @@ void test('deployment smoke proves users, secret isolation, front authentication
   for (const statement of [
     "assertEqual(stdout, 'listener 10001\\nopapi 10005\\nretention 10006\\n'",
     "assertEqual(stdout.trim(), '10100'",
-    "assertEqual(stdout, 'listener 400\\nopapi 400\\n'",
+    "assertEqual(stdout, 'listener 400\\nlistener 400\\nopapi 400\\n'",
     "'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path",
     "'exec', '-T', 'back', 'find', '/root/secrets', '/run/sol', '-name', '*keypair*'",
     "if (pulled !== '')",
@@ -1525,7 +1526,7 @@ void test('deployment smoke fills its Vault through the host scripts without eve
   assert.ok(fill.includes("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-import.sh printed a secret.');"));
   assert.ok(fill.includes("summary.configs.join(','), 'listener,live'"));
   assert.ok(fill.includes("readdir(resolve(root, 'deploy/config'))"));
-  assert.ok(fill.includes("'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json'"));
+  assert.ok(fill.includes("'helius-listener-accounts,helius-executor-http-url,wallet-keypair.json'"));
 });
 
 void test('deployment smoke proves that six wrong secret_ids do not lock the backup role out', async () => {
@@ -1632,7 +1633,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     '| sol_compose exec -T vault vault write -field=token auth/userpass/login/operator password=-',
     'VAULT_TOKEN="$(vault login -token-only)"',
     // A secret reaches Vault on stdin, never on a command line that history and ps would keep.
-    '| sol_vault kv put sol/secrets/back/helius-listener-http-url value=-',
+    '| sol_vault kv put sol/secrets/back/helius-executor-http-url value=-',
     '| sol_vault write auth/userpass/users/operator/password password=-',
     // The key goes in on stdin with the attempt's nonce, so Vault refuses a swapped attempt, and
     // the encoded token is decoded from stdin: only the OTP is ever an argument.
@@ -1907,4 +1908,22 @@ void test('operator overview documents the active runtime order and paper readin
   ]) assert.ok(runtime.includes(statement), `missing active runtime statement: ${statement}`);
   assert.doesNotMatch(runtime, /Health RPC|Baseline HTTP|Souscriptions WebSocket|Catch-up de fermeture de fenêtre/iu);
   assert.doesNotMatch(runtime, /Paper exige une première passe finalité réussie[^.]*worker paper ne démarre pas[^.]*aucun retry initial/iu);
+});
+
+void test('sol helius reload pulls, distributes, checks the list, then restarts the listener only', async () => {
+  const sol = await readArtifact('deploy/back/bin/sol');
+  const steps = [
+    'node /app/dist/scripts/deploy/vault-pull.js back "$current"',
+    'node /app/dist/scripts/deploy/distribute-secrets.js "$current"',
+    'node /app/dist/scripts/deploy/helius-accounts.js names /run/sol/listener/helius-listener-accounts',
+    'ctl restart listener',
+  ];
+  let position = -1;
+  for (const step of steps) {
+    const next = sol.indexOf(step, position + 1);
+    assert.ok(next > position, `missing or out of order: ${step}`);
+    position = next;
+  }
+  assert.ok(!/cat [^|]*helius-listener-accounts/u.test(sol), 'the reload never prints the account file');
+  assert.match(sol, /helius\) helius "\$@" ;;/u);
 });
