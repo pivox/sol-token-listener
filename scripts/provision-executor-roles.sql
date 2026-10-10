@@ -1378,10 +1378,11 @@ GRANT SELECT ON TABLE
 TO sol_token_retention_worker;
 
 -- intent_id, attempt_number and armament_id: the guard trigger on execution_pre_signature_locks
--- (migration 039) reads them when retention deletes a SIGNED_PERSISTED lock.
+-- (migration 039) reads them when retention deletes a SIGNED_PERSISTED lock. state_revision: the
+-- deferred ledger trigger on execution_submission_events (migration 036) reads it at COMMIT.
 GRANT SELECT (
   artifact_id,state,purge_after,exit_authorization_id,pre_signature_lock_id,reservation_id,
-  intent_id,attempt_number,armament_id
+  intent_id,attempt_number,armament_id,state_revision
 )
 ON TABLE execution_signed_transactions TO sol_token_retention_worker;
 
