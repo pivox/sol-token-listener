@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { chmod, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -1271,6 +1271,9 @@ async function assertRetentionOneShot() {
 }
 
 async function assertBackup() {
+  // Vault 2 locks a login out after five failures by default, and vault-setup turns that off: the
+  // backup must still pass after six wrong secret_ids for its role.
+  await assertWrongBackupLoginsRefused();
   const { stdout } = await runCommand('bash', [resolve(root, 'deploy/host/backup.sh')], {
     commandEnvironment: hostScriptEnvironment({ SOL_REPOSITORY: root }),
   });
@@ -1280,6 +1283,38 @@ async function assertBackup() {
   if (dump.subarray(0, 5).toString('latin1') !== 'PGDMP') throw new Error('The database backup is not a pg_dump archive.');
   const snapshot = await readFile(files[2]);
   if (snapshot[0] !== 0x1f || snapshot[1] !== 0x8b) throw new Error('The Vault backup is not a gzip raft snapshot.');
+}
+
+/** Six runs of the snapshot tool with the backup role_id and a random secret_id: each is refused (77). */
+async function assertWrongBackupLoginsRefused() {
+  const approle = parseJson(
+    await readFile(join(hostDirectory, 'secrets/vault/approle/backup.json'), 'utf8'),
+    'The backup AppRole file is unreadable.',
+  );
+  if (typeof approle?.role_id !== 'string' || approle.role_id === '') throw new Error('The backup AppRole file has no role_id.');
+  const wrongSecretId = randomUUID();
+  smokeSecrets.push(wrongSecretId);
+  const input = `${JSON.stringify({ role_id: approle.role_id, secret_id: wrongSecretId })}\n`;
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    assertEqual(
+      await composeExitCode(['run', '--rm', '--no-deps', '-T', 'vault-snapshot'], { input }),
+      77,
+      'The snapshot tool did not refuse a wrong backup secret_id.',
+    );
+  }
+}
+
+/** The exit code of a compose command, 0 included; its output is never reflected. */
+async function composeExitCode(args, options) {
+  try {
+    await compose(args, { ...options, reflectFailureOutput: false });
+    return 0;
+  } catch (error) {
+    // runCommand's message for an exit code; a deadline, a signal or an interruption is rethrown.
+    const code = /^Docker [a-z-]+ failed \(exit ([0-9]+)\)\.$/u.exec(error instanceof Error ? error.message : '')?.[1];
+    if (code === undefined) throw error;
+    return Number(code);
+  }
 }
 
 async function assertNoSecretLeak() {

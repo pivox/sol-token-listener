@@ -1528,6 +1528,30 @@ void test('deployment smoke fills its Vault through the host scripts without eve
   assert.ok(fill.includes("'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json'"));
 });
 
+void test('deployment smoke proves that six wrong secret_ids do not lock the backup role out', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  const backup = smoke.slice(smoke.indexOf('async function assertBackup'), smoke.indexOf('async function assertNoSecretLeak'));
+  // Vault 2 locks a login out after five failures by default: the sixth attempt, then the real
+  // backup.sh, would be refused if vault-setup left the lockout on.
+  const wrongLogins = backup.indexOf('await assertWrongBackupLoginsRefused();');
+  assert.ok(wrongLogins >= 0, 'missing wrong logins');
+  assert.ok(wrongLogins < backup.indexOf("runCommand('bash', [resolve(root, 'deploy/host/backup.sh')]"), 'wrong logins after the backup');
+  for (const statement of [
+    "await readFile(join(hostDirectory, 'secrets/vault/approle/backup.json'), 'utf8')",
+    'const wrongSecretId = randomUUID();',
+    'JSON.stringify({ role_id: approle.role_id, secret_id: wrongSecretId })',
+    'for (let attempt = 1; attempt <= 6; attempt += 1) {',
+    "await composeExitCode(['run', '--rm', '--no-deps', '-T', 'vault-snapshot'], { input }),\n      77,",
+    'await compose(args, { ...options, reflectFailureOutput: false });',
+  ]) {
+    assert.ok(backup.includes(statement), `missing lockout check: ${statement}`);
+  }
+  // The wrong secret_id is redacted from any output before its first use, and the final leak scan
+  // looks for it too.
+  const redaction = backup.indexOf('smokeSecrets.push(wrongSecretId);');
+  assert.ok(redaction >= 0 && redaction < backup.indexOf('await composeExitCode(['), 'wrong secret_id not redacted first');
+});
+
 void test('top-level deployment errors are categorized, bounded, and never reflect input', () => {
   const secret = `review-secret-${'x'.repeat(4_096)}`;
   const result = spawnSync(

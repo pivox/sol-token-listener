@@ -400,6 +400,51 @@ void test('the stdout audit device is enabled by root alone, once, with the body
   assert.equal(vault.audits.size, 0);
 });
 
+void test('the user lockout is turned off by root alone, per enabled auth mount, with the exact field Vault reads', async () => {
+  const vault = new FakeVault();
+  const sent: { readonly path: string; readonly method: string | undefined; readonly body: unknown }[] = [];
+  const recording: VaultFetch = async (url, init) => {
+    if (url.endsWith('/tune')) {
+      sent.push({
+        path: new URL(url).pathname, method: init.method,
+        body: typeof init.body === 'string' ? JSON.parse(init.body) as unknown : init.body,
+      });
+    }
+    return vault.fetch(url, init);
+  };
+  const client = new VaultClient({ address: ADDRESS, fetch: recording });
+
+  // Only root administers, and a refused call changes nothing.
+  const appRoleToken = await client.appRoleLogin(vault.addAppRole('back'));
+  await assert.rejects(client.disableLockout(appRoleToken, 'approle'),
+    (error) => error instanceof VaultDeniedError && error.message === 'vault POST sys/auth/approle/tune: HTTP 403');
+  assert.equal(vault.lockoutDisabled.size, 0);
+
+  // Vault answers 204 to a misspelt field and leaves the lockout on, so the body is pinned.
+  const misspelt = await vault.fetch(`${ADDRESS}/v1/sys/auth/approle/tune`, {
+    method: 'POST', headers: { 'X-Vault-Token': vault.rootToken },
+    body: JSON.stringify({ user_lockout_config: { disable_lockout: true } }),
+  });
+  assert.equal(misspelt.status, 204);
+  assert.equal(vault.lockoutDisabled.size, 0);
+  await client.disableLockout(vault.rootToken, 'approle');
+  await client.disableLockout(vault.rootToken, 'userpass');
+  assert.deepEqual([...vault.lockoutDisabled], ['approle', 'userpass']);
+  assert.deepEqual(sent.slice(-2), ['approle', 'userpass'].map((mount) => ({
+    path: `/v1/sys/auth/${mount}/tune`, method: 'POST', body: { user_lockout_config: { lockout_disable: true } },
+  })));
+
+  // `sys/init` hands out a Vault with the lockout on, where the tune of a mount not yet enabled answers 400.
+  vault.initialized = false;
+  vault.sealed = true;
+  await client.initialize();
+  assert.equal(vault.lockoutDisabled.size, 0);
+  await client.unseal(vault.unsealKey);
+  await assert.rejects(client.disableLockout(vault.rootToken, 'approle'),
+    (error) => error instanceof VaultDeniedError && error.message === 'vault POST sys/auth/approle/tune: HTTP 400');
+  assert.equal(vault.lockoutDisabled.size, 0);
+});
+
 void test('a path segment outside the safe alphabet is refused before any request', async () => {
   const vault = new FakeVault();
   const client = new VaultClient({ address: ADDRESS, fetch: vault.fetch });

@@ -5,7 +5,8 @@
 # only once it has written its entries. Prints only the Vault operator password, once. Refuses to
 # run unless secrets/vault/unseal and secrets/vault/approle are empty directories the caller owns:
 # Docker would otherwise create a missing one root-owned, or a leftover file would fail
-# vault-setup after Vault is initialized.
+# vault-setup after Vault is initialized. Its refusal tells a finished init, an unfinished one and
+# a lost key apart.
 set -euo pipefail
 : "${SOL_HOST_DIR:?SOL_HOST_DIR is required}"
 # The checks below read $SOL_HOST_DIR from the current directory, while Compose resolves the same
@@ -22,8 +23,23 @@ for directory in unseal approle; do
     exit 78
   fi
 done
+# vault-setup saves the key first, then the three AppRole files: the key without all three is an
+# init that did not finish, and AppRole files without the key belong to a Vault in service whose
+# key is gone, which starting over would wipe.
+approle_files=0
+for name in back migrate backup; do
+  if [ -e "$SOL_HOST_DIR/secrets/vault/approle/$name.json" ]; then approle_files=$((approle_files + 1)); fi
+done
 if [ -e "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" ]; then
-  echo 'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)' >&2
+  if [ "$approle_files" -eq 3 ]; then
+    echo 'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)' >&2
+  else
+    echo 'vault-init: secrets/vault/unseal/unseal-key exists but the AppRole files are missing: an earlier vault-init did not finish: start over as the runbook says' >&2
+  fi
+  exit 78
+fi
+if [ "$approle_files" -gt 0 ]; then
+  echo 'vault-init: secrets/vault/approle holds AppRole files but secrets/vault/unseal/unseal-key is missing: Vault is already initialized: put the key back as the runbook says; do not start over' >&2
   exit 78
 fi
 for directory in unseal approle; do

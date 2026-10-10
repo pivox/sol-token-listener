@@ -342,7 +342,78 @@ void test('the backup jobs run backup.sh daily on the server and on the Mac', as
   if (lint.error === undefined) assert.equal(lint.status, 0, lint.stdout);
 });
 
-void test('vault-init runs vault-setup once as the calling user and refuses a second time', async () => {
+const APPROLE_FILES = Object.freeze(['approle/back.json', 'approle/migrate.json', 'approle/backup.json']);
+
+/**
+ * Runs vault-init on empty secrets/vault/unseal and secrets/vault/approle directories, plus `files`
+ * (relative to secrets/vault), with a docker that only logs its calls: `dockerCalls` is null when
+ * it was never called.
+ */
+async function vaultInitWith(
+  files: readonly string[],
+): Promise<Readonly<{ status: number | null; stderr: string; dockerCalls: string | null }>> {
+  const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-files-'));
+  try {
+    const log = join(directory, 'docker-log');
+    const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'`);
+    const host = join(directory, 'host');
+    for (const name of ['unseal', 'approle']) await mkdir(join(host, 'secrets/vault', name), { recursive: true });
+    for (const file of files) await writeFile(join(host, 'secrets/vault', file), 'x\n');
+    const result = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
+    const dockerCalls = await readFile(log, 'utf8').catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    });
+    return { status: result.status, stderr: result.stderr, dockerCalls };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+void test('vault-init has nothing to do once the key and the three AppRole files exist', async () => {
+  assert.deepEqual(await vaultInitWith(['unseal/unseal-key', ...APPROLE_FILES]), {
+    status: 78,
+    stderr: 'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)\n',
+    dockerCalls: null,
+  });
+});
+
+void test('vault-init calls the key without the three AppRole files an unfinished init, to start over', async () => {
+  // vault-setup saves the key first: it failed before the first AppRole file, or between two.
+  for (const approle of [[], APPROLE_FILES.slice(0, 1), APPROLE_FILES.slice(0, 2)]) {
+    assert.deepEqual(await vaultInitWith(['unseal/unseal-key', ...approle]), {
+      status: 78,
+      stderr: 'vault-init: secrets/vault/unseal/unseal-key exists but the AppRole files are missing: an earlier vault-init did not finish: start over as the runbook says\n',
+      dockerCalls: null,
+    }, approle.join(' '));
+  }
+});
+
+void test('vault-init tells AppRole files without the key to put the key back, never to start over', async () => {
+  // A lost key, or one moved away to seal a Vault in service: starting over would wipe that Vault.
+  // Another file in unseal/ does not turn it into an earlier attempt.
+  for (const files of [APPROLE_FILES, ['approle/backup.json', 'unseal/unseal-key.old']]) {
+    assert.deepEqual(await vaultInitWith(files), {
+      status: 78,
+      stderr: 'vault-init: secrets/vault/approle holds AppRole files but secrets/vault/unseal/unseal-key is missing: Vault is already initialized: put the key back as the runbook says; do not start over\n',
+      dockerCalls: null,
+    }, files.join(' '));
+  }
+});
+
+void test('vault-init calls another file without the key or any AppRole file an earlier attempt, to start over', async () => {
+  for (const directory of ['unseal', 'approle']) {
+    assert.deepEqual(await vaultInitWith([`${directory}/notes.txt`]), {
+      status: 78,
+      stderr: `vault-init: secrets/vault/${directory} holds files of an earlier attempt: start over as the runbook says\n`,
+      dockerCalls: null,
+    }, directory);
+  }
+});
+
+void test('vault-init runs vault-setup once as the calling user when both directories are empty', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-'));
   try {
     const log = join(directory, 'docker-log');
@@ -355,11 +426,10 @@ void test('vault-init runs vault-setup once as the calling user and refuses a se
     const host = join(directory, 'host');
     await mkdir(join(host, 'secrets/vault/unseal'), { recursive: true });
     await mkdir(join(host, 'secrets/vault/approle'), { recursive: true });
-    const run = (): ReturnType<typeof spawnSync> => spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+    const result = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
       encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
     });
-    const first = run();
-    assert.equal(first.status, 0, String(first.stderr));
+    assert.equal(result.status, 0, result.stderr);
     const compose = `compose --env-file ${host}/compose.env -f ${repository}/deploy/compose.yaml`;
     const user = `${String(process.getuid?.() ?? 0)}:${String(process.getgid?.() ?? 0)}`;
     assert.deepEqual((await readFile(log, 'utf8')).trim().split('\n'), [
@@ -367,32 +437,19 @@ void test('vault-init runs vault-setup once as the calling user and refuses a se
       `${compose} exec -T vault wget -q -O /dev/null http://127.0.0.1:8200/v1/sys/seal-status`,
       `${compose} run --rm --no-deps --user ${user} vault-setup init`,
     ]);
-    assert.equal((String(first.stdout).match(/fake-operator-password/gu) ?? []).length, 1);
-    assert.match(String(first.stdout), /^next: store secrets\/vault\/unseal\/unseal-key in your password manager, then run deploy\/host\/vault-import\.sh$/mu);
-
-    await writeFile(join(host, 'secrets/vault/unseal/unseal-key'), 'key\n');
-    await rm(log);
-    const second = run();
-    assert.equal(second.status, 78);
-    assert.equal(
-      second.stderr,
-      'vault-init: secrets/vault/unseal/unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)\n',
-    );
-    await assert.rejects(stat(log), { code: 'ENOENT' });
+    assert.equal((result.stdout.match(/fake-operator-password/gu) ?? []).length, 1);
+    assert.match(result.stdout, /^next: store secrets\/vault\/unseal\/unseal-key in your password manager, then run deploy\/host\/vault-import\.sh$/mu);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-void test('vault-init refuses before any docker call when its directories are missing or not empty', async () => {
+void test('vault-init refuses before any docker call a relative SOL_HOST_DIR or a missing directory', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sol-vault-init-pre-'));
   try {
     const log = join(directory, 'docker-log');
     const bin = await fakeDocker(directory, `printf '%s\\n' "$*" >> '${log}'`);
     const host = join(directory, 'host');
-    const run = (): ReturnType<typeof spawnSync> => spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
-      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
-    });
     // The checks below look at $SOL_HOST_DIR from here, while Compose resolves its bind sources elsewhere.
     const relative = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
       encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: 'relative/host' },
@@ -400,19 +457,13 @@ void test('vault-init refuses before any docker call when its directories are mi
     assert.equal(relative.status, 78);
     assert.equal(relative.stderr, 'vault-init: SOL_HOST_DIR must be an absolute path\n');
     await mkdir(join(host, 'secrets/vault/unseal'), { recursive: true });
-    const missing = run();
+    const missing = spawnSync('bash', [join(repository, 'deploy/host/vault-init.sh')], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SOL_HOST_DIR: host },
+    });
     assert.equal(missing.status, 78);
     assert.equal(
       missing.stderr,
       'vault-init: secrets/vault/approle must be a directory you own and can write (deploy/host/init-secrets.sh creates it)\n',
-    );
-    await mkdir(join(host, 'secrets/vault/approle'), { recursive: true });
-    await writeFile(join(host, 'secrets/vault/approle/back.json'), '{}\n');
-    const leftover = run();
-    assert.equal(leftover.status, 78);
-    assert.equal(
-      leftover.stderr,
-      'vault-init: secrets/vault/approle holds files of an earlier attempt: start over as the runbook says\n',
     );
     await assert.rejects(stat(log), { code: 'ENOENT' });
   } finally {

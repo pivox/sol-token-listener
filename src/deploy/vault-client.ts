@@ -172,6 +172,18 @@ export class VaultClient {
   }
 
   /**
+   * Turns off the user lockout of an auth mount. Vault 2 locks a login out for 15 minutes after 5
+   * failures, and the AppRole secret_ids and the operator password are random: the lockout would
+   * only let a wrong file lock the back out. Vault answers 204 to an unknown field and changes
+   * nothing, so this exact name matters.
+   */
+  public async disableLockout(token: string, mount: 'approle' | 'userpass'): Promise<void> {
+    await this.json('POST', `sys/auth/${mount}/tune`, {
+      token, body: { user_lockout_config: { lockout_disable: true } },
+    });
+  }
+
+  /**
    * A `file` audit device writing to the server's stdout, so every authenticated request and its
    * answer reach the container log (spec 1 and 3). String values are HMAC'd; numbers and booleans
    * in answers are logged as is, which is why every entry holds strings only.

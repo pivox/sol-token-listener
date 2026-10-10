@@ -67,10 +67,14 @@ void test('init unseals, configures Vault and writes only the unseal key and the
   assert.equal(vault.sealed, false);
   assert.deepEqual([...vault.mounts], ['sol']);
   assert.deepEqual([...vault.auths].sort(), ['approle', 'userpass']);
+  // Both secrets are random: a lockout would only let a wrong AppRole file lock the back out.
+  assert.deepEqual([...vault.lockoutDisabled].sort(), ['approle', 'userpass']);
   assert.deepEqual([...vault.audits], ['file']);
-  // The audit device comes right after the unseal, so that every later request is audited.
-  assert.deepEqual(vault.requests.slice(0, 6), [
+  // The audit device comes right after the unseal, so that every later request is audited, and
+  // each auth method loses its lockout right after it is enabled.
+  assert.deepEqual(vault.requests.slice(0, 10), [
     'GET sys/seal-status', 'PUT sys/init', 'PUT sys/unseal', 'GET sys/health', 'PUT sys/audit/file', 'POST sys/mounts/sol',
+    'POST sys/auth/approle', 'POST sys/auth/approle/tune', 'POST sys/auth/userpass', 'POST sys/auth/userpass/tune',
   ]);
   assert.deepEqual([...vault.policies.keys()].sort(), [...VAULT_POLICIES].sort());
   for (const name of VAULT_POLICIES) assert.equal(vault.policies.get(name), `# policy ${name}\n`);

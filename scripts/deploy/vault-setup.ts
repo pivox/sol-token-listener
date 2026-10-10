@@ -54,7 +54,7 @@ class SetupFileError extends Error {
  * with one key share and saves the unseal key first, then:
  * - unseals Vault and enables a `file` audit device writing to its stdout (every later
  *   authenticated request reaches the container log, string values HMAC'd), then `sol/` (KV v2),
- *   AppRole and userpass;
+ *   AppRole and userpass, both without user lockout;
  * - loads the four policies, creates the three AppRoles and writes their files;
  * - generates the nine login passwords and the operator API token in Vault;
  * - creates the `operator` login, prints its password once and revokes the root token.
@@ -96,7 +96,9 @@ export async function runVaultSetupCli(
     await client.enableStdoutAudit(rootToken);
     await client.enableKv2(rootToken, VAULT_MOUNT);
     await client.enableAuth(rootToken, 'approle');
+    await client.disableLockout(rootToken, 'approle');
     await client.enableAuth(rootToken, 'userpass');
+    await client.disableLockout(rootToken, 'userpass');
     for (const [name, policy] of policies) await client.putPolicy(rootToken, name, policy);
     for (const name of VAULT_APPROLES) {
       const credentials = await client.createAppRole(rootToken, name);

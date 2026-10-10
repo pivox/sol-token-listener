@@ -24,6 +24,9 @@ void test('the four policies grant only what spec 6.2 lists', async () => {
   assert.deepEqual(grants(await artifact('deploy/vault/policies/operator.hcl')), [
     // patch: `vault kv patch` sends PATCH; without it, the CLI's fallback first logs a 403.
     'sol/* "create", "read", "update", "patch", "delete", "list"',
+    // The exact path wins over the glob: the operator cannot change max_versions,
+    // delete_version_after or cas_required, the last of which would fail vault-import.
+    'sol/config "read"',
   ]);
   for (const name of VAULT_POLICIES) {
     const policy = await artifact(`deploy/vault/policies/${name}.hcl`);

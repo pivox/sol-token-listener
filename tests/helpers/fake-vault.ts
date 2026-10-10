@@ -21,7 +21,8 @@ const READABLE: Readonly<Record<string, readonly string[]>> = Object.freeze({
  * policy's. A mount or an auth method that is not enabled does not answer, and `sys/init` hands out
  * a Vault where none is, with no audit device either: a test starts from a configured Vault (`sol`,
  * `approle` and `userpass` enabled, no audit device) unless it initializes it. An audit device is
- * enabled by root, once per name.
+ * enabled by root, once per name. Root turns off the user lockout of an enabled auth mount;
+ * `lockoutDisabled` records it, and the logins do not model the lockout itself.
  */
 export class FakeVault {
   public initialized = true;
@@ -33,6 +34,8 @@ export class FakeVault {
   public readonly policies = new Map<string, string>();
   public readonly mounts = new Set<string>(['sol']);
   public readonly auths = new Set<string>(['approle', 'userpass']);
+  /** The auth mounts whose user lockout root turned off (`sys/auth/<mount>/tune`). */
+  public readonly lockoutDisabled = new Set<string>();
   public readonly audits = new Set<string>();
   public readonly appRoles = new Map<string, AppRoleCredentials>();
   public readonly users = new Map<string, Readonly<{ password: string; policy: string }>>();
@@ -130,6 +133,7 @@ export class FakeVault {
     // A fresh Vault has no mount, no auth method, no audit device, no policy, no AppRole, no entry and no user.
     this.mounts.clear();
     this.auths.clear();
+    this.lockoutDisabled.clear();
     this.audits.clear();
     this.policies.clear();
     this.appRoles.clear();
@@ -183,6 +187,15 @@ export class FakeVault {
     const mount = /^sys\/mounts\/(.+)$/u.exec(path);
     if (method === 'POST' && mount !== null) {
       this.mounts.add(mount[1] ?? '');
+      return new Response(null, { status: 204 });
+    }
+    const tune = /^sys\/auth\/([^/]+)\/tune$/u.exec(path);
+    if (method === 'POST' && tune !== null) {
+      const name = tune[1] ?? '';
+      if (!this.auths.has(name)) return json(400, { errors: [`tune of path "auth/${name}/" failed: no mount entry found`] });
+      // Vault also answers 204 to a field it does not know, and changes nothing.
+      const lockout = body.user_lockout_config as Record<string, unknown> | null | undefined;
+      if (lockout?.lockout_disable === true) this.lockoutDisabled.add(name);
       return new Response(null, { status: 204 });
     }
     const auth = /^sys\/auth\/(.+)$/u.exec(path);
