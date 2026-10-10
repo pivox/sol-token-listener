@@ -1377,8 +1377,11 @@ GRANT SELECT ON TABLE
   transaction_inbox_recoveries
 TO sol_token_retention_worker;
 
+-- intent_id, attempt_number and armament_id: the guard trigger on execution_pre_signature_locks
+-- (migration 039) reads them when retention deletes a SIGNED_PERSISTED lock.
 GRANT SELECT (
-  artifact_id,state,purge_after,exit_authorization_id,pre_signature_lock_id,reservation_id
+  artifact_id,state,purge_after,exit_authorization_id,pre_signature_lock_id,reservation_id,
+  intent_id,attempt_number,armament_id
 )
 ON TABLE execution_signed_transactions TO sol_token_retention_worker;
 
