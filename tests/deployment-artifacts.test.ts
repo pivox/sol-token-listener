@@ -1908,3 +1908,21 @@ void test('operator overview documents the active runtime order and paper readin
   assert.doesNotMatch(runtime, /Health RPC|Baseline HTTP|Souscriptions WebSocket|Catch-up de fermeture de fenêtre/iu);
   assert.doesNotMatch(runtime, /Paper exige une première passe finalité réussie[^.]*worker paper ne démarre pas[^.]*aucun retry initial/iu);
 });
+
+void test('sol helius reload pulls, distributes, checks the list, then restarts the listener only', async () => {
+  const sol = await readArtifact('deploy/back/bin/sol');
+  const steps = [
+    'node /app/dist/scripts/deploy/vault-pull.js back "$current"',
+    'node /app/dist/scripts/deploy/distribute-secrets.js "$current"',
+    'node /app/dist/scripts/deploy/helius-accounts.js names /run/sol/listener/helius-listener-accounts',
+    'ctl restart listener',
+  ];
+  let position = -1;
+  for (const step of steps) {
+    const next = sol.indexOf(step, position + 1);
+    assert.ok(next > position, `missing or out of order: ${step}`);
+    position = next;
+  }
+  assert.ok(!/cat [^|]*helius-listener-accounts/u.test(sol), 'the reload never prints the account file');
+  assert.match(sol, /helius\) helius "\$@" ;;/u);
+});
