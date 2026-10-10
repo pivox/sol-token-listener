@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { LegacyConfirmationStatus } from './types.js';
 import type { TransactionBlockRpc } from './transaction-locator.js';
-import type { RpcProviderCatalog } from './rpc-provider-catalog.js';
+import { catalogFetch, type RpcProviderCatalog } from './rpc-provider-catalog.js';
 import { createObservedRpcFetch, type RpcHttpEvidenceRecorder } from './rpc-http-evidence.js';
 import type { RpcHttpRoleEvidenceRecorder } from './rpc-http-role-evidence.js';
 import type { OrdinaryRpcAttemptBudget } from './ordinary-rpc-attempt-budget.js';
@@ -61,13 +61,19 @@ export function createProviderPinnedBlockRpc(
   }
   const requestTimeoutMs = readRequestTimeout(options, exposedProviderId);
   const requestContext = new AsyncLocalStorage<AbortSignal>();
+  let baseFetch: FetchFn;
+  try {
+    baseFetch = catalogFetch(catalog) ?? globalThis.fetch;
+  } catch {
+    throw failure('CONFIG_INVALID', exposedProviderId);
+  }
   const observedFetch = dependencies === undefined
     && (recorder !== undefined || roleRecorder !== undefined || attemptBudget !== undefined)
-    ? createObservedRpcFetch(providerId, recorder, globalThis.fetch, roleRecorder, 'BLOCK_HYDRATION', attemptBudget)
+    ? createObservedRpcFetch(providerId, recorder, baseFetch, roleRecorder, 'BLOCK_HYDRATION', attemptBudget)
     : undefined;
   const createConnection = dependencies === undefined
     ? (url: string, selected: Commitment): Connection => (
-      createDefaultConnection(url, selected, requestContext, observedFetch)
+      createDefaultConnection(url, selected, requestContext, observedFetch, baseFetch)
     )
     : dependencyFactory(dependencies, exposedProviderId);
   const httpUrl = resolveHttpUrl(catalog, providerId);
@@ -237,13 +243,14 @@ function createDefaultConnection(
   commitment: Commitment,
   requestContext: AsyncLocalStorage<AbortSignal>,
   observedFetch: FetchFn | undefined,
+  baseFetch: FetchFn,
 ): Connection {
   return new Connection(httpUrl, {
     commitment, disableRetryOnRateLimit: true,
     fetch: (input, init): Promise<Response> => {
       const signal = requestContext.getStore();
       if (signal === undefined) return Promise.reject(new Error('Block request context is unavailable.'));
-      if (observedFetch === undefined) return fetch(input, { ...init, signal });
+      if (observedFetch === undefined) return baseFetch(input, { ...init, signal });
       return observedFetch(input, { ...init, signal });
     },
   });

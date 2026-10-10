@@ -1,3 +1,4 @@
+import type { FetchFn } from '@solana/web3.js';
 import type { AppConfig } from '../../config/env.js';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 
@@ -9,8 +10,16 @@ export interface RpcProviderPair {
   readonly websocketUrl: string;
 }
 
+/** What the catalog needs from the Helius account rotation (helius-account-rotation.ts). */
+export interface RpcAccountRotation {
+  readonly fetch: FetchFn;
+  websocketUrl(): string;
+}
+
 export interface RpcProviderCatalog {
   readonly ids: readonly RpcProviderId[];
+  /** Base fetch of every listener HTTP client: the Helius account rotation, when configured. */
+  readonly fetch?: FetchFn;
   resolve(id: RpcProviderId): RpcProviderPair;
 }
 
@@ -21,6 +30,7 @@ type RpcProviderCatalogConfig = Pick<
 
 export function createRpcProviderCatalog(
   config: RpcProviderCatalogConfig,
+  rotation?: RpcAccountRotation,
 ): RpcProviderCatalog {
   if (!validConfigShape(config)) throw invalidCatalog();
   const httpFallbacks = [...config.httpRpcFallbackUrls];
@@ -44,12 +54,23 @@ export function createRpcProviderCatalog(
   const ids = Object.freeze(pairs.map(({ id }) => id));
   return Object.freeze({
     ids,
+    ...(rotation === undefined ? {} : { fetch: rotation.fetch }),
     resolve(id: RpcProviderId): RpcProviderPair {
       const value = byId.get(id);
       if (value === undefined) throw invalidCatalog();
-      return value;
+      // A new primary WebSocket connection takes the key of the current Helius account.
+      if (rotation === undefined || id !== 'primary') return value;
+      return pair('primary', value.httpUrl, rotation.websocketUrl());
     },
   });
+}
+
+/** The catalog's base fetch, read as an own data property: no getter, no proxy trap. */
+export function catalogFetch(catalog: RpcProviderCatalog): FetchFn | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(catalog, 'fetch');
+  if (descriptor === undefined) return undefined;
+  if (!('value' in descriptor) || typeof descriptor.value !== 'function') throw invalidCatalog();
+  return descriptor.value as FetchFn;
 }
 
 function validConfigShape(value: unknown): value is RpcProviderCatalogConfig {
