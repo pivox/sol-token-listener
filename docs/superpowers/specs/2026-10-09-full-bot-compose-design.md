@@ -240,8 +240,10 @@ passe elle aussi dans Vault.
 
 ### 7.4 Rotation
 
-Modifier le fichier, puis `docker compose restart back` ; pour un mot de passe PostgreSQL,
-relancer `migrate` avant le back.
+Depuis le sous-projet 2, une valeur se modifie dans Vault, plus dans un fichier (spec Vault,
+section 8.3, et runbook, « Rotation des secrets »). Puis `docker compose restart back` ; pour un
+mot de passe de login PostgreSQL, relancer `migrate` aussitôt après la modification, avant tout
+redémarrage du back.
 
 ## 8. Front Caddy
 

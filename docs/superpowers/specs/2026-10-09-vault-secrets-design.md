@@ -136,7 +136,7 @@ Toutes au plus juste et versionnées dans `deploy/vault/policies/`, en lecture s
 | `back` | lire `sol/data/config/*`, `sol/data/secrets/back/*`, `sol/data/secrets/logins/*` |
 | `migrate` | lire `sol/data/secrets/logins/*` |
 | `backup` | lire `sys/storage/raft/snapshot` |
-| `operator` | créer, lire, modifier, supprimer et lister sous `sol/` (données, métadonnées, versions) ; rien sur les politiques ni l'authentification |
+| `operator` | créer, lire, modifier, supprimer et lister sous `sol/` (données, métadonnées, versions) ; la configuration du moteur, `sol/config`, en lecture seule (13.13) ; rien sur les politiques ni l'authentification |
 
 ### 6.3 Authentification
 
@@ -145,6 +145,7 @@ Toutes au plus juste et versionnées dans `deploy/vault/policies/`, en lecture s
   - Le jeton obtenu vit 5 minutes et ne sert qu'au démarrage.
   - Le `secret_id` n'expire pas, car un redémarrage peut survenir à tout moment ; sa rotation est une procédure documentée.
 - **Opérateur** : un login `operator` (méthode userpass), dont le mot de passe est affiché une seule fois à l'initialisation et gardé dans le gestionnaire de mots de passe de l'utilisateur. Son jeton vit une heure, renouvelable jusqu'à 8 heures (13.6).
+- **Sans verrouillage** : AppRole et userpass ne verrouillent aucun login après des échecs ; un identifiant faux est simplement refusé (13.12).
 - **Jeton root** : il ne sert qu'au script d'initialisation, puis il est révoqué. Une modification ultérieure des politiques le régénère avec la clé de déverrouillage (`vault operator generate-root`, permis sans jeton : 13.8), selon une procédure documentée.
 
 Le sous-projet 1 prévoyait un rôle Vault par utilisateur Unix (section 7.3). Le script d'entrée du
@@ -206,7 +207,7 @@ Vault depuis Node (13.3). Il :
 1. initialise Vault avec une part de clé ;
 2. écrit la clé de déverrouillage dans `secrets/vault/unseal/unseal-key` (0600), sans l'afficher ;
 3. déverrouille Vault, active l'audit sur la sortie standard (13.7), `sol/` (KV v2), AppRole et
-   userpass, et charge les quatre politiques ;
+   userpass sans verrouillage des logins (13.12), et charge les quatre politiques ;
 4. crée les trois AppRoles et écrit leurs fichiers ;
 5. génère directement dans Vault les neuf mots de passe de login et le jeton de l'API opérateur,
    comme `init-secrets.sh` le fait aujourd'hui en fichiers ;
@@ -331,6 +332,7 @@ C'est la tâche 16, avec le feu vert de l'utilisateur :
 - Mot de passe administrateur PostgreSQL et empreinte du front dans Vault.
 - Page de configuration dans la console.
 - Exposition publique de Vault.
+- Le changement de la clé de déverrouillage (`vault operator rekey`).
 
 ## 12. Critères d'acceptation
 
@@ -344,7 +346,7 @@ C'est la tâche 16, avec le feu vert de l'utilisateur :
 ## 13. Amendements (plan d'implémentation et implémentation)
 
 Le plan `docs/superpowers/plans/2026-10-09-vault-secrets.md` précise ce spec sur six points (1 à
-6), puis l'implémentation sur cinq autres (7 à 11). Tous sont reportés dans les sections
+6), puis l'implémentation sur sept autres (7 à 13). Tous sont reportés dans les sections
 concernées :
 
 1. Les fichiers d'amorçage de Vault sur l'hôte vivent dans deux dossiers, `secrets/vault/unseal/`
@@ -389,8 +391,9 @@ concernées :
      L'invariant 1 en dépend.
    - La trace tourne avec les journaux `json-file` (5 fichiers de 20 Mo) et disparaît quand le
      conteneur est recréé : ce n'est pas un audit durable.
-   - Elle est fail-closed : si la sortie standard du conteneur bloque, Vault cesse de répondre
-     plutôt que de servir sans trace.
+   - Une sortie standard bloquée arrête Vault plutôt que de le laisser servir sans trace. Mais
+     `json-file` peut perdre des lignes qu'il ne peut pas écrire, disque plein par exemple : la
+     trace n'est pas une preuve durable.
 8. `deploy/vault/vault.hcl` fixe `enable_unauthenticated_access = ["generate-root"]` (sections 6.3
    et 8.3).
    - Pourquoi : depuis la version 2.0 (correctif de la CVE-2026-5807), Vault refuse un
@@ -407,7 +410,9 @@ concernées :
     - `vault-init.sh` vérifie, avant `compose up vault`, que `secrets/vault/unseal/` et
       `secrets/vault/approle/` existent, appartiennent à l'appelant, lui sont inscriptibles et
       sont vides. Sinon, Docker créerait un dossier manquant au nom de root, et la clé, impossible
-      à écrire, serait perdue après l'initialisation ;
+      à écrire, serait perdue après l'initialisation. Ses refus, tous en 78 et sans appel à
+      Docker, distinguent une initialisation terminée, une initialisation inachevée et une clé
+      perdue : seule la deuxième, ou un reste inconnu, invite à repartir de zéro ;
     - les scripts de l'hôte lancent les services ponctuels avec `--no-deps` : ils ne démarrent ni
       ne recréent jamais Vault ;
     - `vault-setup` et `vault-snapshot` n'ont aucune copie de journal (pilote `none`) : leur
@@ -417,3 +422,15 @@ concernées :
 11. Section 7.1 : `vault-pull` est la première étape du script d'entrée qui contacte Vault, pas la
     première étape tout court. La validation du mode et la préparation de `/run/sol` la
     précèdent.
+12. AppRole et userpass ne verrouillent aucun login (sections 6.3 et 8.1). Vault 2 verrouille par
+    défaut un login pendant 15 minutes après 5 échecs ; `vault-setup` le désactive sur les deux
+    méthodes (`sys/auth/<méthode>/tune`, `user_lockout_config.lockout_disable`).
+    - Pourquoi : les `secret_id` et le mot de passe `operator` sont aléatoires, et le verrouillage
+      n'ajoutait qu'un déni de service. Une seule faute dans un fichier AppRole aurait verrouillé
+      le rôle du back, relancé en boucle par `restart: unless-stopped`, et suspendu les sorties.
+    - Un fichier AppRole ou un mot de passe faux est simplement refusé (code 77). Le smoke le
+      prouve : six connexions `backup` refusées, puis une sauvegarde réussie.
+13. La politique `operator` laisse la configuration du moteur, `sol/config`, en lecture seule
+    (section 6.2) : le chemin exact l'emporte sur `sol/*`. L'opérateur ne peut plus changer
+    `max_versions`, `delete_version_after` ni `cas_required` : les deux premiers effaceraient des
+    versions de toutes les entrées, le troisième ferait échouer `vault-import`.

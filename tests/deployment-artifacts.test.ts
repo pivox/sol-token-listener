@@ -1607,7 +1607,11 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     'deploy/sql/table-row-counts.sql',
     'diff "$takeover/source.counts" "$takeover/target.counts"',
     'docker stop sol-token-listener-live-pg',
-    'docker volume rm sol-token-listener_postgres-data',
+    // The project name comes from COMPOSE_PROJECT_NAME: a rehearsal on a throwaway project never
+    // removes a volume of the stack.
+    'export COMPOSE_PROJECT_NAME=sol-token-listener',
+    'docker volume rm "${COMPOSE_PROJECT_NAME:?}_postgres-data"',
+    'docker volume rm "${COMPOSE_PROJECT_NAME:?}_vault-data"',
     // H2f reads the draft only when ops owns it with mode 0600 (readPreflightProtectedFile).
     "sh -c 'umask 077 && sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json && chown ops:ops /var/lib/sol/evidence/preflight-draft.json'",
     'sol ctl restart <programme>',
@@ -1623,8 +1627,22 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     // Nobody else's generate-root attempt may receive the unseal key.
     'vault operator generate-root -status',
     'vault operator generate-root -cancel',
+    // Tokens live in the shell's VAULT_TOKEN, passed by name: never on disk or on a command line.
+    'sol_compose exec -T -e VAULT_TOKEN vault vault "$@"',
+    '| sol_compose exec -T vault vault write -field=token auth/userpass/login/operator password=-',
+    'VAULT_TOKEN="$(vault login -token-only)"',
     // A secret reaches Vault on stdin, never on a command line that history and ps would keep.
-    '| sol_compose exec -T vault vault kv put sol/secrets/back/helius-listener-http-url value=-',
+    '| sol_vault kv put sol/secrets/back/helius-listener-http-url value=-',
+    '| sol_vault write auth/userpass/users/operator/password password=-',
+    // The key goes in on stdin with the attempt's nonce, so Vault refuses a swapped attempt, and
+    // the encoded token is decoded from stdin: only the OTP is ever an argument.
+    '-nonce="$nonce" -format=json - < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
+    '| sol_vault operator generate-root -decode=- -otp="$otp"',
+    // The new secret_id logs in before it replaces the file.
+    "auth/approle/login - > /dev/null && echo 'secret_id valide'",
+    // restore -force returns early: the restart waits for Vault to seal itself.
+    'sol_compose rm --stop --force --volumes vault',
+    "until sol_compose logs --since 2m vault | grep -q 'vault is sealed'; do sleep 1; done",
     // The unseal key goes to the password manager without being displayed, and comes back the same way.
     'pbcopy < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
     // set -C: the paste never overwrites a key file that is already there.
@@ -1632,7 +1650,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     // The copy in the password manager is checked once, without being displayed.
     "| shasum -a 256)\" ] && echo 'copie identique'",
     // The emergency seal moves the only key out of the mounted folder; it never deletes it.
-    'mv "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" "$SOL_HOST_DIR/secrets/unseal-key.sealed"',
+    'mv -n "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" "$SOL_HOST_DIR/secrets/unseal-key.sealed"',
     // Old log lines must not pass for the restart that follows a rotation.
     'sol_compose logs --since 2m back',
     'sol_compose exec back sol ops envelope revoke --envelope-id=<id>',
@@ -1640,11 +1658,31 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
   }
   assert.doesNotMatch(runbook, /\brm\b[^\n]*secrets\/vault\/unseal\/unseal-key/u, 'the only key is never deleted');
-  // `vault.uninitialized` stays in the log of every container vault-init created: only `vault status`
-  // proves a lost volume, and a restore over a live Vault is never the default.
+  assert.doesNotMatch(runbook, /docker volume rm sol-token-listener_/u, 'volume names follow COMPOSE_PROJECT_NAME');
+  // `down --volumes` erases a whole project: the command always names it.
+  for (const line of runbook.split('\n').filter((text) => /^\s*sol_compose\b.*\bdown --volumes/u.test(text))) {
+    assert.match(line, /^\s*sol_compose -p \S+ down --volumes$/u, `down --volumes without -p: ${line}`);
+  }
+  // A token a `vault login` stores would stay on disk in the container.
+  for (const match of runbook.matchAll(/vault login\b[^\n]*/gu)) {
+    if (!match[0].startsWith('vault login`')) assert.match(match[0], /^vault login -token-only/u, match[0]);
+  }
+  // The runbook quotes each refusal of vault-init.sh as the script prints it.
+  const vaultInit = await readArtifact('deploy/host/vault-init.sh');
+  for (const message of [
+    'unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)',
+    'unseal-key exists but the AppRole files are missing: an earlier vault-init did not finish: start over as the runbook says',
+    'unseal-key is missing: Vault is already initialized: put the key back as the runbook says; do not start over',
+    'holds files of an earlier attempt: start over as the runbook says',
+  ]) {
+    assert.ok(vaultInit.includes(message), `vault-init.sh no longer prints: ${message}`);
+    assert.ok(runbook.includes(message), `runbook misses the vault-init message: ${message}`);
+  }
+  // Only `vault status` proves a lost volume: the first start of any Vault may log
+  // `vault.uninitialized`, `vault.unseal_key_missing` or `vault.unseal_failed`.
   assert.match(runbook, /`Initialized false`/u);
   for (const sentence of runbook.split(/(?<=\.)\s+/u).filter((text) => text.includes('vault.uninitialized'))) {
-    assert.match(sentence, /premier démarrage/u, `vault.uninitialized must not prove a lost volume: ${sentence}`);
+    assert.match(sentence, /premier démarrage|vault status/u, `vault.uninitialized must not prove a lost volume: ${sentence}`);
   }
   const secrets = runbook.slice(runbook.indexOf('## Dossier hôte et Vault'), runbook.indexOf('## Démarrage et arrêt'));
   assert.ok(secrets.length > 0);
@@ -1669,7 +1707,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   assert.ok(rotation.indexOf('vault.pulled') < rotation.indexOf('secret-id-accessor/destroy'));
   // The audit log HMACs strings only: a number or a JSON array would reach `docker logs` in clear.
   assert.match(runbook, /mode JSON de l'interface/u);
-  assert.match(runbook, /Operation nonce/u);
+  assert.match(runbook, /incorrect nonce supplied/u);
   assert.match(runbook, /enable_unauthenticated_access/u);
   assert.match(runbook, /vault\.unseal_failed/u);
   assert.match(runbook, /host\.docker\.internal/u);
