@@ -71,8 +71,10 @@ const throwawayKeypair = JSON.stringify([...randomBytes(64)]);
 // The fake RPC URLs carry a key, as a provider's do: the leak checks look for it too.
 const rpcApiKey = randomBytes(16).toString('hex');
 const spareRpcApiKey = randomBytes(16).toString('hex');
+// The executor's own project key: vault-import refuses a listener key equal to it.
+const executorRpcApiKey = randomBytes(16).toString('hex');
 // Grows at run time with what Vault generates or the back pulls: every value is redacted.
-const smokeSecrets = [postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey];
+const smokeSecrets = [postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey, executorRpcApiKey];
 let operatorPassword = null;
 const basicAuthorization = `Basic ${Buffer.from(`${SMOKE_USER}:${frontPassword}`).toString('base64')}`;
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
@@ -896,7 +898,11 @@ async function writeSmokeHost() {
       `SOLANA_HTTP_RPC_URL=https://rpc.invalid/?api-key=${rpcApiKey}`,
       `SOLANA_WS_RPC_URL=wss://rpc.invalid/?api-key=${rpcApiKey}`,
     ]],
-    ['live', [`EXECUTOR_KEYPAIR_PATH=${keypairFile}`]],
+    ['live', [
+      // opapi reads the wallet balance through the executor project in both modes.
+      `SOLANA_HTTP_RPC_URL=https://rpc.invalid/?api-key=${executorRpcApiKey}`,
+      `EXECUTOR_KEYPAIR_PATH=${keypairFile}`,
+    ]],
   ]) {
     const template = await readFile(resolve(root, `deploy/config/${name}.env.example`), 'utf8');
     await writeFile(join(hostDirectory, `import/env/${name}.env`), [template.trimEnd(), ...lines, ''].join('\n'), { mode: 0o600 });
@@ -970,7 +976,7 @@ async function importSmokeVault() {
   );
   assertEqual(
     summary.secrets.join(','),
-    'helius-listener-accounts,wallet-keypair.json',
+    'helius-listener-accounts,helius-executor-http-url,wallet-keypair.json',
     'vault-import did not import the expected secrets.',
   );
 }

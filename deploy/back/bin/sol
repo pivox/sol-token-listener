@@ -63,13 +63,17 @@ helius() {
       # The steps of sol-entrypoint for the listener only (Helius accounts spec 7.1). A refused or
       # invalid entry stops here, before any restart: the listener keeps its accounts.
       current="$(mode)"
-      node /app/dist/scripts/deploy/vault-pull.js back "$current" > /dev/null \
-        || die 'helius reload: Vault refused or an entry is invalid; the listener keeps its accounts' 78
+      # vault-pull's own message (stderr) says why: unavailable (69), refused (77), invalid (78).
+      node /app/dist/scripts/deploy/vault-pull.js back "$current" > /dev/null || {
+        status=$?
+        die 'helius reload: Vault was not read; the listener keeps its accounts' "$status"
+      }
       node /app/dist/scripts/deploy/distribute-secrets.js "$current" > /dev/null \
         || die 'helius reload: the secrets were not distributed; the listener keeps its accounts' 78
       names="$(node /app/dist/scripts/deploy/helius-accounts.js names /run/sol/listener/helius-listener-accounts)" \
         || die 'helius reload: the account list is invalid' 78
-      ctl restart listener > /dev/null
+      ctl restart listener > /dev/null \
+        || die 'helius reload: the listener did not restart (sol ctl status, docker compose logs back)' 1
       printf '{"event":"helius.reloaded","accounts":%s}\n' "$names" ;;
     *) die 'usage: sol helius reload' 64 ;;
   esac

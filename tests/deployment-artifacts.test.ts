@@ -1295,7 +1295,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /`SOLANA_HTTP_RPC_URL=https:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
   assert.match(smoke, /`SOLANA_WS_RPC_URL=wss:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
   assert.match(smoke, /const rpcApiKey = randomBytes\(16\)\.toString\('hex'\);/);
-  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey\];/);
+  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey, executorRpcApiKey\];/);
   assert.match(smoke, /smokePhase\('HELIUS_RELOAD', assertHeliusReload\)/u);
   assert.match(smoke, /'LISTENER_ENABLED=false'/);
   assert.match(smoke, /`EXECUTOR_KEYPAIR_PATH=\$\{keypairFile\}`/);
@@ -1526,7 +1526,7 @@ void test('deployment smoke fills its Vault through the host scripts without eve
   assert.ok(fill.includes("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-import.sh printed a secret.');"));
   assert.ok(fill.includes("summary.configs.join(','), 'listener,live'"));
   assert.ok(fill.includes("readdir(resolve(root, 'deploy/config'))"));
-  assert.ok(fill.includes("'helius-listener-accounts,wallet-keypair.json'"));
+  assert.ok(fill.includes("'helius-listener-accounts,helius-executor-http-url,wallet-keypair.json'"));
 });
 
 void test('deployment smoke proves that six wrong secret_ids do not lock the backup role out', async () => {

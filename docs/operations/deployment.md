@@ -232,6 +232,9 @@ l'hôte ne restent que les secrets d'amorçage :
    - convertit `SOLANA_HTTP_RPC_URL` et `SOLANA_WS_RPC_URL` de `listener.env` en un compte `01`
      de `sol/secrets/back/helius-listener-accounts` (les deux URL doivent porter la même clé), et
      leurs adresses sans clé en `HELIUS_RPC_HTTP_URL` et `HELIUS_RPC_WS_URL` de `sol/config/listener` ;
+     refuse une clé du listener identique à celle de l'exécuteur ;
+   - importe `SOLANA_HTTP_RPC_URL` de `live.env` dans `sol/secrets/back/helius-executor-http-url`,
+     requise même en mode `observe` : l'API opérateur y lit le solde du wallet ;
    - réécrit les chemins de preuves vers `/var/lib/sol/evidence`. Le second argument, facultatif,
      nomme le dossier de preuves d'origine ; par défaut, `evidence/` à côté du dossier source ;
    - fixe `API_HOST=0.0.0.0`, `API_PORT=3000`, `OPERATOR_API_HOST=0.0.0.0` et
@@ -353,7 +356,8 @@ unset cle
 sol_vault kv patch -remove-data=02-pro sol/secrets/back/helius-listener-accounts
 ```
 
-La première création utilise `kv put` au lieu de `kv patch`. Ne jamais lancer `kv get` sur cette
+La première création utilise `kv put` au lieu de `kv patch` ; `kv put` remplace toute l'entrée,
+il ne sert donc jamais à ajouter un compte. Ne jamais lancer `kv get` sur cette
 entrée : il affiche les clés. Puis recharger la liste sans toucher au trading :
 
 ```bash
