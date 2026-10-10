@@ -131,29 +131,49 @@ l'hôte ne restent que les secrets d'amorçage :
      `pbcopy < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"`, puis vider le presse-papiers
      (`pbcopy < /dev/null`). Sans cette clé, aucune sauvegarde de Vault ne se restaure.
 
+   Vérifier une fois cette copie, sans l'afficher : la recopier depuis le gestionnaire de mots de
+   passe, puis comparer. La commande doit afficher `copie identique` :
+
+   ```bash
+   [ "$(pbpaste | tr -d '\r\n' | shasum -a 256)" = "$(tr -d '\r\n' < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" | shasum -a 256)" ] && echo 'copie identique'
+   pbcopy < /dev/null
+   ```
+
    Un Vault en service ne se réinitialise jamais :
    - `already initialized` alors que `secrets/vault/unseal/unseal-key` existe : rien à faire ;
    - `already initialized` sans ce fichier, ou `holds files of an earlier attempt` : la clé manque
-     sur l'hôte. La remettre depuis le gestionnaire de mots de passe, en mode 0600 (sur le Mac :
-     `(umask 077 && pbpaste > "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key")`, puis
-     `pbcopy < /dev/null`), puis `sol_compose restart vault`, sans rien supprimer. Si les fichiers
-     AppRole manquent aussi, les recréer comme à leur rotation (« Rotation des secrets »), avec le
-     `role_id` de `vault read -field=role_id auth/approle/role/<rôle>/role-id` ;
-   - la clé existe, mais `sol_compose logs vault` montre `vault.uninitialized` : c'est le volume
-     `vault-data` qui est perdu. Restaurer le dernier instantané (« Restaurer Vault »).
+     sur l'hôte. La remettre depuis le gestionnaire de mots de passe, ou depuis
+     `secrets/unseal-key.sealed` (« Sceller Vault en urgence »), en mode 0600. Sur le Mac :
+     `(umask 077 && set -C && pbpaste > "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key")`, puis
+     `pbcopy < /dev/null`. Lancer ensuite `sol_compose restart vault`, sans rien supprimer. Si les
+     fichiers AppRole manquent aussi, les recréer comme à leur rotation
+     (« Rotation des secrets »), avec le `role_id` de
+     `vault read -field=role_id auth/approle/role/<rôle>/role-id` ;
+   - la clé existe, mais Vault est vide : après `sol_compose up --detach vault`,
+     `sol_compose exec vault vault status` montre `Initialized false`. C'est le volume `vault-data`
+     qui est perdu : restaurer le dernier instantané (« Restaurer Vault »). Le journal ne le prouve
+     pas : il garde la ligne `vault.uninitialized` du premier démarrage.
 
-   Seulement sans aucune copie, la clé est perdue : repartir de zéro, comme ci-dessous. Repartir de
-   zéro aussi quand l'initialisation n'a jamais abouti (`start over as the runbook says`, aucun mot
-   de passe `operator` affiché) : Vault ne contient encore rien. Supprimer le conteneur, le volume
-   et les fichiers de `secrets/vault/` :
+   Seulement sans aucune copie, la clé est perdue : repartir de zéro, comme ci-dessous. Si
+   `sol_compose exec vault vault status` montre encore `Sealed false`, ce Vault en marche est la
+   dernière copie lisible des valeurs : ne pas le redémarrer, et relever dans l'interface les
+   entrées modifiées depuis l'import avant d'effacer quoi que ce soit.
+
+   Repartir de zéro aussi quand l'initialisation n'a jamais abouti
+   (`start over as the runbook says`, aucun mot de passe `operator` affiché) : Vault ne contient
+   encore rien. Garder une copie de `secrets/vault/`, puis supprimer le conteneur, le volume et les
+   fichiers de `secrets/vault/` :
 
    ```bash
+   cp -Rp "$SOL_HOST_DIR/secrets/vault" "$SOL_HOST_DIR/secrets/vault.before-reset-$(date -u +%Y%m%dT%H%M%SZ)"
    sol_compose rm --stop --force vault
    docker volume rm sol-token-listener_vault-data
    find "$SOL_HOST_DIR/secrets/vault/unseal" "$SOL_HOST_DIR/secrets/vault/approle" -mindepth 1 -delete
    ```
 
-   Puis relancer `deploy/host/vault-init.sh`, et l'import (étape 3).
+   Avec le dernier instantané, cette copie permet de revenir sur un départ à zéro fait par erreur ;
+   `vault-init.sh` ne vérifie que `unseal/` et `approle/`. Puis relancer
+   `deploy/host/vault-init.sh`, et l'import (étape 3).
 
 3. Importer les fichiers actuels. Le script lit les fichiers de rôle du lot 5 et les fichiers de
    clés qu'ils nomment, demande le mot de passe `operator`, puis écrit le tout dans Vault sans
@@ -361,13 +381,14 @@ paquet précédent, déjà consommé.
   cause corrigée, `sol_compose exec back sol ctl restart <programme>` le relance tout de suite.
 - `sol_compose logs -f back` : une ligne JSON par événement, avec le nom du service. Le pilote
   `json-file` garde 5 fichiers de 20 Mo par conteneur.
-- `vault` est sain une fois déverrouillé. Son journal montre `vault.unsealed` à chaque démarrage.
-  `vault.uninitialized` est normal avant `vault-init.sh` ; après, le volume `vault-data` est perdu
-  (« Restaurer Vault »). Il montre `vault.unseal_key_missing` si le fichier de clé manque,
-  `vault.unseal_failed` si le déverrouillage échoue, par exemple avec une mauvaise clé, et
-  `vault.api_unavailable` si l'API n'a pas répondu après 60 essais. Après avoir remis le bon
-  fichier dans `secrets/vault/unseal/`, lancer `sol_compose restart vault` : le script d'entrée ne
-  déverrouille qu'au démarrage du conteneur.
+- `vault` est sain une fois déverrouillé. Son journal montre `vault.unsealed` à chaque démarrage,
+  et garde la ligne `vault.uninitialized` du premier démarrage, antérieure à `vault-init.sh`. Un
+  volume `vault-data` perdu se reconnaît à `sol_compose exec vault vault status`, qui montre
+  `Initialized false` (« Restaurer Vault »). Le journal montre aussi `vault.unseal_key_missing` si
+  le fichier de clé manque, `vault.unseal_failed` si le déverrouillage échoue, par exemple avec une
+  mauvaise clé, et `vault.api_unavailable` si l'API n'a pas répondu après 60 essais. Après avoir
+  remis le bon fichier dans `secrets/vault/unseal/`, lancer `sol_compose restart vault` : le
+  script d'entrée ne déverrouille qu'au démarrage du conteneur.
 - `vault-pull: Vault unavailable for 60 s` dans le journal du back : Vault était arrêté ou
   verrouillé pendant 60 s. Le back redémarre en boucle jusqu'au retour de Vault, puis reprend
   seul ; en mode `live`, relancer ensuite `sol trading start`.
@@ -430,6 +451,10 @@ La restauration doit être répétée régulièrement sur un projet jetable : le
 reprise ci-dessous, avec un autre `--project-name`.
 
 ### Restaurer Vault
+
+Restaurer remplace tout le contenu de Vault. Si `sol_compose exec vault vault status` montre
+`Initialized true`, Vault n'est pas perdu : ne le restaurer que volontairement, après
+`SOL_REPOSITORY="$PWD" deploy/host/backup.sh`.
 
 Sur un Vault vide, avec la clé de déverrouillage d'origine et les fichiers AppRole d'origine dans
 `secrets/vault/`. Un instantané antérieur à une rotation d'AppRole ne connaît que l'ancien
@@ -573,8 +598,12 @@ Prérequis :
 - un budget RPC du listener tenable. Sa charge HTTP est estimée entre 20 000 et 55 000 crédits par
   heure, au-delà d'un forfait gratuit.
 
-Procédure : sur le Mac, vérifier d'abord la précondition. La ligne doit être `0|0|0|0` ; sinon, ne
-pas aller plus loin.
+Procédure : sur le Mac, amener d'abord la base à la précondition, puis la vérifier.
+`sol_compose exec back sol trading stop` arrête les achats ; attendre que les positions ouvertes
+soient vendues à leur échéance. Révoquer ensuite l'enveloppe encore `ACTIVE`, sauf si elle a
+expiré : `sol_compose exec back sol ops envelope revoke --envelope-id=<id>`, l'id venant de
+`sol_compose exec back sol ops envelope show`. La ligne doit être `0|0|0|0` ; sinon, ne pas aller
+plus loin.
 
 ```bash
 sol_compose exec -T postgres sh -c 'exec psql -X -A -t -v ON_ERROR_STOP=1 -U sol_owner -d "$POSTGRES_DB"' \
@@ -654,7 +683,8 @@ devrait garder l'uid 100 (l'utilisateur `vault` de l'image) sur chaque fichier.
      `secret_id_accessor` ;
   2. sur l'hôte, remplacer `secret_id` dans `secrets/vault/approle/back.json` (objet JSON
      `{"role_id":"…","secret_id":"…"}`, mode 0600), puis `sol_compose restart back` :
-     `sol_compose logs back` doit montrer `vault.pulled` ;
+     `sol_compose logs --since 2m back` doit montrer `vault.pulled`, et `sol_compose ps` le back
+     `healthy`. Sans `--since`, le journal montre aussi les démarrages précédents ;
   3. seulement alors, `vault list auth/approle/role/back/secret-id` liste les accessors : détruire
      chacun de ceux qui ne sont pas le nouveau avec
      `vault write auth/approle/role/back/secret-id-accessor/destroy secret_id_accessor=<ancien>` ;
@@ -715,10 +745,17 @@ scellé :
 - arrêter le conteneur : `sol_compose stop vault`. Pour rouvrir : `sol_compose start vault`.
   Entre-temps, `sol_compose up`, ou `sol_compose run --rm migrate` sans `--no-deps`, redémarrerait
   Vault et le déverrouillerait ;
-- ou, après avoir vérifié que le gestionnaire de mots de passe en garde une copie, supprimer la
-  clé (`rm "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"`), puis `sol_compose restart vault` :
-  Vault reste scellé (`vault.unseal_key_missing`). Pour rouvrir : remettre la clé (« Dossier hôte
-  et Vault », étape 2), puis `sol_compose restart vault`.
+- ou sortir la clé du dossier monté, sans la supprimer, puis redémarrer `vault` : il reste scellé
+  (`vault.unseal_key_missing`).
+
+  ```bash
+  mv "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" "$SOL_HOST_DIR/secrets/unseal-key.sealed"
+  sol_compose restart vault
+  ```
+
+  `secrets/` est en 0700 et aucun conteneur ne le monte. Pour rouvrir : le `mv` inverse, puis
+  `sol_compose restart vault`. Ne supprimer la clé de l'hôte qu'après `copie identique`
+  (« Dossier hôte et Vault », étape 2).
 
 Le back déjà démarré continue de tourner, sorties comprises. Il ne redémarre plus tant que Vault
 reste scellé : une position ouverte attendrait alors son retour.

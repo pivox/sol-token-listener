@@ -1603,9 +1603,24 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     '| sol_compose exec -T vault vault kv put sol/secrets/back/helius-listener-http-url value=-',
     // The unseal key goes to the password manager without being displayed, and comes back the same way.
     'pbcopy < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
-    '(umask 077 && pbpaste > "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key")',
+    // set -C: the paste never overwrites a key file that is already there.
+    '(umask 077 && set -C && pbpaste > "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key")',
+    // The copy in the password manager is checked once, without being displayed.
+    "| shasum -a 256)\" ] && echo 'copie identique'",
+    // The emergency seal moves the only key out of the mounted folder; it never deletes it.
+    'mv "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" "$SOL_HOST_DIR/secrets/unseal-key.sealed"',
+    // Old log lines must not pass for the restart that follows a rotation.
+    'sol_compose logs --since 2m back',
+    'sol_compose exec back sol ops envelope revoke --envelope-id=<id>',
   ]) {
     assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
+  }
+  assert.doesNotMatch(runbook, /\brm\b[^\n]*secrets\/vault\/unseal\/unseal-key/u, 'the only key is never deleted');
+  // `vault.uninitialized` stays in the log of every container vault-init created: only `vault status`
+  // proves a lost volume, and a restore over a live Vault is never the default.
+  assert.match(runbook, /`Initialized false`/u);
+  for (const sentence of runbook.split(/(?<=\.)\s+/u).filter((text) => text.includes('vault.uninitialized'))) {
+    assert.match(sentence, /premier démarrage/u, `vault.uninitialized must not prove a lost volume: ${sentence}`);
   }
   const secrets = runbook.slice(runbook.indexOf('## Dossier hôte et Vault'), runbook.indexOf('## Démarrage et arrêt'));
   assert.ok(secrets.length > 0);
@@ -1615,6 +1630,8 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   const restore = runbook.slice(runbook.indexOf('### Restaurer Vault'), runbook.indexOf('## Reprise de la base actuelle'));
   assert.ok(restore.length > 0);
   assert.doesNotMatch(restore, /sol_compose stop/u, 'the restore leaves the back running');
+  assert.ok(restore.indexOf('`Initialized true`') > 0);
+  assert.ok(restore.indexOf('`Initialized true`') < restore.indexOf('docker volume rm'), 'the guard comes before the wipe');
   // The server move checks the precondition, then exports with Vault and the base still running.
   const move = runbook.slice(runbook.indexOf('## Bascule vers le serveur'), runbook.indexOf('## Rotation des secrets'));
   const precondition = move.indexOf('< deploy/sql/takeover-precondition.sql');
