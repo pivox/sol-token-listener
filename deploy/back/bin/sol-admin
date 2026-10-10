@@ -1,14 +1,18 @@
 #!/bin/sh
 # Administrator commands of the migrate container (root; the admin password lives only here):
-#   sol-admin migrate       migrations, provisioning replay, the nine logins (default command)
+#   sol-admin migrate       login passwords from Vault, then migrations, provisioning replay and
+#                           the nine logins (default command)
 #   sol-admin group-roles   the NOLOGIN group roles only, before a pg_restore
 #   sol-admin report        fast-path report as the administrator, run as the node user
 set -eu
 command="${1:-}"
 [ "$#" -eq 0 ] || shift
 case "$command" in
-  migrate|group-roles)
-    exec node /app/dist/scripts/deploy/admin-database.js "$command" ;;
+  migrate)
+    node /app/dist/scripts/deploy/vault-pull.js migrate
+    exec node /app/dist/scripts/deploy/admin-database.js migrate ;;
+  group-roles)
+    exec node /app/dist/scripts/deploy/admin-database.js group-roles ;;
   report)
     DATABASE_URL="$(node /app/dist/scripts/deploy/admin-database.js url)"
     export DATABASE_URL

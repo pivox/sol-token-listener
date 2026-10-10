@@ -82,7 +82,9 @@ partageraient le système de fichiers de la keypair, et un superviseur resterait
   publie 80 et 443 ; ni la base ni le back ne publient de port.
 - **Volumes** : `postgres-data`, `caddy-data` (certificats). Les logs vont sur la sortie
   standard.
-- **Vault** sera ajouté plus tard comme quatrième conteneur sans changer cette topologie.
+- **Vault** sera ajouté plus tard comme quatrième conteneur. Le sous-projet 2 ajoute le
+  conteneur `vault`, son volume `vault-data`, le réseau `vault-ui` (interface locale) et, au
+  profil `tools`, trois services ponctuels ; les autres réseaux et ports ne changent pas.
 
 ## 6. Conteneur back
 
@@ -230,10 +232,18 @@ utilisateur, chaque politique ne donnant accès qu'aux secrets de cet utilisateu
 les mêmes dossiers `/run/sol/<utilisateur>/`. La keypair n'est lisible que par la politique de
 `h2b`. Le reste de la stack ne voit aucune différence.
 
+Cette jonction est précisée par le sous-projet 2,
+`docs/superpowers/specs/2026-10-09-vault-secrets-design.md`, avec deux écarts : un AppRole par
+conteneur plutôt qu'un rôle par utilisateur (section 6.3 du spec Vault), la keypair restant
+réservée à `h2b` par la distribution par utilisateur ; et la configuration non secrète, qui
+passe elle aussi dans Vault.
+
 ### 7.4 Rotation
 
-Modifier le fichier, puis `docker compose restart back` ; pour un mot de passe PostgreSQL,
-relancer `migrate` avant le back.
+Depuis le sous-projet 2, une valeur se modifie dans Vault, plus dans un fichier (spec Vault,
+section 8.3, et runbook, « Rotation des secrets »). Puis `docker compose restart back` ; pour un
+mot de passe de login PostgreSQL, relancer `migrate` aussitôt après la modification, avant tout
+redémarrage du back.
 
 ## 8. Front Caddy
 

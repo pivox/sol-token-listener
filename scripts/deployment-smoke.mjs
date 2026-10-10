@@ -1,6 +1,6 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,10 +18,11 @@ const MAX_RETENTION_COUNTERS = 128;
 const MAX_FAILURE_SUMMARY_BYTES = 1_024;
 const smokeFailureContext = new WeakMap();
 const SMOKE_PHASES = new Set([
-  'BUILD', 'HOST_SETUP', 'START', 'PORT_DISCOVERY', 'SIGNAL_PROBE', 'PROCESS_USERS',
-  'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'PUBLIC_HEALTH', 'CORS', 'MIGRATIONS',
-  'LOGINS', 'OPERATIONS', 'FRONTEND', 'SSE_SHUTDOWN', 'APP_RESTART', 'HEALTH_RECOVERY',
-  'RETENTION', 'CLEANUP',
+  'BUILD', 'HOST_SETUP', 'VAULT_SETUP', 'VAULT_IMPORT', 'START', 'PORT_DISCOVERY', 'SIGNAL_PROBE',
+  'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'PUBLIC_HEALTH', 'CORS',
+  'MIGRATIONS', 'LOGINS', 'OPERATIONS', 'FRONTEND', 'SSE_SHUTDOWN', 'APP_RESTART',
+  'HEALTH_RECOVERY', 'RETENTION', 'BACKUP', 'VAULT_RESTART', 'VAULT_FAIL_CLOSED', 'SECRET_LEAKS',
+  'CLEANUP',
 ]);
 const SMOKE_OPERATIONS = new Set(['HTTP_HEADERS', 'HTTP_BODY', 'SSE_BODY']);
 const TRANSPORT_CODES = new Set([
@@ -53,7 +54,6 @@ const hostDirectory = hostDirectoryFor(projectName);
 const SMOKE_USER = 'smoke';
 const postgresPassword = randomBytes(24).toString('hex');
 const frontPassword = randomBytes(24).toString('hex');
-const operatorApiToken = randomBytes(32).toString('hex');
 // Same table as src/deploy/stack.ts DATABASE_LOGINS (tests/deployment-artifacts.test.ts checks it).
 const loginGroups = Object.freeze({
   sol_listener: 'sol_token_listener_writer',
@@ -66,14 +66,13 @@ const loginGroups = Object.freeze({
   sol_ops: 'sol_token_executor_operations',
   sol_readiness: 'sol_token_executor_readiness',
 });
-const loginPasswords = Object.freeze(Object.fromEntries(
-  Object.keys(loginGroups).map((login) => [login, randomBytes(24).toString('hex')]),
-));
-// Throwaway: random bytes, never a funded key; only used to prove the tmpfs isolation.
+// Throwaway: random bytes, never a funded key; proves that observe mode leaves it in Vault.
 const throwawayKeypair = JSON.stringify([...randomBytes(64)]);
-const smokeSecrets = Object.freeze([
-  postgresPassword, frontPassword, operatorApiToken, ...Object.values(loginPasswords),
-]);
+// The fake RPC URLs carry a key, as a provider's do: the leak checks look for it too.
+const rpcApiKey = randomBytes(16).toString('hex');
+// Grows at run time with what Vault generates or the back pulls: every value is redacted.
+const smokeSecrets = [postgresPassword, frontPassword, throwawayKeypair, rpcApiKey];
+let operatorPassword = null;
 const basicAuthorization = `Basic ${Buffer.from(`${SMOKE_USER}:${frontPassword}`).toString('base64')}`;
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
 const signalExitCodes = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
@@ -240,19 +239,30 @@ function deploymentImagesFor(name) {
   return Object.freeze({
     backend: `sol-token-listener-smoke-backend:${name}`,
     frontend: `sol-token-listener-smoke-frontend:${name}`,
+    vault: `sol-token-listener-smoke-vault:${name}`,
   });
 }
 
+// The compose inputs the smoke sets, also written to compose.env: the host scripts read them there.
+const COMPOSE_INPUTS = Object.freeze([
+  'COMPOSE_PROJECT_NAME', 'SOL_HOST_DIR', 'SOL_STACK_MODE', 'SOL_HEALTH_REQUIRE_OK',
+  'SOL_VAULT_PULL_TIMEOUT_MS', 'POSTGRES_DB', 'BACKEND_IMAGE', 'FRONTEND_IMAGE', 'VAULT_IMAGE',
+  'FRONT_PORT', 'VAULT_PORT', 'FRONT_BASIC_AUTH_USER',
+]);
 const environment = Object.freeze({
   ...process.env,
   COMPOSE_PROJECT_NAME: projectName,
   SOL_HOST_DIR: hostDirectory,
   SOL_STACK_MODE: 'observe',
   SOL_HEALTH_REQUIRE_OK: 'false',
+  // Seconds, not a minute: VAULT_FAIL_CLOSED waits for the back to give up on a stopped Vault.
+  SOL_VAULT_PULL_TIMEOUT_MS: '5000',
   POSTGRES_DB: 'smoke',
   BACKEND_IMAGE: deploymentImages.backend,
   FRONTEND_IMAGE: deploymentImages.frontend,
+  VAULT_IMAGE: deploymentImages.vault,
   FRONT_PORT: '0',
+  VAULT_PORT: '0',
   FRONT_BASIC_AUTH_USER: SMOKE_USER,
 });
 let baseUrl = null;
@@ -284,8 +294,10 @@ async function runDeployment(selfSignal) {
   const cleanupFailures = [];
   try {
     try {
-      await smokePhase('BUILD', async () => { await compose(['build', 'back', 'front']); });
+      await smokePhase('BUILD', async () => { await compose(['build', 'back', 'front', 'vault']); });
       await smokePhase('HOST_SETUP', writeSmokeHost);
+      await smokePhase('VAULT_SETUP', setupSmokeVault);
+      await smokePhase('VAULT_IMPORT', importSmokeVault);
       await smokePhase('START', async () => { await compose(['up', '--detach', '--wait', '--wait-timeout', '180']); });
       baseUrl = await smokePhase('PORT_DISCOVERY', discoverFrontendBaseUrl);
       if (selfSignal !== null) {
@@ -318,6 +330,12 @@ async function runDeployment(selfSignal) {
       await smokePhase('APP_RESTART', async () => { await compose(['exec', '-T', 'back', 'sol', 'ctl', 'start', 'listener']); });
       await smokePhase('HEALTH_RECOVERY', waitForPublicHealth);
       await smokePhase('RETENTION', assertRetentionOneShot);
+      await smokePhase('BACKUP', assertBackup);
+      await smokePhase('VAULT_RESTART', assertVaultAutoUnseal);
+      await smokePhase('VAULT_FAIL_CLOSED', assertBackFailsClosed);
+      // Last: the scan covers the entrypoint's first unseal from the key file (VAULT_RESTART) and the
+      // boots refused without Vault.
+      await smokePhase('SECRET_LEAKS', assertNoSecretLeak);
     } catch (error) {
       primaryFailure = error;
     }
@@ -558,7 +576,9 @@ function faultCleanupEnvironment(faultName) {
     POSTGRES_DB: 'smoke',
     BACKEND_IMAGE: deploymentImagesFor(faultName).backend,
     FRONTEND_IMAGE: deploymentImagesFor(faultName).frontend,
+    VAULT_IMAGE: deploymentImagesFor(faultName).vault,
     FRONT_PORT: '0',
+    VAULT_PORT: '0',
   });
 }
 
@@ -733,7 +753,7 @@ function commandLabel(args) {
     value !== 'compose'
     && value !== '-f'
     && value !== composeFile);
-  return `Docker ${action ?? 'command'}`;
+  return `${action?.endsWith('.sh') ? 'Command' : 'Docker'} ${action ?? 'command'}`;
 }
 
 function redact(value) {
@@ -854,32 +874,112 @@ async function writeSmokeHost() {
     '--bcrypt-cost', '10',
   ], { input: `${frontPassword}\n`, reflectFailureOutput: false });
   if (!/^\$2a\$10\$[./A-Za-z0-9]{53}\n$/u.test(frontHash)) throw new Error('Caddy did not return a bcrypt hash.');
-  const secrets = join(hostDirectory, 'secrets');
-  const files = [
-    ['secrets/db/postgres-admin-password', `${postgresPassword}\n`],
-    ...Object.entries(loginPasswords).map(([login, password]) => [`secrets/db/logins/pg-${login}-password`, `${password}\n`]),
-    ['secrets/back/helius-listener-http-url', 'https://rpc.invalid\n'],
-    ['secrets/back/helius-listener-ws-url', 'wss://rpc.invalid\n'],
-    ['secrets/back/operator-api-token', `${operatorApiToken}\n`],
-    ['secrets/back/wallet-keypair.json', `${throwawayKeypair}\n`],
-    ['secrets/front/front-basic-auth-hash', frontHash],
-  ];
-  for (const directory of ['secrets/db/logins', 'secrets/back', 'secrets/front', 'config']) {
+  // The layout of deploy/host/init-secrets.sh, plus the import source.
+  for (const directory of [
+    'secrets/db', 'secrets/front', 'secrets/vault/unseal', 'secrets/vault/approle',
+    'import/env', 'import/keys', 'backups',
+  ]) {
     await mkdir(join(hostDirectory, directory), { recursive: true, mode: 0o700 });
   }
-  for (const [path, content] of files) await writeFile(join(hostDirectory, path), content, { mode: 0o600 });
   await chmod(hostDirectory, 0o700);
-  await chmod(secrets, 0o700);
-  for (const name of [
-    'listener', 'live', 'live-recovery', 'operations', 'operator-api', 'retention', 'worker-sim',
-    'readiness', 'provider-evidence', 'preflight-bundle',
+  await writeFile(join(hostDirectory, 'secrets/db/postgres-admin-password'), `${postgresPassword}\n`, { mode: 0o600 });
+  await writeFile(join(hostDirectory, 'secrets/front/front-basic-auth-hash'), frontHash, { mode: 0o600 });
+  // Import source in the lot5 layout: role files under env/, and a key file outside it that a
+  // *_PATH variable names. The smoke never contacts an RPC: its listener only serves the API.
+  const keypairFile = join(hostDirectory, 'import/keys/wallet-keypair.json');
+  await writeFile(keypairFile, `${throwawayKeypair}\n`, { mode: 0o600 });
+  for (const [name, lines] of [
+    ['listener', [
+      'LISTENER_ENABLED=false',
+      `SOLANA_HTTP_RPC_URL=https://rpc.invalid/?api-key=${rpcApiKey}`,
+      `SOLANA_WS_RPC_URL=wss://rpc.invalid/?api-key=${rpcApiKey}`,
+    ]],
+    ['live', [`EXECUTOR_KEYPAIR_PATH=${keypairFile}`]],
   ]) {
     const template = await readFile(resolve(root, `deploy/config/${name}.env.example`), 'utf8');
-    // The smoke never contacts an RPC: its listener only serves the API.
-    const override = name === 'listener' ? 'LISTENER_ENABLED=false\n' : '';
-    await writeFile(join(hostDirectory, 'config', `${name}.env`), `${template}${override}`, { mode: 0o644 });
+    await writeFile(join(hostDirectory, `import/env/${name}.env`), [template.trimEnd(), ...lines, ''].join('\n'), { mode: 0o600 });
   }
-  await chmod(join(hostDirectory, 'config'), 0o755);
+  await writeFile(
+    join(hostDirectory, 'compose.env'),
+    COMPOSE_INPUTS.map((name) => `${name}=${environment[name]}\n`).join(''),
+    { mode: 0o600 },
+  );
+}
+
+/**
+ * A host script runs as on the operator's machine: SOL_HOST_DIR and what Docker needs, while every
+ * other compose input comes from compose.env. The project name comes from both, in defence in
+ * depth: should Compose stop reading it from --env-file, no script may act on the operator's own
+ * sol-token-listener project.
+ */
+function hostScriptEnvironment(extra = {}) {
+  return Object.freeze({
+    ...Object.fromEntries(Object.entries(process.env).filter(([name]) => /^(?:PATH|HOME|DOCKER_\w+)$/u.test(name))),
+    COMPOSE_PROJECT_NAME: projectName,
+    SOL_HOST_DIR: hostDirectory,
+    ...extra,
+  });
+}
+
+async function setupSmokeVault() {
+  // vault-setup exits 0 only once Vault is unsealed and configured. The script prints the operator
+  // password: no failure message may carry its output.
+  // Known limitation, as for every host script: a deadline or a signal kills bash, not its docker compose.
+  const { stdout, stderr } = await runCommand('bash', [resolve(root, 'deploy/host/vault-init.sh')], {
+    commandEnvironment: hostScriptEnvironment(),
+    reflectFailureOutput: false,
+  });
+  const password = /^Vault operator password, shown once \(store it in your password manager\): (\S+)$/mu.exec(stdout)?.[1];
+  if (password === undefined) throw new Error('vault-init.sh did not print the operator password.');
+  operatorPassword = password;
+  smokeSecrets.push(password);
+  const unsealKey = (await readFile(join(hostDirectory, 'secrets/vault/unseal/unseal-key'), 'utf8')).trim();
+  if (unsealKey === '') throw new Error('vault-setup wrote an empty unseal key.');
+  smokeSecrets.push(unsealKey);
+  for (const name of ['back', 'migrate', 'backup']) {
+    const approle = parseJson(
+      await readFile(join(hostDirectory, `secrets/vault/approle/${name}.json`), 'utf8'),
+      'vault-setup wrote an unreadable AppRole file.',
+    );
+    if (typeof approle?.secret_id !== 'string' || approle.secret_id === '') {
+      throw new Error('vault-setup wrote an AppRole file without its secret_id.');
+    }
+    smokeSecrets.push(approle.secret_id);
+  }
+  // Checked once every secret it created is known: the operator password is all it may show.
+  assertNoSmokeSecret(`${stdout}\n${stderr}`, 'vault-init.sh printed a secret.', password);
+}
+
+async function importSmokeVault() {
+  const { stdout, stderr } = await runCommand('bash', [
+    resolve(root, 'deploy/host/vault-import.sh'), join(hostDirectory, 'import/env'),
+  ], { commandEnvironment: hostScriptEnvironment(), input: `${operatorPassword}\n`, reflectFailureOutput: false });
+  assertNoSmokeSecret(`${stdout}\n${stderr}`, 'vault-import.sh printed a secret.');
+  const summary = parseJson(stdout.trim().split('\n').at(-1), 'vault-import did not print its summary.');
+  assertEqual(summary.configs.join(','), 'listener,live', 'vault-import did not take the two role files.');
+  // Every other configuration comes from its repository template.
+  const templates = (await readdir(resolve(root, 'deploy/config')))
+    .map((file) => /^(.+)\.env\.example$/u.exec(file)?.[1])
+    .filter((name) => name !== undefined && name !== 'listener' && name !== 'live');
+  assertEqual(
+    [...summary.templates].sort().join(','),
+    templates.sort().join(','),
+    'vault-import did not fill the other configurations from their templates.',
+  );
+  assertEqual(
+    summary.secrets.join(','),
+    'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json',
+    'vault-import did not import the expected secrets.',
+  );
+}
+
+/** A file the back pulled from Vault into its root-only tmpfs; the value joins the redactions. */
+async function readBackSecret(file) {
+  const { stdout } = await compose(['exec', '-T', 'back', 'cat', `/root/secrets/${file}`], { reflectFailureOutput: false });
+  const value = stdout.replace(/\n$/u, '');
+  if (value === '') throw new Error('The back pulled an empty secret.');
+  smokeSecrets.push(value);
+  return value;
 }
 
 async function assertProcessUsers() {
@@ -896,10 +996,10 @@ async function assertFrontNonRoot() {
 }
 
 async function assertSecretIsolation() {
-  const secretPaths = ['/run/sol/h2b/wallet-keypair.json', '/run/sol/opapi/operator-api-token'];
+  const secretPaths = ['/run/sol/listener/pg-sol_listener-password', '/run/sol/opapi/operator-api-token'];
   const { stdout } = await compose(['exec', '-T', 'back', 'stat', '-c', '%U %a', ...secretPaths]);
-  assertEqual(stdout, 'h2b 400\nopapi 400\n', 'Secrets are not owner-only in the tmpfs.');
-  for (const path of secretPaths) {
+  assertEqual(stdout, 'listener 400\nopapi 400\n', 'Secrets are not owner-only in the tmpfs.');
+  for (const path of secretPaths.slice(1)) {
     let readable = true;
     try {
       await compose([
@@ -910,9 +1010,14 @@ async function assertSecretIsolation() {
     }
     if (readable) throw new Error('The listener user can read the secret of another user.');
   }
+  // Observe mode never pulls the keypair out of Vault (Vault spec 7.1): no such file anywhere in
+  // either tmpfs, which the container always mounts.
+  const { stdout: pulled } = await compose(['exec', '-T', 'back', 'find', '/root/secrets', '/run/sol', '-name', '*keypair*']);
+  if (pulled !== '') throw new Error('The observe stack pulled the keypair out of Vault.');
 }
 
 async function assertFrontAuthentication() {
+  const operatorApiToken = await readBackSecret('back/operator-api-token');
   const anonymous = await fetchBounded('/index.html', { authenticated: false });
   assertEqual(anonymous.status, 401, 'The front served the console without credentials.');
   const write = await fetchBounded('/api/v1/health', { method: 'POST' });
@@ -942,8 +1047,9 @@ async function assertLogins() {
     .map((login) => `${login}|false|${loginGroups[login]}:false:false:true`).join('\n');
   assertEqual(stdout.trim(), expected, 'Logins are not NOINHERIT members of exactly their group role.');
   for (const [login, group] of Object.entries(loginGroups)) {
+    const password = await readBackSecret(`logins/pg-${login}-password`);
     const { stdout: role } = await runDocker(composeCommand([
-      'exec', '-T', '-e', `PGPASSWORD=${loginPasswords[login]}`, '-e', `PGOPTIONS=-c role=${group}`,
+      'exec', '-T', '-e', `PGPASSWORD=${password}`, '-e', `PGOPTIONS=-c role=${group}`,
       'postgres', 'psql', '-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-h', '127.0.0.1', '-U', login, '-d', 'smoke',
       '-c', 'SELECT current_user',
     ]), { reflectFailureOutput: false });
@@ -1164,6 +1270,88 @@ async function assertRetentionOneShot() {
   }
 }
 
+async function assertBackup() {
+  // Vault 2 locks a login out after five failures by default, and vault-setup turns that off: the
+  // backup must still pass after six wrong secret_ids for its role.
+  await assertWrongBackupLoginsRefused();
+  const { stdout } = await runCommand('bash', [resolve(root, 'deploy/host/backup.sh')], {
+    commandEnvironment: hostScriptEnvironment({ SOL_REPOSITORY: root }),
+  });
+  const files = /^backup (\S+\.dump) (\S+\.snap)$/mu.exec(stdout);
+  if (files === null) throw new Error('backup.sh did not report its dump and its snapshot.');
+  const dump = await readFile(files[1]);
+  if (dump.subarray(0, 5).toString('latin1') !== 'PGDMP') throw new Error('The database backup is not a pg_dump archive.');
+  const snapshot = await readFile(files[2]);
+  if (snapshot[0] !== 0x1f || snapshot[1] !== 0x8b) throw new Error('The Vault backup is not a gzip raft snapshot.');
+}
+
+/** Six runs of the snapshot tool with the backup role_id and a random secret_id: each is refused (77). */
+async function assertWrongBackupLoginsRefused() {
+  const approle = parseJson(
+    await readFile(join(hostDirectory, 'secrets/vault/approle/backup.json'), 'utf8'),
+    'The backup AppRole file is unreadable.',
+  );
+  if (typeof approle?.role_id !== 'string' || approle.role_id === '') throw new Error('The backup AppRole file has no role_id.');
+  const wrongSecretId = randomUUID();
+  smokeSecrets.push(wrongSecretId);
+  const input = `${JSON.stringify({ role_id: approle.role_id, secret_id: wrongSecretId })}\n`;
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    assertEqual(
+      await composeExitCode(['run', '--rm', '--no-deps', '-T', 'vault-snapshot'], { input }),
+      77,
+      'The snapshot tool did not refuse a wrong backup secret_id.',
+    );
+  }
+}
+
+/** The exit code of a compose command, 0 included; its output is never reflected. */
+async function composeExitCode(args, options) {
+  try {
+    await compose(args, { ...options, reflectFailureOutput: false });
+    return 0;
+  } catch (error) {
+    // runCommand's message for an exit code; a deadline, a signal or an interruption is rethrown.
+    const code = /^Docker [a-z-]+ failed \(exit ([0-9]+)\)\.$/u.exec(error instanceof Error ? error.message : '')?.[1];
+    if (code === undefined) throw error;
+    return Number(code);
+  }
+}
+
+async function assertNoSecretLeak() {
+  const { stdout: ids } = await compose(['ps', '--all', '--quiet']);
+  const { stdout: inspect } = await runDocker(['inspect', ...ids.split('\n').filter((id) => id !== '')]);
+  assertNoSmokeSecret(inspect, 'A secret value appears in docker inspect.');
+  assertNoSmokeSecret(await composeLogs(), 'A secret value appears in the container logs.');
+}
+
+async function assertVaultAutoUnseal() {
+  await compose(['restart', 'vault']);
+  await compose(['up', '--detach', '--wait', '--wait-timeout', '60', 'vault']);
+  const { stdout } = await compose(['exec', '-T', 'vault', 'vault', 'status', '-format=json']);
+  assertEqual(String(parseJson(stdout, 'vault status did not answer JSON.').sealed), 'false',
+    'Vault did not unseal itself after a restart.');
+}
+
+async function assertBackFailsClosed() {
+  const occurrences = async (pattern) => ((await composeLogs('back')).match(pattern) ?? []).length;
+  const distributions = () => occurrences(/"event":"secrets\.distributed"/gu);
+  const failedPulls = () => occurrences(/vault-pull: Vault unavailable/gu);
+  const before = await distributions();
+  // The first start distributed: a changed log line must not turn the guard below into 0 === 0.
+  if (before < 1) throw new Error('The back log shows no distribution of its first start.');
+  const failedBefore = await failedPulls();
+  await compose(['stop', 'vault']);
+  await compose(['restart', 'back']);
+  // About 14 s with the 5 s pull timeout. A second refused boot proves that the first one exited,
+  // with everything it did already logged.
+  for (let attempt = 1; ; attempt += 1) {
+    if (await failedPulls() >= failedBefore + 2) break;
+    if (attempt >= 45) throw new Error('The back did not refuse to start twice without Vault.');
+    await delay(1_000);
+  }
+  assertEqual(String(await distributions()), String(before), 'The back distributed secrets without Vault.');
+}
+
 async function fetchBounded(path, { authenticated = true, headers = {}, ...options } = {}) {
   const response = await requestWithDeadline(`${publicBaseUrl()}${path}`, {
     ...options,
@@ -1250,6 +1438,17 @@ function assertEqual(actual, expected, message) {
 
 function assertMatch(actual, pattern, message) {
   if (!pattern.test(actual)) throw new Error(message);
+}
+
+/** Fails without showing it when the text holds a smoke secret other than `allowed`. */
+function assertNoSmokeSecret(text, message, allowed) {
+  if (smokeSecrets.some((secret) => secret !== allowed && text.includes(secret))) throw new Error(message);
+}
+
+/** Both streams of `compose logs`: no line may hide from a check on its stderr. */
+async function composeLogs(...services) {
+  const { stdout, stderr } = await compose(['logs', '--no-color', ...services]);
+  return `${stdout}\n${stderr}`;
 }
 
 function safeName(error) {

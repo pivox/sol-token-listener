@@ -105,7 +105,15 @@ void test('the back stop grace covers every program stopped one after the other'
   ];
   // supervisord stops one program at a time, each within stopwaitsecs plus about one second.
   const budget = all.reduce((total, program) => total + Number(program.settings.get('stopwaitsecs')) + 1, 0);
-  const grace = /^ {4}stop_grace_period: (\d+)s$/mu.exec(await artifact('deploy/compose.yaml'));
+  // The Vault service has its own, shorter grace: read the back service block only, up to the next service key.
+  const compose = await artifact('deploy/compose.yaml');
+  const backKey = '\n  back:\n';
+  const backStart = compose.indexOf(backKey);
+  assert.notEqual(backStart, -1, 'compose.yaml has no back service');
+  const backBody = backStart + backKey.length;
+  const nextService = compose.slice(backBody).search(/\n {2}[a-z][a-z-]*:\n/u);
+  assert.notEqual(nextService, -1, 'compose.yaml has no service after the back');
+  const grace = /^ {4}stop_grace_period: (\d+)s$/mu.exec(compose.slice(backStart, backBody + nextService));
   assert.ok(grace !== null, 'the back has no stop_grace_period in seconds');
   assert.ok(budget + 10 <= Number(grace[1]), `stop budget ${String(budget)} s + 10 s margin exceeds ${grace[1] ?? ''} s`);
 });
@@ -125,6 +133,8 @@ void test('the entrypoint distributes secrets and applies the boot entry-stop be
   // Under `set -e`, a failing plain command line ends the entrypoint before supervisord.
   assert.match(entrypoint, /^set -eu$/mu);
   assertOrder(entrypoint, [
+    // Alone on its line: a commented-out or `|| true` variant would let the container boot without Vault.
+    '\nnode /app/dist/scripts/deploy/vault-pull.js back "$mode"\n',
     'node /app/dist/scripts/deploy/distribute-secrets.js "$mode"',
     'install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf',
     'if [ "$mode" = live ]; then',
@@ -293,4 +303,16 @@ void test('sol-h2b relaunches after exit 75, backs off after a failure and stops
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+void test('sol-admin migrate reads the login passwords from Vault before migrating', async () => {
+  const solAdmin = await artifact('deploy/back/bin/sol-admin');
+  assertOrder(solAdmin, [
+    '  migrate)\n',
+    '    node /app/dist/scripts/deploy/vault-pull.js migrate\n',
+    '    exec node /app/dist/scripts/deploy/admin-database.js migrate ;;\n',
+    '  group-roles)\n',
+    '    exec node /app/dist/scripts/deploy/admin-database.js group-roles ;;\n',
+    '  report)\n',
+  ]);
 });

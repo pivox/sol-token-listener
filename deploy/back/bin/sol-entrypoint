@@ -1,6 +1,7 @@
 #!/bin/sh
-# Entrypoint of the back container (root): distribute the secrets into /run/sol, select the
-# programs of SOL_STACK_MODE, apply the boot entry-stop in live mode, then run supervisord.
+# Entrypoint of the back container (root): read the variables of SOL_STACK_MODE from Vault into
+# tmpfs, distribute the secrets into /run/sol, select the programs, apply the boot entry-stop in
+# live mode, then run supervisord.
 set -eu
 mode="${SOL_STACK_MODE:-observe}"
 case "$mode" in
@@ -11,6 +12,8 @@ install -d -m 0711 /run/sol
 install -d -m 0755 /run/sol/programs /run/sol/overrides
 rm -f /run/sol/programs/*.conf /run/sol/overrides/*.env /run/sol/qualify
 printf '%s\n' "$mode" > /run/sol/mode
+# Without Vault the container stops here: never a fallback to host files (Vault spec 7.3).
+node /app/dist/scripts/deploy/vault-pull.js back "$mode"
 node /app/dist/scripts/deploy/distribute-secrets.js "$mode"
 install -m 0644 /etc/sol/programs/common.conf /run/sol/programs/common.conf
 if [ "$mode" = live ]; then

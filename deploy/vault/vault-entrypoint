@@ -1,0 +1,56 @@
+#!/bin/sh
+# Entrypoint of the vault container (docs/superpowers/specs/2026-10-09-vault-secrets-design.md, 5):
+# starts Vault as the image's `vault` user and, once Vault is initialized, unseals it with the
+# host key file. Only this root shell reads the key: printf is a shell builtin and wget takes the
+# request body on stdin, so the key never enters argv, the environment or the logs. The shell
+# stays the parent of Vault and of the unseal job, so it reaps both and forwards TERM, INT and HUP.
+set -eu
+key_file=/run/vault/unseal-key
+api=http://127.0.0.1:8200
+
+unseal_when_ready() {
+  tries=0
+  until seal="$(wget -q -T 5 -O- "$api/v1/sys/seal-status" 2> /dev/null)"; do
+    tries=$((tries + 1))
+    # Vault is gone (a crash, or TERM forwarded by the trap): stop polling; wait reports its status.
+    kill -0 "$server" 2> /dev/null || return 1
+    if [ "$tries" -ge 60 ]; then
+      echo '{"service":"vault-entrypoint","event":"vault.api_unavailable"}' >&2
+      return 1
+    fi
+    sleep 1
+  done
+  case "$seal" in
+    *'"initialized":false'*)
+      echo '{"service":"vault-entrypoint","event":"vault.uninitialized"}'
+      return 0 ;;
+    *'"sealed":false'*) return 0 ;;
+  esac
+  if [ ! -s "$key_file" ]; then
+    echo '{"service":"vault-entrypoint","event":"vault.unseal_key_missing"}' >&2
+    return 1
+  fi
+  if printf '{"key":"%s"}' "$(head -n 1 "$key_file")" \
+    | wget -q -T 5 -O /dev/null --post-file=/dev/stdin "$api/v1/sys/unseal"; then
+    echo '{"service":"vault-entrypoint","event":"vault.unsealed"}'
+  else
+    echo '{"service":"vault-entrypoint","event":"vault.unseal_failed"}' >&2
+    return 1
+  fi
+}
+
+su-exec vault vault server -config=/vault/config/vault.hcl &
+server=$!
+trap 'kill -TERM "$server" 2> /dev/null || true' TERM INT
+# HUP makes Vault reload; unhandled, it would kill this shell (129) under `init: true`, and Vault with it.
+trap 'kill -HUP "$server" 2> /dev/null || true' HUP
+unseal_when_ready || true
+status=0
+wait "$server" || status=$?
+while [ "$status" -gt 128 ] && kill -0 "$server" 2> /dev/null; do
+  # A trapped signal (TERM, INT or HUP) interrupted wait while Vault runs: let it finish. A Vault
+  # killed by a signal (137 from the OOM killer) is already reaped, and its status is final.
+  status=0
+  wait "$server" || status=$?
+done
+exit "$status"

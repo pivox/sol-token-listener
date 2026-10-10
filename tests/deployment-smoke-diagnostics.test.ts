@@ -151,6 +151,8 @@ void test('real deployment sequencing attaches the failing phase and preserves s
     composeCommand = (args) => args;
     discoverFrontendBaseUrl = async () => 'http://127.0.0.1:43210';
     writeSmokeHost = async () => undefined;
+    setupSmokeVault = async () => undefined;
+    importSmokeVault = async () => undefined;
     assertProcessUsers = async () => undefined;
     assertFrontNonRoot = async () => undefined;
     assertSecretIsolation = async () => undefined;

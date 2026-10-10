@@ -24,6 +24,8 @@ const caddyImage =
   'caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d';
 const postgresImage =
   'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3';
+const vaultImage =
+  'hashicorp/vault:2.1.2@sha256:c2f666266f383d2cf424d86b8bb8ce7d065562173ffec2b476d762943608bb55';
 
 async function readArtifact(path: string): Promise<string> {
   return (await readFile(new URL(path, root), 'utf8')).replaceAll('\r\n', '\n');
@@ -61,6 +63,7 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
     [nodeImage, 'production-dependencies'],
     [nodeImage, 'backend'],
     [caddyImage, 'frontend'],
+    [vaultImage, 'vault'],
   ]);
   assert.doesNotMatch(dockerfile, /^COPY\s+(?:--\S+\s+)*\.(?:\s|$)/gim);
 
@@ -89,6 +92,18 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
     productionDependencies,
     /^RUN\s+npm ci --omit=dev --ignore-scripts --workspaces=false\s+&&\s+npm cache clean --force$/m,
   );
+
+  const vault = stage(dockerfile, 'vault');
+  // Exactly these two copies, with the modes the vault user needs whatever the build host's umask
+  // (a 0600 source would make vault.hcl unreadable for uid 100): nothing else can enter the image.
+  assert.deepEqual(vault.match(/^COPY\s+.+$/gm) ?? [], [
+    'COPY --chmod=0644 deploy/vault/vault.hcl /vault/config/vault.hcl',
+    'COPY --chmod=0755 deploy/vault/vault-entrypoint /usr/local/bin/vault-entrypoint',
+  ]);
+  assert.match(vault, /^USER root$/m);
+  assert.match(vault, /^ENV VAULT_ADDR=http:\/\/127\.0\.0\.1:8200$/m);
+  assert.match(vault, /^EXPOSE 8200$/m);
+  assert.match(vault, /^ENTRYPOINT \["vault-entrypoint"\]$/m);
 });
 
 void test('backend image ships compiled artifacts, supervisor and one Unix user per process', async () => {
@@ -104,6 +119,7 @@ void test('backend image ships compiled artifacts, supervisor and one Unix user 
     'COPY --chmod=0755 deploy/back/bin/ /usr/local/bin/',
     'COPY deploy/back/supervisor/supervisord.conf /etc/sol/supervisord.conf',
     'COPY deploy/back/supervisor/programs/ /etc/sol/programs/',
+    'COPY --chmod=0755 deploy/vault/policies/ /etc/sol/vault/policies/',
   ]);
   assert.doesNotMatch(backend, /\btests?\/|fixtures?|\.env\b|\.git\b|\.worktrees|npm-cache|secret|keypair|wallet/iu);
   assert.match(backend, /^ENV\s+NODE_ENV=production$/m);
@@ -220,7 +236,7 @@ void test('the front entrypoint reads only the bcrypt hash and drops root before
   assert.equal(syntax.status, 0, syntax.stderr);
 });
 
-void test('Compose defines postgres, migrate, back and front, with no published database or backend port', async () => {
+void test('Compose defines postgres, vault, migrate, back, front and the Vault tools, publishing only the front and the local Vault UI', async () => {
   const [compose, server] = await Promise.all([
     readArtifact('deploy/compose.yaml'),
     readArtifact('deploy/compose.server.yaml'),
@@ -233,69 +249,120 @@ void test('Compose defines postgres, migrate, back and front, with no published 
     .matchAll(/^ {2}([a-z][a-z-]*):\s*$/gm)]
     .map((match) => match[1])
     .filter((name): name is string => name !== undefined);
-  assert.deepEqual(serviceNames, ['postgres', 'migrate', 'back', 'front']);
+  const tools = ['vault-setup', 'vault-import', 'vault-snapshot'];
+  assert.deepEqual(serviceNames, ['postgres', 'vault', 'migrate', 'back', 'front', ...tools]);
   assert.match(compose, new RegExp(`^    image: ${postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
-  for (const service of ['migrate', 'back']) {
-    assert.match(composeService(compose, service), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
+  for (const service of ['migrate', 'back', ...tools]) {
+    assert.match(composeService(compose, service), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m, service);
   }
   assert.match(composeService(compose, 'front'), /^ {4}image: \$\{FRONTEND_IMAGE:\?FRONTEND_IMAGE is required\}$/m);
-  assert.match(composeService(compose, 'back'), /^ {4}build:\s*$/m);
-  assert.match(composeService(compose, 'front'), /^ {4}build:\s*$/m);
-  assert.doesNotMatch(composeService(compose, 'migrate'), /^ {4}build:\s*$/m);
+  assert.match(composeService(compose, 'vault'), /^ {4}image: \$\{VAULT_IMAGE:\?VAULT_IMAGE is required\}$/m);
+  for (const service of ['back', 'front', 'vault']) {
+    assert.match(composeService(compose, service), /^ {4}build:\s*$/m, service);
+  }
+  assert.match(composeService(compose, 'vault'), /^ {6}target: vault$/m);
+  for (const service of ['migrate', ...tools]) {
+    assert.doesNotMatch(composeService(compose, service), /^ {4}build:\s*$/m, service);
+  }
 
-  assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
+  assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 2);
   assert.match(composeService(compose, 'front'), /^ {4}ports: \["127\.0\.0\.1:\$\{FRONT_PORT:-8080\}:8080"\]$/m);
+  assert.match(composeService(compose, 'vault'), /^ {4}ports: \["127\.0\.0\.1:\$\{VAULT_PORT:-8200\}:8200"\]$/m);
   assert.match(server, /^ {4}ports: !override\n {6}- "80:80"\n {6}- "443:443"$/m);
   assert.match(server, /^ {6}SITE_ADDRESS: \$\{SITE_ADDRESS:\?SITE_ADDRESS is required on the server\}$/m);
+  assert.doesNotMatch(server, /vault/u);
 
   const postgres = composeService(compose, 'postgres');
+  const vault = composeService(compose, 'vault');
   const migrate = composeService(compose, 'migrate');
   const back = composeService(compose, 'back');
   const front = composeService(compose, 'front');
   assert.match(postgres, /^ {6}POSTGRES_USER: sol_owner$/m);
   assert.match(postgres, /^ {6}POSTGRES_PASSWORD_FILE: \/root\/secrets\/postgres-admin-password$/m);
+  const approle = (name: string): string => [
+    '      - type: bind\n',
+    `        source: \${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/approle/${name}.json\n`,
+    '        target: /root/vault/approle.json\n',
+    '        read_only: true\n',
+  ].join('');
   for (const [service, mount] of [
     [postgres, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro'],
-    [migrate, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db:/root/secrets/db:ro'],
-    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/logins:/root/secrets/logins:ro'],
-    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/back:/root/secrets/back:ro'],
-    [back, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/config:/etc/sol/config:ro'],
+    [vault, '      - vault-data:/vault/file'],
+    [vault, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault/unseal:/run/vault:ro'],
+    [migrate, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/db/postgres-admin-password:/root/secrets/db/postgres-admin-password:ro'],
+    [migrate, approle('migrate')],
+    [back, approle('back')],
     [back, '      - evidence:/var/lib/sol/evidence'],
     [front, '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro'],
+    [composeService(compose, 'vault-setup'), '      - ${SOL_HOST_DIR:?SOL_HOST_DIR is required}/secrets/vault:/out'],
   ] as const) {
     assert.ok(service.includes(mount), `missing mount ${mount}`);
   }
+  // Vault replaces the host directories of sub-project 1, and no bind creates a missing file.
+  assert.doesNotMatch(compose, /SOL_HOST_DIR[^\n]*\/(?:secrets\/back|secrets\/db\/logins|config)\b|create_host_path: true/u);
+  // Compose creates the missing source of a long-syntax bind too, unless it is told not to: a missing
+  // AppRole file must fail the start, not become a directory.
+  for (const service of [migrate, back]) {
+    assert.match(service, /^ {8}read_only: true\n {8}bind:\n {10}create_host_path: false$/m);
+  }
+  assert.match(migrate, /^ {4}tmpfs: \["\/root\/secrets\/db\/logins:mode=0700,size=1m"\]$/m);
+  assert.match(back, /^ {4}tmpfs:\n {6}- \/run\/sol:mode=0711,size=16m\n {6}- \/root\/secrets:mode=0700,size=4m\n {6}- \/etc\/sol\/config:mode=0755,size=1m$/m);
   assert.match(migrate, /^ {4}command: \["sol-admin", "migrate"\]$/m);
   assert.match(back, /^ {4}command: \["sol-entrypoint"\]$/m);
+  for (const service of [migrate, back]) {
+    assert.match(service, /^ {6}SOL_VAULT_PULL_TIMEOUT_MS: \$\{SOL_VAULT_PULL_TIMEOUT_MS:-60000\}$/m);
+  }
   assert.match(back, /^ {6}SOL_STACK_MODE: \$\{SOL_STACK_MODE:-observe\}$/m);
   assert.match(back, /^ {6}SOL_HEALTH_REQUIRE_OK: \$\{SOL_HEALTH_REQUIRE_OK:-true\}$/m);
-  assert.match(back, /^ {4}tmpfs: \["\/run\/sol:mode=0711,size=16m"\]$/m);
-  assert.match(back, /^ {4}init: true$/m);
+  for (const service of [back, vault]) assert.match(service, /^ {4}init: true$/m);
   assert.match(back, /^ {4}stop_grace_period: 240s$/m);
+  assert.match(vault, /^ {4}stop_grace_period: 30s$/m);
   assert.match(compose, /^x-hardening: &hardening\n {2}security_opt: \["no-new-privileges:true"\]\n {2}cap_drop: \[NET_RAW, MKNOD\]\n {2}ulimits:\n {4}core: 0$/m);
-  for (const service of [migrate, back]) assert.match(service, /^ {4}<<: \*hardening$/m);
+  for (const service of [vault, migrate, back, ...tools.map((name) => composeService(compose, name))]) {
+    assert.match(service, /^ {4}<<: \*hardening$/m);
+  }
   // Caddy binds 80 and 443 as a non-root user through its file capability: no-new-privileges
   // would drop it. The front gets a CPU share instead, against bcrypt floods.
   assert.doesNotMatch(front, /hardening|no-new-privileges/u);
   assert.match(front, /^ {4}cpus: 0\.5$/m);
   assert.match(back, /^ {6}test: \["CMD", "sol-health"\]$/m);
+  assert.match(vault, /^ {6}test: \["CMD", "vault", "status"\]$/m);
+  for (const name of tools) {
+    const tool = composeService(compose, name);
+    assert.match(tool, /^ {4}profiles: \[tools\]$/m, name);
+    assert.match(tool, new RegExp(`^ {4}entrypoint: \\["node", "/app/dist/scripts/deploy/${name}\\.js"\\]$`, 'm'), name);
+    assert.match(tool, /^ {4}networks: \[internal\]$/m, name);
+    assert.match(tool, /^ {4}restart: "no"$/m, name);
+  }
+  assert.match(composeService(compose, 'vault-setup'), /^ {4}command: \["init"\]$/m);
 
   assert.match(postgres, /^ {4}networks: \[internal\]$/m);
+  assert.match(vault, /^ {4}networks: \[internal, vault-ui\]$/m);
   assert.match(migrate, /^ {4}networks: \[internal\]$/m);
   assert.match(back, /^ {4}networks: \[internal, egress, edge\]$/m);
   assert.match(front, /^ {4}networks: \[edge\]$/m);
-  assert.match(compose, /^networks:\n {2}internal:\n {4}internal: true\n {2}egress:\n {2}edge:$/m);
-  assert.match(compose, /^volumes:\n {2}postgres-data:\n {2}evidence:\n {2}caddy-data:$/m);
-  assert.match(migrate, /depends_on:\n {6}postgres:\n {8}condition: service_healthy/);
-  assert.match(back, /depends_on:\n {6}migrate:\n {8}condition: service_completed_successfully/);
+  assert.match(compose, /^networks:\n {2}internal:\n {4}internal: true\n {2}egress:\n {2}edge:\n {2}vault-ui:$/m);
+  assert.match(compose, /^volumes:\n {2}postgres-data:\n {2}evidence:\n {2}caddy-data:\n {2}vault-data:$/m);
+  assert.match(migrate, /depends_on:\n {6}postgres:\n {8}condition: service_healthy\n {6}vault:\n {8}condition: service_healthy/);
+  assert.match(back, /depends_on:\n {6}migrate:\n {8}condition: service_completed_successfully\n {6}vault:\n {8}condition: service_healthy/);
   assert.match(front, /depends_on:\n {6}back:\n {8}condition: service_healthy/);
+  for (const name of ['vault-import', 'vault-snapshot']) {
+    assert.match(composeService(compose, name), /depends_on:\n {6}vault:\n {8}condition: service_healthy/, name);
+  }
+  assert.doesNotMatch(composeService(compose, 'vault-setup'), /depends_on/u);
   assert.match(compose, /^x-logging: &logging\n {2}driver: json-file\n {2}options:\n {4}max-size: "20m"\n {4}max-file: "5"$/m);
-  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 4);
+  assert.equal((compose.match(/^ {4}logging: \*logging$/gm) ?? []).length, 6);
+  // vault-setup prints the Vault operator password once and vault-snapshot streams the raw snapshot on
+  // stdout: json-file would keep a copy of both on disk. vault-import prints names only.
+  for (const name of ['vault-setup', 'vault-snapshot']) {
+    assert.match(composeService(compose, name), /^ {4}logging:\n {6}driver: none$/m, name);
+  }
+  assert.match(composeService(compose, 'vault-import'), /^ {4}logging: \*logging$/m);
 
-  assert.doesNotMatch(compose, /DATABASE_URL|SOLANA_|LISTENER_|EXECUTOR_|POSTGRES_PASSWORD:|privileged:|network_mode: host|docker\.sock/u);
+  assert.doesNotMatch(compose, /DATABASE_URL|SOLANA_|LISTENER_|EXECUTOR_|VAULT_TOKEN|POSTGRES_PASSWORD:|privileged:|network_mode: host|docker\.sock/u);
   assert.doesNotMatch(compose, /api-key|keypair|wallet/iu);
   for (const imageLine of compose.match(/^ {4}image: .+$/gm) ?? []) {
-    assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND)_IMAGE:\?)/u);
+    assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND|VAULT)_IMAGE:\?)/u);
   }
 });
 
@@ -483,7 +550,10 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
     readonly stop_grace_period?: string;
     readonly cpus?: number;
     readonly ports?: readonly Readonly<{ host_ip?: string; published?: string | number; target?: number }>[];
-    readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean }>[];
+    readonly volumes?: readonly Readonly<{ type?: string; source?: string; target?: string; read_only?: boolean; bind?: Readonly<{ create_host_path?: boolean }> }>[];
+    readonly tmpfs?: readonly string[];
+    readonly restart?: string;
+    readonly logging?: Readonly<{ driver?: string }>;
   }
   const resolvedConfig = (
     files: readonly string[],
@@ -504,29 +574,46 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   const binds = (service: ResolvedService | undefined): string[] => (service?.volumes ?? [])
     .filter((volume) => volume.type === 'bind')
     .map((volume) => `${volume.source ?? ''}:${volume.target ?? ''}:${volume.read_only === true ? 'ro' : 'rw'}`);
+  // Compose creates the missing source of a long-syntax bind unless create_host_path is false: a missing
+  // AppRole file must fail the start, also once the server override is merged. Compose 5 renders the
+  // explicit false; Compose 2 (the CI runner) omits a false bool from its JSON. Either way the resolved
+  // bind must never ask for creation, and the static test pins the explicit `create_host_path: false`.
+  const approleBind = (service: ResolvedService | undefined): boolean | undefined => service?.volumes
+    ?.find((volume) => volume.target === '/root/vault/approle.json')?.bind?.create_host_path;
 
   const services = resolvedConfig(['deploy/compose.yaml']);
-  assert.deepEqual(Object.keys(services).sort(), ['back', 'front', 'migrate', 'postgres']);
+  assert.deepEqual(Object.keys(services).sort(), ['back', 'front', 'migrate', 'postgres', 'vault']);
   assert.deepEqual(services.back?.environment, {
     POSTGRES_DB: 'sol_token_listener', SOL_HEALTH_REQUIRE_OK: 'true', SOL_STACK_MODE: 'observe',
+    SOL_VAULT_PULL_TIMEOUT_MS: '60000',
   });
-  assert.deepEqual(services.migrate?.environment, { POSTGRES_DB: 'sol_token_listener' });
+  assert.deepEqual(services.migrate?.environment, { POSTGRES_DB: 'sol_token_listener', SOL_VAULT_PULL_TIMEOUT_MS: '60000' });
+  // Vault has no environment, so no token can be passed to it.
+  assert.equal(services.vault?.environment, undefined);
   assert.deepEqual(services.front?.environment, { FRONT_BASIC_AUTH_USER: 'operator', SITE_ADDRESS: 'http://:8080' });
   assert.deepEqual(ports(services.front), ['127.0.0.1:8080:8080']);
+  assert.deepEqual(ports(services.vault), ['127.0.0.1:8200:8200']);
   for (const name of ['postgres', 'migrate', 'back']) assert.deepEqual(ports(services[name]), [], name);
   assert.deepEqual(binds(services.postgres), [
     '/srv/sol-token-listener/secrets/db/postgres-admin-password:/root/secrets/postgres-admin-password:ro',
   ]);
-  assert.deepEqual(binds(services.migrate), ['/srv/sol-token-listener/secrets/db:/root/secrets/db:ro']);
-  assert.deepEqual(binds(services.back), [
-    '/srv/sol-token-listener/secrets/db/logins:/root/secrets/logins:ro',
-    '/srv/sol-token-listener/secrets/back:/root/secrets/back:ro',
-    '/srv/sol-token-listener/config:/etc/sol/config:ro',
+  assert.deepEqual(binds(services.vault), ['/srv/sol-token-listener/secrets/vault/unseal:/run/vault:ro']);
+  assert.deepEqual(binds(services.migrate), [
+    '/srv/sol-token-listener/secrets/db/postgres-admin-password:/root/secrets/db/postgres-admin-password:ro',
+    '/srv/sol-token-listener/secrets/vault/approle/migrate.json:/root/vault/approle.json:ro',
   ]);
+  assert.deepEqual(binds(services.back), [
+    '/srv/sol-token-listener/secrets/vault/approle/back.json:/root/vault/approle.json:ro',
+  ]);
+  for (const name of ['migrate', 'back']) assert.notEqual(approleBind(services[name]), true, name);
+  assert.deepEqual(services.back?.tmpfs, [
+    '/run/sol:mode=0711,size=16m', '/root/secrets:mode=0700,size=4m', '/etc/sol/config:mode=0755,size=1m',
+  ]);
+  assert.deepEqual(services.migrate?.tmpfs, ['/root/secrets/db/logins:mode=0700,size=1m']);
   assert.deepEqual(binds(services.front), [
     '/srv/sol-token-listener/secrets/front/front-basic-auth-hash:/root/secrets/front-basic-auth-hash:ro',
   ]);
-  for (const name of ['migrate', 'back']) {
+  for (const name of ['vault', 'migrate', 'back']) {
     const service = services[name];
     assert.deepEqual(service?.security_opt, ['no-new-privileges:true'], name);
     assert.deepEqual(service?.cap_drop, ['NET_RAW', 'MKNOD'], name);
@@ -534,13 +621,28 @@ void test('Compose resolves the stack: only mode inputs reach the containers, se
   }
   assert.equal(services.front?.security_opt, undefined);
   assert.equal(services.back?.stop_grace_period, '4m0s');
+  assert.equal(services.vault?.stop_grace_period, '30s');
+  assert.equal(services.vault?.restart, 'unless-stopped');
+  assert.equal(services.back?.restart, 'unless-stopped');
+  assert.equal(services.migrate?.restart, 'no');
   assert.equal(services.front?.cpus, 0.5);
+
+  const tools = resolvedConfig(['deploy/compose.yaml'], { COMPOSE_PROFILES: 'tools' });
+  assert.deepEqual(Object.keys(tools).sort(), [
+    'back', 'front', 'migrate', 'postgres', 'vault', 'vault-import', 'vault-setup', 'vault-snapshot',
+  ]);
+  assert.deepEqual(binds(tools['vault-setup']), ['/srv/sol-token-listener/secrets/vault:/out:rw']);
+  for (const name of ['vault-import', 'vault-snapshot']) assert.deepEqual(binds(tools[name]), [], name);
+  // The setup and snapshot output (operator password, raw snapshot) must not be copied to the json-file log.
+  for (const name of ['vault-setup', 'vault-snapshot']) assert.equal(tools[name]?.logging?.driver, 'none', name);
+  assert.equal(tools['vault-import']?.logging?.driver, 'json-file');
 
   const server = resolvedConfig(['deploy/compose.yaml', 'deploy/compose.server.yaml'], {
     SITE_ADDRESS: 'bot.example.invalid',
   });
   assert.deepEqual(ports(server.front), [':80:80', ':443:443']);
   assert.equal(server.front?.environment?.SITE_ADDRESS, 'bot.example.invalid');
+  for (const name of ['migrate', 'back']) assert.notEqual(approleBind(server[name]), true, `${name} after the server override`);
 });
 
 void test('block hydration canary proves active routing and bounded serialized admission', async () => {
@@ -1139,8 +1241,10 @@ void test('the compose input template holds no secret and documents every input'
     'POSTGRES_DB=sol_token_listener',
     `BACKEND_IMAGE=registry.invalid/sol-token-listener/backend@sha256:${'0'.repeat(64)}`,
     `FRONTEND_IMAGE=registry.invalid/sol-token-listener/frontend@sha256:${'1'.repeat(64)}`,
+    `VAULT_IMAGE=registry.invalid/sol-token-listener/vault@sha256:${'2'.repeat(64)}`,
     'FRONT_PORT=8080',
     'FRONT_BASIC_AUTH_USER=operator',
+    'VAULT_PORT=8200',
     'SITE_ADDRESS=',
   ]) {
     assert.ok(lines.includes(value), `missing compose input: ${value}`);
@@ -1148,7 +1252,7 @@ void test('the compose input template holds no secret and documents every input'
   assert.match(environment, /outside version control/iu);
   assert.match(environment, /holds no secret/iu);
   assert.doesNotMatch(environment, /PASSWORD|PRIVATE_KEY|SECRET_KEY|WALLET|api-key|SOLANA_/iu);
-  for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
+  for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE', 'VAULT_IMAGE']) {
     assert.match(environment, new RegExp(`^${name}=registry\\.invalid/[^\\s@]+@sha256:[0-9a-f]{64}$`, 'm'));
   }
 });
@@ -1184,19 +1288,29 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /REQUEST_TIMEOUT_MS\s*=\s*10_000/);
   assert.match(smoke, /postgresPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
   assert.match(smoke, /frontPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
-  assert.match(smoke, /operatorApiToken\s*=\s*randomBytes\(32\)\.toString\('hex'\)/);
   assert.match(smoke, /SOL_HOST_DIR:\s*hostDirectory/);
   assert.match(smoke, /SOL_STACK_MODE:\s*'observe'/);
   assert.match(smoke, /SOL_HEALTH_REQUIRE_OK:\s*'false'/);
-  assert.match(smoke, /\['secrets\/back\/helius-listener-http-url', 'https:\/\/rpc\.invalid\\n'\]/);
-  assert.match(smoke, /\['secrets\/back\/helius-listener-ws-url', 'wss:\/\/rpc\.invalid\\n'\]/);
-  assert.match(smoke, /const override = name === 'listener' \? 'LISTENER_ENABLED=false\\n' : '';/);
+  // The import source: the smoke's listener never contacts an RPC, and the fake key traces leaks.
+  assert.match(smoke, /`SOLANA_HTTP_RPC_URL=https:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
+  assert.match(smoke, /`SOLANA_WS_RPC_URL=wss:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
+  assert.match(smoke, /const rpcApiKey = randomBytes\(16\)\.toString\('hex'\);/);
+  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey\];/);
+  assert.match(smoke, /'LISTENER_ENABLED=false'/);
+  assert.match(smoke, /`EXECUTOR_KEYPAIR_PATH=\$\{keypairFile\}`/);
+  assert.match(smoke, /VAULT_IMAGE:\s*deploymentImages\.vault/);
+  assert.match(smoke, /VAULT_PORT:\s*'0'/);
+  assert.match(smoke, /SOL_VAULT_PULL_TIMEOUT_MS:\s*'5000'/);
+  // The real host scripts set up, fill and back up the throwaway Vault, as an operator would.
+  assert.match(smoke, /runCommand\('bash', \[resolve\(root, 'deploy\/host\/vault-init\.sh'\)\]/);
+  assert.match(smoke, /runCommand\('bash', \[\s*resolve\(root, 'deploy\/host\/vault-import\.sh'\), join\(hostDirectory, 'import\/env'\),/);
+  assert.match(smoke, /runCommand\('bash', \[resolve\(root, 'deploy\/host\/backup\.sh'\)\]/);
   assert.doesNotMatch(smoke, /SOLANA_EXPECTED_GENESIS_HASH/);
   assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
   assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
   assert.doesNotMatch(smoke, /compose\.smoke\.yaml|smokeComposeFile/);
   assert.match(smoke, /return \['compose', \.\.\.projectArgs, '-f', composeFile, \.\.\.args\];/);
-  assert.match(smoke, /await compose\(\['build', 'back', 'front'\]\)/);
+  assert.match(smoke, /await compose\(\['build', 'back', 'front', 'vault'\]\)/);
   assert.match(smoke, /composeCommand\(\[\s*'exec', '-T', 'postgres', 'psql'/);
   assert.match(smoke, /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\]\)/);
   assert.equal((smoke.match(/\['compose'/g) ?? []).length, 1);
@@ -1222,7 +1336,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'executionIntents'/);
   assert.doesNotMatch(smoke, /Migration history does not contain exactly 14 rows\./);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key/iu);
-  // The only keypair is random bytes that prove the tmpfs isolation; it never holds funds.
+  // The only keypair is random bytes that prove observe mode leaves it in Vault; it never holds funds.
   assert.match(smoke, /const throwawayKeypair = JSON\.stringify\(\[\.\.\.randomBytes\(64\)\]\);/u);
   assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
 
@@ -1239,7 +1353,7 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
   const retention = smoke.slice(
     smoke.indexOf('async function assertRetentionOneShot'),
-    smoke.indexOf('async function fetchBounded'),
+    smoke.indexOf('async function assertBackup'),
   );
 
   assert.match(
@@ -1339,26 +1453,103 @@ void test('failed signal fault probes always clean only their explicit child pro
 
 void test('deployment smoke proves users, secret isolation, front authentication, logins and closed operations', async () => {
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
-  for (const phase of ['HOST_SETUP', 'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION', 'FRONT_AUTH', 'LOGINS', 'OPERATIONS']) {
-    assert.ok(smoke.includes(`await smokePhase('${phase}'`), `missing smoke phase ${phase}`);
+  let previous = -1;
+  for (const phase of [
+    'HOST_SETUP', 'VAULT_SETUP', 'VAULT_IMPORT', 'PROCESS_USERS', 'NON_ROOT_FRONT', 'SECRET_ISOLATION',
+    'FRONT_AUTH', 'LOGINS', 'OPERATIONS', 'BACKUP', 'VAULT_RESTART', 'VAULT_FAIL_CLOSED', 'SECRET_LEAKS',
+  ]) {
+    const index = smoke.indexOf(`await smokePhase('${phase}'`);
+    assert.ok(index > previous, `missing or misplaced smoke phase ${phase}`);
+    previous = index;
   }
+  // The leak scan comes last: it covers the entrypoint's unseal from the key file and the refused boots.
+  assert.equal(smoke.lastIndexOf('await smokePhase('), smoke.indexOf("await smokePhase('SECRET_LEAKS'"));
   for (const statement of [
     "assertEqual(stdout, 'listener 10001\\nopapi 10005\\nretention 10006\\n'",
     "assertEqual(stdout.trim(), '10100'",
-    "assertEqual(stdout, 'h2b 400\\nopapi 400\\n'",
+    "assertEqual(stdout, 'listener 400\\nopapi 400\\n'",
     "'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path",
+    "'exec', '-T', 'back', 'find', '/root/secrets', '/run/sol', '-name', '*keypair*'",
+    "if (pulled !== '')",
+    "await readBackSecret('back/operator-api-token')",
     'assertEqual(anonymous.status, 401',
     'assertEqual(write.status, 405',
     'assertEqual(operator.status, 401',
     'assertEqual(authorized.status, 200',
+    'readBackSecret(`logins/pg-${login}-password`)',
     '`PGOPTIONS=-c role=${group}`',
     "assertEqual(counts.trim(), '0|0'",
+    "occurrences(/vault-pull: Vault unavailable/gu)",
+    'if (before < 1)',
+    'if (await failedPulls() >= failedBefore + 2) break;',
+    'if (attempt >= 45)',
+    "assertEqual(String(await distributions()), String(before)",
+    "assertNoSmokeSecret(inspect, 'A secret value appears in docker inspect.')",
+    "assertNoSmokeSecret(await composeLogs(), 'A secret value appears in the container logs.')",
+    'return `${stdout}\\n${stderr}`;',
   ]) {
     assert.ok(smoke.includes(statement), `missing smoke check: ${statement}`);
   }
   for (const [login, group] of Object.entries(DATABASE_LOGINS)) {
     assert.ok(smoke.includes(`  ${login}: '${group}',`), `smoke login table differs for ${login}`);
   }
+});
+
+void test('deployment smoke fills its Vault through the host scripts without ever reflecting their output', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  const between = (start: string, end: string): string => smoke.slice(smoke.indexOf(start), smoke.indexOf(end));
+  const hostEnvironment = between('function hostScriptEnvironment', 'async function setupSmokeVault');
+  const setup = between('async function setupSmokeVault', 'async function importSmokeVault');
+  const fill = between('async function importSmokeVault', 'async function readBackSecret');
+
+  // The host scripts read every compose input from compose.env. Only Docker's own variables come
+  // from the smoke's environment, plus the project name, in defence in depth.
+  assert.match(smoke, /COMPOSE_INPUTS\.map\(\(name\) => `\$\{name\}=\$\{environment\[name\]\}\\n`\)/);
+  assert.match(smoke, /const COMPOSE_INPUTS = Object\.freeze\(\[\s*'COMPOSE_PROJECT_NAME', 'SOL_HOST_DIR',/);
+  assert.ok(hostEnvironment.includes('.filter(([name]) => /^(?:PATH|HOME|DOCKER_\\w+)$/u.test(name))'));
+  assert.deepEqual(
+    [...hostEnvironment.matchAll(/^ {4}([A-Z_]+): /gmu)].map((match) => match[1]),
+    ['COMPOSE_PROJECT_NAME', 'SOL_HOST_DIR'],
+  );
+  assert.match(hostEnvironment, /COMPOSE_PROJECT_NAME: projectName,\s*SOL_HOST_DIR: hostDirectory,/);
+  assert.doesNotMatch(hostEnvironment, /\.\.\.(?:environment|process\.env)\b/);
+  // vault-init.sh prints the operator password once: no failure message may carry its output, and the
+  // output may show no other secret, checked once the unseal key and the secret_ids are known.
+  assert.match(setup, /commandEnvironment: hostScriptEnvironment\(\),\s*reflectFailureOutput: false,/);
+  assert.ok(setup.includes(
+    '/^Vault operator password, shown once \\(store it in your password manager\\): (\\S+)$/mu',
+  ));
+  const outputCheck = setup.indexOf("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-init.sh printed a secret.', password);");
+  assert.ok(outputCheck > setup.lastIndexOf('smokeSecrets.push('), 'vault-init output checked after the last push');
+  assert.match(fill, /input: `\$\{operatorPassword\}\\n`, reflectFailureOutput: false/);
+  assert.ok(fill.includes("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-import.sh printed a secret.');"));
+  assert.ok(fill.includes("summary.configs.join(','), 'listener,live'"));
+  assert.ok(fill.includes("readdir(resolve(root, 'deploy/config'))"));
+  assert.ok(fill.includes("'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json'"));
+});
+
+void test('deployment smoke proves that six wrong secret_ids do not lock the backup role out', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  const backup = smoke.slice(smoke.indexOf('async function assertBackup'), smoke.indexOf('async function assertNoSecretLeak'));
+  // Vault 2 locks a login out after five failures by default: the sixth attempt, then the real
+  // backup.sh, would be refused if vault-setup left the lockout on.
+  const wrongLogins = backup.indexOf('await assertWrongBackupLoginsRefused();');
+  assert.ok(wrongLogins >= 0, 'missing wrong logins');
+  assert.ok(wrongLogins < backup.indexOf("runCommand('bash', [resolve(root, 'deploy/host/backup.sh')]"), 'wrong logins after the backup');
+  for (const statement of [
+    "await readFile(join(hostDirectory, 'secrets/vault/approle/backup.json'), 'utf8')",
+    'const wrongSecretId = randomUUID();',
+    'JSON.stringify({ role_id: approle.role_id, secret_id: wrongSecretId })',
+    'for (let attempt = 1; attempt <= 6; attempt += 1) {',
+    "await composeExitCode(['run', '--rm', '--no-deps', '-T', 'vault-snapshot'], { input }),\n      77,",
+    'await compose(args, { ...options, reflectFailureOutput: false });',
+  ]) {
+    assert.ok(backup.includes(statement), `missing lockout check: ${statement}`);
+  }
+  // The wrong secret_id is redacted from any output before its first use, and the final leak scan
+  // looks for it too.
+  const redaction = backup.indexOf('smokeSecrets.push(wrongSecretId);');
+  assert.ok(redaction >= 0 && redaction < backup.indexOf('await composeExitCode(['), 'wrong secret_id not redacted first');
 });
 
 void test('top-level deployment errors are categorized, bounded, and never reflect input', () => {
@@ -1389,7 +1580,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
   const runbook = await readArtifact('docs/operations/deployment.md');
   let previous = -1;
   for (const heading of [
-    '## Topologie', '## Prérequis', '## Dossier hôte, secrets et configuration', '## Images',
+    '## Topologie', '## Prérequis', '## Images', '## Dossier hôte et Vault',
     '## Démarrage et arrêt', '## Commandes sol', '## Trading', "## Qualification d'une enveloppe (gate 10)",
     '## Santé et journaux', '## Sauvegardes', '## Reprise de la base actuelle', '## Retour arrière',
     '## Bascule vers le serveur', '## Rotation des secrets', '## Frontière de sécurité',
@@ -1408,28 +1599,145 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     'sol_compose exec back sol trading stop',
     'sol_compose exec back sol qualify start',
     'sol_compose exec back sol qualify stop',
-    'sol_compose run --rm migrate sol-admin report',
-    'sol_compose run --rm migrate sol-admin group-roles',
+    // --no-deps: neither sol-admin command reads Vault, so Compose never starts or recreates it for them.
+    'sol_compose run --rm --no-deps migrate sol-admin report',
+    'sol_compose run --rm --no-deps migrate sol-admin group-roles',
     'pg_restore --exit-on-error --single-transaction -U sol_owner',
     'deploy/sql/takeover-precondition.sql',
     'deploy/sql/table-row-counts.sql',
     'diff "$takeover/source.counts" "$takeover/target.counts"',
     'docker stop sol-token-listener-live-pg',
-    'docker volume rm sol-token-listener_postgres-data',
+    // The project name comes from COMPOSE_PROJECT_NAME: a rehearsal on a throwaway project never
+    // removes a volume of the stack.
+    'export COMPOSE_PROJECT_NAME=sol-token-listener',
+    'docker volume rm "${COMPOSE_PROJECT_NAME:?}_postgres-data"',
+    'docker volume rm "${COMPOSE_PROJECT_NAME:?}_vault-data"',
     // H2f reads the draft only when ops owns it with mode 0600 (readPreflightProtectedFile).
     "sh -c 'umask 077 && sol ops envelope prepare --valid-ms=21600000 > /var/lib/sol/evidence/preflight-draft.json && chown ops:ops /var/lib/sol/evidence/preflight-draft.json'",
     'sol ctl restart <programme>',
     'sudo systemctl enable --now sol-backup.timer',
     'launchctl bootstrap "gui/$(id -u)" "$plist"',
+    'deploy/host/vault-init.sh',
+    'deploy/host/vault-import.sh "$HOME/.sol-token-listener/lot5/env"',
+    'vault kv patch sol/config/',
+    'sol_compose restart back',
+    'vault operator raft snapshot restore -force /tmp/restore.snap',
+    // The entrypoint unseals only when the container starts.
+    'sol_compose restart vault',
+    // Nobody else's generate-root attempt may receive the unseal key.
+    'vault operator generate-root -status',
+    'vault operator generate-root -cancel',
+    // Tokens live in the shell's VAULT_TOKEN, passed by name: never on disk or on a command line.
+    'sol_compose exec -T -e VAULT_TOKEN vault vault "$@"',
+    '| sol_compose exec -T vault vault write -field=token auth/userpass/login/operator password=-',
+    'VAULT_TOKEN="$(vault login -token-only)"',
+    // A secret reaches Vault on stdin, never on a command line that history and ps would keep.
+    '| sol_vault kv put sol/secrets/back/helius-listener-http-url value=-',
+    '| sol_vault write auth/userpass/users/operator/password password=-',
+    // The key goes in on stdin with the attempt's nonce, so Vault refuses a swapped attempt, and
+    // the encoded token is decoded from stdin: only the OTP is ever an argument.
+    '-nonce="$nonce" -format=json - < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
+    '| sol_vault operator generate-root -decode=- -otp="$otp"',
+    // The new secret_id must log in before it may replace the file: the write and the restart
+    // are chained on that login, so a failed parse never overwrites a working AppRole file.
+    [
+      "auth/approle/login - > /dev/null \\",
+      "  && echo 'secret_id valide' \\",
+      "  && (umask 077 && printf '{\"role_id\":\"%s\",\"secret_id\":\"%s\"}\\n' \"$role_id\" \"$secret_id\" > \"$approle.new\") \\",
+      '  && mv "$approle.new" "$approle" \\',
+      '  && sol_compose restart back',
+    ].join('\n'),
+    // A destructive step shows its project and runs only once its name is typed again.
+    "printf 'Projet %s : retaper son nom pour continuer : ' \"${COMPOSE_PROJECT_NAME:?}\" && IFS= read -r confirm \\\n  && [ \"$confirm\" = \"$COMPOSE_PROJECT_NAME\" ] \\",
+    // restore -force returns early: the restart waits, 60 tries at most, for Vault to seal itself.
+    'sol_compose rm --stop --force --volumes vault',
+    "/tmp/restore.snap' \\\n  && sealed=no && for i in $(seq 60); do",
+    "if sol_compose logs --since 2m vault | grep -q 'vault is sealed'; then sealed=yes; break; fi",
+    '  && [ "$sealed" = yes ] \\\n  && sol_compose restart vault \\',
+    // The Mac copy is erased only under Docker Desktop with the Mac's host folder: never the server.
+    "[ \"$(docker info --format '{{.OperatingSystem}}')\" = 'Docker Desktop' ] && [ \"$SOL_HOST_DIR\" = \"$HOME/.sol-token-listener/docker\" ] && sol_compose -p sol-token-listener down --volumes",
+    'launchctl bootout "gui/$(id -u)/com.sol-token-listener.backup"',
+    // The unseal key goes to the password manager without being displayed, and comes back the same way.
+    'pbcopy < "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key"',
+    // set -C: the paste never overwrites a key file that is already there.
+    '(umask 077 && set -C && pbpaste > "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key")',
+    // The copy in the password manager is checked once, without being displayed.
+    "| shasum -a 256)\" ] && echo 'copie identique'",
+    // The emergency seal moves the only key out of the mounted folder; it never deletes it.
+    'mv -n "$SOL_HOST_DIR/secrets/vault/unseal/unseal-key" "$SOL_HOST_DIR/secrets/unseal-key.sealed"',
+    // Old log lines must not pass for the restart that follows a rotation.
+    'sol_compose logs --since 2m back',
+    'sol_compose exec back sol ops envelope revoke --envelope-id=<id>',
   ]) {
     assert.ok(runbook.includes(command), `missing runbook command: ${command}`);
   }
-  const secrets = runbook.slice(runbook.indexOf('## Dossier hôte'), runbook.indexOf('## Images'));
+  assert.doesNotMatch(runbook, /\brm\b[^\n]*secrets\/vault\/unseal\/unseal-key/u, 'the only key is never deleted');
+  assert.doesNotMatch(runbook, /docker volume rm sol-token-listener_/u, 'volume names follow COMPOSE_PROJECT_NAME');
+  // `down --volumes` erases a whole project: every command that runs it names the project.
+  const downs = runbook.split('\n').filter((text) => /\bsol_compose\b.*\bdown --volumes/u.test(text));
+  assert.ok(downs.length >= 2);
+  for (const line of downs) assert.match(line, /\bsol_compose -p \S+ down --volumes$/u, `down --volumes without -p: ${line}`);
+  // Every destructive line of the restore and of the start over is chained after the confirmation.
+  for (const block of [runbook.slice(runbook.indexOf('### Restaurer Vault')), runbook.slice(runbook.indexOf('Repartir de zéro aussi'))]) {
+    const confirmation = block.indexOf('IFS= read -r confirm');
+    assert.ok(confirmation > 0 && confirmation < block.indexOf('docker volume rm'), 'confirmation before the wipe');
+    assert.match(block, /\n[ ]+&& sol_compose rm --stop --force --volumes vault \\\n[ ]+&& docker volume rm "\$\{COMPOSE_PROJECT_NAME:\?\}_vault-data"/u);
+  }
+  // No AppRole file write runs on its own line, outside the chain that follows the validity login.
+  assert.doesNotMatch(runbook, /^\(umask 077 && printf '\{"role_id"/mu);
+  // A token a `vault login` stores would stay on disk in the container.
+  for (const match of runbook.matchAll(/vault login\b[^\n]*/gu)) {
+    if (!match[0].startsWith('vault login`')) assert.match(match[0], /^vault login -token-only/u, match[0]);
+  }
+  // The runbook quotes each refusal of vault-init.sh as the script prints it.
+  const vaultInit = await readArtifact('deploy/host/vault-init.sh');
+  for (const message of [
+    'unseal-key exists: Vault is already initialized: nothing to do (to start over, see the runbook)',
+    'unseal-key exists but the AppRole files are missing: if vault-init never printed its next: line, start over as the runbook says; otherwise recreate the missing file as the runbook says',
+    'unseal-key is missing: Vault is already initialized: put the key back as the runbook says; do not start over',
+    'holds files of an earlier attempt: start over as the runbook says',
+  ]) {
+    assert.ok(vaultInit.includes(message), `vault-init.sh no longer prints: ${message}`);
+    assert.ok(runbook.includes(message), `runbook misses the vault-init message: ${message}`);
+  }
+  // Only `vault status` proves a lost volume: the first start of any Vault may log
+  // `vault.uninitialized`, `vault.unseal_key_missing` or `vault.unseal_failed`.
+  assert.match(runbook, /`Initialized false`/u);
+  for (const sentence of runbook.split(/(?<=\.)\s+/u).filter((text) => text.includes('vault.uninitialized'))) {
+    assert.match(sentence, /premier démarrage|vault status/u, `vault.uninitialized must not prove a lost volume: ${sentence}`);
+  }
+  const secrets = runbook.slice(runbook.indexOf('## Dossier hôte et Vault'), runbook.indexOf('## Démarrage et arrêt'));
+  assert.ok(secrets.length > 0);
   assert.doesNotMatch(secrets, /\b(?:cat|echo)\s+"?\$(?:back|SOL_HOST_DIR)/u, 'secrets are copied, never printed');
+  assert.doesNotMatch(runbook, /run --rm migrate sol-admin/u, 'sol-admin runs with --no-deps');
+  // A running back never needs Vault: restoring Vault must not suspend the exits.
+  const restore = runbook.slice(runbook.indexOf('### Restaurer Vault'), runbook.indexOf('## Reprise de la base actuelle'));
+  assert.ok(restore.length > 0);
+  assert.doesNotMatch(restore, /sol_compose stop/u, 'the restore leaves the back running');
+  assert.ok(restore.indexOf('`Initialized true`') > 0);
+  assert.ok(restore.indexOf('`Initialized true`') < restore.indexOf('docker volume rm'), 'the guard comes before the wipe');
+  // The server move checks the precondition, then exports with Vault and the base still running.
+  const move = runbook.slice(runbook.indexOf('## Bascule vers le serveur'), runbook.indexOf('## Rotation des secrets'));
+  const precondition = move.indexOf('< deploy/sql/takeover-precondition.sql');
+  assert.ok(precondition > 0, 'the server move checks the takeover precondition');
+  assert.ok(precondition < move.indexOf('sol_compose stop back'));
+  assert.ok(move.indexOf('sol_compose stop back') < move.indexOf('pg_dump -Fc'));
+  assert.ok(move.indexOf('pg_dump -Fc') < move.indexOf('sol_compose stop\n'));
+  // The new AppRole file must work before the old secret_id is destroyed.
+  const rotation = runbook.slice(runbook.indexOf('## Rotation des secrets'), runbook.indexOf('## Frontière de sécurité'));
+  assert.ok(rotation.indexOf('vault.pulled') > 0);
+  assert.ok(rotation.indexOf('vault.pulled') < rotation.indexOf('secret-id-accessor/destroy'));
+  // The audit log HMACs strings only: a number or a JSON array would reach `docker logs` in clear.
+  assert.match(runbook, /mode JSON de l'interface/u);
+  assert.match(runbook, /incorrect nonce supplied/u);
+  assert.match(runbook, /enable_unauthenticated_access/u);
+  assert.match(runbook, /vault\.unseal_failed/u);
+  assert.match(runbook, /host\.docker\.internal/u);
   assert.match(runbook, /pg_advisory_lock/u);
   assert.match(runbook, /Les migrations\s+restent forward-only/u);
-  // `down --volumes` also deletes the evidence and the TLS certificate: never a documented command.
+  // `down --volumes` also deletes Vault, the evidence and the TLS certificate: never a documented command.
   assert.match(runbook, /`down --volumes` efface tous les volumes de la stack/u);
+  assert.match(runbook, /`down --volumes` efface tous les volumes de la stack[^.]*`vault-data`/u);
   assert.doesNotMatch(runbook, /^\s*sol_compose down --volumes/mu);
   assert.doesNotMatch(runbook, /--timeout 60/u, 'the stop waits for the whole stop_grace_period');
   assert.match(runbook, /ENTRY_STOP/u);

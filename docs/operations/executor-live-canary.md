@@ -2,8 +2,8 @@
 
 > **Stack Docker Compose.** Depuis le 2026-10-09, les commandes `npm run live:*` et
 > `executor:*` de ce runbook s'exécutent par `docker compose exec -it back sol …`
-> (`docs/operations/deployment.md`, « Commandes sol »), avec la configuration de
-> `config/<rôle>.env` et les secrets distribués par la stack.
+> (`docs/operations/deployment.md`, « Commandes sol »), avec la configuration de l'entrée
+> Vault `sol/config/<rôle>` et les secrets que la stack lit dans Vault.
 
 **Version :** 1.17.8 — 2026-09-12
 

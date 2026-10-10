@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import {
   RoleEnvironmentError,
   buildRoleEnvironment,
+  isVariableName,
   loginDatabaseUrl,
   parseRoleConfig,
   renderShellExports,
@@ -124,6 +125,26 @@ void test('configuration files cannot carry secrets, injected variables or crede
   assert.deepEqual(
     parseRoleConfig('# comment\nEXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64=AAAA\n', 'operations.env'),
     { EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: 'AAAA' },
+  );
+});
+
+void test('configuration and shell exports share one rule for variable names', () => {
+  for (const name of ['A', 'API_PORT', 'X1_2', `A${'B'.repeat(127)}`]) {
+    assert.equal(isVariableName(name), true, name);
+  }
+  for (const name of [
+    '', 'a', 'Api', '1A', '_A', 'A-B', 'A.B', 'A B', 'A=B', 'A\n', 'A\nB', `A${'B'.repeat(128)}`,
+  ]) {
+    assert.equal(isVariableName(name), false, JSON.stringify(name));
+  }
+  assert.throws(
+    () => parseRoleConfig('lower=1\n', 'listener.env'),
+    (error: unknown) => error instanceof RoleEnvironmentError
+      && error.message === 'listener.env: invalid variable name',
+  );
+  assert.throws(
+    () => renderShellExports({ lower: 'x' }),
+    (error: unknown) => error instanceof RoleEnvironmentError && error.message === 'invalid variable name',
   );
 });
 
