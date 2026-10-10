@@ -1633,7 +1633,7 @@ void test('deployment runbook documents the full-bot lifecycle, takeover and sec
     '| sol_compose exec -T vault vault write -field=token auth/userpass/login/operator password=-',
     'VAULT_TOKEN="$(vault login -token-only)"',
     // A secret reaches Vault on stdin, never on a command line that history and ps would keep.
-    '| sol_vault kv put sol/secrets/back/helius-listener-http-url value=-',
+    '| sol_vault kv put sol/secrets/back/helius-executor-http-url value=-',
     '| sol_vault write auth/userpass/users/operator/password password=-',
     // The key goes in on stdin with the attempt's nonce, so Vault refuses a swapped attempt, and
     // the encoded token is decoded from stdin: only the OTP is ever an argument.
