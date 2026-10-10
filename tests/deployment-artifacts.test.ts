@@ -1295,7 +1295,8 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /`SOLANA_HTTP_RPC_URL=https:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
   assert.match(smoke, /`SOLANA_WS_RPC_URL=wss:\/\/rpc\.invalid\/\?api-key=\$\{rpcApiKey\}`/);
   assert.match(smoke, /const rpcApiKey = randomBytes\(16\)\.toString\('hex'\);/);
-  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey\];/);
+  assert.match(smoke, /const smokeSecrets = \[postgresPassword, frontPassword, throwawayKeypair, rpcApiKey, spareRpcApiKey\];/);
+  assert.match(smoke, /smokePhase\('HELIUS_RELOAD', assertHeliusReload\)/u);
   assert.match(smoke, /'LISTENER_ENABLED=false'/);
   assert.match(smoke, /`EXECUTOR_KEYPAIR_PATH=\$\{keypairFile\}`/);
   assert.match(smoke, /VAULT_IMAGE:\s*deploymentImages\.vault/);
@@ -1467,7 +1468,7 @@ void test('deployment smoke proves users, secret isolation, front authentication
   for (const statement of [
     "assertEqual(stdout, 'listener 10001\\nopapi 10005\\nretention 10006\\n'",
     "assertEqual(stdout.trim(), '10100'",
-    "assertEqual(stdout, 'listener 400\\nopapi 400\\n'",
+    "assertEqual(stdout, 'listener 400\\nlistener 400\\nopapi 400\\n'",
     "'setpriv', '--reuid=listener', '--regid=listener', '--clear-groups', 'cat', path",
     "'exec', '-T', 'back', 'find', '/root/secrets', '/run/sol', '-name', '*keypair*'",
     "if (pulled !== '')",
@@ -1525,7 +1526,7 @@ void test('deployment smoke fills its Vault through the host scripts without eve
   assert.ok(fill.includes("assertNoSmokeSecret(`${stdout}\\n${stderr}`, 'vault-import.sh printed a secret.');"));
   assert.ok(fill.includes("summary.configs.join(','), 'listener,live'"));
   assert.ok(fill.includes("readdir(resolve(root, 'deploy/config'))"));
-  assert.ok(fill.includes("'helius-listener-http-url,helius-listener-ws-url,wallet-keypair.json'"));
+  assert.ok(fill.includes("'helius-listener-accounts,wallet-keypair.json'"));
 });
 
 void test('deployment smoke proves that six wrong secret_ids do not lock the backup role out', async () => {
