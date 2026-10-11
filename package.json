@@ -8,6 +8,12 @@
     "frontend"
   ],
   "scripts": {
+    "jitosol:status": "tsx src/jitosol/main.ts status",
+    "jitosol:observe": "tsx src/jitosol/main.ts observe",
+    "jitosol:preflight": "tsx src/jitosol/main.ts preflight",
+    "jitosol:run": "tsx src/jitosol/main.ts run",
+    "jitosol:start": "node dist/src/jitosol/main.js run",
+    "jitosol:test": "tsx --test tests/jitosol-*.test.ts",
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
     "executor:dev": "tsx src/executor/main.ts",

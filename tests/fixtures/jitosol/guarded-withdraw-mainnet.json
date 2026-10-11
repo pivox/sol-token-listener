@@ -1,0 +1,181 @@
+{
+  "description": "Public mainnet RPC compatibility probe: unsigned simulation only, no signature created and no transaction submitted.",
+  "source": "https://api.mainnet-beta.solana.com",
+  "capturedAt": "2026-10-11T09:56:10.621Z",
+  "programAddress": "SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy",
+  "programDataAddress": "EmiU8AQkB2sswTxVB6aCmsAJftoowZGGDXuytm6X65R3",
+  "deploymentSlot": "429882117",
+  "programDataSha256": "bcdbe9c692f865d54e824df8ef77e08ada3d788dc995fa935755c21feada7046",
+  "simulationFeePayer": "5eosrve6LktMZgVNszYzebgmmC7BjLK8NoWyRQtcmGTF",
+  "feePayerProvenance": "Public Jito stake-pool manager address decoded from pool state; no private key accessed. Simulated fees are not charged.",
+  "simulationConfig": {
+    "encoding": "base64",
+    "commitment": "confirmed",
+    "sigVerify": false
+  },
+  "pinnedAbiSource": "https://github.com/solana-program/stake-pool/blob/8abfd17428728bc4c1ce181c238a3357bab82ad5/program/src/instruction.rs",
+  "probes": [
+    {
+      "name": "guarded",
+      "instructionDataHex": "1800000000000000000000000000000000",
+      "accountKeys": [],
+      "context": {
+        "apiVersion": "4.3.0",
+        "slot": 455609391
+      },
+      "err": {
+        "InstructionError": [
+          0,
+          "NotEnoughAccountKeys"
+        ]
+      },
+      "logs": [
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy invoke [1]",
+        "Program log: Instruction: WithdrawStakeWithSlippage",
+        "Program log: Error: NotEnoughAccountKeys",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy consumed 423 of 200000 compute units",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy failed: insufficient account keys for instruction"
+      ],
+      "unitsConsumed": 423
+    },
+    {
+      "name": "guarded-truncated",
+      "instructionDataHex": "180000000000000000",
+      "accountKeys": [],
+      "context": {
+        "apiVersion": "4.3.0",
+        "slot": 455609391
+      },
+      "err": {
+        "InstructionError": [
+          0,
+          "BorshIoError"
+        ]
+      },
+      "logs": [
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy invoke [1]",
+        "Program log: Error: BorshIoError",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy consumed 435 of 200000 compute units",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy failed: Failed to serialize or deserialize account data"
+      ],
+      "unitsConsumed": 435
+    },
+    {
+      "name": "unknown",
+      "instructionDataHex": "7f00000000000000000000000000000000",
+      "accountKeys": [],
+      "context": {
+        "apiVersion": "4.3.0",
+        "slot": 455609392
+      },
+      "err": {
+        "InstructionError": [
+          0,
+          "BorshIoError"
+        ]
+      },
+      "logs": [
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy invoke [1]",
+        "Program log: Error: BorshIoError",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy consumed 665 of 200000 compute units",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy failed: Failed to serialize or deserialize account data"
+      ],
+      "unitsConsumed": 665
+    },
+    {
+      "name": "guarded-impossible-minimum-before-burn",
+      "capturedAt": "2026-10-11T09:58:25.269Z",
+      "instructionDataHex": "180094357700000000ffffffffffffffff",
+      "accountKeys": [
+        {
+          "pubkey": "Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "3R3nGZpQs2aZo5FDQvd2MUQ6R7KhAPainds6uT6uE2mn",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "6iQKfEyhr3bZMotVkW6beNZz5CPAkiwvgV2CTje9pVSS",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "GvHKfMTegKhVyYEyt6nmh6KVY8yFTztAQdxHXpzSX1XP",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "H5X4mHNpdrhXW1Y36rVGpmtub2tLMPwmY5oH3E8R3vsc",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "5eosrve6LktMZgVNszYzebgmmC7BjLK8NoWyRQtcmGTF",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "5eosrve6LktMZgVNszYzebgmmC7BjLK8NoWyRQtcmGTF",
+          "isSigner": true,
+          "isWritable": false
+        },
+        {
+          "pubkey": "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "8yoigZfzZ1nNaadumY9uPVD118225UYHTDpmjpr2nrSa",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "SysvarC1ock11111111111111111111111111111111",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "Stake11111111111111111111111111111111111111",
+          "isSigner": false,
+          "isWritable": false
+        }
+      ],
+      "poolTokens": "2000000000",
+      "quotedMinimumLamports": "2608821942",
+      "minimumLamportsOut": "18446744073709551615",
+      "context": {
+        "apiVersion": "4.3.0",
+        "slot": 455610017
+      },
+      "err": {
+        "InstructionError": [
+          0,
+          {
+            "Custom": 39
+          }
+        ]
+      },
+      "logs": [
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy invoke [1]",
+        "Program log: Instruction: WithdrawStakeWithSlippage",
+        "Program log: Error: Instruction exceeds desired slippage limit",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy consumed 7494 of 200000 compute units",
+        "Program SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy failed: custom program error: 0x27"
+      ],
+      "unitsConsumed": 7494
+    }
+  ]
+}
