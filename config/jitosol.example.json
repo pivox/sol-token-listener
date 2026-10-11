@@ -1,0 +1,35 @@
+{
+  "strategy": {
+    "version": 1,
+    "enabled": false,
+    "walletAddress": "",
+    "inputLamports": "3000000000",
+    "minProfitLamports": "9000000",
+    "networkBudgetLamports": "1000000",
+    "reserveLamports": "20000000",
+    "carryAnnualBps": 650,
+    "carryHours": 72,
+    "confirmationDelayMs": 10000,
+    "maxConfirmationGapMs": 30000,
+    "maxObservationAgeMs": 5000,
+    "maxSourceSlotLag": 50,
+    "maxPoolQuoteSlotGap": 32,
+    "maxCycles": 1,
+    "maxTotalFeesLamports": "0",
+    "maxRealizedLossLamports": "0",
+    "stopFile": "STOP"
+  },
+  "runtime": {
+    "rpcUrl": "https://api.mainnet-beta.solana.com",
+    "keypairPath": "",
+    "jupiterApiKeyFile": "",
+    "stateDirectory": "~/.sol-token-listener/jitosol-bot",
+    "pollIntervalMs": 10000,
+    "claimPollIntervalMs": 60000,
+    "maxRuntimeSeconds": 604800,
+    "rpcTimeoutMs": 10000,
+    "computeUnitLimit": 400000,
+    "computeUnitPriceMicroLamports": "0",
+    "maxTransactionFeeLamports": "250000"
+  }
+}

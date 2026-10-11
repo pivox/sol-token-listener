@@ -9,6 +9,11 @@ combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
 leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
 secondaire isolé; son code n'est pas activé par ce bootstrap.
 
+Un [bot JitoSOL à déstaking différé](docs/jitosol-bot.md) dispose de commandes
+indépendantes pour l'observation, les contrôles et le cycle d'exécution durable.
+Il est livré **désactivé**, sans clé ni autorisation de frais. `npm run jitosol:status`
+affiche son état local ; `npm run jitosol:run` retourne `disabled` avec l'exemple fourni.
+
 ## Admission worker Pump.fun bornée (#176/#177)
 
 La classification est exécutable mais désactivée : les exemples et Compose

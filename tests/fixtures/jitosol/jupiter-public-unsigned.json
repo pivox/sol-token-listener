@@ -1,0 +1,353 @@
+{
+  "capturedAt": "2026-10-11T09:50:13.921Z",
+  "walletPublicKey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+  "source": "https://api.jup.ag/swap/v1",
+  "unsignedOnly": true,
+  "quote": {
+    "inputMint": "So11111111111111111111111111111111111111112",
+    "inAmount": "3000000000",
+    "outputMint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+    "outAmount": "2299035030",
+    "otherAmountThreshold": "2296735995",
+    "swapMode": "ExactIn",
+    "slippageBps": 10,
+    "platformFee": null,
+    "priceImpactPct": "0.0006241454557117506113390474",
+    "routePlan": [
+      {
+        "swapInfo": {
+          "ammKey": "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp",
+          "label": "Whirlpool",
+          "inputMint": "So11111111111111111111111111111111111111112",
+          "outputMint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+          "inAmount": "3000000000",
+          "outAmount": "2299035030",
+          "updateContextSlot": "455607619"
+        },
+        "percent": 100,
+        "bps": null
+      }
+    ],
+    "contextSlot": 455607763,
+    "timeTaken": 0.000313931,
+    "swapUsdValue": "327.8230203385122",
+    "mostReliableAmmsQuoteReport": {
+      "info": {
+        "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE": "Not used RG: FullLiquidIntermediate, contains ALT: true",
+        "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp": "2299035030"
+      }
+    },
+    "longtailMarketQuoteReport": null,
+    "useIncurredSlippageForQuoting": null,
+    "useRewards": null,
+    "otherRoutePlans": null,
+    "loadedLongtailToken": false,
+    "instructionVersion": "V1",
+    "transactionVersion": 0
+  },
+  "swapInstructions": {
+    "tokenLedgerInstruction": null,
+    "computeBudgetInstructions": [
+      {
+        "programId": "ComputeBudget111111111111111111111111111111",
+        "accounts": [],
+        "data": "AsBcFQA="
+      }
+    ],
+    "setupInstructions": [
+      {
+        "programId": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        "accounts": [
+          {
+            "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+            "isSigner": true,
+            "isWritable": true
+          },
+          {
+            "pubkey": "784s8wLpoEU56MbZJRU96FJvTNs7iMPbox5sVCg8TFep",
+            "isSigner": false,
+            "isWritable": true
+          },
+          {
+            "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+            "isSigner": false,
+            "isWritable": false
+          },
+          {
+            "pubkey": "So11111111111111111111111111111111111111112",
+            "isSigner": false,
+            "isWritable": false
+          },
+          {
+            "pubkey": "11111111111111111111111111111111",
+            "isSigner": false,
+            "isWritable": false
+          },
+          {
+            "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "isSigner": false,
+            "isWritable": false
+          }
+        ],
+        "data": "AQ=="
+      },
+      {
+        "programId": "11111111111111111111111111111111",
+        "accounts": [
+          {
+            "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+            "isSigner": true,
+            "isWritable": true
+          },
+          {
+            "pubkey": "784s8wLpoEU56MbZJRU96FJvTNs7iMPbox5sVCg8TFep",
+            "isSigner": false,
+            "isWritable": true
+          }
+        ],
+        "data": "AgAAAABe0LIAAAAA"
+      },
+      {
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "accounts": [
+          {
+            "pubkey": "784s8wLpoEU56MbZJRU96FJvTNs7iMPbox5sVCg8TFep",
+            "isSigner": false,
+            "isWritable": true
+          }
+        ],
+        "data": "EQ=="
+      },
+      {
+        "programId": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        "accounts": [
+          {
+            "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+            "isSigner": true,
+            "isWritable": true
+          },
+          {
+            "pubkey": "GKy6CDGtjUwf9mCuvNRT4tpWmSUke3iku5SU7w4MkuSH",
+            "isSigner": false,
+            "isWritable": true
+          },
+          {
+            "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+            "isSigner": false,
+            "isWritable": false
+          },
+          {
+            "pubkey": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+            "isSigner": false,
+            "isWritable": false
+          },
+          {
+            "pubkey": "11111111111111111111111111111111",
+            "isSigner": false,
+            "isWritable": false
+          },
+          {
+            "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "isSigner": false,
+            "isWritable": false
+          }
+        ],
+        "data": "AQ=="
+      }
+    ],
+    "swapInstruction": {
+      "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+      "accounts": [
+        {
+          "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+          "isSigner": true,
+          "isWritable": false
+        },
+        {
+          "pubkey": "784s8wLpoEU56MbZJRU96FJvTNs7iMPbox5sVCg8TFep",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "GKy6CDGtjUwf9mCuvNRT4tpWmSUke3iku5SU7w4MkuSH",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "GKy6CDGtjUwf9mCuvNRT4tpWmSUke3iku5SU7w4MkuSH",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "D8cy77BBepLMngZx6ZukaTff5hCt1HrWyKk3Hnd9oitf",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "784s8wLpoEU56MbZJRU96FJvTNs7iMPbox5sVCg8TFep",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "F7tcS67EfP4bBJhWLxCk6ZmPVcsmPnJvPLQcDw5eeR67",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "GKy6CDGtjUwf9mCuvNRT4tpWmSUke3iku5SU7w4MkuSH",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "8tfJVFdcogGMmvW1RA1kDZey2BjwdCznF3MD4Pcxi9xn",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "ZXJpGfQ1BGsLayxu4CwDqxkGSYwFeJ3tovsUUHNjWf3",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "HNdvJiPJBkG3STtBLKSGLH9z8E6p7ZSNBygQ7WhDoS2k",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "8BRAdYeP3DaGChmH7yu1HmACdArrtkYFTcLZ3U84gib5",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "HtKTsc1mu3PaLo89AZBaHtxooUfdvxEvBbo2YT99k45Z",
+          "isSigner": false,
+          "isWritable": false
+        }
+      ],
+      "data": "5RfLl3rjrSoBAAAAEQFkAAEAXtCyAAAAAJZ9CIkAAAAACgAA"
+    },
+    "cleanupInstruction": {
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "accounts": [
+        {
+          "pubkey": "784s8wLpoEU56MbZJRU96FJvTNs7iMPbox5sVCg8TFep",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "646xBYVKzCuUxmCHrMUhLHx3GKvAGZBxDRHLoYmtT8j1",
+          "isSigner": true,
+          "isWritable": false
+        }
+      ],
+      "data": "CQ=="
+    },
+    "otherInstructions": [],
+    "addressLookupTableAddresses": [
+      "5m2LUxvFW8zBq4baKUCnsC9zK7FSCEeLPoi1CsLBB4dQ"
+    ],
+    "prioritizationFeeLamports": 0,
+    "computeUnitLimit": 1400000,
+    "loadedAccountsDataSize": null,
+    "loadedAccountsDataSizeLimit": null,
+    "transactionVersion": 0,
+    "prioritizationType": {
+      "computeBudget": {
+        "microLamports": 0,
+        "estimatedMicroLamports": null
+      }
+    },
+    "simulationSlot": null,
+    "dynamicSlippageReport": null,
+    "simulationError": null,
+    "addressesByLookupTableAddress": null,
+    "blockhashWithMetadata": {
+      "blockhash": [
+        205,
+        62,
+        53,
+        49,
+        194,
+        207,
+        89,
+        215,
+        142,
+        51,
+        247,
+        97,
+        166,
+        16,
+        63,
+        214,
+        58,
+        63,
+        204,
+        232,
+        50,
+        16,
+        124,
+        141,
+        224,
+        13,
+        205,
+        48,
+        205,
+        47,
+        247,
+        230
+      ],
+      "lastValidBlockHeight": 433645029,
+      "fetchedAt": {
+        "secs_since_epoch": 1791712206,
+        "nanos_since_epoch": 415644563
+      }
+    },
+    "timeTaken": 0.000123147,
+    "createAtaTimeTaken": 0.000095093
+  }
+}
