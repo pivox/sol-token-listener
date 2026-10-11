@@ -13,6 +13,6 @@ Tech stack: existing Node22/TypeScript, web3.js, SPL Token; no new paid service 
 - [x] Integrate each module; test full synthetic delayed-unstake lifecycle and crash boundaries; typecheck and lint touched files; broaden tests where integration warrants.
 - [x] Fresh independent review of specification, financial/protocol implementation and signing/broadcast gates; fix findings and rerun affected checks.
 - [x] Close current 30-minute research run; immutable report and no remaining research process. Build release; verify disabled CLI with network and signing ports denied.
-- [ ] Commit reviewed implementation and integrate locally if clean; deliver exact code/report paths, test evidence and limits before17:00, bot disabled and no real funds engaged.
+- [x] Commit reviewed implementation and integrate locally into `main`; verify the build, typecheck, 139 focused tests and disabled command from the main workspace before 17:00. Operator guide, validation and observation reports delivered; no real funds engaged.
 
 Review-driven changes: guarded `WithdrawStakeWithSlippage` with a durable original economic floor; STOP and quote-expiry rechecks after journal fsync; zero-lamport simulation tombstones; SPL zero-denominator fee semantics; retryable RPC reads distinguished from inconsistent receipts. See the independent reviews in `../reviews/`.

@@ -9,6 +9,11 @@ La configuration livrée est **désactivée**, sans portefeuille, sans clé et a
 Depuis la racine du dépôt, avec Node ≥22.13 et les dépendances du lockfile :
 
 ```bash
+# Sur cette machine, Node 24 est déjà installé ici ; le shell utilisait Node 20.
+export PATH="$HOME/.local/node/bin:$PATH"
+node --version
+# À refaire uniquement si les dépendances locales sont absentes :
+# npm ci --include=dev --ignore-scripts --no-audit --no-fund
 npm run jitosol:test
 npm run check:backend
 npm run build:backend

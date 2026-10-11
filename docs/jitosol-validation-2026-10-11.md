@@ -2,6 +2,8 @@
 
 Périmètre : bot complet livré désactivé, avec observation publique, achat, retrait Stake Pool gardé, désactivation, attente de disponibilité réelle et récupération des SOL. La livraison ne comporte aucune activation opérationnelle ni cycle financé.
 
+Implémentation enregistrée dans le commit `8be68e98` et intégrée localement dans `main`. À 12:08, heure de Paris, la compilation, le contrôle TypeScript/IDL et les 139 tests JitoSOL ont été revérifiés depuis le dossier principal ; `status` confirme le mode désactivé et le binaire compilé reste désactivé avec `--live` et les ports réseau/signature interdits. L'échéance de 17:00 est respectée.
+
 | Contrôle | Résultat |
 |---|---|
 | Tests JitoSOL après corrections de revue | 139 réussis, aucun échec |
@@ -18,7 +20,7 @@ Périmètre : bot complet livré désactivé, avec observation publique, achat, 
 
 Les tests PostgreSQL et autres intégrations conditionnelles ignorés le restent faute de leur environnement de test dédié. Aucun serveur de production, coffre ou portefeuille utilisateur n'a été ouvert pour les forcer. Les changements JitoSOL utilisent un journal local et ne modifient aucune migration ni service PostgreSQL.
 
-La première exécution de la suite backend avant compilation signalait 15 fichiers `dist/` manquants. La compilation a fourni ces artefacts ; la suite complète relancée ensuite est celle rapportée ci-dessus.
+La suite backend vérifie aussi les graphes compilés : exécuter `npm run build:backend` avant `npm run test:backend`. Les dépendances du lockfile sont installées dans le dossier principal. Le runtime validé sur cette machine est Node 24.21.0, disponible dans `~/.local/node/bin` ; le guide fournit la commande pour le sélectionner dans le shell.
 
 Le test d'intégration JitoSOL emploie le vrai moteur, le vrai journal privé et le vrai adaptateur RPC, avec chaîne et signataire de test contrôlés. Il traverse les quatre actions, une interruption avec achat en attente, un redémarrage pendant le déstaking et une indisponibilité au-delà de 72 h. Il vérifie la persistance avant diffusion, les reçus finalisés, le minimum de retrait, les frais et les loyers, ainsi que la conservation d'un solde JitoSOL antérieur.
 
